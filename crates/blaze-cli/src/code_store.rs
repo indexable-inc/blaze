@@ -1,5 +1,6 @@
 //! Code records kept across commands: blaze-ladder's `CodeStore` over the ONE store a user, the
-//! plain store the command already opens at `<home>/.blaze/v2/store` (store.rs,
+//! plain store the command already opens at `<home>/.blaze/` plain_place.rs `STORE_DIR`, the
+//! folder of this blaze's forms (`v2/store/f5s2`, D160) (store.rs,
 //! `open_for_command`), so an entry made by one `blaze run` is found by the next one by its key,
 //! read in place, and never emitted again (AGENTS.md, "The design": everything kept is a record,
 //! keyed from text before the work, written once, read in place; a command answers and exits).

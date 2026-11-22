@@ -27,6 +27,7 @@ use std::{
     sync::atomic::AtomicU64,
 };
 
+use blaze_sys::posix::{io::{MapFlags, Prot, munmap}, thread::geteuid};
 use crate::wait::{Clock, Deadline, WaitError, Waited};
 
 #[cfg(not(target_endian = "little"))]
@@ -78,8 +79,7 @@ impl Shared {
             Err(other) => return Err(io("open")(other)),
         };
         let meta = file.metadata().map_err(io("stat"))?;
-        // SAFETY: a read of this process's effective user id.
-        let mine = unsafe { libc::geteuid() };
+        let mine = geteuid();
         if meta.uid() != mine {
             return Err(error(SharedWhy::Owner { uid: meta.uid(), mine }));
         }
@@ -133,7 +133,7 @@ impl Drop for Shared {
     fn drop(&mut self) {
         // SAFETY: the mapping `map` made, of this length, unmapped once; no `&` to its words
         // outlives `self`.
-        _ = unsafe { libc::munmap(self.words.as_ptr().cast(), self.len * WORD) };
+        _ = unsafe { munmap(self.words.cast(), self.len * WORD) };
     }
 }
 
@@ -177,8 +177,8 @@ fn map(file: &File, len: usize) -> io::Result<NonNull<AtomicU64>> {
         libc::mmap(
             std::ptr::null_mut(),
             len * WORD,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
+            (Prot::READ | Prot::WRITE).bits() as core::ffi::c_int,
+            MapFlags::SHARED.bits() as core::ffi::c_int,
             file.as_raw_fd(),
             0,
         )

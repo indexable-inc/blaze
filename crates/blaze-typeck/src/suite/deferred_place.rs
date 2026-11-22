@@ -23,7 +23,10 @@
 //! lowered (rustc's `check_fn` takes the signature normalized in the param env), so `?r = u8`
 //! before the body. The planted bug `Plant::SignatureUnsettled` skips that select; the control
 //! sees the finding move off `1u16`: the late projection fails at the body's block (the output
-//! signature obligation's place, machine.rs `sig_place`), an E0277 where E0308 is wanted.
+//! signature obligation's place, machine.rs `sig_place`), where E0308 at `1u16` is wanted. That
+//! finding is E0271, not E0277: `X: Tr` holds by the bound and `X: Tr<A = u8>` decides `X::A` to
+//! `u8`, another type than the term `u16`, rustc's "type mismatch resolving `<X as Tr>::A ==
+//! u16`" (`report_projection_error`; machine.rs files it as `ProjectionMismatch`).
 //!
 //! The second case is the census class `check: Check: DiagWithoutPlace { code: Unsatisfied,
 //! name: None }` (tempo build census 7, 8 functions, e.g. primeorder's `<impl<C>
@@ -104,11 +107,15 @@ fn signature_projection_is_settled_before_the_body() {
         other => wrong.push(format!("wide: want [(Mismatch, {})] (`1u16` where `u8` is wanted), got {other:?}", lit.0)),
     }
     // Settled late, the projection fails after `1u16` bound `?r`: a finding with a place (the
-    // body's block, where the output's obligation is filed), but not E0308 at `1u16`.
+    // body's block, where the output's obligation is filed), but not E0308 at `1u16`. The trait
+    // goal holds and the bound decides `X::A = u8` against the term `u16`: E0271.
     let planted = findings(&fx, &b, wide, root, Plant::SignatureUnsettled);
     match &planted {
-        Ok(d) if d.as_slice() != [(DiagCode::Mismatch, lit.0)] && d.iter().any(|&(c, _)| c == DiagCode::Unsatisfied) => {}
-        other => wrong.push(format!("control: Plant::SignatureUnsettled should give an E0277 with a place, not E0308 at `1u16`, got {other:?}")),
+        Ok(d) if !d.contains(&(DiagCode::Mismatch, lit.0)) && d.contains(&(DiagCode::ProjectionMismatch, root.0)) => {}
+        other => wrong.push(format!(
+            "control: Plant::SignatureUnsettled should give an E0271 at the block ({}), not E0308 at `1u16`, got {other:?}",
+            root.0
+        )),
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     std::println!("signature_projection_is_settled_before_the_body: ok (control caught)");

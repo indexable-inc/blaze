@@ -164,6 +164,8 @@ pub mod audio;
 pub mod automation;
 /// An object store beneath a directory: `Blobs`, bytes under the BLAKE3 of what they are.
 pub mod blobs;
+/// Block devices (D182): `Block` over a `Device` (a file, the simulated device, a raw device).
+pub mod block;
 /// Budgets: the byte limit of a `Net` and the quota of a `Dir`, and the `Over` each ends in.
 pub mod budget;
 #[expect(
@@ -281,6 +283,9 @@ mod simtest;
 pub mod streams;
 pub mod sync;
 pub mod task;
+// What a run used and where its time went, kept per worker and merged into one `Report` at
+// exit (D178): spans, distributions, effects by kind, the pool, the longest chain.
+pub mod telemetry;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
 pub mod term;
 pub mod trace;
@@ -294,6 +299,20 @@ pub mod url;
 pub mod user;
 /// The program's windows: `Window`, a surface's size and its events.
 pub mod window;
+/// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
+/// `cx.on_worker`.
+#[expect(
+    unsafe_code,
+    reason = "the cells' sparse reservation: typed columns reached by offset, each cell's making and drop, the keys' and handles' `Send`/`Sync`, and a gather's reach of a column (`each_made`), each with its SAFETY"
+)]
+pub mod workers;
+/// One value per worker, written with no lock, merged once at a boundary no task can hold one
+/// across (D179's GATHERED).
+#[expect(
+    unsafe_code,
+    reason = "two calls of `Workers::each_made`, whose contract `&mut Gathered` (the only key, lent only to `with`) meets, each with its SAFETY"
+)]
+pub mod gathered;
 
 /// Bytes held without a copy: their own `Arc`, a range their owner keeps in place, or a
 /// `'static` slice (blaze-bytes). Not [`mem::Bytes`], which are bytes being written into an

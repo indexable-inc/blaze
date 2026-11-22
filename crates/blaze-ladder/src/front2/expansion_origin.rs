@@ -51,6 +51,12 @@ pub enum Unmapped {
     NoText { call: LibKey },
     /// The loader serves no origins for the call (a loader that keeps none: `Load`'s default).
     NotServed { call: LibKey },
+    /// The expansion's record keeps no call part, by its writer's design (blaze-scope
+    /// expansion_records.rs `write`: a text whose origins are `Err`, such as a call's statements
+    /// read as items, a block's module text or a column that could not be made, keeps none): where
+    /// the call stands is not recorded, so nothing in that text is placed through it. Typed,
+    /// never a records error (tempo a1425, 2026-11-21: filed in the log, it voided the instance).
+    NoCallPart { call: LibKey },
     /// Over the crates' records, the calling text's outline is not served yet: owed with the
     /// `Texts` table's filling over records (texts.rs `Texts::empty`).
     OverRecords { call: LibKey },

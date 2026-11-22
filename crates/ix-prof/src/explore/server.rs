@@ -287,7 +287,7 @@ fn clock_of(driver: &impl blaze_core::Driver) -> Clock {
 /// The loop, until the explorer stops (and its sessions are closed, or [`SHUTDOWN`] passed) or
 /// its socket fails.
 fn run(driver: &mut impl blaze_core::Driver, mut core: Loop, mut serving: Serving, shared: &Shared, source: &Arc<dyn Source>) {
-    let results: Arc<SegQueue<(JobId, Done)>> = Arc::new_in(SegQueue::new(), Global);
+    let results: Arc<SegQueue<(JobId, Done), Global>> =Arc::new_in(SegQueue::new(), Global);
     let mut effects = Vec::new_in(Global);
     let mut done = Vec::new_in(Global);
     let mut jobs = Vec::new_in(Global);
@@ -345,7 +345,7 @@ fn run(driver: &mut impl blaze_core::Driver, mut core: Loop, mut serving: Servin
 }
 
 /// Runs `job` on a thread of its own; its result is queued on `results` and the loop woken.
-fn run_job(job: Job, source: &Arc<dyn Source>, results: &Arc<SegQueue<(JobId, Done)>>, waker: &Waker) {
+fn run_job(job: Job, source: &Arc<dyn Source>, results: &Arc<SegQueue<(JobId, Done), Global>>, waker: &Waker) {
     let Job { id, work } = job;
     let (to, wake, source) = (Arc::clone(results), waker.clone(), Arc::clone(source));
     let spawned = std::thread::Builder::new().spawn(move || {

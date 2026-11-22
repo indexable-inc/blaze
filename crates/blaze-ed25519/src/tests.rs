@@ -16,8 +16,15 @@ use std::format;
 
 use blaze_sim::{Broke, Config, Tape};
 
+use blaze_own::planted::NoPlant;
+
 use crate::point::{BASEPOINT, Point};
-use crate::{Encoding, PLANT, Plant, Refused, VerifyingKey, same_point, scalar, verify};
+use crate::{Encoding, Plant, Refused, VerifyingKey, same_point, scalar, verify};
+
+/// [`verify`] with `plant` planted.
+fn verify_planted(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64], plant: Plant) -> Result<(), Refused> {
+    VerifyingKey::decode_planted(public_key, plant)?.verify_parts_planted(&[message], signature, plant)
+}
 
 #[path = "../tests/data/mod.rs"]
 mod data;
@@ -46,12 +53,12 @@ fn judge(name: &str, want: Result<(), Refused>, got: Result<(), Refused>) -> Res
 /// T1: `PRIME_KEY` + `TORSION[i]` is refused as `KeyMixedOrder` for every i in 1..8 (under
 /// Miri, the keys of order 4L and 2L, the two a weakened check lets through), and (0, -1) is
 /// not the identity.
-pub(crate) fn mixed_keys_refused() -> Result<(), Broke> {
+pub(crate) fn mixed_keys_refused(plant: Plant) -> Result<(), Broke> {
     for (i, key) in data::MIXED_KEYS.iter().enumerate() {
         if cfg!(miri) && !matches!(i + 1, 2 | 4) {
             continue;
         }
-        match VerifyingKey::decode(key).map(|_| ()) {
+        match VerifyingKey::decode_planted(key, plant).map(|_| ()) {
             Err(Refused::KeyMixedOrder) => {}
             Ok(()) => return Err(Broke::Oracle(format!("PRIME_KEY + TORSION[{}]: a key of mixed order accepted", i + 1))),
             Err(other) => {
@@ -60,7 +67,7 @@ pub(crate) fn mixed_keys_refused() -> Result<(), Broke> {
         }
     }
     let minus_one = Point::decode(&data::TORSION[4]).map_err(|why| Broke::Oracle(format!("(0, -1) does not decode: {why:?}")))?;
-    if minus_one.is_identity() {
+    if minus_one.is_identity_planted(plant) {
         return Err(Broke::Oracle("(0, -1) taken for the identity".into()));
     }
     Ok(())
@@ -68,7 +75,7 @@ pub(crate) fn mixed_keys_refused() -> Result<(), Broke> {
 
 /// T2: S's range check at its boundaries: L - 1 and L - 2^192 below L; L, L + 1, L + 2^64,
 /// L + 2^128 and L + 2^192 not.
-pub(crate) fn s_bounds_hold() -> Result<(), Broke> {
+pub(crate) fn s_bounds_hold(plant: Plant) -> Result<(), Broke> {
     let l = scalar::L;
     let cases: [(&str, [u64; 4], bool); 7] = [
         ("L - 1", [l[0] - 1, l[1], l[2], l[3]], true),
@@ -80,7 +87,7 @@ pub(crate) fn s_bounds_hold() -> Result<(), Broke> {
         ("L + 2^192", [l[0], l[1], l[2], l[3] + 1], false),
     ];
     for (name, limbs, want) in cases {
-        let got = scalar::is_canonical(&scalar::to_bytes(&limbs));
+        let got = scalar::is_canonical_planted(&scalar::to_bytes(&limbs), plant);
         if got != want {
             return Err(Broke::Oracle(format!("is_canonical({name}) is {got}, want {want}")));
         }
@@ -90,28 +97,28 @@ pub(crate) fn s_bounds_hold() -> Result<(), Broke> {
 
 /// T6: two points that share one coordinate are not equal: B and -B (same y), B and
 /// (0, -1) - B = (x, -y) (same x).
-pub(crate) fn distinct_points_differ() -> Result<(), Broke> {
+pub(crate) fn distinct_points_differ(plant: Plant) -> Result<(), Broke> {
     let minus_one = Point::decode(&data::TORSION[4]).map_err(|why| Broke::Oracle(format!("(0, -1) does not decode: {why:?}")))?;
-    if BASEPOINT.equals(&BASEPOINT.neg()) {
+    if BASEPOINT.equals_planted(&BASEPOINT.neg(), plant) {
         return Err(Broke::Oracle("two different points compared equal: B and -B".into()));
     }
-    if BASEPOINT.equals(&minus_one.sub(&BASEPOINT)) {
+    if BASEPOINT.equals_planted(&minus_one.sub(&BASEPOINT), plant) {
         return Err(Broke::Oracle("two different points compared equal: B and (0, -1) - B".into()));
     }
     Ok(())
 }
 
-fn every_vector(tape: &Tape) -> Result<(), Broke> {
+fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let rfc = if cfg!(miri) { &data::RFC[..1] } else { &data::RFC[..] };
     for vector in rfc {
-        judge(vector.name, Ok(()), verify(&vector.public, vector.message, &vector.signature))?;
+        judge(vector.name, Ok(()), verify_planted(&vector.public, vector.message, &vector.signature, plant))?;
     }
     for edge in edges() {
-        judge(edge.name, edge.want, verify(&edge.key, edge.message, &edge.signature))?;
+        judge(edge.name, edge.want, verify_planted(&edge.key, edge.message, &edge.signature, plant))?;
     }
-    mixed_keys_refused()?;
-    s_bounds_hold()?;
-    distinct_points_differ()?;
+    mixed_keys_refused(plant)?;
+    s_bounds_hold(plant)?;
+    distinct_points_differ(plant)?;
     let vector = &rfc[tape.index(rfc.len(), "vector")];
     let mut key = vector.public;
     let mut message = [0u8; 1024];
@@ -127,17 +134,10 @@ fn every_vector(tape: &Tape) -> Result<(), Broke> {
     } else {
         signature[byte - 32 - len] ^= mask;
     }
-    match verify(&key, &message[..len], &signature) {
+    match verify_planted(&key, &message[..len], &signature, plant) {
         Ok(()) => Err(Broke::Oracle(format!("{}: a hostile signature accepted (bit {bit} flipped)", vector.name))),
         Err(_) => Ok(()),
     }
-}
-
-fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    PLANT.set(plant);
-    let out = every_vector(tape);
-    PLANT.set(Plant::None);
-    out
 }
 
 #[test]
@@ -192,9 +192,7 @@ fn the_bounds_catch_a_range_check_of_the_top_limb() {
 #[test]
 fn a_lenient_r_decoding_is_refused_only_for_small_order() {
     let edge = data::EDGE.iter().find(|edge| edge.name == "noncanonical_identity_r").expect("the case");
-    PLANT.set(Plant::RNonCanonical);
-    let got = verify(&edge.key, edge.message, &edge.signature);
-    PLANT.set(Plant::None);
+    let got = verify_planted(&edge.key, edge.message, &edge.signature, Plant::RNonCanonical);
     assert_eq!(got, Err(Refused::RSmallOrder));
     assert_eq!(verify(&edge.key, edge.message, &edge.signature), Err(Refused::REncoding(Encoding::YNotReduced)));
 }
@@ -206,7 +204,7 @@ fn a_degenerate_point_is_never_the_signature_s() {
     let degenerate = Point::DEGENERATE;
     assert!(degenerate.is_identity() && degenerate.equals(&BASEPOINT), "the cross-multiplication alone takes it");
     for r in [BASEPOINT, Point::IDENTITY, BASEPOINT.neg()] {
-        assert!(!same_point(&degenerate, &r), "step 7 refuses a computed (0 : 0 : 0)");
-        assert!(same_point(&r, &r), "and takes a point as itself");
+        assert!(!same_point(&degenerate, &r, NoPlant), "step 7 refuses a computed (0 : 0 : 0)");
+        assert!(same_point(&r, &r, NoPlant), "and takes a point as itself");
     }
 }

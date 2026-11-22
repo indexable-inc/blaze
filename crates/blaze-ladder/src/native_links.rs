@@ -31,7 +31,10 @@ use blaze_scope::resolve::CrateNames;
 use blaze_surface::ItemIndex;
 
 use crate::front2::links::{CrateExport, CrateLinks, LinkDecl, LinkKind, LinksError, Modifiers, scope_links};
-use crate::natives::{CrateNative, NativeError, NativeInputs, NativeSummary, native_key, native_library};
+pub use crate::natives::Asked;
+use crate::natives::{CrateNative, NativeError, NativeInputs, NativeSummary, asked, native_key, native_library};
+pub use blaze_native::libraries::{Library, LibraryKind, Linked, Source};
+pub use blaze_native::tbd::TbdError;
 
 pub const TABLE_MAGIC: [u8; 4] = *b"BZLK";
 /// The table's FORMAT number: a change of the layout above says so here.
@@ -173,15 +176,31 @@ pub struct ProgramCrate<'a> {
 
 /// The image's key (natives.rs `native_key`: the link line, the root and export names, the
 /// libraries; never a Rust body).
-pub fn program_key<'a>(crates: &'a [ProgramCrate<'a>], platform: Platform, producer: &'a ProducerId<Whole>, alloc: Alloc<'a>) -> Result<ContentId, NativeError<'a>> {
+pub fn program_key<'a>(
+    crates: &'a [ProgramCrate<'a>],
+    installs: &'a [Linked<'a>],
+    platform: Platform,
+    producer: &'a ProducerId<Whole>,
+    alloc: Alloc<'a>,
+) -> Result<ContentId, NativeError<'a>> {
     let natives = as_natives(crates, alloc)?;
-    native_key(&NativeInputs { platform, producer, crates: natives }, alloc)
+    native_key(&NativeInputs { platform, producer, crates: natives, installs }, alloc)
+}
+
+/// The libraries the program's link line asks for, each once, in link order, by where its
+/// install name comes from (natives.rs `asked`): the caller reads each SDK stub
+/// (`Source::Stub`) through the file system it holds and hands the libraries back resolved as
+/// [`program_key`]'s and [`program_image`]'s `installs`.
+pub fn program_libraries<'a>(crates: &'a [ProgramCrate<'a>], platform: Platform, producer: &'a ProducerId<Whole>, alloc: Alloc<'a>) -> Result<AVec<'a, Asked<'a>>, NativeError<'a>> {
+    let natives = as_natives(crates, alloc)?;
+    asked(&NativeInputs { platform, producer, crates: natives, installs: &[] }, alloc)
 }
 
 /// The image's bytes appended to `out` (natives.rs `native_library`): a program with no C
 /// input still gets a real image naming only the system library.
 pub fn program_image<'a>(
     crates: &'a [ProgramCrate<'a>],
+    installs: &'a [Linked<'a>],
     platform: Platform,
     producer: &'a ProducerId<Whole>,
     seed: FixedState,
@@ -189,7 +208,7 @@ pub fn program_image<'a>(
     alloc: Alloc<'a>,
 ) -> Result<NativeSummary, NativeError<'a>> {
     let natives = as_natives(crates, alloc)?;
-    native_library(&NativeInputs { platform, producer, crates: natives }, seed, out, alloc)
+    native_library(&NativeInputs { platform, producer, crates: natives, installs }, seed, out, alloc)
 }
 
 fn as_natives<'a>(crates: &'a [ProgramCrate<'a>], alloc: Alloc<'a>) -> Result<&'a [CrateNative<'a>], NativeError<'a>> {

@@ -22,11 +22,10 @@
 //! `extern "rust-call" fn call_once(self, args: Args) -> Self::Output;`. Its tuple's fields
 //! cross as separate parameters (lib.rs `Abi::RustCall`), so the body takes `(env, a..)`.
 
-use blaze_typeck::CaptureKind;
+use blaze_typeck::{CaptureKind, EnvField};
 
 use super::*;
 use crate::FnTrait;
-use crate::layout::LayoutFacts;
 
 // The other function the language makes with no text: a tuple struct's or variant's ctor.
 #[path = "ctor_fn.rs"]
@@ -109,20 +108,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.closure_parts(g).map_err(|error| Self::ty_err(e, error))
     }
 
-    /// Closure or `async` block `e`'s captures in the checker's order: the binding and how. The
-    /// one list its environment's fields are (`layout::captures`).
-    pub(super) fn captures_of(&self, e: ExprId, out: &mut Vec<(PatId, CaptureKind), A>) {
-        out.clear();
-        out.extend(crate::layout::captures(self.checked, e));
-    }
-
-    /// The offset of field `j` of the struct or tuple laid out as row `l`.
+    /// The offset of field `j` (by declaration index) of the struct or tuple laid out as row
+    /// `l`: walk.rs `decl_field`, the one lookup walk/moves/env_places.rs `env_field_offset`
+    /// shares.
     pub(super) fn field_offset(&self, l: u32, j: usize) -> Result<u32, BuildError> {
-        let Shape::Fields { first, len } = self.layouts[l as usize].shape else {
+        let Shape::Fields { .. } = self.layouts[l as usize].shape else {
             return Err(malformed("a closure's environment not laid out as a struct"));
         };
-        let rows = self.layout_fields.get(first as usize..(first + len) as usize).ok_or(malformed("a layout's fields past their table"))?;
-        rows.iter().find(|f| f.0 == Name(j as u64)).map(|f| f.1).ok_or(malformed("a capture past its environment's fields"))
+        let j = u32::try_from(j).map_err(|_| malformed("a capture past its environment's fields"))?;
+        Ok(self.decl_field(l, 0, j)?.0)
     }
 
     /// The invariant of `layout::captures`, checked where the walk reads an environment: ground
@@ -168,24 +162,38 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// `|..| body`: its environment, each by-reference capture the address of the binding's
     /// home, each by-value capture its value moved in (the Reference, "Closure types",
-    /// "Capture modes").
+    /// "Capture modes"). A field holding a place below its binding (`x.a`, RFC 2229) is the
+    /// place's address or value (walk/moves/env_places.rs `store_env_place`).
     pub(super) fn closure_value(&mut self, e: ExprId) -> Result<(), BuildError> {
         let t = self.expr_ty(e)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
         let repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
-        let mut caps = Vec::new_in(self.alloc.clone());
-        self.captures_of(e, &mut caps);
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
+        for f in self.checked.env_fields(e) {
+            fields.push(f);
+        }
         if let Repr::None = repr {
+            if fields.iter().any(|f| !f.is_whole()) {
+                return Err(BuildError::Unsupported {
+                    expr: e,
+                    what: "not lowered: a zero-sized closure environment holding a captured place below its binding",
+                });
+            }
             self.push_val(V::None, None);
             return Ok(());
         }
         let mut offs = Vec::new_in(self.alloc.clone());
-        self.capture_offsets(e, g, caps.len(), &mut offs)?;
+        self.capture_offsets(e, g, fields.len(), &mut offs)?;
         let at = self.temp(repr);
-        for (j, &(p, by)) in caps.iter().enumerate() {
+        for (j, &f) in fields.iter().enumerate() {
+            let dst = (at.0, at.1 + offs[j] as i32);
+            if !f.is_whole() {
+                self.store_env_place(e, f, dst)?;
+                continue;
+            }
+            let (p, by) = (f.base, f.how);
             let (home, prepr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a binding captured before its binding"))?;
             let src = self.home(home);
-            let dst = (at.0, at.1 + offs[j] as i32);
             match by {
                 CaptureKind::ByRef | CaptureKind::ByMutRef => {
                     let a = self.address(src);
@@ -285,7 +293,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 };
                 self.vals[base] = V::Scalar(self.address((p, off)));
                 reprs.push(Repr::Ptr);
-                passes.push(Self::rust_pass(Repr::Ptr)?);
+                passes.push(self.rust_pass(Repr::Ptr)?);
             }
             FnTrait::FnOnce => {
                 let repr = self.repr(g).map_err(|error| Self::ty_err(callee, error))?;
@@ -349,7 +357,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut passes = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
         reprs.push(env_repr);
         passes.push(match parts.kind {
-            FnTrait::Fn | FnTrait::FnMut => Self::rust_pass(Repr::Ptr)?,
+            FnTrait::Fn | FnTrait::FnMut => self.rust_pass(Repr::Ptr)?,
             FnTrait::FnOnce => self.pass(g, env_repr, Abi::Rust, None)?,
         });
         for &gi in inputs.iter() {
@@ -381,11 +389,21 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             V::None => None,
             V::Unsized(..) => return Err(malformed("a closure's environment as an unsized place")),
         };
-        let mut caps = Vec::new_in(self.alloc.clone());
-        self.captures_of(closure, &mut caps);
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
+        for f in self.checked.env_fields(closure) {
+            fields.push(f);
+        }
         let mut offs = Vec::new_in(self.alloc.clone());
-        self.capture_offsets(closure, g, caps.len(), &mut offs)?;
-        for (j, &(p, by)) in caps.iter().enumerate() {
+        self.capture_offsets(closure, g, fields.len(), &mut offs)?;
+        for (j, &f) in fields.iter().enumerate() {
+            // A place below its binding (`x.a`): its uses read the field (walk/moves/env_places.rs).
+            if !f.is_whole() {
+                let at = env.map(|(base, off)| (base, off + offs[j] as i32));
+                self.bind_env_place(closure, f, at, parts.kind)?;
+                continue;
+            }
+            self.note_env_whole(f);
+            let (p, by) = (f.base, f.how);
             // A zero-sized environment passed by value (an `FnOnce` body; the environment is
             // its captures, so each is a by-value capture of a zero-sized value: `move ||
             // marker` with `marker: PhantomData<T>` or a unit struct, as libc-adjacent
@@ -420,6 +438,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 }
             }
         }
+        self.settle_env_places(closure)?;
         for (i, &repr) in reprs.iter().enumerate().skip(1) {
             let p = self.body.params[i - 1];
             match self.take_passed(repr, passes[i], &mut next)? {
@@ -457,7 +476,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         match which {
             FnTrait::Fn | FnTrait::FnMut => {
                 reprs.push(Repr::Ptr);
-                passes.push(Self::rust_pass(Repr::Ptr)?);
+                passes.push(self.rust_pass(Repr::Ptr)?);
             }
             FnTrait::FnOnce => {
                 reprs.push(env_repr);
@@ -510,7 +529,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.push_val(v, None);
         }
         reprs[0] = Repr::Ptr;
-        passes[0] = Self::rust_pass(Repr::Ptr)?;
+        passes[0] = self.rust_pass(Repr::Ptr)?;
         let instance = self.body_instance(closure, g, parts)?;
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
@@ -573,18 +592,16 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 if ins.len() != inputs.len() {
                     return Err(malformed("a fn pointer's shim whose tuple and signature differ in number"));
                 }
-                let abi = match header.abi {
-                    blaze_typeck::Abi::Rust => Abi::Rust,
-                    blaze_typeck::Abi::C => Abi::C,
-                    _ => return Err(BuildError::UnsupportedSig { what: "a fn pointer of an ABI other than \"Rust\" and \"C\" used as an `Fn*` value" }),
-                };
+                let abi = pointer_abi(header.abi).ok_or(BuildError::UnsupportedSig {
+                    what: "a fn pointer outside the Rust, rust-call and C-family calling conventions used as an `Fn*` value",
+                })?;
                 (None, abi, None, output)
             }
             _ => return Err(malformed("a fn shim asked of a type that is neither a fn item nor a fn pointer")),
         };
         // core's function.rs: "rust-call" is not `Fn*`-compatible; the checker never makes this.
         if abi == Abi::RustCall {
-            return Err(BuildError::UnsupportedSig { what: "a \"rust-call\" fn item used as an `Fn*` value" });
+            return Err(BuildError::UnsupportedSig { what: "a \"rust-call\" function used as an `Fn*` value" });
         }
         let self_repr = match which {
             FnTrait::Fn | FnTrait::FnMut => Repr::Ptr,
@@ -594,14 +611,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
         let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
         reprs.push(self_repr);
-        passes.push(Self::rust_pass(self_repr)?);
+        passes.push(self.rust_pass(self_repr)?);
         for &gi in inputs.iter() {
             let repr = self.repr(gi).map_err(sig_err)?;
             reprs.push(repr);
-            passes.push(Self::rust_pass(repr)?);
+            passes.push(self.rust_pass(repr)?);
         }
         self.ret = self.repr(output).map_err(sig_err)?;
-        self.ret_pass = Self::rust_pass(self.ret)?;
+        self.ret_pass = self.rust_pass(self.ret)?;
         let (params, rets) = self.sig_of(&passes, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
@@ -662,7 +679,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 }
 
 /// An empty check record: a shim has no body of its own, and its walk reads none.
-fn empty_record(a: Alloc<'_>) -> Checked<'_> {
+pub(crate) fn empty_record(a: Alloc<'_>) -> Checked<'_> {
     Checked {
         types: PortableTys::new_in(a),
         expr_ty: blaze_own::Vec::new_in(a),
@@ -676,14 +693,18 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         pat_defs: blaze_own::Soa::new_in(a),
         fields: blaze_own::Soa::new_in(a),
         captures: blaze_own::Soa::new_in(a),
+        capture_places: blaze_own::Soa::new_in(a),
+        capture_projs: blaze_own::Soa::new_in(a),
         closures: blaze_own::Soa::new_in(a),
         diags: blaze_own::Vec::new_in(a),
+        why: blaze_own::Vec::new_in(a),
         reads: blaze_typeck::ReadList { rows: blaze_own::Soa::new_in(a) },
         needs: blaze_typeck::Needs::new_in(a),
         suggests: blaze_typeck::suggest::Suggests::new_in(a),
         hidden: blaze_own::Vec::new_in(a),
         promoted: blaze_own::Vec::new_in(a),
         stalled: blaze_own::Vec::new_in(a),
+        coroutine_witnesses: blaze_own::Vec::new_in(a),
         awaited: blaze_own::Vec::new_in(a),
         selected: blaze_own::Vec::new_in(a),
         fru_fields: blaze_own::Soa::new_in(a),
@@ -716,7 +737,7 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
 
 /// The body of a function the language makes, with no text of its own (a fn shim, a ctor's fn:
 /// ctor_fn.rs), named by `owner`: nothing in it, so its walk reads none of it.
-fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
+pub(crate) fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
     BodyView {
         owner,
         edition: Edition::E2024,
@@ -750,5 +771,7 @@ fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         asm_text: "",
         call_arg_ints: &[],
         unsafe_blocks: &[],
+        expr_editions: &[],
+        pat_editions: &[],
     }
 }

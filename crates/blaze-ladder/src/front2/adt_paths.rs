@@ -8,7 +8,9 @@
 //! Reference, "Generic parameters": `Vec<u8>` is `Vec<u8, Global>`; the one home of that is
 //! [`super::types::with_defaults`]), as a type alias's segment in a body path already is
 //! ([`super::world_paths::AliasPaths::expand`]): the written arguments, then each default with
-//! the arguments before it put in. A fresh variable in its place would leave `A` unconstrained
+//! the arguments before it put in. A variant's path is filled the same way, on whichever of the
+//! enum's segment and the variant's carries the arguments (`FilterChanges::<T>::Logs(x)`,
+//! `E::V::<T>`; `expand`'s `Kind::Variant` branch). A fresh variable in its place would leave `A` unconstrained
 //! where no impl's self type fixes it (`impl<T, A: Mk> V<T, A> { fn make() -> Self }`,
 //! `V::<u8>::make()`): an ambiguity where the default answers.
 //!

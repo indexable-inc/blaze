@@ -19,10 +19,14 @@
 //!    advertisement (`info/refs`, protocol v2), then a `fetch` of the commit at depth 1. At most
 //!    [`Limits::in_flight_most`] at once, each with a byte limit and a deadline. A request
 //!    past its deadline is failed by the machine itself and its late answer ignored.
-//! 3. A transient failure (no connection, a reset, a timeout, a 429 or a 5xx) is tried again
-//!    after a backoff, at most [`Limits::tries_most`] tries in all; anything else fails the
-//!    unit with a typed [`Why`] at once. A wrong digest is never tried again: it is the bytes'
-//!    fault, not the network's.
+//! 3. One try (D172, rule 3): any failure (no connection, a reset, a timeout, a 429, a 5xx, a
+//!    wrong digest) fails the unit at once with a typed [`Why`], which the caller names with
+//!    the unit's source. Nothing is tried again in the command: a failure of the network is
+//!    owed, so the NEXT command asks again (blaze-cli engine_check.rs, the Units phase's owed
+//!    list), and one that succeeds stands by its key. (Until 2026-11-20 a transient failure
+//!    was tried again after a backoff, four tries in all: a command offline waited out every
+//!    backoff of every unit to say "no connection (4 tries)".) An answer past a first
+//!    request's `most` is asked again sized to its length: a bigger buffer, not a second try.
 //! 4. A `.crate`'s SHA-256 is compared with the lock's before a byte is inflated; a git
 //!    answer's objects are read by their ids from the pinned commit down. Only then is it
 //!    unpacked ([`crate::unpack`]) into a record.
@@ -63,10 +67,6 @@ pub struct Limits {
     pub in_flight_most: u32,
     /// Each request's deadline, from when it is asked.
     pub ask_ns: u64,
-    /// Tries of one request in all, the first included, for transient failures only.
-    pub tries_most: u32,
-    /// The wait before the second try; doubled for each try after.
-    pub backoff_ns: u64,
     /// Bytes of one `.crate`.
     pub crate_most: u64,
     /// Bytes of a git advertisement.
@@ -101,8 +101,6 @@ impl Limits {
         git_first_most: 32 << 20,
         in_flight_most: 48,
         ask_ns: 120_000_000_000,
-        tries_most: 4,
-        backoff_ns: 500_000_000,
         crate_most: 256 << 20,
         advert_most: 1 << 20,
         git_most: 1 << 30,
@@ -245,11 +243,7 @@ pub enum NetFailure {
 }
 
 impl NetFailure {
-    pub(crate) fn transient(self) -> bool {
-        matches!(self, NetFailure::Connect | NetFailure::Reset | NetFailure::Timeout)
-    }
-
-    pub(crate) fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             NetFailure::Connect => "no connection",
             NetFailure::Reset => "the connection broke",
@@ -270,9 +264,10 @@ pub enum StoreFailure {
 /// Why a unit failed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Why {
-    /// The server answered `status` (after `tries` tries).
-    Status { status: u16, tries: u32 },
-    Net { failure: NetFailure, tries: u32 },
+    /// The server answered `status` to the one try (D172).
+    Status { status: u16 },
+    /// The one try had no answer (D172).
+    Net { failure: NetFailure },
     /// A body longer than its limit came anyway.
     TooBig { most: u64, got: u64 },
     /// The `.crate`'s SHA-256 is not the lock's.
@@ -286,8 +281,8 @@ pub enum Why {
 impl Show for Why {
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
         match self {
-            Why::Status { status, tries } => out.str("the server answered ").int(*status).str(" (").int(*tries).str(" tries)"),
-            Why::Net { failure, tries } => out.str(failure.name()).str(" (").int(*tries).str(" tries)"),
+            Why::Status { status } => out.str("the server answered ").int(*status),
+            Why::Net { failure } => out.str(failure.name()),
             Why::TooBig { most, got } => out.str("an answer of ").byte_count(*got).str(", past its limit of ").byte_count(*most),
             Why::Mismatch { want, got } => {
                 out.str("its sha256 is ").hex_bytes(got).str(", not the lock's ").hex_bytes(want)
@@ -345,7 +340,6 @@ enum Phase {
     Adopting,
     Ready(Step),
     Asked { step: Step, seq: u32, deadline: u64 },
-    Backoff { step: Step, until: u64 },
     /// A reservation asked: the driver keeps the answer's body until [`Machine::reserved`].
     Reserving(Step),
     Storing(Made),
@@ -355,8 +349,6 @@ enum Phase {
 #[derive(Clone, Copy)]
 struct State {
     phase: Phase,
-    /// Tries of the current step so far.
-    tries: u32,
     seq: u32,
     down: u64,
     /// The next or current request's `most`: 0 for the step's first.
@@ -381,7 +373,6 @@ pub struct Machine<'p, 'l, 'a> {
     tried: Vec<Option<LocalTry>, Alloc<'a>>,
     ready: VecDeque<u32, Alloc<'a>>,
     asked: Vec<u32, Alloc<'a>>,
-    waiting: Vec<u32, Alloc<'a>>,
     puts: VecDeque<(u32, ContentId, Vec<u8, Alloc<'a>>), Alloc<'a>>,
     reserves: VecDeque<(u32, ContentId, u64), Alloc<'a>>,
     left: usize,
@@ -411,7 +402,7 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         let mut outcomes = Vec::with_capacity_in(units.len(), alloc);
         let mut tried = Vec::with_capacity_in(units.len(), alloc);
         for _ in units {
-            states.push(State { phase: Phase::Idle, tries: 0, seq: 0, down: 0, most: 0, held: 0, adopted: false });
+            states.push(State { phase: Phase::Idle, seq: 0, down: 0, most: 0, held: 0, adopted: false });
             outcomes.push(Outcome::Pending);
             tried.push(None);
         }
@@ -425,7 +416,6 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
             tried,
             ready: VecDeque::new_in(alloc),
             asked: Vec::new_in(alloc),
-            waiting: Vec::new_in(alloc),
             puts: VecDeque::new_in(alloc),
             reserves: VecDeque::new_in(alloc),
             left: 0,
@@ -660,8 +650,9 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         self.states.get(unit as usize).is_some_and(|state| state.adopted)
     }
 
-    /// The answer to `ask`, at `now`.
-    pub fn answered(&mut self, ask: Ask, now: u64, reply: Reply<'_>) {
+    /// The answer to `ask`. No time is taken: nothing waits on an answer (no backoff, D172), and
+    /// a deadline is checked at the next [`Machine::poll`].
+    pub fn answered(&mut self, ask: Ask, reply: Reply<'_>) {
         let Some(state) = self.states.get(ask.unit as usize).copied() else { return };
         let Phase::Asked { step, seq, .. } = state.phase else {
             self.stale += 1;
@@ -674,7 +665,6 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         self.asked.retain(|it| *it != ask.unit);
         self.in_flight -= state.most;
         let unit = ask.unit;
-        let tries = state.tries;
         match reply {
             // Past a first request's `most`: asked again once, sized to the answer.
             Reply::Failed(NetFailure::TooBig { said }) if state.most < self.most(step) => {
@@ -691,22 +681,19 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
                     Some(said) if first && said > state.most => said,
                     _ if limit.min(self.limits.bytes_most) > state.most => limit.min(self.limits.bytes_most),
                     _ => {
-                        self.fail(unit, Why::Net { failure: NetFailure::TooBig { said }, tries });
+                        self.fail(unit, Why::Net { failure: NetFailure::TooBig { said } });
                         return;
                     }
                 };
                 let state = &mut self.states[unit as usize];
                 state.most = most;
-                state.tries -= 1;
                 state.phase = Phase::Ready(step);
                 self.ready.push_back(unit);
             }
-            Reply::Failed(failure) if failure.transient() => self.again(unit, step, now, Why::Net { failure, tries }),
-            Reply::Failed(failure) => self.fail(unit, Why::Net { failure, tries }),
-            Reply::Body { status, .. } if status == 429 || (500..600).contains(&status) => {
-                self.again(unit, step, now, Why::Status { status, tries })
-            }
-            Reply::Body { status, .. } if status != 200 => self.fail(unit, Why::Status { status, tries }),
+            // One try (D172): every other failure, the network's or the server's, is the unit's
+            // outcome now, never a backoff and a second ask.
+            Reply::Failed(failure) => self.fail(unit, Why::Net { failure }),
+            Reply::Body { status, .. } if status != 200 => self.fail(unit, Why::Status { status }),
             Reply::Body { bytes, .. } => {
                 let most = self.most(step);
                 if bytes.len() as u64 > most {
@@ -736,18 +723,16 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         }
     }
 
-    /// The earliest time something is due without a completion: a request's deadline or a
-    /// backoff's end.
+    /// The earliest time something is due without a completion: a request's deadline (there is
+    /// no backoff: one try, D172).
     pub fn next_deadline(&self) -> Option<u64> {
-        let asked = self.asked.iter().filter_map(|unit| match self.states[*unit as usize].phase {
-            Phase::Asked { deadline, .. } => Some(deadline),
-            _ => None,
-        });
-        let waiting = self.waiting.iter().filter_map(|unit| match self.states[*unit as usize].phase {
-            Phase::Backoff { until, .. } => Some(until),
-            _ => None,
-        });
-        asked.chain(waiting).min()
+        self.asked
+            .iter()
+            .filter_map(|unit| match self.states[*unit as usize].phase {
+                Phase::Asked { deadline, .. } => Some(deadline),
+                _ => None,
+            })
+            .min()
     }
 
     /// Every unit wanted has its outcome.
@@ -776,29 +761,17 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         }
     }
 
-    /// Requests past their deadline failed as timeouts; backoffs ended made ready.
+    /// Requests past their deadline failed as timeouts, at once (one try, D172).
     fn expire(&mut self, now: u64) {
         let mut at = 0;
         while at < self.asked.len() {
             let unit = self.asked[at];
             let state = self.states[unit as usize];
             match state.phase {
-                Phase::Asked { step, deadline, .. } if deadline <= now => {
+                Phase::Asked { deadline, .. } if deadline <= now => {
                     self.asked.swap_remove(at);
                     self.in_flight -= state.most;
-                    self.again(unit, step, now, Why::Net { failure: NetFailure::Timeout, tries: state.tries });
-                }
-                _ => at += 1,
-            }
-        }
-        let mut at = 0;
-        while at < self.waiting.len() {
-            let unit = self.waiting[at];
-            match self.states[unit as usize].phase {
-                Phase::Backoff { step, until } if until <= now => {
-                    self.waiting.swap_remove(at);
-                    self.states[unit as usize].phase = Phase::Ready(step);
-                    self.ready.push_back(unit);
+                    self.fail(unit, Why::Net { failure: NetFailure::Timeout });
                 }
                 _ => at += 1,
             }
@@ -833,23 +806,10 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         let state = &mut self.states[unit as usize];
         state.most = most;
         state.seq += 1;
-        state.tries += 1;
         state.phase = Phase::Asked { step, seq: state.seq, deadline };
         let ask = Ask { unit, seq: state.seq };
         self.asked.push(unit);
         Effect::Http { ask, method, url, headers, body, most, deadline_ns: deadline }
-    }
-
-    /// A transient failure: tried again after a backoff, or failed once tries are spent.
-    fn again(&mut self, unit: u32, step: Step, now: u64, why: Why) {
-        let tries = self.states[unit as usize].tries;
-        if tries >= self.limits.tries_most {
-            self.fail(unit, why);
-            return;
-        }
-        let wait = self.limits.backoff_ns.saturating_mul(1 << tries.saturating_sub(1).min(16));
-        self.states[unit as usize].phase = Phase::Backoff { step, until: now.saturating_add(wait) };
-        self.waiting.push(unit);
     }
 
     /// A whole answer of `step`, its length checked: verified, then unpacked or followed.
@@ -873,7 +833,6 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
                 match blaze_git_fetch::check_advertisement(bytes) {
                     Ok(()) => {
                         let state = &mut self.states[unit as usize];
-                        state.tries = 0;
                         state.most = 0;
                         state.phase = Phase::Ready(Step::GitFetch);
                         self.ready.push_back(unit);

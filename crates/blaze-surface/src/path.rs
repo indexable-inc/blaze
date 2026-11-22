@@ -289,14 +289,6 @@ impl<'a> Paths<'a> {
             strings: self.strings,
         }
     }
-
-    /// The path at `index`, or none for [`NONE`].
-    pub(crate) fn get_opt(&self, index: u32) -> Option<PathView<'a>> {
-        match index {
-            NONE => None,
-            index => Some(self.get(index)),
-        }
-    }
 }
 
 /// A path of a record, read in place.

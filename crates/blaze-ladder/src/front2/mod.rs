@@ -10,7 +10,11 @@
 //! | [`index`] | every impl and lang item, from the library's tables |
 //! | [`types`] | a written type to a portable one through the resolver; `Why::Need` for a head not lowered yet |
 
+pub mod adt_facts;
+pub mod adt_outlives;
+pub mod adt_variance;
 pub mod anon;
+pub mod asks;
 mod async_output;
 mod back_needs;
 pub mod block_crates;
@@ -20,6 +24,7 @@ pub mod block_traits;
 pub mod block_type_uses;
 pub mod body;
 pub mod body_host;
+pub mod body_scopes;
 #[cfg(test)]
 mod body_host_include_tests;
 pub mod body_left;
@@ -28,15 +33,12 @@ pub mod borrow_reads;
 pub mod borrows;
 pub mod borrows_print;
 pub mod borrows_nested;
+/// The call census (D190 step 2): each body checked under both call rules, its calls compared.
+pub mod call_census;
 pub mod borrows_unmade;
 mod bound_kids;
 pub mod buckets;
 pub mod call_generics;
-/// The impl text a member's signature is read with, and its read row (sig-assoc-projection).
-pub mod sig_impl;
-/// The impl-text row keyed by the impl (sig-assoc-per-call, part L).
-#[cfg(test)]
-mod sig_impl_tests;
 pub mod check;
 pub mod by_origin;
 pub mod const_at;
@@ -92,13 +94,17 @@ pub mod panic_entry;
 pub mod pattern_ty;
 pub mod nested_exports;
 pub mod preds;
+pub mod heads_regions;
 pub mod program;
 pub mod project;
 pub mod project_records;
 pub mod reach;
 pub mod reads;
 pub mod receiver;
+pub mod rpitit;
 pub mod scoped;
+// D189 point 4: the surface pass over the finished module names.
+pub mod surface_names;
 mod self_size;
 pub mod shared_keys;
 pub mod source;
@@ -195,7 +201,7 @@ impl<'n> Front2<'n> {
     pub fn for_program(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], linked: &linked::Linked<'_>) -> Result<Front2<'n>, FrontError> {
         let texts = texts::Texts::new(names, user).map_err(FrontError::Texts)?;
         let index = index::Index::new(names, linked).map_err(FrontError::Lang)?;
-        let mut keys = keys::Keys::new();
+        let keys = keys::Keys::new();
         for (krate, c) in names.crates().iter().enumerate() {
             for (key, _, _) in names.items(krate) {
                 keys.item(key).map_err(FrontError::Key)?;

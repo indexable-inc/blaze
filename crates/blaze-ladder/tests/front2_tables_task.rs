@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use blaze_drive::key::{ABSENT, Key, Kind, Name};
 use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_ladder::front2::buckets::{ImplShelf, ImplShelfOpts, ShelfError, ShelvedTwice, TableSet, framed, impl_tables_name, impl_tables_task, write_impl_tables};
+use blaze_ladder::front2::buckets::{ImplShelf, ImplShelfOpts, ImplTables, ShelfError, ShelfSource, ShelvedTwice, TableSet, check_framed, framed, impl_tables_name, impl_tables_task, write_impl_tables};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
-use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
+use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::{BodyFrame, BodyOut, Facts, Make, MakeRefused, check_body, verdict_bytes};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_own::Alloc;
@@ -156,12 +156,12 @@ const APP_AT: usize = 0;
 const CORE_AT: usize = 1;
 const LANG: &[usize] = &[APP_AT, CORE_AT];
 
-struct Texts;
+struct Texts(&'static str);
 
 impl SourceTexts<'static> for Texts {
     fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
         match (krate, path) {
-            (APP_AT, "/app/lib.rs") => Some(APP),
+            (APP_AT, "/app/lib.rs") => Some(self.0),
             (CORE_AT, "/core/lib.rs") => Some(CORE),
             _ => None,
         }
@@ -210,19 +210,21 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    /// The texts, with no origins kept.
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 
 fn kept() -> &'static Kept {
+    kept_with_app(APP)
+}
+
+fn kept_with_app(app: &'static str) -> &'static Kept {
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts(app), &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
     let g = a();
     let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), keys: Vec::new(), crate_names: Vec::new() };
     for c in names.crates().iter() {
@@ -302,7 +304,7 @@ impl<'a> Make<'a> for MapMake {
 }
 
 /// One body task over `records`.
-fn run(records: &'static Records<'static>, impls: Option<&'static TableSet<'static>>, key: ItemKey, frame: &BodyFrame<'static>, make: &MapMake) -> BodyOut<'static> {
+fn run(records: &'static Records<'static>, impls: Option<&'static TableSet<'static>>, key: ItemKey, frame: &BodyFrame<'static>, make: &dyn Make<'static>) -> BodyOut<'static> {
     let g = a();
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let tables = Tables::new(TablesOpts { records, impls, lang_crates: LANG, reads: &unused });
@@ -311,7 +313,7 @@ fn run(records: &'static Records<'static>, impls: Option<&'static TableSet<'stat
 
 fn body_frame(plant: Option<NameCell>) -> BodyFrame<'static> {
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    BodyFrame { frame, alloc: a(), plant_drop: plant, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None }
+    BodyFrame { frame, alloc: a(), plant_drop: plant, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, census: None }
 }
 
 /// What two runs are compared by: each body's whole result, by key.
@@ -431,7 +433,10 @@ fn several_runs_read_one_shelf() {
         assert_eq!(shelf.put(key, &tables), Err(ShelvedTwice { krate: key }), "a crate put twice is refused");
     }
     assert_eq!(shelf.len(), 2);
-    assert!(matches!(shelf.put_framed(CrateItemKey(ContentId([7; 32])), b"bzimpl1\0\x05"), Err(ShelfError::Malformed { .. })), "a cut payload is refused");
+    // The form's magic (one aligned word), then a length word cut short.
+    assert!(matches!(shelf.put_framed(CrateItemKey(ContentId([7; 32])), b"bzimpl2\0\0\0\0\0\0\0\0\0\x05"), Err(ShelfError::Malformed { .. })), "a cut payload is refused");
+    // The form before the parts were aligned (`bzimpl1`) is another form, refused by its magic.
+    assert!(matches!(shelf.put_framed(CrateItemKey(ContentId([7; 32])), b"bzimpl1\0\0\0\0\0\0\0\0\0"), Err(ShelfError::Malformed { at: 0, .. })), "a form-1 payload is refused by name");
     let shelf: &'static ImplShelf = Box::leak(Box::new(shelf));
     let keys: Vec<ItemKey> = list.iter().map(|(k, _)| *k).collect();
     let mut eight: Vec<String> = Vec::new();
@@ -455,6 +460,83 @@ fn several_runs_read_one_shelf() {
     eight.sort();
     assert_eq!(eight.len(), keys.len(), "entries per result: 1");
     assert_eq!(shown(&want), eight, "runs over one shelf answer otherwise than one reader's own tables");
+}
+
+/// The test's [`ShelfSource`]: each crate's framed tables by key, at an address aligned as the
+/// store aligns a payload (blaze-drive record.rs `PAYLOAD_ALIGN`), and how many asks it had.
+struct Framed {
+    by_key: Vec<(CrateItemKey, &'static [u8])>,
+    asks: std::sync::atomic::AtomicUsize,
+}
+
+impl ShelfSource for Framed {
+    fn framed(&self, krate: CrateItemKey) -> Option<&[u8]> {
+        self.asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.by_key.iter().find(|(k, _)| *k == krate).map(|(_, b)| *b)
+    }
+}
+
+/// THE PAGED SHELF IS THE WHOLE ONE (rule 78: one seam, two sources). Every body checked over a
+/// `TableSet::paged` (an empty shelf and a source holding each crate's framed tables; then a
+/// shelf holding one crate and the source the other) gives the result it gives over a
+/// `TableSet::lent` whose shelf holds every crate: the verdict's bytes and the `Done`, its read
+/// list included. Each reader asks the source at most once a crate, and none of a crate the
+/// shelf holds. CONTROL (rule 23): a source that holds nothing moves some body's result, so the
+/// comparison sees the tables; a lookup of a crate it lacks is `NoTables`.
+#[test]
+fn a_paged_shelf_answers_as_the_whole_one() {
+    use blaze_impls::ImplRecords;
+    let kept = kept();
+    let records = reader(kept);
+    let list = bodies(records);
+    let make = MapMake { edited: Vec::new() };
+    let mut whole = ImplShelf::new(ImplShelfOpts {});
+    let mut half = ImplShelf::new(ImplShelfOpts {});
+    let mut by_key: Vec<(CrateItemKey, &'static [u8])> = Vec::new();
+    for krate in [APP_AT, CORE_AT] {
+        let mut rows = Vec::new();
+        assert!(NamesSource::each_impl_row(records, krate, &mut |r| rows.push(r)), "crate {krate} has impl rows");
+        let done = impl_tables_task(records, krate, &rows, a());
+        let tables = done.records.expect("the task's records");
+        let key = NamesSource::crate_key(records, krate).expect("the crate's key");
+        let bytes: &'static [u8] = aligned(&framed(&tables, std::alloc::Global), a());
+        check_framed(key, bytes).unwrap_or_else(|e| panic!("crate {krate}'s framed tables: {e}"));
+        // THE CAUSE'S CONTROL (rule 23): the same bytes one byte off an aligned address are
+        // refused by name, never handed on to be read in place (where every record's reader
+        // refuses its address: blaze-format-core `header`, and the paged answers part).
+        let mut shifted: Vec<u8> = vec![0; bytes.len() + 16];
+        let off = (1..16).find(|k| !(shifted.as_ptr().addr() + k).is_multiple_of(16)).expect("an unaligned offset");
+        shifted[off..off + bytes.len()].copy_from_slice(bytes);
+        assert_eq!(check_framed(key, &shifted[off..off + bytes.len()]), Err(ShelfError::Unaligned { krate: key }), "crate {krate}'s tables off an aligned address are refused by their address");
+        whole.put_framed(key, bytes).unwrap_or_else(|e| panic!("crate {krate}'s framed tables: {e}"));
+        if krate == APP_AT {
+            half.put_framed(key, bytes).unwrap_or_else(|e| panic!("crate {krate}'s framed tables: {e}"));
+        }
+        by_key.push((key, bytes));
+    }
+    assert!(matches!(check_framed(CrateItemKey(ContentId([7; 32])), b"bzimpl2\0\0\0\0\0\0\0\0\0\x05"), Err(ShelfError::Malformed { .. })), "a cut payload is refused");
+    let crates = by_key.len();
+    let whole: &'static ImplShelf = Box::leak(Box::new(whole));
+    let half: &'static ImplShelf = Box::leak(Box::new(half));
+    let empty: &'static ImplShelf = Box::leak(Box::new(ImplShelf::new(ImplShelfOpts {})));
+    let source: &'static Framed = Box::leak(Box::new(Framed { by_key, asks: std::sync::atomic::AtomicUsize::new(0) }));
+    let lent: &'static TableSet<'static> = Box::leak(Box::new(TableSet::lent(whole, a())));
+    let want: Vec<(ItemKey, BodyOut<'static>)> = list.iter().map(|(k, _)| (*k, run(records, Some(lent), *k, &body_frame(None), &make))).collect();
+    for (label, shelf, most) in [("an empty shelf", empty, crates), ("a shelf of one crate", half, crates - 1)] {
+        source.asks.store(0, std::sync::atomic::Ordering::Relaxed);
+        let paged: &'static TableSet<'static> = Box::leak(Box::new(TableSet::paged(shelf, source, a())));
+        let got: Vec<(ItemKey, BodyOut<'static>)> = list.iter().map(|(k, _)| (*k, run(records, Some(paged), *k, &body_frame(None), &make))).collect();
+        assert_eq!(shown(&got), shown(&want), "over {label} and the source, the bodies answer otherwise than over the whole shelf");
+        let asks = source.asks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(asks <= most, "over {label}: {asks} asks of the source, more than the {most} crate(s) it alone holds");
+        // CONTROL: the paged path ran (an empty shelf answers nothing by itself).
+        assert!(shelf.len() == crates || asks >= 1, "over {label}: the source was never asked, so the paged path did not run");
+    }
+    let nothing: &'static Framed = Box::leak(Box::new(Framed { by_key: Vec::new(), asks: std::sync::atomic::AtomicUsize::new(0) }));
+    let bare: &'static TableSet<'static> = Box::leak(Box::new(TableSet::paged(empty, nothing, a())));
+    let core_key = NamesSource::crate_key(records, CORE_AT).expect("the crate's key");
+    assert!(bare.directory(core_key).is_err() && bare.no_impls_of(core_key).is_err(), "CONTROL: a crate no source holds has no tables");
+    assert!(lent.directory(core_key).is_ok(), "the whole shelf holds it");
 }
 
 /// THE READ LIST IS WHAT MOVES THE ANSWER. `wrong_one` returns `Tri`: its answer is a
@@ -483,6 +565,114 @@ fn an_edit_dirties_the_body_and_a_dropped_read_is_caught() {
     let planted = run(records, Some(tables), body, &body_frame(Some(cell)), &MapMake { edited: Vec::new() });
     assert!(!dirtied(&planted, &edit), "CONTROL: the planted dropped read must leave the body standing under the edit");
     assert_eq!(planted.bytes.as_slice(), before.bytes.as_slice(), "the planted bug changes only the read list");
+}
+
+// Use the writer's real impl definitions in both revisions. Holding every other table
+// fixed isolates whether the body's impl reads alone carry the change.
+struct AppImpls(&'static ImplTables<'static>);
+
+impl<'a> Make<'a> for AppImpls {
+    fn make(&self, want: &CellId, _: &mut SVec<'a, Made<'a>>) -> Result<ContentId, MakeRefused> {
+        if want.of != impl_tables_name(self.0.krate) {
+            return Ok(ABSENT);
+        }
+        let defs = &self.0.defines;
+        Ok(defs.binary_search_by_key(&want.cell.0, |(cell, _)| *cell).map_or(ABSENT, |at| defs[at].1))
+    }
+}
+
+fn side_revision(source: &'static str) -> (AppImpls, CellId, BodyOut<'static>) {
+    use blaze_drive::cells::Cell;
+    use blaze_ladder::front2::buckets::bucket_cell;
+    use blaze_surface::{BucketKey, SelfShape, Shape};
+
+    let records = reader(kept_with_app(source));
+    let tables = impl_tables(records);
+    let root = NamesSource::root_module(records, APP_AT).expect("app's root");
+    let item = |ns, name: &str| {
+        let segments = [name];
+        NamesSource::walk(records, root, ns, Written { kind: PathKind::Plain, segments: &segments })
+            .expect("a fixture path").whole(1).expect("a fixture item").key
+    };
+    let app = tables.of(NamesSource::crate_key(records, APP_AT).expect("app's key")).expect("app's impls");
+    let shape = SelfShape::new(Shape::Def(item(Namespace::Types, "Tri"))).expect("nominal self type");
+    let bucket = BucketKey::Trait { trait_: item(Namespace::Types, "Shape"), shape };
+    let read = CellId { of: impl_tables_name(app.krate), cell: Cell(bucket_cell(bucket.hash())) };
+    let make = AppImpls(app);
+    let body = run(records, Some(tables), item(Namespace::Values, "side"), &body_frame(None), &make);
+    (make, read, body)
+}
+
+#[test]
+fn adding_an_impl_to_a_consulted_empty_bucket_rechecks_the_body() {
+    use blaze_ladder::front2::tables::task::SaidWhat;
+
+    // Sq keeps the trait present on both revisions. Only the Shape-for-Tri
+    // bucket changes from absent to present among the body's impl reads.
+    const SOURCE: &str = "#![no_std]
+pub trait Shape { fn sides(&self) -> u32; }
+pub struct Tri;
+pub struct Sq;
+impl Shape for Sq { fn sides(&self) -> u32 { 4 } }
+pub fn side(t: &Tri) -> u32 { t.sides() }
+";
+    let edited = Box::leak(format!("{SOURCE}impl Shape for Tri {{ fn sides(&self) -> u32 {{ 3 }} }}\n").into_boxed_str());
+
+    let (old_defs, cell, mut before) = side_revision(SOURCE);
+    let (new_defs, edited_cell, after) = side_revision(edited);
+    assert_eq!(cell, edited_cell, "adding an impl preserves the identity of its bucket");
+    assert!(before.said.iter().any(|s| matches!(s.what, SaidWhat::Type { code: "E0599" })), "Tri has no sides method: {:?}", before.said);
+    assert!(after.said.is_empty(), "Tri implements Shape and its sides method returns u32: {:?}", after.said);
+    assert!(before.done.reads.contains(&(cell, ABSENT)), "a missing impl is a read of its absent bucket");
+    assert!(after.done.reads.iter().any(|(id, digest)| *id == cell && *digest != ABSENT), "the added impl defines the bucket");
+    assert!(!dirtied(&before, &old_defs), "the original definitions validate the read list");
+    assert!(dirtied(&before, &new_defs), "the new impl must invalidate the missing-method diagnostic");
+    before.done.reads.retain(|(id, _)| *id != cell);
+    assert!(!dirtied(&before, &new_defs), "CONTROL: dropping the negative read accepts the stale E0599");
+    println!("adding Shape for Tri rechecks side: E0599 becomes clean; dropping the negative read leaves E0599 stale");
+}
+
+#[test]
+fn the_first_unread_trait_impl_invalidates_a_rejected_trait_lookup() {
+    use blaze_ladder::front2::buckets::TRAIT_HELD;
+    use blaze_ladder::front2::tables::task::SaidWhat;
+    use blaze_surface::NoImplsOfView;
+
+    const SOURCE: &str = "#![no_std]
+pub trait Shape { fn sides(&self) -> u32; }
+pub struct Tri;
+pub fn side(t: &Tri) -> u32 { t.sides() }
+";
+    let edited = Box::leak(format!("{SOURCE}impl gone::Gone for Tri {{}}\n").into_boxed_str());
+    let (old_defs, exact, mut before) = side_revision(SOURCE);
+    let (new_defs, edited_exact, after) = side_revision(edited);
+    assert_eq!(before.done.name, after.done.name, "the edit preserves the body");
+    assert_eq!(exact, edited_exact);
+    assert_eq!(NoImplsOfView::read(&old_defs.0.records.no_impls_of).expect("original filter").unread(), (0, 0));
+    assert_eq!(NoImplsOfView::read(&new_defs.0.records.no_impls_of).expect("edited filter").unread(), (1, 0));
+    assert!(!before.done.failed && before.said.iter().any(|s| matches!(s.what, SaidWhat::Type { code: "E0599" })), "Tri has no sides method: {:?}", before.said);
+    // The gap is said by its words (said.rs `gap_words`: the gap's `Display`, rule 19), never by
+    // its `Debug` name: "(unread as written)" is what `Gap::UnreadImpl` alone prints
+    // (world_items.rs), so this names the same gap the variant's name did.
+    assert!(
+        after.done.failed && after.said.iter().any(|s| matches!(s.what, SaidWhat::NotChecked { .. }) && s.words.contains("(unread as written)") && s.words.contains("`gone::Gone`")),
+        "resolving sides depends on the unread impl for Tri: {:?}",
+        after.said
+    );
+    assert!(!before.done.reads.iter().any(|(id, _)| *id == exact), "the rejected trait lookup stopped before its shaped bucket");
+    assert!(after.done.reads.contains(&(exact, ABSENT)), "the filter now admits Shape but its named bucket is still empty");
+    assert!(!dirtied(&before, &old_defs));
+    assert!(dirtied(&before, &new_defs), "the first unread impl must invalidate the completed verdict");
+    assert!(dirtied(&after, &old_defs), "removing the last unread impl must invalidate the incomplete verdict");
+    // Discover the changed dependency from the two real read lists, without teaching the
+    // fixture the writer's cell name. The old named-trait-only scheme fails above.
+    let mut changed = before.done.reads.iter().filter(|(id, saw)| *saw == ABSENT && after.done.reads.contains(&(*id, TRAIT_HELD)));
+    let &(guard, _) = changed.next().expect("the crate's missing unread-impl flag became present");
+    assert_eq!(guard.of, exact.of);
+    assert_eq!(changed.next(), None);
+    before.done.reads.retain(|(id, _)| *id != guard);
+    assert!(!dirtied(&before, &new_defs), "CONTROL: without the unread-impl cell, the stale E0599 stands");
+    println!("first unread impl for Tri rechecks side: E0599 becomes an unread-impl gap; dropping the crate flag leaves E0599 stale");
 }
 
 /// A FACT'S CELL IS THE CELL THAT HOLDS IT, READ WHOLE. `go` calls one constructor of `Light`:
@@ -576,7 +766,7 @@ fn every_head_the_check_touches_is_read() {
 }
 
 /// Whether a result's row is not today's under `edit`: a read whose digest moved.
-fn dirtied(out: &BodyOut<'_>, edit: &MapMake) -> bool {
+fn dirtied(out: &BodyOut<'_>, edit: &dyn Make<'static>) -> bool {
     let mut made = SVec::new_in(blaze_own::testing::heap().shared());
     out.done.reads.iter().any(|(id, saw)| edit.make(id, &mut made).expect("a digest") != *saw)
 }

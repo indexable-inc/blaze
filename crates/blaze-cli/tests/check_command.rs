@@ -1,7 +1,7 @@
 //! `blaze check` IS the engine (check_command.rs): one checker (rule 30). Before the switch,
 //! `check` ran the old checker (main.rs `request`, body_types.rs) and the engine was a second
 //! command, `engine-check`; now `check` runs the engine, `engine-check` is its alias, and the old
-//! checker answers only to `check-old`, which says so in its first line (main.rs `CHECK_OLD`).
+//! checker is gone (2026-11-19: `check-old`, its word, with it).
 //!
 //! The fixture: a workspace of two `#![no_std]` packages, `app` calling `dep` (the shape the
 //! engine type-checks whole, tests/engine_block_extern_crate.rs). Five runs, each in its own
@@ -14,22 +14,23 @@
 //! 2. A TYPE ERROR (`let _x: u32 = T;`, `T` a unit struct: the Reference, "Let statements",
 //!    the initializer's type must be the pattern's; E0308): status 1, the finding at
 //!    `app/src/lib.rs:4:<col>`, the closing line `1 error: blaze check`.
-//! 3. ONE BODY WHOSE BORROWS ARE NOT CHECKED (`folder_of`, the census's NestedOutlives shape:
-//!    a closure returning a reference into the fn's argument; its types are checked): the
+//! 3. ONE BODY WHOSE BORROWS ARE NOT CHECKED (`later`, holding an `async` closure, which the
+//!    borrow lowering refuses by name, `AsyncClosure`; its types are checked): the
 //!    closing lines say "NOT checked: borrows" and never "types" (the owner's rule: never a
 //!    pass for a stage that did not run, and never a fail for one that did); status 3, not 4
 //!    (no item was left unchecked: its types were checked). Under `--each` the body's own note
 //!    says "types checked; borrows not checked"; without it, one line counts the body.
 //!    CONTROL: the clean run (1) prints neither the note nor the count.
-//! 4. `check-old` on the clean checkout: its first line on standard output is the old
-//!    checker's own ("note: check-old: the OLD checker"); `check`'s first line is not.
+//! 4. `check-old` on the clean checkout is no command: refused (a nonzero status) with the
+//!    usage line naming the commands there are, nothing on standard output. CONTROL: `check`
+//!    on the same checkout answers (1).
 //! 5. `check --stats` on the clean checkout, checked before (its certificate stands): the
 //!    same status and closing line as a plain check, and on stderr one line "blaze: 0 of N
 //!    task(s) entered, .., certificate stood; .. ms in main; .blaze/v2/profile.txt"
 //!    (engine_check.rs `stats_line`). CONTROL: the plain check prints no such line.
 //!
 //! Expected line: `CHECK COMMAND: clean <s>, type error <s> at <line>, borrows-only <s>,
-//! check-old first line <line>, --stats <s>` (`--stats Some(3)` while borrows are notes).
+//! check-old refused <s>, --stats <s>` (`--stats Some(3)` while borrows are notes).
 //!
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain` (linked into a fresh home).
 
@@ -56,16 +57,26 @@ const APP: &str = "#![no_std]\npub struct T;\npub fn two() -> u32 {\n    {BODY}\
 /// The line of `{BODY}` in [`APP`].
 const BODY_LINE: u32 = 4;
 
-/// A body whose types check and whose move and borrow check the engine refuses today
-/// (flow-census-1118-0049.txt, `bstd::fs::looks::folder_of`: NestedOutlives).
-const BORROWS_ONLY: &str = "pub fn folder_of(path: &str) -> &str {\n    path.rsplit_once('/').map_or(\"\", |(folder, _)| folder)\n}\n";
+/// A body whose types check and whose move and borrow check the engine refuses today: an
+/// `async` closure (the Reference, "Closure expressions", "Async closures", stable since 1.85),
+/// which the borrow lowering refuses by name, `Form::AsyncClosure` (blaze-flow-lower lib.rs, the
+/// body walk; blaze-ladder tests/front2_borrow_async_closure.rs CONTROL 3: "still refused
+/// `AsyncClosure` by name, never checked clean"). Until 2026-11-21 it was `folder_of` (the
+/// census's NestedOutlives shape, flow-census-1118-0049.txt: a closure returning a reference
+/// into the fn's argument); its closure's output is now an owner position whose requirement the
+/// owner proves (blaze-flow-lower closure.rs `External::SigOwner`, `Need::Sig`), so its borrows
+/// are checked whole, as rustc accepts it, and it plants no refusal.
+const BORROWS_ONLY: &str = "pub fn later() -> u8 {\n    let c = async || 1u8;\n    let _ = c;\n    1\n}\n";
 
 /// The body's note under `--each` (engine_bodies.rs `Said::BorrowsUnchecked`).
 const BORROWS_NOTE: &str = "types checked; borrows not checked";
 /// The count line without `--each` (print.rs `stage_notes`).
 const BORROWS_COUNT: &str = "type-checked whole had the move and borrow check refused";
-/// The old checker's first line (main.rs `CHECK_OLD`, drawn as a note).
+/// The first line the old checker printed (main.rs `CHECK_OLD`, gone 2026-11-19): no command
+/// prints it now.
 const OLD_FIRST: &str = "note: check-old: the OLD checker";
+/// The usage line of a word that is no command (main.rs `command`'s last arm).
+const NO_COMMAND: &str = "the command is check, run, test, clean or explain";
 
 fn write(path: &Path, text: &str) {
     if let Some(dir) = path.parent() {
@@ -200,15 +211,17 @@ fn check_is_the_engine_and_names_exactly_the_stage_not_checked() {
         assert!(said.not_checked().iter().all(|line| !line.contains("types")), "borrows-only ({what}): the types WERE checked, and a NOT checked line names them:\n{}", said.all());
         assert!(!said.out.contains("the check is incomplete: blaze could not check"), "borrows-only ({what}): counted as an item not checked:\n{}", said.all());
     }
-    assert!(each.out.lines().any(|line| line.contains(BORROWS_NOTE) && line.contains("folder_of")), "borrows-only (--each): the body's own note naming `folder_of`:\n{}", each.all());
+    assert!(each.out.lines().any(|line| line.contains(BORROWS_NOTE) && line.contains("later")), "borrows-only (--each): the body's own note naming `later`:\n{}", each.all());
     if !errors {
         assert!(counted.out.contains(&format!("1 body {BORROWS_COUNT}")), "borrows-only: the one line counting the body:\n{}", counted.all());
     }
 
-    // 4. The old checker, by its own word.
+    // 4. The old checker's word is no command now: refused by the usage line, nothing checked.
     let old = blaze(&clean_ws, &home, &["check-old"], "old");
-    let first = old.out.lines().next().unwrap_or("");
-    assert!(first.starts_with(OLD_FIRST), "check-old: its first line says it is the old checker:\n{}", old.all());
+    assert!(old.status.is_some_and(|status| status != 0), "check-old: refused with a nonzero status:\n{}", old.all());
+    assert!(old.out.is_empty() && !old.out.contains(OLD_FIRST), "check-old: nothing on standard output:\n{}", old.all());
+    assert!(old.err.contains(NO_COMMAND), "check-old: the usage line names the commands:\n{}", old.all());
+    let first = old.status;
 
     // 5. `--stats`: the same answer, and one stats line on stderr (engine_check.rs
     // `stats_line`). The clean checkout was checked above, so this one stands on its
@@ -225,7 +238,7 @@ fn check_is_the_engine_and_names_exactly_the_stage_not_checked() {
 
     let _ = std::fs::remove_dir_all(&base);
     println!(
-        "CHECK COMMAND: clean {:?}, type error {:?} at {finding}, borrows-only {:?}, check-old first line {first:?}, --stats {:?}",
+        "CHECK COMMAND: clean {:?}, type error {:?} at {finding}, borrows-only {:?}, check-old refused {first:?}, --stats {:?}",
         clean.status, typed.status, counted.status, stats.status
     );
 }

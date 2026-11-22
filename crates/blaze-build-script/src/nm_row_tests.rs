@@ -13,7 +13,8 @@ use blaze_own::AString;
 
 use crate::host_tools::{HostToolError, Place, granted, host_tools, path_folders, tool_env};
 use crate::native::{Grant, seatbelt_with};
-use crate::toolchain::{PIN, SHELF_MEMBERS, clang_major, shelf_missing};
+use crate::toolchain::{SHELF_MEMBERS, clang_major, shelf_missing};
+use blaze_pins::CLANG_JSON as PIN;
 
 const MAC: &str = "aarch64-apple-darwin";
 const SHELF: &str = "/h/.blaze/v2/toolchain/clang/5d3179db";

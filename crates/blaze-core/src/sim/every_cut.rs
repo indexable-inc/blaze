@@ -32,7 +32,11 @@
 //!   [`crate::world::disk::mixed`], as `crash_with` makes them; so the prefixes of a write of
 //!   several sectors, each later sector surviving alone, and every mix between are all here;
 //! - each change of a name not synced is undone or not, a later one sharing a name with one
-//!   undone undone with it, and the undoing done newest first as `crash_with` does.
+//!   undone undone with it, and the undoing done newest first as `crash_with` does; a
+//!   directory's making undone takes every file and directory under it, a directory's removal
+//!   undone brings it back empty (`sim/host/dir_names.rs`). A disk left names its directories
+//!   ([`AfterCrash::dirs`]), so a folder a write made and a crash took is told apart from one
+//!   kept empty.
 //!
 //! HOW THE TWO ARE KNOWN TO AGREE: the mirror above is one reading of the code; the proof is
 //! the test `the_enumeration_is_the_random_crash_s_set`, a property on `blaze_sim::check`: for
@@ -97,7 +101,7 @@ use core::fmt;
 use super::host::Plant;
 use super::{Duration, Global, NameChange, Named, Op, Rng, Sim, SimFile, keep_ordered};
 use crate::world::disk::{SECTOR, mixed, sectors};
-use crate::{Completion, DirName, Done, Driver, Effect, FileName, Tag, wait::Deadline};
+use crate::{Completion, Done, Driver, Effect, FileName, Tag, wait::Deadline};
 
 /// The fault kinds a caller may switch on by name ([`Sim::inject`]), in a stable order.
 pub const KINDS: &[&str] = &["short-receive", "clock-jump"];
@@ -212,10 +216,12 @@ pub struct Left {
     pub bytes: Vec<u8>,
 }
 
-/// A disk a crash left: every file there, by name.
+/// A disk a crash left: every file there, by name, and every directory there but the root,
+/// sorted (a directory a crash keeps is there empty or not, as the simulation's are).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AfterCrash {
     pub files: Vec<Left>,
+    pub dirs: Vec<FileName>,
 }
 
 impl AfterCrash {
@@ -232,7 +238,10 @@ impl AfterCrash {
             files.push(Left { name: name.clone(), link: file.link, bytes: file.contents() });
         }
         files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-        AfterCrash { files }
+        let mut dirs: Vec<FileName> = Vec::with_capacity_in(sim.host.made.len(), Global);
+        // clone: refcounts; `made` is sorted.
+        dirs.extend(sim.host.made.iter().cloned());
+        AfterCrash { files, dirs }
     }
 }
 
@@ -310,9 +319,6 @@ pub enum Refused {
     InFlight { after: usize, effects: usize },
     /// A moment with a mapping for writing held, which a crash folds.
     MappedForWriting { after: usize },
-    /// A moment with directories made, or a directory's change of a name not synced, which the
-    /// rebuilt disk would not hold.
-    DirectoriesMade { after: usize },
     /// A step's poll told a completion of another effect, or more than one.
     NotOneAtATime { step: &'static str, tag: Tag },
     /// A step's effect did not complete within [`POLLS_MOST`] polls.
@@ -343,9 +349,6 @@ impl fmt::Display for Refused {
             Refused::MappedForWriting { after } => {
                 write!(f, "after step {after}: a mapping for writing is held, which a crash folds; {rule} does not enumerate it")
             }
-            Refused::DirectoriesMade { after } => {
-                write!(f, "after step {after}: directories were made, which the disk {rule} rebuilds does not hold")
-            }
             Refused::NotOneAtATime { step, tag } => {
                 write!(f, "step {step:?}: told {tag:?}, not its own effect alone; {rule} takes one effect at a time")
             }
@@ -363,6 +366,8 @@ impl fmt::Display for Refused {
 struct DiskCopy {
     /// Every file, by name.
     files: Vec<(FileName, SimFile)>,
+    /// Every directory there but the root, sorted (`Host::made`).
+    dirs: Vec<FileName>,
     /// The changes of names not synced, oldest first, each with its epoch.
     names: Vec<NameChange>,
     /// The epoch now: the stamp of every change not stamped yet.
@@ -428,16 +433,21 @@ impl DiskCopy {
         for named in &sim.names {
             names.push(copy_named(named));
         }
-        DiskCopy { files, names, epoch: sim.epoch, barriers_not_kept: sim.planted(Plant::BarriersNotKept) }
+        let mut dirs: Vec<FileName> = Vec::with_capacity_in(sim.host.made.len(), Global);
+        // clone: refcounts.
+        dirs.extend(sim.host.made.iter().cloned());
+        DiskCopy { files, dirs, names, epoch: sim.epoch, barriers_not_kept: sim.planted(Plant::BarriersNotKept) }
     }
 
-    /// The copy put into `sim`, a fresh one: its files and its names not synced, so that its
-    /// own [`Sim::crash`] draws from the moment's disk.
+    /// The copy put into `sim`, a fresh one: its files, its directories and its names not
+    /// synced, so that its own [`Sim::crash`] draws from the moment's disk.
     fn restore(&self, sim: &mut Sim) {
         for (name, file) in &self.files {
             // clone: a refcount.
             sim.files.insert(name.clone(), copy_file(file));
         }
+        // clone: refcounts.
+        sim.host.made.extend(self.dirs.iter().cloned());
         for named in &self.names {
             sim.names.push(copy_named(named));
         }
@@ -519,11 +529,6 @@ impl Steps<'_> {
         if !self.sim.drawn.is_empty() {
             return Err(Refused::MappedForWriting { after });
         }
-        if self.sim.made_under(&DirName::Root).next().is_some()
-            || self.sim.names.iter().any(|change| change.named.dir_changed().is_some())
-        {
-            return Err(Refused::DirectoriesMade { after });
-        }
         for (name, file) in self.sim.files.iter() {
             if file.link && core::str::from_utf8(&file.contents()).is_err() {
                 // clone: a refcount, for the error.
@@ -599,7 +604,7 @@ fn record(sim: &mut Sim, program: impl FnOnce(&mut Steps<'_>) -> Result<(), Refu
     Ok(steps.moments)
 }
 
-/// A fresh simulation holding `disk`, every file of it durable.
+/// A fresh simulation holding `disk`, every file and directory of it durable.
 fn rebuilt(disk: &AfterCrash, seed: u64) -> Sim {
     let mut sim = Sim::new(seed, super::Faults::default());
     for left in &disk.files {
@@ -609,6 +614,8 @@ fn rebuilt(disk: &AfterCrash, seed: u64) -> Sim {
         // clone: a refcount.
         sim.files.insert(left.name.clone(), file);
     }
+    // clone: refcounts; sorted, as `made` is kept.
+    sim.host.made.extend(disk.dirs.iter().cloned());
     sim
 }
 
@@ -814,6 +821,9 @@ fn put_back(name: &FileName, was: &SimFile) -> Left {
 /// The disk one crash point leaves, as `crash_with` makes it: each file's cut, then each
 /// change of a name undone, the newest first.
 fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
+    let mut dirs: Vec<FileName> = Vec::with_capacity_in(disk.dirs.len(), Global);
+    // clone: refcounts.
+    dirs.extend(disk.dirs.iter().cloned());
     let mut left: Vec<Left> = Vec::with_capacity_in(disk.files.len(), Global);
     for ((name, file), cut) in disk.files.iter().zip(files) {
         let bytes = match &cut.tear {
@@ -844,12 +854,21 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
                     put(&mut left, put_back(to, was));
                 }
             }
-            Named::MadeDir { .. } | Named::RemovedDir { .. } => {
-                unreachable!("a moment holding a directory's change of a name is refused at `Steps::keep` (Refused::DirectoriesMade)")
+            // As `Sim::undo_made_dir`: the directory goes with every file and directory at or
+            // under it (every later change under it was undone first, newest first).
+            Named::MadeDir { dir } => {
+                left.retain(|it| !it.name.is_under(dir));
+                dirs.retain(|it| !it.is_under(dir));
             }
+            // As `Sim::undo_removed_dir`: back, empty but for the names undone after.
+            Named::RemovedDir { dir } => match dirs.binary_search(dir) {
+                Ok(_) => unreachable!("{dir}: a directory whose removal is undone is not there: a later make of it was undone first"),
+                // clone: a refcount.
+                Err(at) => dirs.insert(at, dir.clone()),
+            },
         }
     }
-    AfterCrash { files: left }
+    AfterCrash { files: left, dirs }
 }
 
 /// Every crash point of a moment with the disk it leaves, in the module's order.
@@ -903,7 +922,7 @@ mod tests {
 
     use super::*;
     use crate::sim::Faults;
-    use crate::{Address, run_until_idle};
+    use crate::{Address, DirName, run_until_idle};
 
     fn name(it: &str) -> FileName {
         FileName::new(it).expect("a name")

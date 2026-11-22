@@ -14,7 +14,8 @@
 //!   library's eh.rs: "Ip is not present in the table. This indicates a nounwind call.", then
 //!   `EHAction::Terminate`, "Process should be terminated as the call site does not permit
 //!   unwinding"): a destructor that panics while the stack unwinds ends the process, as rustc's
-//!   own cleanups do with their terminate edge.
+//!   own cleanups do with their terminate edge. The one exception is `resume`'s call of
+//!   `_Unwind_Resume`, whose row continues (below): the unwind goes on through it.
 //! - **Cleanup code** is every block reached from a `cleanup` or `terminate` landing block by
 //!   ordinary edges (a drop flag's test makes ordinary blocks inside a cleanup). A `catch`
 //!   landing block's code is not: the unwind has stopped there, and a call in it unwinds as any.
@@ -22,7 +23,9 @@
 //!   pinned library's gcc.rs: `UNWIND_DATA_REG: (i32, i32) = (0, 1); // R0, R1 / X0, X1` and
 //!   `_Unwind_SetGR(context, UNWIND_DATA_REG.0, exception_object.cast())`) and `sp`, `x29` as
 //!   at the call (restored from the callee's frame): its one parameter's cell is stored first.
-//! - **`resume`** calls `_Unwind_Resume` with the exception; it does not return.
+//! - **`resume`** calls `_Unwind_Resume` with the exception; it does not return. Its `blr` has a
+//!   `Continue` row, cleanup code or not: `_Unwind_Resume`'s phase 2 asks this frame's
+//!   personality routine of that call, and with no row the process aborts.
 //!
 //! The literal-word form refuses all of it by name: it places no unwind entry.
 
@@ -191,11 +194,24 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
     }
 
-    /// `resume exception`: `_Unwind_Resume(exception)`, which does not return.
+    /// `resume exception`: `_Unwind_Resume(exception)`, which does not return. Its `blr` gets a
+    /// row that lands nowhere (`Continue`), though it is in cleanup code: `_Unwind_Resume` goes
+    /// on with phase 2 from its caller, this frame at this call, and asks the personality
+    /// routine of it. With no row the pinned library's eh.rs gives `EHAction::Terminate` ("Ip is
+    /// not present in the table. This indicates a nounwind call."), gcc.rs answers phase 2's
+    /// call with `_URC_FATAL_PHASE2_ERROR`, and libunwind's `_Unwind_Resume` stops the process:
+    /// "libunwind: _Unwind_Resume - _Unwind_Resume() can't return" and SIGABRT, after every
+    /// panic whose unwind passed a cleanup (tempo's tests, t1500, 2026-11-21). LLVM gives its
+    /// `_Unwind_Resume` call a call-site entry with no landing pad, which is this row.
     pub(super) fn resume(&mut self, inst: usize) {
         let exception: Value = self.view.operands(inst).value();
         self.ld(X0, exception);
         self.call_routine(Routine::UnwindResume);
+        // `call_routine` ends with the `blr`.
+        let at = self.here() - unwind::INST;
+        if let Some(form) = self.record.as_deref_mut() {
+            form.unwind.calls.push(Call { at, landing: None });
+        }
     }
 
     /// Once every block is placed: each call's row, its landing an offset.

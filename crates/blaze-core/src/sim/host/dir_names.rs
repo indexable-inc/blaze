@@ -35,9 +35,18 @@
 //!   durable removal of a directory above it. A durable change of a name UNDER it never makes it
 //!   durable: that is the case of a file synced into a new directory whose parent was not.
 //!
-//! Not modelled, stated: a directory that exists only because a file is under it (the
-//! simulation's implicit directories: a file is made under a name never made) has no name of its
-//! own to lose; only a directory made by [`crate::Effect::MakeDir`] is journaled.
+//! A directory a file's making made (the drivers make a file's missing directories with it,
+//! `fs.rs`'s `making_parent`; [`Sim::make_parents`]) is journaled as one [`crate::Effect::MakeDir`]
+//! made: before 2026-11-20 such a directory was implicit, there while a file was under it, had
+//! no name of its own to lose, and so survived every crash, where a disk loses a folder
+//! `create_dir_all` made and nothing synced the parent of. Every effect that makes a file
+//! syncs the parent of each directory it made on the way, before it completes, as the native
+//! drivers do since the same day (`fs.rs`'s `make_parent`; the folders rule, on
+//! [`crate::Effect`]): a sans-IO caller cannot know which folders its effects made, so only
+//! the making can sync them, and a durable call under them (its file synced, its name synced
+//! into the folder) is then durable from the root down. Only [`crate::Effect::MakeDir`], a
+//! folder asked for by name, waits for its parent's sync. Scenario (5) below holds that, with
+//! its control ([`Plant::MadeParentsNotSynced`]).
 //!
 //! The control is [`Plant::DirNamesDurable`]: the old loose rule, a directory's change kept
 //! through every crash, under which the tests below find no seed that loses one.

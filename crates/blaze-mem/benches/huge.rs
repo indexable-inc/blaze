@@ -65,7 +65,7 @@ mod walks {
     const IOC_RESET: u32 = 0x2403;
 
     pub struct Walks {
-        fd: libc::c_int,
+        fd: core::ffi::c_int,
         pub event: &'static str,
     }
 
@@ -115,10 +115,10 @@ mod walks {
                 config1: 0,
             };
             let (this_thread, any_cpu, no_group, no_flags): (
-                libc::c_long,
-                libc::c_long,
-                libc::c_long,
-                libc::c_long,
+                core::ffi::c_long,
+                core::ffi::c_long,
+                core::ffi::c_long,
+                core::ffi::c_long,
             ) = (0, -1, -1, 0);
             // SAFETY: the kernel reads `size` bytes of `attr`, a live value of that size; every
             // other argument is a full-width integer, as the variadic `syscall` reads them.
@@ -135,12 +135,12 @@ mod walks {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Walks { fd: fd as libc::c_int, event })
+            Ok(Walks { fd: fd as core::ffi::c_int, event })
         }
 
         /// The walks while `f` runs.
         pub fn count(&self, f: impl FnOnce()) -> u64 {
-            let none: libc::c_ulong = 0;
+            let none: core::ffi::c_ulong = 0;
             // SAFETY: `fd` is this counter's; the ioctls read no argument memory.
             unsafe {
                 libc::ioctl(self.fd, IOC_RESET as _, none);
@@ -148,19 +148,23 @@ mod walks {
             }
             f();
             let mut count = 0u64;
-            // SAFETY: as above; `read` writes the 8-byte count into `count`.
-            unsafe {
-                libc::ioctl(self.fd, IOC_DISABLE as _, none);
-                libc::read(self.fd, (&raw mut count).cast(), 8);
-            }
+            // SAFETY: as above; the ioctl takes no argument memory.
+            unsafe { libc::ioctl(self.fd, IOC_DISABLE as _, none) };
+            // SAFETY: `count` is a live eight-byte integer and the kernel writes exactly those bytes.
+            let _ = blaze_sys::posix::io::read(
+                blaze_sys::Fd::new(self.fd),
+                core::slice::from_raw_parts_mut((&raw mut count).cast::<u8>(), 8),
+            );
             count
         }
     }
 
     impl Drop for Walks {
         fn drop(&mut self) {
-            // SAFETY: the counter's own descriptor, closed once.
-            unsafe { libc::close(self.fd) };
+            // SAFETY: this value owns the counter descriptor and closes it once.
+            let _ = unsafe {
+                blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(self.fd))
+            };
         }
     }
 }
@@ -174,7 +178,11 @@ fn made(pages: Pages, next: &[u32]) -> Result<Region, String> {
         // So a machine with transparent huge pages `always` still measures base pages.
         // SAFETY: the region's whole reservation, holding nothing yet; advice only.
         unsafe {
-            libc::madvise(region.base().as_ptr().cast(), region.reserved(), libc::MADV_NOHUGEPAGE)
+            blaze_sys::posix::io::madvise(
+                region.base(),
+                region.reserved(),
+                blaze_sys::posix::io::Advice::NoHugePage,
+            )
         };
     }
     region.ensure(BYTES).map_err(|error| error.to_string())?;

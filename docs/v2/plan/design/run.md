@@ -680,6 +680,138 @@ and 6 above; it waits on the ladder's L1b); (2) `Links` and `Native` as drive ki
 with the launcher's half of it, one batch. Until (1) is in, the in-process run stays the path a hello world
 is debugged on, and it links nothing.
 
+### Run and test read the engine's answer (D147, the coordinator's design, 2026-11-19; not built)
+
+MEASURED, 2026-11-19, the real project tempo, `blaze test -p tempo-dkg-onchain-artifacts` (a 171-line
+crate with one test): 193 s, then 62 s warm, **no test started**. `check` is the engine
+(main.rs: `"check" | "engine-check"` go to engine_check.rs); `run` and `test` still build the OLD
+request, whose own check (per-FILE body jobs in a 64 MB frame) runs before any start. On tempo that
+check runs out of its frames in dozens of files ("frames: its region of 67108864 reserved bytes is used
+up"), checks the whole workspace to test one crate, and holds every test behind any failure anywhere.
+The engine checks the same tree in 0.2 s when nothing moved and 2.6 s after a one-body edit.
+
+RULE: `run` and `test` take every fact they need from the ENGINE's stored answer. The old request is
+not built for them; when both commands pass their tests on the engine it is deleted with `check-old`.
+
+The seams exist. run_ids.rs asks two questions of "the command's standing answer" and nothing else:
+`trait Today` (a name's out, a cell's digest) and `trait Answer` (a named record's parts, then its
+payload). The old `Request` answers both; so do the tests' tables. The engine gets its own answers
+(rule 78: one seam, each instantiation tested equal while two exist). What each consumer needs, and
+where the engine holds it (the facts: /Volumes/Projects/blaze-lanes-1117/_evidence/run-test-facts.txt):
+
+| The run path needs | Old request | Engine |
+|---|---|---|
+| a name's out and cells today | `settled_input`, `cell_now` | the answer's row: `out`, `defines` |
+| the walk Units -> FileItems -> BodyCheck parts | each record's parts | the Units and Outlines records' parts (the Bodies plan reads the same parts) |
+| per body: checked or not, the items it covers, its key, its reads | the `BodyCheck` record (findings, `body_payload`), found by `body_check_key` | the row's key and reads; **nothing else is kept** (engine_check.rs: `Stage::Bodies => None`) |
+| each crate's names and items | the `CrateScope` record at its `Input` | the Names stage's record at `NamesStage::input_of`: same reader, with the request's snapshot for expansion texts |
+| the certificate that keys the start list and the tables | `req.certificate()` | the answer's root |
+| `Owners` outs | part of `body_check_key` | not needed: the body's key is the row's |
+
+So ONE thing is missing, and it is a record (rule 51): **a body's run facts**. The Bodies stage puts,
+for each BodyCheck task, a small record: its class (clean; errors with the count and the first rule;
+not finished with the rule) and the sorted item keys of the bodies it covers (what `work::body_payload`
+holds today). Keyed as the other stages key theirs (`engine_store::record_key`); its out is the row's
+verdict digest, so nothing new invalidates. Cost: one small put a body task on a first check (tempo:
+about 16,600 beside 17,900 puts today), none on a no-op, one on a one-body edit. Findings stay in the
+lines record alone (rule 30): the facts record holds their CLASS, never their text.
+
+`Answer` gains the one question that hid the old key: `body(check: Name)` gives a body's key, class,
+reads and covered items. The old answer computes it as today (`record_reads`, `verdict`); the engine's
+reads its row and its facts record. `RunIds`, `Checked` and the parent's `step` do not change.
+
+THE GATE IS THE CALL. There is no whole-request gate. A program or a test starts when the check has
+answered, whatever it found; each workspace body is admitted at its first call by its own facts
+(`Checked::runs`, which run_parent.rs `step` asks). THE GATE'S RULE (D151): a workspace body is run
+when its types were checked whole and it has no error: `Clean`, or `Typed` (its borrow check refused
+or not run: the borrow check never changes what a body does, its findings are notes until
+`BORROWS_ARE_ERRORS`, and `check` answers "0 errors, incomplete: NOT checked: borrows" for it, the
+line `run` prints before it starts). A body that has an error (`Errors`) or whose types were not
+checked whole (`Incomplete`: no typed body to lower) stops the program, or fails the one test that
+called it (`NOT RUN`, T1), naming the body and its class. A called fn the table has no row for is
+refused with what the table holds beside it (run_ids.rs `NoRow`, rule 19): its workspace crate
+rows by prefix, and whether the called prefix is one and how many rows it has. The two gaps it
+tells apart: a body no check's covers list (the called crate has rows, none this fn's), and a call
+under a unit no check covered (the prefix is none of the rows). Which unit the fn was checked
+under is not said: an item's key hashes its parent's whole key, so it differs in every byte
+between units, and naming it needs the item's place, which the table does not hold; D152 removes
+that gap. The engine's facts record lists in each entry's covers every fn declared in a body its
+check reached (front2 tables/task.rs `BodyReads::locals`), as the old path's `covered` did. Why: "a run compiles what is called" (AGENTS.md, scope); an error in a function no test
+calls must not hide every test (tempo has 11 open false errors, and any one held all tests). The
+check's summary line is printed before the start, so nothing is hidden. Owner's call if `run` should
+also refuse to start over an error in the program's own crates: the table knows them (the walk lists
+the closure's bodies), so it is one rule to add.
+
+Selection follows the check: the engine checks every member; `run` picks its program and `test` its
+units from the engine's unit graph (made with tests, so it holds the library, binary and test units).
+The old `run` graph was made without tests: a library unit's crate key must not depend on that flag
+(to verify before piece E3; if it does, that is a key that holds too much, rule 21).
+
+PIECES, one writer each; E1 || E2, then E3; the real runs are the coordinator's:
+- **E1** the facts record: engine_bodies.rs (where the row is built), engine_check.rs (the put), a new
+  engine_body_facts.rs (the bytes, one reader). First tests: restore equals fresh in bytes (rule 26);
+  a one-body edit puts one facts record; planted: a class of `clean` for a body with an error is
+  caught by the reader's oracle test.
+- **E2** the engine's `Today` and `Answer` (a new engine_run_answer.rs) and `Answer::body` in
+  run_ids.rs. First tests: over a two-crate fixture the table built from the engine's answer holds
+  the same bodies, classes and crate rows as the one built from the old request; a body the engine
+  refused is `Incomplete`, never `Clean`.
+- **E3** main.rs's `run` and `test` arms and run_names.rs's inputs: the engine check, then the start
+  from E2's answer; the certificate is the root; the old request is no longer built for them.
+- **The judge**: hello world prints through the new path in a fresh home and replays in 10 ms the
+  second time; then `blaze test -p tempo-dkg-onchain-artifacts` runs its one test; then
+  `tempo-hardfork` (17 tests); the first failure of each is the next piece.
+- NOT in this cut: code as engine tasks and a typed body kept for codegen (D144; the parent still
+  lowers a called body itself), `run` on a pool. They make the first run fast; this makes it happen.
+
+THE CONTRACT OF E3 (2026-11-19 17:40; the pieces below are written at once, against these names):
+
+```rust
+// crates/blaze-cli/src/engine_check.rs (piece R1 owns the file): the check, kept open for a start.
+/// The engine's check of the checkout, its answer printed, and what a start reads afterwards.
+pub(crate) fn check_for_start<'r>(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static Heap, frame: &'r Frame)
+    -> Result<Standing<'r>, CliError>;
+pub(crate) struct Standing<'r> {
+    /// The answer's root: the certificate of the start list and of the run tables.
+    pub(crate) root: ContentId,
+    /// The command's store, its puts committed.
+    pub(crate) store: /* the command's store */,
+    /// E2's answer over the stored rows and records (engine_run_answer.rs).
+    pub(crate) answer: EngineAnswer<'r, ..>,
+    /// The unit graph's row and each crate's names row, as the run's names reader takes them.
+    pub(crate) graph: Input,
+    pub(crate) names: &'r dyn Fn(Name) -> Option<Input>,   // `NamesStage::input_of`
+    /// How many errors the check printed (the summary line is already out).
+    pub(crate) errors: u32,
+}
+
+// crates/blaze-cli/src/engine_start.rs (new; piece R1): what main.rs's `run` and `test` arms call.
+pub(crate) fn run_program(cx: &Cx, standing: Standing<'_>, picked: &run_package::Program, args: ..) -> Result<Status, CliError>;
+pub(crate) fn run_tests(cx: &Cx, standing: Standing<'_>, packages: &[..], args: &test_args::Args) -> Result<Status, CliError>;
+
+// crates/blaze-cli/src/engine_native.rs (new; piece R2): the program's native image, by key.
+/// The native image (the BNL2 record native_image.rs writes) of the program whose crates are
+/// `closure`: found by its key, else made now from each crate's link facts and its build script's
+/// record and put. A program with no C input has a real image that links the system library.
+pub(crate) fn image_for(cx: &Cx, standing: &mut Standing<'_>, closure: &[CrateAt]) -> Result<Key, NativeError>;
+```
+
+- **R1** engine_check.rs (`check_for_start`), engine_start.rs, main.rs's `run`/`test` arms,
+  run_names.rs (its inputs from `Standing`, opened with the snapshot as the Bodies stage opens them).
+  The start does what `Effect::StartProgram` / `StartTests` do today with the request's parts replaced
+  by `Standing`'s; the old request is not built for these commands.
+- **R2** engine_native.rs, native_image.rs: no new stage; the image is a record keyed by its inputs
+  (the closure's crates' link facts, read from their names and outline records, and their Script
+  records' outs), made at the first start that lacks it.
+- **R3** selection: run_package.rs and test_args.rs. A command given a member's directory walks up
+  to the workspace root (today: `error[manifest-not-read] ... the root's [workspace] does not offer
+  it`); `-p` and `--bin` pick from the engine's unit graph for `run` and `test` alike.
+- **R4** the typed body is kept (D144's first half, RV3's job 4): the Bodies stage leaves, beside
+  the facts record, the checked generic body in the flat `blaze-body` form with the portable type
+  table it indexes; the parent builds a called instance from it and lowers nothing again. Files:
+  front2 tables/task.rs, blaze-body, blaze-body-lower, and a new blaze-cli engine_body_record.rs.
+  Test first: a restored body builds the same instance as the fresh one (bytes of the code record).
+
 ## Records, keys and read lists
 
 | Record | Key | Read list / validity |

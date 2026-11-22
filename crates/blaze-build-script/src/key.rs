@@ -27,8 +27,9 @@ use crate::env::Env;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum CMode {
-    /// For `check`: the request is kept in the record and nothing is compiled. A `build`
-    /// never takes a record made so.
+    /// Every command's (design A; blaze-cli scripts.rs `C_MODE`): the request is kept in the
+    /// record and nothing is compiled at the script's run. `run` and `test` run the requests
+    /// later (blaze-cli native_runner_c.rs) and link their built record, never this one.
     Deferred = 0,
     /// For `build`: each request answered by its own record from a sandboxed C toolchain (not
     /// built).
@@ -104,8 +105,11 @@ impl<'k> HostToolKey<'k> {
 
 /// The domain of the base key; a change to what it covers takes the next number.
 /// The outputs record's layout word is hashed in too, so a record of another layout is never
-/// looked up under a key of this one.
-pub const DOMAIN: &str = "blaze v2 build-script run 2";
+/// looked up under a key of this one. 3: a deferred C request's relative paths are rooted at
+/// its spawn's folder when recorded (c_tasks.rs `rooted`): a `bzbsout6` record of run 2 holds
+/// them as spawned, which the C tasks refuse as host paths, so none is found again. 4: a
+/// `--param` value is no longer taken for a path (`rooted` made it `/package/ssp-buffer-size=4`).
+pub const DOMAIN: &str = "blaze v2 build-script run 4";
 
 /// The base key.
 pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> ContentId {
@@ -125,6 +129,12 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
+    if let RunnerKey::Wasm = inputs.runner {
+        // A wasm script's compiler probes are answered from this table (c_tasks_probe): a
+        // changed answer re-runs the scripts, and no probe is in a read list. A native script
+        // runs its compiler, so the table is not in its key.
+        hasher.part(b"clang answers").id(&crate::c_tasks_probe::table_id(blaze_pins::CLANG_ANSWERS_JSON.as_bytes()));
+    }
     if let RunnerKey::Native { compiler, target, sysroot, host_tools } = inputs.runner {
         hasher.part(b"native").part(&compiler).part(target.as_bytes()).part(sysroot.as_bytes());
         if !host_tools.is_empty() {

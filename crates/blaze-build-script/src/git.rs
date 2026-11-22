@@ -12,9 +12,13 @@
 //! - the branch: `rev-parse --abbrev-ref [--symbolic-full-name] HEAD`, `branch --show-current`,
 //!   `symbolic-ref HEAD` (on a detached head: git's own exit 128 and message).
 //!
+//! - `status --porcelain` (with `-uno` or `-uall`) and `describe --dirty`: from the index, a stat
+//!   of each tracked file and the ignore files; after a change, from the previous answer and the
+//!   journal's paths ([`status_after`]);
+//!
 //! Refused by name ([`Refused`]), never answered with a guess:
-//! - whether the tree is dirty (`status`, `diff-index`, `describe --dirty`): it needs the index
-//!   and a stat of every tracked file, which reads the whole tree into the read list;
+//! - whether the tree is dirty asked another way (`diff-index`, another `status` form, a
+//!   `--dirty=<mark>` other than `-dirty`);
 //! - an abbreviated commit (`--short`, with or without a length): git lengthens the prefix until
 //!   it is unique among the repository's objects, so its length needs the object store;
 //! - a checkout with no `.git` served (a fetched package's record carries none);
@@ -65,6 +69,7 @@ pub enum LinkUnread {
 }
 
 pub use crate::git_attributes::Attribute;
+pub use crate::git_objects::{After, CoveredSince, Gen, Made, StatusAnswer, StatusPlant, WholeWhy};
 pub use blaze_git_fetch::Oid;
 pub use blaze_git_fetch::store::{CommitWhy, StoreWhy};
 
@@ -185,17 +190,19 @@ pub enum Question {
     /// An abbreviated commit (`--short`).
     Short,
     /// `status --porcelain`, listing untracked files when `untracked` (git's default) and not
-    /// with `--untracked-files=no`.
-    Status { untracked: bool },
-    /// Whether the tree is dirty, asked another way (`diff-index`, `describe --dirty`, another
-    /// `status` form).
+    /// with `--untracked-files=no`; `all` selects `--untracked-files=all` instead of Git's
+    /// directory-collapsed default.
+    Status { untracked: bool, all: bool },
+    /// Whether the tree is dirty, asked another way (`diff-index`, another `status` form, a
+    /// `describe --dirty=<mark>` with a mark other than git's own `-dirty`).
     Dirty,
     /// `log -1` with a `--pretty=format:` or `--format=` string: the HEAD commit object. The
     /// format as read, or why it is refused.
     Log(Result<LogFormat, Refused>),
-    /// `describe` (without `--dirty`) with only `--always`, `--tags` and `--match`: a walk of
-    /// history to a tag; with `always`, the abbreviated commit when no tag is found.
-    Describe { always: bool },
+    /// `describe` with only `--always`, `--tags`, `--match` and `--dirty`: a walk of history to
+    /// a tag; with `always`, the abbreviated commit when no tag is found; with `dirty`, `-dirty`
+    /// after it when a tracked file differs ([`dirty_marked`]: the tracked status not empty).
+    Describe { always: bool, dirty: bool },
     /// Anything else.
     Other,
 }
@@ -212,10 +219,10 @@ pub fn question(args: &[&str]) -> Question {
         ["branch", "--show-current"] => Question::ShowCurrent,
         ["symbolic-ref", "HEAD"] => Question::SymbolicRef,
         ["rev-parse", rest @ ..] if rest.iter().any(|arg| *arg == "--short" || arg.starts_with("--short=")) => Question::Short,
-        ["status", "--porcelain"] => Question::Status { untracked: true },
-        ["status", "--porcelain", "--untracked-files=no"] => Question::Status { untracked: false },
+        ["status", "--porcelain"] => Question::Status { untracked: true, all: false },
+        ["status", "--porcelain", "--untracked-files=no"] | ["status", "--porcelain", "-uno"] => Question::Status { untracked: false, all: false },
+        ["status", "--porcelain", "--untracked-files=all"] | ["status", "--porcelain", "-uall"] => Question::Status { untracked: true, all: true },
         ["status", ..] | ["diff-index", ..] => Question::Dirty,
-        ["describe", rest @ ..] if rest.iter().any(|arg| *arg == "--dirty" || arg.starts_with("--dirty=")) => Question::Dirty,
         ["describe", rest @ ..] => describe(rest),
         ["log", "-1", format] if format.starts_with("--pretty=format:") => Question::Log(LogFormat::parse(&format["--pretty=format:".len()..])),
         // `--format=<f>` is `--pretty=tformat:<f>`: a newline after the commit.
@@ -319,7 +326,7 @@ pub enum StoreFile {
 /// Why a `git` question is not answered: the script stops, naming the command and this.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refused {
-    /// Whether the tree is dirty (D53: refused until shown cheap).
+    /// Whether the tree is dirty, asked in a form not answered ([`Question::Dirty`]).
     Dirty,
     /// An abbreviated commit, whose length git makes unique among the objects.
     Short,
@@ -378,8 +385,8 @@ pub enum Refused {
     /// An attributes file names a byte-changing form blaze does not apply (only `* text=auto`
     /// in the top `.gitattributes` or `info/attributes` is applied).
     AttributeNotBuilt(Attribute),
-    /// A file in the worktree that is not tracked: git lists it unless an ignore rule covers
-    /// it, and blaze has no ignore rules (D54).
+    /// Kept for malformed-reader compatibility. Served status now prints an untracked path after
+    /// evaluating the checkout's `.gitignore` files and `info/exclude`.
     Untracked,
     /// An index entry, starting at byte `at`, whose path is absolute or has an empty, `.`, `..`
     /// or `.git` component: git never writes one (`verify_path`).
@@ -393,7 +400,7 @@ pub enum Refused {
 impl core::fmt::Display for Refused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Refused::Dirty => f.write_str("whether the tree is dirty needs the index and a stat of every tracked file; refused until shown cheap (D53)"),
+            Refused::Dirty => f.write_str("whether the tree is dirty, asked in a form not answered (`diff-index`, a `status` form other than `--porcelain` with `-uno`/`-uall`, a `--dirty=<mark>` other than `-dirty`); `status --porcelain` and `describe --dirty` are"),
             Refused::Short => f.write_str("an abbreviated commit: git lengthens it until it is unique among the repository's objects, which needs the object store"),
             Refused::NoRepository => f.write_str("no `.git` is served from the script's folder up (a fetched package's record carries none)"),
             Refused::NoCommit => f.write_str("HEAD names no commit (an unborn branch, or a ref neither loose nor packed)"),
@@ -425,7 +432,7 @@ impl core::fmt::Display for Refused {
             Refused::LinkUnread(LinkUnread::ReaderCannot) => f.write_str("a tracked symlink whose stat changed, served by a reader that cannot read link targets (`GitFiles::read_link` not given)"),
             Refused::AttributesNotApplied => f.write_str("a file holding a CR, to hash with no `text` attribute in force: git would consult `core.autocrlf`, which blaze does not read"),
             Refused::AttributeNotBuilt(which) => write!(f, "an attributes file names the byte-changing form {which:?}, which blaze does not apply (gitattributes(5); only `* text=auto` in the top `.gitattributes` or `info/attributes` is)"),
-            Refused::Untracked => f.write_str("an untracked file: git lists it unless an ignore rule covers it, and blaze has no ignore rules (D54)"),
+            Refused::Untracked => f.write_str("an untracked file was refused by the status reader"),
             Refused::DescribeNotBuilt => f.write_str("`describe` with tags present walks history to a tag; blaze's capped walk (D54) is not built yet"),
             Refused::CannotAnswerYet => f.write_str("blaze cannot answer this git question yet"),
         }
@@ -485,8 +492,9 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             // reachable: without `--always` git's own failure; with it the abbreviated commit
             // at git's automatic length, `max(7, ceil((msb(n) + 1) / 2))` (object-name.c), which
             // is 7 while the commit's objects number under 2^14.
-            Question::Describe { always: false } => Ok(Answer { code: 128, stdout: String::new_in(alloc), stderr: NO_NAMES }),
-            Question::Describe { always: true } => Ok(ok(&hex[..FALLBACK_DEFAULT_ABBREV])),
+            // Clean, as for `status`: no `-dirty` mark.
+            Question::Describe { always: false, .. } => Ok(Answer { code: 128, stdout: String::new_in(alloc), stderr: NO_NAMES }),
+            Question::Describe { always: true, .. } => Ok(ok(&hex[..FALLBACK_DEFAULT_ABBREV])),
             Question::Dirty | Question::Other => Err(Refused::CannotAnswerYet),
         };
     }
@@ -527,16 +535,12 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             // `format:` separates commits: no newline after the one commit.
             return Ok(Answer { code: 0, stdout, stderr: "" });
         }
-        Question::Status { untracked } => {
-            let commit = head_commit(&repo, files, alloc)?;
-            let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
-            let mut body = Vec::new_in(alloc);
-            crate::git_objects::read_commit(&store, &commit, files, alloc, &mut body)?;
-            let parsed = blaze_git_fetch::store::Commit::parse(&body).map_err(|(at, why)| Refused::Commit { commit, at, why })?;
-            let stdout = crate::git_objects::status(&repo.gitdir, &repo.common, &repo.work, untracked, parsed.tree, files, alloc)?;
+        Question::Status { untracked, all } => {
+            let tree = head_tree(&repo, files, alloc)?;
+            let stdout = crate::git_objects::status(&repo.gitdir, &repo.common, &repo.work, untracked, all, tree, files, alloc)?;
             return Ok(Answer { code: 0, stdout, stderr: "" });
         }
-        Question::Describe { always } => {
+        Question::Describe { always, dirty } => {
             let commit = head_commit(&repo, files, alloc)?;
             if crate::git_objects::has_tags(&repo.common, files, alloc)? {
                 return Err(Refused::DescribeNotBuilt);
@@ -549,7 +553,13 @@ pub fn answer<'a>(question: Question, folder: &str, vcs: Vcs, files: &mut impl G
             let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
             let len = store.abbrev(&commit, files, alloc)?;
             let hex = commit.hex();
-            return Ok(ok(core::str::from_utf8(&hex[..len]).expect("hex")));
+            let answer = ok(core::str::from_utf8(&hex[..len]).expect("hex"));
+            if !dirty {
+                return Ok(answer);
+            }
+            let tree = head_tree(&repo, files, alloc)?;
+            let tracked = crate::git_objects::status(&repo.gitdir, &repo.common, &repo.work, false, false, tree, files, alloc)?;
+            return Ok(dirty_marked(answer, &tracked));
         }
         _ => {}
     }
@@ -596,10 +606,11 @@ pub const FALLBACK_DEFAULT_ABBREV: usize = 7;
 pub const FETCHED_NO_COMMIT_OBJECT: &str = "fatal: blaze: a fetched git source keeps no commit object, only its id (D54)\n";
 
 /// `describe`'s arguments read: only `--always`, `--tags` and `--match <glob>` (which change
-/// nothing when no tag exists); `--dirty` is [`Question::Dirty`], any other is
-/// [`Question::Other`].
+/// nothing when no tag exists) and `--dirty` (or `--dirty=-dirty`, git's own mark); another
+/// mark is [`Question::Dirty`], any other argument [`Question::Other`].
 fn describe(args: &[&str]) -> Question {
     let mut always = false;
+    let mut dirty = false;
     let mut at = 0;
     while at < args.len() {
         match args[at] {
@@ -607,12 +618,29 @@ fn describe(args: &[&str]) -> Question {
             "--tags" => {}
             "--match" if at + 1 < args.len() => at += 1,
             arg if arg.starts_with("--match=") => {}
-            arg if arg == "--dirty" || arg.starts_with("--dirty=") => return Question::Dirty,
+            "--dirty" | "--dirty=-dirty" => dirty = true,
+            arg if arg.starts_with("--dirty=") => return Question::Dirty,
             _ => return Question::Other,
         }
         at += 1;
     }
-    Question::Describe { always }
+    Question::Describe { always, dirty }
+}
+
+/// git's `--dirty` mark on a `describe` answer (describe.c: `-dirty` appended when
+/// `diff-index HEAD` finds a change, which is a tracked file differing, staged changes being
+/// refused by the status): `answer` with `-dirty` before its newline when it succeeded and
+/// `tracked_status` (the `status --porcelain --untracked-files=no` text) is not empty. The one
+/// home of the mark: [`answer`] and a checkout sweep that answers the status after a change
+/// (blaze-cli engine_script_reads.rs) both make it here.
+pub fn dirty_marked<'a>(mut answer: Answer<'a>, tracked_status: &str) -> Answer<'a> {
+    if answer.code == 0 && !tracked_status.is_empty() {
+        if answer.stdout.ends_with('\n') {
+            answer.stdout.pop();
+        }
+        answer.stdout.push_str("-dirty\n");
+    }
+    answer
 }
 
 /// The commit HEAD names, through its ref.
@@ -628,6 +656,67 @@ fn head_commit(repo: &Repo<'_>, files: &mut impl GitFiles, alloc: Alloc<'_>) -> 
         None => String::from_str_in(head, alloc),
     };
     Oid::parse_hex(hex.as_bytes()).ok_or(Refused::Malformed(GitFile::Head))
+}
+
+/// The tree of the commit HEAD names: what the index's cache tree must equal.
+fn head_tree(repo: &Repo<'_>, files: &mut impl GitFiles, alloc: Alloc<'_>) -> Result<Oid, Refused> {
+    let commit = head_commit(repo, files, alloc)?;
+    let store = crate::git_objects::Store::open(&repo.common, files, alloc)?;
+    let mut body = Vec::new_in(alloc);
+    crate::git_objects::read_commit(&store, &commit, files, alloc, &mut body)?;
+    let parsed = blaze_git_fetch::store::Commit::parse(&body).map_err(|(at, why)| Refused::Commit { commit, at, why })?;
+    Ok(parsed.tree)
+}
+
+/// `status --porcelain` ([`Question::Status`]'s `untracked` and `all`) asked in `folder`,
+/// answered from the `previous` answer and the paths the journal named since its place
+/// (`covered`, each relative to the served tree's root, as the journal names them), sans-IO
+/// through `files` (E3): byte-equal to [`answer`]'s, and computed whole where the change-driven
+/// answer is not covered, saying why ([`Made::Whole`]). `now`: the journal's place this command
+/// took before reading any file, kept with the answer for the next.
+///
+/// Each named path is rebased onto the repository's worktree: one under it loses the
+/// worktree's prefix, one above it (a lost subtree holding the worktree) names the worktree
+/// itself, and one beside it changes nothing of this status.
+#[allow(clippy::too_many_arguments, reason = "the question, the previous answer and its proof, the place now, the reader, the allocator and the plant")]
+pub fn status_after<'a, F: GitFiles>(
+    folder: &str,
+    untracked: bool,
+    all: bool,
+    previous: Option<&StatusAnswer<'_>>,
+    covered: Option<&CoveredSince<'_>>,
+    now: Gen,
+    files: &mut F,
+    alloc: Alloc<'a>,
+    plant: impl blaze_own::planted::Planted<StatusPlant>,
+) -> Result<After<'a>, Refused> {
+    let repo = find(folder, files, alloc)?;
+    let work = repo.work.as_str();
+    let mut rebased: AVec<'_, &str> = Vec::new_in(alloc);
+    let mut proof = None;
+    if let Some(covered) = covered {
+        for path in covered.changed() {
+            let rel = if work.is_empty() {
+                Some(*path)
+            } else if *path == work {
+                Some("")
+            } else if let Some(rest) = path.strip_prefix(work).and_then(|rest| rest.strip_prefix('/')) {
+                Some(rest)
+            } else if path.is_empty() || work.strip_prefix(*path).is_some_and(|rest| rest.starts_with('/')) {
+                // A folder holding the worktree: all of it named.
+                Some("")
+            } else {
+                None
+            };
+            rebased.extend(rel);
+        }
+        // The ignored folder (if any) is rebased with the paths: a proof made anew here would
+        // drop it, and the walk under blaze's own folder would run every command.
+        proof = Some(covered.rebased(work, &rebased));
+    }
+    // HEAD's tree is read only for a whole computation (git_objects.rs `status_after`).
+    let tree = |files: &mut F, alloc: Alloc<'a>| head_tree(&repo, files, alloc);
+    crate::git_objects::status_after(previous, proof.as_ref(), untracked, all, &repo.gitdir, &repo.common, work, tree, now, files, alloc, plant)
 }
 
 /// A repository: its own git folder (HEAD, index), the common one (refs, objects), and its

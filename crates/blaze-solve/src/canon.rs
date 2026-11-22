@@ -413,6 +413,7 @@ fn mode_word(m: TypingMode) -> u32 {
     match m {
         TypingMode::Analysis => 0,
         TypingMode::Coherence => 1,
+        TypingMode::PostAnalysis => 2,
     }
 }
 
@@ -663,7 +664,7 @@ impl<'a> Decode<'a> {
     fn pred<T: Tys>(&mut self, tys: &mut T, w: &[u32], at: usize, tag: u32, i: &mut usize) -> Result<Pred, SolveError> {
         let _ = tys;
         let bad = SolveError::Malformed(Malformed::Canonical { at: at as u32 });
-        let mut two = |s: &mut Self| -> Result<(Ty, Ty), SolveError> {
+        let two = |s: &mut Self| -> Result<(Ty, Ty), SolveError> {
             s.pop_kids(2, at)?;
             Ok((s.kids[0], s.kids[1]))
         };
@@ -760,7 +761,13 @@ pub fn instantiate_input<T: Tys>(tys: &mut T, d: &mut Decode<'_>, w: &[u32]) -> 
         return Err(SolveError::Malformed(Malformed::Canonical { at: 0 }));
     }
     d.reset();
-    let mode = if w[0] == 1 { TypingMode::Coherence } else { TypingMode::Analysis };
+    // Exactly the words `mode_word` writes; any other is malformed, never a mode by default.
+    let mode = match w[0] {
+        0 => TypingMode::Analysis,
+        1 => TypingMode::Coherence,
+        2 => TypingMode::PostAnalysis,
+        _ => return Err(SolveError::Malformed(Malformed::Canonical { at: 0 })),
+    };
     let env = EnvId(w[1]);
     let bound = w[2];
     let pred = d.run(tys, &w[3..])?.ok_or(SolveError::Malformed(Malformed::Canonical { at: 3 }))?;

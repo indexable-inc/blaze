@@ -7,6 +7,24 @@ use blaze_sim::{Config, Tape};
 
 use super::*;
 
+/// [`Csr::build_in`] with its columns and cursors on the test's heap (the counted global one).
+fn build<T, I>(rows: usize, pairs: I) -> Csr<T, Global>
+where
+    I: IntoIterator<Item = (u32, T)>,
+    I::IntoIter: Clone,
+{
+    Csr::build_in(rows, pairs, Global, Global)
+}
+
+/// [`Csr::graph_in`] on the test's heap.
+fn graph<I>(nodes: usize, edges: I) -> Csr<u32, Global>
+where
+    I: IntoIterator<Item = (u32, u32)>,
+    I::IntoIter: Clone,
+{
+    Csr::graph_in(nodes, edges, Global, Global)
+}
+
 /// The spec: `blaze-link`'s `Csr::build` (`native.rs`) as it was before it moved here, the
 /// plainest of the copies (count, prefix sum, place with the starts as cursors, shift back).
 fn reference(rows: usize, pairs: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>) {
@@ -43,7 +61,7 @@ fn rows_and_pairs(tape: &Tape) -> (usize, Vec<(u32, u32)>) {
 fn build_is_the_reference_counting_sort() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let (rows, pairs) = rows_and_pairs(tape);
-        let csr = Csr::build(rows, pairs.iter().copied());
+        let csr = build(rows, pairs.iter().copied());
         let (starts, items) = reference(rows, &pairs);
         assert_eq!(csr.starts(), &starts[..]);
         assert_eq!(csr.items(), &items[..]);
@@ -63,10 +81,10 @@ fn a_rebuild_is_a_build() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let (rows, pairs) = rows_and_pairs(tape);
         let (rows2, pairs2) = rows_and_pairs(tape);
-        let mut csr = Csr::build(rows, pairs.iter().copied());
+        let mut csr = build(rows, pairs.iter().copied());
         let mut cursors = Vec::new();
         csr.rebuild(rows2, pairs2.iter().copied(), &mut cursors);
-        assert_eq!(csr, Csr::build(rows2, pairs2.iter().copied()));
+        assert_eq!(csr, build(rows2, pairs2.iter().copied()));
     });
 }
 
@@ -75,7 +93,7 @@ fn a_graph_is_its_edges_sorted() {
     blaze_sim::check(Config::DEFAULT, |tape| {
         let (nodes, pairs) = rows_and_pairs(tape);
         let edges: Vec<(u32, u32)> = pairs.iter().map(|&(s, t)| (s, t % nodes as u32)).collect();
-        let graph = Csr::graph(nodes, edges.iter().copied());
+        let graph = graph(nodes, edges.iter().copied());
         let mut sorted = edges.clone();
         sorted.sort_unstable();
         let (starts, _) = reference(nodes, &sorted);
@@ -93,12 +111,12 @@ fn a_graph_is_its_edges_sorted() {
 
 #[test]
 fn no_rows_and_no_pairs() {
-    let none: Csr<u8> = Csr::new();
+    let none: Csr<u8, Global> = Csr::new_in(Global);
     assert_eq!((none.rows(), none.len(), none.starts()), (0, 0, &[][..]));
     assert_eq!(none.get(0), None);
-    let empty = Csr::<u8>::build(0, std::iter::empty());
+    let empty = build::<u8, _>(0, std::iter::empty());
     assert_eq!((empty.rows(), empty.starts()), (0, &[0][..]));
-    let blank = Csr::<u8>::build(3, std::iter::empty());
+    let blank = build::<u8, _>(3, std::iter::empty());
     assert_eq!(blank.starts(), &[0, 0, 0, 0]);
     assert_eq!(blank.row(2), &[] as &[u8]);
     let (starts, items) = blank.into_parts();
@@ -109,7 +127,7 @@ fn no_rows_and_no_pairs() {
 fn items_that_are_not_copy_are_placed_once() {
     let words = ["b", "a", "c", "d"];
     let csr =
-        Csr::build(2, words.iter().enumerate().map(|(at, it)| ((at % 2) as u32, it.to_string())));
+        build(2, words.iter().enumerate().map(|(at, it)| ((at % 2) as u32, it.to_string())));
     assert_eq!(csr.row(0), ["b", "c"]);
     assert_eq!(csr.row(1), ["a", "d"]);
 }
@@ -117,7 +135,7 @@ fn items_that_are_not_copy_are_placed_once() {
 #[test]
 #[should_panic(expected = "is not below its 2 rows")]
 fn a_row_past_the_rows_is_a_bug() {
-    Csr::build(2, [(0, ()), (2, ())]);
+    build(2, [(0, ()), (2, ())]);
 }
 
 #[test]
@@ -139,7 +157,7 @@ fn a_second_walk_with_other_rows_panics() {
             let row = if at == 3 { if walks.get() == 1 { first } else { second } } else { at % 3 };
             (row, at)
         });
-        let caught = catch_unwind(AssertUnwindSafe(|| Csr::build(3, pairs)));
+        let caught = catch_unwind(AssertUnwindSafe(|| build(3, pairs)));
         assert!(caught.is_err(), "{first} then {second}");
     }
     let walks = Cell::new(0usize);
@@ -151,12 +169,12 @@ fn a_second_walk_with_other_rows_panics() {
         })
         .take_while(|&at| walks.get() == 1 || at < 5)
         .map(|at| (at % 2, at));
-    assert!(catch_unwind(AssertUnwindSafe(|| Csr::build(2, shorter))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| build(2, shorter))).is_err());
 }
 
 #[test]
 fn dedup_keeps_each_rows_first_of_a_run() {
-    let mut csr = Csr::build(3, [(0, 1u32), (0, 1), (0, 2), (2, 2), (2, 2), (0, 1)]);
+    let mut csr = build(3, [(0, 1u32), (0, 1), (0, 2), (2, 2), (2, 2), (0, 1)]);
     csr.dedup_rows();
     assert_eq!(csr.row(0), [1, 2, 1]);
     assert_eq!(csr.row(1), [] as [u32; 0]);
@@ -169,9 +187,9 @@ fn dedup_keeps_each_rows_first_of_a_run() {
 fn a_warm_rebuild_allocates_nothing() {
     let pairs: Vec<(u32, u32)> =
         (0..10_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 500, at)).collect();
-    let (mut csr, mut cursors) = (Csr::new(), Vec::new());
+    let (mut csr, mut cursors) = (Csr::new_in(Global), Vec::new());
     csr.rebuild(500, pairs.iter().copied(), &mut cursors);
-    let (mut graph, mut by_target) = (Csr::new(), Csr::new());
+    let (mut graph, mut by_target) = (Csr::new_in(Global), Csr::new_in(Global));
     graph.rebuild_graph(
         500,
         pairs.iter().map(|&(s, t)| (s, t % 500)),
@@ -218,18 +236,18 @@ unsafe impl Allocator for Scratch<'_> {
     }
 }
 
-/// `build_in` is `build`, with the cursors (one block) in the scratch and only the two columns
-/// on the heap.
+/// `build_in` with the cursors (one block) in the scratch puts only the two columns on the
+/// heap, and builds what it builds with both on the heap.
 #[test]
 fn build_in_puts_the_cursors_in_the_scratch() {
     let pairs: Vec<(u32, u32)> =
         (0..2_000u32).map(|at| (at.wrapping_mul(2_654_435_761) % 300, at)).collect();
     let asked = Cell::new(0);
     let csr = blaze_alloc_count::assert_at_most(2, "a CSR built with scratch cursors", || {
-        Csr::build_in(300, pairs.iter().copied(), Scratch(&asked))
+        Csr::build_in(300, pairs.iter().copied(), Global, Scratch(&asked))
     });
     assert_eq!(asked.get(), 1);
-    assert_eq!(csr, Csr::build(300, pairs.iter().copied()));
+    assert_eq!(csr, build(300, pairs.iter().copied()));
 }
 
 /// A CSR and a graph with their columns, scratch and cursors all in an allocator of their own
@@ -255,10 +273,10 @@ fn a_csr_in_an_allocator_is_the_global_one() {
         (csr, graph)
     });
     assert!(asked.get() >= 5, "the columns, by-target columns and cursors were not in the scratch");
-    assert_eq!(csr, Csr::build(300, pairs.iter().copied()));
-    let mut global = Csr::graph(300, pairs.iter().map(|&(s, t)| (s, t % 300)));
+    assert_eq!(csr, build(300, pairs.iter().copied()));
+    let mut global = self::graph(300, pairs.iter().map(|&(s, t)| (s, t % 300)));
     global.dedup_rows();
     assert_eq!(graph, global);
     let (starts, items) = csr.into_parts();
-    assert_eq!(Csr::from_parts(starts, items), Csr::build(300, pairs.iter().copied()));
+    assert_eq!(Csr::from_parts(starts, items), build(300, pairs.iter().copied()));
 }

@@ -44,22 +44,30 @@ fn random<const N: usize>() -> Result<[u8; N], String> {
             if got == N {
                 break;
             }
-            // SAFETY: the pointer and length are the unfilled tail of `bytes`.
-            let n = unsafe { libc::getrandom(bytes[got..].as_mut_ptr().cast(), N - got, 0) };
-            if n < 0 {
-                let why = std::io::Error::last_os_error();
-                if why.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(format!("getrandom: {why}"));
+            #[cfg(target_os = "linux")]
+            let read = blaze_sys::linux::getrandom(&mut bytes[got..], blaze_sys::linux::RandomFlags::NONE)
+                .map_err(|why| std::io::Error::from_raw_os_error(i32::from(why.raw())));
+            #[cfg(target_os = "android")]
+            let read = {
+                // SAFETY: the pointer and length are the unfilled tail of `bytes`.
+                let n = unsafe { libc::getrandom(bytes[got..].as_mut_ptr().cast(), N - got, 0) };
+                if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+            };
+            match read {
+                Ok(n) => got += n,
+                Err(why) if why.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(why) => return Err(format!("getrandom: {why}")),
             }
-            got += n as usize;
         }
         if got != N {
             return Err(format!("getrandom gave {got} of {N} bytes"));
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    blaze_sys::posix::io::getentropy(&mut bytes).map_err(|why| {
+        format!("getentropy: {}", std::io::Error::from_raw_os_error(i32::from(why.raw())))
+    })?;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         // SAFETY: `bytes` is N <= 256 writable bytes, getentropy's limit.
         if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), N) } != 0 {

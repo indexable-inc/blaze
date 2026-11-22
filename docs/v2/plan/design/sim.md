@@ -135,3 +135,37 @@ that; a check that drew nothing, discarded everything or missed a reach point fa
 On fixed seeds, the store's ported tests found two bugs that were on main: a batch read handed
 one file's bytes to its neighbour, and a derive chain two deep left its lower base in `placed/`.
 Both were fixed, each with its case pinned, in the same change.
+
+## A model is held against what it models
+
+D167 part c, 2026-11-20. A model may be stricter than the real service, never more permissive,
+and every bug found on the real one is added as a suite case, which adds it to both by
+construction.
+
+- **One conformance suite per outside service.** Its cases are written once, as functions over
+  the service's trait, and run unchanged on the model in ordinary tests (`unit`) and on the real
+  service in a scratch directory under the test's own temporary folder (`process`; no network,
+  nothing outside that folder). For the file system the trait is `blaze_core::Driver`'s file
+  effects plus a setup from outside, `crates/blaze-core/src/conform/fs.rs`: `Sim` against this
+  host's native driver. For the journal it is a stopped and resumed journal, the `JournalCase`
+  table in `crates/blaze-core/src/fsevents.rs`'s tests: fseventsd itself against the model of
+  its store, which also runs cases the tape draws.
+- **One outcome per case.** A case answers one typed value: each effect's answer as a kind
+  (done, refused, a file of this length, a directory, not there) and the state after it looked
+  at through the same trait, never an error's text. Where systems legitimately differ (a disk
+  that folds case and one that keeps it), the expectation is one value per platform, the
+  model's among them; a case never skips its assert.
+- **Stricter, never more permissive.** Where the real disk refuses what the model did, the
+  model is wrong and is fixed; where the model refuses what some real disk does (a second
+  spelling of a name a disk would fold to the first), the model's expectation is its own named
+  value. The first run of the file system's cases found the model more permissive in six places
+  (a folder vanished with its last file; a folder a write made outlived every crash; a file was
+  made under a file and where a folder is; a stat under a file answered "not there"; a stat
+  followed no link; two spellings of one folded name were two), and the native driver outside
+  its contract in two (a rename of nothing made the target's folders; a durable write's folders
+  were made unsynced). The list, each with its fix, heads `conform/fs.rs`.
+- **What the real side cannot show.** A promise about a power cut (a sync's) is tested on the
+  model only, with its control: a test cannot cut its own machine's power, and the page cache it
+  would read back holds every name, synced or not. The suite says so beside the case
+  (`a_durable_write_into_new_folders_survives_a_crash`), and names what a trace of system calls
+  could check instead.

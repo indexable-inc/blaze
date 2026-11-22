@@ -1,0 +1,15 @@
+{
+ "id": "body-reads-offered-again",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), joiner lane, the recorder piece",
+ "where": "crates/blaze-typeck/src/world.rs `Reads::record_with`, `prefetch_syntactic`; crates/blaze-ladder/src/front2/tables/recorder.rs `Recorder::keep`; blaze-scope names_cells.rs `Logged`",
+ "what": "tempo: reads offered 757,804,987 for 22,834,789 kept (33 per kept, about 8,800 per body); every ask of a question re-walked the names and offered every cell again, and the prefetch answered every path once before the checker asked it again",
+ "cost": "the tempo profile's bodies line; not re-measured here (write-only lane)",
+ "cause": "the checker's run had no memo of what it already asked, and the recorder learned a repeat only after the offer (one `last` compare, then a hash probe)",
+ "whys": "the read seam was the recorder's input, not the question's answer; a question's reads are a function of the question within one run, but nothing said so",
+ "class": "work-once at the wrong layer (rule 77): deduplicating outputs instead of not producing them",
+ "prevention": "blaze-typeck `World::asking` with `Asking::repeat` from `Reads::heard`; recorder `Repeats::Quiet` mutes a repeated question; a direct-mapped filter replaces `last`; `compare_repeats` is the oracle under `--features asks-oracle`",
+ "annoyance": "the per-kind split needs the question kind at the recorder, which only the checker knows: passed down through World -> NamesSource -> ReadSink",
+ "workaround": "none needed",
+ "state": "open until the coordinator's tempo run quotes the new bodies lines"
+}

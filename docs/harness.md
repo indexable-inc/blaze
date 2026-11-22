@@ -21,7 +21,7 @@ The scripts run from the repository's root in its Python workspace (`pyproject.t
 `uv.lock`): `uv run --frozen python harness/<script>.py '<json>'`. A script moved to one typed
 input (AGENTS.md, scripts-take-typed-input) reads it with the workspace's `typed_input`
 (`tools/typed-input`); the fields are in each script's docstring. Those that ask rustc for the
-host need the pinned nightly (`harness/toolchain`).
+host need the pinned nightly (`pins/toolchain`).
 
 ## What each one checks
 
@@ -29,8 +29,8 @@ host need the pinned nightly (`harness/toolchain`).
 
 | Script | What it checks |
 |---|---|
-| `answers.py --write` | Not a check: writes what the pinned rustc answers to the questions blaze answers in its place (`-vV`, `--print cfg`, cargo's probe of file names, `target-spec-json`) into `crates/blaze-units/src/stdlib/rustc.json`, after a toolchain bump, on each CI host ([no-rustc.md](no-rustc.md), step B) |
-| `toolchain_pins.py` | That the sha256 and size of each file of blaze's own Rust (`crates/blaze-cargo/src/toolchain/pins.txt`) are what the release's manifest at static.rust-lang.org says, for every host blaze ships for; `'{"write": true}'` regenerates them when blaze moves to another release ([cargo.md](cargo.md)). Needs the network |
+| `answers.py --write` | Not a check: writes what the pinned rustc answers to the questions blaze answers in its place (`-vV`, `--print cfg`, cargo's probe of file names, `target-spec-json`) into `pins/answers/rustc.json`, after a toolchain bump, on each CI host ([no-rustc.md](no-rustc.md), step B) |
+| `toolchain_pins.py` | That the sha256 and size of each file of blaze's own Rust (`pins/rust.txt`) are what the release's manifest at static.rust-lang.org says, for every host blaze ships for; `'{"write": true}'` regenerates them when blaze moves to another release ([cargo.md](cargo.md)). Needs the network |
 | `nightly_features.py '{"dry_run": true}'` | Not a check: keeps the GitHub issue tree of the pinned nightly's unstable features (#967), so every `#![feature(..)]` blaze has to accept is tracked. Each language feature of rustc_feature's `unstable.rs` at library/UPSTREAM's commit is an issue labelled `nightly-feature` under a group of at most 100 sub-issues; the library features (the `#[unstable]` and `#[rustc_const_unstable]` attributes of the sysroot crates in library/) are one issue, #969, for what blaze has to do for all of them (`'{"library": true}'` makes one each). A rerun creates only what is missing (by a hidden marker in each body), links what is not under its group, and comments on and closes the issue of a feature stabilized or removed since. `'{}'` makes the changes, paced under GitHub's limits. Needs `gh` |
 
 ### Reading the workspace as cargo does
@@ -40,12 +40,6 @@ discovered, a package outside its workspace's members, config and manifest error
 expected output committed next to them, so the crate's unit tests check them without the
 network. The files were first written from what cargo printed; they are not written from cargo
 again, and a change to one is a change to what blaze expects.
-
-### The store
-
-| Script | What it checks |
-|---|---|
-| `cargo test -p blaze-storemodel` (in CI's `cargo` job) | The model checker of the store and kernel protocol (`crates/blaze-storemodel`, [storemodel.md](v2/plan/design/storemodel.md)): the real `blaze-cas` and `blaze-kernel` state machines through every schedule of a few actors, a crash after every IO step on a file system that models what a crash keeps, on one that shares blocks and one that refuses clones. No script of its own: it runs only where the workspace's unit tests run, so a change to `crates/blaze-cas`, `crates/blaze-kernel`, `crates/blaze-record` or `blaze_core::Effect` runs it by name before it lands. A run is good only when each test prints its `N executions, M crash states checked` line with both above 0: on 2026-11-12 ten of its tests had failed at their first step since the store's open began to ask an effect the model had no rule for, and nothing ran them |
 
 ### Timing
 
@@ -117,17 +111,17 @@ job of the gate runs on Linux AArch64 on an ix runner ([ix runners](#ix-runners)
 | `blaze.yaml` (`scripts`) | every change | ruff and pyright over the Python workspace, `harness/imports.py`, the selftests of `harness/failures.py` and `harness/v2/ran.py`, `harness/library.py check`, the agent rules (`tools/agents/rules.ts --check`), the Rust scripts of `scripts/src/bin` (the docs, `rustcsites`, the ledger, `changed`, the invariants, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts), and `harness/v2/lean_gate.py`'s checks that need no Lean |
 | `blaze.yaml` (`lean`) | every change | the Lean proofs (`harness/v2/lean_gate.py`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms` |
 | `blaze.yaml` (`workflows`) | every change | actionlint over `.github/workflows` (below) |
-| `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`harness/toolchain`): `cargo check --locked --workspace --exclude blaze-std --all-targets`, then `cargo test --locked --workspace --exclude blaze-std --no-fail-fast` |
+| `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`pins/toolchain`): `cargo check --locked --workspace --exclude blaze-std --all-targets`, then `cargo test --locked --workspace --exclude blaze-std --no-fail-fast` |
 | `blaze.yaml` (`ci`) | always | whether every job the tier expected ran and succeeded: the one check the branch rules require |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file |
-| `llvm.yaml` | a change of its recipe, by hand | the pinned LLVM (`crates/blaze-toolchain/pins/llvm.json`) built for each target by `.github/scripts/llvm.py` on hosted runners, and put into R2 (`.github/scripts/r2.py`) |
+| `llvm.yaml` | a change of its recipe, by hand | the pinned LLVM (`pins/llvm.json`) built for each target by `.github/scripts/llvm.py` on hosted runners, and put into R2 (`.github/scripts/r2.py`) |
 | `site.yaml` | a change of the site, by hand | builds and checks `site/`; a push to main deploys it |
 
 The `cargo` job runs only for a change that touches a file it reads; any other change runs the
 rest alone. `scripts/src/bin/gate_changes.rs` (the `changes` job) names those files, and why
 each: the crates (`crates/`, with their test data), the vendored crates (`vendor/`), astlog
 (`tools/astlog/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`,
-the pinned nightly (`harness/toolchain`), `blaze.yaml` and the actions it uses (`toolchain`,
+the pinned nightly (`pins/toolchain`), `blaze.yaml` and the actions it uses (`toolchain`,
 `rustup`, `script`, `blaze`), the release of blaze that builds the scripts
 (`.github/blaze-version`), and `scripts/`; on a push to main, the smoke corpus too
 (`harness/smoke.py`, `harness/smoke/`). It names what is code rather than what is not, so a

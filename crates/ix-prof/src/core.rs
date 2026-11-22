@@ -573,7 +573,7 @@ impl Recorder {
                 (*a, frames.into_iter().map(|f| interner.frame(f)).collect())
             })
             .collect();
-        let mut stack_of = |pcs: &[u64], span: Option<&str>, interner: &mut Interner| -> u32 {
+        let stack_of = |pcs: &[u64], span: Option<&str>, interner: &mut Interner| -> u32 {
             if pcs.is_empty() {
                 return interner.named_stack(span.unwrap_or("<no stack>"), FrameKind::Alloc);
             }

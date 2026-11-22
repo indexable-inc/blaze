@@ -158,8 +158,15 @@ impl fmt::Display for Error {
         if !self.name.bytes().is_empty() {
             write!(f, " ({})", self.name)?;
         }
-        f.write_str(": ")?;
-        match self.why {
+        write!(f, ": {}", self.why)
+    }
+}
+
+/// What was wrong, without where: an [`Error`]'s message after its entry, offset and name, and
+/// the words a test's oracle quotes for a refusal it holds only the `Why` of.
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
             Why::Checksum { stored, computed } => {
                 write!(f, "the header's checksum is {stored}, its bytes sum to {computed}")
             }

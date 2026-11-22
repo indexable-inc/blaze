@@ -405,7 +405,10 @@ fn checkout(name: &str, files: &[(&str, &str)]) -> (PathBuf, Tree) {
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("a folder");
         std::fs::write(&path, text).expect("a fixture file");
     }
-    (root.clone(), Tree::Dir(root))
+    // The resolved root (on macOS the temporary folder is behind `/var -> private/var`): an
+    // absolute gitdir a test writes names the tree as its reads see it.
+    let real = crate::script_sandbox::RealRoot::resolve(&root).expect("the fixture's folder resolves");
+    (real.path().to_owned(), Tree::Dir(real))
 }
 
 /// `git <args>` asked in `folder` of `tree`: the answer's code and output, and the reads.
@@ -524,7 +527,9 @@ fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     assert_eq!(ask(&unborn, "", &["rev-parse", "--short=8", "HEAD"]).0, Err(git::Refused::Short));
     assert_eq!(ask(&unborn, "", &["status", "--porcelain"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["status", "--short"]).0, Err(git::Refused::Dirty));
-    assert_eq!(ask(&unborn, "", &["describe", "--always", "--dirty"]).0, Err(git::Refused::Dirty));
+    // `--dirty` is answered (from the tracked status); another mark is not.
+    assert_eq!(ask(&unborn, "", &["describe", "--always", "--dirty"]).0, Err(git::Refused::NoCommit));
+    assert_eq!(ask(&unborn, "", &["describe", "--always", "--dirty=+"]).0, Err(git::Refused::Dirty));
     assert_eq!(ask(&unborn, "", &["describe", "--always", "--tags"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["log", "-1", "--pretty=format:%cI"]).0, Err(git::Refused::NoCommit));
     assert_eq!(ask(&unborn, "", &["log", "-1", "--pretty=format:%an"]).0, Err(git::Refused::Placeholder(*b"an")));
@@ -535,7 +540,9 @@ fn git_refuses_by_name_what_it_cannot_answer_exactly() {
     // smolgen's quoted forms, read as `sh` reads them.
     assert_eq!(words("git log -1 --pretty=format:'%cI'").expect("quoted"), ["log", "-1", "--pretty=format:%cI"]);
     assert_eq!(words("git describe --always --tags --match \"tempo/v[0-9]*\"").expect("quoted"), ["describe", "--always", "--tags", "--match", "tempo/v[0-9]*"]);
-    assert_eq!(git::question(&["status", "--porcelain", "--untracked-files=no"]), git::Question::Status { untracked: false });
+    assert_eq!(git::question(&["status", "--porcelain", "--untracked-files=no"]), git::Question::Status { untracked: false, all: false });
+    assert_eq!(git::question(&["status", "--porcelain", "-uno"]), git::Question::Status { untracked: false, all: false });
+    assert_eq!(git::question(&["status", "--porcelain", "-uall"]), git::Question::Status { untracked: true, all: true });
     for refused in ["git status; rm -rf /", "git log \"$HOME\"", "git log 'open", "git describe --match v*", "sh -c git"] {
         assert!(words(refused).is_none(), "{refused}");
     }

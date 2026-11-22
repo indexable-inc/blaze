@@ -42,7 +42,7 @@ const MIN_COLS: u16 = 10;
 pub enum Stage {
     /// The workspace checked (the gate: a body that is not clean is never built).
     Checking,
-    /// The crates of the program found (`run_names::found`).
+    /// The crates of the program found (`run_names::found_answered`).
     Crates,
     /// The body ids read (the check's proofs, by item).
     BodyIds,

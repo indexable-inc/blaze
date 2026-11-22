@@ -30,11 +30,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let g = self.ground_in(sig.types, t).map_err(sig_err)?;
             let repr = self.repr(g).map_err(sig_err)?;
             reprs.push(repr);
-            passes.push(Self::rust_pass(repr)?);
+            passes.push(self.rust_pass(repr)?);
         }
         let output = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
         self.ret = self.repr(output).map_err(sig_err)?;
-        self.ret_pass = Self::rust_pass(self.ret)?;
+        self.ret_pass = self.rust_pass(self.ret)?;
         let (params, rets) = self.sig_of(&passes, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);

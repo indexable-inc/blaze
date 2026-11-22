@@ -703,7 +703,7 @@ fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, line: &Line, into: &
         Some(Range { first, last: Some(last) }) if last >= first => (last - first + 1).min(wire.body_most as u64),
         Some(_) | None => wire.body_most as u64,
     };
-    let limits = blaze_h1::Limits { most_head: 64 << 10, most_headers: 100, most_body };
+    let limits = blaze_h1::Limits { most_head: 64 << 10, most_headers: 100, most_body, ..blaze_h1::Limits::SHIPPED };
     // alloc: the core's head and its body's next piece, `Vec`s freed as this returns.
     let mut answer = blaze_h1::Response::new_in(limits, request.method == Method::Head, alloc::alloc::Global);
     let mut decoded: Vec<u8> = Vec::new();

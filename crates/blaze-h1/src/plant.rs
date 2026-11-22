@@ -1,38 +1,20 @@
-//! Planted bugs for the oracles' controls (rule 53): a test sets one for the length of a closure
-//! on its own thread, and the code it names misbehaves on purpose. Outside tests [`on`] is
-//! `false` and folds away.
+//! The bugs a control can plant in the response parser (D165, rule 78: a strategy is a type
+//! parameter at one seam). [`Response::feed_planted`](crate::Response::feed_planted) takes one as
+//! `plant: impl Planted<H1Plant>`; shipped code passes `NoPlant` (through `Response::feed`), whose
+//! every `has` is `false`, so the check compiles away. The split oracle's control (tests.rs)
+//! passes a value.
 
-/// A bug a control plants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    /// Nothing planted: the code as it is.
-    #[cfg(test)]
-    Clean,
+#![blaze::sans_io]
+
+use blaze_own::planted::Plants;
+
+/// A bug a control plants in the response parser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum H1Plant {
+    /// The code as it is.
+    None,
     /// A chunk-size line split between two feeds loses the digits of the first.
     SizeLineRestarts,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static PLANTED: core::cell::Cell<Plant> = const { core::cell::Cell::new(Plant::Clean) };
-}
-
-/// Whether `plant` is planted on this thread.
-#[cfg(test)]
-pub(crate) fn on(plant: Plant) -> bool {
-    PLANTED.with(core::cell::Cell::get) == plant
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) const fn on(_plant: Plant) -> bool {
-    false
-}
-
-/// Runs `body` with `plant` planted on this thread, and puts the clean code back after.
-#[cfg(test)]
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for H1Plant {}

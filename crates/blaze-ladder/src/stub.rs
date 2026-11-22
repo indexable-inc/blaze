@@ -186,7 +186,7 @@ impl Stops {
         #[cfg(target_arch = "aarch64")]
         {
             // SAFETY: `pthread_self` has no precondition.
-            self.thread.store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
+            self.thread.store(thread_token(), Ordering::Release);
             // SAFETY: the caller's contract for `function` and the two words; `jump` is this
             // `Stops`' own buffer, written only here (one run at a time) and read only by a
             // `leave` under this call.
@@ -214,7 +214,7 @@ pub extern "C" fn stopped(stops: *const Stops, stub: u64) -> ! {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: `pthread_self` has no precondition.
-        let here = unsafe { libc::pthread_self() } as usize;
+        let here = thread_token();
         if here == stops.thread.load(Ordering::Acquire) {
             // SAFETY: this thread is inside the `enter` that filled the buffer (`run` set
             // `thread` to it and clears it after); the frames dropped are the program's and
@@ -227,11 +227,20 @@ pub extern "C" fn stopped(stops: *const Stops, stub: u64) -> ! {
     for part in parts {
         // SAFETY: a write of live bytes to descriptor 2; the process ends below whether or
         // not its last words could be written.
-        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
+        let _ = blaze_sys::posix::io::write(blaze_sys::Fd::STDERR, part);
     }
     // SAFETY: the process's end, as a signal handler would end it: other threads may hold
     // any lock, so nothing is flushed or unwound.
-    unsafe { libc::_exit(OTHER_THREAD_STATUS) }
+    blaze_sys::posix::signal::exit_now(OTHER_THREAD_STATUS)
+}
+
+fn thread_token() -> usize {
+    #[cfg(target_os = "macos")]
+    { blaze_sys::posix::thread::pthread_self() as usize }
+    #[cfg(target_os = "linux")]
+    { unsafe { libc::pthread_self() as usize } }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { 0 }
 }
 
 #[cfg(test)]

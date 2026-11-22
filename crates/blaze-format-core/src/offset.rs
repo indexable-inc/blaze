@@ -11,6 +11,7 @@
 //! [`Rel::between`] is a plain value, which panics past 2 GiB.
 //!
 //! [`Text`]: crate::Text
+#![blaze::sans_io]
 
 use core::fmt;
 

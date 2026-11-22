@@ -5,7 +5,7 @@
 use blaze_report::{
     palette::{Depth, Ground},
     say,
-    say::{At, Cmd, Code, Count},
+    say::{At, Code, Count},
     terminal::Terminal,
 };
 use blaze_screen::{Built, Caps, Command, Event, Options, Screen, Test, Verdict, Why, encode};

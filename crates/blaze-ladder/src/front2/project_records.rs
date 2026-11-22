@@ -47,6 +47,16 @@ pub trait BodySource<'n>: NamesSource<'n> {
     /// outline; `false`, `each` not called, when there is no such text. An outline made for
     /// the call is made in `alloc`.
     fn with_outline(self, file: u32, alloc: Alloc<'_>, each: &mut dyn FnMut(&str, &Outline<'_>)) -> bool;
+
+    /// The text the item `key` is written in (a file or an expansion), from its row alone: no
+    /// text is read and no file is proved at item grain ([`list_files_with`] asks it of every
+    /// item, to read the texts of its files' items only). `None`: the row has no place. By
+    /// default the item's place ([`NamesSource::place_of`]: over the solved names, read in place;
+    /// over a source that records its reads, recorded as that question is); the records answer
+    /// from the row alone.
+    fn written_in(self, key: LibKey) -> Option<At> {
+        NamesSource::place_of(self, key).map(|p| p.at)
+    }
 }
 
 impl<'n> BodySource<'n> for &'n Names<'n> {
@@ -67,6 +77,12 @@ impl<'n> BodySource<'n> for &'n Names<'n> {
 }
 
 impl<'n> BodySource<'n> for &'n source::Records<'n> {
+    fn written_in(self, key: LibKey) -> Option<At> {
+        // The items row's place alone (source.rs `Records::text_at`): no expansion record and
+        // no file text is read.
+        self.text_at(key)
+    }
+
     fn own_file(self, file: u32) -> Option<&'n str> {
         // The file as it is now: every body listed from it was read at item grain
         // (source/item_grain.rs), so after a body edit the file's other bodies still list.
@@ -117,7 +133,32 @@ pub fn list_bodies<'n, 'a, S: BodySource<'n>>(names: S, alloc: Alloc<'a>) -> AVe
 
 /// [`list_bodies`] holding what `listing` names.
 pub fn list_with<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
+    list_in(names, listing, None, alloc)
+}
+
+/// [`list_with`] of the items written in the files `files` alone (indexes of the program's own
+/// crate, any order): each fn, initializer and impl or trait member whose item (or container)
+/// is written in one of them ([`BodySource::written_in`], which reads no text), so an item of another
+/// file is never asked for its text. The one listing (rule 30): every listed body is the one
+/// [`list_with`] lists, with the same `at` and `entry`, for the bodies whose item or container is
+/// in `files`. A member's text is inside its container's text, one text per file or expansion,
+/// so a free row also filed as a member is in the same file as its container and is dropped as
+/// [`list_with`] drops it. A body a macro wrote at module level is placed in its expansion, in no
+/// file, and is not listed here (blaze-cli engine_member_rows.rs keeps what a check asks of
+/// those bodies, by the crate's records).
+pub fn list_files_with<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, files: &[u32], alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
+    list_in(names, listing, Some(files), alloc)
+}
+
+/// The one listing of [`list_with`] and [`list_files_with`]: `files` `None` lists every item.
+fn list_in<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, files: Option<&[u32]>, alloc: Alloc<'a>) -> AVec<'a, Listed<'n>> {
     let initializers = listing == Listing::FnsAndInitializers;
+    // Whether the item `key` is listed by `files`: asked only of an item with text (a fn,
+    // initializer or container), whose row has a place, so no row without one is asked.
+    let in_files = |key: LibKey| match files {
+        None => true,
+        Some(files) => matches!(names.written_in(key), Some(At::File(file)) if files.contains(&file)),
+    };
     let mut items: AVec<'a, LibKey> = AVec::new_in(alloc);
     names.each_item(0, &mut |key, _module| items.push(key));
     // Each file's text, asked once: a body's start is its text's offset in it.
@@ -140,7 +181,7 @@ pub fn list_with<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, alloc: A
         let value = matches!(kind, ItemKind::Const | ItemKind::Static);
         match kind {
             ItemKind::Function | ItemKind::Const | ItemKind::Static if !value || initializers => {
-                if !names.has_text(key) {
+                if !names.has_text(key) || !in_files(key) {
                     continue;
                 }
                 let Some(it) = names.text_of(key) else { continue };
@@ -159,6 +200,9 @@ pub fn list_with<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, alloc: A
                 out.push(Listed { body: BodyRef::Free(key), at, entry });
             }
             ItemKind::Impl | ItemKind::Trait => {
+                if !in_files(key) {
+                    continue;
+                }
                 let file = names.place_of(key).and_then(|p| match p.at {
                     At::File(file) => Some(file),
                     At::Expansion(_) => None,
@@ -172,6 +216,15 @@ pub fn list_with<'n, 'a, S: BodySource<'n>>(names: S, listing: Listing, alloc: A
                         _ => return,
                     };
                     let (kind, name) = member;
+                    // A trait's fn declared with no default body (`fn f(&self);`, `async fn
+                    // g(&self) -> R;`) is no body, as a free fn's declaration above: the
+                    // Reference, "Traits": "If the trait function defines a body, this
+                    // definition acts as a default"; one without is only a signature, checked
+                    // with the trait's head. An impl's fn with no body stays listed: its
+                    // lowering refuses it by name (the Reference, "Implementations").
+                    if is_trait && kind == MemberKind::Fn && m.text.trim_end().ends_with(';') {
+                        return;
+                    }
                     let at = file.and_then(|file| start_in(file, m.text).map(|start| BodyAt { file, start }));
                     let entry = match (at, m.written_by) {
                         (Some(at), None) => Some((at.file, m.item)),
@@ -272,22 +325,8 @@ pub fn index_by_chain<'n, S: BodySource<'n>>(names: S, listed: &[Listed<'n>], ch
         let run = &placed[from..to];
         let mut refused: Option<ChainError<'n>> = None;
         let outlined = names.with_outline(file, alloc, &mut |text, outline| {
-            for &(_, entry, body) in run {
-                let Some(item) = outline.items().get(entry as usize) else {
-                    refused = Some(ChainError::NoEntry { file, entry, body });
-                    return;
-                };
-                let fits = match body {
-                    BodyRef::Free(_) => matches!(item.kind(), ItemKind::Function | ItemKind::Const | ItemKind::Static),
-                    BodyRef::Member { kind: MemberKind::Fn, .. } => item.kind() == ItemKind::Function,
-                    BodyRef::Member { kind: MemberKind::Const, .. } => item.kind() == ItemKind::Const,
-                    BodyRef::Member { .. } => false,
-                };
-                if !fits {
-                    refused = Some(ChainError::NotItsKind { file, entry, found: item.kind(), body });
-                    return;
-                }
-                rows.push((file, chain(outline, item, text), body));
+            if let Err(error) = chain_rows(file, run.iter().map(|&(_, entry, body)| (entry, body)), text, outline, chain, &mut rows) {
+                refused = Some(error);
             }
         });
         if !outlined {
@@ -298,6 +337,66 @@ pub fn index_by_chain<'n, S: BodySource<'n>>(names: S, listed: &[Listed<'n>], ch
         }
         from = to;
     }
+    by_chain_of(rows, unplaced)
+}
+
+/// [`index_by_chain`] of the bodies of one file, `file`, whose text `text` and outline `outline`
+/// the caller holds (the outline [`BodySource::with_outline`] gives of it): `listed` are that
+/// file's listed bodies (each with `entry` `Some((file, _))`; a body of another file, or with no
+/// entry, is refused as `NoEntry` at entry `u32::MAX`). The same rows and the same refusals as
+/// [`index_by_chain`] over those bodies, with no outline made: a caller that walks the file's
+/// entries in its own `with_outline` call keys them by chain in that call, the file outlined once.
+pub fn index_outlined_by_chain<'n>(
+    file: u32,
+    listed: &[Listed<'n>],
+    text: &str,
+    outline: &Outline<'_>,
+    chain: ChainOf<'_>,
+    alloc: Alloc<'n>,
+) -> Result<ByChain<'n>, ChainError<'n>> {
+    let mut placed: AVec<'n, (u32, BodyRef<'n>)> = AVec::with_capacity_in(listed.len(), alloc);
+    for l in listed {
+        match l.entry {
+            Some((at, entry)) if at == file => placed.push((entry.0, l.body)),
+            _ => return Err(ChainError::NoEntry { file, entry: u32::MAX, body: l.body }),
+        }
+    }
+    placed.sort_unstable();
+    let mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)> = AVec::with_capacity_in(placed.len(), alloc);
+    chain_rows(file, placed.iter().copied(), text, outline, chain, &mut rows)?;
+    by_chain_of(rows, 0)
+}
+
+/// Each of `run` (an entry of `file`'s outline and its body, sorted by entry) keyed by its
+/// entry's chain onto `rows`: the one check that the entry is there and is the body's kind.
+fn chain_rows<'n>(
+    file: u32,
+    run: impl Iterator<Item = (u32, BodyRef<'n>)>,
+    text: &str,
+    outline: &Outline<'_>,
+    chain: ChainOf<'_>,
+    rows: &mut AVec<'n, (u32, ContentId, BodyRef<'n>)>,
+) -> Result<(), ChainError<'n>> {
+    for (entry, body) in run {
+        let Some(item) = outline.items().get(entry as usize) else {
+            return Err(ChainError::NoEntry { file, entry, body });
+        };
+        let fits = match body {
+            BodyRef::Free(_) => matches!(item.kind(), ItemKind::Function | ItemKind::Const | ItemKind::Static),
+            BodyRef::Member { kind: MemberKind::Fn, .. } => item.kind() == ItemKind::Function,
+            BodyRef::Member { kind: MemberKind::Const, .. } => item.kind() == ItemKind::Const,
+            BodyRef::Member { .. } => false,
+        };
+        if !fits {
+            return Err(ChainError::NotItsKind { file, entry, found: item.kind(), body });
+        }
+        rows.push((file, chain(outline, item, text), body));
+    }
+    Ok(())
+}
+
+/// The rows sorted by (file, chain), refused at the first two of one (file, chain) (rule 21).
+fn by_chain_of<'n>(mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)>, unplaced: u32) -> Result<ByChain<'n>, ChainError<'n>> {
     rows.sort_unstable_by(|a, b| (a.0, &a.1.0, a.2).cmp(&(b.0, &b.1.0, b.2)));
     for pair in rows.windows(2) {
         if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 {

@@ -1,6 +1,7 @@
 //! BLAKE3 as `const fn`s, so a record's [`SchemaHash`] is a constant made from its
 //! description: the same bytes as [`ContentId::of`] of that description under
 //! [`SCHEMA_DOMAIN`], which the tests check against the `blake3` crate.
+#![blaze::sans_io]
 
 use blaze_ids::ContentId;
 

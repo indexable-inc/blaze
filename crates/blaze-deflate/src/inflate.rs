@@ -48,12 +48,15 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::{Box, Vec};
+use blaze_own::{
+    Box, Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
     error::{Error, Format, Tree, Why},
     fast::{self, DIST_BITS, END, LIT_BITS, LITERAL, SUB, VALUE},
-    plant::{self, Plant},
+    plant::DeflatePlant,
     tables::{
         DIST_BASE, DIST_EXTRA, FIXED_DIST_LENS, FIXED_LIT_LENS, LEN_BASE, LEN_EXTRA, MAX_MATCH,
         PRECODE_ORDER, WINDOW, reverse,
@@ -397,8 +400,18 @@ impl Out for Flat<'_> {
     }
 }
 
-/// The decoder's state, whatever the output: see the module.
-struct Core {
+/// Which decoding loop runs where the output is one slice: a strategy chosen once, at the
+/// constructor (C2: a choice is an enum, never a bool).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Path {
+    /// The fast loop, then the careful decoder for what it leaves.
+    Fast,
+    /// The careful decoder alone: the fast loop's twin in the tests.
+    Careful,
+}
+
+/// The decoder's state, whatever the output: see the module. `P` is the plant seam.
+struct Core<P> {
     tables: Tables,
     /// Bytes written: the output's length so far.
     written: u64,
@@ -415,15 +428,17 @@ struct Core {
     /// Whole bytes the bit buffer read past the final block.
     tail: [u8; 8],
     tail_len: u8,
-    /// Whether the fast loop runs where the output is one slice; the careful decoder alone is
-    /// its twin in the tests.
-    fast: bool,
+    /// Whether the fast loop runs where the output is one slice.
+    path: Path,
+    /// The plant seam: [`NoPlant`] where it ships.
+    plant: P,
 }
 
-impl Core {
-    const fn new(limits: Limits, fast: bool) -> Core {
+impl<P: Planted<DeflatePlant>> Core<P> {
+    const fn new(limits: Limits, path: Path, plant: P) -> Core<P> {
         Core {
-            fast,
+            path,
+            plant,
             tables: Tables::EMPTY,
             written: 0,
             bits: 0,
@@ -492,7 +507,7 @@ impl Core {
             return Err(Why::OutputOver { most: self.limits.most_out });
         }
         let most = self.taken.saturating_mul(self.limits.most_ratio).saturating_add(RATIO_SLACK);
-        if output > most && !plant::on(Plant::RatioUnchecked) {
+        if output > most && !self.plant.has(DeflatePlant::RatioUnchecked) {
             return Err(Why::RatioOver { input: self.taken, output, most_ratio: self.limits.most_ratio });
         }
         Ok(())
@@ -516,7 +531,7 @@ impl Core {
                             if !t.fixed {
                                 t.lit.build(&FIXED_LIT_LENS, Tree::Literals)?;
                                 t.dist.build(&FIXED_DIST_LENS, Tree::Distances)?;
-                                if self.fast {
+                                if self.path == Path::Fast {
                                     t.build_fast(&FIXED_LIT_LENS, &FIXED_DIST_LENS);
                                 }
                                 t.fixed = true;
@@ -651,7 +666,7 @@ impl Core {
                     }
                     t.lit.build(&t.lens[..hlit], Tree::Literals)?;
                     t.dist.build(&t.lens[hlit..hlit + hdist], Tree::Distances)?;
-                    if self.fast {
+                    if self.path == Path::Fast {
                         let lens = t.lens;
                         t.build_fast(&lens[..hlit], &lens[hlit..hlit + hdist]);
                     }
@@ -670,7 +685,7 @@ impl Core {
     /// The symbols of a Huffman block, to its end (`true`) or the input's (`false`).
     fn codes<O: Out>(&mut self, input: &[u8], at: &mut usize, out: &mut O) -> Result<bool, Why> {
         loop {
-            if self.fast
+            if self.path == Path::Fast
                 && let Some(flat) = out.flat()
             {
                 self.fast_codes(input, at, flat);
@@ -806,7 +821,7 @@ impl Core {
             let (dlen, dextra) = (d & 15, (d >> 8) & 15);
             let distance = (d >> 16) as usize
                 + ((rest >> dlen) as usize & ((1 << dextra) - 1))
-                + usize::from(plant::on(Plant::FastDistanceOffByOne));
+                + usize::from(self.plant.has(DeflatePlant::FastDistanceOffByOne));
             if distance > w {
                 break;
             }
@@ -856,26 +871,37 @@ fn copy_match(out: &mut [u8], at: usize, distance: usize, length: usize) {
     }
 }
 
-/// A streaming inflater appending to the caller's vector: see the module.
-pub struct Inflate<A: Allocator> {
-    core: Box<Core, A>,
+/// A streaming inflater appending to the caller's vector: see the module. `P` is the plant seam
+/// (D165): shipped code names [`Inflate`], this with [`NoPlant`].
+pub struct PlantedInflate<A: Allocator, P> {
+    core: Box<Core<P>, A>,
     window: Vec<u8, A>,
     /// Bytes of the window already appended to the caller's output.
     flushed: u64,
 }
 
-impl<A: Allocator + Clone> Inflate<A> {
+/// The inflater as it ships: [`PlantedInflate`] with no plant.
+pub type Inflate<A> = PlantedInflate<A, NoPlant>;
+
+impl<A: Allocator + Clone> PlantedInflate<A, NoPlant> {
     /// An inflater held to `limits`, its window and tables in `alloc`.
     pub fn new_in(limits: Limits, alloc: A) -> Inflate<A> {
-        Inflate {
-            core: Box::new_in(Core::new(limits, false), alloc.clone()),
+        PlantedInflate::new_planted(limits, alloc, NoPlant)
+    }
+}
+
+impl<A: Allocator + Clone, P: Planted<DeflatePlant>> PlantedInflate<A, P> {
+    /// [`Inflate::new_in`] with its plant seam: `plant` is a control's [`DeflatePlant`].
+    pub fn new_planted(limits: Limits, alloc: A, plant: P) -> PlantedInflate<A, P> {
+        PlantedInflate {
+            core: Box::new_in(Core::new(limits, Path::Careful, plant), alloc.clone()),
             window: Vec::from_elem_in(0u8, WINDOW, alloc),
             flushed: 0,
         }
     }
 }
 
-impl<A: Allocator> Inflate<A> {
+impl<A: Allocator, P: Planted<DeflatePlant>> PlantedInflate<A, P> {
     /// Takes what it can of `input`, appending the output it makes to `out`. Once the stream has
     /// ended nothing more is taken. On an error the stream is refused for good: `out` holds what
     /// was made before it, which the caller must not take as the stream's output.
@@ -915,20 +941,32 @@ impl<A: Allocator> Inflate<A> {
     }
 }
 
-/// A streaming inflater writing into one slice the caller sized: see the module.
-pub struct InflateInto {
-    core: Core,
+/// A streaming inflater writing into one slice the caller sized: see the module. `P` is the
+/// plant seam (D165): shipped code names [`InflateInto`], this with [`NoPlant`].
+pub struct PlantedInflateInto<P> {
+    core: Core<P>,
 }
 
-impl InflateInto {
+/// The slice inflater as it ships: [`PlantedInflateInto`] with no plant.
+pub type InflateInto = PlantedInflateInto<NoPlant>;
+
+impl PlantedInflateInto<NoPlant> {
     /// An inflater held to `limits` (and to the slice it is fed: the lesser bound wins).
     pub const fn new(limits: Limits) -> InflateInto {
-        InflateInto { core: Core::new(limits, true) }
+        PlantedInflateInto { core: Core::new(limits, Path::Fast, NoPlant) }
     }
 
     /// The same decoder without its fast loop: the twin the tests hold it equal to.
     pub const fn careful(limits: Limits) -> InflateInto {
-        InflateInto { core: Core::new(limits, false) }
+        PlantedInflateInto { core: Core::new(limits, Path::Careful, NoPlant) }
+    }
+}
+
+impl<P: Planted<DeflatePlant>> PlantedInflateInto<P> {
+    /// [`InflateInto::new`] (the fast loop on) with its plant seam: `plant` is a control's
+    /// [`DeflatePlant`].
+    pub const fn new_planted(limits: Limits, plant: P) -> PlantedInflateInto<P> {
+        PlantedInflateInto { core: Core::new(limits, Path::Fast, plant) }
     }
 
     /// Takes what it can of `input`, writing the output into `out` after the

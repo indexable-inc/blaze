@@ -4,14 +4,15 @@
 
 use std::{
     io::{self, Write as _},
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::io::OwnedHandle,
     path::Path,
 };
 
-use windows_sys::Win32::{
-    Foundation::{FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE},
-    Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+use blaze_sys::windows::{
+    Handle,
+    foundation::{FILE_SUPPORTS_BLOCK_REFCOUNTING, FILETIME, GENERIC_READ, GENERIC_WRITE},
+    fs::{
+        CREATE_NEW,CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
         FILE_BASIC_INFO, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
@@ -22,14 +23,10 @@ use windows_sys::Win32::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
         SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
-    System::{
-        IO::DeviceIoControl,
-        Ioctl::{
-            DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-            FSCTL_GET_INTEGRITY_INFORMATION, FSCTL_GET_INTEGRITY_INFORMATION_BUFFER,
-            FSCTL_SET_INTEGRITY_INFORMATION, FSCTL_SET_INTEGRITY_INFORMATION_BUFFER,
-        },
-        SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING,
+    io::{
+        DUPLICATE_EXTENTS_DATA, DeviceIoControl, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+        FSCTL_GET_INTEGRITY_INFORMATION, FSCTL_GET_INTEGRITY_INFORMATION_BUFFER,
+        FSCTL_SET_INTEGRITY_INFORMATION, FSCTL_SET_INTEGRITY_INFORMATION_BUFFER,
     },
 };
 
@@ -67,7 +64,7 @@ pub(super) fn open(wide: &[u16], access: Access) -> io::Result<OwnedHandle> {
             std::ptr::null(),
             disposition,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     sys::owned(handle)
@@ -89,11 +86,11 @@ pub(super) fn read_whole(wide: &[u16]) -> io::Result<Vec<u8>> {
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     let handle = sys::owned(handle)?;
-    let raw = handle.as_raw_handle();
+    let raw = sys::handle_of(&handle);
     let size = usize::try_from(size(raw)?).unwrap_or(usize::MAX);
     // alloc: the bytes read, `Done::Read`'s payload, which the reads write in place.
     let mut bytes = Vec::with_capacity(size.saturating_add(1));
@@ -125,7 +122,7 @@ pub(super) fn read_whole(wide: &[u16]) -> io::Result<Vec<u8>> {
 }
 
 /// The length of the file open as `handle`.
-pub(super) fn size(handle: HANDLE) -> io::Result<u64> {
+pub(super) fn size(handle: Handle) -> io::Result<u64> {
     let mut size = 0i64;
     // SAFETY: an open handle (the caller's) and an `i64` to write.
     sys::check(unsafe { GetFileSizeEx(handle, &mut size) })?;
@@ -288,14 +285,16 @@ pub(super) fn set_times_of(wide: &[u16], modified_ns: u64) -> io::Result<()> {
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     let handle = sys::owned(handle)?;
     let time = file_time(modified_ns);
     // SAFETY: an open handle with the right to write attributes, and a `FILETIME` alive across
     // the call for both the access and the write time; the null creation time is left as is.
-    sys::check(unsafe { SetFileTime(handle.as_raw_handle(), std::ptr::null(), &time, &time) })
+    sys::check(unsafe {
+        SetFileTime(sys::handle_of(&handle), std::ptr::null(), &time, &time)
+    })
 }
 
 /// [`set_times_of`] of `path`, for the calls on threads; the error names `path`.
@@ -318,7 +317,7 @@ fn plain(path: &Path, rights: u32, disposition: u32) -> io::Result<OwnedHandle> 
             std::ptr::null(),
             disposition,
             FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     // alloc: an error path.
@@ -342,7 +341,7 @@ fn clone_source(from: &Path) -> io::Result<OwnedHandle> {
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     // alloc: an error path.
@@ -376,7 +375,7 @@ fn attribute_tag(handle: &OwnedHandle) -> io::Result<FILE_ATTRIBUTE_TAG_INFO> {
     // SAFETY: an open handle and a buffer of the type and size the class fills.
     sys::check(unsafe {
         GetFileInformationByHandleEx(
-            handle.as_raw_handle(),
+            sys::handle_of(handle),
             FileAttributeTagInfo,
             (&raw mut info).cast(),
             std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
@@ -413,7 +412,7 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     // alloc: an error path.
@@ -466,7 +465,7 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
     // the class reads.
     sys::check(unsafe {
         SetFileInformationByHandle(
-            handle.as_raw_handle(),
+            sys::handle_of(&handle),
             FileBasicInfo,
             (&raw const basic).cast(),
             std::mem::size_of::<FILE_BASIC_INFO>() as u32,
@@ -483,7 +482,7 @@ fn file_system(handle: &OwnedHandle) -> io::Result<(String, bool)> {
     // rest is not asked for.
     sys::check(unsafe {
         GetVolumeInformationByHandleW(
-            handle.as_raw_handle(),
+            sys::handle_of(handle),
             std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),
@@ -516,7 +515,7 @@ fn control<T, U>(
     // be UB.
     sys::check(unsafe {
         DeviceIoControl(
-            handle.as_raw_handle(),
+            sys::handle_of(handle),
             code,
             in_ptr,
             in_len as u32,
@@ -546,7 +545,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
             ),
         ));
     }
-    let len = size(source.as_raw_handle())?;
+    let len = size(sys::handle_of(&source))?;
     let target = plain(to, GENERIC_READ | GENERIC_WRITE, CREATE_NEW)?;
     let cloned = (|| {
         // Both must keep checksums alike, and the clone is in whole clusters.
@@ -564,7 +563,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
         // SAFETY: an open handle and the information of the class named, of its size.
         sys::check(unsafe {
             SetFileInformationByHandle(
-                target.as_raw_handle(),
+                sys::handle_of(&target),
                 FileEndOfFileInfo,
                 (&raw const end).cast(),
                 size_of::<FILE_END_OF_FILE_INFO>() as u32,
@@ -578,7 +577,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
             let count = (len - at).div_ceil(cluster) * cluster;
             let count = count.min(most);
             let extents = DUPLICATE_EXTENTS_DATA {
-                FileHandle: source.as_raw_handle(),
+                FileHandle: sys::handle_of(&source),
                 SourceFileOffset: at as i64,
                 TargetFileOffset: at as i64,
                 ByteCount: count as i64,

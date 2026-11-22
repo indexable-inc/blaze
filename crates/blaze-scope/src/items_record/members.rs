@@ -65,7 +65,9 @@ impl<'a> ItemsRecord<'a> {
         let b: &'a [u8] = self.bytes;
         let m = self.row(T_MEMBERS, k);
         let flags = b[m + 55];
-        let text = self.span(le32(b, m + 32), le32(b, m + 36), le32(b, m + 40))?;
+        let outline = ItemIndex(le32(b, m + 44));
+        let at = self.at_of(le32(b, m + 32))?;
+        let text = self.item_span(at, outline, le32(b, m + 36), le32(b, m + 40))?;
         let written_by = match text {
             Some(TextSpan { at: At::Expansion(call), .. }) if flags & CTOR_OR_WRITTEN_BY != 0 => Some(call),
             _ => None,
@@ -73,11 +75,12 @@ impl<'a> ItemsRecord<'a> {
         Ok(MemberRow {
             key: key_at(b, m),
             name: if flags & NAMED != 0 { Some(self.str_at("a member's name", le32(b, m + 48), u32::from(le16(b, m + 52)))?) } else { None },
-            outline: ItemIndex(le32(b, m + 44)),
+            outline,
             kind: ItemKind::from_byte(b[m + 54]).ok_or(ItemsRecordError::Byte { what: "a member's kind", byte: b[m + 54] })?,
             body_holds_items: flags & BODY_HOLDS_ITEMS != 0,
             text,
             written_by,
+            lifetimes: super::lifetimes_of(le16(b, m + 56)),
         })
     }
 }

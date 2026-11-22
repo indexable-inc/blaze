@@ -26,7 +26,6 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_unit_graph::{Ask, CfgAtom, NoResolver, Package, Records, Resolver, TargetDesc};
 use bstd::cx::Cx;
-use bstd::fs::Fs;
 use bstd::mem::Frame;
 
 use crate::CliError;
@@ -214,6 +213,12 @@ impl<'f> Graph<'f> {
     pub fn member_dirs(&self) -> &[(LockId, blaze_unit_graph::Text<'static>)] {
         &self.dirs
     }
+
+    /// The graph source is the standing proof's graph half. It is derived from the lock bytes,
+    /// layout reads, target and host cfg, and the request ask by `unit_graph_task::source`.
+    pub(crate) fn plan_source(&self) -> ContentId {
+        self.source
+    }
 }
 
 /// This build's target as the pinned toolchain states it: its cfg atoms, read from the
@@ -234,7 +239,7 @@ pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, program: blaze_manifest
     let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, id).map_err(CliError::Toolchain)?;
     let view = blaze_toolchain::ToolchainView::open(manifest.as_ref(), id)
         .map_err(|_| CliError::Text { what: "the pinned toolchain's manifest is refused by its reader" })?;
-    let refused = |why: &dyn core::fmt::Display| CliError::Program(blaze_ladder::run::RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(crate::ManifestRefused::of(why, frame));
     // The build script's run target is this machine's (the unit graph's host today).
     let cuts = blaze_world::panic::Cuts::read(view, TRIPLE).map_err(|e| refused(&e))?;
     let panic = blaze_world::panic::unit_panic(program, blaze_world::Side::Target, kind, &cuts).map_err(|e| refused(&e))?;

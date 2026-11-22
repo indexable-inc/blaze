@@ -22,7 +22,7 @@ use std::{
     ffi::{OsString, c_void},
     io,
     marker::PhantomPinned,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::io::OwnedHandle,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -30,44 +30,39 @@ use std::{
     },
 };
 
-use windows_sys::Win32::{
-    Foundation::{
-        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, STATUS_COMMITMENT_LIMIT,
-    },
-    Security::SECURITY_ATTRIBUTES,
-    Storage::FileSystem::{
+use blaze_sys::windows::{
+    Bool, Handle,
+    foundation::{GENERIC_READ, GENERIC_WRITE, STATUS_COMMITMENT_LIMIT},
+    fs::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
         PIPE_ACCESS_OUTBOUND,
     },
-    System::{
-        JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-            JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
-            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-            TerminateJobObject,
-        },
-        Pipes::{
-            CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-            PIPE_WAIT,
-        },
-        Threading::{
-            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-            INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-            RegisterWaitForSingleObject, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-            STARTUPINFOW, TerminateProcess, UnregisterWaitEx, UpdateProcThreadAttribute,
-            WT_EXECUTEONLYONCE,
-        },
+    io::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        PIPE_WAIT,
+    },
+    security::SECURITY_ATTRIBUTES,
+    threading::{
+        AssignProcessToJobObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+        CreateJobObjectW, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+        InitializeProcThreadAttributeList, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+        JobObjectExtendedLimitInformation, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+        QueryInformationJobObject, RegisterWaitForSingleObject, ResumeThread,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, SetInformationJobObject,
+        TerminateJobObject, TerminateProcess, UnregisterWaitEx, UpdateProcThreadAttribute,
+        WT_EXECUTEONLYONCE,
     },
 };
 
 use super::{
     rundirs::RunDirs,
-    sys::{self, KEY_JOB, Port, WideName},
+    sys::{self, KEY_JOB, Port, WideName, handle_of},
 };
 use crate::{Command, Confine, Exit, Sandbox};
 
@@ -228,7 +223,7 @@ pub(super) fn standard(command: &Command, n: u64) -> io::Result<Standard> {
 fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     let job = job(command.memory)?;
     let Standard { stdin, stdout, stderr, theirs } = standard(command, n)?;
-    let inherited = theirs.each_ref().map(|it| it.as_raw_handle());
+    let inherited = theirs.each_ref().map(handle_of);
     let flags = CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT
         | CREATE_SUSPENDED
@@ -236,10 +231,10 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     let (process, thread) = create(launch, inherited, &inherited, flags)?;
     // SAFETY: the job and the process just made, which has not run.
     if let Err(error) = sys::check(unsafe {
-        AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle())
+        AssignProcessToJobObject(handle_of(&job), handle_of(&process))
     }) {
         // SAFETY: the process just made.
-        unsafe { TerminateProcess(process.as_raw_handle(), KILLED) };
+        unsafe { TerminateProcess(handle_of(&process), KILLED) };
         // alloc: an error path.
         return Err(io::Error::new(error.kind(), format!("into its job: {error}")));
     }
@@ -253,8 +248,8 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
 /// returns). Its process and first thread.
 pub(super) fn create(
     launch: &Launch<'_>,
-    standard: [HANDLE; 3],
-    inherited: &[HANDLE],
+    standard: [Handle; 3],
+    inherited: &[Handle],
     flags: PROCESS_CREATION_FLAGS,
 ) -> io::Result<(OwnedHandle, OwnedHandle)> {
     // alloc: what the process is started with, made once as it starts.
@@ -282,7 +277,7 @@ pub(super) fn create(
             line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            1,
+            Bool::TRUE,
             flags,
             env.as_ptr().cast(),
             dir.as_ptr(),
@@ -299,7 +294,7 @@ pub(super) fn create(
 /// The process of `thread`, made suspended in `job`, run; or, refused, its job ended.
 pub(super) fn resume(thread: OwnedHandle, job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: the process's thread, suspended once at its making.
-    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+    if unsafe { ResumeThread(handle_of(&thread)) } == u32::MAX {
         let error = io::Error::last_os_error();
         terminate(job, KILLED);
         return Err(error);
@@ -318,7 +313,7 @@ pub(super) fn follow(job: &OwnedHandle, port: &Port, key: usize) -> io::Result<(
     // number, handed back with each message.
     sys::check(unsafe {
         SetInformationJobObject(
-            job.as_raw_handle(),
+            handle_of(job),
             JobObjectAssociateCompletionPortInformation,
             (&raw const associate).cast(),
             size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
@@ -342,7 +337,7 @@ pub(super) fn job(memory: Option<u64>) -> io::Result<OwnedHandle> {
     // SAFETY: the job, and information of the class named, of its size.
     sys::check(unsafe {
         SetInformationJobObject(
-            job.as_raw_handle(),
+            handle_of(&job),
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -354,7 +349,7 @@ pub(super) fn job(memory: Option<u64>) -> io::Result<OwnedHandle> {
 /// The job, and with it everything in it, ended with `code`.
 pub(super) fn terminate(job: &OwnedHandle, code: u32) {
     // SAFETY: an open job.
-    unsafe { TerminateJobObject(job.as_raw_handle(), code) };
+    unsafe { TerminateJobObject(handle_of(job), code) };
 }
 
 /// No process may join `job` from here (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` of 0), its other
@@ -366,7 +361,7 @@ pub(super) fn seal(job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: an open job and a buffer of the class named, of its size.
     sys::check(unsafe {
         QueryInformationJobObject(
-            job.as_raw_handle(),
+            handle_of(job),
             JobObjectExtendedLimitInformation,
             (&raw mut limits).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -378,7 +373,7 @@ pub(super) fn seal(job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: the job, and information of the class named, of its size.
     sys::check(unsafe {
         SetInformationJobObject(
-            job.as_raw_handle(),
+            handle_of(job),
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -390,7 +385,7 @@ pub(super) fn seal(job: &OwnedHandle) -> io::Result<()> {
 pub(super) fn code(process: &OwnedHandle) -> io::Result<i32> {
     let mut code = 0u32;
     // SAFETY: an open process and a code to write.
-    sys::check(unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) })?;
+    sys::check(unsafe { GetExitCodeProcess(handle_of(process), &mut code) })?;
     Ok(code as i32)
 }
 
@@ -429,7 +424,7 @@ pub(super) fn pipe(inbound: bool, n: u64, which: &str) -> io::Result<(OwnedHandl
     let inherit = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
+        bInheritHandle: Bool::TRUE,
     };
     // The child's reading end may set its own pipe's state, as a console program does.
     let rights = match inbound {
@@ -438,7 +433,7 @@ pub(super) fn pipe(inbound: bool, n: u64, which: &str) -> io::Result<(OwnedHandl
     };
     // SAFETY: the name just made and attributes that outlive the call.
     let theirs = unsafe {
-        CreateFileW(wide.as_ptr(), rights, 0, &inherit, OPEN_EXISTING, 0, std::ptr::null_mut())
+        CreateFileW(wide.as_ptr(), rights, 0, &inherit, OPEN_EXISTING, 0, Handle::NULL)
     };
     Ok((ours, sys::owned(theirs)?))
 }
@@ -449,7 +444,7 @@ fn nothing() -> io::Result<OwnedHandle> {
     let inherit = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
+        bInheritHandle: Bool::TRUE,
     };
     // SAFETY: a NUL-terminated name and attributes that outlive the call.
     let handle = unsafe {
@@ -460,7 +455,7 @@ fn nothing() -> io::Result<OwnedHandle> {
             &inherit,
             OPEN_EXISTING,
             0,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     };
     sys::owned(handle)
@@ -472,7 +467,7 @@ struct Attributes {
 }
 
 impl Attributes {
-    fn new(handles: &[HANDLE]) -> io::Result<Attributes> {
+    fn new(handles: &[Handle]) -> io::Result<Attributes> {
         let mut size = 0;
         // SAFETY: a query of the size, writing nothing but `size`; it fails, as it must.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
@@ -523,7 +518,7 @@ pub(super) struct Waiter {
 
 #[derive(Clone, Copy)]
 struct Posted {
-    port: HANDLE,
+    port: Handle,
     key: usize,
     id: u64,
 }
@@ -541,7 +536,7 @@ impl Waiter {
 /// Asks the thread pool to post as its [`Waiter`] says once the process has ended;
 /// unregistered, and waited out, when dropped.
 pub(super) struct Waiting {
-    wait: HANDLE,
+    wait: Handle,
 }
 
 /// # Safety
@@ -559,22 +554,22 @@ impl Waiting {
     /// `waiter` stays where it is, alive, until the `Waiting` is dropped.
     pub(super) unsafe fn new(process: &OwnedHandle, waiter: &Waiter) -> io::Result<Waiting> {
         let context = waiter.posted.get();
-        let mut wait = std::ptr::null_mut();
+        let mut wait = Handle::NULL;
         // SAFETY: an open process, a callback of the signature asked for, and a context that
         // lives until the wait is unregistered (the caller's word).
         let ok = unsafe {
             RegisterWaitForSingleObject(
                 &mut wait,
-                process.as_raw_handle(),
+                handle_of(process),
                 Some(ended),
                 context.cast_const().cast(),
                 INFINITE,
                 WT_EXECUTEONLYONCE,
             )
         };
-        match ok {
-            0 => Err(io::Error::last_os_error()),
-            _ => Ok(Waiting { wait }),
+        match ok.is_true() {
+            false => Err(io::Error::last_os_error()),
+            true => Ok(Waiting { wait }),
         }
     }
 }
@@ -583,7 +578,7 @@ impl Drop for Waiting {
     fn drop(&mut self) {
         // SAFETY: the wait `new` registered; `INVALID_HANDLE_VALUE` waits for a callback in
         // progress to return, after which no call reads the waiter.
-        unsafe { UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE) };
+        unsafe { UnregisterWaitEx(self.wait, Handle::INVALID) };
     }
 }
 
@@ -628,7 +623,7 @@ fn peak(job: &OwnedHandle) -> io::Result<u64> {
     // SAFETY: an open job and a buffer of the class named, of its size.
     sys::check(unsafe {
         QueryInformationJobObject(
-            job.as_raw_handle(),
+            handle_of(job),
             JobObjectExtendedLimitInformation,
             (&raw mut limits).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,

@@ -148,7 +148,7 @@ impl<'b, 'n, H: Heads, S: super::source::NamesSource<'n>> Builder<'b, H, S> {
     /// `<me as Tr<..>>::name` for the one trait among them and their supertraits that declares
     /// `name`; `None` when no written bound declares it; two are the language's ambiguity.
     #[expect(clippy::too_many_arguments, reason = "the path, where it is written, and whose bounds are read")]
-    fn written_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, subject: Subject, me: PTy, name: Name, r: Range, shown: &str) -> Result<Option<PTy>, Why> {
+    fn written_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, subject: Subject, me: PTy, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<Option<PTy>, Why> {
         let mut bounds = Vec::new_in(Global);
         written_bounds(v, subject, &mut bounds)?;
         let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
@@ -195,7 +195,7 @@ impl<'b, 'n, H: Heads, S: super::source::NamesSource<'n>> Builder<'b, H, S> {
         }
         match found.as_slice() {
             [] => Ok(None),
-            &[(t, a)] => Ok(Some(intern(tys, PNode::Alias { trait_: self.heads.checker(t), name, args: a })?)),
+            &[(t, a)] => self.assoc_with_args(tys, t, name, a, own, r, shown).map(Some),
             many => {
                 let mut traits = Vec::with_capacity_in(many.len(), Global);
                 traits.extend(many.iter().map(|&(t, _)| t));
@@ -207,9 +207,10 @@ impl<'b, 'n, H: Heads, S: super::source::NamesSource<'n>> Builder<'b, H, S> {
     /// `Self::name` in the header `v` of a trait whose supertraits are not filed yet (its own
     /// bounds are being lowered) and that does not declare `name` itself: through its
     /// supertrait list and `where Self: ..` as written.
-    pub(super) fn written_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
+    #[expect(clippy::too_many_arguments, reason = "the associated item's arguments and the site of Self's written bounds")]
+    pub(super) fn written_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
         let me = intern(tys, PNode::Param(0))?;
-        match self.written_assoc(tys, env, v, Subject::TraitSelf, me, name, r, shown)? {
+        match self.written_assoc(tys, env, v, Subject::TraitSelf, me, name, own, r, shown)? {
             Some(t) => Ok(t),
             None => Err(Why::AssocNotFound(shown.into(), r)),
         }
@@ -219,9 +220,9 @@ impl<'b, 'n, H: Heads, S: super::source::NamesSource<'n>> Builder<'b, H, S> {
     /// lowered: through the bounds written on `T` in `v`. `None` when none of them declares
     /// `name` (the parameter may be an outer item's, whose bounds `env` holds).
     #[expect(clippy::too_many_arguments, reason = "the path, where it is written, and the parameter")]
-    pub(super) fn written_param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, param: u32, name: Name, r: Range, shown: &str) -> Result<Option<PTy>, Why> {
+    pub(super) fn written_param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, param: u32, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<Option<PTy>, Why> {
         let Some(&(pname, _)) = env.params.iter().find(|(_, i)| *i == param) else { return Ok(None) };
         let me = intern(tys, PNode::Param(param))?;
-        self.written_assoc(tys, env, v, Subject::Param(pname), me, name, r, shown)
+        self.written_assoc(tys, env, v, Subject::Param(pname), me, name, own, r, shown)
     }
 }

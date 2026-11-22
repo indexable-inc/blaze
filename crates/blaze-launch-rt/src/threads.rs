@@ -23,6 +23,9 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+use blaze_sys::posix::thread;
+
 use crate::table::{Birth, Mutator, Shared};
 
 /// The launcher's `Shared`, leaked by [`adopt`]: what [`create`] announces births to.
@@ -47,13 +50,19 @@ const ROUNDS: u8 = 4;
 /// calling thread (the program's main thread) its [`Mutator`], which it keeps until the
 /// process ends. Called once, before any of the program's code runs.
 pub fn adopt(shared: &Arc<Shared>) -> Result<Mutator, i32> {
-    let mut key: libc::pthread_key_t = 0;
-    // SAFETY: `key` is a live local the call fills; `ended` has the destructor's signature
-    // and lives as long as the process.
-    let refused = unsafe { libc::pthread_key_create(&mut key, Some(ended)) };
-    if refused != 0 {
-        return Err(refused);
-    }
+    #[cfg(target_os = "macos")]
+    let key = thread::key_create(Some(ended)).map_err(|error| i32::from(error.raw()))?;
+    #[cfg(not(target_os = "macos"))]
+    let key = {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: `key` is a live local the call fills; `ended` has the destructor's signature
+        // and lives as long as the process.
+        let refused = unsafe { libc::pthread_key_create(&mut key, Some(ended)) };
+        if refused != 0 {
+            return Err(refused);
+        }
+        key
+    };
     KEY.store(key as usize + 1, Ordering::Release);
     // One count of the `Arc` is leaked: threads announce to it for the life of the process.
     SHARED.store(Arc::into_raw(Arc::clone(shared)).cast_mut(), Ordering::Release);
@@ -71,10 +80,15 @@ unsafe extern "C" fn ended(ending: *mut c_void) {
     let rounds = unsafe { &mut (*ending).rounds };
     *rounds += 1;
     if *rounds < ROUNDS {
-        let key = (KEY.load(Ordering::Acquire) - 1) as libc::pthread_key_t;
+        let key = KEY.load(Ordering::Acquire) - 1;
         // SAFETY: the key is this module's; the value is this thread's own `Ending`. Set
         // again, the system calls this destructor again in its next round.
-        if unsafe { libc::pthread_setspecific(key, ending.cast()) } == 0 {
+        #[cfg(target_os = "macos")]
+        let armed = unsafe { thread::set_specific(key as thread::pthread_key_t, ending.cast()) }.is_ok();
+        #[cfg(not(target_os = "macos"))]
+        // SAFETY: the same live key and its own Ending.
+        let armed = unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, ending.cast()) } == 0;
+        if armed {
             return;
         }
     }
@@ -105,10 +119,14 @@ extern "C" fn run(born: *mut c_void) -> *mut c_void {
     let sampled = crate::sample::register::enter(me.thread().0);
     // alloc: one `Ending` a thread, freed by the key's destructor as the thread ends.
     let ending = Box::into_raw(Box::new(Ending { me, rounds: 0, sampled }));
-    let key = (KEY.load(Ordering::Acquire) - 1) as libc::pthread_key_t;
+    let key = KEY.load(Ordering::Acquire) - 1;
+    #[cfg(target_os = "macos")]
+    // SAFETY: adopt created this live key with ended as its destructor for this boxed Ending.
+    let _ = unsafe { thread::set_specific(key as thread::pthread_key_t, ending.cast()) };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: the key was made by `adopt` before any thread could be created through
     // `create`; the value is this thread's own.
-    unsafe { libc::pthread_setspecific(key, ending.cast()) };
+    unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, ending.cast()) };
     start(arg)
 }
 
@@ -124,7 +142,7 @@ pub unsafe extern "C" fn create(
     attr: *const libc::pthread_attr_t,
     start: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
-) -> libc::c_int {
+) -> core::ffi::c_int {
     let shared = SHARED.load(Ordering::Acquire);
     // SAFETY: `adopt` leaked a count of the `Arc` this points to (the caller's contract), so
     // it lives as long as the process; a count is taken for the borrow below and given
@@ -135,6 +153,11 @@ pub unsafe extern "C" fn create(
     };
     // alloc: what the new thread begins with, freed by it.
     let born = Box::into_raw(Box::new(Born { birth: shared.birth(), start, arg }));
+    #[cfg(target_os = "macos")]
+    // SAFETY: thread is writable and attr is null or initialized, as guaranteed by the caller.
+    // The macOS pointers name the same pthread ABI types, and run takes ownership of the box.
+    let refused = unsafe { thread::pthread_create(thread.cast(), attr.cast(), run, born.cast()) };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: the caller's contract for `thread`, `attr`; `run` takes the box.
     let refused = unsafe { libc::pthread_create(thread, attr, run, born.cast()) };
     if refused != 0 {

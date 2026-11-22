@@ -14,26 +14,6 @@ members = [
 exclude = [
     # Parked (docs/v2/plan/parked.md): kept on disk, out of the build until the new item layer
     # (docs/v2/plan/design/bottom.md) gives what each waits on. The list there says why.
-    "crates/blaze-cargo",
-    "crates/blaze-certify",
-    "crates/blaze-codegen",
-    "crates/blaze-diagnostics",
-    "crates/blaze-doc",
-    "crates/blaze-global",
-    "crates/blaze-item-hash",
-    "crates/blaze-items",
-    "crates/blaze-launch-host",
-    "crates/blaze-lazy",
-    "crates/blaze-link",
-    "crates/blaze-macro-eval",
-    "crates/blaze-metadata",
-    "crates/blaze-registry",
-    "crates/blaze-shader",
-    "crates/blaze-stencil",
-    "crates/blaze-testsel",
-    "crates/blaze-tree",
-    "crates/blaze-units",
-    "crates/blaze-usercode",
     # harness, its own workspace with its own lock: a macOS app and daemon blaze does not build
     # (crates/harness/README.md).
     "crates/harness",
@@ -83,14 +63,14 @@ version = "0.20261105.4"
 lock = "required"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
-# crates/blaze-toolchain/pins/llvm.json names for the target, checks its sha256, unpacks it read-only
+# pins/llvm.json names for the target, checks its sha256, unpacks it read-only
 # under its home and sets LLVM_SYS_231_PREFIX to it for these build scripts, over any value the
 # shell has. llvm-sys's (vendor/llvm-sys/pin.rs) links it; blaze-stencil's makes its stencils with
 # it when `llvm-stencils` is on (the wasm seed builds it without, and asks for no LLVM).
 [workspace.metadata.blaze.native.llvm]
-pin = "crates/blaze-toolchain/pins/llvm.json"
+pin = "pins/llvm.json"
 env = "LLVM_SYS_231_PREFIX"
-packages = ["llvm-sys", "blaze-stencil/llvm-stencils", "blaze-llvm"]
+packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 
 [workspace.package]
 version = "0.0.0"
@@ -223,8 +203,11 @@ rustls = { path = "vendor/rustls" }
 
 [workspace.dependencies]
 arrow-array = { version = "60.1.0", default-features = false }
+astlog = { path = "tools/astlog/cli" }
 crossbeam-channel = "0.5.17"
 crossbeam-queue = "0.3.14"
+gpu = { path = "crates/gpu" }
+gpu-macros = { path = "crates/gpu-macros" }
 parking_lot = "0.12.5"
 aho-corasick = "1.1.5"
 arrayvec = "0.7.8"
@@ -232,6 +215,7 @@ either = "1.19.0"
 expect-test = "1.5.1"
 indexmap = { version = "2.14.2", features = ["serde"] }
 itertools = "0.15.0"
+scripts = { path = "scripts" }
 smallvec = { version = "1.16.4", features = [
     "const_new",
     "union",
@@ -255,45 +239,57 @@ unicode-security = "=0.1.2"
 regex = { version = "1.13.1", default-features = false, features = ["perf", "std", "unicode-perl"] }
 blaze-glob = { path = "crates/blaze-glob" }
 # local crates
-macros = { path = "crates/macros", version = "0.0.0" }
 blaze-body = { path = "crates/blaze-body" }
 blaze-body-drops = { path = "crates/blaze-body-drops" }
 blaze-body-eval = { path = "crates/blaze-body-eval" }
 blaze-body-flow = { path = "crates/blaze-body-flow" }
 blaze-body-lower = { path = "crates/blaze-body-lower" }
 blaze-build-script = { path = "crates/blaze-build-script" }
-blaze-macro-eval = { path = "crates/blaze-macro-eval" }
+blaze-cad = { path = "crates/blaze-cad" }
+blaze-cad-field = { path = "crates/blaze-cad-field" }
+blaze-cad-mesh = { path = "crates/blaze-cad-mesh" }
+blaze-cad-out = { path = "crates/blaze-cad-out" }
+blaze-cad-picture = { path = "crates/blaze-cad-picture" }
+blaze-cast = { path = "crates/blaze-cast" }
+blaze-cc = { path = "crates/blaze-cc" }
+blaze-cert = { path = "crates/blaze-cert" }
+blaze-code = { path = "crates/blaze-code" }
+blaze-cunit = { path = "crates/blaze-cunit" }
+blaze-engine = { path = "crates/blaze-engine" }
+blaze-export = { path = "crates/blaze-export" }
+blaze-launcher = { path = "crates/blaze-launcher" }
+blaze-lower = { path = "crates/blaze-lower" }
 blaze-manifest = { path = "crates/blaze-manifest" }
-blaze-metadata = { path = "crates/blaze-metadata" }
+blaze-math = { path = "crates/blaze-math" }
+blaze-native = { path = "crates/blaze-native" }
+blaze-pins = { path = "crates/blaze-pins" }
 blaze-new = { path = "crates/blaze-new" }
-blaze-tree = { path = "crates/blaze-tree" }
+blaze-producers = { path = "crates/blaze-producers" }
 blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
-blaze-units = { path = "crates/blaze-units" }
+blaze-stage = { path = "crates/blaze-stage" }
+blaze-test-reach = { path = "crates/blaze-test-reach" }
 blaze-unit-graph = { path = "crates/blaze-unit-graph" } # Features and cfgs per crate by cargo's rules, sans-IO: the unit graph of the new layer.
-blaze-shader = { path = "crates/blaze-shader" }
-blaze-doc = { path = "crates/blaze-doc" }
+blaze-units = { path = "crates/blaze-units" }
 blaze-facts = { path = "crates/blaze-facts" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
-blaze-image = { path = "crates/blaze-image" }
 blaze-profile = { path = "crates/blaze-profile" }
+blaze-world-api = { path = "crates/blaze-world-api" }
 ix-prof = { path = "crates/ix-prof", default-features = false }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
 blaze-screen = { path = "crates/blaze-screen" }
 blaze-script = { path = "crates/blaze-script" }
-blaze-serde = { path = "crates/blaze-serde" }
-blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 # v2 (docs/v2/plan.md)
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
+blaze-answer = { path = "crates/blaze-answer" }
+blaze-ask = { path = "crates/blaze-ask" }
+blaze-bench = { path = "crates/blaze-bench" }
 blaze-bytes = { path = "crates/blaze-bytes" }
 blaze-cas = { path = "crates/blaze-cas" }
-blaze-kernel = { path = "crates/blaze-kernel" }
-blaze-front-items = { path = "crates/blaze-front-items" }
-blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
 # The two lock-free queues, bounded and unbounded (rule standard-structures).
@@ -301,9 +297,7 @@ blaze-queue = { path = "crates/blaze-queue" }
 # Spans and events, the one home of tracing (crates/blaze-trace; docs/v2/plan/design/no-tracing.md).
 blaze-trace = { path = "crates/blaze-trace" }
 blaze-sys = { path = "crates/blaze-sys" }
-blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
-blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 # `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
@@ -323,7 +317,7 @@ blaze-blake3 = { path = "crates/blaze-blake3" }
 blaze-ed25519 = { path = "crates/blaze-ed25519" } # Ed25519 verification written here; the shared cache's head check
 # The SwissTable group probe and `Index`, re-exported as `blaze_mem::swiss`.
 blaze-swiss = { path = "crates/blaze-swiss" }
-blaze-hash = { path = "crates/blaze-hash", features = ["serde", "shared"] }
+blaze-hash = { path = "crates/blaze-hash", features = ["shared"] }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids", features = ["serde"] }
@@ -341,29 +335,23 @@ blaze-run = { path = "crates/blaze-run" } # `blaze run`/`blaze test` as sans-IO 
 blaze-drive = { path = "crates/blaze-drive" } # One command's request on the new item layer as a sans-IO machine (docs/v2/plan/design/drive.md).
 blaze-cli = { path = "crates/blaze-cli" } # The `blaze` binary over blaze-drive, reaching the system through bstd (drive.md, "The system side").
 blaze-watch = { path = "crates/blaze-watch" } # The monitor's rings, transport, viewer core and recorder (docs/v2/plan/design/watch.md).
-# The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
-# and the process that performs the driver's effects.
-blaze-host = { path = "crates/blaze-host" }
-# The no-daemon leaf table and its sweep.
-blaze-solo = { path = "crates/blaze-solo" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-build = { path = "crates/blaze-build" } # A type-checked body to LIR (crates/blaze-cli/tests/ladder/README.md).
 blaze-body-build = { path = "crates/blaze-body-build" }
 blaze-consteval = { path = "crates/blaze-consteval" } # The constant evaluator (docs/v2/plan/design/consteval.md).
 blaze-emit = { path = "crates/blaze-emit" } # The baseline tier: LIR to AArch64 machine code.
 blaze-tier = { path = "crates/blaze-tier" } # Piece 0 of the tiers (backend-next.md D99): the seam, the record rows, the template table's form, register descriptions, samples, keys.
-blaze-llvm = { path = "crates/blaze-llvm" } # The optimizing tier's LLVM (backend-next.md D100 points 7, 8, 9, 14): LIR to LLVM IR with blaze's facts, the named custom pipeline, the inliner's remarks, offered bitcode.
 blaze-ladder = { path = "crates/blaze-ladder" } # The `blaze run` walking skeleton's straight line.
 blaze-world = { path = "crates/blaze-world" } # One world for run and check: the unit graph made into the names library's inputs.
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-lint = { path = "crates/blaze-lint" }
-blaze-real = { path = "crates/blaze-real" } # blaze's stages on a real checkout (tempo): the harness behind docs/v2/plan/design/tempo.md.
+blaze-live = { path = "crates/blaze-live" }
+blaze-real ={ path = "crates/blaze-real" } # blaze's stages on a real checkout (tempo): the harness behind docs/v2/plan/design/tempo.md.
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-record = { path = "crates/blaze-record" }
 blaze-proc-macro = { path = "crates/blaze-proc-macro", default-features = false }
 blaze-remote = { path = "crates/blaze-remote" }
 # The request certificate, its slot and the client's own check, with no compiler in it.
-blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
 # blaze's own DEFLATE, zlib and gzip, in place of flate2 and miniz_oxide: no_std, sans-IO, bounded.
@@ -377,6 +365,8 @@ blaze-h2 = { path = "crates/blaze-h2" }
 blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: checked addresses, the one home; bstd re-exports them.
 # A commit's files over git's smart HTTP protocol v2: pkt-lines, packs with deltas, SHA-1 object ids.
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
+# What a run may see and what it saw: roots, RelPath, the read list and its one check (no_std, sans-IO).
+blaze-roots = { path = "crates/blaze-roots" }
 # blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
 blaze-sim = { path = "crates/blaze-sim" }
 # The spawn seam as records: a build step's spawned command and its answer, keyed from text (port27/hvbox-1116/READINESS.md 1a).
@@ -389,6 +379,7 @@ blaze-solve = { path = "crates/blaze-solve" }
 blaze-flow = { path = "crates/blaze-flow" }
 # The lowering from a type-checked body to its flow (flow.md, "The lowering").
 blaze-flow-lower = { path = "crates/blaze-flow-lower" }
+blaze-borrow = { path = "crates/blaze-borrow" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
 blaze-rel = { path = "crates/blaze-rel" }
@@ -398,30 +389,22 @@ blaze-pg = { path = "crates/blaze-pg" }
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 # bstd, blaze's own standard library (docs/v2/plan/design/std.md).
 blaze-std = { path = "crates/blaze-std" }
-blaze-items = { path = "crates/blaze-items" }
-blaze-item-hash = { path = "crates/blaze-item-hash" }
-blaze-link = { path = "crates/blaze-link", default-features = false }
 blaze-store-check = { path = "crates/blaze-store-check" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
 blaze-unicode = { path = "crates/blaze-unicode" }
 # fastcompile (docs/v2/plan/design/compile-time.md)
-blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-inproc = { path = "crates/blaze-inproc" }
 blaze-launch = { path = "crates/blaze-launch" }
 blaze-pack = { path = "crates/blaze-pack" }
-blaze-launch-host = { path = "crates/blaze-launch-host" }
 blaze-launch-rt = { path = "crates/blaze-launch-rt" }
-blaze-program = { path = "crates/blaze-program" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
-blaze-lazy = { path = "crates/blaze-lazy", default-features = false }
-blaze-stencil = { path = "crates/blaze-stencil", default-features = false }
-blaze-testsel = { path = "crates/blaze-testsel" }
 # The session memo the front end runs on, and its attributes.
 blaze-memo = { path = "crates/blaze-memo" }
 blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
+blaze-meter = { path = "crates/blaze-meter" } # D169: each stretch's use (allocations, faults, instructions, effects, store, hashing, waits) from thread-local counters, read without a lock.
 blaze-names-demand = { path = "crates/blaze-names-demand" } # Names by demand: a sans-IO machine that asks a `Source` for one module's entries at a time.
 blaze-names-source = { path = "crates/blaze-names-source" } # blaze-names-demand's `Source` over real inputs (outlines, macro write summaries).
 blaze-malloc = { path = "crates/blaze-malloc" } # blaze's general-purpose allocator: a heap per thread, size-class spans, remote frees by queue (docs/v2/plan/design/malloc.md).
@@ -436,6 +419,7 @@ blaze-cond = { path = "crates/blaze-cond" } # Presence conditions: hash-consed d
 blaze-lex = { path = "crates/blaze-lex" } # The SIMD lexer: rustc_lexer's tokens, a body skipper, UTF-8 validation.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
 blaze-apple-sdk = { path = "crates/blaze-apple-sdk" } # The macOS SDK's one home: its folder (SDKROOT, else xcrun), its version as the identity keys hold.
+blaze-c = { path = "crates/blaze-c" } # C in blaze (docs/v2/plan/design/c.md, D174): the declaration model and record, the import's key, the `CFrontEnd` seam, the rendering to Rust.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).
 blaze-base64 = { path = "crates/blaze-base64" }
@@ -447,19 +431,20 @@ blaze-arrow-ipc = { path = "crates/blaze-arrow-ipc" }
 # `TextSize` and `TextRange`, in place of text-size.
 blaze-text-size = { path = "crates/blaze-text-size" }
 blaze-cbor = { path = "crates/blaze-cbor" } # Deterministic CBOR (RFC 8949 4.2.1): the one home; blaze-pack and blaze-watch take it from here.
+# Compile-time code on blaze's own execution path (D175): grants, the protocol's two machines, the equality harness.
+blaze-comptime = { path = "crates/blaze-comptime" }
+# The C-name table a compile-time child's code is bound to, and its system layer (D175).
+blaze-comptime-sys = { path = "crates/blaze-comptime-sys" }
 blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML) and `value!`.
 blaze-json = { path = "crates/blaze-json" }
 blaze-semver = { path = "crates/blaze-semver" }
 blaze-toml = { path = "crates/blaze-toml" }
-blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
-blaze-vfs = { path = "crates/blaze-vfs" }
 # WASI preview 1 for wasm guests at both pointer widths.
 blaze-wasi = { path = "crates/blaze-wasi" }
 intern = { path = "crates/intern", version = "0.0.0" }
 parser = { path = "crates/parser", version = "0.0.0" }
 paths = { path = "crates/paths", version = "0.0.0" }
-span = { path = "crates/span", version = "0.0.0" }
 stdx = { path = "crates/stdx", version = "0.0.0" }
 syntax = { path = "crates/syntax", version = "0.0.0" }
 const-ast = { path = "crates/const-ast", version = "0.0.0" }
@@ -471,8 +456,7 @@ edition = { path = "crates/edition", version = "0.0.0" }
 # (harness/toolchain_bump.py).
 rustc_lexer = { path = "crates/rustc_lexer" }
 rustc_parse_format = { path = "vendor/rustc_parse_format", version = "0.0.0" }
-ra-ap-rustc_index = { version = "0.179", default-features = false }
-# rustc's layout code, from the tag of the stable in `harness/toolchain`.
+# rustc's layout code, from the tag of the stable in `pins/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.179", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.179", default-features = false }
@@ -550,26 +534,6 @@ sonic-rs = { version = "0.5", default-features = false }
 rustc-literal-escaper = "0.0.8"
 toml = "1.1.8"
 url = "2.5.8"
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    "Win32_Networking_WinSock",
-    "Win32_Security",
-    "Win32_Security_Cryptography",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_IO",
-    "Win32_System_Ioctl",
-    "Win32_System_JobObjects",
-    # `CONTEXT` in `Win32_System_Diagnostics_Debug`.
-    "Win32_System_Kernel",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Pipes",
-    "Win32_System_SystemInformation",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-] }
 hashbrown = { version = "0.17.1", features = [
     "inline-more",
     "nightly",
@@ -577,8 +541,6 @@ hashbrown = { version = "0.17.1", features = [
 ], default-features = false }
 
 # Dependencies of one member, moved to the root (dedup, 2026-10-30).
-blaze-cargo = { path = "crates/blaze-cargo", default-features = false }
-blaze-registry = { path = "crates/blaze-registry", default-features = false }
 cargo-util-schemas = "=0.14.3"
 cov-mark = "2.2.0"
 cranelift-module = "=0.137.1"
@@ -627,7 +589,6 @@ synstructure = "0.13.2"
 tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"
-uds_windows = "1.2.1"
 wasm-encoder = { version = "0.263.0", default-features = false }
 zip = { version = "9.1.3", default-features = false }
 

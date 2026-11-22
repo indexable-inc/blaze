@@ -174,14 +174,18 @@ pub(crate) fn launcher_beside<'f>(exe: &str, frame: &'f Frame) -> Result<bstd::m
 /// ([`crate::code_store::HomeCodeStore`]), so the next `blaze run` finds what this one made.
 /// `today` is the request's certificate and the start list's name (main.rs's
 /// `Effect::StartProgram` site): the list is read under it before the start and written under
-/// it at exit (the module's doc).
+/// it at exit (the module's doc). `native` is the program's native library when its image holds
+/// native code (engine_native.rs `NativeSend`): named in the child's start
+/// (`BLAZE_LAUNCH_NATIVE`) and told as the first frame, before today's list and the
+/// personality (blaze-launch wire/run.rs `Down::Native`); `None` sends neither.
 #[expect(clippy::too_many_arguments, reason = "the own-process run's edge: each argument one input, handle or allocator of it")]
-pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h>>>(
+pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     cx: &Cx,
     launch: &Launch<'_>,
     package: &str,
     builder: Builder,
     front: F,
+    native: Option<crate::engine_native::NativeSend<'_>>,
     lent: &crate::store::CommandLent,
     today: start_list::Today,
     // The run's closing count, for the profile's `run` line on every run (phases.rs): set once
@@ -213,7 +217,7 @@ pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h
     let mut listed = run_parent::ListHeld::None;
     let list = match held.map(|bytes| start_list::read(bytes, alloc)) {
         None => None,
-        Some(Ok(view)) => Some(view.under(today.certificate)),
+        Some(Ok(view)) => Some(view.under(&today.certificate)),
         Some(Err(why)) => {
             listed = run_parent::ListHeld::Unread(why);
             run_parent::Resolve::watch(&lazy).see(blaze_screen::Step::Says);
@@ -237,6 +241,11 @@ pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h
     let mut needs = Needs::new(alloc);
     let mut ahead = std::vec::Vec::new_in(alloc);
     let mut placed = Vec::new_in(alloc);
+    // The native library first: before any `Declare` (the child hands the entry over only once
+    // it has loaded it).
+    if let Some(send) = native {
+        needs.tell_native(send.library, send.words, &mut ahead).map_err(OwnError::Parent)?;
+    }
     let head = run_parent::ahead_of(rows, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?;
     let line = head.line;
     let entry = bstd::mem::format_in!(frame, "{line}");
@@ -247,6 +256,10 @@ pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h
     let mut granted = [0u8; MOST_BYTES];
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     start_env(env.each(), store.as_str(), entry.as_str(), line.form, launch.grants, &mut granted, frame, &mut vars)?;
+    // `launch_env` left out any `BLAZE_LAUNCH_NATIVE` of the command's own: the parent's word.
+    if let Some(send) = native {
+        vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
+    }
     let spawner = host.spawner().map_err(OwnError::Missing)?;
     // The program's command line, for every entry form: its name first (`arg0`, the binary
     // target's), then the words after `--`.
@@ -257,7 +270,7 @@ pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h
         run_loop::run_program(&cx, &spawner, &started, &mut needs, &mut lazy, &ahead, alloc)
     };
     let tally = lazy.tally();
-    *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed), lowerings: lazy.lowering_counts() });
+    *counted = Some(run_parent::RunTally { codes: tally, start: needs.start_tally(lazy.built(), listed), lowerings: lazy.lowering_counts(), walk: lazy.walk_counts() });
     // A crash the program's handler told by place, named while the walk is alive (rule 19,
     // run_fault.rs): the fn by its path, the trap by the instruction in its record.
     let mut struck_in = bstd::mem::Bytes::new_in(frame, "the code record a crash struck in");
@@ -291,7 +304,9 @@ pub(crate) fn run_own<'h, F: Front<Maker = blaze_ladder::run::make_one::Maker<'h
     }
     // This run's first answers, the next start's list, under today's certificate.
     let mut bytes = blaze_own::Vec::new_in(alloc);
-    let wrote = start_list::encode(today.certificate, head, needs.first(), &mut bytes)
+    let wrote = needs
+        .first()
+        .encode(&today.certificate, head, &mut bytes)
         .map_err(start_list::ListError::Cap)
         .and_then(|()| start_list::write(lent, &today.name, held, bytes.as_slice()));
     let list = match wrote {
@@ -345,7 +360,7 @@ fn start_env<'e>(
             }
             Some(&*grants::format(&pairs, granted).map_err(OwnError::Grants)?)
         }
-        EntryForm::Unit | EntryForm::CMain => {
+        EntryForm::Unit | EntryForm::CMain | EntryForm::Comptime => {
             if !grants.is_empty() {
                 return Err(OwnError::GrantsNotHosted { count: grants.len(), form });
             }

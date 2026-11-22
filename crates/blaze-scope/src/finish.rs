@@ -10,7 +10,7 @@ use blaze_hash::HashMap;
 use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
-    AnonImport, Binding, BindingState, Def, DefKind, GlobEdge, Namespace, Origin, Path, ScopeBuilder,
+    AnonImport, Binding, Def, DefKind, GlobEdge, Namespace, Origin, Path, ScopeBuilder,
     ScopeEntry, ScopeError, Site, TextualDef, TextualMark, Unresolved, Visibility, globs_digest,
     textual_digest,
 };
@@ -175,21 +175,6 @@ impl<'a, N: Name> Resolver<'a, N> {
             },
             reads: ReadList { entries },
         }))
-    }
-
-    /// The module whose record answers `read`.
-    fn owner_of(&self, read: &Read<N>) -> Option<ItemKey> {
-        match *read {
-            // One level: a module's entry is its parent's, and the parent is on this chain.
-            Read::TextualEntry { module } => {
-                let at = self.chain.iter().position(|&c| c == module)?;
-                self.chain.get(at + 1).copied()
-            }
-            Read::Name { module, .. }
-            | Read::Globs { module }
-            | Read::TextualOut { module } => Some(module),
-            Read::DeriveHelpers { .. } => None,
-        }
     }
 
     /// One fragment's errors, then its slots' in order, an expansion's where its call is.

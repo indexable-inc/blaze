@@ -19,7 +19,7 @@ doctest = false
 blaze-own.workspace = true
 # `HashMap`: the task cache's index from a canonical input's hash to its row. By path, not the
 # workspace entry, which turns on the `serde` and `shared` adapters and crates from outside.
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 
 [features]
 # The test language, its arena and its in-memory world (src/testing/), on `std`: for this crate's

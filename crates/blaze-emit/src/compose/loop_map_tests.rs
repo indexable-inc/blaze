@@ -151,7 +151,7 @@ fn the_harness_seed_63_shape_seals() {
         Err(error) => panic!("the committed table does not read: {error}"),
     };
     let machine = table.head().machine;
-    let emitted = match (Fast { table: &table, regs: &ARM64 }).emit(view, &Nameless, machine, alloc) {
+    let emitted = match (Fast { table: &table, regs: &ARM64 }).emit(blaze_lir::verify(view).expect("the tape's program is LIR"), &Nameless, machine, alloc) {
         Ok(emitted) => emitted,
         Err(error) => panic!("the Fast tier refused the tape's program: {error}"),
     };

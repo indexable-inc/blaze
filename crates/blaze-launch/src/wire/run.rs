@@ -108,10 +108,19 @@ pub enum Down<'a> {
     /// Rust functions its C code calls: pair i's slot's entry thunk fills the library's word i.
     /// Sent once, first, before any `Declare` of the entry; each pair declares its slot as a
     /// `Declare` pair does (wire/native.rs).
+    ///
+    /// THE ONE RULE of when it is sent: exactly when the program's image holds C, C++ or
+    /// assembly of its crates (an object or archive member, from a build script's outputs or a
+    /// `#[link(kind = "static")]`). Then the parent names the record in the child's start
+    /// (`BLAZE_LAUNCH_NATIVE`, its 64 hex digits) and writes this as its first frame; the child
+    /// hands the entry over only once it has loaded it (blaze-launch-rt run_mode.rs `run`). A
+    /// program with no native input gets neither: its image (which still exists, linking the
+    /// system library, as the record its start list is rooted beside) is not opened, so its
+    /// start costs nothing new. A `Native` the start did not name is refused by name.
     Native { library: RecordId, words: List<'a, Declared> },
-    /// These statics, each its symbol and datum record, placed together before anything names
-    /// them: sent before the `Declare` and `Publish` of the record that names them (run.md,
-    /// "Statics in the run"; wire/data.rs).
+    /// Place these statics together, each by symbol and datum record. An on-demand answer sends
+    /// its new function slots in `Declare`, then its statics in `Data`, then the code naming
+    /// them in `Publish` or `Positioned` (wire/data.rs).
     Data { data: List<'a, super::data::Datum> },
     /// The run's thread-local descriptor is `descriptor` (the `Space::Static` target of every
     /// record touching a thread-local) and its pthread key's destructor is the fn `ender`. Sent

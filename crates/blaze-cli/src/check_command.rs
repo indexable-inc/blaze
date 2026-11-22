@@ -3,11 +3,10 @@
 //! old checker (main.rs `request`, whole-crate tasks, body_types.rs) while the engine was a
 //! second command, `engine-check`, and every fix was weighed against two paths (a bug lived in
 //! the seam between them on 2026-11-17). Now `check` and `engine-check` (its old name, an alias)
-//! both enter here; the old checker answers only to its own word, `check-old`, which says so in
-//! its first line and goes away with `request` (main.rs `CHECK_OLD`). Never a fallback: nothing
-//! here runs the old checker (rule 3).
+//! both enter here, and the old checker is gone (2026-11-19, with `check-old` and main.rs
+//! `request`). Never a fallback (rule 3).
 //!
-//! The arguments are `check`'s (main.rs `flags`, one parser). Each flag of the old `check`:
+//! The arguments are `check`'s (main.rs `flags`, one parser). Each flag of `check`:
 //!
 //! | flag | on the engine |
 //! |---|---|
@@ -16,9 +15,9 @@
 //! | `--color`, `--view` | taken (the printer's abilities and view, print.rs `Shown`) |
 //! | `--each` | taken (`Shown::each`: each consequence and borrow note drawn) |
 //! | `--status-every S` | taken (engine_status.rs; the engine's alone) |
-//! | `--fix <selector>..` | taken (engine_check.rs `serve`: a quiet check, fix.rs `apply`, a second check, through main.rs `fix_then_check`, the one home of both checkers'; the listed findings are in the request's frame, which outlives both checks) |
+//! | `--fix <selector>..` | taken (engine_check.rs `serve`: a quiet check, fix.rs `apply`, a second check, through main.rs `fix_then_check`; the listed findings are in the request's frame, which outlives both checks) |
 //! | `--stats` | taken (engine_check.rs `stats_line`: one line on stderr; the profile holds the rest) |
-//! | `--origin`, `--origin-key` | taken (`Opts::origin`: the store opened with the named origin, as `check-old` opens it) |
+//! | `--origin`, `--origin-key` | taken (`Opts::origin`: the store opened with the named origin) |
 //! | `--grant`, `-p`/`--bin`, `-- args` | REFUSED: `run`'s, never `check`'s |
 //!
 //! A flag of `check` the engine does not take would be listed in [`NOT_TAKEN`] and refused as

@@ -16,34 +16,36 @@
 //!   addend;
 //! - `Static(k)`: static `k`'s symbol (symbols.rs `static_symbol`) plus the addend, and `k`
 //!   DECLARED, so the parent sends it with this one (one batch: a cycle of statics is one);
-//! - `Fn` and `Vtable`: refused by name until step 2 of the spec names them as instances.
+//! - `Fn`: a `Space::Func` target, named by its instance symbol, and a declared instance row so
+//!   the parent gives its slot before the datum is placed;
+//! - `Vtable`: refused by name until the evaluator carries its table datum.
 //!
 //! THE PLACE: read-only for a static that is neither `static mut` nor holds an allocation the
 //! evaluator marked mutable (interior mutability: data.rs `DataAlloc::mutable`); writable
-//! otherwise (the child refuses writable statics by name until step 3). A `#[thread_local]`
+//! otherwise. A `#[thread_local]`
 //! static is no static's datum: reached as a static it is refused by name; its initial value is
 //! a TEMPLATE in the same form ([`make_template_entry`]), always read-only, under its `Tls`
-//! symbol, from which each thread's copy is made.
+//! symbol, from which each thread's copy is made after the child fills its words.
 //!
-//! THE FORM, little-endian: [`STATIC_ENTRY_MAGIC`], [`super::ENTRY_FORM`] (5), the datum's
+//! THE FORM, little-endian: [`STATIC_ENTRY_MAGIC`], [`super::ENTRY_FORM`], the datum's
 //! length (4) and bytes, the declared instances' block as a code entry's (count 4, then rows:
-//! none until step 2), and the declared statics' block (count 4, then item keys 16 each,
+//! each tabled fn key, name length and canonical instance name), and the declared statics' block (count 4, then item keys 16 each,
 //! ascending, each once). The KEY is a walk row's (body_ids.rs `record_key`: the static's
 //! symbol, its initializer's BodyCheck key and reads, its crate's fact), so an edit of the
 //! initializer moves this record's key alone: code names the static's word, not its value.
 
 use core::fmt;
-use std::alloc::Global;
 
-use blaze_build::StaticItem;
-use blaze_build::data::{DataRecord, DataTarget};
+use blaze_build::{InstanceKey, StaticItem};
+use blaze_build::data::DataTarget;
 use blaze_code::datum::{Datum, DatumError, DatumView, OWN_DATUM, Place};
 use blaze_code::record::{Space, Symbol, Target, Word};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_typeck::ItemKey;
 
 use super::{Cursor, Declared, ENTRY_FORM, EntryError, each_key, put_statics};
-use crate::symbols::static_symbol;
+use crate::seam::SeamData;
+use crate::symbols::{SymbolError, fn_symbol_of_name, static_symbol};
 
 /// The first eight bytes of a static's entry (a code record's is [`super::ENTRY_MAGIC`]).
 pub const STATIC_ENTRY_MAGIC: [u8; 8] = *b"bzsent01";
@@ -55,9 +57,11 @@ pub enum StaticRecordError {
     ThreadLocal,
     /// The evaluator's record has no allocation.
     Empty,
-    /// The word at `at` of allocation `alloc` names a fn instance: step 2 of the spec.
+    /// The word at `at` of allocation `alloc` names a fn instance whose metadata is unavailable.
     Fn { alloc: u32, at: u32 },
-    /// The word at `at` of allocation `alloc` names a vtable: step 2 of the spec.
+    /// The fn instance at this word has no encodable ground name.
+    FnName { alloc: u32, at: u32, error: SymbolError },
+    /// The word at `at` of allocation `alloc` names a vtable, whose datum is unavailable.
     Vtable { alloc: u32, at: u32 },
     /// Relocation `reloc` of allocation `alloc` is past its bytes, or names an allocation past
     /// the record's.
@@ -81,8 +85,9 @@ impl fmt::Display for StaticRecordError {
         match *self {
             StaticRecordError::ThreadLocal => write!(f, "a `#[thread_local]` static is the thread's template, made with the thread-locals, not a static's datum ({spec}, step 4)"),
             StaticRecordError::Empty => write!(f, "the constant evaluator's record of its initializer holds no allocation (blaze-build data.rs: `allocs[0]` is the value)"),
-            StaticRecordError::Fn { alloc, at } => write!(f, "its value's allocation {alloc} holds a fn's address at byte {at}, which a static's record does not name yet ({spec}, step 2)"),
-            StaticRecordError::Vtable { alloc, at } => write!(f, "its value's allocation {alloc} holds a vtable's address at byte {at}, which a static's record does not name yet ({spec}, step 2)"),
+            StaticRecordError::Fn { alloc, at } => write!(f, "its value's allocation {alloc} holds a fn's address at byte {at}, but the fn instance's symbol and name are unavailable ({spec}, step 2)"),
+            StaticRecordError::FnName { alloc, at, error } => write!(f, "its value's allocation {alloc} holds a fn's address at byte {at}: {error}"),
+            StaticRecordError::Vtable { alloc, at } => write!(f, "its value's allocation {alloc} holds a vtable's address at byte {at}, but its datum is unavailable ({spec}, step 2)"),
             StaticRecordError::Reloc { alloc, reloc } => write!(f, "relocation {reloc} of its value's allocation {alloc} is past its bytes or names no allocation of the record (blaze-build data.rs, \"The form\")"),
             StaticRecordError::TooLarge { what } => write!(f, "its {what} is larger than a static's entry counts"),
             StaticRecordError::Datum(why) => write!(f, "its datum: {why}"),
@@ -97,7 +102,20 @@ impl core::error::Error for StaticRecordError {}
 
 /// A static's entry from the evaluator's record of its initializer, `value`, and its kind (the
 /// module doc).
-pub fn make_static_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
+pub fn make_static_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
+    make_static_entry_with_targets(value, kind, |_| Ok(None), alloc)
+}
+
+/// A static entry with the function-instance metadata needed by `DataTarget::Fn` words.
+pub fn make_static_entry_with_targets<'a, F>(
+    value: &SeamData,
+    kind: StaticItem,
+    mut fn_target: F,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, StaticRecordError>
+where
+    F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+{
     if kind.thread_local {
         return Err(StaticRecordError::ThreadLocal);
     }
@@ -105,7 +123,7 @@ pub fn make_static_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc
         true => Place::Writable,
         false => Place::ReadOnly,
     };
-    datum_entry(value, place, false, alloc)
+    datum_entry(value, place, false, &mut fn_target, alloc)
 }
 
 /// A `#[thread_local]` static's TEMPLATE entry (run.md, "Statics in the run", step 4): its
@@ -116,19 +134,41 @@ pub fn make_static_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc
 /// template's, shared by every thread, which is right only while that allocation is immutable:
 /// a mutable one is refused, and so is a word naming the value's own bytes (each copy would
 /// point at the template, not at itself).
-pub fn make_template_entry<'a>(value: &DataRecord<Global>, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
+pub fn make_template_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
+    make_template_entry_with_targets(value, kind, |_| Ok(None), alloc)
+}
+
+/// A thread-local template with the function-instance metadata needed by `DataTarget::Fn` words.
+pub fn make_template_entry_with_targets<'a, F>(
+    value: &SeamData,
+    kind: StaticItem,
+    mut fn_target: F,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, StaticRecordError>
+where
+    F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+{
     if !kind.thread_local {
         return Err(StaticRecordError::NotThreadLocal);
     }
     if let Some(n) = value.allocs.iter().skip(1).position(|a| a.mutable) {
         return Err(StaticRecordError::SharedMutable { alloc: n as u32 + 1 });
     }
-    datum_entry(value, Place::ReadOnly, true, alloc)
+    datum_entry(value, Place::ReadOnly, true, &mut fn_target, alloc)
 }
 
 /// The entry of `value` as a datum at `place`; `template`: a word naming allocation 0 is refused
 /// ([`StaticRecordError::SelfPointer`]).
-fn datum_entry<'a>(value: &DataRecord<Global>, place: Place, template: bool, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
+fn datum_entry<'a, F>(
+    value: &SeamData,
+    place: Place,
+    template: bool,
+    fn_target: &mut F,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, StaticRecordError>
+where
+    F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+{
     let first = value.allocs.first().ok_or(StaticRecordError::Empty)?;
     // Each allocation's offset in the datum, in order, each at its own alignment.
     let mut starts: AVec<'_, u64> = Vec::with_capacity_in(value.allocs.len(), alloc);
@@ -148,6 +188,7 @@ fn datum_entry<'a>(value: &DataRecord<Global>, place: Place, template: bool, all
         d.bytes[at..at + a.bytes.len()].copy_from_slice(&a.bytes);
     }
     let mut statics: AVec<'_, ItemKey> = Vec::new_in(alloc);
+    let mut declared: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
     for (n, a) in value.allocs.iter().enumerate() {
         for (r, reloc) in a.relocs.iter().enumerate() {
             let refused = StaticRecordError::Reloc { alloc: n as u32, reloc: r as u32 };
@@ -174,7 +215,14 @@ fn datum_entry<'a>(value: &DataRecord<Global>, place: Place, template: bool, all
                     statics.push(k);
                     (d.target(Target { space: Space::Static, symbol: static_symbol(k) }), addend)
                 }
-                DataTarget::Fn(_) => return Err(StaticRecordError::Fn { alloc: n as u32, at: reloc.offset }),
+                DataTarget::Fn(key) => {
+                    let (tabled, name) = fn_target(key)
+                        .map_err(|error| StaticRecordError::FnName { alloc: n as u32, at: reloc.offset, error })?
+                        .ok_or(StaticRecordError::Fn { alloc: n as u32, at: reloc.offset })?;
+                    let symbol = fn_symbol_of_name(&name);
+                    declared.push((tabled, name));
+                    (d.target(Target { space: Space::Func, symbol }), addend)
+                }
                 DataTarget::Vtable(_) => return Err(StaticRecordError::Vtable { alloc: n as u32, at: reloc.offset }),
             };
             d.words.push(Word { at, target, addend });
@@ -189,8 +237,14 @@ fn datum_entry<'a>(value: &DataRecord<Global>, place: Place, template: bool, all
     out.extend_from_slice(&ENTRY_FORM.to_le_bytes());
     out.extend_from_slice(&u32::try_from(datum.len()).map_err(|_| too_large("datum"))?.to_le_bytes());
     out.extend_from_slice(&datum);
-    // No declared instance until step 2 names a fn's address.
-    out.extend_from_slice(&0u32.to_le_bytes());
+    declared.sort_unstable_by(|a, b| (a.0, a.1.as_slice()).cmp(&(b.0, b.1.as_slice())));
+    declared.dedup_by(|a, b| a.0 == b.0 && a.1.as_slice() == b.1.as_slice());
+    out.extend_from_slice(&u32::try_from(declared.len()).map_err(|_| too_large("declared instances"))?.to_le_bytes());
+    for (tabled, name) in declared.iter() {
+        out.extend_from_slice(&tabled.0.to_le_bytes());
+        out.extend_from_slice(&u32::try_from(name.len()).map_err(|_| too_large("declared instance's name"))?.to_le_bytes());
+        out.extend_from_slice(name.as_slice());
+    }
     put_statics(&statics, &mut out, alloc).map_err(too_large)?;
     Ok(out)
 }
@@ -316,8 +370,10 @@ mod tests {
     use blaze_build::StaticItem;
     use blaze_build::data::{DataAlloc, DataRecord, DataReloc, DataTarget};
     use blaze_code::datum::{OWN_DATUM, Place};
+    use blaze_code::record::{Space, Target, Word};
+    use blaze_typeck::ItemKey;
 
-    use super::{StaticEntryView, StaticRecordError, make_static_entry, make_template_entry};
+    use super::{StaticEntryView, StaticRecordError, make_static_entry, make_static_entry_with_targets, make_template_entry, make_template_entry_with_targets};
 
     /// `#[thread_local] static V: (&str, u32) = ("hi", 7)`'s evaluated value: allocation 0 the
     /// value (a pointer word to allocation 1, its length, the u32), allocation 1 the bytes "hi";
@@ -370,5 +426,105 @@ mod tests {
         let plain = make_template_entry(&value(false, DataTarget::Local(1)), StaticItem { thread_local: false, mutable: false }, alloc).map(|_| ());
         assert_eq!(plain, Err(StaticRecordError::NotThreadLocal));
         std::println!("template: read-only, 26 bytes, one own word at +24; a thread-local as a static, a shared mutable, a self pointer and a plain static refused");
+    }
+
+    #[test]
+    fn a_fn_word_names_its_slot_and_declares_its_instance() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let key = blaze_build::InstanceKey(blaze_ids::ContentId([7; 32]));
+        let value = value(false, DataTarget::Fn(key));
+        // The canonical name of fn 11 with no generic arguments.
+        let item = ItemKey(11);
+        let mut expected = [0; 20];
+        expected[..16].copy_from_slice(&item.0.to_le_bytes());
+        for thread_local in [false, true] {
+            let kind = StaticItem { thread_local, mutable: false };
+            let missing = if thread_local {
+                make_template_entry(&value, kind, alloc)
+            } else {
+                make_static_entry(&value, kind, alloc)
+            };
+            assert_eq!(missing.map(|_| ()), Err(StaticRecordError::Fn { alloc: 0, at: 0 }));
+            let target = |asked| {
+                assert_eq!(asked, key);
+                let mut name = blaze_own::Vec::new_in(alloc);
+                name.extend_from_slice(&expected);
+                Ok(Some((item, name)))
+            };
+            let made = if thread_local {
+                make_template_entry_with_targets(&value, kind, target, alloc)
+            } else {
+                make_static_entry_with_targets(&value, kind, target, alloc)
+            }.expect("a fn word has a place in both kinds of datum");
+            let view = StaticEntryView::read(&made).expect("the entry reads");
+            assert_eq!(view.datum.place(), Place::ReadOnly);
+            assert_eq!((view.datum.words(), view.datum.targets()), (1, 1));
+            assert_eq!(view.datum.word(0), Word { at: 0, target: 0, addend: 0 });
+            assert_eq!(view.datum.target(0), Target { space: Space::Func, symbol: crate::symbols::fn_symbol_of_name(&expected) });
+            let mut declared = std::vec::Vec::new();
+            view.each_declared(|row| {
+                declared.push((row.tabled, row.name));
+                Ok::<(), ()>(())
+            }, |_| ()).expect("the declared instance reads");
+            assert_eq!(declared, [(item, expected.as_slice())]);
+        }
+        std::println!("a static fn word names Space::Func and declares its instance name");
+    }
+
+    #[test]
+    fn filling_nested_string_slices_preserves_both_interior_addends() {
+        use blaze_code::{datum, image::ImageError, place::Words};
+        use crate::symbols::static_symbol;
+
+        const OWN: u64 = 0x2000;
+        const OTHER: u64 = 0x8000;
+        const OTHER_ITEM: ItemKey = ItemKey(17);
+        const OTHER_BYTES: &[u8] = b"---cdef!";
+
+        struct OtherStatic;
+        impl Words for OtherStatic {
+            fn word(&mut self, target: Target, _: bool) -> Result<u64, ImageError> {
+                Err(ImageError::Unbound { target })
+            }
+            fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+                assert_eq!(target, Target { space: Space::Static, symbol: static_symbol(OTHER_ITEM) });
+                Ok(OTHER)
+            }
+        }
+
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let words = |values: &[u64]| values.iter().flat_map(|n| n.to_le_bytes()).collect();
+        let fill = |second_offset: u64| {
+            // The root slice points at two string slices. The first borrows from
+            // within this datum, the second from the middle of another static.
+            let value = DataRecord { allocs: vec![
+                DataAlloc { align: 3, mutable: false, bytes: words(&[0, 2]),
+                    relocs: vec![DataReloc { offset: 0, target: DataTarget::Local(1) }] },
+                DataAlloc { align: 3, mutable: false, bytes: words(&[1, 2, second_offset, 4]),
+                    relocs: vec![DataReloc { offset: 0, target: DataTarget::Local(2) },
+                        DataReloc { offset: 16, target: DataTarget::Static(OTHER_ITEM) }] },
+                DataAlloc { align: 0, mutable: false, bytes: b"/ab".to_vec(), relocs: vec![] },
+            ] };
+            let entry = make_static_entry(&value, StaticItem { mutable: false, thread_local: false }, erased.handle()).expect("the slice's entry");
+            let datum = StaticEntryView::read(&entry).expect("the slice's datum").datum;
+            let mut bytes = vec![0; datum.bytes().len()];
+            datum::fill(&datum, static_symbol(ItemKey(23)), OWN, &mut OtherStatic, &mut bytes).expect("place the slice");
+            bytes
+        };
+        let second_is_cdef = |bytes: &[u8]| {
+            let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            assert_eq!((word(0), word(8)), (OWN + 16, 2), "the outer slice names its two elements");
+            assert_eq!((word(16), word(24)), (OWN + 48 + 1, 2), "the first string starts inside the local allocation");
+            assert_eq!(&bytes[49..51], b"ab");
+            assert_eq!(word(40), 4, "placing the second pointer preserves its adjacent length");
+            let offset = word(32).checked_sub(OTHER).and_then(|n| usize::try_from(n).ok());
+            offset.and_then(|i| OTHER_BYTES.get(i..)?.get(..4)) == Some(&b"cdef"[..])
+        };
+        assert!(second_is_cdef(&fill(3)), "the second string starts three bytes into its static");
+        assert!(!second_is_cdef(&fill(4)), "a one-byte displacement must change the string");
+        std::println!("nested slices: local +1 and external +3 preserved; external +4 caught");
     }
 }

@@ -43,7 +43,7 @@ pub(crate) fn reader() -> Func<Global> {
 fn relocations_name_the_static_and_the_inner_data() {
     let func = reader();
     let mut code = Code::new_in(Global);
-    emit(func.view(), &[], ISA, &mut code).expect("emits");
+    emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &[], ISA, &mut code).expect("emits");
     assert!(code.fixups.is_empty(), "no function is called");
     let statics: Vec<_> = code.relocs.iter().filter(|r| r.to == RelocTo::Static(0)).collect();
     assert_eq!(statics.len(), 1, "one literal word for the static, used twice");
@@ -62,7 +62,7 @@ fn a_placed_function_reads_and_writes_a_static_and_follows_data_addresses() {
 
     let func = reader();
     let mut code = Code::new_in(Global);
-    emit(func.view(), &[], ISA, &mut code).expect("emits");
+    emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &[], ISA, &mut code).expect("emits");
     let mut cell: Box<u64> = Box::new(40);
     let static_at = &mut *cell as *mut u64 as u64;
     let exec = Executable::written(code.bytes.len(), 0, |out, _| {
@@ -102,10 +102,11 @@ fn a_slot_function_address_in_data_is_its_slot_stub() {
     b.ret(&[t]);
     let func = b.finish_checked().expect("builds");
     let mut code = Code::new_in(Global);
-    emit(func.view(), &[Via::Slot], ISA, &mut code).expect("a slot function's address is placed");
+    let verified = blaze_lir::verify(func.view()).expect("the test's function is LIR");
+    emit(verified, &[Via::Slot], ISA, &mut code).expect("a slot function's address is placed");
     assert_eq!(code.relocs.len(), 1);
     assert_eq!(code.relocs[0].to, RelocTo::SlotStub(0));
-    emit(func.view(), &[Via::Address], ISA, &mut code).expect("an outside function's address is placed");
+    emit(verified, &[Via::Address], ISA, &mut code).expect("an outside function's address is placed");
     assert_eq!(code.relocs.len(), 1);
     assert_eq!(code.relocs[0].to, RelocTo::Func(0));
 }

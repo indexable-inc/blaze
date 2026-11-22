@@ -22,7 +22,10 @@ use crate::work::{Extras, Record};
 /// it, so an edit of one producer still moves only its kinds' keys (rule 52).
 /// 2: an outline record lists its parts, paths and findings (`write_listed`), other bytes
 /// than form 1's under the same task key, so every key moves (rule 21).
-const ENGINE_FORM: &str = "blaze-cli engine record form 2";
+/// 3: a units record lists its parts too (the run's walk from `Name::units()` reads them:
+/// engine_check.rs's put, run_ids.rs `workspace_of`), and the Bodies stage puts a body's run
+/// facts (engine_body_facts.rs): other bytes under form 2's task keys.
+const ENGINE_FORM: &str = "blaze-cli engine record form 3";
 
 /// The engine's tool of each kind, from the kinds' tools (home.rs `tools`).
 pub(crate) fn tools(kinds: &[Tool; blaze_drive::key::KINDS]) -> Tools {
@@ -54,12 +57,17 @@ pub(crate) struct Put<'r> {
     pub(crate) out: ContentId,
     pub(crate) reads: &'r [(Name, ContentId)],
     pub(crate) payload: &'r [u8],
-    /// A file's outline: its parts, paths and findings too, so a later request that finds the
-    /// file unchanged reads the whole outline back ([`outline_from`]) and never the file.
-    pub(crate) listing: Option<Listing<'r>>,
+    pub(crate) head: PutHead<'r>,
     /// The records the task made beside its own (a `CrateScope`'s expansion records,
     /// work.rs `Record::extras`), put right after it, in its namespace.
     pub(crate) extras: Option<&'r Extras>,
+}
+
+pub(crate) enum PutHead<'r> {
+    /// The worker encoded this header alongside the key and payload.
+    Prepared(&'r [u8]),
+    /// Encode a plain header, or include an outline's parts, paths and findings for `outline_from`.
+    Build(Option<Listing<'r>>),
 }
 
 /// A test's planted bug: every expansion record whose text holds `marker` is not put, so a
@@ -102,26 +110,32 @@ impl<'r> Listing<'r> {
     }
 }
 
-/// Puts every record of `puts` in key order (rule 25), its head written into `alloc` and handed
-/// to the store with its payload, each counted in `ledger` under `stage`; returns how many.
+/// Puts every record in key order, borrowing a prepared header or building one in `alloc`.
+/// Counts each put in `ledger` under `stage` and returns the number of records.
 pub(crate) fn put_all(cx: &Cx, store: &mut dyn Store<'_>, puts: &mut [Put<'_>], stage: Stage, ledger: &mut Ledger, alloc: blaze_own::Alloc<'_>) -> Result<u32, CliError> {
     let cx = cx.span("engine: a phase's records put");
     puts.sort_unstable_by_key(|put| put.key);
     for put in puts.iter() {
         // The head (its name, reads, listing and the payload's length) and the payload as two
         // slices: the payload goes to the store from the buffer its task made it in, never joined.
-        let head = match &put.listing {
-            None => blaze_drive::record::write_plain_head(put.name, put.source, put.out, put.reads, put.payload.len(), alloc),
-            Some(listing) => {
+        let built;
+        let head: &[u8] = match &put.head {
+            PutHead::Prepared(bytes) => bytes,
+            PutHead::Build(None) => {
+                built = blaze_drive::record::write_plain_head(put.name, put.source, put.out, put.reads, put.payload.len(), alloc);
+                &built
+            }
+            PutHead::Build(Some(listing)) => {
                 let mut paths = std::vec::Vec::with_capacity_in(listing.paths.len(), alloc);
                 paths.extend(listing.paths.iter().map(|&(name, at, to, module)| PathOf { name, path: &listing.path_bytes[at as usize..to as usize], module }));
                 let mut findings = std::vec::Vec::with_capacity_in(listing.findings.len(), alloc);
                 findings.extend(listing.findings.iter().map(|&(rule, start, end, at, to)| Finding { rule, start, end, message: &listing.messages[at..to] }));
                 let listed = blaze_drive::record::Listed { parts: listing.parts, paths: &paths, findings: &findings };
-                blaze_drive::record::write_listed_head(put.name, put.source, put.out, put.reads, &listed, put.payload.len(), alloc)
+                built = blaze_drive::record::write_listed_head(put.name, put.source, put.out, put.reads, &listed, put.payload.len(), alloc);
+                &built
             }
         };
-        let parts: [&[u8]; 2] = [&head, put.payload];
+        let parts = [head, put.payload];
         ledger.put(stage, put.key, &parts, put.payload.len());
         store.put_parts(&cx, put.key, &parts)?;
         // Its extra records after it, in key order (sorted by their writer, expansion_records.rs
@@ -339,6 +353,9 @@ impl Ledger {
         let line = &mut self.lines[stage.index()];
         line.puts += 1;
         line.bytes += len as u64;
+        // The meter (D169): one put and its bytes, on the thread that put it.
+        blaze_meter::add(blaze_meter::Count::StorePuts, 1);
+        blaze_meter::add(blaze_meter::Count::StorePutBytes, len as u64);
         self.results[stage.index()] += payload as u64;
         self.digest.update(&key.0.0).update(&(len as u64).to_le_bytes());
         for part in parts {

@@ -38,7 +38,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc};
 use blaze_wasi::{Answer, Errno, Filestat, Filetype, Open, Stop};
 
-use super::{Node, Opened, Place, Refusal, ScriptRoot, ScriptSandbox, Tree, digest, filestat, listing_digest, stat_digest};
+use super::{Node, Opened, Place, Refusal, ScriptRoot, ScriptSandbox, Tree, filestat};
 
 /// A native script's view: the same values laid as real read-only folders (D112, brief N8).
 pub mod native;
@@ -387,42 +387,35 @@ impl ScriptSandbox {
         )))
     }
 
-    /// What `rel` under the mount `mount` is. `stat`: the read is a stat (recorded as one).
-    fn dep_node(&mut self, mount: usize, rel: &str, stat: bool) -> Result<Option<Node<'static>>, Stop> {
+    /// Serve the operation through the mount whose grant the script used.
+    fn dep_node(&mut self, mount: usize, rel: String, op: super::NodeRead) -> Result<Option<Node<'static>>, Stop> {
         let script = Arc::clone(&self.script);
         match &script.deps.mounts[mount].served {
             Served::Keyed(files) => {
                 let tree = Tree::Mem { files: Arc::clone(files), git: None };
-                match tree.node(rel) {
+                match tree.node(&rel) {
                     Ok(found) => Ok(found.map(owned)),
-                    Err(why) => Err(self.refuse(Refusal::Path(why))),
+                    Err(why) => Err(self.refuse(Refusal::Path(why.to_string()))),
                 }
             }
             Served::ReaderTree => {
-                let found = match script.tree.node(rel) {
+                let found = match script.tree.node(&rel) {
                     Ok(found) => found.map(owned),
-                    Err(why) => return Err(self.refuse(Refusal::Path(why))),
+                    Err(why) => return Err(self.refuse(Refusal::Path(why.to_string()))),
                 };
                 // The same subjects as the reader's own reads of its tree: the same folder.
-                match (&found, stat) {
-                    (Some(Node::File(bytes)), true) => self.record(format!("stat:{rel}"), Some(stat_digest(Filetype::RegularFile, bytes.len() as u64))),
-                    (Some(Node::Folder(_)), true) => self.record(format!("stat:{rel}"), Some(stat_digest(Filetype::Directory, 0))),
-                    (None, true) => self.record(format!("stat:{rel}"), None),
-                    (Some(Node::File(bytes)), false) => self.record(format!("file:{rel}"), Some(digest(bytes))),
-                    (Some(Node::Folder(entries)), false) => self.record(format!("dir:{rel}"), Some(listing_digest(entries))),
-                    (None, false) => self.record(format!("file:{rel}"), None),
-                }
+                self.record_node(rel, op, found.as_ref());
                 Ok(found)
             }
         }
     }
 
     /// `path_open` under a mount: read-only; `path` is the whole path, for a folder's entries.
-    pub(super) fn dep_open(&mut self, mount: usize, rel: &str, path: &[u8], how: Open) -> Answer<u32> {
+    pub(super) fn dep_open(&mut self, mount: usize, rel: String, path: &[u8], how: Open) -> Answer<u32> {
         if how.create() || how.truncate() || how.write() || how.append() {
-            return Err(self.dep_write(mount, rel));
+            return Err(self.dep_write(mount, &rel));
         }
-        let opened = match self.dep_node(mount, rel, false)? {
+        let opened = match self.dep_node(mount, rel, super::NodeRead::open(&how))? {
             None => return Ok(Err(Errno::NOENT)),
             Some(Node::Folder(entries)) => Opened::Ro { bytes: Vec::new(), pos: 0, entries: Some(entries), folder: path.to_vec() },
             Some(Node::File(_)) if how.directory() => return Ok(Err(Errno::NOTDIR)),
@@ -432,8 +425,8 @@ impl ScriptSandbox {
     }
 
     /// `path_filestat_get` under a mount.
-    pub(super) fn dep_stat(&mut self, mount: usize, rel: &str) -> Answer<Filestat> {
-        Ok(match self.dep_node(mount, rel, true)? {
+    pub(super) fn dep_stat(&mut self, mount: usize, rel: String) -> Answer<Filestat> {
+        Ok(match self.dep_node(mount, rel, super::NodeRead::Stat)? {
             Some(Node::File(bytes)) => Ok(filestat(Filetype::RegularFile, bytes.len() as u64)),
             Some(Node::Folder(_)) => Ok(filestat(Filetype::Directory, 0)),
             None => Err(Errno::NOENT),
@@ -441,8 +434,8 @@ impl ScriptSandbox {
     }
 
     /// A file's bytes under a mount, for a spawn's snippet.
-    pub(super) fn dep_file(&mut self, mount: usize, rel: &str) -> Result<Option<Vec<u8>>, Stop> {
-        Ok(match self.dep_node(mount, rel, false)? {
+    pub(super) fn dep_file(&mut self, mount: usize, rel: String) -> Result<Option<Vec<u8>>, Stop> {
+        Ok(match self.dep_node(mount, rel, super::NodeRead::Bytes)? {
             Some(Node::File(bytes)) => Some(bytes.into_owned()),
             _ => None,
         })
@@ -527,6 +520,66 @@ mod tests {
         };
         buf.truncate(n);
         Ok(buf)
+    }
+
+    #[test]
+    fn member_mount_records_the_served_operation_and_a_fetched_reader_has_no_workspace_grant() {
+        let dir = std::env::temp_dir().join(format!("blaze-script-member-mount-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("producer")).unwrap();
+        std::fs::write(dir.join("producer/header.h"), b"header").unwrap();
+        let mut made = producer(b"out");
+        made.tree = Tree::Dir(crate::script_sandbox::RealRoot::resolve(&dir).expect("the fixture's folder resolves"));
+        made.root = ScriptRoot::member("producer").unwrap();
+        let pairs = [DepMetadata { links: "sys", key: "include", value: "/workspace/producer" }];
+        let alloc = blaze_own::testing::heap().alloc();
+        let fetched = reader(DepViews::none(), &[]);
+        assert!(matches!(view(&fetched.tree, &[("sys", &made)], &pairs, alloc), Err(DepViewError::OtherWorkspace { .. })));
+
+        let viewed = view(&made.tree, &[("sys", &made)], &pairs, alloc).unwrap();
+        let mut member = reader(viewed.views, &[]);
+        let script = Arc::make_mut(&mut member);
+        script.tree = made.tree.clone();
+        script.root = ScriptRoot::member("consumer").unwrap();
+        let mut sandbox = ScriptSandbox::new(member);
+        assert_eq!(read_whole(&mut sandbox, "/deps/sys/producer/header.h"), Ok(b"header".to_vec()));
+        assert_eq!(sandbox.reads[0].subject, "file:producer/header.h");
+        assert_eq!(sandbox.reads[0].digest, Some(crate::script_sandbox::file_answer(b"header")));
+        let directory = Open { oflags: 2, ..READ };
+        for mount in ["/deps/sys", "/workspace"] {
+            let path = format!("{mount}/producer/header.h");
+            assert_eq!(sandbox.open(ROOT_FD, path.as_bytes(), directory).unwrap(), Err(Errno::NOTDIR));
+            let path = format!("{mount}/producer/missing");
+            assert_eq!(sandbox.open(ROOT_FD, path.as_bytes(), directory).unwrap(), Err(Errno::NOENT));
+        }
+        assert_eq!(sandbox.reads.len(), 3, "both grants resolve to the same checkout observations");
+        for (read, expected) in sandbox.reads[1..].iter().zip([Some(super::super::NOT_A_FOLDER), None]) {
+            assert_eq!(read.digest, expected);
+            assert_eq!(super::super::answer_now(&made.tree, &read.subject).unwrap(), expected);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_supplied_environment_distinguishes_absence_from_an_empty_value() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let encoded = |empty: bool| {
+            let mut env = blaze_build_script::Env { vars: AVec::new_in(alloc) };
+            if empty {
+                env.vars.push((AString::from_str_in("OPTION", alloc), AString::new_in(alloc)));
+            }
+            assert_eq!(env.get("OPTION"), empty.then_some(""));
+            let mut key = AVec::new_in(alloc);
+            env.encode(&mut key);
+            let mut script = reader(DepViews::none(), &[]);
+            Arc::make_mut(&mut script).env = super::super::owned_env(&env, alloc);
+            let mut run = ScriptSandbox::new(script);
+            let (bytes, count) = run.environ().unwrap();
+            assert_eq!(count, 1 + usize::from(empty)); // NUM_JOBS, and possibly OPTION
+            assert_eq!(bytes.split(|&b| b == 0).any(|pair| pair == b"OPTION="), empty);
+            key
+        };
+        assert_ne!(encoded(false), encoded(true), "enumeration exposes the whole keyed environment");
     }
 
     /// The cargo book, "The links Manifest Key": a `links` package's `cargo::metadata` pairs

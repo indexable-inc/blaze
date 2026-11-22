@@ -36,17 +36,17 @@ const WARNED: &str = "outside its package";
 #[test]
 fn a_member_reading_outside_its_package_inside_the_workspace_is_allowed_and_warned() {
     let io = workspace(51, "    include_str!(\"../../../other-dir/file.txt\");\n");
-    let first = check(&io, work::Sizes::USUAL);
+    let first = check(&io);
     let out = stdout(&io);
-    assert!(first.failed.is_empty(), "{:?}\n{}", first.failed, first.profile);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     assert_eq!(first.errors, 0, "a warning is no error:\n{out}");
     assert_eq!(out.matches(WARNED).count(), 1, "exactly one finding:\n{out}");
     let line = out.lines().find(|line| line.contains(WARNED)).unwrap_or("");
     assert!(line.contains("include_str!") && line.contains("other-dir/file.txt") && line.contains("crates/a"), "{line}");
     let seen = out.len();
-    let repeat = check(&io, work::Sizes::USUAL);
+    let repeat = check(&io);
     let again = &stdout(&io)[seen..];
-    assert_eq!(repeat.runs, 0, "{}", repeat.profile);
+    assert!(repeat.stood(), "the repeat stands on its certificate:\n{}", repeat.profile);
     assert_eq!(again.matches(WARNED).count(), 1, "the repeat shows it from the record:\n{again}");
     println!("warned: {line}");
 }
@@ -57,9 +57,9 @@ fn a_member_reading_outside_its_package_inside_the_workspace_is_allowed_and_warn
 #[test]
 fn an_include_inside_its_own_package_is_not_warned() {
     let io = workspace(52, "    include_str!(\"../assets/own.json\");\n");
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
-    assert!(checked.failed.is_empty(), "{:?}\n{}", checked.failed, checked.profile);
+    assert_eq!(checked.failures, 0, "{}", checked.profile);
     assert_eq!((checked.errors, out.matches(WARNED).count()), (0, 0), "{out}");
 }
 
@@ -71,7 +71,7 @@ fn an_include_inside_its_own_package_is_not_warned() {
 #[test]
 fn an_include_leaving_the_workspace_is_refused_by_name() {
     let io = workspace(53, "    include_str!(\"../../../../x.txt\");\n");
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
     assert!(checked.errors > 0, "a path leaving the workspace is an error:\n{out}\n{}", checked.profile);
     assert_eq!(out.matches(WARNED).count(), 0, "{out}");

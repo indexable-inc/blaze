@@ -18,7 +18,7 @@ doctest = false
 [dependencies]
 # `events`: a run's event stream as records in columns. Its `record!` names `::std`, the one
 # reason the crate links std. By path: the workspace entry turns on its `serde`.
-blaze-format = { path = "../blaze-format" }
+blaze-format.workspace = true
 # Every collection: `Vec`, `VecDeque`, `SortedMap`, `SortedSet`, `Soa` (no `alloc`).
 blaze-own.workspace = true
 # The two insert-heavy maps (the tier's reverse map, the suite's postings), where a sorted

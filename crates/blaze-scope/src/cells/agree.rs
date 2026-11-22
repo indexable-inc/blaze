@@ -248,6 +248,22 @@ impl<'h, 'a, N: crate::Name> Sources<'h> for OldScopes<'h, 'a, N> {
 
     fn node(&mut self, source: Def) -> Result<Node<'h>, ()> {
         let (cells, old): (&'h Cells<'a, N>, &'h ABTreeMap<'a, ItemKey, ScopeBuilder<'a, N>>) = (self.cells, self.old);
+        // An enum source (`use self::Location::*;` in a block, aquamarine attrs.rs:295; `use
+        // self::Cursor::*;`, http header/map.rs:1109) is read by its variants, as the core
+        // reads it ([`super::EnumNames`]): a name that is no variant is not there, and the walk
+        // goes on to the other globs (the block's lexical `use super::*;`). Stopping here made
+        // the old reader answer `Outside` for every name such a block reaches through its
+        // other globs, a disagreement of this harness alone (tempo, 21 Nov 04:10: 11 of the 20
+        // listed). An enum the crate does not hold, or a variant undecided or ambiguous there,
+        // stays outside.
+        if source.kind == DefKind::Enum {
+            let held = cells.enums.filter(|e| e.holds(source.key)).ok_or(())?;
+            return match held.variant(source.key, self.ns, self.name) {
+                super::DepAnswer::NotFound => Ok(Node::Value(None)),
+                super::DepAnswer::Found(def, vis) => Ok(Node::Value(Some(Passed { def, vis, state: BindingState::Determined }))),
+                super::DepAnswer::Ambiguous(..) | super::DepAnswer::Unknown => Err(()),
+            };
+        }
         if source.kind != DefKind::Module {
             return Err(());
         }
@@ -307,12 +323,33 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             held.opened.insert(key, opened);
         }
         // The root's published `#[macro_export]`s (resolve.rs `publish_expanded_exports`): what
-        // another crate reads at the root, after the root's own bindings. First by module key.
+        // another crate reads at the root, after the root's own bindings. Its two sources, as
+        // resolve.rs gives them: each written scope's expansion-written exports, and the exports
+        // in the own text of a module an expansion or a block made (`in_made`: commonware's
+        // `stability_scope!(.. { pub mod hostname; })`, nix's `feature! { pub mod socket; }`;
+        // without them the old answer at the root was absent where every other crate finds
+        // the macro, tempo 21 Nov 05:33). Of one name exported twice, the least key, as there.
         let root_key = self.modules[self.root as usize].key;
         let mut published: ABTreeMap<'a, N, Def> = ABTreeMap::new_in(alloc);
+        let mut publish = |name: N, def: Def| {
+            let kept = published.entry(name).or_insert(def);
+            if def.key < kept.key {
+                *kept = def;
+            }
+        };
         for s in old.values() {
             for t in s.macro_exports.iter() {
-                published.entry(t.name).or_insert(Def { key: t.def, kind: DefKind::Macro(t.shapes) });
+                publish(t.name, Def { key: t.def, kind: DefKind::Macro(t.shapes) });
+            }
+        }
+        for md in self.modules[self.walked as usize..].iter() {
+            if md.foreign || md.unread || md.text == FragId::MAX {
+                continue;
+            }
+            for (_, slot) in self.frags[md.text as usize].slots.iter() {
+                if let super::Slot::Rules(name, def, true) = *slot {
+                    publish(name, def);
+                }
             }
         }
         let mut scratch = ThroughScratch::new_in(alloc);
@@ -405,12 +442,24 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 let new_answer = match hop {
                     TextualHop::Found(def, _) => Answer::Found { def, vis: Visibility::Public, ambiguous: false },
                     TextualHop::NotInTables => Answer::Absent,
+                    // The ancestor `at` has no mark for the child the walk came up from because
+                    // that child is a block's module (no `mod` line): core-only on both sides
+                    // ([`Unfollowed::BlockTextualCut`]). Any other child's missing mark stays a gap.
+                    TextualHop::Unfollowed(at, Unfollowed::TextualCut) if self.block_below(&md.chain, at) => Answer::Unfollowed(Unfollowed::BlockTextualCut),
                     TextualHop::Unfollowed(_, why) => Answer::Unfollowed(why),
                 };
                 self.judge(&mut totals, key, Asked::Textual, name, old_answer, new_answer, &log, report)?;
             }
         }
         Ok(totals)
+    }
+
+    /// Whether the module just below `at` on `chain` (a module first, its root last: the child
+    /// a textual walk came up from) is a block's module ([`crate::blocks::is_block_module`]).
+    fn block_below(&self, chain: &[ItemKey], at: ItemKey) -> bool {
+        let Some(i) = chain.iter().position(|&k| k == at) else { return false };
+        let Some(&child) = i.checked_sub(1).and_then(|c| chain.get(c)) else { return false };
+        self.by_key.get(&child).is_some_and(|&m| self.modules[m as usize].name.is_some_and(|n| crate::blocks::is_block_module(n.as_ref())))
     }
 
     /// Counts one lookup, or stops with the disagreement.

@@ -8,7 +8,6 @@
 use core::cmp::Ordering;
 
 use blaze_id::ItemKey;
-use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
     AmbiguityKind, BindingState, CallShape, Def, DefKind, Edition, GlobEdge, Namespace, Origin, Path,
     PathKind, TextualDef, Unresolved, Visibility,
@@ -18,8 +17,8 @@ use crate::error::{GlobBug, ResolveError};
 use crate::facts::{Name, ScopeFacts};
 use crate::read::{NameAnswer, Read};
 use crate::resolver::{
-    Amb, At, Blame, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, NsRes,
-    Query, Res, Resolver, Scan, Sink, Slot, Source, MAX_MODULE_DEPTH,
+    Amb, At, Blame, CallState, Cached, Env, Hit, ImportOutcome, Layer, NsRes,
+    Query, Res, Resolver, Scan, Sink, Slot, Source,
 };
 use blaze_surface::{Node, Passed, SeenFrom, Sources, Through, through};
 use crate::work::Key;
@@ -1255,7 +1254,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     pub(crate) fn resolve_glob<F: ScopeFacts<Name = N>>(
         &self,
         g: usize,
-        facts: &F,
+        _facts: &F,
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) -> Result<GlobOutcome, ResolveError> {

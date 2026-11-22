@@ -231,3 +231,27 @@ fn heap_is_the_global_allocator() {
     assert_eq!(moved.as_slice(), &[1, 2, 3]);
     std::println!("heap: one allocator");
 }
+
+/// The `Default` test heap is the process heap: a vector made over it is freed through a
+/// handle of the heap, and a struct holding one is `Default` and `mem::take`n.
+#[test]
+fn the_default_test_heap_is_the_process_heap() {
+    use crate::testing::{TestHeap, heap};
+
+    #[derive(Default)]
+    struct Holder {
+        heap: TestHeap,
+    }
+
+    let mut v: Vec<u32, TestHeap> = Vec::new_in(TestHeap::default());
+    v.extend_from_slice(&[4, 5, 6]);
+    let (ptr, len, cap, _test_heap) = v.into_raw_parts_with_alloc();
+    // SAFETY: the parts are the vector's own, moved out once; its allocator, `TestHeap`, is the
+    // process heap's shared handle, which `heap().alloc()` is a handle of.
+    let adopted = unsafe { Vec::from_raw_parts_in(ptr, len, cap, heap().alloc()) };
+    assert_eq!(adopted.as_slice(), &[4, 5, 6]);
+    drop(adopted);
+    let mut holder = Holder::default();
+    let taken = core::mem::take(&mut holder);
+    assert_eq!(taken.heap, holder.heap, "every `TestHeap` is the one heap");
+}

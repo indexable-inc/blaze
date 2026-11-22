@@ -19,14 +19,14 @@ doctest = false
 blaze-own.workspace = true
 # The solver's vocabulary (terms, predicates, canonical words), its `Facts` and the recorder
 # `Ask` every read goes through, and its portable import (`fold`).
-blaze-solve = { path = "../blaze-solve" }
+blaze-solve.workspace = true
 # `idx`, `len32`: integer conversions in place of `as`.
 blaze-int.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std", "testing"] }
 # The test language and its in-memory world: the goals the differential test solves and checks.
-blaze-solve = { path = "../blaze-solve", features = ["testing"] }
+blaze-solve = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

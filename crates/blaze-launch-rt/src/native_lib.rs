@@ -39,6 +39,8 @@ use blaze_code::record::Symbol as CodeSymbol;
 use blaze_launch::wire::RecordId;
 use blaze_native::descriptor::DescriptorError;
 use blaze_run::SlotId;
+#[cfg(target_os = "macos")]
+use blaze_sys::posix::thread::{self as dyld, RtldFlags};
 
 use crate::run_mode::{CName, Memory, RunModeError};
 
@@ -84,6 +86,25 @@ pub enum NativeError {
     /// Init cell `index` of `record` holds address 0: nothing to call, and calling it would
     /// fault at 0.
     NullInit { record: RecordId, index: u32 },
+    /// `dlopen` refused `record` because `symbol`, an import of its C, is defined by none of
+    /// the libraries it loads (`RTLD_NOW` binds every import at the load; [`open_refused`]).
+    Unresolved { record: RecordId, symbol: CName },
+    /// `dlopen` refused `record` for another reason: `said` is dlerror's words after the path.
+    Refused { record: RecordId, said: CName },
+}
+
+/// The typed refusal of a `dlopen` of `record` from dyld's (or ld.so's) `said` text: the name
+/// dyld could not bind when it says one (macOS: "symbol not found in flat namespace '_x'" or
+/// "Symbol not found: _x"; glibc: "undefined symbol: x"), else its words after the path.
+pub fn open_refused(record: RecordId, said: &str) -> NativeError {
+    for (lead, end) in [("symbol not found in flat namespace '", '\''), ("Symbol not found: ", '\n'), ("undefined symbol: ", ' ')] {
+        if let Some((_, rest)) = said.split_once(lead) {
+            let name = rest.split(end).next().unwrap_or(rest).trim_end_matches(['\'', ')', ' ', '\n']);
+            return NativeError::Unresolved { record, symbol: CName::new(name) };
+        }
+    }
+    let words = said.split_once("): ").map_or(said, |(_, words)| words);
+    NativeError::Refused { record, said: CName::new(words) }
 }
 
 impl fmt::Display for NativeError {
@@ -148,6 +169,16 @@ impl fmt::Display for NativeError {
                 f.write_str("the native library record ")?;
                 hex(f, record)?;
                 write!(f, "'s initializer {index} is address 0 (NATIVE.md 3.4)")
+            }
+            NativeError::Unresolved { record, symbol } => {
+                f.write_str("the program did not start: its native library record ")?;
+                hex(f, record)?;
+                write!(f, " imports {symbol}, which none of the libraries it links defines (`dlopen`, NATIVE.md 3.7)")
+            }
+            NativeError::Refused { record, said } => {
+                f.write_str("the program did not start: its native library record ")?;
+                hex(f, record)?;
+                write!(f, " did not load: {said} (`dlopen`, NATIVE.md 3.7)")
             }
         }
     }
@@ -230,16 +261,17 @@ impl NativeLoad {
     }
 }
 
-/// Binds C name `name` (code record symbol `symbol`) through the loaded library: its address.
-/// `natives` is `None` before the parent's `Native` was loaded.
-pub fn bind<N: Natives>(natives: Option<&mut N>, symbol: CodeSymbol, name: &str) -> Result<u64, RunModeError> {
+/// Binds C name `name` (code record symbol `symbol`, named by record `record`) through the
+/// loaded library: its address. `natives` is `None` before the parent's `Native` was loaded.
+pub fn bind<N: Natives>(natives: Option<&mut N>, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<u64, RunModeError> {
     let Some(natives) = natives else {
         return Err(RunModeError::NoNativeLibrary { symbol });
     };
     if name.len() >= NAME_MOST || name.as_bytes().contains(&0) {
-        return Err(RunModeError::Outside { symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
+        return Err(RunModeError::Outside { record, symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
     }
     natives.lookup(name).ok_or(RunModeError::Outside {
+        record,
         symbol,
         name: CName::new(name),
         why: "neither the program's native library nor a library it loads defines it (`dlsym` on its handle)",
@@ -305,6 +337,10 @@ impl DlNatives {
     }
 
     fn keep_dlerror(&mut self) {
+        #[cfg(target_os = "macos")]
+        // SAFETY: the loader's thread-local error text is copied before the next loader call.
+        let text = unsafe { dyld::dlerror() };
+        #[cfg(target_os = "linux")]
         // SAFETY: `dlerror` returns null or a NUL-terminated string owned by the dynamic loader,
         // valid until the next dl* call on this thread; it is copied out before any.
         let text = unsafe { libc::dlerror() };
@@ -330,7 +366,7 @@ impl Natives for DlNatives {
             // `new` checked the length; kept named all the same.
             return Err(NativeError::Path { record, len: self.folder_len + 66 });
         }
-        // SAFETY: `path` is NUL-terminated (record_path). Assumptions this load rests on:
+        // `path` is NUL-terminated (record_path). Assumptions this load rests on:
         // (1) the file is a record, written once and never rewritten in place (the store's
         //     rule 51): dyld maps its pages and checks their code-signing hashes as they fault
         //     in, so a file changed under the mapping would kill the process;
@@ -343,6 +379,11 @@ impl Natives for DlNatives {
         //     one now, so a missing name fails here, named by dlerror, not at a later call);
         // (5) `RTLD_LOCAL`: its names do not join the process's global lookup, so nothing
         //     loaded later binds against the program's C code by accident.
+        #[cfg(target_os = "macos")]
+        // SAFETY: the path names the NUL-terminated library record described above.
+        let handle = unsafe { dyld::dlopen(path.as_ptr().cast(), (RtldFlags::NOW | RtldFlags::LOCAL).bits()) };
+        #[cfg(target_os = "linux")]
+        // SAFETY: the path names the NUL-terminated library record described above.
         let handle = unsafe { libc::dlopen(path.as_ptr().cast(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             self.keep_dlerror();
@@ -352,16 +393,29 @@ impl Natives for DlNatives {
         // The base: the descriptor's image-relative addresses are from the image's first byte,
         // where its Mach-O header (or ELF header) is. `dladdr` of the descriptor names that
         // image's load address.
+        #[cfg(target_os = "macos")]
+        // SAFETY: a lookup on a live handle by a NUL-terminated name.
+        let descriptor = unsafe { dyld::dlsym(handle, DESCRIPTOR_NAME.as_ptr()) };
+        #[cfg(target_os = "linux")]
         // SAFETY: a lookup on a live handle by a NUL-terminated name.
         let descriptor = unsafe { libc::dlsym(handle, DESCRIPTOR_NAME.as_ptr()) };
         if descriptor.is_null() {
             return Err(NativeError::NoDescriptor { record });
         }
-        // SAFETY: an all-zero `Dl_info` is a valid value for the call to fill.
-        let mut info: libc::Dl_info = unsafe { core::mem::zeroed() };
-        // SAFETY: `descriptor` is an address inside the image just loaded; `info` a live local.
-        let found = unsafe { libc::dladdr(descriptor, &mut info) };
-        if found == 0 || info.dli_fbase.is_null() {
+        #[cfg(target_os = "macos")]
+        let info = dyld::address_info(descriptor).ok_or(NativeError::NoDescriptor { record })?;
+        #[cfg(target_os = "linux")]
+        let info = {
+            // SAFETY: an all-zero `Dl_info` is a valid value for the call to fill.
+            let mut info: libc::Dl_info = unsafe { core::mem::zeroed() };
+            // SAFETY: `descriptor` is an address inside the image just loaded; `info` a live local.
+            let found = unsafe { libc::dladdr(descriptor, &mut info) };
+            if found == 0 {
+                return Err(NativeError::NoDescriptor { record });
+            }
+            info
+        };
+        if info.dli_fbase.is_null() {
             return Err(NativeError::NoDescriptor { record });
         }
         Ok(info.dli_fbase as u64)
@@ -371,6 +425,10 @@ impl Natives for DlNatives {
         if self.handle.is_null() {
             return Err(NativeError::Open { record });
         }
+        #[cfg(target_os = "macos")]
+        // SAFETY: a lookup on the live handle by a NUL-terminated name.
+        let at = unsafe { dyld::dlsym(self.handle, DESCRIPTOR_NAME.as_ptr()) };
+        #[cfg(target_os = "linux")]
         // SAFETY: a lookup on the live handle by a NUL-terminated name.
         let at = unsafe { libc::dlsym(self.handle, DESCRIPTOR_NAME.as_ptr()) };
         if at.is_null() {
@@ -404,6 +462,10 @@ impl Natives for DlNatives {
         }
         let mut cname = [0u8; NAME_MOST];
         cname[..name.len()].copy_from_slice(name.as_bytes());
+        #[cfg(target_os = "macos")]
+        // SAFETY: the handle is live and the zero following the copied name terminates it.
+        let address = unsafe { dyld::dlsym(self.handle, cname.as_ptr().cast()) };
+        #[cfg(target_os = "linux")]
         // SAFETY: a lookup on the live handle by a NUL-terminated name: the image, then the
         // libraries it loaded, in load order (dlsym(3) with a handle).
         let address = unsafe { libc::dlsym(self.handle, cname.as_ptr().cast()) };
@@ -415,12 +477,13 @@ impl Natives for DlNatives {
 /// after the entry is numbered and before it is called (NATIVE.md 3.4, 3.7).
 #[cfg(target_os = "macos")]
 pub fn run_inits(loaded: Loaded) -> Result<(), RunModeError> {
+    use blaze_sys::posix::proc::{_NSGetArgc, _NSGetArgv, _NSGetEnviron};
     use core::ffi::{c_char, c_int};
     type Init = extern "C" fn(c_int, *const *const c_char, *const *const c_char);
     // SAFETY: `_NSGetArgc`, `_NSGetArgv`, `_NSGetEnviron` (<crt_externs.h>) return the
     // process's own argc, argv and environ, set up by dyld before any code ran; the program
     // runs in this process, so they are its arguments (the entry's `argv` is the same list).
-    let (argc, argv, envp) = unsafe { (*libc::_NSGetArgc(), *libc::_NSGetArgv(), *libc::_NSGetEnviron()) };
+    let (argc, argv, envp) = unsafe { (*_NSGetArgc(), *_NSGetArgv(), *_NSGetEnviron()) };
     for index in 0..loaded.inits {
         let cell = loaded.inits_at + 8 * u64::from(index);
         // SAFETY: init cell `index < inits` of the image's `__blaze_inits`, 8-aligned and

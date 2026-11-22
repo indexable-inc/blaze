@@ -14,7 +14,9 @@
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
 //! output pipes read and its input written by the ring. A listen's accepts (one multishot
-//! request for all of them, each connection put straight into the table), a connect, a
+//! request for all of them: a TCP listen's connections put straight into the table, a Unix
+//! listen's into a descriptor first, its peer's uid checked as every driver checks it, then
+//! put in the table: `ops::UNIX_PEER`), a connect, a
 //! connection's receives (one multishot request into a ring of provided buffers) and sends,
 //! and a hangup's shutdown are the ring's; mapping a file is a call made where it is
 //! submitted. A listing, which may take long, runs on a thread of its own, which wakes the ring
@@ -69,6 +71,8 @@ use std::{
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Handle, Slab, Tag as MemTag, scratch};
 use blaze_radix as radix;
+use blaze_sys::{Errno, Fd, linux, posix::types::off_t};
+use core::ffi::c_uint;
 use std::alloc::Global;
 
 use self::ops::{Cold, Hot, Id, Kind};
@@ -122,8 +126,8 @@ const SQ_NEED_WAKEUP: u32 = 1 << 0;
 /// In the submission ring's flags: completions wait in the kernel for room, flushed by an
 /// enter that gets events.
 const SQ_CQ_OVERFLOW: u32 = 1 << 1;
-const OFF_SQ_RING: libc::off_t = 0;
-const OFF_SQES: libc::off_t = 0x1000_0000;
+const OFF_SQ_RING: off_t = 0;
+const OFF_SQES: off_t = 0x1000_0000;
 /// How long the kernel's submission thread spins for work before it sleeps: an idle daemon
 /// burns nothing, a busy one makes no system call to submit.
 const SQ_THREAD_IDLE_MS: u32 = 50;
@@ -151,11 +155,11 @@ const CQE_BUFFER_SHIFT: u32 = 16;
 const ASYNC_CANCEL_ALL: u32 = 1 << 0;
 const ASYNC_CANCEL_ANY: u32 = 1 << 2;
 
-const REGISTER_FILES2: libc::c_uint = 13;
-const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
-const REGISTER_PBUF_RING: libc::c_uint = 22;
-const UNREGISTER_PBUF_RING: libc::c_uint = 23;
-const REGISTER_FILE_ALLOC_RANGE: libc::c_uint = 25;
+const REGISTER_FILES2: c_uint = 13;
+const REGISTER_FILES_UPDATE2: c_uint = 14;
+const REGISTER_PBUF_RING: c_uint = 22;
+const UNREGISTER_PBUF_RING: c_uint = 23;
+const REGISTER_FILE_ALLOC_RANGE: c_uint = 25;
 const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 
 /// The most slots of the table of registered files; fewer where `RLIMIT_NOFILE` is lower,
@@ -179,7 +183,7 @@ const ZERO_COPY_LEAST: usize = 32 << 10;
 const STATX_STAMP: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
 /// `statx`'s flag to answer from what the kernel has, never asking a network file system's
 /// server first.
-const AT_STATX_DONT_SYNC: i32 = 0x4000;
+const AT_STATX_DONT_SYNC: u32 = 0x4000;
 /// Names a stamper claims at once: enough to make the claim's atomic add and the reopen of a
 /// chunk's first directory a percent or two of them (64 `statx`es are ~30 µs), few enough that
 /// the cores' last chunks end within ~30 µs of each other, under 5% of 100 000 names' sweep on
@@ -216,49 +220,6 @@ const SPARES: usize = 64;
 
 /// How long dropping the driver waits for the kernel to give back what it was lent.
 const LETTING_GO: Duration = Duration::from_secs(5);
-
-#[repr(C)]
-#[derive(Default)]
-struct SqOffsets {
-    head: u32,
-    tail: u32,
-    ring_mask: u32,
-    ring_entries: u32,
-    flags: u32,
-    dropped: u32,
-    array: u32,
-    resv1: u32,
-    user_addr: u64,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct CqOffsets {
-    head: u32,
-    tail: u32,
-    ring_mask: u32,
-    ring_entries: u32,
-    overflow: u32,
-    cqes: u32,
-    flags: u32,
-    resv1: u32,
-    user_addr: u64,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct Params {
-    sq_entries: u32,
-    cq_entries: u32,
-    flags: u32,
-    sq_thread_cpu: u32,
-    sq_thread_idle: u32,
-    features: u32,
-    wq_fd: u32,
-    resv: [u32; 3],
-    sq_off: SqOffsets,
-    cq_off: CqOffsets,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -330,7 +291,7 @@ struct ProvidedBuf {
     resv: u16,
 }
 
-const _: () = assert!(size_of::<Params>() == 120);
+const _: () = assert!(size_of::<linux::UringParams>() == 120);
 const _: () = assert!(size_of::<Sqe>() == 64);
 const _: () = assert!(size_of::<Cqe>() == 16);
 const _: () = assert!(size_of::<RsrcRegister>() == 32);
@@ -339,71 +300,20 @@ const _: () = assert!(size_of::<BufReg>() == 40);
 const _: () = assert!(size_of::<FileIndexRange>() == 16);
 const _: () = assert!(size_of::<ProvidedBuf>() == 16);
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code, reason = "made by the kernel, read through a pointer")]
-#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
-struct StatxTime {
-    sec: i64,
-    nsec: u32,
-    _pad: i32,
-}
-
-/// `struct statx` of `linux/stat.h`, the same on every architecture and C library, with only
-/// what a [`Stamp`] reads named.
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code, reason = "made by the kernel, read through a pointer")]
-#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
-struct Statx {
-    mask: u32,
-    /// `stx_blksize`, `stx_attributes`, `stx_nlink`, `stx_uid` and `stx_gid`.
-    _head: [u32; 6],
-    mode: u16,
-    _pad: u16,
-    ino: u64,
-    size: u64,
-    /// `stx_blocks` and `stx_attributes_mask`.
-    _counts: [u64; 2],
-    /// `stx_atime` and `stx_btime`.
-    _times: [StatxTime; 2],
-    ctime: StatxTime,
-    mtime: StatxTime,
-    _rest: [u64; 16],
-}
-
-const _: () = assert!(size_of::<Statx>() == 256);
-const _: () = assert!(std::mem::offset_of!(Statx, mode) == 28);
-const _: () = assert!(std::mem::offset_of!(Statx, ino) == 32);
-const _: () = assert!(std::mem::offset_of!(Statx, ctime) == 96);
-const _: () = assert!(std::mem::offset_of!(Statx, mtime) == 112);
-
-impl Statx {
-    /// The stamp [`crate::fs::stamp_of`] makes of a `stat` of the same file; unknown where the
-    /// file system did not fill in all of it.
-    fn stamp(&self) -> Stamp {
-        if self.mask & STATX_STAMP != STATX_STAMP {
-            return Stamp::UNKNOWN;
-        }
-        let ns = |t: &StatxTime| {
-            (t.sec as u64).wrapping_mul(1_000_000_000).wrapping_add(u64::from(t.nsec))
-        };
-        Stamp {
-            ino: self.ino,
-            size: self.size,
-            mtime_ns: ns(&self.mtime),
-            ctime_ns: ns(&self.ctime),
-            mode: u32::from(self.mode),
-        }
-    }
-}
+const _: () = assert!(size_of::<linux::Statx>() == 256);
+const _: () = assert!(std::mem::offset_of!(linux::Statx, mode) == 28);
+const _: () = assert!(std::mem::offset_of!(linux::Statx, ino) == 32);
+const _: () = assert!(std::mem::offset_of!(linux::Statx, ctime) == 96);
+const _: () = assert!(std::mem::offset_of!(linux::Statx, mtime) == 112);
 
 /// A name's stamp where its `statx` failed with `-res`: gone where nothing is there, unknown
 /// otherwise, as [`crate::fs::stamps`] has it.
 fn stamp_of_error(res: i32) -> Stamp {
-    match -res {
-        libc::ENOENT | libc::ENOTDIR => Stamp::GONE,
-        _ => Stamp::UNKNOWN,
+    let code = -res;
+    if code == i32::from(Errno::NoEnt.raw()) || code == i32::from(Errno::NotDir.raw()) {
+        Stamp::GONE
+    } else {
+        Stamp::UNKNOWN
     }
 }
 
@@ -411,9 +321,9 @@ fn stamp_of_error(res: i32) -> Stamp {
 /// kernel that has it, where this one refuses it as unknown.
 fn register<T>(
     ring: RawFd,
-    opcode: libc::c_uint,
+    opcode: c_uint,
     arg: *const T,
-    nr: libc::c_uint,
+    nr: c_uint,
     what: &str,
     since: &str,
 ) -> io::Result<i64> {
@@ -423,8 +333,9 @@ fn register<T>(
         return Ok(got);
     }
     let error = io::Error::last_os_error();
-    Err(match error.raw_os_error() {
-        Some(libc::EINVAL | libc::EOPNOTSUPP) => io::Error::new(
+    let errno = error.raw_os_error().and_then(|code| u16::try_from(code).ok()).map(Errno::from_raw);
+    Err(match errno {
+        Some(Errno::Inval | Errno::OpNotSupp) => io::Error::new(
             io::ErrorKind::Unsupported,
             // alloc: the error of a setup that failed.
             format!(
@@ -440,22 +351,19 @@ fn register<T>(
 
 /// An anonymous mapping of `len` bytes, page-aligned, unmapped when dropped.
 fn anonymous(len: usize) -> io::Result<Mapping> {
-    // SAFETY: a new private anonymous mapping: no file, no address hint, so it overlaps nothing
-    // the program holds; the result is checked against `MAP_FAILED` below.
+    // SAFETY: a private anonymous mapping without FIXED or an address hint replaces nothing.
     let at = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
+        linux::mmap(
+            None,
             len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
-            -1,
+            linux::Prot::READ | linux::Prot::WRITE,
+            linux::MapFlags::PRIVATE | linux::MapFlags::ANONYMOUS | linux::MapFlags::POPULATE,
+            None,
             0,
         )
-    };
-    if at == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
     }
-    Ok(Mapping { at: at.cast(), len })
+    .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+    Ok(Mapping { at: at.as_ptr(), len })
 }
 
 /// The table of registered files: requests name a slot of it (`IOSQE_FIXED_FILE`), so the
@@ -474,11 +382,8 @@ struct Table {
 
 impl Table {
     fn new(ring: &Rc<OwnedFd>) -> io::Result<Rc<Table>> {
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: `&mut limit` is a live, aligned `rlimit` the call writes and does not keep.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let limit = linux::host::prlimit64(0, linux::host::Resource::NOFILE, None)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
         let size = u32::try_from(limit.rlim_cur).unwrap_or(u32::MAX).min(TABLE) & !1;
         if size < 2 {
             // alloc: the error of a setup that failed.
@@ -490,7 +395,7 @@ impl Table {
         let fd = ring.as_raw_fd();
         let sparse =
             RsrcRegister { nr: size, flags: RSRC_REGISTER_SPARSE, resv2: 0, data: 0, tags: 0 };
-        let nr = size_of::<RsrcRegister>() as libc::c_uint;
+        let nr = size_of::<RsrcRegister>() as c_uint;
         register(
             fd,
             REGISTER_FILES2,
@@ -531,7 +436,7 @@ impl Table {
             nr: 1,
             resv2: 0,
         };
-        let nr = size_of::<RsrcUpdate2>() as libc::c_uint;
+        let nr = size_of::<RsrcUpdate2>() as c_uint;
         register(
             self.ring.as_raw_fd(),
             REGISTER_FILES_UPDATE2,
@@ -780,8 +685,8 @@ impl ReservedCheck {
     /// shows one.
     fn answered(errno: Option<i32>) -> Option<ReservedCheck> {
         match errno {
-            Some(libc::ENOENT) => Some(ReservedCheck::Upstream),
-            Some(libc::EINVAL) => Some(ReservedCheck::Inverted),
+            Some(code) if code == i32::from(Errno::NoEnt.raw()) => Some(ReservedCheck::Upstream),
+            Some(code) if code == i32::from(Errno::Inval.raw()) => Some(ReservedCheck::Inverted),
             _ => None,
         }
     }
@@ -803,20 +708,21 @@ fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Er
         ReservedCheck::Upstream => "",
         ReservedCheck::Inverted => ", as this kernel's inverted check takes them",
     };
-    let why = match error.raw_os_error() {
+    let errno = error.raw_os_error().and_then(|code| u16::try_from(code).ok()).map(Errno::from_raw);
+    let why = match errno {
         // alloc: the error of a setup that failed.
-        Some(libc::EINVAL) => format!(
+        Some(Errno::Inval) => format!(
             "every requirement io_register_pbuf_ring states is met (a power of two of entries \
              under 65536, a page-aligned ring, no flags, reserved words as this kernel checks \
              them), and this kernel (Linux {kernel}) refuses it all the same: its io_uring/kbuf.c \
              says for what"
         ),
         // alloc: the error of a setup that failed.
-        Some(libc::EEXIST) => format!("group {} already has buffers on this ring", reg.bgid),
+        Some(Errno::Exist) => format!("group {} already has buffers on this ring", reg.bgid),
         // alloc: the error of a setup that failed.
-        Some(libc::ENOMEM) => "the kernel had no memory for the group or to pin the ring's page".to_owned(),
+        Some(Errno::NoMem) => "the kernel had no memory for the group or to pin the ring's page".to_owned(),
         // alloc: the error of a setup that failed.
-        Some(libc::EFAULT) => "the kernel could not read the registration or pin the ring's page".to_owned(),
+        Some(Errno::Fault) => "the kernel could not read the registration or pin the ring's page".to_owned(),
         // alloc: the error of a setup that failed.
         _ => format!("an answer io_register_pbuf_ring is not known to give on Linux {kernel}"),
     };
@@ -838,22 +744,21 @@ struct Mapping {
 }
 
 impl Mapping {
-    fn new(fd: RawFd, len: usize, offset: libc::off_t) -> io::Result<Mapping> {
-        // SAFETY: a shared mapping of the ring's file at the offset the kernel names for it.
+    fn new(fd: RawFd, len: usize, offset: off_t) -> io::Result<Mapping> {
+        // SAFETY: the kernel chooses a fresh address. Ring state that it can change is
+        // accessed through raw pointers and the ring's atomic synchronization.
         let at = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
+            linux::mmap(
+                None,
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                fd,
-                offset,
+                linux::Prot::READ | linux::Prot::WRITE,
+                linux::MapFlags::SHARED | linux::MapFlags::POPULATE,
+                Some(Fd::new(fd)),
+                offset as u64,
             )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
         }
-        Ok(Mapping { at: at.cast(), len })
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+        Ok(Mapping { at: at.as_ptr(), len })
     }
 
     /// The `T` at `offset`, which the kernel's offsets say is one. Checked against the mapping
@@ -872,8 +777,8 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: the mapping `new` made, unmapped once.
-        unsafe { libc::munmap(self.at.cast(), self.len) };
+        // SAFETY: mmap returned this non-null address. No user of the range outlives the mapping.
+        let _ = unsafe { linux::munmap(ptr::NonNull::new_unchecked(self.at), self.len) };
     }
 }
 
@@ -918,31 +823,27 @@ impl Ring {
     /// when the issuing thread runs it, mean nothing with SQPOLL, and the kernel refuses them
     /// with it.
     fn new(entries: u32, completions: u32) -> io::Result<Ring> {
-        let mut params = Params {
+        let mut params = linux::UringParams {
             flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL,
             sq_thread_idle: SQ_THREAD_IDLE_MS,
             cq_entries: completions,
-            ..Params::default()
+            ..linux::UringParams::default()
         };
-        // SAFETY: `params` is the `io_uring_params` the call reads and fills.
-        let fd = unsafe {
-            libc::syscall(libc::SYS_io_uring_setup, entries, &raw mut params as *mut libc::c_void)
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            let errno = error.raw_os_error().unwrap_or(0);
+        let fd = linux::io_uring_setup(entries, &mut params).map_err(|code| {
+            let errno = i32::from(code.raw());
+            let error = io::Error::from_raw_os_error(errno);
             let disabled = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled")
                 .ok()
                 .and_then(|it| it.trim().parse().ok());
-            let kind = match errno {
-                libc::ENOSYS | libc::EINVAL => io::ErrorKind::Unsupported,
+            let kind = match code {
+                Errno::NoSys | Errno::Inval => io::ErrorKind::Unsupported,
                 _ => error.kind(),
             };
             let why = setup_refused(errno, &error, disabled, &crate::cgroup::kernel());
-            return Err(io::Error::new(kind, why));
-        }
-        // SAFETY: the call returned a file descriptor of its own.
-        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
+            io::Error::new(kind, why)
+        })?;
+        // SAFETY: into_raw transfers sole ownership of the new ring descriptor.
+        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) }); // alloc: setup, once per driver.
         let wanted = [
             (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP", "5.4"),
             (FEAT_NODROP, "IORING_FEAT_NODROP", "5.5"),
@@ -1126,14 +1027,12 @@ impl Ring {
 /// `kernel` the running kernel's release. On Linux the build runs on io_uring and on nothing
 /// else, so this is where it stops.
 fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &str) -> String {
-    let name = match errno {
-        libc::ENOSYS => "ENOSYS",
-        libc::EPERM => "EPERM",
-        libc::EACCES => "EACCES",
-        libc::EINVAL => "EINVAL",
-        libc::ENOMEM => "ENOMEM",
-        libc::EMFILE => "EMFILE",
-        libc::ENFILE => "ENFILE",
+    use blaze_sys::Errno;
+
+    let code = u16::try_from(errno).ok().map(Errno::from_raw);
+    let name = match code {
+        Some(e @ (Errno::NoSys | Errno::Perm | Errno::Acces | Errno::Inval | Errno::NoMem
+            | Errno::MFile | Errno::NFile)) => e.name(),
         _ => "",
     };
     let seccomp = "a seccomp policy that refuses io_uring_setup, such as Docker's default profile \
@@ -1147,40 +1046,40 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
         "" => write!(out, "errno {errno} ({error}). Likely cause: "),
         name => write!(out, "{name} ({error}). Likely cause: "),
     };
-    _ = match (errno, disabled) {
-        (libc::EPERM | libc::EACCES, Some(2)) => write!(
+    _ = match (code, disabled) {
+        (Some(Errno::Perm | Errno::Acces), Some(2)) => write!(
             out,
             "the sysctl kernel.io_uring_disabled is 2, which disables io_uring for every process. \
              Fix: sysctl -w kernel.io_uring_disabled=0 as root (and set it in /etc/sysctl.d to keep it)"
         ),
-        (libc::EPERM | libc::EACCES, Some(1)) => write!(
+        (Some(Errno::Perm | Errno::Acces), Some(1)) => write!(
             out,
             "the sysctl kernel.io_uring_disabled is 1, which allows io_uring only to processes \
              in the group kernel.io_uring_group names or with CAP_SYS_ADMIN. \
              Fix: sysctl -w kernel.io_uring_disabled=0 as root, or add this user to the group \
              kernel.io_uring_group names"
         ),
-        (libc::EPERM | libc::EACCES, _) => write!(out, "{seccomp}. Fix: {allow}"),
-        (libc::ENOSYS, _) => write!(
+        (Some(Errno::Perm | Errno::Acces), _) => write!(out, "{seccomp}. Fix: {allow}"),
+        (Some(Errno::NoSys), _) => write!(
             out,
             "this kernel (Linux {kernel}) has no io_uring: older than 5.1 or built without \
              CONFIG_IO_URING; or {seccomp}, answering ENOSYS. \
              Fix: run on Linux 6.0 or later built with io_uring, or {allow}"
         ),
-        (libc::EINVAL, _) => write!(
+        (Some(Errno::Inval), _) => write!(
             out,
             "this kernel (Linux {kernel}) lacks IORING_SETUP_SQPOLL with \
              IORING_SETUP_SUBMIT_ALL, which Linux 5.18 and later have. \
              Fix: run on Linux 6.0 or later"
         ),
-        (libc::ENOMEM, _) => write!(
+        (Some(Errno::NoMem), _) => write!(
             out,
             "the locked-memory limit (RLIMIT_MEMLOCK), which kernels before 5.12 charge a ring \
              to, is too small, or the machine is out of memory. \
              Fix: raise the limit (ulimit -l unlimited, or LimitMEMLOCK= for a systemd unit), or run \
              on Linux 6.0 or later"
         ),
-        (libc::EMFILE | libc::ENFILE, _) => write!(
+        (Some(Errno::MFile | Errno::NFile), _) => write!(
             out,
             "no file descriptor is left for the ring, in this process or the system. \
              Fix: raise the open-file limit (ulimit -n)"
@@ -1313,14 +1212,11 @@ struct Offload {
 
 impl Offload {
     fn new() -> io::Result<Offload> {
-        // SAFETY: no pointers.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = blaze_sys::linux::eventfd2(0, blaze_sys::linux::EventFlags::CLOSE_ON_EXEC)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
         let (sender, receiver) = crate::chan::unbounded();
-        // SAFETY: the call returned a descriptor of its own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: into_raw transfers sole ownership of the open eventfd.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd.into_raw()) };
         let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false), asked: AtomicBool::new(false) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
         let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
@@ -1429,7 +1325,7 @@ enum Step {
 /// A spawn in flight: its process, until it has exited and both its pipes have ended.
 struct Spawning {
     tag: Tag,
-    pid: libc::pid_t,
+    pid: blaze_sys::posix::types::pid_t,
     /// What a kill signals: the process itself, whatever its pid names by then.
     pidfd: OwnedFd,
     finish: crate::process::Finish,
@@ -1546,7 +1442,8 @@ impl Job {
             let from = (chunk * STAMP_CHUNK).min(self.names.len());
             let to = (from + STAMP_CHUNK).min(self.names.len());
             let dir = self.dir.get_or_init(|| {
-                open_dir(&self.root).map_err(|it| it.raw_os_error().unwrap_or(libc::EIO))
+                open_dir(&self.root)
+                    .map_err(|it| it.raw_os_error().unwrap_or(i32::from(blaze_sys::Errno::Io.raw())))
             });
             if let Ok(dir) = dir {
                 stamp_names(dir.as_raw_fd(), &self.names, from..to, parent, |at, stamp| {
@@ -1713,7 +1610,7 @@ fn stamper(
     inboxes: &[crate::chan::Sender<ToStamp>],
 ) {
     // alloc: one buffer per stamper, reused for every directory of every job.
-    let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
+    let mut parent = Vec::with_capacity(blaze_sys::posix::proc::PATH_MAX as usize);
     while let Ok(work) = inbox.recv() {
         let wanted = match &work {
             ToStamp::Sweep(job) => job.claims.chunks(),
@@ -1777,47 +1674,51 @@ fn stamp_names(
     }
 }
 
-/// The last error of a call of this thread's, as a ring's result is: negative.
-fn errno() -> i32 {
-    -io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
-}
-
 /// The directory `name` (with its NUL) under `dir`, opened only to name it in calls relative
 /// to it; the error as a negative errno.
 fn open_path(dir: RawFd, name: &[u8]) -> Result<OwnedFd, i32> {
+    use blaze_sys::linux::OpenFlags;
+
     debug_assert_eq!(name.last(), Some(&0));
-    // SAFETY: an open directory and a NUL-terminated name; the result is a descriptor of its
-    // own or -1.
-    let fd = unsafe {
-        libc::openat(dir, name.as_ptr().cast(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-    };
-    if fd < 0 {
-        return Err(errno());
-    }
-    // SAFETY: the call returned a descriptor of its own.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let name = CStr::from_bytes_until_nul(name).map_err(|_| -i32::from(blaze_sys::Errno::Inval.raw()))?;
+    let fd = blaze_sys::linux::openat(
+        blaze_sys::Fd::new(dir),
+        blaze_sys::Path::new(name),
+        OpenFlags::PATH | OpenFlags::DIRECTORY | OpenFlags::CLOSE_ON_EXEC,
+        0,
+    )
+    .map_err(|error| -i32::from(error.raw()))?;
+    // SAFETY: into_raw transfers sole ownership of the open directory.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) })
 }
 
 /// The stamp of `leaf` (with its NUL) under `dir`, not followed through a symlink.
 fn statx_at(dir: RawFd, leaf: &[u8]) -> Stamp {
     debug_assert_eq!(leaf.last(), Some(&0));
-    let mut statx = std::mem::MaybeUninit::<Statx>::uninit();
-    // SAFETY: an open directory, a NUL-terminated name, and room for a `struct statx`.
-    let got = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            dir,
-            leaf.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
-            STATX_STAMP,
-            statx.as_mut_ptr(),
-        )
+    let Ok(leaf) = CStr::from_bytes_until_nul(leaf) else { return Stamp::UNKNOWN };
+    let flags = linux::AtFlags::NO_FOLLOW | linux::AtFlags::from_bits(AT_STATX_DONT_SYNC);
+    let stat = match linux::statx(
+        Fd::new(dir),
+        blaze_sys::Path::new(leaf),
+        flags,
+        linux::StatxMask::from_bits(STATX_STAMP),
+    ) {
+        Ok(stat) => stat,
+        Err(error) => return stamp_of_error(-i32::from(error.raw())),
     };
-    if got != 0 {
-        return stamp_of_error(errno());
+    if stat.mask & STATX_STAMP != STATX_STAMP {
+        return Stamp::UNKNOWN;
     }
-    // SAFETY: the call succeeded, so it filled the `statx`.
-    unsafe { statx.assume_init_ref() }.stamp()
+    let ns = |t: &linux::StatxTime| {
+        (t.sec as u64).wrapping_mul(1_000_000_000).wrapping_add(u64::from(t.nsec))
+    };
+    Stamp {
+        ino: stat.ino,
+        size: stat.size,
+        mtime_ns: ns(&stat.mtime),
+        ctime_ns: ns(&stat.ctime),
+        mode: u32::from(stat.mode),
+    }
 }
 
 /// The ring's wake for work done off it: the eventfd its thread reads while it waits, and
@@ -1857,8 +1758,7 @@ fn wake_ring(wake: &Wake) {
         return;
     }
     let one = 1u64.to_ne_bytes();
-    // SAFETY: eight bytes, which an eventfd write takes, of an open eventfd.
-    unsafe { libc::write(wake.fd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    let _ = blaze_sys::linux::write(blaze_sys::Fd::new(wake.fd.as_raw_fd()), &one);
 }
 
 pub struct Uring {
@@ -1959,6 +1859,10 @@ pub struct Uring {
     /// for tests of what follows a start (a slot's reuse, a warm watch's allocations).
     #[cfg(test)]
     walks_here: bool,
+    /// A test's planted bug: a Unix listen's connection put in the table with its peer
+    /// unchecked, as every accept on the ring was until 2026-11-21 (flight.rs `admitted`).
+    #[cfg(test)]
+    peers_unchecked: bool,
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
@@ -2067,6 +1971,8 @@ impl Uring {
             walk_gate: None,
             #[cfg(test)]
             walks_here: false,
+            #[cfg(test)]
+            peers_unchecked: false,
             stampers: None,
             host: crate::host::Host::new(Arc::new(HostSink {
                 // clone: setup, a channel's handle and a count of the wake, for the host.
@@ -2613,8 +2519,8 @@ fn kill(pidfd: RawFd) -> io::Result<()> {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd,
-            libc::SIGKILL,
-            ptr::null::<libc::siginfo_t>(),
+            blaze_sys::posix::signal::SIGKILL,
+            ptr::null::<blaze_sys::posix::signal::siginfo_t>(),
             0,
         )
     };
@@ -2623,7 +2529,7 @@ fn kill(pidfd: RawFd) -> io::Result<()> {
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
+        Some(code) if code == i32::from(blaze_sys::Errno::Srch.raw()) => Ok(()),
         _ => Err(error),
     }
 }
@@ -2728,40 +2634,35 @@ fn with_c<R>(path: &Path, f: impl FnOnce(&CStr) -> io::Result<R>) -> io::Result<
 }
 
 /// `path` opened with `flags`, made `0o644` where they make it.
-fn open_c(path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
-    // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
-    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644 as libc::c_uint) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: as above.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+fn open_c(path: &CStr, flags: core::ffi::c_int) -> io::Result<OwnedFd> {
+    let fd = blaze_sys::linux::openat(
+        blaze_sys::linux::CWD,
+        blaze_sys::Path::new(path),
+        blaze_sys::linux::OpenFlags::from_bits(flags as u32),
+        0o644,
+    )
+    .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+    // SAFETY: into_raw transfers sole ownership of the open descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) })
 }
 
 /// The directory `dir`, opened on a stamper's thread for calls relative to it.
 fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
-    with_c(dir, |dir| open_c(dir, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC))
+    use blaze_sys::linux::OpenFlags;
+    let flags = OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::CLOSE_ON_EXEC;
+    with_c(dir, |dir| open_c(dir, flags.bits() as i32))
 }
 
 /// How many names the file open as `fd` has: 0 once it was removed.
 fn links_of(fd: RawFd) -> io::Result<u64> {
-    // SAFETY: as `size_of_file`'s.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: an open descriptor and a `stat` to write.
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let stat = blaze_sys::linux::task::fstat(blaze_sys::Fd::new(fd))
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
     Ok(stat.st_nlink as u64)
 }
 
 fn size_of_file(fd: RawFd) -> io::Result<u64> {
-    // SAFETY: `libc::stat` is a C struct of integers and arrays of them, for which all-zero
-    // bytes is a valid value.
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: an open descriptor and a `stat` to write.
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let stat = blaze_sys::linux::task::fstat(blaze_sys::Fd::new(fd))
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
     Ok(stat.st_size as u64)
 }
 
@@ -2770,7 +2671,7 @@ fn size_of_file(fd: RawFd) -> io::Result<u64> {
 /// `crate::net::listen` before its bind; the ring accepts straight into its table, and each
 /// connection keeps the listen's options as Linux copies them (sockopt's test
 /// `an_accepted_connection_carries_the_listen_s_options`).
-fn connect_socket(table: &Rc<Table>, domain: libc::c_int, options: &crate::sockopt::Tcp) -> io::Result<Fixed> {
+fn connect_socket(table: &Rc<Table>, domain: core::ffi::c_int, options: &crate::sockopt::Tcp) -> io::Result<Fixed> {
     let fd = crate::net::stream_socket(domain)?;
     crate::sockopt::for_stream(fd.as_raw_fd(), domain, options, crate::sockopt::Side::Connect)?;
     table.install(fd)
@@ -2914,9 +2815,12 @@ impl Driver for Uring {
                 // Linux keeps no journal across a restart: the first batch says what of the
                 // cursor is lost, told once the watch is in place, and the watch is live from
                 // then.
-                Effect::Journal { dir, since, .. } => {
-                    let first = crate::journal::first_on_linux(&dir, &since);
+                Effect::Journal { dir: crate::DirName::Named(dir), since, .. } => {
+                    let first = crate::journal::first_on_linux(&since);
                     self.watch(tag, dir, Some(first)).map(|()| None)
+                }
+                Effect::Journal { dir: crate::DirName::Root, .. } => {
+                    Ok(Some(crate::journal::root_not_journaled("io_uring")))
                 }
                 // No name to stamp: answered here, with no stamper woken for it.
                 Effect::Stamp { files, .. } if files.is_empty() => {
@@ -3018,19 +2922,20 @@ impl Driver for Uring {
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, options, .. } => crate::net::listen(&self.root, &address, &options)
                     .and_then(|listener| {
+                        let unix = listener.is_unix();
                         let listener = self.listeners.insert(listener);
-                        let id = self.start(
-                            Hot::new(tag, Kind::Accept, listener.to_bits()),
-                            ops::NO_BYTES,
-                            Cold::EMPTY,
-                        );
+                        let mut hot = Hot::new(tag, Kind::Accept, listener.to_bits());
+                        if unix {
+                            hot.flags |= ops::UNIX_PEER;
+                        }
+                        let id = self.start(hot, ops::NO_BYTES, Cold::EMPTY);
                         self.listens.insert(tag, id);
                         Ok(None)
                     }),
                 Effect::Connect { at: address, options, .. } => crate::net::sockaddr(&self.root, &address)
                     .and_then(|address| {
                         let socket = connect_socket(&self.table, address.domain, &options)?;
-                        let tcp = address.domain != libc::AF_UNIX;
+                        let tcp = address.domain != blaze_sys::posix::net::AF_UNIX;
                         let connecting = self.connectings.insert(Connecting {
                             socket: Some(socket),
                             at: address,
@@ -3174,6 +3079,7 @@ impl Driver for Uring {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use blaze_sys::{Errno, linux::OpenFlags, posix::signal};
 
     use super::*;
     use crate::{
@@ -3518,8 +3424,8 @@ mod tests {
         let one = exited(1);
         assert_eq!((one.code, one.signal), (Some(3), None));
         assert_eq!((&one.stdout[..], &one.stderr[..]), (&b"HELLO\n"[..], &b"oops\n"[..]));
-        assert_eq!((exited(2).code, exited(2).signal), (None, Some(libc::SIGTERM)));
-        assert_eq!(exited(3).signal, Some(libc::SIGKILL));
+        assert_eq!((exited(2).code, exited(2).signal), (None, Some(signal::SIGTERM)));
+        assert_eq!(exited(3).signal, Some(signal::SIGKILL));
         let four = exited(4);
         assert_eq!(four.code, Some(0));
         assert!(four.stdout.starts_with(b"300000\n"), "{:?}", four.stdout.get(..10));
@@ -3711,6 +3617,73 @@ mod tests {
         assert_eq!(ours, round_trip(&mut threads, &at));
     }
 
+    /// A Unix listen's connection of another user is refused on the ring by the decision every
+    /// driver's accept takes (net.rs `Listener::admit`, `peer_is`, `peer_judged`): closed
+    /// before a byte of it is read, never told as `Done::Accepted`, and the listen goes on: the
+    /// next connection, of the listener's own user, is accepted. No second user exists where
+    /// tests run, so the listener is told another uid (`answer_only`) and this process plays the
+    /// foreign peer. CONTROL (rule 23): the check planted away (`peers_unchecked`, the ring's
+    /// accept as it was until 2026-11-21), the same foreign connection is adopted.
+    #[test]
+    fn a_foreign_peer_is_closed_unread_on_the_ring() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+
+        #[derive(PartialEq, Eq, Debug)]
+        enum Foreign {
+            Adopted,
+            ClosedUnread,
+        }
+        fn foreign(planted: bool) -> Foreign {
+            let root = dir(if planted { "uring-peer-planted" } else { "uring-peer" });
+            let mut ring = Uring::new(&root).unwrap();
+            ring.peers_unchecked = planted;
+            let at = Address::Unix(FileName::new("p.sock").unwrap());
+            ring.submit(&mut vec![Effect::Listen { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
+            let own = blaze_sys::posix::thread::geteuid();
+            let told = |ring: &mut Uring, uid: u32| {
+                for (_, listener) in ring.listeners.iter_mut() {
+                    listener.answer_only(uid);
+                }
+            };
+            told(&mut ring, own.wrapping_add(1));
+            let socket = root.join("p.sock");
+            let mut peer = UnixStream::connect(&socket).unwrap();
+            peer.write_all(b"x").unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let mut out = Vec::new();
+            let mut answer = [0u8; 1];
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let seen = loop {
+                assert!(Instant::now() < deadline, "the foreign connection was neither accepted nor closed in 10 s: {out:?}");
+                ring.poll(&mut out, Deadline::after(ring.now(), Duration::from_millis(50)));
+                if out.iter().any(|it| matches!(it.done, Done::Accepted { .. })) {
+                    break Foreign::Adopted;
+                }
+                match peer.read(&mut answer) {
+                    Ok(0) => break Foreign::ClosedUnread,
+                    Ok(_) => panic!("the foreign peer was answered"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    // Reset: closed with its byte unread.
+                    Err(_) => break Foreign::ClosedUnread,
+                }
+            };
+            if seen == Foreign::ClosedUnread {
+                // The listen went on: a connection of its own user is accepted.
+                assert!(out.is_empty(), "a refused connection was told: {out:?}");
+                told(&mut ring, own);
+                let _ours = UnixStream::connect(&socket).unwrap();
+                poll_until(&mut ring, &mut out, |out| !out.is_empty());
+                assert!(matches!(&out[..], [Completion { tag: Tag(1), done: Done::Accepted { .. } }]), "{out:?}");
+            }
+            drop(ring);
+            std::fs::remove_dir_all(&root).unwrap();
+            seen
+        }
+        assert_eq!(foreign(false), Foreign::ClosedUnread);
+        assert_eq!(foreign(true), Foreign::Adopted, "CONTROL: with the check left out, the foreign peer is adopted");
+    }
+
     #[test]
     fn a_tcp_round_trip() {
         let mut ring = Uring::new(dir("uring-tcp")).unwrap();
@@ -3882,8 +3855,7 @@ mod tests {
         drop(ring);
         assert!(began.elapsed() < LETTING_GO, "{:?}", began.elapsed());
         // Reaped: no process of this pid is a child of this one any more.
-        // SAFETY: no pointers.
-        assert_eq!(unsafe { libc::waitpid(pid, ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert!(blaze_sys::linux::task::waitpid(pid, blaze_sys::linux::WaitOptions::NO_HANG).is_err());
         assert!(!root.join("api.sock").exists());
     }
 
@@ -4071,7 +4043,7 @@ mod tests {
     /// of `a_write_at_an_offset_goes_through_the_page_cache`.
     fn around_the_cache(sqes: &[Sqe]) -> Option<String> {
         sqes.iter().find_map(|sqe| match sqe.opcode {
-            OP_OPENAT if sqe.op_flags & libc::O_DIRECT as u32 != 0 => {
+            OP_OPENAT if sqe.op_flags & OpenFlags::DIRECT.bits() != 0 => {
                 Some("an open asks for O_DIRECT".to_owned())
             }
             5 => Some("a write is from a registered buffer (WRITE_FIXED)".to_owned()),
@@ -4085,7 +4057,7 @@ mod tests {
     fn the_oracle_catches_a_write_at_an_offset_opened_around_the_cache() {
         let planted = Sqe {
             opcode: OP_OPENAT,
-            op_flags: (libc::O_WRONLY | libc::O_DIRECT) as u32,
+            op_flags: (OpenFlags::WRITE | OpenFlags::DIRECT).bits(),
             ..Sqe::default()
         };
         let write = Sqe { opcode: OP_WRITE, ..Sqe::default() };
@@ -4093,7 +4065,7 @@ mod tests {
         assert_eq!(said.as_deref(), Some("an open asks for O_DIRECT"));
         let fixed = Sqe { opcode: 5, ..Sqe::default() };
         assert!(around_the_cache(&[fixed]).is_some_and(|it| it.contains("WRITE_FIXED")));
-        let buffered = Sqe { opcode: OP_OPENAT, op_flags: libc::O_WRONLY as u32, ..Sqe::default() };
+        let buffered = Sqe { opcode: OP_OPENAT, op_flags: OpenFlags::WRITE.bits(), ..Sqe::default() };
         assert_eq!(around_the_cache(&[buffered, write]), None);
     }
 
@@ -4377,7 +4349,7 @@ mod tests {
         let root = dir("uring-stamp-alloc");
         let names = sweep_tree(&root, 2_000);
         let fd = open_dir(&root).unwrap();
-        let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
+        let mut parent = Vec::with_capacity(blaze_sys::posix::proc::PATH_MAX as usize);
         let mut stamps = vec![Stamp::UNKNOWN; names.len()];
         blaze_alloc_count::assert_at_most(0, "stamp_names", || {
             stamp_names(fd.as_raw_fd(), &names, 0..names.len(), &mut parent, |at, stamp| {
@@ -4695,14 +4667,14 @@ mod tests {
             std::fs::create_dir_all(root.join("src")).unwrap();
             let src = FileName::new("src").unwrap();
             let mut driver = Uring::new(&root).unwrap();
-            driver.submit(&mut vec![Effect::Journal { dir: src.clone(), since, tag: Tag(7) }]);
+            driver.submit(&mut vec![Effect::Journal { dir: crate::DirName::Named(src.clone()), since, tag: Tag(7) }]);
             let mut done = Vec::new();
             driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_secs(5)));
-            let lost = if lost { vec![(src.clone(), Lost::NoJournal)] } else { Vec::new() };
+            let whole = lost.then_some(Lost::NoJournal);
             match done.remove(0) {
                 Completion { tag: Tag(7), done: Done::Journaled(first) } => assert_eq!(
                     *first,
-                    Journaled { files: Vec::new(), lost, cursor: Cursor::None, caught_up: true }
+                    Journaled { files: Vec::new(), lost: Vec::new(), whole, itself: false, cursor: Cursor::None, caught_up: true }
                 ),
                 other => panic!("{other:?}"),
             }
@@ -4718,7 +4690,7 @@ mod tests {
                 for it in done.drain(..) {
                     match (it.tag.0, it.done) {
                         (7, Done::Journaled(batch)) => {
-                            assert!(batch.caught_up && batch.lost.is_empty(), "{batch:?}");
+                            assert!(batch.caught_up && batch.lost.is_empty() && batch.whole.is_none(), "{batch:?}");
                             heard.extend(batch.files);
                         }
                         (8, Done::Flushed) => {
@@ -4881,7 +4853,7 @@ mod tests {
         assert_eq!(read.index(), synced.index(), "the sync's slot is the read's");
         assert_ne!(read, synced);
         driver.completed(data(synced, 0), 0, 0);
-        driver.completed(data(synced, 0), -libc::EIO, 0);
+        driver.completed(data(synced, 0), -i32::from(Errno::Io.raw()), 0);
         assert!(driver.ready.is_empty(), "{:?}", driver.ready);
         assert!(driver.ops.contains(read));
         let mut seen = Vec::new();
@@ -4908,7 +4880,7 @@ mod tests {
         let reused = reused.expect("the watch's read's slot is taken again");
         assert_ne!(reused, watched);
         driver.completed(data(watched, 0), 16, 0);
-        driver.completed(data(watched, 0), -libc::ECANCELED, 0);
+        driver.completed(data(watched, 0), -i32::from(Errno::Canceled.raw()), 0);
         assert!(driver.ready.is_empty(), "{:?}", driver.ready);
         assert!(driver.ops.contains(reused) && driver.watches.contains_key(&Tag(4)));
         let mut seen = BTreeMap::new();
@@ -5184,6 +5156,7 @@ mod tests {
     /// `EPERM`, as the budget tests count allocations. The ring's requests are no calls of the
     /// thread's, so they pass.
     mod path_calls {
+        use blaze_sys::linux::{self, nr};
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static TRAPPED: AtomicU64 = AtomicU64::new(0);
@@ -5193,46 +5166,51 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
         #[cfg(target_arch = "x86_64")]
-        const CALLS: &[libc::c_long] = &[
+        const CALLS: &[core::ffi::c_long] = &[
             libc::SYS_open,
             libc::SYS_creat,
-            libc::SYS_openat,
-            libc::SYS_openat2,
+            nr::OPENAT as core::ffi::c_long,
+            nr::OPENAT2 as core::ffi::c_long,
             libc::SYS_mkdir,
-            libc::SYS_mkdirat,
+            nr::MKDIRAT as core::ffi::c_long,
             libc::SYS_rmdir,
             libc::SYS_unlink,
-            libc::SYS_unlinkat,
+            nr::UNLINKAT as core::ffi::c_long,
             libc::SYS_link,
-            libc::SYS_linkat,
+            nr::LINKAT as core::ffi::c_long,
             libc::SYS_rename,
-            libc::SYS_renameat,
-            libc::SYS_renameat2,
+            nr::RENAMEAT as core::ffi::c_long,
+            nr::RENAMEAT2 as core::ffi::c_long,
         ];
         #[cfg(target_arch = "aarch64")]
-        const CALLS: &[libc::c_long] = &[
-            libc::SYS_openat,
-            libc::SYS_openat2,
-            libc::SYS_mkdirat,
-            libc::SYS_unlinkat,
-            libc::SYS_linkat,
-            libc::SYS_renameat,
-            libc::SYS_renameat2,
+        const CALLS: &[usize] = &[
+            nr::OPENAT,
+            nr::OPENAT2,
+            nr::MKDIRAT,
+            nr::UNLINKAT,
+            nr::LINKAT,
+            nr::RENAMEAT,
+            nr::RENAMEAT2,
         ];
 
-        extern "C" fn trapped(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
+        extern "C" fn trapped(
+            _: core::ffi::c_int,
+            _: *mut blaze_sys::posix::signal::siginfo_t,
+            context: *mut core::ffi::c_void,
+        ) {
             TRAPPED.fetch_add(1, Ordering::Relaxed);
-            let context = context.cast::<libc::ucontext_t>();
+            let context = context.cast::<blaze_sys::posix::signal::ucontext_t>();
             // SAFETY: the context the kernel hands an `SA_SIGINFO` handler, of the thread whose
             // call trapped; the register written is the one the call returns in.
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                (*context).uc_mcontext.gregs[libc::REG_RAX as usize] = -i64::from(libc::EPERM)
+                (*context).uc_mcontext.gregs[blaze_sys::posix::signal::REG_RAX as usize] =
+                    -i64::from(blaze_sys::Errno::Perm.raw())
             };
             // SAFETY: as above.
             #[cfg(target_arch = "aarch64")]
             unsafe {
-                (*context).uc_mcontext.regs[0] = (-i64::from(libc::EPERM)) as u64
+                (*context).uc_mcontext.regs[0] = (-i64::from(blaze_sys::Errno::Perm.raw())) as u64
             };
         }
 
@@ -5240,21 +5218,25 @@ mod tests {
         pub(super) fn forbid() {
             static HANDLER: std::sync::Once = std::sync::Once::new();
             HANDLER.call_once(|| {
-                // SAFETY: `sigaction` is a C struct of integers, pointers and a mask, for which
-                // all-zero bytes is a valid value; the fields read are set below.
-                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-                action.sa_sigaction = trapped as usize;
-                action.sa_flags = libc::SA_SIGINFO;
-                // SAFETY: a handler that touches an atomic and its context alone.
-                let set = unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) };
-                assert_eq!(set, 0);
+                use blaze_sys::{
+                    linux::signal::{SigAction, set_action},
+                    posix::signal::{SA_SIGINFO, SIGSYS},
+                };
+                let action = SigAction {
+                    sa_sigaction: trapped as usize,
+                    sa_flags: SA_SIGINFO,
+                    ..SigAction::DEFAULT
+                };
+                // SAFETY: the three-argument handler lives for the process's lifetime and
+                // touches only a lock-free atomic and its own signal context.
+                assert!(unsafe { set_action(SIGSYS as u32, &action) }.is_ok());
             });
             const LD_W_ABS: u16 = 0x20;
             const JEQ_K: u16 = 0x15;
             const RET_K: u16 = 0x06;
             const ALLOW: u32 = 0x7fff_0000;
             const TRAP: u32 = 0x0003_0000;
-            let insn = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+            let insn = |code, jt, jf, k| linux::SockFilter { code, jt, jf, k };
             let mut program = vec![
                 insn(LD_W_ABS, 0, 0, 4), // the architecture
                 insn(JEQ_K, 1, 0, ARCH),
@@ -5266,9 +5248,8 @@ mod tests {
             }
             program.push(insn(RET_K, 0, 0, ALLOW));
             let fprog =
-                libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr() };
-            // SAFETY: no pointers.
-            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+                libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr().cast() };
+            assert!(linux::prctl(linux::Prctl::NoNewPrivs).is_ok());
             // SAFETY: a program of `len` instructions, which the call copies and does not keep.
             let set = unsafe {
                 libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const fprog)
@@ -5582,14 +5563,15 @@ mod tests {
     /// left of its deadline (`wait::until`, proven in wait/tests.rs).
     #[test]
     fn a_timed_poll_ends_under_a_storm_of_signals() {
-        extern "C" fn nothing(_: libc::c_int) {}
+        use blaze_sys::linux::{
+            getpid, sample::gettid,
+            signal::{SigAction, set_action, tgkill},
+        };
+        extern "C" fn nothing(_: core::ffi::c_int) {}
         let signal = libc::SIGRTMIN() + 5;
-        // SAFETY: `sigaction` is a C struct of integers, pointers and a mask, for which all
-        // zeroes is valid; no SA_RESTART, as the sampler's handler has none.
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = nothing as usize;
-        // SAFETY: a handler that does nothing, for a signal nothing else in the test uses.
-        assert_eq!(unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) }, 0);
+        let action = SigAction { sa_sigaction: nothing as usize, ..SigAction::DEFAULT };
+        // SAFETY: this process-lifetime handler takes one argument and does nothing.
+        assert!(unsafe { set_action(signal as u32, &action) }.is_ok());
         let root = dir("uring-eintr");
         let mut ring = Uring::new(&root).unwrap();
         let at = Address::Unix(FileName::new("s.sock").unwrap());
@@ -5606,15 +5588,13 @@ mod tests {
         };
         // Nothing is sent, so the receive stays in flight through the poll.
         ring.submit(&mut vec![Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(3) }]);
-        // SAFETY: the calling thread's own handle.
-        let me = unsafe { libc::pthread_self() };
+        let (process, me) = (getpid(), gettid());
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let storm = std::thread::spawn({
             let stop = stop.clone();
             move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    // SAFETY: `me` is the test's thread, which lives until this one is joined.
-                    unsafe { libc::pthread_kill(me, signal) };
+                    let _ = tgkill(process, me, signal as u32);
                     std::thread::sleep(Duration::from_millis(5));
                 }
             }
@@ -5659,7 +5639,7 @@ mod tests {
             if got < 0 { io::Error::last_os_error().raw_os_error() } else { None }
         };
         let kernel = crate::cgroup::kernel();
-        assert_eq!(call(reg(1, other)), Some(libc::EINVAL), "{other:?} on Linux {kernel}");
+        assert_eq!(call(reg(1, other)), Some(i32::from(blaze_sys::Errno::Inval.raw())), "{other:?} on Linux {kernel}");
         assert_eq!(call(reg(1, check)), None, "{check:?} on Linux {kernel}");
         drop(ring);
     }
@@ -5804,9 +5784,9 @@ mod tests {
 
     #[test]
     fn a_ring_refused_by_seccomp_says_what_failed_why_and_the_fix() {
-        let error = io::Error::from_raw_os_error(libc::EPERM);
+        let error = io::Error::from_raw_os_error(i32::from(blaze_sys::Errno::Perm.raw()));
         assert_eq!(
-            super::setup_refused(libc::EPERM, &error, Some(0), "6.8.0"),
+            super::setup_refused(i32::from(blaze_sys::Errno::Perm.raw()), &error, Some(0), "6.8.0"),
             "blaze runs its build on io_uring on Linux and cannot start without it: \
              io_uring_setup failed with EPERM (Operation not permitted (os error 1)). \
              Likely cause: a seccomp policy that refuses io_uring_setup, such as Docker's \
@@ -5823,30 +5803,30 @@ mod tests {
         };
         let cases: [(i32, Option<u8>, &str, &str, &str); 7] = [
             (
-                libc::EPERM,
+                i32::from(blaze_sys::Errno::Perm.raw()),
                 Some(2),
                 "with EPERM",
                 "kernel.io_uring_disabled is 2",
                 "sysctl -w kernel.io_uring_disabled=0",
             ),
             (
-                libc::EPERM,
+                i32::from(blaze_sys::Errno::Perm.raw()),
                 Some(1),
                 "with EPERM",
                 "kernel.io_uring_group",
                 "sysctl -w kernel.io_uring_disabled=0",
             ),
             (
-                libc::EPERM,
+                i32::from(blaze_sys::Errno::Perm.raw()),
                 None,
                 "with EPERM",
                 "seccomp",
                 "io_uring_setup, io_uring_enter and io_uring_register",
             ),
-            (libc::ENOSYS, None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
-            (libc::EINVAL, None, "with EINVAL", "IORING_SETUP_SUBMIT_ALL", "Linux 6.0 or later"),
-            (libc::ENOMEM, None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
-            (libc::EBADF, None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
+            (i32::from(blaze_sys::Errno::NoSys.raw()), None, "with ENOSYS", "Linux 5.0.0", "Linux 6.0 or later"),
+            (i32::from(blaze_sys::Errno::Inval.raw()), None, "with EINVAL", "IORING_SETUP_SUBMIT_ALL", "Linux 6.0 or later"),
+            (i32::from(blaze_sys::Errno::NoMem.raw()), None, "with ENOMEM", "RLIMIT_MEMLOCK", "ulimit -l"),
+            (i32::from(blaze_sys::Errno::BadF.raw()), None, "with errno 9", "not known", "kernel.io_uring_disabled is 0"),
         ];
         for (errno, disabled, failed, cause, fix) in cases {
             let text = says(errno, disabled);

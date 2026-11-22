@@ -10,9 +10,10 @@
 //! `body::lower_member`, checked by `check::check_body` and evaluated by the same machine as
 //! any constant item's body (`consts::Consts::value`). Nothing here evaluates.
 //!
-//! Its key is a function of (the module, the type, the expression's text): computed from text
-//! before the work (rule 65), with no position and no ordinal, so two heads of one module that
-//! write `1 << 0` at `usize` share one record. Its NEED key is that checker key widened to a
+//! Its key includes the module, type and expression text. A body constant also includes its
+//! enclosing item and block when it uses their names, and a marked expression includes the
+//! positions and identities of its token marks. Two unmarked module heads that write
+//! `1 << 0` at `usize` share one record. Its NEED key is that checker key widened to a
 //! library key ([`need_key`]): `Why::NeedConst` carries it through every driver loop that
 //! already evaluates a constant item a head names (`check::eval_len`), unchanged.
 //!
@@ -40,10 +41,13 @@ use std::vec::Vec;
 
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
+use blaze_lower::mark_site::TextMark;
+use blaze_own::{AString, AVec, Alloc};
+use blaze_scope::crate_roots::TextMarks;
 use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, Name, PNode};
 
-use super::heads::{FnHead, Store};
+use super::heads::{FnHead, FnQualifiers, Store};
 use super::keys::{KeyClash, Keys, MemberKind, anon_const_key, checker_of};
 use super::preds::Preds;
 use super::types::{PRIMS, SelfTy, Why, intern};
@@ -70,7 +74,19 @@ pub struct Ask {
     /// an item declared in the body ([`Ask::in_body`]): its names are read there first, then
     /// at the module. `None`: a constant of the module.
     pub body: Option<(ItemKey, u32)>,
+    /// Marks are relative to the expression, independent of its position in the enclosing text.
+    marked: Option<Marked>,
 }
+
+#[derive(Clone, Debug)]
+struct Marked {
+    member: AString<'static>,
+    rows: AVec<'static, (u32, TextMark)>,
+}
+
+/// The synthetic members whose expressions contain marked tokens. Both the synthetic text
+/// and the opened column live in the command frame.
+pub(super) type Columns<'n> = blaze_hash::HashMap<ItemKey, TextMarks<'n>, &'n blaze_mem::Frame>;
 
 /// Why an asked anonymous constant could not be filed.
 #[derive(Debug)]
@@ -81,6 +97,7 @@ pub enum FileFail {
     Type(Why),
     /// Its type has no name to write (never: [`Ask::of`] refuses such a type).
     NoName(PNode),
+    Marks { item: ItemKey, error: blaze_expand::origin_column::ColumnError },
 }
 
 impl core::fmt::Display for FileFail {
@@ -89,6 +106,7 @@ impl core::fmt::Display for FileFail {
             FileFail::Clash(c) => write!(f, "an anonymous constant's key: {c}"),
             FileFail::Type(why) => write!(f, "an anonymous constant's type: {why:?}"),
             FileFail::NoName(n) => write!(f, "an anonymous constant of the type {n:?}, which has no name to write"),
+            FileFail::Marks { item, error } => write!(f, "origin marks of anonymous constant {item:?}: {error}"),
         }
     }
 }
@@ -186,8 +204,20 @@ pub fn mentions(text: &str, params: &[(Name, u32)]) -> bool {
 /// the checker key (so `checker_of` gives it back and the names library finds its crate by
 /// the prefix), the rest a hash under this module's own domain, so no library item has it.
 pub fn need_key(key: ItemKey) -> LibKey {
+    request_key(key, "blaze-ladder front2 anonymous constant need 1")
+}
+
+// Head discovery may probe a candidate that the checker never selects. Its
+// evaluator files a refusal for that candidate. A lexical body's request is
+// mandatory: eval_len and Consts::first must return its typed error to the
+// requesting body. Both request classes project to the same checker key.
+fn body_need_key(key: ItemKey) -> LibKey {
+    request_key(key, "blaze-ladder front2 required body constant 1")
+}
+
+fn request_key(key: ItemKey, domain: &'static str) -> LibKey {
     let first = key.0.to_be_bytes();
-    let rest = ContentId::of("blaze-ladder front2 anonymous constant need 1", &first);
+    let rest = ContentId::of(domain, &first);
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(&first);
     bytes[16..].copy_from_slice(&rest.0[..16]);
@@ -205,7 +235,7 @@ impl Ask {
         }
         let name = format!("{prim}: {text}").into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None, marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in block `scope` of the body `owner`
@@ -235,8 +265,8 @@ impl Ask {
             Some((_, other)) => format!("{prim}: {text} in the body {:x} at block {scope} where Self is {}", owner.0, PRIMS.iter().find(|(_, n)| *n == other)?.0),
         }
         .into_boxed_str();
-        let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)) })
+        let need = body_need_key(anon_const_key(checker_of(module), &name));
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: self_.map(|(t, _)| t), body: Some((owner, scope)), marked: None })
     }
 
     /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
@@ -261,8 +291,50 @@ impl Ask {
         }
         .into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, marked: None })
     }
+
+    pub(super) fn carry_marks(mut self, rows: AVec<'static, (u32, TextMark)>) -> Self {
+        if !rows.is_empty() {
+            let mut hash = blaze_ids::Hasher::new("blaze-ladder marked anonymous constant 1");
+            hash.part(self.name.as_bytes());
+            for &(offset, mark) in &rows {
+                hash.update(&offset.to_le_bytes()).update(&mark.to_bytes());
+            }
+            let member = blaze_own::format_in!(*rows.allocator(), "marked {:x}", hash.finish());
+            let key = anon_const_key(checker_of(self.module), &member);
+            self.need = if self.body.is_some() { body_need_key(key) } else { need_key(key) };
+            self.marked = Some(Marked { member, rows });
+        }
+        self
+    }
+
+    fn member_name(&self) -> &str {
+        self.marked.as_ref().map_or(&self.name, |m| m.member.as_str())
+    }
+}
+
+/// Move the expression's marks past the synthetic declaration prefix before passing the
+/// text to the ordinary marked-item lowering.
+fn file_marks<'n>(
+    columns: &mut Columns<'n>,
+    item: ItemKey,
+    text: &'n str,
+    prefix: usize,
+    marked: &Marked,
+    alloc: Alloc<'_>,
+) -> Result<(), blaze_expand::origin_column::ColumnError> {
+    use blaze_expand::origin_column::{ColumnError, OriginsRef};
+    let mut rows = AVec::with_capacity_in(marked.rows.len(), alloc);
+    for &(offset, mark) in &marked.rows {
+        let at = prefix + offset as usize;
+        rows.push((u32::try_from(at).map_err(|_| ColumnError::TooLarge { at })?, mark));
+    }
+    let bytes = blaze_lower::mark_site::column_of_copy(text, &rows, alloc)?;
+    let frame = *columns.allocator();
+    let (column, _) = OriginsRef::open(frame.alloc_slice_copy(&bytes))?;
+    columns.insert(item, TextMarks { text, column });
+    Ok(())
 }
 
 /// The value of the constant expression `text` of type `ty` that names a ground `Self`
@@ -285,15 +357,105 @@ pub fn self_value<H: super::types::Heads + ?Sized>(heads: &H, module: LibKey, ty
     if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(text), r)) }
 }
 
-/// The value of the body's anonymous constant `ask` ([`Ask::in_body`]), read as
-/// [`self_value`] reads one: its bits once evaluated, the evaluator's refusal by the
-/// expression's name, [`Why::NeedConst`] naming it until the driver has filed and evaluated it.
+/// The token marks of a HEAD's constant expression `source` (a slice of the text `marks` are
+/// of: a head a macro wrote), each at its place in `asked`, the text the constant is asked
+/// with: `source` itself, or `source` with every qualified constant leaf replaced by its
+/// value ([`super::const_qpath::substitute`]; a leaf's own marks go with it, its value being a
+/// literal). Rust's rule: a path in the expression resolves where ITS tokens' hygiene says
+/// (the Reference, "Macros By Example", "Hygiene": `$crate` "refers to the crate defining the
+/// macro"), so the constant made of it is lowered with them as a body's is
+/// ([`Ask::carry_marks`]). zerocopy's `cryptocorrosion_derive_traits!` writes `(): PaddingFree<
+/// Self, { $crate::cryptocorrosion_derive_traits!(@struct_padding_check ..) }>` into an impl
+/// it expands in ppv-lite86; without them `crate` named ppv-lite86 (tempo t1500, rand_chacha
+/// `refill_wide_impl`: "segment 0: not found"). `Ok(None)`: `source` is no slice of the marks'
+/// text (a type macro's expansion lowered inside the head's view, or a text the inherent
+/// leaves rewrote: `Builder::const_term`), whose marks this does not hold; the caller decides.
+/// An `asked` that does not follow from `source` leaf by leaf is refused by name.
+pub(super) fn head_marks(
+    marks: blaze_scope::crate_roots::TextMarks<'_>,
+    source: &str,
+    asked: Option<&str>,
+    alloc: Alloc<'static>,
+    r: blaze_surface::Range,
+) -> Result<Option<AVec<'static, (u32, TextMark)>>, Why> {
+    let Ok(item) = blaze_lower::mark_site::ItemMarks::of(source, marks) else { return Ok(None) };
+    let mut rows = AVec::new_in(alloc);
+    let Some(asked) = asked else {
+        for row in item.marked() {
+            rows.push(row);
+        }
+        return Ok(Some(rows));
+    };
+    let off = |why: &'static str| Why::Program(format!("a marked constant expression `{source}` asked as `{asked}`: {why}").into_boxed_str(), r);
+    let at = |i: usize| u32::try_from(i).map_err(|_| off("past 4 GiB"));
+    let mut marked = item.marked().peekable();
+    // Copies `source[from..to]`, found at `asked[out..]`, with its marks.
+    let mut copy = |from: usize, to: usize, out: usize, rows: &mut AVec<'static, (u32, TextMark)>| -> Result<usize, Why> {
+        let seg = source.get(from..to).ok_or_else(|| off("a leaf off a char boundary"))?;
+        if !asked.get(out..).is_some_and(|rest| rest.starts_with(seg)) {
+            return Err(off("the text between two leaves is not copied"));
+        }
+        while let Some(&(start, mark)) = marked.peek() {
+            let s = start as usize;
+            if s >= to {
+                break;
+            }
+            marked.next();
+            if s >= from {
+                rows.push((at(s - from + out)?, mark));
+            }
+        }
+        Ok(out + seg.len())
+    };
+    let (mut from, mut out) = (0usize, 0usize);
+    for leaf in super::const_qpath::Leaves::of(source) {
+        out = copy(from, leaf.start, out, &mut rows)?;
+        out += literal_len(asked.get(out..).unwrap_or("")).ok_or_else(|| off("a leaf's value is no literal"))?;
+        from = leaf.end;
+    }
+    out = copy(from, source.len(), out, &mut rows)?;
+    if out != asked.len() {
+        return Err(off("text past the last leaf"));
+    }
+    Ok(Some(rows))
+}
+
+/// Whether `text` has the word `crate` (a `crate::` path, or the `crate` an expansion wrote for
+/// another crate's `$crate`): what a constant expression's missing marks would misread.
+pub(super) fn names_crate(text: &str) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let b = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(i) = text.get(from..).and_then(|t| t.find("crate")) {
+        let (s, e) = (from + i, from + i + 5);
+        if (s == 0 || !word(b[s - 1])) && b.get(e).is_none_or(|&c| !word(c)) {
+            return true;
+        }
+        from = e;
+    }
+    false
+}
+
+/// The length of the literal `text` starts with, as [`super::const_qpath::push_literal`]
+/// writes one: `true`/`false` or digits with a suffix (one word), `'\u{..}'`, or a negative
+/// integer `(-N - 1T)`.
+fn literal_len(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    match *b.first()? {
+        b'(' => text.find(')').map(|i| i + 1),
+        b'\'' => text.find("}'").map(|i| i + 2),
+        _ => {
+            let n = b.iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
+            (n > 0).then_some(n)
+        }
+    }
+}
+
+/// A body's anonymous constant is required. Return its bits or ask the driver
+/// to evaluate it. A failure goes directly to the requesting body.
 pub fn body_value<H: super::types::Heads + ?Sized>(heads: &H, ask: Ask, r: blaze_surface::Range) -> Result<u128, Why> {
     if let Some(bits) = heads.const_bits(ask.need) {
         return Ok(bits);
-    }
-    if let Some(why) = heads.anon_failed(ask.need) {
-        return Err(Why::ConstPath(format!("{}: {why}", ask.text).into_boxed_str(), r));
     }
     let need = ask.need;
     let text = ask.text.clone();
@@ -303,16 +465,18 @@ pub fn body_value<H: super::types::Heads + ?Sized>(heads: &H, ask: Ask, r: blaze
 /// Files every anonymous constant the type builder asked for since the last call
 /// (`Maps::anon_asked`) as a constant item's head in `store.fns`, its key in `keys`: after
 /// this, `Consts::value(checker_of(ask.need))` lowers, checks and evaluates it. One already
-/// filed is left as it is (its key says its type and text). Returns the need key of each, in
-/// asking order: the caller evaluates them in one round (an enum of sixty-four written
-/// discriminants, core's `AlignmentEnum`, is then one round, not sixty-four).
+/// filed is left as it is (its key says its type and text). Returns the head probes
+/// eligible for batch evaluation, in asking order (e.g. enum discriminants).
+/// A mandatory body need is evaluated by the driver that requested it.
 pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibKey, Global>, FileFail> {
     let asked = store.maps.anon_asked.take();
     let mut needs = Vec::with_capacity_in(asked.len(), Global);
     for a in asked.iter() {
-        needs.push(a.need);
+        if a.body.is_none() {
+            needs.push(a.need);
+        }
         let module = keys.item(a.module).map_err(FileFail::Clash)?;
-        let key = keys.member(module, MemberKind::Anon, &a.name).map_err(FileFail::Clash)?;
+        let key = keys.member(module, MemberKind::Anon, a.member_name()).map_err(FileFail::Clash)?;
         // A body's constant reads its names in the block it is written in first.
         if let Some((owner, scope)) = a.body {
             store.locals.file_anon(key, owner, scope);
@@ -321,10 +485,20 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
             continue;
         }
         let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
-        let text: &'n str = store.locals.keep_text(&format!("const _: {prim} = {};", a.text));
+        let alloc = store.tys.alloc();
+        let mut declaration = blaze_own::format_in!(alloc, "const _: {prim} = ");
+        let prefix = declaration.len();
+        declaration.push_str(&a.text);
+        declaration.push(';');
+        let text = store.locals.keep_text(&declaration);
+        if let Some(marked) = &a.marked {
+            file_marks(&mut store.anon_marks, key, text, prefix, marked, alloc)
+                .map_err(|error| FileFail::Marks { item: key, error })?;
+        }
         let output = intern(&mut store.tys, a.ty).map_err(FileFail::Type)?;
         let header = tc::FnPtrHeader::RUST;
-        store.preds.insert(key, Preds::new());
+        // An array length or a const argument's constant: no clause, no lifetime in scope.
+        store.preds.insert(key, Preds::new_in(super::heads_regions::Scope::new_in(alloc)));
         store.fns.insert(
             key,
             FnHead {
@@ -338,6 +512,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 self_param: false,
                 header,
                 c_variadic: false,
+                qualifiers: FnQualifiers::CONST.note_lifetimes(text),
                 legacy_const_generics: Vec::new_in(Global),
                 inputs: Vec::new_in(Global),
                 output,
@@ -357,4 +532,37 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
         );
     }
     Ok(needs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_expand::origin_column::TextMark;
+    use blaze_expand::{DefSite, Edition, Transparency};
+    use blaze_id::CrateItemKey;
+
+    #[test]
+    fn anonymous_const_key_distinguishes_marked_roots_and_their_positions() {
+        // A rendered foreign `$crate` is the word `crate` with an opaque root mark.
+        // Either of these roots can be foreign, and the other can belong to the caller.
+        let expr = "crate::A == crate::B";
+        let ask = Ask::in_body(LibKey(ContentId([3; 32])), PNode::Bool, expr, ItemKey(7), 1, None).expect("a bool constant in block 1");
+        let key = |offset: u32, defining_crate: u8| {
+            let mut marks = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+            marks.push((
+                offset,
+                TextMark {
+                    site: DefSite { krate: CrateItemKey(ContentId([defining_crate; 32])), module: None },
+                    transparency: Transparency::Opaque,
+                    edition: Edition::E2021,
+                },
+            ));
+            ask.clone().carry_marks(marks).need
+        };
+        let left = key(0, 4);
+        assert_eq!(left, key(0, 4), "identical semantic inputs share the value");
+        assert_ne!(left, ask.need, "the unmarked root selects the calling crate");
+        assert_ne!(left, key(0, 5), "the left root selects a different defining crate");
+        assert_ne!(left, key(expr.rfind("crate").expect("second root") as u32, 4), "the foreign root now qualifies B");
+    }
 }

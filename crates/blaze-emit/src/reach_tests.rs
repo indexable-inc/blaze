@@ -33,7 +33,7 @@ fn fill<A: Allocator + Clone, S: Sink>(b: &mut Builder<A, S>, from: Value, step:
 /// (whole even when refused: the refusal is `settle`'s, after every byte is written).
 fn emit_with<A: Allocator + Clone>(view: View<'_>, via: &[Via], reach: Reach, like: &Code<A>) -> (Result<(), EmitError>, Code<A>) {
     let mut out = Code::new_in(like.bytes.allocator().clone());
-    let got = emit_reaching(view, via, &RoutinePlaces::NONE, ISA, BULK_INLINE_MOST, reach, &mut out).map(|_| ());
+    let got = emit_reaching(blaze_lir::verify(view).expect("the test's function is LIR"), via, &RoutinePlaces::NONE, ISA, BULK_INLINE_MOST, reach, &mut out).map(|_| ());
     (got, out)
 }
 

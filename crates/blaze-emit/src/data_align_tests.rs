@@ -82,7 +82,7 @@ fn an_align_64_row_runs_on_64() {
 /// when given (the control).
 fn record_bytes<'a>(func: blaze_lir::View<'_>, force: Option<u8>, alloc: Alloc<'a>) -> AVec<'a, u8> {
     let (mut record, _): (CodeRecord<'a>, _) =
-        emit_record(func, &Nameless, &RoutinePlaces::NONE, ISA, alloc).unwrap_or_else(|e| panic!("the record emits: {e:?}"));
+        emit_record(blaze_lir::verify(func).expect("the test's function is LIR"), &Nameless, &RoutinePlaces::NONE, ISA, alloc).unwrap_or_else(|e| panic!("the record emits: {e:?}"));
     if let Some(align) = force {
         record.code_align = align;
     }

@@ -301,10 +301,18 @@ pub fn built(built: Built) {
 pub fn thread_cpu() -> Option<u64> {
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
+        {
+            let at = blaze_sys::posix::io::clock_gettime(blaze_sys::posix::io::ClockId::ThreadCpu).ok()?;
+            return Some((at.sec as u64) * 1_000_000_000 + at.nsec as u64);
+        }
+        #[cfg(target_os = "linux")]
+        {
         let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: `at` is a timespec to write.
         if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) } == 0 {
             return Some(at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64);
+        }
         }
     }
     None

@@ -42,7 +42,7 @@ pub(crate) trait Leading {
 /// A thread's buffers for [`of_many_into`], kept warm across calls: the inputs grouped by
 /// leading blocks, the grouping's cursors and one group's chaining values.
 struct Kept {
-    groups: radix::Csr<u32>,
+    groups: radix::Csr<u32, std::alloc::Global>,
     cursors: Vec<u32>,
     cvs: Vec<[u32; 8]>,
 }

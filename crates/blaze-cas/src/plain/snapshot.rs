@@ -55,7 +55,9 @@
 //! copy, no checksum, no allocation, no syscall. A NEGATIVE lookup probes every listed segment:
 //! there is no filter for absent keys yet (store-next.md, "Left, and why": "A per-segment fuse
 //! filter ... Planned, not written here"), so its cost is the segment count (compaction keeps
-//! it under [`super::SEGMENTS_MOST`], 16, per generation) times one index search.
+//! it under [`super::SEGMENTS_MOST`], 276 for a namespace under 256 GiB, about 45 at 100 GB,
+//! once its cleanup has run) times one
+//! index search.
 
 use core::fmt;
 use std::alloc::Allocator;
@@ -63,17 +65,25 @@ use std::alloc::Allocator;
 use blaze_core::{Driver, Mapping};
 use blaze_ids::ContentId;
 use blaze_keyed::kind::Namespace;
-use blaze_keyed::store::ENTRY;
+use blaze_keyed::store::{ENTRY, Generation};
 
 use super::core::{POINTER_TAG, Plain};
 use super::format::{self, Entry, Segment};
 use super::lent::{Lent, LentError};
+use super::verified::Proof;
 use crate::Key;
 
-/// At most this many segments in one snapshot (rule 18): a cap with a typed refusal, far above
-/// what a generation names when compaction keeps up ([`super::SEGMENTS_MOST`]; blaze-cli says
-/// compaction is behind past 64).
-pub const SNAPSHOT_SEGMENTS_MOST: usize = 1024;
+/// At most this many segments in one snapshot (rule 18): a table cap with a typed refusal, as
+/// a multiple of the one bound ([`super::SEGMENTS_MOST`], 276 a namespace under 256 GiB after
+/// a cleanup). A
+/// snapshot is taken mid-command too, after the command's own commits (one each phase and each
+/// 256 MiB) and before its cleanup merges them, and after a crashed command whose commits no
+/// cleanup merged: so this is not the at-rest bound (a store at it would refuse every command
+/// before the cleanup that restores it), but 21 times it (5796), room for a command's commits
+/// past a namespace at its bound and for every namespace a home holds.
+pub const SNAPSHOT_SEGMENTS_MOST: usize = 21 * super::SEGMENTS_MOST;
+
+const _: () = assert!(SNAPSHOT_SEGMENTS_MOST >= 1024, "no store the old cap admitted is refused");
 
 /// Why a snapshot could not be taken or read, by name (rule 19).
 #[derive(Clone, Debug)]
@@ -123,10 +133,24 @@ pub(crate) enum SnapshotPlant {
     SkipsMapAll,
 }
 
-/// One listed segment: its manifest row (where its index lies) and its mapping, shared.
+/// One listed segment: its manifest row (where its index lies), its mapping, shared, and the
+/// proof its [`super::verified::Verified`] gave when the snapshot was taken.
 struct Listed {
     seg: Segment,
     map: Mapping,
+    proof: Proof,
+}
+
+/// A record read through a snapshot with the store's proof beside its bytes: the bytes lie in a
+/// segment proved once this boot (its manifest row, its seal, or its one full check;
+/// verified.rs), so they are the bytes put under the key, whole, and no byte is hashed for it
+/// (rule 74). `proof` is a [`Proof`], which only a `Verified` makes (`Verified::proof`; its
+/// fields are private to verified.rs): a `Proved` cannot be built over bytes nothing proved
+/// (rule 76). It proves the bytes, not the form of the record they hold.
+#[derive(Clone, Copy, Debug)]
+pub struct Proved<'s> {
+    pub bytes: &'s [u8],
+    pub proof: Proof,
 }
 
 /// A read-only snapshot of the committed segments of one generation: see the module's docs.
@@ -172,11 +196,12 @@ impl<A: Allocator> Snapshot<A> {
         }
         let mut listed = Vec::new_in(alloc);
         listed.try_reserve_exact(segments).map_err(|_| SnapshotError::Alloc { segments })?;
+        let branded = Generation(generation);
         for space in plain.reads() {
             for at in in_space(plain, *space) {
                 let verified = plain.mapped_at(at);
                 // Within the reserve: no reallocation.
-                listed.push(Listed { seg: *verified.seg(), map: verified.mapping().clone() });
+                listed.push(Listed { seg: *verified.seg(), map: verified.mapping().clone(), proof: verified.proof(branded) });
             }
         }
         Ok(Snapshot { listed, generation, plant })
@@ -190,7 +215,18 @@ impl<A: Allocator> Snapshot<A> {
     /// The bytes start where the segment's payload does, at a multiple of `ALIGN` (16) in a
     /// mapping that begins on a page (or, for a copied mapping, a sixteen-byte boundary): where
     /// the `Aligned16` of lent.rs lands, it wraps this return (`Aligned16::new(bytes)`).
+    ///
+    /// The bytes alone: [`Snapshot::get_proved`]'s bytes, its proof dropped. A caller that hashes
+    /// every byte itself (the `--verify` path: blaze-engine pages.rs `Sealed::hashed`) reads
+    /// through this; one that takes the store's proof reads through `get_proved`.
     pub fn get(&self, key: &Key) -> Result<Option<&[u8]>, SnapshotError> {
+        Ok(self.get_proved(key)?.map(|proved| proved.bytes))
+    }
+
+    /// [`Snapshot::get`] with the store's proof beside the bytes: the [`Proof`] of the listed
+    /// segment that holds the key (made once, at the take, from its `Verified`; nothing checked
+    /// here). The same pure read: no lock, no allocation, no syscall.
+    pub fn get_proved(&self, key: &Key) -> Result<Option<Proved<'_>>, SnapshotError> {
         for listed in self.listed.iter() {
             let file = listed.map.bytes();
             let run = listed.seg.run(file);
@@ -202,7 +238,8 @@ impl<A: Allocator> Snapshot<A> {
             }
             // A proved segment's entry places its payload inside the file (its layout was
             // checked once with every byte, or its row proves it): no check here.
-            return Ok(Some(&file[entry.at as usize..(entry.at + u64::from(entry.len)) as usize]));
+            let bytes = &file[entry.at as usize..(entry.at + u64::from(entry.len)) as usize];
+            return Ok(Some(Proved { bytes, proof: listed.proof }));
         }
         Ok(None)
     }

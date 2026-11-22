@@ -12,7 +12,7 @@ use super::index::Index;
 use crate::resolve::{Kind, Ns};
 
 /// The lang items that are traits: what `TraitDef::lang` may be.
-pub const TRAITS: [LangItem; 49] = [
+pub const TRAITS: [LangItem; 52] = [
     LangItem::Sized,
     LangItem::MetaSized,
     LangItem::PointeeSized,
@@ -49,6 +49,9 @@ pub const TRAITS: [LangItem; 49] = [
     LangItem::FnOnce,
     LangItem::FnMut,
     LangItem::Fn,
+    LangItem::AsyncFnOnce,
+    LangItem::AsyncFnMut,
+    LangItem::AsyncFn,
     LangItem::Drop,
     LangItem::Sync,
     LangItem::Unpin,
@@ -252,16 +255,6 @@ pub fn mark(item: LangItem) -> Mark {
 /// Every [`LangItem`] in declaration order, for the test that each has an answer in the pinned
 /// library (tests/front2_bounds.rs, which checks this list's length against
 /// `core::mem::variant_count::<LangItem>()` and its order, so a new variant cannot be left out).
-pub const ALL: [LangItem; 98] = {
-    use LangItem::*;
-    [
-        Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
-        BitXorAssign, ShlAssign, ShrAssign, Neg, Not, PartialEq, PartialOrd, Index, IndexMut, FnOnce, FnMut, Fn, MetaSized, PointeeSized, Clone, Send, Sync, Unpin, Drop, Destruct, Tuple,
-        Unsize, CoerceUnsized, DispatchFromDyn, FnPtrTrait, FnOnceOutput, Pointee, Metadata, DynMetadata, DiscriminantKind, Discriminant, PhantomData, OwnedBox, CStr, ManuallyDrop, Future,
-        IntoFuture, FormatArguments, FmtDisplay, FmtDebug, FmtLowerHex, FmtUpperHex, FmtOctal, FmtBinary, FmtLowerExp, FmtUpperExp, FmtPointer, PanicBoundsCheck, IntoIterIntoIter,
-        IteratorNext, OptionSome, OptionNone, TryTraitBranch, TryTraitFromResidual, ControlFlowContinue, ControlFlowBreak, Range, RangeFrom, RangeTo, RangeFull, RangeInclusiveNew,
-        RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
-        Freeze,
-        AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
-    ]
-};
+/// The list's one home is blaze-typeck's `LangItem::ALL` (the checked-body record decodes a
+/// lang item by it).
+pub const ALL: [LangItem; 98] = LangItem::ALL;

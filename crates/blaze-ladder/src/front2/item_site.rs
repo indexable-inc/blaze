@@ -151,6 +151,7 @@ pub fn head_marks<'n, S: NamesSource<'n>>(names: S, owner: LibKey, name: &str, k
         if m.kind != kind || m.name != Some(name) {
             return;
         }
+        names.read_member_body(m.key, m.written_by);
         match first {
             Some(_) => several = true,
             None => first = Some(m.written_by),
@@ -212,7 +213,12 @@ pub fn written_site<'n, S: NamesSource<'n>>(
         }
         (None, _) => None,
     };
-    site_in(resolver.names, mark, first, abs, module).map_err(|refused| match refused {
+    marked_site(resolver.names, mark, first, abs, module, r)
+}
+
+/// Resolves a first token read from a path row or copied out of a constant argument.
+pub(super) fn marked_site<'n, S: NamesSource<'n>>(names: S, mark: Option<TextMark>, first: &str, abs: bool, module: LibKey, r: Range) -> Result<PathSite, Why> {
+    site_in(names, mark, first, abs, module).map_err(|refused| match refused {
         SiteRefused::UnmarkedDollarCrate => Why::Unsupported("`$crate` on a token no expansion wrote (drive.md, \"A token keeps its mark\")", r),
         SiteRefused::OpaqueWithoutModule { .. } => Why::Unsupported("a path under a def-site mark of a crate this build does not hold (drive.md, \"A token keeps its mark\")", r),
     })

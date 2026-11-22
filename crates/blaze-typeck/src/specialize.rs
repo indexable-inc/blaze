@@ -30,9 +30,10 @@ use crate::ty::{Cause, Goal, Obligation, Ty, TypeCtx};
 use crate::world::{ImplHeader, PClause, Question, Reads, World};
 
 /// Where-clause `c` of a record in `types`, imported with `Param(i)` as `subst[i]` (a
-/// parameter past `subst` stays a rigid `TyView::Param(i)`), as a goal.
-pub(crate) fn clause_goal(cx: &mut InferCtx<'_>, types: PTys<'_>, c: PClause, subst: &[Ty]) -> Result<Goal, CheckError> {
-    Ok(match c {
+/// parameter past `subst` stays a rigid `TyView::Param(i)`), as a goal; `None` for an outlives
+/// clause, which is the borrow checker's (D148) and taken as true here.
+pub(crate) fn clause_goal(cx: &mut InferCtx<'_>, types: PTys<'_>, c: PClause, subst: &[Ty]) -> Result<Option<Goal>, CheckError> {
+    Ok(Some(match c {
         PClause::Trait { trait_, args } => Goal::Trait { trait_, args: import_list(cx, &mut NoClosures, types, args, subst, 0)? },
         PClause::Projection { trait_, args, name, term } => Goal::Projection {
             trait_,
@@ -41,7 +42,8 @@ pub(crate) fn clause_goal(cx: &mut InferCtx<'_>, types: PTys<'_>, c: PClause, su
             term: import(cx, &mut NoClosures, types, term, subst, 0)?,
         },
         PClause::Const { cond, args } => Goal::ConstHolds { cond, args: import_list(cx, &mut NoClosures, types, args, subst, 0)? },
-    })
+        PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => return Ok(None),
+    }))
 }
 
 /// Whether impl `a` specializes impl `b` (both impls of `trait_`): A's trait reference with
@@ -91,14 +93,14 @@ fn specializes_in<W: World>(
     // A's where-clauses (its implied sizedness included) are the param env.
     let wa = reads.predicates(a)?;
     for &c in wa.clauses {
-        let goal = clause_goal(cx, wa.types, c, &[])?;
+        let Some(goal) = clause_goal(cx, wa.types, c, &[])? else { continue };
         cx.assume(goal)?;
     }
     // B's header, its parameters fresh variables by kind, against A's trait reference.
     let Some(fresh) = unify_header(cx, hb, a_ref)? else { return Ok(false) };
     let wb = reads.predicates(b)?;
     for &c in wb.clauses {
-        let goal = clause_goal(cx, wb.types, c, &fresh)?;
+        let Some(goal) = clause_goal(cx, wb.types, c, &fresh)? else { continue };
         cx.register(Obligation { goal, cause: Cause::Body })?;
     }
     cx.select_all(reads)?;

@@ -17,21 +17,31 @@
 //! its decoder read `=` as a zero symbol anywhere and did not check the trailing bits, both of
 //! which are refused here.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 use core::{alloc::Allocator, fmt};
 
-use blaze_own::{String, Vec};
+use blaze_own::{
+    String, Vec,
+    planted::{NoPlant, Planted},
+};
 
-#[cfg(test)]
 mod plant;
 #[cfg(test)]
 mod tests;
+
+pub use plant::Base64Plant;
 
 /// The value of a byte that is no symbol of an alphabet.
 const NOT_A_SYMBOL: u8 = 0xFF;
@@ -194,6 +204,17 @@ impl Engine {
 
     /// Writes the encoding of `input` to the start of `out`; the bytes written.
     pub fn encode_into(&self, input: &[u8], out: &mut [u8]) -> Result<usize, OutputTooSmall> {
+        self.encode_into_planted(input, out, NoPlant)
+    }
+
+    /// [`Engine::encode_into`] with its plant seam: `plant` is [`NoPlant`] where it ships and a
+    /// [`Base64Plant`] under the round trip's control (D165).
+    pub fn encode_into_planted(
+        &self,
+        input: &[u8],
+        out: &mut [u8],
+        plant: impl Planted<Base64Plant>,
+    ) -> Result<usize, OutputTooSmall> {
         let need = match self.encoded_len(input.len()) {
             Some(need) => need,
             None => return Err(OutputTooSmall { need: usize::MAX, have: out.len() }),
@@ -223,7 +244,9 @@ impl Engine {
             [b0, b1] => {
                 out[o] = a.symbol(b0 >> 2);
                 out[o + 1] = a.symbol((b0 << 4) | (b1 >> 4));
-                out[o + 2] = a.symbol(plant::tail_bits(b1 << 2));
+                let third = b1 << 2;
+                let third = if plant.has(Base64Plant::TailSetsBit) { third | 1 } else { third };
+                out[o + 2] = a.symbol(third);
                 o += 3;
             }
             _ => unreachable!("`chunks_exact(3)` leaves fewer than three"),
@@ -345,14 +368,5 @@ impl Engine {
             1 => Err(DecodeError::Length { len }),
             _ => Ok(symbols),
         }
-    }
-}
-
-/// The planted bug the control asks for, compiled away outside tests.
-#[cfg(not(test))]
-mod plant {
-    #[inline(always)]
-    pub(crate) fn tail_bits(v: u8) -> u8 {
-        v
     }
 }

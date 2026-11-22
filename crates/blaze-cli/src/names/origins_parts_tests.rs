@@ -1,5 +1,5 @@
 //! The store load hands an expansion's origins as the TWO parts they are stored in (front_load.rs
-//! `StoreLoad::expansion_origins`, lane M14): the crate directory's call part and the expansion
+//! `StoreLoad::expansion`'s `LoadedExpansion::origins`, lane M14): the crate directory's call part and the expansion
 //! record's column, read where they lie, never joined into a new block.
 //!
 //! Floor (rule 67): 0 allocations and 0 bytes in the load's allocator for any number of asks.
@@ -23,7 +23,6 @@ use bstd::mem::{Frame, Tag};
 
 use super::tests::{Files, kept, payloads, scope_name, solved};
 use super::{CrateRecords, StoreLoad, crate_records};
-use crate::names::expansion_texts::Eager;
 
 #[test]
 fn a_store_loads_origins_are_two_parts_and_no_copy() {
@@ -33,15 +32,15 @@ fn a_store_loads_origins_are_two_parts_and_no_copy() {
     let home = Erased::new(&frame);
     let alloc = home.handle();
     let payloads = payloads(&names);
-    let mut kept = kept(&names, true);
+    let snapshot = kept(&names, true);
     let mut read: AVec<'_, CrateRecords<'_>> = AVec::with_capacity_in(names.crates().len(), alloc);
     for (c, payload) in names.crates().iter().zip(payloads.iter()) {
-        read.push(crate_records::<Eager>(scope_name(c.key), payload, c.key, &mut kept, alloc).unwrap_or_else(|e| panic!("crate `{}`: {e}", c.name)));
+        read.push(crate_records(scope_name(c.key), payload, c.key, alloc).unwrap_or_else(|e| panic!("crate `{}`: {e}", c.name)));
     }
     let mut packages: AVec<'_, &str> = AVec::with_capacity_in(read.len(), alloc);
     packages.resize(read.len(), "/");
     let counting = Erased::new(Counting::new(&frame));
-    let load = StoreLoad::new(&read[..], &packages[..], &Files, counting.handle());
+    let load = StoreLoad::from_parts(&read[..], &packages[..], &Files, Some(&snapshot), None, None, counting.handle());
 
     // Control: a block made in the counter is counted.
     let before = counting.inner().allocations();
@@ -57,8 +56,10 @@ fn a_store_loads_origins_are_two_parts_and_no_copy() {
         for (krate, c) in names.crates().iter().enumerate() {
             for (call, expansion) in c.expansions.iter() {
                 let Some(made) = expansion.made else { continue };
-                assert_eq!(load.expansion(krate, *call), Some(made.text), "crate `{}` call {call:?}: its text over the store", c.name);
-                let (call_part, column) = load.expansion_origins(krate, *call).unwrap_or_else(|| panic!("crate `{}` call {call:?}: no origins served", c.name));
+                // One read serves the text and its origins (F4).
+                let read = load.expansion(krate, *call).unwrap_or_else(|| panic!("crate `{}` call {call:?}: no expansion served", c.name));
+                assert_eq!(read.text, made.text, "crate `{}` call {call:?}: its text over the store", c.name);
+                let (call_part, column) = read.origins.unwrap_or_else(|| panic!("crate `{}` call {call:?}: no origins served", c.name));
                 if round == 0 {
                     calls += 1;
                 }

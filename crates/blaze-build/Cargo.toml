@@ -23,10 +23,10 @@ blaze-own.workspace = true
 # `Identity`: the flow layer's table of identities a coroutine's state is keyed by (ASYNC.md P8).
 blaze-flow-lower.workspace = true
 # `ContentId` and `Hasher`: an instance's key. By path: the workspace entry turns on serde adapters.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # `tls`: the thread-local descriptor, row and table forms (one home with the emitter and the
 # launcher's run mode).
-blaze-code = { path = "../blaze-code" }
+blaze-code.workspace = true
 # `testing`: `read_back`, a value's record read through emitted code (blaze-consteval's
 # layout-drift test).
 blaze-emit = { workspace = true, optional = true }

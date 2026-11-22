@@ -16,7 +16,7 @@
 //!   name); a row the function does not name has its Rust name.
 //! - The base sets are the `target_feature` cfgs the pinned rustc prints for each target with no
 //!   `-C target-cpu` and no `-C target-feature`, as recorded in
-//!   crates/blaze-units/src/stdlib/rustc.json (`targets.<triple>.cfg` and `.nightly_cfg`):
+//!   pins/answers/rustc.json (`targets.<triple>.cfg` and `.nightly_cfg`):
 //!   aarch64-apple-darwin's spec says `"cpu": "apple-m1"` (`target_spec_json`), and its 34
 //!   features equal crates/target-features/src/cpus/table.rs's set of `apple-m1` (= `apple-a14`).
 //!   Not from memory: the planner's list in INTRINSICS.md 2.6 (`sha3, fp16, ..`) is a summary.

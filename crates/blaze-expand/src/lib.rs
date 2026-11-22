@@ -116,7 +116,7 @@ pub use crate::{
         parser_words, write_token, write_tokens,
     },
     call::{AlsoCopy, Call, CallKind, CallShape, CallSite, Constness, DeriveFacts, Eager, Inside},
-    cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas, cfg_predicate, cfg_predicate_at},
+    cfg::{CfgAttrError, CfgPredicateError, Tri, cfg_attr_metas, cfg_predicate, cfg_predicate_at, cfg_predicate_tri},
     derive::{attr_call, derive_attr, derive_meta},
     cx::{
         ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, OutsideRoot, Place, PlaceOf,
@@ -147,6 +147,6 @@ pub use crate::{
     token_record::{OriginMaps, SourceIndexes, TokenRecordError, record_indexes, token_record},
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
-        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex, lex_inside,
+        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex, lex_inside, lex_marked,
     },
 };

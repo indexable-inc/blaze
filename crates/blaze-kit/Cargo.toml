@@ -17,7 +17,7 @@ doctest = false
 # (by path, without the workspace entry's `serde` and `shared` features, as blaze-ids takes it)
 # is for `Dict`'s value-to-code table alone; it sits on blaze-own and blaze-swiss.
 [dependencies]
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 blaze-int.workspace = true
 blaze-own.workspace = true
 

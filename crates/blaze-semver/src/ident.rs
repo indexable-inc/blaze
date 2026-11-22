@@ -9,7 +9,12 @@ use core::{
     hash::{Hash, Hasher},
 };
 
-use blaze_own::String;
+use blaze_own::{
+    String,
+    planted::{NoPlant, Planted},
+};
+
+use crate::SemverPlant;
 
 /// The most bytes an identifier keeps in place. Cargo's pre-releases and build metadata are
 /// almost all shorter (`alpha.1`, `rc.2`, `20260101`), so a version allocates only past this.
@@ -115,15 +120,19 @@ fn cmp_identifier(a: &str, b: &str) -> Ordering {
 }
 
 /// Dotted identifiers in order, a shorter list first when it is a prefix of the other (SemVer
-/// 2.0.0, section 11.4.4).
-fn cmp_dotted(a: &str, b: &str) -> Ordering {
+/// 2.0.0, section 11.4.4). Under [`SemverPlant::NumbersAsText`] each pair compares as text.
+fn cmp_dotted(a: &str, b: &str, plant: impl Planted<SemverPlant>) -> Ordering {
+    let one: fn(&str, &str) -> Ordering = match plant.has(SemverPlant::NumbersAsText) {
+        true => <str as Ord>::cmp,
+        false => cmp_identifier,
+    };
     let (mut xs, mut ys) = (a.split('.'), b.split('.'));
     loop {
         match (xs.next(), ys.next()) {
             (None, None) => return Ordering::Equal,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => match crate::plant::identifier(x, y, cmp_identifier(x, y)) {
+            (Some(x), Some(y)) => match one(x, y) {
                 Ordering::Equal => {}
                 other => return other,
             },
@@ -146,6 +155,17 @@ macro_rules! dotted {
 
             pub fn is_empty(&self) -> bool {
                 self.0.is_empty()
+            }
+
+            /// `Ord`'s order with a planted bug from `plant`: the seam the precedence oracle's
+            /// control drives. `Ord` passes `NoPlant`, and the order is the code as it is.
+            pub fn cmp_planted(&self, other: &$name<A>, plant: impl Planted<SemverPlant>) -> Ordering {
+                match (self.is_empty(), other.is_empty()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => if $empty_first { Ordering::Less } else { Ordering::Greater },
+                    (false, true) => if $empty_first { Ordering::Greater } else { Ordering::Less },
+                    (false, false) => cmp_dotted(self.as_str(), other.as_str(), plant),
+                }
             }
         }
 
@@ -177,12 +197,7 @@ macro_rules! dotted {
 
         impl<A: Allocator> Ord for $name<A> {
             fn cmp(&self, other: &$name<A>) -> Ordering {
-                match (self.is_empty(), other.is_empty()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => if $empty_first { Ordering::Less } else { Ordering::Greater },
-                    (false, true) => if $empty_first { Ordering::Greater } else { Ordering::Less },
-                    (false, false) => cmp_dotted(self.as_str(), other.as_str()),
-                }
+                self.cmp_planted(other, NoPlant)
             }
         }
 
@@ -248,5 +263,5 @@ impl<A: Allocator> BuildMetadata<A> {
 /// The order of two pre-releases' texts, both non-empty and validated, whatever allocators
 /// hold them.
 pub(crate) fn cmp_pre_text(a: &str, b: &str) -> Ordering {
-    cmp_dotted(a, b)
+    cmp_dotted(a, b, NoPlant)
 }

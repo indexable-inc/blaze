@@ -325,7 +325,7 @@ impl Serving {
 }
 
 /// The records imaged runs filed in a snapshot, for [`Memo::file_records`].
-pub(crate) struct Outbox(SegQueue<Filed>);
+pub(crate) struct Outbox(SegQueue<Filed, Global>);
 
 impl Outbox {
     pub(crate) fn new() -> Outbox {

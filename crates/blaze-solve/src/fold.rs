@@ -13,13 +13,18 @@ use crate::tys::Tys;
 /// The most nodes one walk visits (rule 18).
 pub const MAX_WALK: usize = 1 << 22;
 
-/// Scratch the walks reuse: a work stack and a result stack.
+/// Scratch the walks reuse: term work and result stacks, plus portable-parameter buffers.
 pub struct Scratch<'a> {
-    work: Vec<(Ty, u32), Alloc<'a>>,
+    work: Vec<(Ty, u32, u32), Alloc<'a>>,
     out: Vec<Ty, Alloc<'a>>,
-    /// The import's memo: a portable node to its arena handle, for the nodes one import
+    /// The max-ordered worklist for portable-table reachability walks. It is reused by
+    /// `builtin::params_reached`, whose callers may inspect only a few nodes of a large table.
+    params_work: Vec<u32, Alloc<'a>>,
+    /// Roots collected from an impl header before its portable terms are walked.
+    params_roots: Vec<Ty, Alloc<'a>>,
+    /// The import's memo: a portable node and binder depth to its arena handle, for the nodes one import
     /// reaches (a record's table may hold many terms; only the root's are walked).
-    memo: Map<u32, Ty, FixedState, Alloc<'a>>,
+    memo: Map<(Ty, u32), Ty, FixedState, Alloc<'a>>,
     /// Which generics of an impl are const parameters, one bit each, by the impl and its
     /// header's digest (coherence.rs `fresh_for_impl`): found once per solver, not once per
     /// candidate.
@@ -31,6 +36,9 @@ pub struct Scratch<'a> {
     pub(crate) auto: crate::auto_summary::Summaries<'a>,
     /// The shortcuts turned off (none but in tests).
     pub(crate) off: crate::eval::Off,
+    /// On only while `Solver::why_no` runs, so a rule notes what only its chain reads (a
+    /// negative impl naming the goal's type: trait_goals.rs `step_impl`). Not a shortcut.
+    pub(crate) why_no: bool,
 }
 
 impl<'a> Scratch<'a> {
@@ -38,12 +46,23 @@ impl<'a> Scratch<'a> {
         Scratch {
             work: Vec::new_in(alloc),
             out: Vec::new_in(alloc),
+            params_work: Vec::new_in(alloc),
+            params_roots: Vec::new_in(alloc),
             memo: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             masks: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             stats: crate::eval::Stats::default(),
             auto: crate::auto_summary::Summaries::new_in(alloc),
             off: crate::eval::Off { summaries: false, prematch: false, memo: false },
+            why_no: false,
         }
+    }
+
+    pub(crate) fn params_work(&mut self) -> &mut Vec<u32, Alloc<'a>> {
+        &mut self.params_work
+    }
+
+    pub(crate) fn params_buffers(&mut self) -> (&mut Vec<Ty, Alloc<'a>>, &mut Vec<u32, Alloc<'a>>) {
+        (&mut self.params_roots, &mut self.params_work)
     }
 
     /// The const-parameter mask kept for `impl_` with the header digest `digest`.
@@ -66,6 +85,12 @@ fn arity(c: Children) -> u32 {
         Children::List(l) => l.len,
         Children::ListThen(l, _) => l.len + 1,
     }
+}
+
+/// A signature and each existential predicate introduce a binder. The region on a
+/// `Dynamic` node is outside those binders (blaze-ty's kind descriptors).
+fn child_depth(k: TyKind, depth: u32) -> u32 {
+    depth + u32::from(matches!(k, TyKind::FnPtr(..) | TyKind::ExTrait(..) | TyKind::ExProj(..)))
 }
 
 /// The `i`th child of `c`, reading lists with `get`.
@@ -124,20 +149,41 @@ pub fn fold<T: Tys>(
     root: Ty,
     mut replace: impl FnMut(&mut T, Ty) -> Result<Option<Ty>, SolveError>,
 ) -> Result<Ty, SolveError> {
+    fold_at_depth(tys, s, root, |tys, _, t, _| replace(tys, t))
+}
+
+pub(crate) fn fold_at_depth<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    root: Ty,
+    mut replace: impl FnMut(&mut T, &mut Scratch<'_>, Ty, u32) -> Result<Option<Ty>, SolveError>,
+) -> Result<Ty, SolveError> {
     let base_work = s.work.len();
     let base_out = s.out.len();
-    s.work.push((root, u32::MAX));
+    let result = fold_walk(tys, s, root, base_work, base_out, &mut replace);
+    s.work.truncate(base_work);
+    s.out.truncate(base_out);
+    result
+}
+
+fn fold_walk<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    root: Ty,
+    base_work: usize,
+    base_out: usize,
+    replace: &mut impl FnMut(&mut T, &mut Scratch<'_>, Ty, u32) -> Result<Option<Ty>, SolveError>,
+) -> Result<Ty, SolveError> {
+    s.work.push((root, 0, u32::MAX));
     let mut visited = 0usize;
     while s.work.len() > base_work {
-        let (t, state) = s.work[s.work.len() - 1];
+        let (t, depth, state) = s.work[s.work.len() - 1];
         if state == u32::MAX {
             visited += 1;
             if visited > MAX_WALK {
-                s.work.truncate(base_work);
-                s.out.truncate(base_out);
                 return Err(SolveError::Limit(Limit::Walk));
             }
-            if let Some(r) = replace(tys, t)? {
+            if let Some(r) = replace(tys, s, t, depth)? {
                 s.work.pop();
                 s.out.push(r);
                 continue;
@@ -151,10 +197,10 @@ pub fn fold<T: Tys>(
                 continue;
             }
             let last = s.work.len() - 1;
-            s.work[last].1 = s.out.len() as u32;
+            s.work[last].2 = s.out.len() as u32;
             for i in (0..n).rev() {
                 let ch = child(c, i, |l, j| tys.list_get(l, j));
-                s.work.push((ch, u32::MAX));
+                s.work.push((ch, child_depth(k, depth), u32::MAX));
             }
         } else {
             s.work.pop();
@@ -186,9 +232,7 @@ pub fn fold<T: Tys>(
             s.out.push(r);
         }
     }
-    let r = s.out[base_out];
-    s.out.truncate(base_out);
-    Ok(r)
+    Ok(s.out[base_out])
 }
 
 /// How a portable term's generic parameters are instantiated.
@@ -196,7 +240,7 @@ pub fn fold<T: Tys>(
 pub struct Inst<'i> {
     /// `Param(i)` and `ConstParam(i)` become `args[i]`.
     pub args: &'i [Ty],
-    /// `Bound(0, i)` at the top binder becomes `bound[i]` (empty: kept as is).
+    /// A variable of the enclosing binder becomes `bound[i]` at any depth (empty: kept as is).
     pub bound: &'i [Ty],
 }
 
@@ -247,31 +291,32 @@ fn import_walk<T: Tys>(
     };
     let base = s.work.len();
     let mut kids: Vec<Ty, Alloc<'_>> = Vec::new_in(*s.work.allocator());
-    s.work.push((root, 0));
+    s.work.push((root, 0, 0));
     let mut steps = 0usize;
     while s.work.len() > base {
-        let Some((t, exit)) = s.work.pop() else { break };
+        let Some((t, depth, exit)) = s.work.pop() else { break };
         steps += 1;
         if steps > MAX_WALK {
             s.work.truncate(base);
             return Err(SolveError::Limit(Limit::Walk));
         }
-        if exit == 0 && s.memo.contains_key(&t.0) {
+        if exit == 0 && s.memo.contains_key(&(t, depth)) {
             continue;
         }
         let k = p.nodes[t.0 as usize];
         let c = children(k);
         let n = arity(c);
+        let next_depth = child_depth(k, depth);
         if exit == 0 {
-            s.work.push((t, 1));
+            s.work.push((t, depth, 1));
             for j in (0..n).rev() {
                 let ch = child(c, j, get);
                 if ch.0 >= t.0 {
                     s.work.truncate(base);
                     return Err(SolveError::Malformed(Malformed::PortableIndex { node: ch.0, len: t.0 }));
                 }
-                if !s.memo.contains_key(&ch.0) {
-                    s.work.push((ch, 0));
+                if !s.memo.contains_key(&(ch, next_depth)) {
+                    s.work.push((ch, next_depth, 0));
                 }
             }
             continue;
@@ -279,24 +324,26 @@ fn import_walk<T: Tys>(
         kids.clear();
         for j in 0..n {
             let ch = child(c, j, get);
-            kids.push(s.memo[&ch.0]);
+            kids.push(s.memo[&(ch, next_depth)]);
         }
         let made = match k {
             TyKind::Param(x) | TyKind::ConstParam(x) => match inst.args.get(x as usize) {
-                Some(&a) => a,
+                Some(&a) => land(tys, s, a, depth)?,
                 None => {
                     s.work.truncate(base);
-                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.args.len() as u32, at, goal: None }));
+                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.args.len() as u32, at, goal: None, head: None }));
                 }
             },
             TyKind::ReParam(_) => tys.mk(TyKind::ReErased)?,
-            TyKind::Bound(0, x) if !inst.bound.is_empty() => match inst.bound.get(x as usize) {
-                Some(&b) => b,
+            TyKind::Bound(d, x) if d == depth && !inst.bound.is_empty() => match inst.bound.get(x as usize) {
+                Some(&b) => land(tys, s, b, depth)?,
                 None => {
                     s.work.truncate(base);
-                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.bound.len() as u32, at, goal: None }));
+                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.bound.len() as u32, at, goal: None, head: None }));
                 }
             },
+            // Removing the enclosing binder moves variables bound farther out one level closer.
+            TyKind::Bound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::Bound(d - 1, x))?,
             _ => {
                 if n == 0 {
                     tys.mk(k)?
@@ -306,9 +353,44 @@ fn import_walk<T: Tys>(
             }
         };
         s.stats.terms_imported += 1;
-        s.memo.insert(t.0, made);
+        s.memo.insert((t, depth), made);
     }
-    Ok(s.memo[&root.0])
+    Ok(s.memo[&(root, 0)])
+}
+
+/// An argument entering a binder must retain references to its own surrounding binders.
+fn land<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, arg: Ty, depth: u32) -> Result<Ty, SolveError> {
+    if depth == 0 || !tys.flags(arg).has(crate::term::Flags::HAS_BOUND) {
+        return Ok(arg);
+    }
+    tys.shift_in(s, arg, depth)
+}
+
+/// Instantiates the binder enclosing an arena term, including its uses under other binders.
+#[track_caller]
+pub(crate) fn instantiate_bound<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, root: Ty, with: List) -> Result<Ty, SolveError> {
+    if !tys.flags(root).has(crate::term::Flags::HAS_BOUND) {
+        return Ok(root);
+    }
+    let at = core::panic::Location::caller();
+    fold_at_depth(tys, s, root, |tys, s, t, depth| {
+        if !tys.flags(t).has(crate::term::Flags::HAS_BOUND) {
+            return Ok(Some(t));
+        }
+        match tys.kind(t) {
+            TyKind::Bound(d, i) if d == depth => {
+                if i >= with.len {
+                    return Err(SolveError::Malformed(Malformed::Param {
+                        index: i, args: with.len, at, goal: None, head: None,
+                    }));
+                }
+                let arg = tys.list_get(with, i);
+                Ok(Some(land(tys, s, arg, depth)?))
+            }
+            TyKind::Bound(d, i) if d > depth => Ok(Some(tys.reindex_bound(t, d - 1, i)?)),
+            _ => Ok(None),
+        }
+    })
 }
 
 /// Visits every node of `root` (resolving variables at each node) before its children, until

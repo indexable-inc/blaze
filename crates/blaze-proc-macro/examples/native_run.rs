@@ -14,7 +14,7 @@ use blaze_build_script::{
     host_tools,
     key::{CMode, HostToolKey, KeyInputs, RunLimits, RunnerKey, base},
     probe::Table,
-    toolchain::{CInputs, PIN, Shelf},
+    toolchain::{CInputs, Shelf},
 };
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_proc_macro::{
@@ -104,7 +104,7 @@ fn main() -> ExitCode {
     let env = blaze_build_script::env(&given, alloc);
     // D71: the host tools the pin table grants this package (sha3-asm: perl), each by its
     // binary's digest in the key.
-    let table_tools = host_tools::host_tools(PIN, TARGET, alloc).unwrap_or_else(|e| panic!("{e}"));
+    let table_tools = host_tools::host_tools(blaze_pins::CLANG_JSON, TARGET, alloc).unwrap_or_else(|e| panic!("{e}"));
     let tools = host_tools::granted(&table_tools, name, alloc);
     // Each tool under its name, then each program it starts under `<tool>+<path>`, as
     // native_unit keys them.
@@ -145,7 +145,7 @@ fn main() -> ExitCode {
     let mut records: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
     for (pass, package_dir, out_dir) in [("A", pkg_a, out_a), ("B", pkg_b, out_b)] {
         let c = CInputs {
-            shelf: Shelf { dir: shelf, clang_major: blaze_build_script::toolchain::clang_major(PIN).unwrap_or_else(|e| panic!("{e}")) },
+            shelf: Shelf { dir: shelf, clang_major: blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or_else(|e| panic!("{e}")) },
             sysroot: sdk,
             out_dir,
             package: package_dir,
@@ -157,7 +157,8 @@ fn main() -> ExitCode {
         // the run's files are renamed there by digest, so it is on their volume.
         let area = format!("{}/files", out_dir.rsplit_once('/').map_or("", |(parent, _)| parent));
         std::fs::create_dir_all(&area).unwrap_or_else(|e| panic!("{area}: {e}"));
-        let script = NativeScript { program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, jobs: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600), files: &area };
+        // An example's run: no record is kept, so any key names its trees.
+        let script = NativeScript { key: blaze_ids::ContentId([7; 32]), program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, jobs: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600), files: &area };
         let ran = match run_script(&script, alloc) {
             Ok(ran) => ran,
             Err(error) => {

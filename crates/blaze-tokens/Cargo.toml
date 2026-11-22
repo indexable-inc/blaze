@@ -21,10 +21,10 @@ doctest = false
 parser.workspace = true
 # `record!`, `Writer`, `Own`, `Placed`, `Slice`, `open_as`: the record, on `core` alone. By path,
 # as blaze-lower and blaze-body name it.
-blaze-format-core = { path = "../blaze-format-core" }
+blaze-format-core.workspace = true
 # `ContentId`, `Hasher`: the token digest, in its own domain. By path: the workspace entry turns
 # on its serde adapter.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # `CrateItemKey`, `ItemKey`: a mark's definition site.
 blaze-id.workspace = true
 # `DefSite`, `Transparency`, `Edition`: a mark's words, defined once there.
@@ -33,7 +33,7 @@ blaze-surface.workspace = true
 blaze-own.workspace = true
 # `HashMap`, `FixedState`: the builder's table from a lexeme's hash to its number. By path: the
 # workspace entry turns on serde and the shared tables.
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 
 [dev-dependencies]
 # `testing::heap()`: the tests' root allocator capability.

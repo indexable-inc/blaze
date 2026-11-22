@@ -381,8 +381,11 @@ fn a_global_allocator_binds_its_expansion() {
         let written = rows.iter().any(|(path, body, kind, _)| path.ends_with(shim) && *body && *kind == FnKind::Free);
         assert!(written, "`{shim}` of the expansion tabled with its body: {rows:?}");
     }
+    // front2 tables every fn with a body as `FnKind::Free` (program/tabled.rs `row`), an impl's
+    // member too: the member is told by its path, `<.. for Counting>::alloc`, never by the
+    // trait's declaration `GlobalAlloc::alloc` (no body, `Trait`).
     for method in ["::alloc", "::dealloc"] {
-        let reached = rows.iter().any(|(path, body, kind, _)| path.ends_with(method) && *body && matches!(kind, FnKind::Impl(_)));
+        let reached = rows.iter().any(|(path, body, kind, _)| path.ends_with(method) && path.contains("for Counting>") && *body && *kind == FnKind::Free);
         assert!(reached, "`Counting`'s `{method}` reached through the expansion: {rows:?}");
     }
     let defaults: Vec<&String> = rows.iter().map(|(path, ..)| path).filter(|path| path.contains("__rdl_")).collect();

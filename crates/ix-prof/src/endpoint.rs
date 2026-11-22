@@ -153,11 +153,32 @@ mod unix {
     };
 
     use super::{MAX_FILE, PrivateDir};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use blaze_sys::{Errno, Fd, Path as SysPath, posix::{io::{self, OpenFlags}, proc as status}};
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    use libc as status;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const ELOOP: i32 = Errno::Loop.raw() as i32;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const ENOENT: i32 = Errno::NoEnt.raw() as i32;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    use libc::{ELOOP, ENOENT};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn os_error(error: Errno) -> std::io::Error {
+        std::io::Error::from_raw_os_error(i32::from(error.raw()))
+    }
 
     fn c(s: &[u8], what: &Path) -> Result<CString, String> {
         CString::new(s).map_err(|_| format!("{} has a NUL byte", what.display()))
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fstat(fd: RawFd) -> std::io::Result<status::stat> {
+        status::stat_fd(Fd::new(fd)).map_err(os_error)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
         // SAFETY: `stat` is plain old data; all zeroes is a valid value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -168,19 +189,23 @@ mod unix {
         Ok(st)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use blaze_sys::posix::thread::geteuid as me;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn me() -> u32 {
         // SAFETY: geteuid cannot fail.
         unsafe { libc::geteuid() }
     }
 
     fn kind(mode: u32) -> &'static str {
-        match mode & libc::S_IFMT as u32 {
-            m if m == libc::S_IFDIR as u32 => "a directory",
-            m if m == libc::S_IFREG as u32 => "a regular file",
-            m if m == libc::S_IFLNK as u32 => "a symbolic link",
-            m if m == libc::S_IFIFO as u32 => "a FIFO",
-            m if m == libc::S_IFSOCK as u32 => "a socket",
-            m if m == libc::S_IFCHR as u32 || m == libc::S_IFBLK as u32 => "a device",
+        match mode & status::S_IFMT as u32 {
+            m if m == status::S_IFDIR as u32 => "a directory",
+            m if m == status::S_IFREG as u32 => "a regular file",
+            m if m == status::S_IFLNK as u32 => "a symbolic link",
+            m if m == status::S_IFIFO as u32 => "a FIFO",
+            m if m == status::S_IFSOCK as u32 => "a socket",
+            m if m == status::S_IFCHR as u32 || m == status::S_IFBLK as u32 => "a device",
             _ => "not a regular file",
         }
     }
@@ -205,7 +230,8 @@ mod unix {
             let why = std::io::Error::last_os_error();
             return match why.raw_os_error() {
                 // No ACL; or a file system that cannot hold one, so none grants anything.
-                Some(libc::ENOENT | libc::ENOTSUP) => Ok(None),
+                Some(code) if code == i32::from(Errno::NoEnt.raw())
+                    || code == i32::from(Errno::NotSup.raw()) => Ok(None),
                 _ => Err(why),
             };
         }
@@ -225,6 +251,15 @@ mod unix {
     /// refuses at start what every later write in it would refuse.)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn acl(fd: RawFd, dir: bool) -> std::io::Result<Option<&'static str>> {
+        #[cfg(target_os = "linux")]
+        fn present(fd: RawFd, name: &std::ffi::CStr) -> std::io::Result<bool> {
+            match blaze_sys::linux::task::fgetxattr(Fd::new(fd), name, &mut []) {
+                Ok(_) => Ok(true),
+                Err(Errno::NoData | Errno::OpNotSupp) => Ok(false),
+                Err(why) => Err(os_error(why)),
+            }
+        }
+        #[cfg(target_os = "android")]
         fn present(fd: RawFd, name: &std::ffi::CStr) -> std::io::Result<bool> {
             // SAFETY: `fd` is the caller's open descriptor, the name NUL-terminated; a size of 0
             // only asks whether the attribute exists and how long it is.
@@ -276,9 +311,9 @@ mod unix {
     /// but it can be fixed without it: [`PrivateDir::open`] sets its owner to this user.
     #[cfg(target_os = "macos")]
     pub(super) fn volume_verdict(flags: u32, owner: u32, me: u32) -> Volume {
-        if flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0 {
+        if flags & status::MNT_IGNORE_OWNERSHIP as u32 != 0 {
             Volume::IgnoresOwnership
-        } else if flags & libc::MNT_LOCAL as u32 == 0 {
+        } else if flags & status::MNT_LOCAL as u32 == 0 {
             Volume::Network
         } else if owner != me && owner != 0 {
             Volume::MountedBy(owner)
@@ -296,16 +331,9 @@ mod unix {
     /// own volume), who can read it all.
     #[cfg(target_os = "macos")]
     fn refuse_volume(fd: RawFd, shown: &std::path::Display<'_>) -> Result<(), String> {
-        // SAFETY: `statfs` is plain old data; all zeroes is a valid value.
-        let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is the caller's open descriptor and `sf` a valid `statfs` to write.
-        if unsafe { libc::fstatfs(fd, &mut sf) } != 0 {
-            return Err(format!(
-                "checking the volume of {shown}: {}: refused",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let text = |chars: &[libc::c_char]| {
+        let sf = status::stat_fs_fd(Fd::new(fd))
+            .map_err(|why| format!("checking the volume of {shown}: {}: refused", os_error(why)))?;
+        let text = |chars: &[core::ffi::c_char]| {
             let bytes: Vec<u8> =
                 chars.iter().take_while(|it| **it != 0).map(|it| *it as u8).collect(); // alloc: an error's text
             String::from_utf8_lossy(&bytes).into_owned()
@@ -358,21 +386,23 @@ mod unix {
             (0x7375_7245, "Coda"),
         ];
         const FUSE: u64 = 0x6573_5546;
-        // SAFETY: `statfs` is plain old data; all zeroes is a valid value.
-        let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is the caller's open descriptor and `sf` a valid `statfs` to write.
-        if unsafe { libc::fstatfs(fd, &mut sf) } != 0 {
-            return Err(format!(
-                "checking the file system of {shown}: {}: refused",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // `f_type`'s width and sign differ by target; the magic is its low 32 bits.
-        #[allow(
-            clippy::unnecessary_cast,
-            reason = "f_type is c_long on some targets, c_uint on others"
-        )]
-        let magic = sf.f_type as u64 & 0xffff_ffff;
+        #[cfg(target_os = "linux")]
+        let magic = blaze_sys::linux::fstatfs(Fd::new(fd))
+            .map_err(|why| format!("checking the file system of {shown}: {}: refused", os_error(why)))?
+            .kind as u64 & 0xffff_ffff;
+        #[cfg(target_os = "android")]
+        let magic = {
+            // SAFETY: `statfs` is plain old data; all zeroes is a valid value.
+            let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `fd` is the caller's open descriptor and `sf` a valid `statfs` to write.
+            if unsafe { libc::fstatfs(fd, &mut sf) } != 0 {
+                return Err(format!(
+                    "checking the file system of {shown}: {}: refused",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            sf.f_type as u64 & 0xffff_ffff
+        };
         if let Some((_, name)) = NETWORK.iter().find(|(m, _)| *m == magic) {
             return Err(format!(
                 "{shown} is on {name}, a network file system: refused (its server can grant access by ACLs that neither the mode nor a local ACL shows; use a directory on a local disk)"
@@ -381,20 +411,29 @@ mod unix {
         if magic != FUSE {
             return Ok(());
         }
-        // SAFETY: `statx` is plain old data; all zeroes is a valid value.
-        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is the caller's open descriptor, the path empty and NUL-terminated (with
-        // AT_EMPTY_PATH, `fd` itself), and `stx` a valid `statx` to write.
-        if unsafe {
-            libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH, libc::STATX_MNT_ID, &mut stx)
-        } != 0
-        {
-            return Err(format!(
-                "finding the FUSE mount of {shown} (statx STATX_MNT_ID): {}: refused (ix-prof trusts a FUSE mount only once it has checked who mounted it)",
-                std::io::Error::last_os_error()
-            ));
-        }
-        if stx.stx_mask & libc::STATX_MNT_ID == 0 {
+        let stat_error = |why: std::io::Error| format!(
+            "finding the FUSE mount of {shown} (statx STATX_MNT_ID): {why}: refused (ix-prof trusts a FUSE mount only once it has checked who mounted it)"
+        );
+        #[cfg(target_os = "linux")]
+        let (has_mount_id, mount_id, dev) = {
+            use blaze_sys::linux::{AtFlags, StatxMask, statx};
+            let stx = statx(Fd::new(fd), SysPath::EMPTY, AtFlags::EMPTY_PATH, StatxMask::MNT_ID)
+                .map_err(|why| stat_error(os_error(why)))?;
+            (stx.mask & StatxMask::MNT_ID.bits() != 0, stx.mnt_id, (stx.dev_major, stx.dev_minor))
+        };
+        #[cfg(target_os = "android")]
+        let (has_mount_id, mount_id, dev) = {
+            // SAFETY: `statx` contains only integers, so all zeroes are valid.
+            let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+            // SAFETY: the empty path names the open descriptor, and stx is writable.
+            if unsafe {
+                libc::statx(fd, c"".as_ptr(), libc::AT_EMPTY_PATH, libc::STATX_MNT_ID, &mut stx)
+            } != 0 {
+                return Err(stat_error(std::io::Error::last_os_error()));
+            }
+            (stx.stx_mask & libc::STATX_MNT_ID != 0, stx.stx_mnt_id, (stx.stx_dev_major, stx.stx_dev_minor))
+        };
+        if !has_mount_id {
             return Err(format!(
                 "{shown} is on FUSE, and this kernel does not report a descriptor's mount (statx STATX_MNT_ID, Linux 5.8): refused (ix-prof trusts a FUSE mount only once it has checked who mounted it; use a directory on a local disk)"
             ));
@@ -405,19 +444,19 @@ mod unix {
                     "reading /proc/self/mountinfo for the FUSE mount of {shown}: {why}: refused"
                 )
             })?;
-        let mount = super::mountinfo::find(&table, stx.stx_mnt_id)
+        let mount = super::mountinfo::find(&table, mount_id)
             .map_err(|why| format!("finding the FUSE mount of {shown}: {why}: refused"))?
             .ok_or_else(|| {
                 format!(
                     "{shown} is on FUSE mount {}, which /proc/self/mountinfo does not list (a mount in another namespace, reached through /proc/<pid>/root?): refused (ix-prof trusts a FUSE mount only once it has checked who mounted it)",
-                    stx.stx_mnt_id
+                    mount_id
                 )
             })?;
-        if mount.dev != (stx.stx_dev_major, stx.stx_dev_minor) {
+        if mount.dev != dev {
             return Err(format!(
                 "{shown} is on device {}:{}, but mount {} in /proc/self/mountinfo ({}) is on {}:{}: refused (the mount changed while it was checked)",
-                stx.stx_dev_major,
-                stx.stx_dev_minor,
+                dev.0,
+                dev.1,
                 mount.id,
                 mount.point,
                 mount.dev.0,
@@ -486,27 +525,35 @@ mod unix {
                 ));
             }
             let cpath = c(last.as_os_str().as_bytes(), path)?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let opened = io::open(
+                SysPath::new(&cpath),
+                OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::NO_FOLLOW | OpenFlags::CLOSE_ON_EXEC,
+                0,
+            ).map(|fd| fd.into_raw()).map_err(os_error);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             // SAFETY: a NUL-terminated path; the descriptor, if any, is owned below.
-            let fd = unsafe {
-                libc::open(
+            let opened = unsafe {
+                let fd = libc::open(
                     cpath.as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
+                );
+                if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(fd) }
             };
-            if fd < 0 {
-                let why = std::io::Error::last_os_error();
-                if why.raw_os_error() == Some(libc::ELOOP) {
-                    return Err(format!(
+            let fd = opened.map_err(|why| {
+                if why.raw_os_error() == Some(ELOOP) {
+                    format!(
                         "{shown} is a symbolic link: refused ({rule}, and a link can point into another user's)"
-                    ));
+                    )
+                } else {
+                    format!("opening the directory {shown}: {why}")
                 }
-                return Err(format!("opening the directory {shown}: {why}"));
-            }
+            })?;
             // SAFETY: `fd` was just opened and nothing else owns it.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             let st = fstat(fd.as_raw_fd()).map_err(|why| format!("{shown}: {why}"))?;
             let mode = st.st_mode as u32;
-            if mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+            if mode & status::S_IFMT as u32 != status::S_IFDIR as u32 {
                 return Err(format!("{shown} is {}, not a directory: refused", kind(mode)));
             }
             // First: on such a volume the owner and mode below mean nothing.
@@ -525,12 +572,13 @@ mod unix {
             // is this user's alone. For a directory already this user's it changes nothing.
             #[cfg(target_os = "macos")]
             {
-                // SAFETY: `fd` is an open descriptor; a gid of -1 leaves the group as it is.
-                if unsafe { libc::fchown(fd.as_raw_fd(), me(), libc::gid_t::MAX) } != 0 {
+                if let Err(why) = status::change_owner(
+                    Fd::new(fd.as_raw_fd()), me(), blaze_sys::posix::types::gid_t::MAX,
+                ) {
                     return Err(format!(
                         "{shown}: setting its owner to this user (uid {}): {}: refused (macOS shows a directory stored as uid 99, which every user can write, as owned by whoever asks, so ix-prof makes it this user's for real before writing in it; use a directory of your own on a volume that keeps ownership)",
                         me(),
-                        std::io::Error::last_os_error()
+                        os_error(why)
                     ));
                 }
             }
@@ -555,9 +603,18 @@ mod unix {
             let path = self.at(name);
             let shown = path.display();
             let cname = c(name.as_bytes(), &path)?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let opened = io::openat(
+                Fd::new(self.fd.as_raw_fd()),
+                SysPath::new(&cname),
+                OpenFlags::READ | OpenFlags::NO_FOLLOW | OpenFlags::NONBLOCK
+                    | OpenFlags::NO_CONTROLLING_TTY | OpenFlags::CLOSE_ON_EXEC,
+                0,
+            ).map(|fd| fd.into_raw()).map_err(os_error);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             // SAFETY: `self.fd` is an open directory and `cname` NUL-terminated.
-            let fd = unsafe {
-                libc::openat(
+            let opened = unsafe {
+                let fd = libc::openat(
                     self.fd.as_raw_fd(),
                     cname.as_ptr(),
                     libc::O_RDONLY
@@ -565,23 +622,24 @@ mod unix {
                         | libc::O_NONBLOCK
                         | libc::O_NOCTTY
                         | libc::O_CLOEXEC,
-                )
+                );
+                if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(fd) }
             };
-            if fd < 0 {
-                let why = std::io::Error::last_os_error();
-                return match why.raw_os_error() {
-                    Some(libc::ENOENT) => Ok(None),
-                    Some(libc::ELOOP) => Err(format!(
+            let fd = match opened {
+                Ok(fd) => fd,
+                Err(why) => return match why.raw_os_error() {
+                    Some(ENOENT) => Ok(None),
+                    Some(ELOOP) => Err(format!(
                         "{shown} is a symbolic link: refused (it is read only as this user's own regular file)"
                     )),
                     _ => Err(format!("opening {shown}: {why}")),
-                };
-            }
+                },
+            };
             // SAFETY: `fd` was just opened and nothing else owns it.
             let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
             let st = fstat(file.as_raw_fd()).map_err(|why| format!("{shown}: {why}"))?;
             let mode = st.st_mode as u32;
-            if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+            if mode & status::S_IFMT as u32 != status::S_IFREG as u32 {
                 return Err(format!(
                     "{shown} is {}: refused (it is read only as a regular file)",
                     kind(mode)
@@ -621,9 +679,18 @@ mod unix {
             let path = self.at(name);
             let (cname, cpart) = (c(name.as_bytes(), &path)?, c(part.as_bytes(), &path)?);
             let dir = self.fd.as_raw_fd();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let opened = io::openat(
+                Fd::new(dir),
+                SysPath::new(&cpart),
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE
+                    | OpenFlags::NO_FOLLOW | OpenFlags::CLOSE_ON_EXEC,
+                0o600,
+            ).map(|fd| fd.into_raw()).map_err(os_error);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             // SAFETY: an open directory and NUL-terminated names.
-            let fd = unsafe {
-                libc::openat(
+            let opened = unsafe {
+                let fd = libc::openat(
                     dir,
                     cpart.as_ptr(),
                     libc::O_WRONLY
@@ -631,20 +698,18 @@ mod unix {
                         | libc::O_EXCL
                         | libc::O_NOFOLLOW
                         | libc::O_CLOEXEC,
-                    0o600 as libc::c_uint,
-                )
+                    0o600 as core::ffi::c_uint,
+                );
+                if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(fd) }
             };
-            if fd < 0 {
-                return Err(format!(
-                    "making {}: {}",
-                    self.at(part).display(),
-                    std::io::Error::last_os_error()
-                ));
-            }
+            let fd = opened.map_err(|why| format!("making {}: {why}", self.at(part).display()))?;
             // SAFETY: `fd` was just opened and nothing else owns it.
             let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
             let written = (|| -> std::io::Result<()> {
                 // Exactly 0600 under any umask: a reader refuses any other mode.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                status::change_mode(Fd::new(file.as_raw_fd()), 0o600).map_err(os_error)?;
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 // SAFETY: an open descriptor.
                 if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -658,6 +723,10 @@ mod unix {
                     ));
                 }
                 file.write_all(bytes)?;
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                status::rename_at(Fd::new(dir), SysPath::new(&cpart), Fd::new(dir), SysPath::new(&cname))
+                    .map_err(os_error)?;
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 // SAFETY: an open directory and NUL-terminated names.
                 if unsafe { libc::renameat(dir, cpart.as_ptr(), dir, cname.as_ptr()) } != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -665,6 +734,9 @@ mod unix {
                 Ok(())
             })();
             written.map_err(|why| {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let _ = status::unlink_at(Fd::new(dir), SysPath::new(&cpart), status::Unlink::File);
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 // SAFETY: an open directory and a NUL-terminated name; a part file we made.
                 unsafe { libc::unlinkat(dir, cpart.as_ptr(), 0) };
                 format!("writing {}: {why}", path.display())
@@ -675,6 +747,10 @@ mod unix {
         pub fn remove(&self, name: &str) -> Result<(), String> {
             let path = self.at(name);
             let cname = c(name.as_bytes(), &path)?;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            status::unlink_at(Fd::new(self.fd.as_raw_fd()), SysPath::new(&cname), status::Unlink::File)
+                .map_err(|why| format!("removing {}: {}", path.display(), os_error(why)))?;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             // SAFETY: an open directory and a NUL-terminated name.
             if unsafe { libc::unlinkat(self.fd.as_raw_fd(), cname.as_ptr(), 0) } != 0 {
                 return Err(format!(
@@ -954,6 +1030,9 @@ mod tests {
         refused("a linked file", super::read(&dir.0), "is a symbolic link");
         std::fs::remove_file(dir.0.join(FILE)).unwrap();
         let fifo = std::ffi::CString::new(dir.0.join(FILE).as_os_str().as_encoded_bytes()).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(blaze_sys::posix::proc::make_fifo(blaze_sys::Path::new(&fifo), 0o600), Ok(()));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         // SAFETY: a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         refused("a FIFO", super::read(&dir.0), "a FIFO");
@@ -1186,8 +1265,7 @@ mod tests {
             "the hint: {made:?}"
         );
         let st = std::fs::metadata(&run).unwrap();
-        // SAFETY: geteuid cannot fail.
-        let me = unsafe { libc::geteuid() };
+        let me = blaze_sys::posix::thread::geteuid();
         assert_eq!(
             (std::os::unix::fs::MetadataExt::uid(&st), st.permissions().mode() & 0o777),
             (me, 0o700),
@@ -1249,7 +1327,7 @@ mod tests {
     #[test]
     fn a_volume_another_user_mounted_is_refused() {
         use super::unix::{Volume, volume_verdict};
-        let local = libc::MNT_LOCAL as u32;
+        let local = blaze_sys::posix::proc::MNT_LOCAL as u32;
         assert_eq!(volume_verdict(local, 501, 501), Volume::Trusted, "mounted by this user");
         assert_eq!(volume_verdict(local, 0, 501), Volume::Trusted, "mounted by root");
         assert_eq!(
@@ -1259,7 +1337,7 @@ mod tests {
         );
         assert_eq!(volume_verdict(local, 0, 0), Volume::Trusted, "root's own");
         assert_eq!(
-            volume_verdict(local | libc::MNT_IGNORE_OWNERSHIP as u32, 501, 501),
+            volume_verdict(local | blaze_sys::posix::proc::MNT_IGNORE_OWNERSHIP as u32, 501, 501),
             Volume::IgnoresOwnership
         );
         assert_eq!(volume_verdict(0, 501, 501), Volume::Network, "not local");
@@ -1426,23 +1504,20 @@ mod tests {
             b
         }
         fn set(path: &std::path::Path, name: &std::ffi::CStr, value: Option<&[u8]>) {
+            use blaze_sys::linux::task::{XattrFlags, removexattr, setxattr};
             let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-            // SAFETY: NUL-terminated path and name; the value, if any, is a live slice.
-            let rc = unsafe {
-                match value {
-                    Some(v) => {
-                        libc::setxattr(c.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0)
-                    }
-                    None => libc::removexattr(c.as_ptr(), name.as_ptr()),
-                }
+            let at = blaze_sys::Path::new(&c);
+            let result = match value {
+                Some(v) => setxattr(at, name, v, XattrFlags::NONE),
+                None => removexattr(at, name),
             };
-            assert_eq!(
-                rc,
-                0,
-                "{name:?} on {}: {} (does this file system hold POSIX ACLs?)",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
+            if let Err(why) = result {
+                panic!(
+                    "{name:?} on {}: {} (does this file system hold POSIX ACLs?)",
+                    path.display(),
+                    std::io::Error::from_raw_os_error(i32::from(why.raw()))
+                );
+            }
         }
         let (access, default) = (c"system.posix_acl_access", c"system.posix_acl_default");
         let dir = Tmp::new("posixacl", 0o700);

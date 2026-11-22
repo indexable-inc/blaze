@@ -7,7 +7,9 @@
 //!   `--version` answers the fixed string `0.29.2` (as D54 states `git version 2.51.0`).
 //! - `sw_vers -productVersion` / `-buildVersion` / `-productName`: the declared userland's pins.
 //! - A C compiler's identity probes (`--version`, `-dumpversion`, `-dumpfullversion`): the
-//!   pinned clang's version text, and [`probe::LLVM`] for the dumped version.
+//!   pinned clang's version text, and [`blaze_pins::RUSTC_LLVM`] for the dumped version.
+//! - A C compiler's probes (`-E` family detection, `-?`, cc's flag checks): routed here and
+//!   answered from pins/answers/clang.json by the caller ([`crate::c_tasks_probe`]).
 //!
 //! A form not handled here is refused by name ([`FactRefused`]), never guessed. A fact reads no
 //! file: its record subject ([`subject`]) is its whole question.
@@ -28,6 +30,10 @@ pub enum Fact<'s> {
     /// A C compiler's identity probe: `program` as spawned (a path or a name) and `arg`, one of
     /// `--version`, `-dumpversion`, `-dumpfullversion`.
     CompilerVersion { program: &'s str, arg: &'s str },
+    /// A compiler probe ([`crate::c_tasks_probe::is_probe`]): answered from the pinned table
+    /// pins/answers/clang.json by the caller (it needs `OUT_DIR`'s files and the spawn's
+    /// environment), never from [`Pins`].
+    CcProbe { program: &'s str, args: &'s [&'s str] },
 }
 
 /// The pinned values a fact is answered from; the caller passes them (the clang pin row and
@@ -63,6 +69,8 @@ pub enum FactRefused<'a> {
     SwVersArgs { args: AString<'a> },
     /// A compiler probe whose argument is not `--version`, `-dumpversion` or `-dumpfullversion`.
     CompilerArgs { program: AString<'a>, arg: AString<'a> },
+    /// A compiler probe asked of [`answer`]: its answer is the table's (`c_tasks_probe`).
+    TableProbe,
 }
 
 impl core::fmt::Display for FactRefused<'_> {
@@ -80,6 +88,7 @@ impl core::fmt::Display for FactRefused<'_> {
             FactRefused::CompilerArgs { program, arg } => {
                 write!(f, "`{} {}`: only --version, -dumpversion, -dumpfullversion are answered for a compiler (READINESS 1f)", program.as_str(), arg.as_str())
             }
+            FactRefused::TableProbe => f.write_str("a compiler probe is answered from pins/answers/clang.json (c_tasks_probe), not from the fact pins"),
         }
     }
 }
@@ -118,6 +127,9 @@ pub fn question<'s>(program: &'s str, args: &'s [&'s str]) -> Option<Fact<'s>> {
             [one] if SW_VERS_OPTIONS.contains(one) => Some(Fact::SwVers { args }),
             _ => None,
         };
+    }
+    if crate::c_tasks_probe::is_probe(program, args) {
+        return Some(Fact::CcProbe { program, args });
     }
     if probe::is_c_tool(program) && COMPILERS.contains(&name) {
         return match args {
@@ -211,7 +223,7 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
             let stdout = match arg {
                 "--version" => String::from_str_in(pins.clang_version_text, alloc),
                 "-dumpversion" | "-dumpfullversion" => {
-                    let mut out = String::from_str_in(probe::LLVM, alloc);
+                    let mut out = String::from_str_in(blaze_pins::RUSTC_LLVM, alloc);
                     out.push('\n');
                     out
                 }
@@ -224,6 +236,7 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
             };
             Ok(FactAnswer { code: 0, stdout, stderr: String::new_in(alloc) })
         }
+        Fact::CcProbe { .. } => Err(FactRefused::TableProbe),
     }
 }
 
@@ -251,6 +264,14 @@ pub fn subject<'a>(fact: &Fact<'_>, alloc: Alloc<'a>) -> AString<'a> {
             out.push_str(name_of(program));
             out.push('\n');
             out.push_str(arg);
+        }
+        Fact::CcProbe { program, args } => {
+            out.push_str("cc-probe\n");
+            out.push_str(name_of(program));
+            for arg in args {
+                out.push('\n');
+                out.push_str(arg);
+            }
         }
     }
     out

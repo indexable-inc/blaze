@@ -71,6 +71,18 @@ impl Laid<'_> {
     pub fn has_graph(&self) -> bool {
         self.graph.is_some() || self.parts.is_some()
     }
+
+    /// The layout half of the standing graph proof. It includes every units record's output and
+    /// name in layout order, so a removed member or a changed manifest cannot reuse an old plan
+    /// directory under the same graph source.
+    pub(crate) fn plan_source(&self) -> ContentId {
+        let mut hash = blaze_ids::Hasher::new("blaze-cli standing plan layout 1");
+        hash.update(&self.root.name.subject.0).update(&self.root.out.0);
+        for (name, member) in self.members.iter() {
+            hash.update(&name.subject.0).update(&member.out.0);
+        }
+        hash.finish()
+    }
 }
 
 /// Read the workspace's layout from the checkout's root: every manifest and listing it asks for
@@ -388,8 +400,13 @@ fn member_units<'f>(
         }
     }
     made.parts.sort_unstable_by_key(|part| part.name);
-    if member.lib.is_none() && member.bins.is_empty() {
-        made.find(UNREAD, (member.span.start, member.span.end), &["the package has no library and no binary"]);
+    // cargo's rule (blaze-manifest manifest.rs `InvalidManifest::NoTargets`): only a package with
+    // no target of any kind is an error, a build script not counted. A package of benches only
+    // or tests only is a package (turso's `perf/query-batch`, `postgres/tests`); a target the
+    // layout refused is a target written, its own finding below. The layout is read with test
+    // targets (`lay`), so `extras` holds every test, example and bench the manifest has.
+    if member.lib.is_none() && member.bins.is_empty() && member.extras.is_empty() && member.refused_targets.is_empty() {
+        made.find(UNREAD, (member.span.start, member.span.end), &["the package has no target: no library, binary, test, example or bench"]);
     }
     // Each test, example or bench target the layout refused is a finding on its table's line
     // (rule 3: left out, never quietly): it is in no unit, and the member's other targets and

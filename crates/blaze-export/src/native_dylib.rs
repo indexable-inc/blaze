@@ -10,7 +10,7 @@
 //! ```text
 //! pub enum DylibError<'a> {
 //!     NotMac,                                         // image.platform is not MacosArm64
-//!     Library(blaze_native::libraries::LibraryError<'a>), // a library with no install name
+//!     Library { name: &'a str },                      // a library resolved for another platform
 //!     TooLarge { what: &'static str, len: u64 },      // a field of the format too narrow
 //!     Alloc,                                          // the output could not be reserved
 //!     Identifier { len: usize },                      // not 64 lowercase hex digits
@@ -60,7 +60,6 @@
 use blaze_ids::Hasher;
 use blaze_native::Platform;
 use blaze_native::image::{FixTo, Image, Placed, Region};
-use blaze_native::libraries::{self, LibraryError};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
 use crate::bytes;
@@ -72,8 +71,9 @@ use crate::sign;
 pub enum DylibError<'a> {
     /// The image is not for arm64 macOS (NATIVE.md 3.1: Mach-O on macOS; Linux is W5's).
     NotMac,
-    /// A library the program declares has no install name (NATIVE.md 3.5).
-    Library(LibraryError<'a>),
+    /// A library of the image resolved for another platform than macOS: its install name is
+    /// no Mach-O load command's (NATIVE.md 3.5).
+    Library { name: &'a str },
     /// A value does not fit the format's field `what` (chained fixups' widths, 32-bit offsets,
     /// the header room of `Layout::header_reserve`).
     TooLarge { what: &'static str, len: u64 },
@@ -307,10 +307,14 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     let mut system: AString<'b> = String::new_in(alloc);
     system.push_str(macho::LIB_SYSTEM);
     paths.push(system);
-    for &library in image.libraries.iter() {
-        let mut path: AString<'b> = String::new_in(alloc);
-        libraries::write_install_name(Platform::MacosArm64, library, &mut path).map_err(DylibError::Library)?;
-        if !paths.iter().any(|p| p.as_str() == path.as_str()) {
+    for library in image.libraries.iter() {
+        if library.platform() != Platform::MacosArm64 {
+            return Err(DylibError::Library { name: library.library().name });
+        }
+        let install = library.install();
+        if !paths.iter().any(|p| p.as_str() == install) {
+            let mut path: AString<'b> = String::new_in(alloc);
+            path.push_str(install);
             paths.push(path);
         }
     }

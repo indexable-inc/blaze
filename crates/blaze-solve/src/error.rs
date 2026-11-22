@@ -3,6 +3,17 @@
 //! `FulfillError` value.
 
 use crate::facts::Question;
+use crate::term::Def;
+
+/// The declaration whose portable parameters a solver rule is instantiating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamHead {
+    ImplValue { impl_: Def, item: Def },
+    TraitDefault { trait_: Def, item: Def },
+    SizedTail { adt: Def },
+    Field { adt: Def, field: u32 },
+    AliasBound { alias: Def, bound: u32 },
+}
 
 /// A bound the solver keeps (rule 18), each named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +42,7 @@ pub enum Malformed {
     /// so it is the rule's own call: alias.rs, builtin.rs, ..), or the solver's check that
     /// refused it (coherence's orphan walk); `goal` is the goal being solved (filled by the
     /// driver's loop, `eval::Search::drive`, as for `Pred`; `None` outside a goal).
-    Param { index: u32, args: u32, at: &'static core::panic::Location<'static>, goal: Option<BadPred> },
+    Param { index: u32, args: u32, head: Option<ParamHead>, at: &'static core::panic::Location<'static>, goal: Option<BadPred> },
     /// Canonical words that do not decode.
     Canonical { at: u32 },
     /// A predicate that cannot be a goal where it was found (an `Eq` in an answer, say).
@@ -120,6 +131,9 @@ pub struct BadPred {
 /// A part of the semantics not ported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsupported {
+    /// Structural selection needs the stored places of this closure. Its
+    /// environment is still opaque to the caller.
+    ClosureCaptureWitness(crate::term::Def),
     InherentAlias,
     FreeAlias,
     AnonConst,
@@ -132,6 +146,13 @@ pub enum Unsupported {
     /// auto traits, its supertraits) or a `DynCompatible` goal would be answered from a verdict
     /// that does not exist, so the goal stops here instead of failing.
     DynUndecided(crate::term::Def),
+    /// The associated item `item` names `trait_` as its trait (`Facts::assoc`), but the facts of
+    /// `trait_` hold no member for it: what bounds it has, whether it has a default, are not
+    /// known here (a dependency trait whose members were not filed, or an `impl Trait` in a
+    /// trait fn's synthetic type missing from its trait's rows). A goal on its projection stops
+    /// here naming both: never No (no bound matched) and never the error type (an impl that
+    /// "does not define it"), each of which would decide what was not read (rule 3).
+    MemberNotFiled { trait_: crate::term::Def, item: crate::term::Def },
 }
 
 /// The solver's own failure: a bound passed or malformed input. Never a user's error.
@@ -144,8 +165,10 @@ pub enum SolveError {
     Unsupported(Unsupported),
     /// A root goal passed [`crate::eval::MAX_STEPS`] solver steps (frames pushed, cycle heads
     /// rerun, candidates run): a COUNT, so the same goal stops at the same step whoever asks
-    /// (rule 18; never a wall-clock limit). `goal` is the root goal.
-    Steps { goal: Option<BadPred>, most: u64 },
+    /// (rule 18; never a wall-clock limit). `goal` is the root goal; `top` the goal on top of
+    /// the stack when the bound was hit and `depth` the stack's depth: a deep stack is a rule
+    /// re-entering (a missing cycle check), a shallow one a wide search (a missing memo).
+    Steps { goal: Option<BadPred>, top: Option<BadPred>, depth: u32, most: u64 },
     /// The goals shared by a request's bodies (share.rs): the audit's finding, a collision.
     Share(crate::share::ShareError),
 }
@@ -155,8 +178,11 @@ impl core::fmt::Display for SolveError {
         match self {
             SolveError::Limit(l) => write!(f, "blaze-solve: bound reached: {l:?} (rule 18)"),
             SolveError::Malformed(m) => write!(f, "blaze-solve: malformed input: {m:?}"),
+            SolveError::Unsupported(Unsupported::ClosureCaptureWitness(d)) => write!(f, "the structural trait of closure {d:?} needs its captured-place types and borrow modes"),
             SolveError::Unsupported(u) => write!(f, "blaze-solve: not ported: {u:?} (solve.md, \"Not ported\")"),
-            SolveError::Steps { goal, most } => write!(f, "blaze-solve: the goal {goal:?} took more than {most} solver steps (eval.rs `MAX_STEPS`, rule 18)"),
+            SolveError::Steps { goal, top, depth, most } => {
+                write!(f, "blaze-solve: the goal {goal:?} took more than {most} solver steps (eval.rs `MAX_STEPS`, rule 18); at the bound, {depth} frames deep, on {top:?}")
+            }
             SolveError::Share(e) => write!(f, "blaze-solve: shared goals (share.rs): {e:?}"),
         }
     }
@@ -170,6 +196,17 @@ impl core::error::Error for SolveError {}
 pub enum Stop {
     Need(Question),
     Error(SolveError),
+}
+
+impl Stop {
+    pub(crate) fn in_head(self, owner: ParamHead) -> Self {
+        match self {
+            Stop::Error(SolveError::Malformed(Malformed::Param { index, args, head: None, at, goal })) => {
+                Stop::Error(SolveError::Malformed(Malformed::Param { index, args, head: Some(owner), at, goal }))
+            }
+            other => other,
+        }
+    }
 }
 
 impl From<SolveError> for Stop {

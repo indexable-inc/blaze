@@ -319,6 +319,23 @@ impl Parker {
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
         let plant = parking::ParkPlant::None;
+        // The thread's meter (D169): one park and its time on `clock`, the one this wait runs on.
+        let began = clock.now();
+        let parked = self.park_on(what, deadline, clock, plant);
+        let ns = u64::try_from(clock.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        blaze_meter::add(blaze_meter::Count::Parks, 1);
+        blaze_meter::add(blaze_meter::Count::ParkNs, ns);
+        parked
+    }
+
+    /// [`Parker::park`]'s wait, on the kernel this process chose.
+    fn park_on(
+        &self,
+        what: &'static str,
+        deadline: Option<Deadline>,
+        clock: &impl Clock,
+        plant: parking::ParkPlant,
+    ) -> Result<Waited<()>, WaitError> {
         #[cfg(target_os = "linux")]
         if choice::chosen() == Waits::Direct {
             let kernel = direct::Direct(&direct::Kernel);

@@ -144,7 +144,7 @@ impl Target<'static> {
         vendor: "apple",
         debug_assertions: true,
         reliable_f16: true,
-        // The pinned rustc's `--print cfg` for the target (crates/blaze-units/src/stdlib/rustc.json,
+        // The pinned rustc's `--print cfg` for the target (pins/answers/rustc.json,
         // `nightly_cfg`) holds `target_has_reliable_f128` and not `target_has_reliable_f128_math`.
         reliable_f128: true,
         reliable_f128_math: false,
@@ -187,6 +187,12 @@ pub struct Cfg<'s, 'a> {
 
 /// The most nested a predicate this reads may be (`all(any(not(..)))`): past it, unread.
 pub const MOST_CFG_DEPTH: usize = 32;
+
+/// The weak lang items (rustc_hir weak_lang_items.rs, `weak_lang_items!`: `PanicImpl,
+/// rust_begin_unwind; EhPersonality, rust_eh_personality; EhCatchTypeinfo,
+/// rust_eh_catch_typeinfo`): one crate of a program defines each; another names it by a
+/// `#[lang]` foreign fn, a use and no declaration ([`Lower::item`]).
+const WEAK_LANG_ITEMS: [&str; 3] = ["panic_impl", "eh_personality", "eh_catch_typeinfo"];
 
 const CFG_DOMAIN: &str = "blaze-scope cfg 2";
 
@@ -459,6 +465,15 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 // read in `Lower::attrs` (task/attr_value.rs). `doc` and `deprecated` values
                 // are not read here at all: nothing in the build depends on them.
                 "lang" => (attrs.lang, attrs.lang_call) = attr_string(content),
+                // `#[link_name = concat!(prefix!(), stringify!(f))]` (ring's `prefixed_item!`):
+                // a value written as a call is kept for the names' fill, which expands it at the
+                // item's place (crate::attr_values). A quoted value is read where it is used.
+                "link_name" | "export_name" => {
+                    let attr = if name == "link_name" { "link_name" } else { "export_name" };
+                    if let (_, Some(call)) = attr_string(content) {
+                        attrs.values.push((attr, call));
+                    }
+                }
                 // `#[panic_handler]` files its fn in the lang rows under the attribute's own
                 // name (the Reference, [panic.panic_handler.unique]: "There must be a single
                 // panic_handler function in the dependency graph"): what a call of core's
@@ -722,6 +737,9 @@ pub struct Attrs<'t, 'a> {
     pub lang_call: Option<AttrCall<'t>>,
     /// `path = <macro call>`, read by [`read_call`] where the edition is known.
     pub path_call: Option<AttrCall<'t>>,
+    /// `link_name = <macro call>` and `export_name = <macro call>`, by the attribute's name:
+    /// expanded at the item's place once the crate's names are solved (crate::attr_values).
+    pub values: AVec<'a, (&'static str, AttrCall<'t>)>,
     pub builtin: bool,
     pub builtin_name: Option<&'t str>,
     /// What is inside `#[rustc_builtin_macro(Name, attributes(..))]`'s `attributes(..)`, as
@@ -835,6 +853,7 @@ impl<'a> Attrs<'_, 'a> {
             lang: None,
             lang_call: None,
             path_call: None,
+            values: AVec::new_in(alloc),
             builtin: false,
             builtin_name: None,
             builtin_helpers: "",
@@ -1351,8 +1370,9 @@ pub struct Module<'t, 'a> {
 pub enum WalkNote<'t, 'a> {
     /// Both `x.rs` and `x/mod.rs` exist: `x.rs` taken.
     BothFiles { at: Loc },
-    /// Neither `x.rs` nor `x/mod.rs` exists.
-    NeitherFile { at: Loc, name: &'t str },
+    /// Neither `x.rs` nor `x/mod.rs` exists: both places, as the walk looked for them (the
+    /// finding names them: blaze-cli names/module_missing.rs, rustc's E0583).
+    NeitherFile { at: Loc, name: &'t str, rs: AString<'a>, mod_rs: AString<'a> },
     /// A `#[path]` names a file the crate does not have.
     PathFileNotFound { at: Loc, path: AString<'a> },
     /// More than [`MOST_MODULES`] modules: the rest are not walked.
@@ -1613,9 +1633,9 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                         (b, sub.clone(), sub)
                     }
                     (false, false) => {
+                        tree.notes.push(WalkNote::NeitherFile { at: loc, name, rs: a.clone(), mod_rs: b.clone() });
                         tree.missing.push(a);
                         tree.missing.push(b);
-                        tree.notes.push(WalkNote::NeitherFile { at: loc, name });
                         continue;
                     }
                 }
@@ -1714,6 +1734,28 @@ pub struct CallSrc<'t> {
 /// written (D104; blaze-unit-graph `Implicit::entry`): bstd's `#[bstd::main]`, which the edition
 /// names `std`. Absolute, so no item of the program shadows it.
 pub const IMPLICIT_MAIN: &str = "::std::main";
+
+/// The proc-macro harness call's path (D175, [`CallRole::ProcMacroHarness`]): a word no path
+/// lookup reads (the cells answer the role, never the path), shown in notes.
+const HARNESS_PATH: &str = "proc_macro_harness";
+/// The kind tag of the harness call's key ([`key_of`]): no item kind's.
+const HARNESS_TAG: &str = "proc-macro harness";
+/// The name the harness's static is declared with (rustc's `sym::_DECLS`), never bound.
+pub const PROC_MACRO_DECLS: &str = "_DECLS";
+/// The static's text up to its list (the attributes rustc puts on it).
+const HARNESS_HEAD: &str =
+    "#[rustc_proc_macro_decls]\n#[used]\n#[allow(deprecated)]\npub static _DECLS: &[::proc_macro::bridge::client::Client] = &[";
+/// One entry's path up to its constructor.
+const HARNESS_CLIENT: &str = "::proc_macro::bridge::client::Client::";
+
+/// The key of crate `krate`'s `_DECLS` static (D175): the static's key in the harness call's
+/// expansion, the call being the root's one entry of its tag. A function of the crate's key
+/// alone (rule 71): what a code-record program names it by (blaze-ladder front2
+/// `proc_macro_decls`). Only a proc-macro crate (`Implicit::proc_macro`) has the item.
+pub fn proc_macro_decls_key(krate: CrateItemKey) -> ItemKey {
+    let call = key_of(krate, root_key(krate), HARNESS_TAG, HARNESS_PATH, 0);
+    key_of(krate, call, kind_tag(ItemKind::Static), PROC_MACRO_DECLS, 0)
+}
 
 /// The symbol of a hosted program's start (bstd's `guest::start`, run.md "The hosted world").
 const HOSTED_START: &str = "bstd_hosted_start";
@@ -1958,6 +2000,8 @@ pub struct Lowered<'t, 'a> {
     /// The tuple and unit structs: each is its own constructor's key.
     pub ctors: AVec<'a, ItemKey>,
     pub notes: AVec<'a, LowerNote<'t>>,
+    /// The `link_name`/`export_name` values written as macro calls, each at its item's place.
+    pub values: AVec<'a, crate::attr_values::ValueSite<'t>>,
 }
 
 impl Lowered<'_, '_> {
@@ -1986,6 +2030,11 @@ pub struct LowerCx<'c, 'p, W: ?Sized> {
     /// written on it or the file exports its own entry ([`exports_entry`]). False for every
     /// other module and every expansion.
     pub entry: bool,
+    /// D175: this is the root module's own fragment of a proc-macro crate
+    /// (`Implicit::proc_macro`): it ends with the crate's harness call
+    /// ([`Lower::proc_macro_harness`]), whose expansion is the `_DECLS` static. False for every
+    /// other module, every expansion and every other crate.
+    pub harness: bool,
     /// How a derived item's derives and the names after them are sent: [`AttrOrder::Written`]
     /// for every real source (resolve.rs `SourceTexts::attr_order`).
     pub order: AttrOrder,
@@ -2061,8 +2110,11 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         && fragment.depth == 0
         && matches!(fragment.at, Where::File(_))
         && !exports_entry(cx.cfg, fragment.outline, fragment.text, alloc);
+    let harness = cx.harness && fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && fragment.members_of.is_none();
     let mut low = Lower {
         entry,
+        harness,
+        harnessed: AVec::new_in(alloc),
         krate: cx.krate,
         tools: cx.tools,
         edition: cx.edition,
@@ -2103,6 +2155,7 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
             members: AVec::new_in(alloc),
             ctors: AVec::new_in(alloc),
             notes: AVec::new_in(alloc),
+            values: AVec::new_in(alloc),
         },
     };
     // The entries left to lower, each a run of siblings (`at..end`): an extern block's items
@@ -2133,6 +2186,9 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
             runs.push(children_run(outline, Some(idx)));
         }
     }
+    if low.harness {
+        low.proc_macro_harness();
+    }
     low.out
 }
 
@@ -2147,6 +2203,11 @@ fn children_run(outline: &Outline<'_>, parent: Option<ItemIndex>) -> (usize, usi
 struct Lower<'c, 't, 'a, W: ?Sized> {
     /// [`LowerCx::entry`], and the file exports no entry of its own.
     entry: bool,
+    /// [`LowerCx::harness`], and this is the root file's own fragment.
+    harness: bool,
+    /// Under `harness`: each `#[proc_macro*]` fn at the root, in declaration order, its kind
+    /// and its name as written (a raw `r#name` kept raw): the harness's list.
+    harnessed: AVec<'a, (ProcKind, &'t str)>,
     krate: CrateItemKey,
     /// [`LowerCx::tools`].
     tools: &'c [&'c str],
@@ -2329,12 +2390,75 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         self.out.macros.push((key, src));
     }
 
+    /// D175: the proc-macro crate's harness, as rustc's (compiler/rustc_builtin_macros
+    /// proc_macro_harness.rs at the pinned nightly) writes it: ONE static listing the crate's
+    /// macros in declaration order, each the pinned `proc_macro::bridge::client::Client` of its
+    /// fn (library/proc_macro/src/bridge/client.rs: `Client::expand1` for a derive and a
+    /// function-like macro, `Client::expand2` for an attribute macro, whose fn takes two
+    /// streams). The macro's name and a derive's helpers are not in it (the pinned bridge
+    /// keeps them out of `Client`); they are the crate's `ProcExport`s, in the same order.
+    ///
+    /// It is sent as a call with no macro ([`CallRole::ProcMacroHarness`]): the cells answer
+    /// it at once and resolve.rs `keep_item` lowers its input, the static's text, as its
+    /// expansion, declaring no name (rustc's `_DECLS` is def-site). So the static is an
+    /// ordinary item of an expansion: a text, a key ([`proc_macro_decls_key`]), a head and a
+    /// body checked and evaluated as any static's, named by key from a code-record program.
+    /// Its key is a function of the crate alone (rule 71); its content, this text, is a
+    /// function of the root's declarations alone, made here, before any work (rule 65).
+    fn proc_macro_harness(&mut self) {
+        let mut text = AString::new_in(self.alloc);
+        text.push_str(HARNESS_HEAD);
+        for &(kind, function) in self.harnessed.iter() {
+            text.push_str(HARNESS_CLIENT);
+            text.push_str(match kind {
+                ProcKind::Derive | ProcKind::FnLike => "expand1(crate::",
+                ProcKind::Attr => "expand2(crate::",
+            });
+            text.push_str(function);
+            text.push_str("), ");
+        }
+        text.push_str("];\n");
+        let input: &'t str = blaze_own::Box::leak(text.into_boxed_str());
+        let call = self.key(self.owner, HARNESS_TAG, HARNESS_PATH);
+        let Some(parsed) = parse_path(HARNESS_PATH, self.krate, self.alloc) else {
+            self.note(LowerNoteKind::MacroCallPathNotRead, 0, HARNESS_PATH);
+            return;
+        };
+        let pos = self.next_pos();
+        self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: None, role: CallRole::ProcMacroHarness });
+        let src = CallSrc {
+            module: self.module,
+            owner: None,
+            name: HARNESS_PATH,
+            input,
+            kind: CallShape::Attr,
+            loc: self.loc(0),
+            written: self.written,
+            depth: self.depth,
+            implicit: false,
+            // No written text holds it: its expansion keeps no column (resolve.rs `KeepAs`).
+            place: None,
+            tokens: crate::nested_input::CallTokens::Text,
+            answered: 0,
+        };
+        self.out.calls.push((call, src));
+    }
+
     /// Lowers one entry; true when its children are to be lowered next, in its place (an
     /// extern block's).
     fn item(&mut self, idx: ItemIndex, item: &Item) -> bool {
         let text = self.text;
         let attrs = self.attrs(item);
         if !attrs.cfg_ok {
+            // A function-like call's place still counts: calls have no name, so a call's key is
+            // its place among its owner's calls, and the body side numbers a block's calls from
+            // the scan alone, which cannot read a `cfg` (front2 scope_table.rs
+            // `statement_call`). Counting the removed ones keeps both numberings one; a call
+            // under a false `cfg` is otherwise not lowered.
+            if matches!(item.detail, ItemDetail::MacroCall { .. }) {
+                let name = item.name.map(|r| unraw(item.text(text, r)));
+                let _ = self.key(self.owner, kind_tag(ItemKind::MacroCall), name.unwrap_or(""));
+            }
             return false;
         }
         let at = item.range.start;
@@ -2421,6 +2545,13 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // TokenStream"), so the input has no text of its own; the expansion's items have theirs.
         let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
         self.out.texts.push(ItemText { key, module: self.module, item: idx, name, impl_header, text: whole });
+        // Each value written as a call, at the item's place: where its macros are looked up.
+        for &(attr, call) in attrs.values.iter() {
+            let tokens = self.call_tokens(call.expr, crate::nested_input::InputCut::Whole);
+            let loc = self.loc(at);
+            let place = (self.owner, self.pos);
+            self.out.values.push(crate::attr_values::ValueSite { item: key, attr, module: self.module, place, loc, written: self.written, value: call.expr, tokens });
+        }
         self.attr_checks(idx, at, &attrs.checks);
         // The derives the stages before this fragment did not send: all of them on an item no
         // name stands after; none in a keep call's fragment under the planted order.
@@ -2430,7 +2561,19 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         };
         self.derive_calls(idx, item, at, &attrs.derives[run..], whole);
         self.helper_checks(idx, item, &attrs, run);
-        if let Some(lang) = attrs.lang {
+        // A `#[lang]` on an item of an `extern` block naming a WEAK lang item is a use of the
+        // item another crate defines, not a declaration of it: rustc's lang item collector takes
+        // no foreign item, and its weak-items pass reads `#[lang = "panic_impl"] fn panic_impl(..);`
+        // in an extern block as "this crate needs `panic_impl`" (rustc_passes weak_lang_items.rs,
+        // `visit_foreign_item`; a non-weak name there is E0264, "unknown external lang item").
+        // The definition is the `#[panic_handler]` fn (std's). core declares the use twice, in
+        // `panic_fmt`'s and `panic_nounwind_fmt`'s bodies: filed as rows, two keys for one name
+        // stopped every check that links core (front2 index.rs `LangTwice`) once those bodies'
+        // blocks were written as modules.
+        let foreign = item.parent.is_some_and(|p| matches!(self.outline.item(p).detail, ItemDetail::ExternBlock { .. }));
+        if let Some(lang) = attrs.lang
+            && !(foreign && WEAK_LANG_ITEMS.contains(&lang))
+        {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
@@ -2444,6 +2587,16 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                     let from_text = matches!(item.detail, ItemDetail::Fn { .. }) && matches!(self.procs, ProcDecls::Text);
                     if let Some(proc) = attrs.proc_macro.filter(|_| from_text) {
                         self.proc_macro(ProcExport { kind: proc.kind, name: proc.derive.unwrap_or(name), helpers: proc.helpers });
+                    }
+                    // The harness's list (D175): read from the text in both `ProcDecls` modes,
+                    // as rustc's collector reads the root's `#[proc_macro*]` fns in order.
+                    if self.harness
+                        && item.parent.is_none()
+                        && matches!(item.detail, ItemDetail::Fn { .. })
+                        && let Some(proc) = attrs.proc_macro
+                        && let Some(written) = item.name.map(|r| item.text(text, r))
+                    {
+                        self.harnessed.push((proc.kind, written));
                     }
                     self.declare(name, Namespace::Values, key, DefKind::Other, vis);
                 }
@@ -2470,7 +2623,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 self.declare(name, Namespace::Types, key, DefKind::Enum, vis);
                 let mut variants = AVec::new_in(self.alloc);
                 let outline = self.outline;
-                for (vidx, v) in outline.children(Some(idx)) {
+                for (_, v) in outline.children(Some(idx)) {
                     if !matches!(v.detail, ItemDetail::Variant { .. }) {
                         continue;
                     }

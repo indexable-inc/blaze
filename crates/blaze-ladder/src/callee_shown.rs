@@ -31,6 +31,10 @@ pub enum CalleeGap {
     NotOwnInstance,
     /// A method word of a vtable resolved to an item with no tabled body.
     VtableWord,
+    /// The instance's name passed its cap (symbols.rs `NAME_MOST_NODES`, rustc's default
+    /// `type_length_limit` counted in distinct types; `NAME_MOST_BYTES`): `nodes` distinct
+    /// types and `bytes` bytes reached when it stopped (rule 18).
+    NameTooLarge { nodes: u32, bytes: usize },
 }
 
 impl fmt::Display for CalleeGap {
@@ -40,6 +44,14 @@ impl fmt::Display for CalleeGap {
             CalleeGap::NoBody => "which is tabled with no body and is no outside symbol",
             CalleeGap::NotOwnInstance => "slotted under a fn whose key is another item, and none of a closure's, a shim's or a coroutine's function",
             CalleeGap::VtableWord => "a vtable's method word with no tabled body",
+            CalleeGap::NameTooLarge { nodes, bytes } => {
+                return write!(
+                    f,
+                    "whose instance name reached {nodes} distinct types and {bytes} bytes, past its cap of {} types (rustc's default `type_length_limit`) or {} bytes (symbols.rs, rule 18)",
+                    crate::symbols::NAME_MOST_NODES,
+                    crate::symbols::NAME_MOST_BYTES
+                );
+            }
         })
     }
 }

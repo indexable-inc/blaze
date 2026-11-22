@@ -27,6 +27,22 @@ use crate::error::ResolveError;
 pub trait Par {
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>);
 
+    /// Independent files discovered by the same module walk, in discovery order. A driver
+    /// can distribute these texts without lending the crate's allocator to another worker.
+    fn outline_files<'a>(
+        &self,
+        _krate: &'a str,
+        files: &[(&'a str, &'a str)],
+        edition: blaze_surface::Edition,
+        alloc: Alloc<'a>,
+        out: &mut AVec<'a, blaze_file_items::Outline<'a>>,
+    ) -> Result<(), crate::resolve::NamesError<'a>> {
+        for &(_, text) in files {
+            out.push(blaze_file_items::outline(text, edition, alloc));
+        }
+        Ok(())
+    }
+
     /// The calling thread's solve passes into the stretch `stage` (rule 16: every stretch of
     /// a solve has a name the caller's clock can time). The stretch lasts until the thread's
     /// next mark. The library holds no clock: nothing by default.
@@ -59,6 +75,14 @@ pub trait Par {
     /// The check's report for crate `krate`. Nothing by default.
     fn decided(&self, krate: &str, check: &crate::DecideCheck<'_, &str>) {
         let _ = (krate, check);
+    }
+
+    /// The on-demand decision of D116's check, planted wrong for a driver's control of its
+    /// oracle (rule 23; blaze-cli names_oracle_tests.rs). Read only while [`Par::decide_check`]
+    /// asks for the check, and it plants the decision alone: the whole solve, whose answers
+    /// every later stage reads, is the same. [`DecidePlant::None`] by default.
+    fn decide_plant(&self) -> DecidePlant {
+        DecidePlant::None
     }
 
     /// E4: each crate's names written per group too ([`crate::CrateNames::groups`],
@@ -102,6 +126,26 @@ pub trait Par {
         let _ = work;
         Scratch::Kept
     }
+
+    /// D189's strategy seam (rule 78): whether a body's blocks are modules of the crate
+    /// ([`crate::surface::BlockScopes::Modules`], the default) or each body's own, solved by
+    /// [`crate::body_scope`] after the crate's names are finished
+    /// ([`crate::surface::BlockScopes::Bodies`]: the crate solve holds the bodies,
+    /// `CrateNames::bodies`).
+    fn block_scopes(&self) -> crate::surface::BlockScopes {
+        crate::surface::BlockScopes::Modules
+    }
+}
+
+/// A planted bug of D116's on-demand decision ([`Par::decide_plant`]): a control, never the
+/// command's choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecidePlant {
+    None,
+    /// The walk keeps a node's value at once though it read a node still open on its stack
+    /// (cells `CellPlant::DecideCachesOpenCycle`): a glob cycle keeps the bottom it saw, so a
+    /// name reached through the cycle is not found on demand.
+    CachesOpenCycle,
 }
 
 /// Where a macro call's working memory was held ([`Par::call_scratch`]).
@@ -112,6 +156,34 @@ pub enum Scratch {
     Kept,
     /// In a scratch the Par reset once the call's results were copied out.
     Reset,
+}
+
+/// A driver's scratch, as one piece of work takes it: [`Par::call_scratch`] by another name,
+/// for work that has no `Par` at hand (one held body's solve, `crate::body_scope`).
+pub type ScratchHook<'r> = &'r dyn Fn(&mut dyn FnMut(Alloc<'_>)) -> Scratch;
+
+impl Scratch {
+    /// The hook of no driver: every piece of work runs in the caller's allocator.
+    pub fn kept(work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let _ = work;
+        Scratch::Kept
+    }
+
+    /// `work`'s answer, its working memory in `hook`'s scratch (reset once it returns), or in
+    /// `home` when the hook kept none ([`Scratch::Kept`]). What `work` returns holds nothing of
+    /// the scratch: its type names no lifetime of it. A hook that says [`Scratch::Reset`]
+    /// without running `work` broke its contract: a bug that fails this job (rule 20).
+    pub fn run<T>(hook: ScratchHook<'_>, home: Alloc<'_>, mut work: impl FnMut(Alloc<'_>) -> T) -> T {
+        let mut out = None;
+        let mut step = |scratch: Alloc<'_>| out = Some(work(scratch));
+        if hook(&mut step) == Scratch::Kept {
+            step(home);
+        }
+        match out {
+            Some(answer) => answer,
+            None => panic!("a scratch hook said Reset without running its work (blaze-scope task/fill.rs `Scratch::run`)"),
+        }
+    }
 }
 
 /// The stretches of one crate's solve finer than a [`Stage`] ([`Par::names_part`]), in the

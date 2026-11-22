@@ -15,8 +15,11 @@
 //!
 //! The [`Tally`] is fed in the search (search.rs, `Search::ran_case`, each passing case of the
 //! run) and its lines are printed by the driver (check.rs `say_observed`) once the search is over.
-//! Nothing here fails a test or changes a `Verdict`: [`ObserveMode::Observe`] is the only mode
-//! built; [`ObserveMode::Enforce`] is refused by name until the harvest (S8) has read the lines.
+//! Nothing here changes a `Verdict`. Under [`ObserveMode::Observe`] (the default) the block is
+//! printed and fails nothing. Under [`ObserveMode::Enforce`] (D165; what a simulation's entry
+//! point, `simulate`, and a control's clean run under it use) the driver fails a run that passed
+//! with a "never varied" finding, naming each label ([`Tally::never_varied_into`]): a drawn limit
+//! or choice that took one value in every case tested none of its others.
 //!
 //! Deterministic: the tally is a function of the passing cases in their order, and the lines are
 //! written in label order, so one config and seed give the same block on any machine.
@@ -26,7 +29,6 @@
 #![blaze::sans_io]
 
 use core::alloc::Allocator;
-use core::fmt::Debug;
 
 use blaze_own::{String, format_into};
 
@@ -55,18 +57,20 @@ pub const MOST_EDGE_KINDS: u32 = u64::BITS;
 pub enum ObserveMode {
     /// Print the block after the test's own output; fail nothing. The default.
     Observe,
-    /// Fail a test on its block's findings. Not built yet: a search asked for it panics naming
-    /// it (never silently observes) until the harvest has read the observed lines.
+    /// Print the block, and fail a run that passed with a "never varied" finding, naming each
+    /// label. The driver judges it (`check`, `simulate`, `controls`); `search`, which returns a
+    /// verdict and judges nothing, refuses it by name rather than ignore it.
     Enforce,
 }
 
 impl ObserveMode {
-    /// Refuses a mode that is not built: `Enforce` panics, naming itself.
-    pub(crate) fn in_force(self) {
+    /// Refuses `Enforce` in a search that gives back only a verdict (check.rs `search`), where no
+    /// driver would judge it: panics, naming the entry points that do.
+    pub(crate) fn refused_without_driver(self) {
         match self {
             ObserveMode::Observe => {}
             ObserveMode::Enforce => panic!(
-                "blaze-sim: `ObserveMode::Enforce` is not built yet (test.md, piece S4: observe mode until the harvest has read the observed lines); use `ObserveMode::Observe`"
+                "blaze-sim: `ObserveMode::Enforce` is judged by the driver (`check`, `simulate`, `controls`), and `search` returns a verdict only: run it through one of those, or observe"
             ),
         }
     }
@@ -142,6 +146,27 @@ impl Entry {
         edges_possible: 0,
         edges_seen: 0,
     };
+
+    /// It could give more than one value, was drawn in at least [`LEAST_CASES`] passing cases,
+    /// and gave one value in all of them.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn never_varied(&self) -> bool {
+        self.most > 0 && self.cases >= LEAST_CASES && self.least == self.greatest
+    }
+
+    /// Its "never varied" line, appended to `out`.
+    fn never_varied_into<A: Allocator>(&self, out: &mut String<A>) {
+        format_into!(
+            out,
+            "  `{}` never varied ({} cases, always {})\n",
+            self.label,
+            self.cases,
+            self.least
+        );
+    }
 }
 
 /// The per-search tally: for each label of a draw (at most [`LABELS`]), how many passing cases
@@ -259,23 +284,37 @@ impl Tally {
         Some(at)
     }
 
+    /// The indices of the tally's entries in label order.
+    fn label_order(&self) -> ([usize; LABELS], usize) {
+        let mut order: [usize; LABELS] = core::array::from_fn(|at| at);
+        order[..self.len].sort_unstable_by(|a, b| self.entries[*a].label.cmp(self.entries[*b].label));
+        (order, self.len)
+    }
+
+    /// The "never varied" lines alone, in label order, appended to `out` as `lines_into` writes
+    /// them; gives how many there were. What `ObserveMode::Enforce` fails a run on.
+    pub fn never_varied_into<A: Allocator>(&self, out: &mut String<A>) -> u32 {
+        let (order, len) = self.label_order();
+        let mut said = 0;
+        for at in &order[..len] {
+            let entry = &self.entries[*at];
+            if entry.never_varied() {
+                entry.never_varied_into(out);
+                said += 1;
+            }
+        }
+        said
+    }
+
     /// The tally's lines, each indented by two spaces and ended by a newline, appended to `out`
     /// in label order: "never varied", then (under `edge-first`) each edge kind never produced,
     /// then the draws past the cap. Nothing when there is nothing to say.
     pub fn lines_into<A: Allocator>(&self, out: &mut String<A>) {
-        let mut order: [usize; LABELS] = core::array::from_fn(|at| at);
-        let order = &mut order[..self.len];
-        order.sort_unstable_by(|a, b| self.entries[*a].label.cmp(self.entries[*b].label));
-        for at in order.iter() {
+        let (order, len) = self.label_order();
+        for at in &order[..len] {
             let entry = &self.entries[*at];
-            if entry.most > 0 && entry.cases >= LEAST_CASES && entry.least == entry.greatest {
-                format_into!(
-                    out,
-                    "  `{}` never varied ({} cases, always {})\n",
-                    entry.label,
-                    entry.cases,
-                    entry.least
-                );
+            if entry.never_varied() {
+                entry.never_varied_into(out);
             }
             if cfg!(feature = "edge-first") && entry.draws >= LEAST_EDGE_DRAWS {
                 let missing = entry.edges_possible & !entry.edges_seen;
@@ -331,17 +370,14 @@ impl Caught {
 }
 
 /// A plant's lines, appended to `out`: where it was caught, and when weak, that it was. The
-/// plant is named by its `Debug` form, as `control`'s messages name it.
-#[expect(
-    blaze::error_debug,
-    reason = "a plant is a value of the caller's own type, which `control` asks only to be `Debug`: its `Debug` form is the name the lines give it"
-)]
-pub fn plant_lines_into<A: Allocator>(plant: &dyn Debug, caught: Caught, out: &mut String<A>) {
-    format_into!(out, "  plant {plant:?}: caught at case {} of {}\n", caught.case, caught.cases);
+/// plant is named by `plant`, the name the control's messages give it (`Plant::name`, or a
+/// legacy plant's `Debug` form).
+pub fn plant_lines_into<A: Allocator>(plant: &str, caught: Caught, out: &mut String<A>) {
+    format_into!(out, "  plant {plant}: caught at case {} of {}\n", caught.case, caught.cases);
     if caught.weak() {
         format_into!(
             out,
-            "  weak: plant {plant:?} needed {} of {} cases\n",
+            "  weak: plant {plant} needed {} of {} cases\n",
             caught.case,
             caught.cases
         );

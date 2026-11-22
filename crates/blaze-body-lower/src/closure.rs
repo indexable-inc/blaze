@@ -38,16 +38,19 @@ pub fn lower_closure<A: Allocator + Clone, F: BodyFacts>(
 }
 
 impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
-    /// The captures of closure `c`, in the record's order: each captured binding and how.
-    fn captures_of(&self, c: ExprId) -> Vec<(PatId, CaptureKind), A> {
+    /// The captures of closure `c`, in its environment's field order (blaze-typeck
+    /// env_fields.rs, the active strategy): each captured binding and how. A field holding a
+    /// place below its binding is refused by name (`Construct::CapturedPlace`): its field is the
+    /// place's value, which this lowering does not build yet.
+    fn captures_of(&self, c: ExprId) -> Result<Vec<(PatId, CaptureKind), A>, LowerError> {
         let mut out = Vec::new_in(self.alloc.clone());
-        let cols = self.ck.captures.column::<0>();
-        for (i, x) in cols.iter().enumerate() {
-            if *x == c {
-                out.push((self.ck.captures.column::<1>()[i], self.ck.captures.column::<2>()[i]));
+        for f in self.ck.env_fields(c) {
+            if !f.is_whole() {
+                return self.refuse(Construct::CapturedPlace, c);
             }
+            out.push((f.base, f.how));
         }
-        out
+        Ok(out)
     }
 
     /// The type of capture of `x` (its variable's type `t`) as a field of the closure.
@@ -65,7 +68,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         let span = self.span(e);
         let at = At::Expr(e);
         let ty = self.expr_ty(e)?;
-        let caps = self.captures_of(e);
+        let caps = self.captures_of(e)?;
         let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
         for &(p, kind) in caps.iter() {
             let place = self.bound(p, e)?;
@@ -127,7 +130,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
             ClosureKind::FnOnce => env_place,
             _ => self.b.project(env_place, Proj::Deref),
         };
-        let caps = self.captures_of(closure);
+        let caps = self.captures_of(closure)?;
         for (index, &(p, ck)) in caps.iter().enumerate() {
             let vt = self.local_ty(p)?;
             let fty = self.capture_ty(ck, vt, at)?;

@@ -23,7 +23,7 @@ use blaze_typeck::{Expr, ExprId, StmtId};
 
 use crate::{Facts, Form, Lower, Refusal};
 
-impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
+impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// `mark_extended` met block `e` as an extending expression of the `let` being lowered:
     /// the drop scope its `super let` bindings join is the one opened after the `let`'s block
     /// (`scope_marks[d]` with `d` the count open now, while that block is the innermost).
@@ -105,6 +105,13 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
                     self.temps.insert(m + j, l);
                 }
                 self.temp_marks[k - 1] += n as u32;
+                // A variable scope opened inside temporary scope `k - 2` (the block's, so after
+                // its temporaries so far) has these `n` around it too (`Lower::scope_temps`).
+                for x in self.scope_temps.iter_mut() {
+                    if x.1 as usize > k - 2 {
+                        x.0 += n as u32;
+                    }
+                }
             }
         }
         Ok(())

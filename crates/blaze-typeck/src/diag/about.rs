@@ -9,7 +9,7 @@
 //! written. The fields stay readable (front2 prints them) and a rule may add a `because` to the
 //! finding it just made (`d.because = Some(..)`), never take content away.
 
-use super::{At, Because, Diag, DiagCode, PendingDiag, PendingGoal, Said, UnsafeOp};
+use super::{At, Because, Diag, DiagCode, PendingDiag, PendingGoal, PendingUndecided, PendingWhy, Said, UndecidedVar, UnsafeOp, Why};
 use crate::ids::{Name, Range};
 use crate::portable::PTy;
 use crate::ty::Ty;
@@ -95,28 +95,41 @@ impl PendingDiag {
             About::Rule { rule, says } => (None, None, None, Some(Because::Reference { rule, says })),
             About::Unsafe(op) => (None, None, None, Some(Because::Unsafe(op))),
         };
-        PendingDiag { code, at, expected, found, name, because, unmet: None, said: Said(()) }
+        PendingDiag { code, at, expected, found, name, because, unmet: None, why: None, undecided: None, said: Said(()) }
+    }
+
+    /// This finding with the undecided variable it is about (an E0282: where the variable was
+    /// made, the goals pending on it).
+    pub(crate) const fn with_undecided(self, undecided: Option<PendingUndecided>) -> PendingDiag {
+        PendingDiag { undecided, ..self }
     }
 
     /// A finding whose reason is `because` (a `where const` condition, a lang item the world
     /// lacks, a rule of dyn compatibility), with the bound's self type and the member named
     /// where there are such.
     pub(crate) const fn because(code: DiagCode, at: At, because: Because, found: Option<Ty>, name: Option<Name>) -> PendingDiag {
-        PendingDiag { code, at, expected: None, found, name, because: Some(because), unmet: None, said: Said(()) }
+        PendingDiag { code, at, expected: None, found, name, because: Some(because), unmet: None, why: None, undecided: None, said: Said(()) }
     }
 
     /// A finding about the goal that failed or stayed undecided, entire, and the leaf
     /// where-clause under it where the checker names one; `found` is the goal's self type.
     /// Exported as [`Because::Unmet`].
     pub(crate) const fn unmet(code: DiagCode, at: At, found: Option<Ty>, goal: PendingGoal, leaf: Option<PendingGoal>) -> PendingDiag {
-        PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, leaf)), said: Said(()) }
+        PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, leaf)), why: None, undecided: None, said: Said(()) }
+    }
+
+    /// [`PendingDiag::unmet`] with the solver's chain of why the goal has no solution.
+    pub(crate) const fn unmet_why(code: DiagCode, at: At, found: Option<Ty>, goal: PendingGoal, leaf: Option<PendingGoal>, why: PendingWhy) -> PendingDiag {
+        PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, leaf)), why: Some(why), undecided: None, said: Said(()) }
     }
 
     /// The record's finding for this one, at writeback: `at` its range, `expected` and `found`
-    /// its types exported, `because` its reason (the unmet goal exported, else its own). The
-    /// content is this finding's, so the record's is never emptier than the walk's.
-    pub(crate) const fn export(self, at: Range, expected: Option<PTy>, found: Option<PTy>, because: Option<Because>) -> Diag {
-        Diag { code: self.code, at, expected, found, name: self.name, because, node: super::node::Node::of(self.at), said: Said(()) }
+    /// its types exported, `because` its reason (the unmet goal exported, else its own), `why`
+    /// its chain with the steps' rows in the record's `why` column. The content is this
+    /// finding's, so the record's is never emptier than the walk's. `undecided` is the
+    /// variable's, its goals exported ([`PendingDiag::undecided`]).
+    pub(crate) const fn export(self, at: Range, expected: Option<PTy>, found: Option<PTy>, because: Option<Because>, why: Option<Why>, undecided: Option<UndecidedVar>) -> Diag {
+        Diag { code: self.code, at, expected, found, name: self.name, because, node: super::node::Node::of(self.at), why, undecided, said: Said(()) }
     }
 }
 
@@ -132,6 +145,8 @@ impl Diag {
             name: member,
             because: Some(because),
             node: None,
+            why: None,
+            undecided: None,
             said: Said(()),
         }
     }

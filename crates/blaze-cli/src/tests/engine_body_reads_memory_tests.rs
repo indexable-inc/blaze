@@ -153,6 +153,48 @@ fn mem_line(profile: &str) -> MemLine {
     }
 }
 
+/// Each reported giant must be a distinct body from the wide member, with the same peak
+/// recorded count as the aggregate and a row whose per-kind counts account for all its ids.
+fn check_largest_bodies(report: &str) {
+    let line = report.lines().find(|line| line.starts_with("bodies memory: ")).expect("body memory line");
+    let (aggregate, ranked) = line.split_once(" · #1 ").expect("the largest body");
+    let (_, recorded) = aggregate.split_once("read cells a body: recorded ").expect("recorded reads");
+    let (_, maximum) = recorded.split_once('/').expect("mean and most");
+    let most: u64 = maximum.split(',').next().unwrap().parse().expect("maximum recorded reads");
+    let mut previous = most;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut entries = ranked.split(" · #");
+    for rank in 1..=3 {
+        let entry = entries.next().expect("three bodies named");
+        let body = if rank == 1 { entry } else { entry.strip_prefix(&format!("{rank} ")).expect("rank in order") };
+        let (label, counts) = body.strip_prefix("`src/lib.rs` item `").expect("member's file").split_once("`: ").expect("its item");
+        let index: usize = label.strip_prefix('b').expect("a caller of the methods").parse().expect("body index");
+        assert!(index < BODIES && seen.insert(index), "unexpected or duplicate giant: {body}");
+        let (n, counts) = counts.split_once(" reads recorded, ").expect("recorded count");
+        let recorded: u64 = n.parse().expect("reads");
+        assert!(recorded > 0 && recorded <= previous, "{body}");
+        if rank == 1 {
+            assert_eq!(recorded, most, "top body has the actual maximum read count");
+        }
+        previous = recorded;
+        let (n, counts) = counts.split_once(" distinct ids, ").expect("distinct count");
+        let distinct: u64 = n.parse().expect("ids");
+        let (n, rest) = counts.split_once(" scratch bytes").expect("scratch use");
+        assert!(distinct > 0 && n.parse::<u64>().expect("scratch") > 0, "{body}");
+        if rank == 1 {
+            let (keys, row) = rest.split_once("; row whole records ").expect("top body's recorded and row splits");
+            for kind in ["recorded names ", "heads ", "impl buckets "] {
+                assert!(keys.contains(kind), "{keys}");
+            }
+            let row = row.trim_end_matches(')');
+            let counts: std::vec::Vec<u64> = row.split(", ").map(|s| s.split_whitespace().last().expect("kind count").parse().expect("count")).collect();
+            assert_eq!(counts.len(), 5, "whole, names, heads, buckets, other");
+            assert_eq!(counts.iter().sum::<u64>(), distinct, "{body}");
+        }
+    }
+    assert!(entries.next().is_none(), "the report retains three bodies");
+}
+
 /// A BODY LEAVES ITS ROW ALONE, AT ITS LENGTH: on [`BODIES`] bodies each calling [`PER`] of a
 /// dependency's methods, the row a body keeps in the request's arena is at most [`ROW_MOST`]
 /// bytes and within 10% of its floor (its lists at their lengths), and the widening narrowed it.
@@ -165,7 +207,9 @@ fn a_body_leaves_its_row_alone_at_its_length() {
     member(&io, "u8");
     let first = answer(&io, true);
     assert_eq!(first.errors(), 0, "the fixture checks clean:\n{}", first.lines());
-    let m = mem_line(&profile(&io));
+    let report = profile(&io);
+    check_largest_bodies(&report);
+    let m = mem_line(&report);
     println!(
         "BODY ROWS: {} bytes a body (most {}; floor {}, {:.2}x) over {} bodies; cells recorded {}, before widening {}, after {} (whole records {}, bucket cells {}; scope crates {}); recorder {} bytes in the scratch, freed as the body ends",
         m.row,
@@ -264,6 +308,14 @@ const MISMATCH: &str = "error[types]: found `u16`, expected `u8`";
 /// Install a real tar.gz in the simulated Cargo cache and put its SHA-256 in the lockfile.
 /// Replacing the archive keeps the package name, version, and caller's text identical.
 fn registry(io: &Io, source: &str) -> blaze_drive::Name {
+    let (name, archive) = locked(io, source);
+    cache_archive(io, archive.as_slice());
+    name
+}
+
+/// `dep`'s archive of `source` and its lock entry written (its SHA-256 the pin), the archive NOT
+/// in cargo's cache: the `Fetch` name and the archive's bytes.
+fn locked(io: &Io, source: &str) -> (blaze_drive::Name, blaze_own::Vec<u8, blaze_own::Alloc<'static>>) {
     use blaze_tar::{Make, Writer};
     let alloc = blaze_own::testing::heap().alloc();
     let mut tar = blaze_own::Vec::new_in(alloc);
@@ -276,12 +328,17 @@ fn registry(io: &Io, source: &str) -> blaze_drive::Name {
     let sha256 = blaze_sha256::digest(&archive);
     let checksum = crate::fetch::key_hex(&blaze_ids::ContentId(sha256));
     let checksum = core::str::from_utf8(&checksum).expect("hex digits");
-    let cx = io.cx(BUDGET, TASK_FRAME).expect("simulated filesystem");
-    let path = Path::new("c/registry/cache/index.crates.io-1949cf8c6b5b557f/dep-1.0.0.crate").expect("cache path");
-    io.need_fs().expect("files").root().publish(&cx, &path, Content::bytes(&archive), Durable::No).expect("publish archive");
     write(io, "Cargo.lock", &format!("version = 4\n\n[[package]]\nname = \"wide\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n]\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"));
     let source_id = blaze_fetch::SourceId::Crate { name: "dep", version: "1.0.0", sha256 };
-    blaze_drive::Name::new(blaze_drive::Kind::Fetch, source_id.key())
+    (blaze_drive::Name::new(blaze_drive::Kind::Fetch, source_id.key()), archive)
+}
+
+/// `archive` put where cargo keeps it (`<cargo home>/registry/cache/<crates.io folder>/`), the
+/// cargo home `/c` ([`dependency_answer`]).
+fn cache_archive(io: &Io, archive: &[u8]) {
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("simulated filesystem");
+    let path = Path::new("c/registry/cache/index.crates.io-1949cf8c6b5b557f/dep-1.0.0.crate").expect("cache path");
+    io.need_fs().expect("files").root().publish(&cx, &path, Content::bytes(archive), Durable::No).expect("publish archive");
 }
 
 fn with_dependency_rows<R>(io: &Io, inspect: impl FnOnce(&blaze_engine::pages::Kept<'_>) -> R) -> R {
@@ -292,23 +349,31 @@ fn with_dependency_rows<R>(io: &Io, inspect: impl FnOnce(&blaze_engine::pages::K
     crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, inspect).expect("open answer").expect("persisted answer")
 }
 
-/// Check the fetch, the graph it fed, and the proof the caller actually persisted.
-/// Return the digest so the edit must also change the value of that same cell.
-fn check_archive_row(io: &Io, fetch: blaze_drive::Name, graph: blaze_engine::CellId) -> blaze_ids::ContentId {
+/// Check the fetch, the graph it fed, and the proof the caller actually persisted: every cell of
+/// the graph the caller read (its whole record's, or since D187 the cell of each settled crate
+/// it reads, engine_units.rs `crate_cell`) is one the graph's row defines at the digest read.
+/// Return those reads, so the edit must move one of them.
+fn check_archive_row(io: &Io, fetch: blaze_drive::Name) -> std::vec::Vec<(blaze_engine::CellId, blaze_ids::ContentId)> {
     use blaze_drive::Kind;
     use crate::engine_tasks::{CELLS, WHOLE};
+    let graph = blaze_drive::Name::unit_graph();
     with_dependency_rows(io, |kept| {
         let rows = &kept.answer.rows;
         let fetched = rows.get(&fetch).expect("a Fetch row for the locked checksum");
         assert_eq!(fetched.out, fetch.subject, "Fetch must hold the pinned archive");
-        let published = rows.get(&graph.of).expect("the request's UnitGraph row");
+        let published = rows.get(&graph).expect("the request's UnitGraph row");
         assert!(!published.failed, "UnitGraph failed after Fetch held {fetch:?}");
-        assert!(published.defines.contains(&(graph.cell, published.out)), "UnitGraph must publish its whole record");
+        assert!(published.defines.contains(&(WHOLE, published.out)), "UnitGraph must publish its whole record");
         let mut bodies = 0;
+        let mut graph_reads = std::vec::Vec::new();
         for (_, row) in rows.iter().filter(|(name, _)| name.kind == Kind::BodyCheck) {
             bodies += 1;
             assert_eq!(row.file, blaze_drive::Name::file(b"src/lib.rs"));
-            assert_eq!(row.read_of(&graph).0, Some(published.out), "caller reads {:?}", row.reads);
+            graph_reads.extend(row.reads.iter().copied().filter(|(id, _)| id.of == graph));
+            assert!(!graph_reads.is_empty(), "the caller reads the graph: {:?}", row.reads);
+            for (id, saw) in &graph_reads {
+                assert!(published.defines.contains(&(id.cell, *saw)), "the caller read {id:?} at a digest the graph does not define: {:?}", published.defines);
+            }
             assert!(row.reads.windows(2).all(|w| w[0].0 < w[1].0));
             for (id, _) in &row.reads {
                 match id.of.kind {
@@ -318,9 +383,15 @@ fn check_archive_row(io: &Io, fetch: blaze_drive::Name, graph: blaze_engine::Cel
                 }
             }
         }
-        assert_eq!(bodies, 1, "one workspace caller");
-        published.out
+        assert_eq!(bodies, 2, "one workspace caller, in its 2 units' rows (D191: the library's and its test build's)");
+        graph_reads
     })
+}
+
+/// The read of `before` (the caller's graph reads before an edit) the edit moved: one not read
+/// again at the same digest after it.
+fn moved_graph_read(before: &[(blaze_engine::CellId, blaze_ids::ContentId)], after: &[(blaze_engine::CellId, blaze_ids::ContentId)]) -> blaze_engine::CellId {
+    before.iter().find(|read| !after.contains(read)).map(|(id, _)| *id).expect("the edit must move a graph cell the caller read")
 }
 
 fn assert_body_read_moved(answer: &Answer, id: blaze_engine::CellId) {
@@ -338,21 +409,143 @@ fn a_changed_archive_checksum_enters_the_body_through_the_graph() {
     let io = Io::simulated(SimWorld::new(61, Limits::USUAL));
     write(&io, "Cargo.toml", &format!("{MANIFEST}\n[dependencies]\ndep = \"1\"\n"));
     write(&io, "src/lib.rs", CALLER);
-    let graph = blaze_engine::CellId { of: blaze_drive::Name::unit_graph(), cell: crate::engine_tasks::WHOLE };
     let original = registry(&io, BYTE);
     let cold = dependency_answer(&io, false);
     assert_eq!(cold.errors(), 0, "{}", cold.lines());
-    let before = check_archive_row(&io, original, graph);
+    let before = check_archive_row(&io, original);
     let replacement = registry(&io, WIDE);
     assert_ne!(original, replacement, "the edit changes the archive checksum");
     let edited = dependency_answer(&io, false);
-    assert_ne!(before, check_archive_row(&io, replacement, graph), "the checksum edit must move the persisted graph cell");
-    assert_body_read_moved(&edited, graph);
+    let after = check_archive_row(&io, replacement);
+    assert_body_read_moved(&edited, moved_graph_read(&before, &after));
     let fresh = dependency_answer(&io, true);
     assert_eq!((&edited.ids, edited.lines(), edited.checked.status.0), (&fresh.ids, fresh.lines(), fresh.checked.status.0));
     assert_eq!(edited.errors(), 1, "{}", edited.lines());
     assert!(edited.lines().contains(MISMATCH), "{}", edited.lines());
     println!("ARCHIVE: checksum changed, graph entered caller, 1 {MISMATCH}");
+}
+
+/// `name` 1.0.0's `.crate` archive with `source` as its lib.rs, and its SHA-256.
+fn crate_archive(name: &str, source: &str) -> ([u8; 32], blaze_own::Vec<u8, blaze_own::Alloc<'static>>) {
+    use blaze_tar::{Make, Writer};
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut tar = blaze_own::Vec::new_in(alloc);
+    let mut writer = Writer::new();
+    let manifest = format!("[package]\nname = \"{name}\"\nversion = \"1.0.0\"\nedition = \"2024\"\n");
+    writer.entry(&format!("{name}-1.0.0/Cargo.toml"), Make::File { exec: false }, manifest.as_bytes(), &mut tar).expect("manifest");
+    writer.entry(&format!("{name}-1.0.0/src/lib.rs"), Make::File { exec: false }, source.as_bytes(), &mut tar).expect("library");
+    writer.finish(&mut tar).expect("tar trailer");
+    let mut archive = blaze_own::Vec::new_in(alloc);
+    blaze_deflate::gzip(&tar, blaze_deflate::Level::Fast, alloc, &mut archive).expect("a .crate archive");
+    (blaze_sha256::digest(&archive), archive)
+}
+
+/// Two registry dependencies, `dep` of `dep_source` and `pin` of [`BYTE`], both in cargo's cache
+/// and both pinned by the lock.
+fn two_registry(io: &Io, dep_source: &str) {
+    let (dep_sum, dep) = crate_archive("dep", dep_source);
+    let (pin_sum, pin) = crate_archive("pin", BYTE);
+    let hex = |sum: [u8; 32]| std::string::String::from(core::str::from_utf8(&crate::fetch::key_hex(&blaze_ids::ContentId(sum))).expect("hex digits"));
+    let entry = |name: &str, sum: [u8; 32]| format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n", hex(sum));
+    write(io, "Cargo.lock", &format!("version = 4\n\n[[package]]\nname = \"wide\"\nversion = \"0.1.0\"\ndependencies = [\n \"dep\",\n \"pin\",\n]\n\n{}\n{}", entry("dep", dep_sum), entry("pin", pin_sum)));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("simulated filesystem");
+    let fs = io.need_fs().expect("files");
+    for (name, archive) in [("dep", &dep), ("pin", &pin)] {
+        let path = format!("c/registry/cache/index.crates.io-1949cf8c6b5b557f/{name}-1.0.0.crate");
+        fs.root().publish(&cx, &Path::new(&path).expect("cache path"), Content::bytes(archive.as_slice()), Durable::No).expect("publish archive");
+    }
+}
+
+/// The bodies the request entered, by the Bodies groups of its "entered because" lines.
+fn bodies_entered(answer: &Answer) -> u32 {
+    answer.checked.because.iter().filter(|(group, _)| group.stage == blaze_engine::Stage::Bodies).map(|(_, count)| *count).sum()
+}
+
+/// A DEPENDENCY BUMPED ENTERS ONLY THE BODIES THAT READ IT (D187: the graph's crate cells,
+/// engine_units.rs `crate_cell`). Two registry dependencies, `dep` and `pin`, and two bodies,
+/// `caller` reading `dep` and `pinned` reading `pin`. `dep`'s archive is replaced (its checksum,
+/// so its crate key, moves); `pin` and both callers' text stand. Only `caller` enters, on a
+/// graph crate cell, and its answer equals a fresh check's. CONTROL (the cause removed, rule 23):
+/// with the graph's whole cell read for every settled crate (`PLANT_WHOLE_GRAPH`, the grain
+/// before D187), the same bump enters both bodies.
+#[test]
+fn a_dependency_bumped_enters_only_the_bodies_that_read_it() {
+    for plant in [false, true] {
+        let io = Io::simulated(SimWorld::new(73, Limits::USUAL));
+        write(&io, "Cargo.toml", &format!("{MANIFEST}\n[dependencies]\ndep = \"1\"\npin = \"1\"\n"));
+        write(&io, "src/lib.rs", "pub fn caller() -> u8 {\n    dep::value()\n}\n\npub fn pinned() -> u8 {\n    pin::value()\n}\n");
+        crate::engine_scope_reads::PLANT_WHOLE_GRAPH.with(|p| p.set(plant));
+        two_registry(&io, BYTE);
+        let cold = dependency_answer(&io, false);
+        assert_eq!(cold.errors(), 0, "{}", cold.lines());
+        two_registry(&io, WIDE);
+        let edited = dependency_answer(&io, false);
+        let fresh = dependency_answer(&io, true);
+        crate::engine_scope_reads::PLANT_WHOLE_GRAPH.with(|p| p.set(false));
+        let entered = bodies_entered(&edited);
+        println!("BUMP (plant {plant}): {entered} bodies entered; because {:?}", edited.checked.because);
+        assert_eq!((&edited.ids, edited.lines(), edited.checked.status.0), (&fresh.ids, fresh.lines(), fresh.checked.status.0), "plant {plant}: the edit's answer is a fresh check's");
+        assert_eq!(edited.errors(), 1, "{}", edited.lines());
+        // D191: each body is checked in its 2 units' rows (the library's and its test build's),
+        // and a row is entered by its own reads: a body entered is 2 rows entered.
+        if plant {
+            assert_eq!(entered, 4, "CONTROL: the whole graph's cell read by both bodies enters both, 2 rows each (D191)");
+            continue;
+        }
+        assert_eq!(entered, 2, "only `caller` reads `dep`, in its 2 units' rows (D191): {:?}", edited.checked.because);
+        assert!(edited.checked.because.iter().any(|(group, count)| group.stage == blaze_engine::Stage::Bodies && group.cell == Some(crate::engine_scope_reads::CellKind::GraphCrate) && *count == 2), "entered on `dep`'s graph crate cell, both of caller's rows (D191): {:?}", edited.checked.because);
+    }
+}
+
+/// A FETCH THAT FAILED OUTSIDE THE CHECKOUT IS OWED, NEVER REPLAYED (turso, 2026-11-20: after a
+/// command whose 152 fetches failed, their sources were put in cargo's cache, and the next
+/// command replayed the 152 failures from the stored answer's certificate). The first command
+/// finds `dep` in no place on the machine and has no network (fetch.rs `NETWORK`): its fetch
+/// fails, owed (engine_units.rs `owes`). The archive is then put in cargo's cache, and nothing in
+/// the checkout moves. The second command must not stand on the certificate: it runs the fetch
+/// again, adopts the archive by the lock's pin and checks the caller with no failure, and its
+/// plan line counts one fetch owed again. A third stands on its certificate (nothing owed).
+/// CONTROL (the cause removed, rule 23): with nothing owed (`OWES_NOTHING`), the second command
+/// stands on the first's certificate and prints the first's failure again: the bug.
+#[test]
+fn a_fetch_failed_for_want_of_its_source_is_fetched_by_the_next_command() {
+    for plant in [false, true] {
+        let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+        write(&io, "Cargo.toml", &format!("{MANIFEST}\n[dependencies]\ndep = \"1\"\n"));
+        write(&io, "src/lib.rs", CALLER);
+        let (fetch, archive) = locked(&io, BYTE);
+        crate::engine_units::OWES_NOTHING.with(|p| p.set(plant));
+        crate::fetch::NETWORK.with(|n| n.set(false));
+        let first = dependency_answer(&io, false);
+        crate::fetch::NETWORK.with(|n| n.set(true));
+        // fetch.rs: with `fetch` the Hole's words name the unit and the client's refusal; without
+        // it, the Done that cannot fetch names the unit and the places tried.
+        #[cfg(feature = "fetch")]
+        assert!(first.lines().contains("no network in this test"), "the first command's fetch fails, naming why:\n{}", first.lines());
+        assert!(first.lines().contains("crate dep 1.0.0"), "the failure names its source:\n{}", first.lines());
+        assert_eq!(first.checked.plan.owed_again, 0, "nothing was owed before the first command");
+        cache_archive(&io, archive.as_slice());
+        // The network stays off: the second command can only take the source from cargo's cache.
+        crate::fetch::NETWORK.with(|n| n.set(false));
+        let second = dependency_answer(&io, false);
+        crate::fetch::NETWORK.with(|n| n.set(true));
+        crate::engine_units::OWES_NOTHING.with(|p| p.set(false));
+        println!(
+            "OWED (plant {plant}): second command certified {}, owed again {}, still owed {}, said:\n{}",
+            second.checked.certified, second.checked.plan.owed_again, second.checked.plan.owed_still, second.lines()
+        );
+        if plant {
+            assert!(second.checked.certified && second.lines().contains("crate dep 1.0.0"), "CONTROL: with nothing owed the failure is replayed:\n{}", second.lines());
+            continue;
+        }
+        assert!(!second.checked.certified, "a failed fetch is owed: no certificate stands on it");
+        assert!(!second.lines().contains("crate dep 1.0.0"), "the source in cargo's cache is fetched:\n{}", second.lines());
+        assert_eq!((second.checked.plan.owed_again, second.checked.plan.owed_still), (1, 0), "one fetch owed again, none still owed");
+        assert_eq!(second.errors(), 0, "the caller checks against the fetched `dep`:\n{}", second.lines());
+        check_archive_row(&io, fetch);
+        let third = dependency_answer(&io, false);
+        assert!(third.checked.certified, "nothing owed, nothing moved: the certificate stands\n{}", third.lines());
+    }
 }
 
 #[test]

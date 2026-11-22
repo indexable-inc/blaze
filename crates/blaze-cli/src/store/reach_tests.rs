@@ -37,7 +37,7 @@ use blaze_core::{Completion, Done, Driver, Effect, FileName, Tag as EffectTag};
 use blaze_ids::ContentId;
 use blaze_ladder::code_records::{CodeKey, CodeStore};
 
-use super::plain_place::{Facts, StoreAlloc, after_answer, config, open};
+use super::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
 use super::roots::{CleanupLine, keep_program, keep_toolchain};
 use crate::code_store::HomeCodeStore;
 use crate::start_list::{self, Certificate, HEAD, ListName, ROW, Today};
@@ -102,7 +102,7 @@ impl Checkout {
     /// Its run's today: one certificate a checkout, its run tables two keys of it.
     fn today(&self) -> Today {
         let table = |what: &'static str| CasKey(ContentId::of(what, &[self.which]));
-        Today { certificate: Certificate([self.which; 32]), name: self.list_name(), tables: [table("reach test ids table"), table("reach test names table")] }
+        Today { certificate: Certificate::for_tests([self.which; 32]), name: self.list_name(), tables: [table("reach test ids table"), table("reach test names table")] }
     }
 
     /// The start list this program's run writes: one code row per instance.
@@ -178,14 +178,14 @@ fn run_with(sim: Sim, n: u64, checkout: Checkout, keep: Keep, std: core::ops::Ra
     if keep.toolchain {
         keep_toolchain(&lent, blaze_toolchain::PINNED, &tool_made, &[]).expect("the toolchain's root");
     }
-    let after = after_answer(&lent, 1).expect("the commit after the answer");
+    let after = after_answer(&test_cx(), &lent, 1).expect("the commit after the answer");
     (back(lent), Ran { made, found, cleanup: after.cleanup }, std_made)
 }
 
 /// An idle command: one slice folded, its lease let go of.
 fn idle(sim: Sim, n: u64) -> Sim {
     let lent = process(sim, n);
-    after_answer(&lent, 1).expect("an idle commit");
+    after_answer(&test_cx(), &lent, 1).expect("an idle commit");
     back(lent)
 }
 
@@ -201,7 +201,7 @@ fn a_left(sim: Sim, n: u64) -> (Sim, u32, bool) {
         }
     }
     let list = start_list::held(&lent, &Checkout { which: 1, program: A }.list_name()).expect("a list read").is_some();
-    after_answer(&lent, 0).expect("the reader's commit");
+    after_answer(&test_cx(), &lent, 0).expect("the reader's commit");
     (back(lent), left, list)
 }
 

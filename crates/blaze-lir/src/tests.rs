@@ -745,7 +745,7 @@ fn the_example_prints_as_written_and_parses_as_built() {
 /// The rule `verify` refuses `func` by.
 fn refused(func: &Func<Global>) -> &'static str {
     match verify(func.view()) {
-        Ok(()) => panic!("LIR that breaks a rule verified:\n{}", print(func.view())),
+        Ok(_) => panic!("LIR that breaks a rule verified:\n{}", print(func.view())),
         Err(error) => error.rule,
     }
 }

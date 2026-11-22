@@ -984,7 +984,9 @@ impl Server {
                 }
                 Tok::Literal { kind, sym, suffix, span } => {
                     let mut body = self.sym_text(sym);
-                    if let Some(rest) = body.strip_prefix('-') {
+                    if matches!(kind, LitKind::Integer | LitKind::Float)
+                        && let Some(rest) = body.strip_prefix('-')
+                    {
                         tokens.punct('-', Spacing::Alone, ctx).map_err(ProduceError::Stream)?;
                         origins.push(origin(&self.spans, span));
                         body = rest;
@@ -1013,6 +1015,39 @@ impl Server {
             diagnostics.push(ProcDiagnostic::Panicked { message });
         }
         Ok(Produced { tokens, origins, reads, diagnostics, text })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_expand::{lex, Edition, LitKind, ProcCall, ProcKind, Reads, TokenKind};
+    use blaze_own::Alloc;
+
+    use super::{Server, ServerLimits, SpanId, Tok};
+
+    fn produce_literal(kind: LitKind, text: &str) -> blaze_expand::TokenStream<'static> {
+        let alloc = Alloc::global();
+        let input = lex("input", Edition::E2021, alloc).expect("the test input lexes");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None };
+        let mut run_input = Vec::new();
+        let mut server = Server::new(Edition::E2021, ServerLimits::STANDARD, &call, alloc, &mut run_input).expect("the server starts");
+        let sym = server.sym(text).expect("the literal text fits");
+        let span = server.spans.len() as SpanId;
+        let handle = server.hold(vec![Tok::Literal { kind, sym, suffix: None, span }]).expect("the output stream is held");
+        server.produce(Some(handle), None, Reads::new_in(alloc), alloc).expect("the output is produced").tokens
+    }
+
+    #[test]
+    fn a_literal_payload_keeps_a_leading_minus_inside_strings_but_splits_numeric_minus() {
+        let string = produce_literal(LitKind::Str, "-output");
+        assert!(matches!(string.tokens()[0].kind, TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, .. }));
+        assert_eq!(string.text_at(0), "-output");
+
+        let integer = produce_literal(LitKind::Integer, "-1");
+        assert_eq!(integer.tokens().len(), 2);
+        assert!(matches!(integer.tokens()[0].kind, TokenKind::Punct { char: '-', .. }));
+        assert!(matches!(integer.tokens()[1].kind, TokenKind::Literal { kind: LitKind::Integer, .. }));
+        assert_eq!(integer.text_at(1), "1");
     }
 }
 

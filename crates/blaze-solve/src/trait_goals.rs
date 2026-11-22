@@ -13,8 +13,8 @@ use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{AStep, BuiltinSource, Cand, Cx, Done, MergeInfo, Merger, Source, Step, Via};
 use crate::canon::RespId;
-use crate::error::{Malformed, SolveError, Stop};
-use crate::facts::{Facts, ImplPolarity, TraitFlags};
+use crate::error::{SolveError, Stop};
+use crate::facts::{Facts, ImplHeader, ImplPolarity, TraitFlags};
 use crate::term::{Certainty, Def, Flags, GoalSource, Lang, List, Polarity, Pred, Ty, TyKind, TypingMode, VarKind};
 use crate::tys::Tys;
 
@@ -124,18 +124,14 @@ fn assemble_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, g: TraitGoal, out: 
     let meta = cx.lang(Lang::MetaSized)? == Some(g.trait_);
     let sized = if meta { cx.lang(Lang::Sized)? } else { None };
     for (i, c) in cx.env.iter().enumerate() {
-        let Pred::Trait { trait_, args, polarity } = c.pred else { continue };
+        let Pred::Trait { trait_, polarity, .. } = c.pred else { continue };
         let same = trait_ == g.trait_ && polarity == g.polarity;
         let sizedness = meta && Some(trait_) == sized && g.polarity == Polarity::Positive;
         if !same && !sizedness {
             continue;
         }
-        let mut f = Flags(0);
-        for k in 0..args.len {
-            f = f.union(cx.tys.flags(cx.arg(args, k)));
-        }
-        let global = !f.has(Flags::HAS_PARAM | Flags::HAS_INFER | Flags::HAS_RE_INFER | Flags::HAS_PLACEHOLDER | Flags::HAS_FREE_REGION);
-        out.push(Cand::new(Source::ParamEnv { global }, crate::assembly::Rule::Trait(Rule::Env(i as u32))));
+        // The probe classifies the matched assumption in its parameter environment.
+        out.push(Cand::new(Source::ParamEnv { global: false }, crate::assembly::Rule::Trait(Rule::Env(i as u32))));
     }
     Ok(())
 }
@@ -189,37 +185,66 @@ pub fn assemble_impls<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, st: &State, o
 
 /// A candidate's stage.
 pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: Rule, stage: u8) -> Result<Step, Stop> {
-    if stage != 0 {
-        return Err(malformed());
-    }
     match rule {
-        Rule::Env(i) => step_env(cx, i),
-        Rule::Impl => step_impl(cx, cand.d),
+        Rule::Env(i) => step_env(cx, cand, i, stage),
+        Rule::Impl if stage == 0 => step_impl(cx, cand.d),
+        Rule::Impl => Err(malformed()),
     }
 }
 
 /// `probe_and_match_goal_against_assumption` with `match_assumption` (trait_goals.rs): the
 /// clause's binder instantiated with fresh variables, its trait ref related with the goal's
 /// (only the self types for a `MetaSized` goal against a `Sized` clause).
-fn step_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, i: u32) -> Result<Step, Stop> {
+fn step_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, i: u32, stage: u8) -> Result<Step, Stop> {
     let Some(&clause) = cx.env.get(i as usize) else { return Err(malformed()) };
-    let (_, gargs, _) = parts(cx.goal.pred)?;
     let Pred::Trait { trait_, args, .. } = clause.pred else { return Err(malformed()) };
-    let args = if clause.bound > 0 {
-        let with = cx.fresh_args(clause.bound)?;
-        let mut f = |cx: &mut Cx<'_, '_, T, F>, t: Ty| cx.instantiate_bound(t, with);
-        cx.map_list(args, &mut f)?
-    } else {
-        args
-    };
-    let (gt, _, _) = parts(cx.goal.pred)?;
-    let ok = if trait_ == gt {
-        cx.eq_lists(gargs, args)?
-    } else {
-        let (a, b) = (cx.arg(gargs, 0), cx.arg(args, 0));
-        cx.eq(a, b)?
-    };
-    Ok(if ok { Step::Done(Certainty::Yes) } else { Step::No })
+    if stage == 0 {
+        let (gt, gargs, _) = parts(cx.goal.pred)?;
+        let args = if clause.bound > 0 {
+            let with = cx.fresh_args(clause.bound)?;
+            let mut f = |cx: &mut Cx<'_, '_, T, F>, t: Ty| cx.instantiate_bound(t, with);
+            cx.map_list(args, &mut f)?
+        } else {
+            args
+        };
+        let ok = if trait_ == gt {
+            cx.eq_lists(gargs, args)?
+        } else {
+            cx.eq(cx.arg(gargs, 0), cx.arg(args, 0))?
+        };
+        if !ok {
+            return Ok(Step::No);
+        }
+        if clause.bound > 0 {
+            return Ok(Step::Done(Certainty::Yes));
+        }
+    }
+
+    // characterize_param_env_assumption: under `A: Api<Net = Marker>`, the
+    // elaborated `A::Net: RpcTypes` is global. Only a still-generic assumption
+    // may shadow the impl when deciding `<Marker as RpcTypes>::Receipt`.
+    // n is the argument being classified; a holds its term across nested goals.
+    let mut depth = stage;
+    while cand.n < args.len {
+        let arg = if depth == 0 { cx.arg(args, cand.n) } else { cx.resolve_deep(cand.a)? };
+        let normalized = crate::alias::normalize(cx, arg)?;
+        if normalized != arg {
+            cand.a = normalized;
+            let next = depth.checked_add(1).ok_or(Stop::Error(SolveError::Limit(crate::error::Limit::Walk)))?;
+            return Ok(Step::Then(next));
+        }
+        let flags = cx.tys.flags(arg);
+        if flags.has(Flags::HAS_INFER | Flags::HAS_RE_INFER) {
+            return Ok(Step::Done(Certainty::Ambiguous));
+        }
+        if flags.has(Flags::HAS_PARAM | Flags::HAS_PLACEHOLDER | Flags::HAS_FREE_REGION) {
+            return Ok(Step::Done(Certainty::Yes));
+        }
+        cand.n += 1;
+        depth = 0;
+    }
+    cand.source = Source::ParamEnv { global: true };
+    Ok(Step::Done(Certainty::Yes))
 }
 
 /// `consider_impl_candidate` (trait_goals.rs): polarity, the impl's header related with the
@@ -230,9 +255,18 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
     let max = match (h.polarity, polarity) {
         (ImplPolarity::Reservation, _) => match cx.mode {
             TypingMode::Coherence => Certainty::Ambiguous,
-            TypingMode::Analysis => return Ok(Step::No),
+            TypingMode::Analysis | TypingMode::PostAnalysis => return Ok(Step::No),
         },
         (ImplPolarity::Positive, Polarity::Positive) | (ImplPolarity::Negative, Polarity::Negative) => Certainty::Yes,
+        // A negative impl for a positive goal (or the reverse): not this goal's impl. Whether
+        // its header names the goal's type is what `why_no` asks (a negative impl naming the
+        // type is that leaf's reason): the header is related below, in its own probe.
+        (ImplPolarity::Negative, Polarity::Positive) => {
+            if cx.scratch.why_no && header_names(cx, impl_, &h, gargs)? {
+                cx.scratch.stats.impl_polarity_refused += 1;
+            }
+            return Ok(Step::No);
+        }
         _ => return Ok(Step::No),
     };
     // The header against the goal in place, before importing it: a rigid head that differs at
@@ -250,11 +284,27 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
         cx.scratch.stats.impl_header_mismatch += 1;
         return Ok(Step::No);
     }
-    for &w in h.where_clauses {
+    for (i, &w) in h.where_clauses.iter().enumerate() {
         let p = cx.import_pred(h.portable, w, args)?;
-        cx.add(GoalSource::ImplWhereBound, p);
+        cx.add_from(GoalSource::ImplWhereBound, p, crate::why_no::Reach::Clause(i as u32));
     }
     Ok(Step::Done(max))
+}
+
+/// Whether impl `impl_`'s header (`h`) relates with the goal's arguments `gargs`, in a probe
+/// rolled back after: a negative impl that names the goal's type (why_no.rs `Leaf::NegativeImpl`).
+fn header_names<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def, h: &ImplHeader<'_>, gargs: List) -> Result<bool, Stop> {
+    let snap = cx.tys.snapshot();
+    let added = cx.added.len();
+    let r = (|| -> Result<bool, Stop> {
+        let args = cx.fresh_impl_args_of(impl_, h)?;
+        let header = cx.import_list(h.portable, h.args, args)?;
+        cx.eq_lists(gargs, header)
+    })();
+    // The relation's deferred alias goals belong to no candidate: dropped with its variables.
+    cx.added.truncate(added);
+    cx.tys.rollback_to(snap);
+    r
 }
 
 /// `try_merge_impl_candidates`.

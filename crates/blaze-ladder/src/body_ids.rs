@@ -32,7 +32,7 @@
 //! holds no BodyCheck record for it ([`Unkeyed::NoRecord`]), or the record it holds read a fact
 //! that has moved ([`Unkeyed::Stale`]: the check would read other things today, so its list is
 //! not today's). That ONE instance is made and NOT put, and the walk says so in its row
-//! ([`How::Unkeyed`]) and its counts; the driver opens a span for each. Every other instance is
+//! ([`Stepped::Unkeyed`]) and its counts; the driver opens a span for each. Every other instance is
 //! still found.
 //!
 //! THE WALK ([`Walk`]) is sans-IO: it asks the seam, the store ([`CodeStore`]), the maker
@@ -139,25 +139,34 @@ pub enum NameError {
     Truncated { at: usize },
     /// A tag symbols.rs never writes, at byte `at`.
     Tag { tag: u8, at: usize },
+    /// A reference, at byte `at`, to a node not written before it.
+    Ref { at: usize },
+    /// Bytes past the name's last part, from byte `at`.
+    Trailing { at: usize },
 }
 
 impl fmt::Display for NameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let rule = "an instance name is its item's key, a count and each argument's nodes (blaze-ladder symbols.rs `encode_instance`)";
+        let rule = "an instance name is its item's key, a count, the distinct nodes of its arguments and a reference per argument (blaze-ladder symbols.rs `encode_instance`)";
         match *self {
             NameError::Truncated { at } => write!(f, "an instance name ends inside a part at byte {at}: {rule}"),
             NameError::Tag { tag, at } => write!(f, "an instance name holds the tag {tag} at byte {at}, which the form never writes: {rule}"),
+            NameError::Ref { at } => write!(f, "an instance name refers, at byte {at}, to a node not written before it: {rule}"),
+            NameError::Trailing { at } => write!(f, "an instance name has bytes past its end, from byte {at}: {rule}"),
         }
     }
 }
 
 impl core::error::Error for NameError {}
 
-/// Each item an instance name holds, in the name's order (an item may come twice), WITHOUT a
-/// ground table: the item itself, then per node the key its tag carries (symbols.rs' table:
-/// 12 ADT, 13 fn item, 17 a `dyn`'s principal, 18 a `dyn`'s projection's trait, 19 auto trait,
-/// 20 closure's owner, 23 coroutine's owner). The nodes are a flat pre-order stream, each a tag,
-/// its payload and a child count, so no tree is rebuilt.
+/// Each item an instance name holds, in the name's order, WITHOUT a ground table: the item
+/// itself, then per DISTINCT node the key its tag carries (symbols.rs' table: 12 ADT, 13 fn
+/// item, 17 a `dyn`'s principal, 18 a `dyn`'s projection's trait, 19 auto trait, 20 closure's
+/// owner, 23 coroutine's owner). A node is written once however often the arguments reach it,
+/// so the calls are linear in the name's bytes; one item may still come more than once (`Vec`
+/// at two arguments is two nodes). The nodes are a flat stream, each a tag, its payload, a
+/// child count and its children's references, so no tree is rebuilt; every reference is
+/// checked to point before its node.
 pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameError> {
     let key_at = |at: usize| -> Result<ItemKey, NameError> {
         let bytes = name.get(at..at + 16).ok_or(NameError::Truncated { at })?;
@@ -165,14 +174,21 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         wide.copy_from_slice(bytes);
         Ok(ItemKey(u128::from_le_bytes(wide)))
     };
+    let u32_at = |at: usize| -> Result<u32, NameError> {
+        let bytes = name.get(at..at + 4).ok_or(NameError::Truncated { at })?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
     each(key_at(0)?);
-    // The item's key (16) and the count of arguments (4).
+    // The item's key (16) and the count of arguments (4); at no argument, nothing more.
+    let args = u32_at(16)? as usize;
     let mut at = 20;
-    if name.len() < at {
-        return Err(NameError::Truncated { at: name.len() });
+    if args == 0 {
+        return if name.len() == at { Ok(()) } else { Err(NameError::Trailing { at }) };
     }
-    while at < name.len() {
-        let tag = name[at];
+    let nodes = u32_at(at)? as usize;
+    at += 4;
+    for index in 0..nodes {
+        let tag = *name.get(at).ok_or(NameError::Truncated { at })?;
         // (the payload's bytes, whether it starts with an item's key)
         let (payload, keyed) = match tag {
             0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 => (0, false),
@@ -187,12 +203,31 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         if keyed {
             each(key_at(at + 1)?);
         }
-        // The tag, the payload, the child count.
-        let end = at + 1 + payload + 4;
-        if end > name.len() {
+        // The tag, the payload, the child count, then each child's reference.
+        let kids = u32_at(at + 1 + payload)? as usize;
+        at += 1 + payload + 4;
+        if kids > (name.len() - at) / 4 {
             return Err(NameError::Truncated { at });
         }
-        at = end;
+        for _ in 0..kids {
+            if u32_at(at)? as usize >= index {
+                return Err(NameError::Ref { at });
+            }
+            at += 4;
+        }
+    }
+    // A reference per argument.
+    if args > name.len().saturating_sub(at) / 4 {
+        return Err(NameError::Truncated { at });
+    }
+    for _ in 0..args {
+        if u32_at(at)? as usize >= nodes {
+            return Err(NameError::Ref { at });
+        }
+        at += 4;
+    }
+    if at != name.len() {
+        return Err(NameError::Trailing { at });
     }
     Ok(())
 }
@@ -303,17 +338,45 @@ impl Form for EntryForm {
 /// The on-demand side: the front end and the builder, made on first need. One call checks,
 /// lowers, builds, emits and seals ONE instance, or makes ONE static's datum; nothing else of
 /// the program is touched.
+///
+/// Every make takes the row's [`Make::Grant`] (D163, rules 74 and 76): the proof that the row's
+/// body may run, made by the gate and handed down unread by anything between. The production
+/// maker's grant is blaze-cli run_ids.rs `Runnable`, so nothing reaches the make path without the
+/// gate having let it; a walk with no gate ([`Walk::run`], the fixtures) makes a [`Fixture`]
+/// grant, and only a maker whose grant is [`Fixture`] takes one.
 pub trait Make {
     type Error;
-    /// Appends to `entry` the entry of the instance `name`, tabled as the fn `tabled`.
-    fn make(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+    /// What the make path accepts as leave to make a row (the trait doc).
+    type Grant: Grant;
+    /// Appends to `entry` the entry of the instance `name`, tabled as the fn `tabled`, under
+    /// `grant`, its fn's proof.
+    fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
     /// Appends to `entry` the entry of static `item` (code_records.rs `statics`): its
     /// initializer evaluated, its value made a datum.
-    fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+    fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
     /// Appends to `entry` the TEMPLATE entry of thread-local `item` (code_records.rs
     /// `statics::make_template_entry`): its initial value made a read-only datum.
-    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
+    fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error>;
 }
+
+/// A proof a make takes ([`Make::Grant`]). It is held, not read: the make path's signature is
+/// the check (rule 76), and which proof a maker takes is its type (`Maker<'_, G>`): blaze-cli
+/// run_ids.rs `Runnable` for the run, [`Fixture`] for a walk with no gate. Implemented by those
+/// two only.
+pub trait Grant {}
+
+/// The grant of a walk with no gate ([`Walk::run`], make_one.rs `walk_records`: the fixtures
+/// and the examples). Made only in this module; a maker taking it is its own instantiation
+/// (`Maker<'_, Fixture>`), never the production maker's.
+///
+/// ```compile_fail
+/// // Outside body_ids.rs no fixture grant is made by hand: its field is private.
+/// let forged = blaze_ladder::body_ids::Fixture(());
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fixture(());
+
+impl Grant for Fixture {}
 
 /// What a walk row is: a fn instance (its code record), a static (its datum) or a thread-local
 /// (its template's datum, under symbols.rs `tls_symbol`).
@@ -341,17 +404,36 @@ pub enum Unkeyed {
     Stale { fact: [u8; 32] },
 }
 
-/// What the walk did with one instance.
+/// Where one instance's walk is: waiting, or done, with what was done.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum How {
     /// Not reached by the loop yet.
     Waiting,
+    /// Stepped ([`Walk::one`]): what was done for it, its key with it when it has one.
+    Done(Stepped),
+}
+
+/// What one step did with its instance, each answer carrying what it holds: a found or made
+/// entry is under its key, so the key is in the variant, never an `Option` beside it (a keyed
+/// answer with no key cannot be written).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stepped {
     /// Its entry was in the store under its key: nothing checked, lowered or built.
-    Found,
+    Found(CodeKey),
     /// Made and put under its key.
-    Made,
-    /// Made and not put.
+    Made(CodeKey),
+    /// Made and not put: why it has no key.
     Unkeyed(Unkeyed),
+}
+
+impl Stepped {
+    /// The key the entry is under; `None` for one made without a key.
+    pub fn key(self) -> Option<CodeKey> {
+        match self {
+            Stepped::Found(key) | Stepped::Made(key) => Some(key),
+            Stepped::Unkeyed(_) => None,
+        }
+    }
 }
 
 /// Why the walk stopped.
@@ -373,6 +455,19 @@ pub enum WalkError<E> {
     Make { tabled: ItemKey, why: E },
     /// More instances than `most` (rule 18).
     Cap { most: usize },
+    /// An instance name of `bytes` bytes, past `most` ([`NAME_MOST_BYTES`] and the forest's
+    /// header), declared by the instance of `declarer` (`None`: a root), whose name's first
+    /// items are `heads` (rule 18). symbols.rs refuses a name past its cap while it is made, so
+    /// this is a name from a stored entry.
+    NameTooLarge { tabled: ItemKey, declarer: Option<ItemKey>, bytes: usize, most: usize, heads: [Option<ItemKey>; 3] },
+    /// The walk's arena of names would pass `u32::MAX` bytes (its offsets are 4 bytes) at the
+    /// instance of `tabled`: `bytes` held, `adding` more (rule 18).
+    ArenaFull { tabled: ItemKey, bytes: usize, adding: usize },
+    /// rustc's "reached the recursion limit while instantiating": the instance of `item`
+    /// (tabled `tabled`) has `depth` instances of `item` above it on the chain of instances that
+    /// first declared it, past `limit` (the crate's `#![recursion_limit]`, 128 when unset);
+    /// `declarer` is the tabled fn of the instance that declared it.
+    RecursionLimit { tabled: ItemKey, item: ItemKey, declarer: Option<ItemKey>, depth: u32, limit: u32 },
 }
 
 impl<E: fmt::Display> fmt::Display for WalkError<E> {
@@ -391,6 +486,32 @@ impl<E: fmt::Display> fmt::Display for WalkError<E> {
             WalkError::Entry { tabled, found: false, why } => write!(f, "the entry just made for an instance of fn {:#x}: {why}", tabled.0),
             WalkError::Make { tabled, why } => write!(f, "the instance of fn {:#x} was not made: {why}", tabled.0),
             WalkError::Cap { most } => write!(f, "the record walk met more than {most} instances (its cap, rule 18)"),
+            WalkError::NameTooLarge { tabled, declarer, bytes, most, heads } => {
+                write!(f, "an instance of fn {:#x}", tabled.0)?;
+                if let Some(d) = declarer {
+                    write!(f, ", declared by an instance of fn {:#x},", d.0)?;
+                }
+                write!(f, " has a name of {bytes} bytes, past the walk's cap of {most} (body_ids.rs `Walk::reach`, rule 18); its name's first items:")?;
+                heads.iter().flatten().try_for_each(|h| write!(f, " {:#x}", h.0))
+            }
+            WalkError::ArenaFull { tabled, bytes, adding } => write!(
+                f,
+                "the record walk's names hold {bytes} bytes, and the name of an instance of fn {:#x} adds {adding}: past 4 GiB, its offsets' width (body_ids.rs `Walk::reach`, rule 18)",
+                tabled.0
+            ),
+            WalkError::RecursionLimit { tabled, item, declarer, depth, limit } => {
+                write!(f, "reached the recursion limit while instantiating fn {:#x}", item.0)?;
+                if *tabled != *item {
+                    write!(f, " (tabled under fn {:#x})", tabled.0)?;
+                }
+                if let Some(d) = declarer {
+                    write!(f, ", declared by an instance of fn {:#x}", d.0)?;
+                }
+                write!(
+                    f,
+                    ": {depth} instances of it above it on the chain that declared it, past the limit {limit} (`#![recursion_limit]`, 128 when unset; rustc's \"reached the recursion limit while instantiating\")"
+                )
+            }
         }
     }
 }
@@ -409,6 +530,12 @@ pub struct Counts {
     pub no_record: usize,
     /// Made and not put: a BodyCheck record whose read moved.
     pub stale: usize,
+    /// The longest instance name reached, in bytes.
+    pub longest_name: usize,
+    /// The most distinct items one name stepped with a key holds.
+    pub most_name_items: usize,
+    /// The bytes of every name reached (the walk's arena).
+    pub arena: usize,
 }
 
 impl Counts {
@@ -419,17 +546,21 @@ impl Counts {
 }
 
 impl fmt::Display for Counts {
-    /// `code records: reached R, found F, made M, unkeyed U (no record N, stale S)`.
+    /// `code records: reached R, found F, made M, unkeyed U (no record N, stale S); names:
+    /// longest B bytes, most items I, arena A bytes`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "code records: reached {}, found {}, made {}, unkeyed {} (no record {}, stale {})",
+            "code records: reached {}, found {}, made {}, unkeyed {} (no record {}, stale {}); names: longest {} bytes, most items {}, arena {} bytes",
             self.reached,
             self.found,
             self.made,
             self.no_record + self.stale,
             self.no_record,
-            self.stale
+            self.stale,
+            self.longest_name,
+            self.most_name_items,
+            self.arena
         )
     }
 }
@@ -439,13 +570,13 @@ impl fmt::Display for Counts {
 pub struct Walk<'a> {
     alloc: Alloc<'a>,
     symbols: AVec<'a, Symbol>,
-    /// All zero for an instance with no key ([`How::Unkeyed`]) or not reached yet.
-    keys: AVec<'a, CodeKey>,
     /// A fn instance's tabled fn; a static's own item.
     tabled: AVec<'a, ItemKey>,
     kinds: AVec<'a, RowKind>,
     /// Each name's (start, length) in `arena`.
     names: AVec<'a, (u32, u32)>,
+    /// Each row's state, its key in it once stepped with one ([`Stepped`]): the one home of a
+    /// row's key.
     how: AVec<'a, How>,
     arena: AVec<'a, u8>,
     /// Each row's (start, length) in `edges`: the rows its entry declares, set when the row
@@ -457,9 +588,29 @@ pub struct Walk<'a> {
     /// digest: its bytes are the hash, so the table has no seed); 0 is empty, else the row + 1.
     /// A power of two long, at most half full.
     slots: AVec<'a, u32>,
+    /// Each row's declarer: the row whose step first reached it ([`NO_ROW`] for a root). The
+    /// rows by their declarers are a tree: the chain an error names, and the recursion depth.
+    declarer: AVec<'a, u32>,
+    /// Each fn instance row's recursion depth: 1 + the depth of the nearest row on its declarer
+    /// chain that instantiates the same item (0 when none does); 0 for a static's row.
+    depth: AVec<'a, u32>,
+    /// The deepest an item may instantiate itself down one declarer chain: rustc's
+    /// `recursion_limit` ([`DEFAULT_RECURSION_LIMIT`] until [`Walk::set_recursion_limit`]).
+    recursion_limit: u32,
+    /// The most distinct items of one name stepped with a key ([`Counts::most_name_items`]).
+    most_name_items: usize,
 }
 
-const NO_KEY: CodeKey = CodeKey(ContentId([0; 32]));
+/// A row index that is no row: a root's declarer.
+const NO_ROW: u32 = u32::MAX;
+
+/// rustc's default `recursion_limit` (the Reference, "Limits"): 128.
+pub const DEFAULT_RECURSION_LIMIT: u32 = 128;
+
+/// The longest instance name the walk files (rule 18): a forest at its cap
+/// ([`crate::symbols::NAME_MOST_BYTES`]) and its header (item key, argument count, node count)
+/// and argument references, the arguments bounded by the cap's nodes.
+pub const WALK_MOST_NAME: usize = crate::symbols::NAME_MOST_BYTES + 24 + 4 * crate::symbols::NAME_MOST_NODES as usize;
 
 /// The buffers one step of the walk ([`Walk::one`]) fills, made once by the caller and reused
 /// by every step, so a step allocates nothing once they have grown.
@@ -478,11 +629,11 @@ impl<'a> Scratch<'a> {
         Scratch { name: Vec::new_in(alloc), made: Vec::new_in(alloc), facts: Vec::new_in(alloc), items: Vec::new_in(alloc), declared: DeclaredList::new_in(alloc) }
     }
 
-    /// The entry bytes the maker made in the last [`Walk::one`], when its row's [`One::how`] is
-    /// [`How::Made`] or [`How::Unkeyed`] (an unkeyed instance is not put: these bytes are the
-    /// only copy of its record, and the caller serves them). Empty after a step that made
-    /// nothing ([`How::Found`], or a row already done); a made entry may itself be empty, so
-    /// the caller tells the cases by `how`, never by the length.
+    /// The entry bytes the maker made in the last [`Walk::one`], when its row's [`One::stepped`]
+    /// is [`Stepped::Made`] or [`Stepped::Unkeyed`] (an unkeyed instance is not put: these bytes
+    /// are the only copy of its record, and the caller serves them). Empty after a step that
+    /// made nothing ([`Stepped::Found`], or a row already done); a made entry may itself be
+    /// empty, so the caller tells the cases by `stepped`, never by the length.
     pub fn made(&self) -> &[u8] {
         &self.made
     }
@@ -491,10 +642,9 @@ impl<'a> Scratch<'a> {
 /// What one step ([`Walk::one`]) holds for its row.
 #[derive(Clone, Copy, Debug)]
 pub struct One<'w> {
-    /// What was done for the row: never [`How::Waiting`].
-    pub how: How,
-    /// The row's key; `None` for an instance made without one ([`How::Unkeyed`]).
-    pub key: Option<CodeKey>,
+    /// What was done for the row, its key in it when it has one (a step's row is never
+    /// waiting, by this type).
+    pub stepped: Stepped,
     /// The rows its entry declares, in the entry's order (an instance declared twice comes
     /// twice). A row may be old (reached before, perhaps already done) or new
     /// ([`How::Waiting`], nothing done for it).
@@ -506,7 +656,6 @@ impl<'a> Walk<'a> {
         Walk {
             alloc,
             symbols: Vec::new_in(alloc),
-            keys: Vec::new_in(alloc),
             tabled: Vec::new_in(alloc),
             kinds: Vec::new_in(alloc),
             names: Vec::new_in(alloc),
@@ -515,6 +664,24 @@ impl<'a> Walk<'a> {
             declares: Vec::new_in(alloc),
             edges: Vec::new_in(alloc),
             slots: Vec::new_in(alloc),
+            declarer: Vec::new_in(alloc),
+            depth: Vec::new_in(alloc),
+            recursion_limit: DEFAULT_RECURSION_LIMIT,
+            most_name_items: 0,
+        }
+    }
+
+    /// The crate's `#![recursion_limit]` (rustc's limit on how deep one item instantiates
+    /// itself down a chain of calls), for the rows reached from now on.
+    pub fn set_recursion_limit(&mut self, limit: u32) {
+        self.recursion_limit = limit;
+    }
+
+    /// Row `row`'s declarer: the row whose step first reached it; `None` for a root.
+    pub fn declarer(&self, row: usize) -> Option<usize> {
+        match self.declarer[row] {
+            NO_ROW => None,
+            d => Some(d as usize),
         }
     }
 
@@ -537,7 +704,7 @@ impl<'a> Walk<'a> {
     /// new and [`How::Waiting`] with nothing done for it, or the row it has. At most `most`
     /// instances in the table.
     pub fn root<E>(&mut self, entry: (ItemKey, &[u8]), most: usize) -> Result<usize, WalkError<E>> {
-        self.reach(entry.0, entry.1, RowKind::Instance, most)
+        self.reach(entry.0, entry.1, RowKind::Instance, most, NO_ROW)
     }
 
     /// Whether row `row` is a fn instance or a static.
@@ -558,9 +725,12 @@ impl<'a> Walk<'a> {
         self.symbols[row]
     }
 
-    /// Row `row`'s key; `None` for an instance made without one.
+    /// Row `row`'s key; `None` for an instance made without one, or not stepped yet.
     pub fn key(&self, row: usize) -> Option<CodeKey> {
-        Some(self.keys[row]).filter(|key| *key != NO_KEY)
+        match self.how[row] {
+            How::Done(stepped) => stepped.key(),
+            How::Waiting => None,
+        }
     }
 
     pub fn tabled(&self, row: usize) -> ItemKey {
@@ -577,14 +747,15 @@ impl<'a> Walk<'a> {
     }
 
     pub fn counts(&self) -> Counts {
-        let mut c = Counts { reached: self.len(), ..Counts::default() };
+        let longest_name = self.names.iter().map(|&(_, len)| len as usize).max().unwrap_or(0);
+        let mut c = Counts { reached: self.len(), longest_name, most_name_items: self.most_name_items, arena: self.arena.len(), ..Counts::default() };
         for how in self.how.iter() {
             match how {
                 How::Waiting => {}
-                How::Found => c.found += 1,
-                How::Made => c.made += 1,
-                How::Unkeyed(Unkeyed::NoRecord) => c.no_record += 1,
-                How::Unkeyed(Unkeyed::Stale { .. }) => c.stale += 1,
+                How::Done(Stepped::Found(_)) => c.found += 1,
+                How::Done(Stepped::Made(_)) => c.made += 1,
+                How::Done(Stepped::Unkeyed(Unkeyed::NoRecord)) => c.no_record += 1,
+                How::Done(Stepped::Unkeyed(Unkeyed::Stale { .. })) => c.stale += 1,
             }
         }
         c
@@ -623,9 +794,46 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// The item a fn instance row instantiates: its name's first 16 bytes (rustc's `def_id`).
+    fn item_of(name: &[u8]) -> Option<ItemKey> {
+        let mut wide = [0u8; 16];
+        wide.copy_from_slice(name.get(..16)?);
+        Some(ItemKey(u128::from_le_bytes(wide)))
+    }
+
+    /// The recursion depth of a new fn instance row of `item` whose declarer is `declarer`, as
+    /// rustc's collector counts it (`check_recursion_limit`): 1 + the depth of the nearest row up
+    /// the declarer chain that instantiates `item`, or 0 when none does. The climb is as long as
+    /// the chain (a declarer is always an older row, so it ends).
+    fn depth_of(&self, item: ItemKey, declarer: u32) -> u32 {
+        let mut at = declarer;
+        while at != NO_ROW {
+            let row = at as usize;
+            if self.kinds[row] == RowKind::Instance && Walk::item_of(self.name(row)) == Some(item) {
+                return self.depth[row] + 1;
+            }
+            at = self.declarer[row];
+        }
+        0
+    }
+
     /// The instance `name` tabled as `tabled` (or the static `tabled`, named by [`static_name`]),
-    /// reached: a new row, or the one it has.
-    fn reach<E>(&mut self, tabled: ItemKey, name: &[u8], kind: RowKind, most: usize) -> Result<usize, WalkError<E>> {
+    /// reached from row `declarer` ([`NO_ROW`] for a root): a new row, or the one it has.
+    fn reach<E>(&mut self, tabled: ItemKey, name: &[u8], kind: RowKind, most: usize, declarer: u32) -> Result<usize, WalkError<E>> {
+        let declarer_fn = (declarer != NO_ROW).then(|| self.tabled[declarer as usize]);
+        if name.len() > WALK_MOST_NAME {
+            let mut heads = [None; 3];
+            let mut n = 0;
+            // The first items, as far as the name lists; a name that does not list still names
+            // its tabled fn and declarer, so its listing error is not the one reported.
+            let _ = each_item(name, |item| {
+                if n < heads.len() {
+                    heads[n] = Some(item);
+                    n += 1;
+                }
+            });
+            return Err(WalkError::NameTooLarge { tabled, declarer: declarer_fn, bytes: name.len(), most: WALK_MOST_NAME, heads });
+        }
         if (self.symbols.len() + 1) * 2 > self.slots.len() {
             self.grow();
         }
@@ -638,11 +846,23 @@ impl<'a> Walk<'a> {
             Ok(row) if self.tabled[row] == tabled => Ok(row),
             Ok(row) => Err(WalkError::TwoTabled { symbol, first: self.tabled[row], second: tabled }),
             Err(_) if self.symbols.len() >= most => Err(WalkError::Cap { most }),
+            Err(_) if self.arena.len() + name.len() > u32::MAX as usize => Err(WalkError::ArenaFull { tabled, bytes: self.arena.len(), adding: name.len() }),
             Err(at) => {
+                let depth = match (kind, Walk::item_of(name)) {
+                    (RowKind::Instance, Some(item)) => {
+                        let depth = self.depth_of(item, declarer);
+                        if depth > self.recursion_limit {
+                            return Err(WalkError::RecursionLimit { tabled, item, declarer: declarer_fn, depth, limit: self.recursion_limit });
+                        }
+                        depth
+                    }
+                    _ => 0,
+                };
                 let row = self.symbols.len();
+                self.declarer.push(declarer);
+                self.depth.push(depth);
                 self.slots[at] = row as u32 + 1;
                 self.symbols.push(symbol);
-                self.keys.push(NO_KEY);
                 self.tabled.push(tabled);
                 self.kinds.push(kind);
                 self.names.push((self.arena.len() as u32, name.len() as u32));
@@ -659,7 +879,10 @@ impl<'a> Walk<'a> {
     /// found in `store` or made by `make` and put, and what its entry declares reached in the
     /// entry's order. At most `most` instances. [`Walk::root`], then [`Walk::one`] over the
     /// rows from the root's in order until none is [`How::Waiting`].
-    pub fn run<M: Make>(
+    ///
+    /// A walk with no gate: its maker takes the [`Fixture`] grant, so a maker whose grant is the
+    /// gate's proof cannot be driven by it (blaze-cli run_parent.rs steps under the gate).
+    pub fn run<M: Make<Grant = Fixture>>(
         &mut self,
         entry: (ItemKey, &[u8]),
         ids: &dyn BodyIds,
@@ -672,9 +895,10 @@ impl<'a> Walk<'a> {
     ) -> Result<(), WalkError<M::Error>> {
         let mut at = self.root(entry, most)?;
         let mut scratch = Scratch::new_in(self.alloc);
+        let grant = Fixture(());
         while at < self.len() {
             if self.how[at] == How::Waiting {
-                self.one(at, ids, store, builder, producer, make, form, most, &mut scratch)?;
+                self.one(at, ids, store, builder, producer, make, &grant, form, most, &mut scratch)?;
             }
             at += 1;
         }
@@ -691,6 +915,9 @@ impl<'a> Walk<'a> {
     /// or maker call. After the step, [`Scratch::made`] holds the entry bytes when the
     /// instance was made. At most `most` instances in the table. On an error the row stays
     /// [`How::Waiting`] (a row its entry reached before the error stays reached).
+    ///
+    /// `grant` is the row's proof ([`Make::Grant`]), handed to the make unread: the caller made
+    /// it from this row (blaze-cli run_parent.rs `Cleared`), so nothing here compares it.
     pub fn one<'w, M: Make>(
         &'w mut self,
         row: usize,
@@ -699,14 +926,15 @@ impl<'a> Walk<'a> {
         builder: &Builder,
         producer: &ProducerId<CodeBuilder>,
         make: &mut M,
+        grant: &M::Grant,
         form: &dyn Form,
         most: usize,
         scratch: &mut Scratch<'a>,
     ) -> Result<One<'w>, WalkError<M::Error>> {
         let Scratch { name, made, facts, items, declared } = scratch;
         made.clear();
-        if self.how[row] != How::Waiting {
-            return Ok(One { how: self.how[row], key: self.key(row), declared: self.declared(row) });
+        if let How::Done(stepped) = self.how[row] {
+            return Ok(One { stepped, declared: self.declared(row) });
         }
         let tabled = self.tabled[row];
         name.clear();
@@ -722,31 +950,42 @@ impl<'a> Walk<'a> {
         }
         declared.clear();
         let mut found = false;
-        let mut key = NO_KEY;
-        if unkeyed.is_none() {
-            items.clear();
-            each_item(name.as_slice(), |item| items.push(item)).map_err(|why| WalkError::Name { tabled, why })?;
-            facts.clear();
-            for &item in items.iter() {
-                facts.push(ids.crate_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
+        // The instance's key, or why it has none: one value, so a keyed step always has its key.
+        let keyed: Result<CodeKey, Unkeyed> = match unkeyed {
+            Some(why) => Err(why),
+            None => {
+                // The name's items, each once, before any fact is looked up: a name lists an
+                // item once per distinct node (symbols.rs' forest), so `items` is at most the
+                // name's bytes / 21 long, and `facts` is as long as the distinct items.
+                items.clear();
+                each_item(name.as_slice(), |item| items.push(item)).map_err(|why| WalkError::Name { tabled, why })?;
+                items.sort_unstable();
+                items.dedup();
+                self.most_name_items = self.most_name_items.max(items.len());
+                facts.clear();
+                for &item in items.iter() {
+                    facts.push(ids.crate_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
+                }
+                facts.sort_unstable();
+                facts.dedup();
+                Ok(record_key(self.symbols[row], &body, facts.as_slice(), builder, producer))
             }
-            facts.sort_unstable();
-            facts.dedup();
-            key = record_key(self.symbols[row], &body, facts.as_slice(), builder, producer);
-            if let Some(bytes) = store.get(key).map_err(WalkError::Store)? {
-                form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
-                found = true;
-            }
+        };
+        if let Ok(key) = keyed
+            && let Some(bytes) = store.get(key).map_err(WalkError::Store)?
+        {
+            form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+            found = true;
         }
         if !found {
             match self.kinds[row] {
-                RowKind::Instance => make.make(tabled, name.as_slice(), made),
-                RowKind::Static => make.make_static(tabled, made),
-                RowKind::ThreadLocal => make.make_thread_local(tabled, made),
+                RowKind::Instance => make.make(grant, tabled, name.as_slice(), made),
+                RowKind::Static => make.make_static(grant, tabled, made),
+                RowKind::ThreadLocal => make.make_thread_local(grant, tabled, made),
             }
             .map_err(|why| WalkError::Make { tabled, why })?;
             form.declared(made.as_slice(), declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
-            if unkeyed.is_none() {
+            if let Ok(key) = keyed {
                 // The toolchain's when every item of its name is (`items` is the name's, filled
                 // when it was keyed above), else the program's.
                 let toolchain = !items.is_empty() && items.iter().all(|&item| ids.class(item) == CodeClass::Toolchain);
@@ -759,15 +998,16 @@ impl<'a> Walk<'a> {
         let start = self.edges.len();
         let (instances, statics) = (declared.len(), declared.statics().len());
         for i in 0..instances + statics + declared.thread_locals().len() {
+            let by = row as u32;
             let reached = if i < instances {
                 let (callee, callee_name) = declared.row(i);
-                self.reach(callee, callee_name, RowKind::Instance, most)
+                self.reach(callee, callee_name, RowKind::Instance, most, by)
             } else if i < instances + statics {
                 let item = declared.statics()[i - instances];
-                self.reach(item, &static_name(item), RowKind::Static, most)
+                self.reach(item, &static_name(item), RowKind::Static, most, by)
             } else {
                 let item = declared.thread_locals()[i - instances - statics];
-                self.reach(item, &static_name(item), RowKind::ThreadLocal, most)
+                self.reach(item, &static_name(item), RowKind::ThreadLocal, most, by)
             };
             match reached {
                 Ok(callee_row) => self.edges.push(callee_row as u32),
@@ -778,14 +1018,13 @@ impl<'a> Walk<'a> {
             }
         }
         self.declares[row] = (start as u32, (self.edges.len() - start) as u32);
-        self.keys[row] = key;
-        let how = match (found, unkeyed) {
-            (true, _) => How::Found,
-            (false, None) => How::Made,
-            (false, Some(why)) => How::Unkeyed(why),
+        let stepped = match keyed {
+            Ok(key) if found => Stepped::Found(key),
+            Ok(key) => Stepped::Made(key),
+            Err(why) => Stepped::Unkeyed(why),
         };
-        self.how[row] = how;
-        Ok(One { how, key: self.key(row), declared: self.declared(row) })
+        self.how[row] = How::Done(stepped);
+        Ok(One { stepped, declared: self.declared(row) })
     }
 }
 
@@ -816,10 +1055,13 @@ mod tests {
         out.extend_from_slice(&item.to_le_bytes());
         match arg {
             None => out.extend_from_slice(&0u32.to_le_bytes()),
+            // One argument, one node (the ADT, no children), the argument's reference to it.
             Some(adt) => {
+                out.extend_from_slice(&1u32.to_le_bytes());
                 out.extend_from_slice(&1u32.to_le_bytes());
                 out.push(12);
                 out.extend_from_slice(&adt.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
                 out.extend_from_slice(&0u32.to_le_bytes());
             }
         }
@@ -856,9 +1098,13 @@ mod tests {
         calls: usize,
     }
 
+    /// The model's grant: these tests drive [`Walk::one`] with no gate.
+    const GRANT: Fixture = Fixture(());
+
     impl Make for Model<'_> {
         type Error = NameError;
-        fn make(&mut self, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+        type Grant = Fixture;
+        fn make(&mut self, _grant: &Fixture, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             self.calls += 1;
             let (_, callees) = CALLS.iter().find(|(f, _)| *f == tabled.0).ok_or(NameError::Tag { tag: 255, at: 0 })?;
             let mut name: AVec<'_, u8> = Vec::new_in(self.alloc);
@@ -872,11 +1118,11 @@ mod tests {
             Ok(())
         }
 
-        fn make_static(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+        fn make_static(&mut self, _grant: &Fixture, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             panic!("the five-instance model declares no static");
         }
 
-        fn make_thread_local(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+        fn make_thread_local(&mut self, _grant: &Fixture, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             panic!("the five-instance model declares no thread-local");
         }
     }
@@ -893,7 +1139,8 @@ mod tests {
 
     impl Make for StaticModel<'_> {
         type Error = NameError;
-        fn make(&mut self, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+        type Grant = Fixture;
+        fn make(&mut self, _grant: &Fixture, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             assert_eq!(tabled.0, MAIN, "the statics model has one fn");
             self.fns += 1;
             entry.extend_from_slice(&S.to_le_bytes());
@@ -901,7 +1148,7 @@ mod tests {
             Ok(())
         }
 
-        fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+        fn make_static(&mut self, _grant: &Fixture, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             self.statics.push(item);
             if item.0 == S {
                 entry.extend_from_slice(&T.to_le_bytes());
@@ -910,7 +1157,7 @@ mod tests {
             Ok(())
         }
 
-        fn make_thread_local(&mut self, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+        fn make_thread_local(&mut self, _grant: &Fixture, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             panic!("the statics model declares no thread-local");
         }
     }
@@ -1169,8 +1416,110 @@ mod tests {
         let mut items: AVec<'_, ItemKey> = Vec::new_in(alloc);
         each_item(&name, |item| items.push(item)).expect("a well-formed name");
         assert_eq!(items.as_slice(), &[ItemKey(TWICE), ItemKey(APP)]);
-        name[20] = 99;
-        assert_eq!(each_item(&name, |_| {}), Err(NameError::Tag { tag: 99, at: 20 }));
+        // The node's tag is at byte 24 (key 16, argument count 4, node count 4).
+        name[24] = 99;
+        assert_eq!(each_item(&name, |_| {}), Err(NameError::Tag { tag: 99, at: 24 }));
+        name[24] = 12;
+        // The argument's reference past the one node: refused, never read past.
+        let last = name.len() - 4;
+        name[last] = 1;
+        assert_eq!(each_item(&name, |_| {}), Err(NameError::Ref { at: last }));
+    }
+
+    /// The polymorphic recursion model: `fn r<T>() { r::<(T,)>() }` (rustc: "reached the
+    /// recursion limit while instantiating `r::<(((...,),),)>`"). `R` at depth `d` is named by
+    /// `T` = `bool` in `d` one-tuples: in the forest, `d + 1` nodes.
+    const R: u128 = 0xC001;
+
+    /// The name of `r` at depth `depth` (symbols.rs' form, written by hand).
+    fn r_name(depth: u32, out: &mut AVec<'_, u8>) {
+        out.extend_from_slice(&R.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(depth + 1).to_le_bytes());
+        // `bool`, no children.
+        out.push(0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        // Each one-tuple of the node before it.
+        for k in 1..=depth {
+            out.push(7);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(k - 1).to_le_bytes());
+        }
+        out.extend_from_slice(&depth.to_le_bytes());
+    }
+
+    /// The model's maker: `r` at depth `d` declares `r` at `d + 1`, while `d + 1 < stop`.
+    struct RecModel<'a> {
+        alloc: Alloc<'a>,
+        stop: u32,
+    }
+
+    impl Make for RecModel<'_> {
+        type Error = NameError;
+        type Grant = Fixture;
+        fn make(&mut self, _grant: &Fixture, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            assert_eq!(tabled.0, R, "the recursion model has one fn");
+            let depth = u32::from_le_bytes([name[20], name[21], name[22], name[23]]) - 1;
+            if depth + 1 < self.stop {
+                let mut callee: AVec<'_, u8> = Vec::new_in(self.alloc);
+                r_name(depth + 1, &mut callee);
+                entry.extend_from_slice(&R.to_le_bytes());
+                entry.extend_from_slice(&(callee.len() as u32).to_le_bytes());
+                entry.extend_from_slice(&callee);
+            }
+            Ok(())
+        }
+
+        fn make_static(&mut self, _grant: &Fixture, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            panic!("the recursion model declares no static");
+        }
+
+        fn make_thread_local(&mut self, _grant: &Fixture, _item: ItemKey, _entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
+            panic!("the recursion model declares no thread-local");
+        }
+    }
+
+    /// (c) Polymorphic recursion stops at the recursion limit with a typed error, rustc's
+    /// words, the item and its declarer named: 128 by default, so `r` at depths 0..=128 are
+    /// rows and depth 129 is refused (rustc's collector: a def's depth is the count of its
+    /// instances above it, refused past the limit). CONTROLS: a raised limit (`#![recursion_limit
+    /// = "200"]`) moves the stop to 201; a recursion that ends at depth 128 walks whole.
+    #[test]
+    fn polymorphic_recursion_stops_at_the_recursion_limit() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let ids = StaticIds { text: [(R, 0), (S, 0), (T, 0)] };
+        let producer = model_producer();
+        let walk_to = |limit: Option<u32>, stop: u32| {
+            let mut store = MemoryStore::new_in(alloc);
+            let mut walk = Walk::new_in(alloc);
+            if let Some(limit) = limit {
+                walk.set_recursion_limit(limit);
+            }
+            let mut model = RecModel { alloc, stop };
+            let mut root: AVec<'_, u8> = Vec::new_in(alloc);
+            r_name(0, &mut root);
+            let ran = walk.run((ItemKey(R), &root), &ids, &mut store, &builder(), &producer, &mut model, &Toy, 1 << 16);
+            (ran, walk.len())
+        };
+        let (ran, rows) = walk_to(None, u32::MAX);
+        match ran {
+            Err(WalkError::RecursionLimit { tabled, item, declarer, depth, limit }) => {
+                assert_eq!((tabled, item, declarer, depth, limit), (ItemKey(R), ItemKey(R), Some(ItemKey(R)), 129, 128));
+            }
+            other => panic!("expected the recursion limit, got {other:?}"),
+        }
+        assert_eq!(rows, 129, "depths 0..=128 are rows");
+        let shown = std::format!("{}", WalkError::<NameError>::RecursionLimit { tabled: ItemKey(R), item: ItemKey(R), declarer: Some(ItemKey(R)), depth: 129, limit: 128 });
+        assert!(shown.starts_with("reached the recursion limit while instantiating fn 0xc001"), "{shown}");
+        let (ran, rows) = walk_to(Some(200), u32::MAX);
+        assert!(matches!(ran, Err(WalkError::RecursionLimit { depth: 201, limit: 200, .. })), "control: the crate's limit is the one read: {ran:?}");
+        assert_eq!(rows, 201);
+        let (ran, rows) = walk_to(None, 129);
+        assert!(ran.is_ok(), "control: a recursion that ends at depth 128 walks whole: {ran:?}");
+        assert_eq!(rows, 129);
+        std::println!("names: r::<(T,)> recursion refused at depth 129 of limit 128, 201 of 200; ends at 128 whole");
     }
 
     fn model_producer() -> ProducerId<CodeBuilder> {
@@ -1203,12 +1552,11 @@ mod tests {
         let mut scratch = Scratch::new_in(alloc);
         let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
         assert_eq!((root, walk.len(), walk.how(root), model.calls, store.puts), (0, 1, How::Waiting, 0, 0), "a root is a row and nothing else");
-        let one = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
-        let (how, key) = (one.how, one.key);
+        let one = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch).expect("main is made");
         let declared = <[u32; 3]>::try_from(one.declared).expect("main declares three instances");
-        assert_eq!(how, How::Made);
-        assert_eq!(walk.key(root), key);
-        assert!(key.is_some(), "main is keyed");
+        let Stepped::Made(key) = one.stepped else { panic!("main was not made under a key: {:?}", one.stepped) };
+        assert_eq!(walk.key(root), Some(key));
+        assert_eq!(walk.how(root), How::Done(Stepped::Made(key)), "the row holds what the step answered");
         assert_eq!(declared.map(|row| walk.tabled(row as usize).0), [HELPER, TWICE, PLAIN], "the entry's order");
         let mut twice: AVec<'_, u8> = Vec::new_in(alloc);
         name_of(TWICE, Some(APP), &mut twice);
@@ -1253,11 +1601,11 @@ mod tests {
         assert_eq!(lazy.root::<NameError>((ItemKey(PLAIN), &plain), 64).expect("plain is reached"), 0);
         let main_row = lazy.root::<NameError>((ItemKey(MAIN), &main), 64).expect("main is reached");
         assert_eq!(main_row, 1);
-        let one = lazy.one(main_row, &ids, &mut lazy_store, &builder, &producer, &mut lazy_model, &Toy, 64, &mut scratch).expect("main is made");
+        let one = lazy.one(main_row, &ids, &mut lazy_store, &builder, &producer, &mut lazy_model, &GRANT, &Toy, 64, &mut scratch).expect("main is made");
         assert_eq!(one.declared[2], 0, "main's step names plain's old row");
         let mut asked = 1;
         while let Some(row) = last_waiting(&lazy) {
-            lazy.one(row, &ids, &mut lazy_store, &builder, &producer, &mut lazy_model, &Toy, 64, &mut scratch).expect("the row is done");
+            lazy.one(row, &ids, &mut lazy_store, &builder, &producer, &mut lazy_model, &GRANT, &Toy, 64, &mut scratch).expect("the row is done");
             asked += 1;
             assert!(asked <= 5, "five instances take five steps");
         }
@@ -1296,10 +1644,10 @@ mod tests {
         let mut walk = Walk::new_in(alloc);
         let mut scratch = Scratch::new_in(alloc);
         let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
-        let first = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
-        let first = (first.how, first.key, <[u32; 3]>::try_from(first.declared).expect("three callees"));
-        let second = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is held");
-        let second = (second.how, second.key, <[u32; 3]>::try_from(second.declared).expect("three callees"));
+        let first = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch).expect("main is made");
+        let first = (first.stepped, <[u32; 3]>::try_from(first.declared).expect("three callees"));
+        let second = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch).expect("main is held");
+        let second = (second.stepped, <[u32; 3]>::try_from(second.declared).expect("three callees"));
         assert_eq!(first, second);
         assert_eq!((model.calls, store.puts, walk.len()), (1, 1, 4));
         assert!(scratch.made().is_empty(), "the second step made nothing");
@@ -1330,8 +1678,8 @@ mod tests {
         walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
         let mut asked = 0;
         while let Some(row) = last_waiting(&walk) {
-            let one = walk.one(row, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("the row is found");
-            assert_eq!(one.how, How::Found);
+            let one = walk.one(row, &ids, &mut store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch).expect("the row is found");
+            assert!(matches!(one.stepped, Stepped::Found(_)), "a row over a full store was not found: {:?}", one.stepped);
             assert!(scratch.made().is_empty(), "a found row makes no bytes");
             asked += 1;
             assert!(asked <= 5, "five instances take five steps");
@@ -1354,7 +1702,7 @@ mod tests {
         let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
         name_of(MAIN, None, &mut entry);
         let mut expected: AVec<'_, u8> = Vec::new_in(alloc);
-        Model { alloc, calls: 0 }.make(ItemKey(MAIN), &entry, &mut expected).expect("main's entry");
+        Model { alloc, calls: 0 }.make(&Fixture(()), ItemKey(MAIN), &entry, &mut expected).expect("main's entry");
         assert!(!expected.is_empty(), "main's entry declares its callees");
 
         let mut dropped = Ids::new([0, 0]);
@@ -1364,8 +1712,8 @@ mod tests {
         let mut walk = Walk::new_in(alloc);
         let mut scratch = Scratch::new_in(alloc);
         let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
-        let one = walk.one(root, &dropped, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
-        assert_eq!((one.how, one.key, one.declared.len()), (How::Unkeyed(Unkeyed::NoRecord), None, 3));
+        let one = walk.one(root, &dropped, &mut store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch).expect("main is made");
+        assert_eq!((one.stepped, one.stepped.key(), one.declared.len()), (Stepped::Unkeyed(Unkeyed::NoRecord), None, 3));
         assert_eq!(scratch.made(), expected.as_slice());
         assert_eq!((store.len(), store.puts, model.calls), (0, 0, 1));
 
@@ -1373,9 +1721,8 @@ mod tests {
         let mut keyed_store = MemoryStore::new_in(alloc);
         let mut keyed = Walk::new_in(alloc);
         let root = keyed.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
-        let one = keyed.one(root, &ids, &mut keyed_store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
-        assert_eq!(one.how, How::Made);
-        let key = one.key.expect("main is keyed");
+        let one = keyed.one(root, &ids, &mut keyed_store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch).expect("main is made");
+        let Stepped::Made(key) = one.stepped else { panic!("main was not made under a key: {:?}", one.stepped) };
         assert_eq!(keyed_store.get(key).expect("a memory store reads"), Some(scratch.made()));
         assert_eq!(scratch.made(), expected.as_slice());
     }

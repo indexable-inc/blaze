@@ -461,6 +461,11 @@ fn the_environment_of_a_unit() {
     assert_eq!(get("RUSTC"), "rustc");
     assert_eq!(env.get("RUSTC_WRAPPER"), None);
     assert_eq!(env.get("PATH"), None);
+    // `cc` reads the deployment target before it would ask `xcrun`; control: no other target
+    // is given one.
+    assert_eq!(get("MACOSX_DEPLOYMENT_TARGET"), crate::toolchain::MACOS_MIN);
+    let linux = Given { target: "aarch64-unknown-linux-gnu", ..given };
+    assert_eq!(crate::env::env(&linux, alloc).get("MACOSX_DEPLOYMENT_TARGET"), None);
     // tempo-node reads the profile as the fourth part from the end of `OUT_DIR`.
     let out_dir = get("OUT_DIR");
     assert_eq!(out_dir.rsplit('/').nth(3), Some("debug"));
@@ -644,9 +649,10 @@ fn the_compiler_answers_its_version_and_refuses_the_rest() {
     assert_eq!(ask(&["--version", "--verbose"]).as_deref(), Ok("version verbose=true"));
     assert_eq!(ask(&["--verbose", "--version"]).as_deref(), Ok("version verbose=true"));
     assert_eq!(ask(&["--crate-type=lib", "--emit=metadata", "-"]).as_deref(), Ok("compile"));
-    assert_eq!(probe::version(false, "aarch64-apple-darwin", alloc).as_str(), "rustc 1.101.0-nightly (16d1ffac1 2026-10-26)\n");
+    assert_eq!(probe::version(false, "aarch64-apple-darwin", alloc).as_str(), format!("{}\n", blaze_pins::RUSTC_V));
     let verbose = probe::version(true, "aarch64-apple-darwin", alloc);
-    assert!(verbose.as_str().contains("\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n"), "{}", verbose.as_str());
+    let tail = format!("\nhost: aarch64-apple-darwin\nrelease: {}\nLLVM version: {}\n", blaze_pins::RELEASE, blaze_pins::RUSTC_LLVM);
+    assert!(verbose.as_str().contains(&tail), "{}", verbose.as_str());
     // A try-compile is keyed without its path, by its snippet; the empty table answers none.
     let key = |args: &[&str], snippet: &[u8]| match crate::probe_ask::classify(args, alloc) {
         Ok(Ask::Compile(compile)) => compile.key("aarch64-apple-darwin", snippet),
@@ -662,19 +668,3 @@ fn the_compiler_answers_its_version_and_refuses_the_rest() {
     assert_eq!(Table { rows: &rows }.answer(&a), Some(true));
 }
 
-/// The version text is the pin's: harness/toolchain's date, and the pins file's `rustc` line.
-#[test]
-fn the_version_is_the_pinned_nightly() {
-    let toolchain = include_str!("../../../harness/toolchain").trim();
-    assert_eq!(toolchain, "nightly-2026-10-27", "the pin moved: update probe.rs's version text from the new nightly's `rustc -vV`");
-    let pins = include_str!("../../blaze-cargo/src/toolchain/pins.txt");
-    let rustc = pins.lines().find_map(|l| l.strip_prefix("rustc ")).unwrap_or("");
-    assert_eq!(format!("rustc {rustc}"), probe::VERSION);
-    let commit = pins.lines().find_map(|l| l.strip_prefix("commit ")).unwrap_or("");
-    assert_eq!(commit, probe::COMMIT_HASH);
-    // `cargo -V`'s line: pins.txt's, written by harness/toolchain_pins.py from the manifest.
-    let cargo = pins.lines().find_map(|l| l.strip_prefix("cargo ")).expect("pins.txt has the cargo line");
-    assert_eq!(format!("cargo {cargo}"), probe::CARGO_VERSION);
-    assert!(cargo.starts_with(probe::RELEASE), "cargo -V says rustc's release");
-    assert_eq!(probe::cargo_version(blaze_own::Alloc::global()).as_str(), "cargo 1.101.0-nightly (cad07cf8e 2026-10-23)\n");
-}

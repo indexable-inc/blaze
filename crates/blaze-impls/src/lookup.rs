@@ -40,7 +40,8 @@
 //!
 //! **What is read.** Of each holder: its `NoImplsOf`; where that may hold the trait and the
 //! bucket, its directory; where that names the bucket, the bucket. Every read is handed to
-//! [`ImplRecords::note`], with its answer, the negative ones included.
+//! [`ImplRecords::note`] or the observer installed by [`Candidates::recording`], with its
+//! answer, the negative ones included.
 
 use core::fmt;
 
@@ -69,6 +70,12 @@ pub trait ImplRecords {
     /// The crate's bucket of content id `bucket`, as its directory names it.
     fn bucket(&self, krate: CrateItemKey, bucket: ContentId) -> Result<&[u8], Self::Error>;
 
+    /// The hash of `key` used by the writer. A reader serving many lookups can retain it
+    /// across questions, including questions that visit different crates.
+    fn bucket_hash(&self, key: BucketKey) -> BucketHash {
+        key.hash()
+    }
+
     /// A read a lookup made, with what it answered.
     fn note(&self, read: ImplRead);
 }
@@ -78,8 +85,15 @@ pub trait ImplRecords {
 pub enum Probe {
     /// Whether the crate has an impl of the trait.
     Trait(ItemKey),
+    /// Whether an impl with an unknown trait prevents the crate from ruling out any trait.
+    UnreadTrait,
     /// Whether the crate has a bucket of the hash.
     Bucket(BucketHash),
+}
+
+impl Probe {
+    /// The wanted buckets, the trait precheck and its crate-wide unread-impl dependency.
+    pub const SLOTS: usize = WANTS + 2;
 }
 
 /// One read of a lookup, with its answer: an entry of the asker's read list, valid while the
@@ -167,19 +181,16 @@ impl<E: fmt::Display + fmt::Debug> core::error::Error for ImplLookupError<E> {}
 #[derive(Clone, Copy, Debug)]
 struct Want {
     key: BucketKey,
-    hash: BucketHash,
+    /// Filled when the first holder reaches this bucket after its trait precheck.
+    hash: Option<BucketHash>,
     /// Asked only of the crates that can name the goal's shape's definition (its rows are at
     /// that shape).
     shaped: bool,
 }
 
 impl Want {
-    fn of(key: BucketKey) -> Want {
-        Want { key, hash: key.hash(), shaped: false }
-    }
-
-    fn shaped(key: BucketKey) -> Want {
-        Want { key, hash: key.hash(), shaped: true }
+    fn of(key: BucketKey, shaped: bool) -> Want {
+        Want { key, hash: None, shaped }
     }
 }
 
@@ -234,6 +245,7 @@ impl<'g> Reach<'g> {
 /// What a lookup holds of the crate it is reading.
 struct InCrate<'c> {
     krate: CrateItemKey,
+    holder: usize,
     filter: NoImplsOfView<'c>,
     directory: Option<DirectoryView<'c>>,
     /// Whether the crate can name the goal's shape's definition: else its shaped wants are
@@ -251,6 +263,7 @@ pub struct Candidates<'g, 'c, C: ImplRecords> {
     /// None for a [`Reach::Listed`] lookup, which reads no crate graph.
     graph: Option<CrateGraphView<'g>>,
     cx: &'c C,
+    observer: Option<&'c dyn Fn(usize, usize, ImplRead)>,
     reach: Reach<'g>,
     /// Asked of each crate's `NoImplsOf` before its buckets: the trait, for a trait lookup.
     trait_: Option<ItemKey>,
@@ -271,12 +284,12 @@ pub struct Candidates<'g, 'c, C: ImplRecords> {
 /// blanket bucket, the unread trait impls at the shape and at any shape, and the blind impls.
 /// A shape no impl is filed under (a blanket's, a placeholder's) wants no shaped bucket.
 fn trait_wants(trait_: ItemKey, shape: SelfShape) -> [Option<Want>; WANTS] {
-    let any = |key| Some(Want::of(key));
+    let any = |key| Some(Want::of(key, false));
     let (by_shape, unread_at) = match shape.files_no_impl() {
         true => (None, None),
         false => (
-            Some(Want::shaped(BucketKey::Trait { trait_, shape })),
-            Some(Want::shaped(BucketKey::UnreadTrait { shape })),
+            Some(Want::of(BucketKey::Trait { trait_, shape }, true)),
+            Some(Want::of(BucketKey::UnreadTrait { shape }, true)),
         ),
     };
     [
@@ -291,14 +304,15 @@ fn trait_wants(trait_: ItemKey, shape: SelfShape) -> [Option<Want>; WANTS] {
 /// What an inherent lookup wants of each crate, in this order: the shape's bucket, the
 /// inherent impls whose self type was not read to a shape, and the blind impls.
 fn inherent_wants(shape: SelfShape) -> [Option<Want>; WANTS] {
+    let any = |key| Some(Want::of(key, false));
     let by_shape = match shape.files_no_impl() {
         true => None,
-        false => Some(Want::of(BucketKey::Inherent { shape })),
+        false => any(BucketKey::Inherent { shape }),
     };
     [
         by_shape,
-        Some(Want::of(BucketKey::Inherent { shape: SelfShape::BLANKET })),
-        Some(Want::of(BucketKey::Blind)),
+        any(BucketKey::Inherent { shape: SelfShape::BLANKET }),
+        any(BucketKey::Blind),
         None,
         None,
     ]
@@ -388,16 +402,44 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
         first_in: Option<&'g [u64]>,
     ) -> Candidates<'g, 'c, C> {
         let done = wants.iter().all(Option::is_none);
-        Candidates { graph, cx, reach, trait_, wants, first_in, word: 0, bits: 0, current: None, done }
+        Candidates { graph, cx, observer: None, reach, trait_, wants, first_in, word: 0, bits: 0, current: None, done }
+    }
+
+    /// Visits just the shape-specific buckets. A survey over several numeric widths visits
+    /// the shared blanket and blind buckets with its first width, then calls this for each
+    /// later width over the same holders. Trait lookups still ask each holder's trait filter.
+    pub fn only_at_shape(mut self) -> Self {
+        for want in &mut self.wants {
+            if want.is_some_and(|w| w.key.shape().is_blanket()) {
+                *want = None;
+            }
+        }
+        if let Some(current) = &mut self.current
+            && current.bucket.as_ref().is_some_and(|(bucket, _)| bucket.key().shape().is_blanket())
+        {
+            current.bucket = None;
+        }
+        self.done |= self.trait_.is_none() && self.wants.iter().all(Option::is_none);
+        self
+    }
+
+    /// Routes subsequent reads to `observer(holder, slot, read)`. The holder is the crate's
+    /// index in the supplied list or in the graph. Slot zero asks whether the crate may
+    /// hold the trait. Slots 1 through WANTS name the wanted buckets in order. The final
+    /// slot reads the unread-impl flag on which the trait precheck also depends.
+    pub fn recording(mut self, observer: &'c dyn Fn(usize, usize, ImplRead)) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// The next crate of the reach, in index order (listed: in the caller's order), and
     /// whether it can name the goal's shape's definition.
-    fn next_holder(&mut self) -> Option<(CrateItemKey, bool)> {
+    fn next_holder(&mut self) -> Option<(usize, CrateItemKey, bool)> {
         if let Reach::Listed(crates) = self.reach {
-            let krate = *crates.get(self.word)?;
+            let at = self.word;
+            let krate = *crates.get(at)?;
             self.word += 1;
-            return Some((krate, true));
+            return Some((at, krate, true));
         }
         let graph = self.graph?;
         loop {
@@ -406,7 +448,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                 self.bits &= self.bits - 1;
                 let at = (self.word - 1) * 64 + bit;
                 let names_shape = self.first_in.is_none_or(|row| row[at / 64] & (1 << (at % 64)) != 0);
-                return Some((graph.key(CrateIndex::of_bit(at)), names_shape));
+                return Some((at, graph.key(CrateIndex::of_bit(at)), names_shape));
             }
             if self.word >= self.reach.words() {
                 return None;
@@ -419,6 +461,11 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
     /// The next row, none at the end.
     fn step(&mut self) -> Result<Option<ImplRow>, ImplLookupError<C::Error>> {
         let cx = self.cx;
+        let observer = self.observer;
+        let note = |holder, slot, read| match observer {
+            Some(observe) => observe(holder, slot, read),
+            None => cx.note(read),
+        };
         loop {
             if let Some(current) = &mut self.current {
                 let krate = current.krate;
@@ -433,12 +480,13 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                     }
                     current.bucket = None;
                 }
-                if let Some(&want) = self.wants.get(current.next_want) {
+                if let Some(want) = self.wants.get_mut(current.next_want) {
                     current.next_want += 1;
                     // A crate that cannot name the shape's definition holds none of the
                     // shape's impls, only those for any shape.
-                    if let Some(want) = want.filter(|want| current.names_shape || !want.shaped) {
-                        let opened = open_want(cx, current, want)?;
+                    if let Some(want) = want.as_mut().filter(|want| current.names_shape || !want.shaped) {
+                        let slot = current.next_want;
+                        let opened = open_want(cx, current, want, slot, &note)?;
                         current.bucket = opened;
                     }
                     continue;
@@ -446,7 +494,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                 self.current = None;
                 continue;
             }
-            let Some((krate, names_shape)) = self.next_holder() else { return Ok(None) };
+            let Some((holder, krate, names_shape)) = self.next_holder() else { return Ok(None) };
             let bytes = cx.no_impls_of(krate).map_err(|error| ImplLookupError::Records {
                 krate,
                 record: RecordKind::NoImplsOf,
@@ -466,12 +514,13 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
             }
             if let Some(trait_) = self.trait_ {
                 let may_hold = filter.may_hold_trait(trait_);
-                cx.note(ImplRead::Filter { krate, probe: Probe::Trait(trait_), may_hold });
+                note(holder, 0, ImplRead::Filter { krate, probe: Probe::Trait(trait_), may_hold });
+                note(holder, WANTS + 1, ImplRead::Filter { krate, probe: Probe::UnreadTrait, may_hold: filter.has_unread() });
                 if !may_hold {
                     continue;
                 }
             }
-            self.current = Some(InCrate { krate, filter, directory: None, names_shape, next_want: 0, bucket: None });
+            self.current = Some(InCrate { krate, holder, filter, directory: None, names_shape, next_want: 0, bucket: None });
         }
     }
 }
@@ -481,11 +530,14 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
 fn open_want<'c, C: ImplRecords>(
     cx: &'c C,
     current: &mut InCrate<'c>,
-    want: Want,
+    want: &mut Want,
+    slot: usize,
+    note: &impl Fn(usize, usize, ImplRead),
 ) -> Result<Option<(BucketView<'c>, usize)>, ImplLookupError<C::Error>> {
     let krate = current.krate;
-    let may_hold = current.filter.may_hold_bucket(want.hash);
-    cx.note(ImplRead::Filter { krate, probe: Probe::Bucket(want.hash), may_hold });
+    let hash = *want.hash.get_or_insert_with(|| cx.bucket_hash(want.key));
+    let may_hold = current.filter.may_hold_bucket(hash);
+    note(current.holder, slot, ImplRead::Filter { krate, probe: Probe::Bucket(hash), may_hold });
     if !may_hold {
         return Ok(None);
     }
@@ -513,15 +565,15 @@ fn open_want<'c, C: ImplRecords>(
             directory
         }
     };
-    let hit = directory.lookup(want.hash);
-    cx.note(ImplRead::Directory { krate, bucket: want.hash, found: hit.map(|hit| hit.bucket) });
+    let hit = directory.lookup(hash);
+    note(current.holder, slot, ImplRead::Directory { krate, bucket: hash, found: hit.map(|hit| hit.bucket) });
     let Some(hit) = hit else { return Ok(None) };
     let bytes = cx.bucket(krate, hit.bucket).map_err(|error| ImplLookupError::Records {
         krate,
         record: RecordKind::Bucket,
         error,
     })?;
-    cx.note(ImplRead::Bucket { krate, bucket: hit.bucket });
+    note(current.holder, slot, ImplRead::Bucket { krate, bucket: hit.bucket });
     let bucket = BucketView::read(bytes).map_err(|error| ImplLookupError::Format {
         krate,
         record: RecordKind::Bucket,

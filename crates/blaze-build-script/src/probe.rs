@@ -10,7 +10,7 @@
 //!   by blaze from the snippet where it can, else by a table of answers for the pinned nightly
 //!   ([`Table`]). A probe neither answers is the runtime's `CannotAnswerYet`, which fails that
 //!   one script naming the probe.
-//! - `cargo -V` (`--version`, `version`): the pinned nightly's cargo line ([`CARGO_VERSION`]),
+//! - `cargo -V` (`--version`, `version`): the pinned nightly's cargo line ([`blaze_pins::CARGO_V`]),
 //!   a fact of the pin keyed with the rustc text ([`answers_id`]); any other cargo command is
 //!   routed like any other program.
 //! - Any other program (a C compiler, `git`, `cmake`, `pkg-config`) is routed by the runner
@@ -23,23 +23,15 @@
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, Alloc, String};
 
+use blaze_pins::{CARGO_V, COMMIT_DATE, COMMIT_HASH, RELEASE, RUSTC_LLVM, RUSTC_V};
+
 use crate::probe_ask::{Ask, classify};
 
-/// What `rustc -V` of the pinned nightly prints (crates/blaze-cargo/src/toolchain/pins.txt's
-/// `rustc` line; a test holds them equal).
-pub const VERSION: &str = "rustc 1.101.0-nightly (16d1ffac1 2026-10-26)";
-pub const COMMIT_HASH: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
-pub const COMMIT_DATE: &str = "2026-10-26";
-pub const RELEASE: &str = "1.101.0-nightly";
-/// `LLVM version:` of `rustc -vV` of nightly-2026-10-27 (read once from the pinned toolchain
-/// on 2026-11-16; the pin bump records it from then on). portable-atomic reads it.
-pub const LLVM: &str = "23.1.4";
-/// What `cargo -V` of the pinned nightly prints (pins.txt's `cargo` line, which
-/// harness/toolchain_pins.py derives from the channel manifest's cargo version: rustc's
-/// release, then cargo's own commit and date; a test holds them equal). A script that asks the
-/// toolchain's cargo for its version (codspeed) is told this, a fact of the pin, never a
-/// program run.
-pub const CARGO_VERSION: &str = "cargo 1.101.0-nightly (cad07cf8e 2026-10-23)";
+// The version answers are the pin's facts (pins/rust.txt and the recorded `rustc -vV` in
+// pins/answers/rustc.json, read at compile time by blaze-pins): what `rustc -V` and `cargo -V`
+// print, the commit and release, and the `LLVM version:` portable-atomic reads. A script that
+// asks the toolchain's cargo for its version (codspeed) is told `CARGO_V`, a fact of the pin,
+// never a program run.
 
 /// Whether a spawn of `cargo` with `args` is a version question the pin answers: `-V`,
 /// `--version` or the `version` command, alone. `-vV` and `version --verbose` print the
@@ -51,7 +43,7 @@ pub fn is_cargo_version(program: &str, args: &[&str]) -> bool {
 
 /// The text `cargo -V` prints.
 pub fn cargo_version<'a>(alloc: Alloc<'a>) -> AString<'a> {
-    let mut out = String::from_str_in(CARGO_VERSION, alloc);
+    let mut out = String::from_str_in(CARGO_V, alloc);
     out.push('\n');
     out
 }
@@ -84,7 +76,7 @@ pub fn is_deferred_tool(program: &str, args: &[&str]) -> bool {
 
 /// The text `rustc` prints for a version request.
 pub fn version<'a>(verbose: bool, host: &str, alloc: Alloc<'a>) -> AString<'a> {
-    let mut out = String::from_str_in(VERSION, alloc);
+    let mut out = String::from_str_in(RUSTC_V, alloc);
     out.push('\n');
     if verbose {
         for (key, value) in [
@@ -93,7 +85,7 @@ pub fn version<'a>(verbose: bool, host: &str, alloc: Alloc<'a>) -> AString<'a> {
             ("commit-date", COMMIT_DATE),
             ("host", host),
             ("release", RELEASE),
-            ("LLVM version", LLVM),
+            ("LLVM version", RUSTC_LLVM),
         ] {
             out.push_str(key);
             out.push_str(": ");
@@ -174,7 +166,7 @@ impl Table<'_> {
 /// The identity of everything a spawn can be answered with.
 pub fn answers_id(table: &Table<'_>) -> ContentId {
     let mut hasher = Hasher::new("blaze v2 build-script answers 3");
-    hasher.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(LLVM.as_bytes()).part(CARGO_VERSION.as_bytes());
+    hasher.part(RUSTC_V.as_bytes()).part(COMMIT_HASH.as_bytes()).part(RUSTC_LLVM.as_bytes()).part(CARGO_V.as_bytes());
     hasher.part(crate::probe_ask::DECIDER.as_bytes());
     for row in table.rows {
         hasher.id(&row.key).update(&[u8::from(row.accepted)]);

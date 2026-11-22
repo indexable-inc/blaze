@@ -8,11 +8,13 @@
 
 use std::{
     mem,
-    os::fd::{AsRawFd as _, OwnedFd, RawFd},
+    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
 };
 
+use blaze_sys::linux::{MsgFlags, OpenFlags, PollEvents};
+
 use super::{
-    ops::{ABANDONED, DIRECT, FINISHED, LINKS, PART, STDERR, STOPPING, ZERO_COPY},
+    ops::{ABANDONED, DIRECT, FINISHED, LINKS, PART, STDERR, STOPPING, UNIX_PEER, ZERO_COPY},
     *,
 };
 
@@ -274,7 +276,7 @@ impl Uring {
                 Sqe {
                     opcode: OP_POLL_ADD,
                     fd: spawn.pidfd.as_raw_fd(),
-                    op_flags: libc::POLLIN as u32,
+                    op_flags: PollEvents::IN.bits() as u32,
                     user_data,
                     ..Sqe::default()
                 }
@@ -284,7 +286,7 @@ impl Uring {
             Kind::Pressure => Sqe {
                 opcode: OP_POLL_ADD,
                 fd: raw(&cold.fds[0]),
-                op_flags: libc::POLLPRI as u32,
+                op_flags: PollEvents::PRI.bits() as u32,
                 user_data,
                 ..Sqe::default()
             },
@@ -310,6 +312,22 @@ impl Uring {
                     ..Sqe::default()
                 }
             }
+            // A Unix listen's accept: into a descriptor of the process's table, close-on-exec,
+            // so its peer's uid is read before it is put in a slot ([`UNIX_PEER`], `admitted`).
+            Kind::Accept if hot.flags & UNIX_PEER != 0 => Sqe {
+                opcode: OP_ACCEPT,
+                ioprio: ACCEPT_MULTISHOT,
+                fd: self
+                    .listeners
+                    .get(Handle::from_bits(hot.of))
+                    .expect("an accept's listener")
+                    .fd(),
+                op_flags: blaze_sys::posix::net::SOCK_CLOEXEC as u32,
+                // No file slot: the completion's result is the new descriptor.
+                splice_fd_in: 0,
+                user_data,
+                ..Sqe::default()
+            },
             Kind::Accept => Sqe {
                 opcode: OP_ACCEPT,
                 ioprio: ACCEPT_MULTISHOT,
@@ -365,7 +383,7 @@ impl Uring {
                     fd,
                     addr,
                     len,
-                    op_flags: libc::MSG_NOSIGNAL as u32,
+                    op_flags: MsgFlags::NO_SIGNAL.bits(),
                     user_data,
                     ..Sqe::default()
                 }
@@ -376,7 +394,7 @@ impl Uring {
                     opcode: OP_SHUTDOWN,
                     flags,
                     fd,
-                    len: libc::SHUT_RDWR as u32,
+                    len: blaze_sys::posix::net::SHUT_RDWR as u32,
                     user_data,
                     ..Sqe::default()
                 }
@@ -626,7 +644,7 @@ impl Uring {
                 let put = self.progress(id, res);
                 match (put < self.ops.buf(id).len(), res) {
                     (false, _) => Step::Ends(Some(Done::Appended)),
-                    (true, 0) => Step::Ends(failed(-libc::EIO)),
+                    (true, 0) => Step::Ends(failed(-i32::from(Errno::Io.raw()))),
                     (true, _) => Step::Again,
                 }
             }
@@ -653,7 +671,7 @@ impl Uring {
                 let (_, len) = memory_of(self.ops.cold(id));
                 match (put < u64::from(len), res) {
                     (false, _) => Step::Ends(Some(Done::Written)),
-                    (true, 0) => Step::Ends(failed(-libc::EIO)),
+                    (true, 0) => Step::Ends(failed(-i32::from(Errno::Io.raw()))),
                     (true, _) => Step::Again,
                 }
             }
@@ -708,12 +726,12 @@ impl Uring {
             Kind::Input => {
                 let spawn = Handle::from_bits(hot.of);
                 // It ended, or closed its input, before reading all of it.
-                if res == -libc::EPIPE {
+                if res == -i32::from(Errno::Pipe.raw()) {
                     return Step::Ends(None);
                 }
                 let len = self.ops.buf(id).len();
                 if res < 0 || (res == 0 && (hot.done as usize) < len) {
-                    let why = if res < 0 { error(res) } else { error(-libc::EIO) };
+                    let why = if res < 0 { error(res) } else { error(-i32::from(Errno::Io.raw())) };
                     self.spoil(spawn, format!("writing its input: {why}")); // alloc: an error.
                     return Step::Ends(None);
                 }
@@ -748,7 +766,7 @@ impl Uring {
                 Step::Ends(None)
             }
             Kind::Send => self.sent(id, hot, res, flags),
-            Kind::Shutdown if res < 0 && res != -libc::ENOTCONN => Step::Ends(failed(res)),
+            Kind::Shutdown if res < 0 && res != -i32::from(Errno::NotConn.raw()) => Step::Ends(failed(res)),
             Kind::Shutdown => Step::Ends(Some(Done::HungUp)),
         }
     }
@@ -770,11 +788,11 @@ impl Uring {
             watchings.get_mut(Handle::from_bits(hot.of)).expect("a watch's read's watching");
         match res {
             // Cancelled for a flush, or by a flush's cancel that came after the read it was for.
-            _ if res == -libc::ECANCELED && !*stopping => {
+            _ if res == -i32::from(Errno::Canceled.raw()) && !*stopping => {
                 flushed(ready, tag, tree, buffer, flushes, journal.as_ref());
                 Step::Again
             }
-            _ if res == -libc::ECANCELED || (res < 0 && *stopping) => {
+            _ if res == -i32::from(Errno::Canceled.raw()) || (res < 0 && *stopping) => {
                 watches.remove(&tag);
                 unflushed(ready, flushes);
                 Step::Ends(Some(Done::Unwatched))
@@ -794,7 +812,7 @@ impl Uring {
             _ => {
                 watches.remove(&tag);
                 unflushed(ready, flushes);
-                Step::Ends(failed(if res < 0 { res } else { -libc::EIO }))
+                Step::Ends(failed(if res < 0 { res } else { -i32::from(Errno::Io.raw()) }))
             }
         }
     }
@@ -806,7 +824,23 @@ impl Uring {
         let stopping = hot.flags & STOPPING != 0;
         if res >= 0 {
             let tcp = self.listeners.get(Handle::from_bits(hot.of)).is_some_and(|it| !it.is_unix());
-            let socket = self.table.accepted(res as u32);
+            let socket = match self.admitted(hot, res) {
+                Ok(Some(socket)) => socket,
+                // Refused and closed unread: as a connection that went before it was taken
+                // (below), the listen goes on.
+                Ok(None) if more => return Step::Held,
+                Ok(None) if stopping => {
+                    self.listens.remove(&tag);
+                    return Step::Ends(Some(Done::Unlistened));
+                }
+                Ok(None) => return Step::Again,
+                Err(error) => {
+                    self.listens.remove(&tag);
+                    // alloc: an error.
+                    let why = format!("putting an accepted connection in the ring's table of files: {error}");
+                    return Step::Ends(Some(Done::Failed(IoError(why))));
+                }
+            };
             let conn = self.add(socket, tcp);
             let done = Done::Accepted { conn };
             // Stopping, it ends only at the completion that says the kernel let go of it: until
@@ -822,11 +856,11 @@ impl Uring {
             // The kernel goes on accepting with it: it has not ended.
             return Step::Held;
         }
-        if res == -libc::ECANCELED || stopping {
+        if res == -i32::from(Errno::Canceled.raw()) || stopping {
             self.listens.remove(&tag);
             return Step::Ends(Some(Done::Unlistened));
         }
-        if res == -libc::ENFILE {
+        if res == -i32::from(Errno::NFile.raw()) {
             self.listens.remove(&tag);
             // alloc: an error.
             let why = format!(
@@ -840,22 +874,49 @@ impl Uring {
         // A connection that went before it was taken, or the network's errors that accept(2)
         // says to take as "try again".
         let again = [
-            libc::ECONNABORTED,
-            libc::EINTR,
-            libc::EPROTO,
-            libc::ENETDOWN,
-            libc::ENOPROTOOPT,
-            libc::EHOSTDOWN,
-            libc::ENONET,
-            libc::EHOSTUNREACH,
-            libc::EOPNOTSUPP,
-            libc::ENETUNREACH,
+            Errno::ConnAborted,
+            Errno::Intr,
+            Errno::Proto,
+            Errno::NetDown,
+            Errno::NoProtoOpt,
+            Errno::HostDown,
+            Errno::NoNet,
+            Errno::HostUnreach,
+            Errno::OpNotSupp,
+            Errno::NetUnreach,
         ];
-        if again.contains(&-res) {
+        if again.iter().any(|e| i32::from(e.raw()) == -res) {
             return Step::Again;
         }
         self.listens.remove(&tag);
         Step::Ends(failed(res))
+    }
+
+    /// The connection an accept of the listen `hot` made, `res` (not negative) its completion's
+    /// result. A TCP listen's: the slot of the kernel's half it was put in. A Unix listen's
+    /// ([`UNIX_PEER`]): a descriptor, whose peer is checked by the decision every driver's
+    /// accept takes (`crate::net::Listener::admit`, net.rs `peer_is`) BEFORE it is put in the
+    /// driver's half of the table and handed to anyone; refused (another user, or a uid that
+    /// cannot be read), it is closed here unread: `Ok(None)`, as the other drivers skip a
+    /// `ConnectionAborted` accept. `Err`: the table could not take it (`Table::install`).
+    fn admitted(&mut self, hot: Hot, res: i32) -> io::Result<Option<Fixed>> {
+        if hot.flags & UNIX_PEER == 0 {
+            return Ok(Some(self.table.accepted(res as u32)));
+        }
+        // SAFETY: a Unix listen's accept asks for no file slot (`sqes`, `splice_fd_in` 0), so its
+        // result is a descriptor the kernel just made in this process's table, which nothing
+        // else names: owning it here closes it exactly once.
+        let fd = unsafe { OwnedFd::from_raw_fd(res) };
+        let listener = self.listeners.get(Handle::from_bits(hot.of)).expect("an accept's listener");
+        let refused = listener.admit(blaze_sys::Fd::new(fd.as_raw_fd())).is_err();
+        // The planted bug of `a_foreign_peer_is_closed_unread_on_the_ring`: the check left out.
+        #[cfg(test)]
+        let refused = refused && !self.peers_unchecked;
+        if refused {
+            drop(fd);
+            return Ok(None);
+        }
+        self.table.install(fd).map(Some)
     }
 
     /// The multishot receive `hot` completed with `res`, its bytes in the provided buffer its
@@ -883,9 +944,9 @@ impl Uring {
             match res {
                 // The peer hung up, or reset it: as good as hung up, for a reader.
                 0 => connection.ended = Some(Ok(())),
-                _ if res == -libc::ECONNRESET => connection.ended = Some(Ok(())),
+                _ if res == -i32::from(Errno::ConnReset.raw()) => connection.ended = Some(Ok(())),
                 // Out of buffers, or paused: armed again once it is wanted.
-                _ if res == -libc::ENOBUFS || res == -libc::ECANCELED || res > 0 => {}
+                _ if res == -i32::from(Errno::NoBufs.raw()) || res == -i32::from(Errno::Canceled.raw()) || res > 0 => {}
                 _ => connection.ended = Some(Err(error(res))),
             }
             return Step::Ends(None);
@@ -914,7 +975,7 @@ impl Uring {
                     bytes.clear();
                     Step::Ends(Some(Done::Sent(bytes)))
                 }
-                (true, 0) => self.unsent(id, libc::EIO),
+                (true, 0) => self.unsent(id, i32::from(Errno::Io.raw())),
                 (true, _) => Step::Again,
             };
         }
@@ -931,7 +992,7 @@ impl Uring {
             }
             errno = match res {
                 _ if res < 0 => -res,
-                0 if hot.done < len => libc::EIO,
+                0 if hot.done < len => i32::from(Errno::Io.raw()),
                 _ => 0,
             };
             if errno == 0 && hot.done < len {
@@ -1346,7 +1407,7 @@ impl Uring {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .custom_flags((OpenFlags::NONBLOCK | OpenFlags::CLOSE_ON_EXEC).bits() as i32)
             .open(&path)
             .map_err(|error| named(error, "opening the memory pressure file"))?;
         file.write_all(PSI_TRIGGER).map_err(|error| {
@@ -1376,11 +1437,11 @@ impl Uring {
     /// or a trigger the kernel tore down (its cgroup removed: `POLLERR`), ends it, naming the
     /// file.
     fn pressed(&mut self, id: Id, hot: Hot, res: i32) -> Step {
-        if hot.flags & STOPPING != 0 || res == -libc::ECANCELED {
+        if hot.flags & STOPPING != 0 || res == -i32::from(Errno::Canceled.raw()) {
             self.watches.remove(&hot.tag);
             return Step::Ends(Some(Done::Unwatched));
         }
-        let gone = (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) as i32;
+        let gone = i32::from((PollEvents::ERR | PollEvents::HUP | PollEvents::NVAL).bits());
         if res < 0 || res & gone != 0 {
             self.watches.remove(&hot.tag);
             let why = if res < 0 { error(res) } else { format!("poll said {res:#x}") }; // alloc: an error path.
@@ -1389,7 +1450,7 @@ impl Uring {
             let why = format!("watching memory pressure through the PSI trigger on {path}: {why}");
             return Step::Ends(Some(Done::Failed(IoError(why))));
         }
-        if res & libc::POLLPRI as i32 != 0 {
+        if res & i32::from(PollEvents::PRI.bits()) != 0 {
             // PSI says nothing of how bad: no trigger here is the critical one.
             return Step::Goes(Done::Pressed { critical: false });
         }
@@ -1466,10 +1527,16 @@ impl Drop for Uring {
         while alive {
             for (user_data, res, flags) in posted.drain(..) {
                 let (id, _) = of_data(user_data);
-                match self.ops.get(id).map(|it| it.kind) {
-                    // A connection the accept made after it was cancelled, let go here.
-                    Some(Kind::Accept) if res >= 0 => _ = self.table.set(res as u32, -1),
-                    Some(Kind::Recv) if flags & CQE_F_BUFFER != 0 => {
+                match self.ops.get(id).map(|it| (it.kind, it.flags)) {
+                    // A connection the accept made after it was cancelled, let go here: a Unix
+                    // listen's is a descriptor ([`UNIX_PEER`]), closed; a TCP one's a slot.
+                    Some((Kind::Accept, kind)) if res >= 0 && kind & UNIX_PEER != 0 => {
+                        // SAFETY: as in `admitted`: a descriptor the kernel just made, which
+                        // nothing else names.
+                        drop(unsafe { OwnedFd::from_raw_fd(res) });
+                    }
+                    Some((Kind::Accept, _)) if res >= 0 => _ = self.table.set(res as u32, -1),
+                    Some((Kind::Recv, _)) if flags & CQE_F_BUFFER != 0 => {
                         self.provided.give((flags >> CQE_BUFFER_SHIFT) as u16);
                     }
                     _ => {}

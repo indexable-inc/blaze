@@ -24,7 +24,7 @@
 use std::{alloc::Global, fmt::Write as _, time::Duration};
 
 use blaze_arrow_ipc::{IpcError, StreamReader, StreamWriter};
-use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_hash::{FixedState, Map};
 
 use crate::{
     batches::{self, Process},

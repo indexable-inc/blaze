@@ -22,7 +22,7 @@
 //! are main.rs's tests'.
 
 use super::super::*;
-use super::unnamed;
+use super::{made_pair, unnamed};
 
 /// The crate root: the two modules and the derive `Copy` declaring the helper `show`, as
 /// serde's `Serialize` declares `serde`.
@@ -63,10 +63,10 @@ fn checks_of(seed: u64, states: &[&str]) -> std::vec::Vec<Seen> {
     let mut seen = std::vec::Vec::new();
     for (i, a) in states.iter().enumerate() {
         write(&io, "src/a.rs", a);
-        let got = check(&io, work::Sizes::USUAL);
-        let made_counts = (made(&got.profile, "Signature"), made(&got.profile, "BodyCheck"));
-        std::println!("check {i}: failed {:?}; errors {}; made (Signature, BodyCheck) {made_counts:?}; words {:?}", got.failed, got.errors, got.words);
-        assert!(got.failed.is_empty(), "check {i}: {:?}\n{}", got.failed, got.profile);
+        let got = check(&io);
+        let made_counts = made_pair(&got);
+        std::println!("check {i}: failures {}; errors {}; made (Heads, Bodies) {made_counts:?}; words {:?}", got.failures, got.errors, got.words);
+        assert_eq!(got.failures, 0, "check {i}: {}", got.profile);
         let all = std::format!("{:?}\n{:?}\n{}", got.ids, got.words, got.profile);
         seen.push(Seen { errors: got.errors, words: std::format!("{:?}", got.words), made: made_counts, all });
     }
@@ -101,7 +101,7 @@ fn a_body_edit_beside_a_kept_item_leaves_its_reader() {
     assert!(!unnamed(&seen[0].words), "a kept item's head was read at no entry: {}", seen[0].all);
     assert_eq!((seen[0].errors, seen[1].errors), (0, 0), "{}", seen[1].all);
     assert!(!stale_words(&seen[1].words), "a body edit refused its file: {}", seen[1].all);
-    assert_eq!(seen[1].made, (0, 1), "a body edit beside a kept item makes no head and that one body:\n{}", seen[1].all);
+    assert_eq!(seen[1].made, (0, 2), "a body edit beside a kept item makes no head and that one body, in its 2 units' rows (D191: the library's and its test build's):\n{}", seen[1].all);
     std::println!("body edit beside a kept item: made {:?}", seen[1].made);
 }
 

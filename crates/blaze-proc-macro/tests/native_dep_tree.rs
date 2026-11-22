@@ -153,6 +153,8 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
     let read_refs: std::vec::Vec<&str> = reads.iter().map(|r| r.as_str()).collect();
     let shown_refs: std::vec::Vec<(&str, &str)> = shown.iter().map(|(r, s)| (r.as_str(), s.as_str())).collect();
     let script = NativeScript {
+        // A test's run: no record is kept, so any key names its trees.
+        key: blaze_ids::ContentId([7; 32]),
         program: &exe,
         c,
         env: &env,

@@ -1,46 +1,119 @@
 //! Guards that move, or-pattern bindings and slice patterns (pattern_forms.rs; lane B8, NEVER
 //! COMPILED when written, 2026-11-18). Each body is a small fn of the fixture world,
-//! type-checked by the real checker, lowered and checked by blaze-flow (`findings_with`).
+//! type-checked by the real checker, lowered and checked by blaze-flow (region_fixture.rs
+//! `findings`, the heads laid in the checked record's own table).
 //! Or-patterns and slice patterns are built with `Bb::or_pat` and `Bb::slice_pat` (blaze-typeck
 //! fixture/pats.rs, lines the lane's report asks for).
+//!
+//! Every fn's head is the region record the head lowering files for it (D148, made by hand
+//! here from the head written in [`World`]'s doc): each has at most one lifetime, elided, so
+//! `Param(0)`, late-bound.
 
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{ExprId, ItemKey, LangItem, Mutbl, Name, PNode, PatId};
+use blaze_typeck::{ExprId, ItemKey, LangItem, Mutbl, Name, PNode, PTy, PatId};
 
-use crate::callee_value_tests::{Lane, call1, call_ref, no_clauses};
-use crate::tests::findings_with;
-use crate::{AdtFacts, CalleeFacts, Facts, Plant, SigLife};
+use crate::callee_value_tests::{call1, call_ref, no_clauses};
+use crate::region_fixture::{Decls, FnHead, findings};
+use crate::{AdtFacts, CalleeFacts, Facts, Plant, Region};
 
-/// [`Lane`]'s facts with two enums of two variants each (`Option<T> { None, Some(T) }` and
-/// `E { A(S), B(S) }`): their variants' field counts.
+/// The fixture's facts: plain ADTs (tests.rs `Plain`: not `Copy`, no lifetime, needing drop),
+/// two enums of two variants each (`Option<T> { None, Some(T) }` and `E { A(S), B(S) }`) with
+/// their variants' field counts, and every fn's region head ([`Decls`]: no ADT of the fixture
+/// declares a lifetime).
 struct Pats {
-    lane: Lane,
     enums: [(ItemKey, [u32; 2]); 2],
+    decls: Decls,
+}
+
+impl Pats {
+    /// `item`'s region head over `fn(io[..last]) -> io[last]`: one elided, late-bound lifetime
+    /// when `slots` names it, none otherwise.
+    fn add(&mut self, _fx: &mut Fx, item: ItemKey, io: &[PTy], slots: &[Region]) {
+        let Some((&output, inputs)) = io.split_last() else { panic!("{item:?}: a head has an output") };
+        let count = u32::from(!slots.is_empty());
+        let late: &[u32] = if count == 1 { &[0] } else { &[] };
+        self.decls.func(item, FnHead { lifetimes: count, late, outlives: &[], inputs, output, slots });
+    }
 }
 
 impl Facts for Pats {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         let is_enum = self.enums.iter().any(|(e, _)| *e == k);
-        self.lane.adt(k).map(|f| AdtFacts { is_enum, ..f })
+        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum, is_box: false })
     }
-    fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
-        self.lane.callee(k)
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.lane.sig(item)
+    fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+        Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
     }
     fn closure_bodies_checked(&self) -> bool {
         true
     }
-    fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32> {
-        self.lane.field(adt, variant, name)
+    fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
+        None
     }
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
         let (_, counts) = self.enums.iter().find(|(e, _)| *e == adt)?;
         counts.get(variant as usize).copied()
     }
-    fn param_copy(&self, index: u32) -> bool {
-        self.lane.param_copy(index)
+    fn param_copy(&self, _: u32) -> bool {
+        false
     }
 }
 
@@ -75,21 +148,30 @@ fn world() -> World {
     let r_slice = fx.r(Mutbl::Mut, slice_s);
     let arr = fx.array(st, 2);
     let r_arr = fx.r(Mutbl::Mut, arr);
-    let _ = fx.func("g", 0, &[rs], unit, no_clauses());
-    let _ = fx.func("m", 0, &[rms], unit, no_clauses());
-    let _ = fx.func("h", 0, &[st], unit, no_clauses());
-    let _ = fx.func("n", 0, &[r_slice], unit, no_clauses());
-    let _ = fx.func("p", 0, &[rs], boolean, no_clauses());
-    let _ = fx.func("take", 0, &[st], boolean, no_clauses());
+    let g = fx.func("g", 0, &[rs], unit, no_clauses());
+    let m = fx.func("m", 0, &[rms], unit, no_clauses());
+    let h = fx.func("h", 0, &[st], unit, no_clauses());
+    let n = fx.func("n", 0, &[r_slice], unit, no_clauses());
+    let p = fx.func("p", 0, &[rs], boolean, no_clauses());
+    let take = fx.func("take", 0, &[st], boolean, no_clauses());
     let opt = fx.func("opt", 0, &[opt_s], unit, no_clauses());
     let either = fx.func("either", 0, &[et], unit, no_clauses());
     let pair = fx.func("pair", 0, &[r_arr], unit, no_clauses());
     let slice = fx.func("slice", 0, &[r_slice], unit, no_clauses());
     fx.finish();
-    let mut lane = Lane::new();
-    lane.wide.add(&fx, pair, "fn pair(a: &mut [S; 2]) {}", &[r_arr], unit);
-    lane.wide.add(&fx, slice, "fn slice(v: &mut [S]) {}", &[r_slice], unit);
-    let facts = Pats { lane, enums: [(option, [0, 1]), (e, [1, 1])] };
+    // Each reference input its one elided lifetime, `Param(0)`; no output borrows.
+    let p0 = Region::Param(0);
+    let mut facts = Pats { enums: [(option, [0, 1]), (e, [1, 1])], decls: Decls::new() };
+    facts.add(&mut fx, g, &[rs, unit], &[p0]);
+    facts.add(&mut fx, m, &[rms, unit], &[p0]);
+    facts.add(&mut fx, h, &[st, unit], &[]);
+    facts.add(&mut fx, n, &[r_slice, unit], &[p0]);
+    facts.add(&mut fx, p, &[rs, boolean], &[p0]);
+    facts.add(&mut fx, take, &[st, boolean], &[]);
+    facts.add(&mut fx, opt, &[opt_s, unit], &[]);
+    facts.add(&mut fx, either, &[et, unit], &[]);
+    facts.add(&mut fx, pair, &[r_arr, unit], &[p0]);
+    facts.add(&mut fx, slice, &[r_slice, unit], &[p0]);
     World { fx, facts, opt, either, pair, slice }
 }
 
@@ -131,10 +213,10 @@ fn a_guard_that_moves_its_binding_is_found() {
     let wild = b.wild();
     let other = b.block(&[], None);
     let root = match_block(&mut b, o, &[(some, Some(guard), empty), (wild, None, other)]);
-    let got = findings_with(&w.fx, &b, w.opt, root, &w.facts, Plant::None);
+    let got = findings(&w.fx, &b, w.opt, root, &w.facts, &w.facts.decls, Plant::None);
     std::println!("guard moves: {got:?}");
     assert!(got.as_ref().is_ok_and(|g| g.iter().any(|l| l.starts_with("move MoveOut(Deref)"))), "E0507: {got:?}");
-    let planted = findings_with(&w.fx, &b, w.opt, root, &w.facts, Plant::GuardBindsByValue);
+    let planted = findings(&w.fx, &b, w.opt, root, &w.facts, &w.facts.decls, Plant::GuardBindsByValue);
     std::println!("guard moves, planted GuardBindsByValue: {planted:?}");
     assert!(planted.as_ref().is_ok_and(|p| !p.iter().any(|l| l.starts_with("move MoveOut(Deref)"))), "the control: the E0507 is gone: {planted:?}");
 }
@@ -163,7 +245,7 @@ fn a_guard_that_reads_its_binding_then_the_body_moves_it() {
         let wild = b.wild();
         let other = b.block(&[], None);
         let root = match_block(&mut b, o, &[(some, Some(guard), body), (wild, None, other)]);
-        let got = findings_with(&w.fx, &b, w.opt, root, &w.facts, Plant::None);
+        let got = findings(&w.fx, &b, w.opt, root, &w.facts, &w.facts.decls, Plant::None);
         std::println!("guard reads{}: {got:?}", if after { ", body uses after move" } else { "" });
         let got = got.expect("lowered");
         assert_eq!(got.iter().any(|l| l.starts_with("move ")), after, "{got:?}");
@@ -196,7 +278,7 @@ fn an_or_pattern_binding_moved_then_used() {
             moved
         };
         let root = match_block(&mut b, e, &[(or, None, body)]);
-        let got = findings_with(&w.fx, &b, w.either, root, &w.facts, Plant::None);
+        let got = findings(&w.fx, &b, w.either, root, &w.facts, &w.facts.decls, Plant::None);
         std::println!("or binding {}: {got:?}", if after { "used after move" } else { "moved once" });
         let got = got.expect("lowered");
         assert_eq!(got.iter().any(|l| l.starts_with("move ")), after, "{got:?}");
@@ -225,10 +307,10 @@ fn two_elements_of_a_mutable_array_are_disjoint() {
     let (mx, my) = (call1(&mut b, "m", x), call1(&mut b, "m", y));
     let (st2, st3) = (b.semi(mx), b.semi(my));
     let root = b.block(&[st1, st2, st3], None);
-    let got = findings_with(&w.fx, &b, w.pair, root, &w.facts, Plant::None);
+    let got = findings(&w.fx, &b, w.pair, root, &w.facts, &w.facts.decls, Plant::None);
     std::println!("slice pair: {got:?}");
     assert!(got.as_ref().is_ok_and(|g| g.is_empty()), "{got:?}");
-    let planted = findings_with(&w.fx, &b, w.pair, root, &w.facts, Plant::SliceElementsOverlap);
+    let planted = findings(&w.fx, &b, w.pair, root, &w.facts, &w.facts.decls, Plant::SliceElementsOverlap);
     std::println!("slice pair, planted SliceElementsOverlap: {planted:?}");
     assert!(planted.as_ref().is_ok_and(|p| p.iter().any(|l| l.starts_with("borrow Invalidated"))), "{planted:?}");
 }
@@ -256,7 +338,7 @@ fn an_element_and_the_whole_slice_overlap() {
         let wild = b.wild();
         let other = b.block(&[], None);
         let root = match_block(&mut b, v, &[(pat, None, body), (wild, None, other)]);
-        let got = findings_with(&w.fx, &b, w.slice, root, &w.facts, Plant::None);
+        let got = findings(&w.fx, &b, w.slice, root, &w.facts, &w.facts.decls, Plant::None);
         std::println!("slice and element, {}: {got:?}", if whole_first { "whole first" } else { "element first" });
         let got = got.expect("lowered");
         assert_eq!(got.iter().any(|l| l.starts_with("borrow Invalidated")), whole_first, "{got:?}");
@@ -277,7 +359,7 @@ fn an_element_and_the_whole_slice_overlap() {
     let wild = b.wild();
     let other = b.block(&[], None);
     let root = match_block(&mut b, v, &[(pat, None, body), (wild, None, other)]);
-    let got = findings_with(&w.fx, &b, w.slice, root, &w.facts, Plant::None);
+    let got = findings(&w.fx, &b, w.slice, root, &w.facts, &w.facts.decls, Plant::None);
     std::println!("slice first and rest: {got:?}");
     assert!(got.as_ref().is_ok_and(|g| g.is_empty()), "{got:?}");
 }

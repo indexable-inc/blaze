@@ -130,7 +130,10 @@ pub fn unit_panic<'v>(program: ProfilePanic, side: Side, kind: &UnitKind<'_>, cu
     match (side, kind) {
         (_, UnitKind::BuildScript) => Ok(cuts.script_run),
         (Side::Macro, _) | (Side::Target, UnitKind::ProcMacro) => macro_cut(),
-        (Side::Target, UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Bench(_)) => Ok(ProfilePanic::Unwind),
-        (Side::Target, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Example(_)) => Ok(program),
+        // A test or bench unwinds whatever the profile says: the unit graph's one rule, which its
+        // cfg follows too (blaze-unit-graph resolve.rs `ignores_profile_panic`, `unit_cfg`).
+        (Side::Target, UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Bench(_) | UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Example(_)) => {
+            Ok(if blaze_unit_graph::ignores_profile_panic(kind) { ProfilePanic::Unwind } else { program })
+        }
     }
 }

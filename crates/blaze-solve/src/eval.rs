@@ -35,6 +35,8 @@ use crate::term::{Certainty, Def, Flags, GoalSource, Lang, MarkerTrait, Polarity
 use crate::trait_goals;
 use crate::tys::Tys;
 use crate::witness::{self, Answered, Choice, Derivations, Emit, Fate, NoDerivation, Refusal, Trace, TraceAsk, TracedRoot};
+use crate::why_maybe::{Bail, Cause, LimitHit, MaybeLog, Shallow, Verdict, WhyMaybe};
+use crate::why_no::{Failed, NoLog, Reach, Reached, WhyNo};
 
 /// A root goal's answer, its response applied to the caller's variables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +117,8 @@ struct Pending {
     source: GoalSource,
     via_only: bool,
     done: bool,
+    /// What the goal is of the goal its rule ran for (why_no.rs).
+    reach: Reach,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -228,6 +232,15 @@ pub struct Solver<'a, E = NoDerivation> {
     /// A measurement, off unless asked for ([`Solver::trace_on`]): every candidate, merge and
     /// root evaluation of the goals of one trait (witness.rs, "the trait-goal trace").
     trace: Option<Trace<'a>>,
+    /// The rows of the one [`Solver::why_no`] running, `None` otherwise (why_no.rs): on
+    /// demand for one goal reported unmet, never a mode.
+    why: NoLog<'a>,
+    /// Whether [`Solver::why_no`] or [`Solver::why_maybe`] is running: every goal is framed.
+    why_on: bool,
+    /// The rows of the one [`Solver::why_maybe`] running (why_maybe.rs), empty otherwise.
+    maybe: MaybeLog<'a>,
+    /// Whether [`Solver::why_maybe`] is running: every hook of its rows tests this one flag.
+    maybe_on: bool,
     /// The plain-goal memo: a goal with no inference variable, by its own identity (mode,
     /// env id, interned predicate handles, bound count), to its interned canonical input.
     /// Such a goal's canonical words are a function of those handles alone (`goal_input`
@@ -304,6 +317,9 @@ pub struct Stats {
     /// Impl candidates refused by the header pre-match before any import
     /// (prefilter.rs `header_may_match`).
     pub impl_prematch_rejected: u64,
+    /// Negative impls refused for a positive goal whose header names the goal's type, counted
+    /// only under [`Solver::why_no`] (`trait_goals::step_impl`).
+    pub impl_polarity_refused: u64,
     /// Goals written in canonical form (`canon::goal_input`: each root and each nested goal
     /// started), and the words written.
     pub canonicalized: u64,
@@ -378,6 +394,7 @@ stats_fields!(
     summary_fields,
     impl_header_mismatch,
     impl_prematch_rejected,
+    impl_polarity_refused,
     canonicalized,
     canon_words,
     canon_skipped,
@@ -516,6 +533,10 @@ impl<'a, E: Emit> Solver<'a, E> {
             marker_pool: Vec::new_in(alloc),
             root_keys: None,
             trace: None,
+            why: NoLog::new_in(alloc),
+            why_on: false,
+            maybe: MaybeLog::new_in(alloc),
+            maybe_on: false,
             plain: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             sharing: false,
             share_new: Vec::new_in(alloc),
@@ -759,6 +780,189 @@ impl<'a, E: Emit> Solver<'a, E> {
         r
     }
 
+    /// Why `goal` has no solution (why_no.rs): evaluated again, framing every goal under it,
+    /// and walked from the goal to the first goal under it that answers No by itself. Asked
+    /// only for a goal the caller reports unmet, never as a mode; what the evaluation binds is
+    /// rolled back (the caller's variables are as before). Every fact read is appended to
+    /// `reads`, as for [`Solver::evaluate_from`]. A goal that holds gives [`Leaf::NotNo`] with
+    /// the root alone.
+    ///
+    /// [`Leaf::NotNo`]: crate::why_no::Leaf::NotNo
+    pub fn why_no<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<WhyNo<'a>, Stop> {
+        let snap = tys.snapshot();
+        let off = self.scratch.off;
+        // Every ADT's fields a goal of their own (no summary), so a field is a step.
+        self.scratch.off.summaries = true;
+        self.scratch.why_no = true;
+        self.why.clear();
+        self.why_on = true;
+        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        self.why_on = false;
+        self.scratch.why_no = false;
+        self.scratch.off = off;
+        tys.rollback_to(snap);
+        let answer = r?;
+        let root = self.input_of(&*tys, mode, goal)?;
+        Ok(self.why.walk(root, answer != Answer::No, self.alloc))
+    }
+
+    /// Why `goal` is still ambiguous (why_maybe.rs): evaluated again as [`Solver::why_no`]
+    /// evaluates (every goal under it framed), and walked from the goal to the first goal under
+    /// it that is ambiguous by itself. Asked only for a goal the caller reports undecided,
+    /// never as a mode; what the evaluation binds is rolled back. Every fact read is appended
+    /// to `reads`. A goal that holds or fails gives [`Leaf::NotMaybe`] with the root alone.
+    ///
+    /// [`Leaf::NotMaybe`]: crate::why_maybe::Leaf::NotMaybe
+    pub fn why_maybe<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+        reads: &mut Vec<Read, Alloc<'a>>,
+    ) -> Result<WhyMaybe<'a>, Stop> {
+        let snap = tys.snapshot();
+        let off = self.scratch.off;
+        self.scratch.off.summaries = true;
+        self.why.clear();
+        self.maybe.clear();
+        self.why_on = true;
+        self.maybe_on = true;
+        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        self.why_on = false;
+        self.maybe_on = false;
+        self.scratch.off = off;
+        tys.rollback_to(snap);
+        let answer = r?;
+        let root = self.input_of(&*tys, mode, goal)?;
+        Ok(self.maybe.walk(root, matches!(answer, Answer::Maybe(_)), self.alloc))
+    }
+
+    /// `why_maybe`'s row of the frame at `top`, whose merge answered `ans` (`bail`: the
+    /// candidates it could not choose between): the verdict, and the frame's candidate causes
+    /// popped.
+    fn maybe_merged(&mut self, top: usize, ans: Ans, bail: Option<Bail>) {
+        let f = self.frames[top];
+        let verdict = match ans {
+            Some(r) if self.resps.certainty(r) != Certainty::Yes => match bail {
+                Some(b) => Verdict::Bail(b),
+                None => {
+                    // The candidate whose response the merge took: one not `Yes` and equal to
+                    // the merged response (`with_via` aside), else the first not `Yes`.
+                    let lo = f.dones_lo as usize;
+                    let mut taken: Option<u32> = None;
+                    let mut first: Option<u32> = None;
+                    for (i, d) in self.dones[lo..].iter().enumerate() {
+                        if self.resps.certainty(d.resp) == Certainty::Yes {
+                            continue;
+                        }
+                        let at = (lo + i) as u32;
+                        first = first.or(Some(at));
+                        if taken.is_none() && self.resps.equal(d.resp, r) {
+                            taken = Some(at);
+                        }
+                    }
+                    match taken.or(first).and_then(|at| self.maybe.cause_of(at)) {
+                        Some((cand, cause)) => Verdict::Cand { cand, cause },
+                        None => Verdict::None,
+                    }
+                }
+            },
+            _ => Verdict::None,
+        };
+        self.maybe.pop_cands(f.dones_lo);
+        self.maybe.verdict(f.input, verdict);
+    }
+
+    /// Why the rule of the candidate of the frame at `top` answered with a shallow certainty
+    /// other than `Yes` (why_maybe.rs `Shallow`), read from the frame's goal as the rule saw it:
+    /// an opaque type with no hidden type under the auto-trait rule; a projection's alias, or
+    /// any other goal's first term, holding an inference variable; a projection otherwise; else
+    /// the rule's own.
+    fn maybe_shallow<T: Tys>(&mut self, tys: &mut T, top: usize) -> Result<Shallow, Stop> {
+        let f = self.frames[top];
+        if f.cand.rule == CandRule::Structural(crate::structural::Rule::Auto)
+            && let Pred::Trait { args, .. } = f.goal.pred
+            && args.len > 0
+            && let TyKind::Alias(_, crate::term::AliasKind::Opaque, opaque, _) = tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))
+        {
+            return Ok(Shallow::Hidden { opaque });
+        }
+        let mut terms: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
+        pred_terms(&*tys, f.goal.pred, &mut |t| {
+            terms.push(t);
+            Ok(())
+        })?;
+        let alias = match f.goal.pred {
+            Pred::Projection { alias, .. } | Pred::NormalizesTo { alias, .. } => match tys.kind(tys.shallow_resolve(alias)) {
+                TyKind::Alias(_, _, d, _) => Some(d),
+                _ => None,
+            },
+            _ => None,
+        };
+        // A projection's term is the variable the goal binds: only its alias is read.
+        let read = if alias.is_some() { 1 } else { terms.len() };
+        for (i, &t) in terms.iter().take(read).enumerate() {
+            let t = fold::resolve(tys, &mut self.scratch, t)?;
+            if tys.flags(t).has(Flags::HAS_INFER) {
+                return Ok(Shallow::Unresolved { term: i as u32 });
+            }
+        }
+        Ok(match alias {
+            Some(alias) => Shallow::Normalize { alias },
+            None => Shallow::Rule,
+        })
+    }
+
+    /// `why_maybe`'s cause of the candidate of the frame at `top`, whose nested goals settled
+    /// with `c` after its rule's shallow certainty `shallow`: `None` when its response is
+    /// `Yes`.
+    fn maybe_cause<T: Tys>(&mut self, tys: &mut T, top: usize, shallow: Certainty, c: Certainty) -> Result<Option<Cause>, Stop> {
+        let f = self.frames[top];
+        let note = self.maybe.note_of(top);
+        if shallow != Certainty::Yes {
+            return Ok(Some(Cause::Shallow(note.shallow)));
+        }
+        if c == Certainty::Yes || matches!(f.goal.pred, Pred::NormalizesTo { .. }) {
+            return Ok(None);
+        }
+        if note.rounds {
+            return Ok(Some(Cause::Rounds));
+        }
+        if c == Certainty::OverflowLimit
+            && let Some(hit) = note.limit
+        {
+            return Ok(Some(Cause::Limit(hit)));
+        }
+        // The round compacted the pending goals to `nested.lo..`: the first is the one followed.
+        let Some(g) = self.goals.get(f.nested.lo as usize).copied() else { return Ok(Some(Cause::Unknown)) };
+        let child = self.input_of(&*tys, f.mode, Goal { env: f.goal.env, pred: g.pred, bound: g.bound })?;
+        let above = match f.goal.pred {
+            Pred::Trait { args, .. } if args.len > 0 => Some(tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))),
+            _ => None,
+        };
+        let reached = Reached::of(Some(Choice::of(&f.cand)), g.source, g.reach, above);
+        Ok(Some(Cause::Nested { child, reached }))
+    }
+
+    /// The goal of a step of a [`WhyNo`] (its canonical input), decoded into `tys`: a region or
+    /// type the canonical form erased is a fresh variable (call it in a probe of the caller's
+    /// and read the terms before rolling back). `None`: no such input in this solver.
+    pub fn why_goal<T: Tys>(&mut self, tys: &mut T, input: u32) -> Result<Option<(TypingMode, Goal)>, Stop> {
+        if input as usize >= self.inputs.len() {
+            return Ok(None);
+        }
+        let w = self.inputs.words_of(input);
+        Ok(Some(canon::instantiate_input(tys, &mut self.decode, w)?))
+    }
+
     fn evaluate_once<T: Tys, S: FactSource<T>>(
         &mut self,
         tys: &mut T,
@@ -768,8 +972,9 @@ impl<'a, E: Emit> Solver<'a, E> {
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<Answer, Stop> {
         self.scratch.stats.evaluations += 1;
-        // A recording solver frames every goal (`with_emit_in`).
+        // A recording solver frames every goal (`with_emit_in`), as `why_no` does.
         if !E::ON
+            && !self.why_on
             && let Some(a) = self.fast_path(tys, mode, goal, reads)
         {
             self.scratch.stats.fast_path += 1;
@@ -927,7 +1132,10 @@ impl<'a, E: Emit> Solver<'a, E> {
         }
         let orig_lo = self.origs.len() as u32;
         self.origs.extend_from_slice(&self.canon.orig);
-        if let Some(e) = self.inputs.lookup(input, self.limit, true) {
+        // `why_no` frames the goal again, so each goal under it is seen (why_no.rs).
+        if !self.why_on
+            && let Some(e) = self.inputs.lookup(input, self.limit, true)
+        {
             self.scratch.stats.cache_hits += 1;
             let lo = self.reads.lo;
             self.reads.seg.extend(lo, self.inputs.reads_of(&e))?;
@@ -939,6 +1147,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         // A recording solver takes no shared answer (it has no choice behind it: witness.rs);
         // it still puts its own final goals (`share_after`) for the bodies that do.
         if !E::ON
+            && !self.why_on
             && let Some(opts) = src.goals().map(|g| g.opts())
         {
             match self.share_root(tys, src, input, goal, opts) {
@@ -1327,7 +1536,11 @@ impl<'a, E: Emit> Solver<'a, E> {
         loop {
             if self.steps_now().saturating_sub(self.steps_at) > MAX_STEPS {
                 let goal = self.frames.first().map(|f| bad_pred_of(&*tys, f.goal.pred));
-                return Err(Stop::Error(SolveError::Steps { goal, most: MAX_STEPS }));
+                // The root goal alone does not say which rule re-entered (rule 19): the goal on
+                // top of the stack when the bound was hit, and the stack's depth, do.
+                let top = self.frames.last().map(|f| bad_pred_of(&*tys, f.goal.pred));
+                let depth = u32::try_from(self.frames.len()).unwrap_or(u32::MAX);
+                return Err(Stop::Error(SolveError::Steps { goal, top, depth, most: MAX_STEPS }));
             }
             let top = self.frames.len() - 1;
             match self.drive_one(tys, src, snaps, probes, top) {
@@ -1345,9 +1558,9 @@ impl<'a, E: Emit> Solver<'a, E> {
                     let goal = self.frames.get(top).map(|f| bad_pred_of(tys, f.goal.pred));
                     return Err(Stop::Error(SolveError::Malformed(Malformed::Sort { term, met, at, goal })));
                 }
-                Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args, at, goal: None }))) => {
+                Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args, head, at, goal: None }))) => {
                     let goal = self.frames.get(top).map(|f| bad_pred_of(tys, f.goal.pred));
-                    return Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args, at, goal })));
+                    return Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args, head, at, goal })));
                 }
                 Err(e) => return Err(e),
             }
@@ -1476,6 +1689,9 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// (`enter_forall`), and computes the path kind of its nested steps.
     fn start<T: Tys, F: Facts>(&mut self, tys: &mut T, facts: &F, top: usize) -> Result<(), Stop> {
         let input = self.frames[top].input;
+        if self.why_on {
+            self.why.framed(input);
+        }
         let (mode, goal) = {
             let w = self.inputs.words_of(input);
             canon::instantiate_input(tys, &mut self.decode, w)?
@@ -1529,7 +1745,7 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// Moves the goals a rule added into the pending list.
     fn take_added(&mut self) {
         for a in self.added.iter() {
-            self.goals.push(Pending { pred: a.pred, bound: a.bound, source: a.source, via_only: a.via_only, done: false });
+            self.goals.push(Pending { pred: a.pred, bound: a.bound, source: a.source, via_only: a.via_only, done: false, reach: a.reach });
         }
         self.added.clear();
     }
@@ -1652,8 +1868,10 @@ impl<'a, E: Emit> Solver<'a, E> {
         top: usize,
         stage: u8,
     ) -> Result<(), Stop> {
-        // The trace's two counters before the step (witness.rs `Refusal`), only when tracing.
-        let at = self.trace.as_ref().map(|_| (self.scratch.stats.impl_prematch_rejected, self.scratch.stats.impl_header_mismatch));
+        // The trace's two counters before the step (witness.rs `Refusal`), only when tracing
+        // or under `why_no`; and the negative impls `why_no` counts.
+        let at = (self.trace.is_some() || self.why_on).then_some((self.scratch.stats.impl_prematch_rejected, self.scratch.stats.impl_header_mismatch));
+        let polarity_at = self.scratch.stats.impl_polarity_refused;
         let (r, cand) = self.pull(tys, src, top, |s, tys, facts| {
             let mut cand = s.frames[top].cand;
             let mut cx = s.cx(tys, facts, top);
@@ -1681,9 +1899,29 @@ impl<'a, E: Emit> Solver<'a, E> {
                 Refusal::Rule
             };
             self.trace_cand(top, cand, Fate::Refused(why));
+            let negative = now.impl_polarity_refused > polarity_at;
+            let input = self.frames[top].input;
+            if self.why_on {
+                self.why.refused(input, Choice::of(&cand), why, negative);
+            }
+        }
+        self.frames[top].cand = cand;
+        // Under `why_maybe`: why the rule's own certainty is not `Yes`, as the rule saw the
+        // goal; the round limit is noted afresh for each nested loop that follows.
+        if self.maybe_on {
+            let shallow = match r {
+                Step::Done(c) if c != Certainty::Yes => Some(self.maybe_shallow(tys, top)?),
+                _ => None,
+            };
+            if let Some(n) = self.maybe.note(top) {
+                n.rounds = false;
+                n.limit = None;
+                if let Some(s) = shallow {
+                    n.shallow = s;
+                }
+            }
         }
         let fr = &mut self.frames[top];
-        fr.cand = cand;
         let lo = fr.probe_lo;
         match r {
             Step::No => self.end_probe(tys, probes, top, None),
@@ -1735,7 +1973,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                     Got::Pushed => return Ok(true),
                     Got::Now(ans) => {
                         if !self.receive(tys, top, ans)? {
-                            self.nested_failed(tys, probes, top);
+                            self.nested_failed(tys, probes, top)?;
                             return Ok(false);
                         }
                     }
@@ -1756,6 +1994,11 @@ impl<'a, E: Emit> Solver<'a, E> {
             } else if !n.changed {
                 Some(n.cert)
             } else if n.round + 1 >= FIXPOINT_STEP_LIMIT {
+                if self.maybe_on
+                    && let Some(note) = self.maybe.note(top)
+                {
+                    note.rounds = true;
+                }
                 Some(OVERFLOW)
             } else {
                 None
@@ -1774,8 +2017,25 @@ impl<'a, E: Emit> Solver<'a, E> {
     }
 
     /// A nested goal has no solution.
-    fn nested_failed<T: Tys>(&mut self, tys: &mut T, probes: &mut [Option<T::Snapshot>], top: usize) {
+    fn nested_failed<T: Tys>(&mut self, tys: &mut T, probes: &mut [Option<T::Snapshot>], top: usize) -> Result<(), Stop> {
         let f = self.frames[top];
+        // Under `why_no`: the goal that failed (`receive` leaves `nested.i` at it), by its
+        // canonical input, and how the candidate (none: the frame itself) reached it.
+        if self.why_on
+            && let Some(g) = self.goals.get(f.nested.i as usize).copied()
+        {
+            let child = self.input_of(&*tys, f.mode, Goal { env: f.goal.env, pred: g.pred, bound: g.bound })?;
+            let cand = match f.after {
+                After::Assemble(_) => None,
+                After::Step(_) | After::Make(_) => Some(Choice::of(&f.cand)),
+            };
+            let above = match f.goal.pred {
+                Pred::Trait { args, .. } if args.len > 0 => Some(tys.kind(tys.shallow_resolve(tys.list_get(args, 0)))),
+                _ => None,
+            };
+            let reached = Reached::of(cand, g.source, g.reach, above);
+            self.why.failed(f.input, Failed { child, reached });
+        }
         match f.after {
             After::Assemble(_) => {
                 self.cands.truncate(f.cands_lo as usize);
@@ -1795,6 +2055,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.end_probe(tys, probes, top, None)
             }
         }
+        Ok(())
     }
 
     /// The nested goals settled with certainty `c`.
@@ -1807,7 +2068,14 @@ impl<'a, E: Emit> Solver<'a, E> {
             }
             After::Step(k) => self.frames[top].phase = Phase::Step(k),
             After::Make(shallow) => {
+                // Under `why_maybe`: why this candidate is not certain, kept by the index its
+                // response takes in `dones` (`end_probe` pushes it next).
                 let r = self.make_response(tys, top, shallow, c)?;
+                if self.maybe_on
+                    && let Some(cause) = self.maybe_cause(tys, top, shallow, c)?
+                {
+                    self.maybe.cand_done(self.dones.len() as u32, Choice::of(&f.cand), cause);
+                }
                 if self.trace.is_some() {
                     let fate = Fate::Held { certainty: self.resps.certainty(r), constrains: !self.resps.is_identity(r) };
                     self.trace_cand(top, f.cand, fate);
@@ -1875,7 +2143,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         let identity = self.resps.is_identity(r);
         let c = self.resps.certainty(r);
         for g in self.resp_goals.iter() {
-            self.goals.push(Pending { pred: g.pred, bound: g.bound, source: g.source, via_only: false, done: false });
+            self.goals.push(Pending { pred: g.pred, bound: g.bound, source: g.source, via_only: false, done: false, reach: Reach::Nth(u32::MAX) });
         }
         let fr = &mut self.frames[top];
         if !identity {
@@ -1936,6 +2204,9 @@ impl<'a, E: Emit> Solver<'a, E> {
             let path = self.path_from(h, step);
             self.frames[h].used |= path.bit();
             self.frames[top].heads.insert(h as u32);
+            // The head met is a nested goal of every goal between (`CycleOnStack(head)`): an
+            // entry holding it does not apply while it is on the stack again.
+            self.nested_ids.push(f.nested_lo, self.frames[h].input)?;
             let prov = self.frames[h].provisional;
             let ans = match prov {
                 Some(a) => a,
@@ -1952,30 +2223,56 @@ impl<'a, E: Emit> Solver<'a, E> {
             }
         }
         if let Some(p) = hit {
+            // rustc `lookup_provisional_cache` -> `update_parent_goal`: the entry's overflow
+            // is the parent's too.
+            self.frames[top].overflow |= p.overflow;
             self.frames[top].heads.union(&p.heads);
             self.frames[p.highest as usize].used |= p.path.bit();
+            // An answer that depends on a cycle (`ProvisionalCacheHit`): kept as a nested goal.
+            self.nested_ids.push(f.nested_lo, input)?;
             return Ok(Got::Now(p.ans));
         }
         // The global cache.
         let avail = f.depth.saturating_sub(1);
-        if let Some(e) = self.inputs.lookup(input, avail, false) {
+        // `why_no` frames every goal under its root (why_no.rs): no global cache.
+        if !self.why_on
+            && let Some(e) = self.inputs.lookup(input, avail, false)
+        {
             self.scratch.stats.cache_hits += 1;
             self.reads.seg.extend(f.reads_lo, self.inputs.reads_of(&e))?;
-            let big = match self.inputs.nested_of(&e) {
+            let (big, depends) = match self.inputs.nested_of(&e) {
                 Some(n) => {
                     self.nested_ids.extend(f.nested_lo, n)?;
-                    false
+                    (false, !n.is_empty())
                 }
-                None => true,
+                None => (true, true),
             };
-            self.nested_ids.push(f.nested_lo, input)?;
+            // WHICH NESTED GOALS (`finish`): the entry's goal itself only when its answer met
+            // a cycle or overflow.
+            if depends || e.overflow {
+                self.nested_ids.push(f.nested_lo, input)?;
+            }
             let fr = &mut self.frames[top];
             fr.big |= big;
             fr.required_depth = fr.required_depth.max(e.required_depth + 1);
+            // rustc search_graph/mod.rs `lookup_global_cache` -> `update_parent_goal`:
+            // `parent.encountered_overflow |= encountered_overflow`. An overflow entry holds at
+            // its own depth only (search.rs `lookup`); a parent built on it that is not marked
+            // would be filed as a success, reused at any deeper limit with the child's
+            // overflow inside (tests/overflow_cache.rs).
+            fr.overflow |= e.overflow;
             return Ok(Got::Now(e.ans));
         }
         // Overflow (`stack_overflow_result`).
         if avail == 0 {
+            if self.maybe_on {
+                let depth = u32::try_from(self.frames.len()).unwrap_or(u32::MAX);
+                let hit = LimitHit::Depth { depth, limit: self.limit };
+                self.maybe.verdict(input, Verdict::Limit(hit));
+                if let Some(n) = self.maybe.note(top) {
+                    n.limit = Some(hit);
+                }
+            }
             self.frames[top].overflow = true;
             return Ok(Got::Now(Some(self.resps.no_constraints(vars, Certainty::OverflowLimit, Via::None)?)));
         }
@@ -1987,7 +2284,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         let f = self.frames[top];
         let mut dones: Vec<Done, Alloc<'a>> = Vec::new_in(self.alloc);
         dones.extend_from_slice(&self.dones[f.dones_lo as usize..]);
-        let mut m = Merger { resps: &mut self.resps, vars: f.vars };
+        let mut m = Merger { resps: &mut self.resps, vars: f.vars, bail: None };
         // Specialization between two impl candidates, a fact of the impls read like any other
         // (the frame's read list keeps it).
         let ask = Ask::new(facts);
@@ -2002,6 +2299,10 @@ impl<'a, E: Emit> Solver<'a, E> {
             Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, &mut dones, &mut specializes)?,
             Kind::WellFormed | Kind::Other => m.merge_responses(&dones)?,
         };
+        let bail = m.bail;
+        if self.maybe_on {
+            self.maybe_merged(top, ans, bail);
+        }
         if let Some(t) = &mut self.trace {
             let verdict = ans.map(|r| (self.resps.certainty(r), !self.resps.is_identity(r)));
             t.merge(f.input, dones.len() as u32, verdict);
@@ -2083,6 +2384,9 @@ impl<'a, E: Emit> Solver<'a, E> {
                     return Ok(None);
                 }
                 // `fixpoint_overflow_result`.
+                if self.maybe_on {
+                    self.maybe.verdict(f.input, Verdict::Limit(LimitHit::Fixpoint { reruns: FIXPOINT_STEP_LIMIT }));
+                }
                 let r = self.resps_no_constraints(f.vars, OVERFLOW)?;
                 ans = Some(self.resps.keep(r)?);
             }
@@ -2134,7 +2438,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 }
                 p
             };
-            self.inputs.prov.push(Prov { input: f.input, heads, highest, path, ans });
+            self.inputs.prov.push(Prov { input: f.input, heads, highest, path, ans, overflow: f.overflow });
         }
         if top == 0 {
             // The root's reads stay for `evaluate` to hand out; its nested goals are done with.
@@ -2146,8 +2450,23 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.scratch.stats.reads_folded += (self.reads.seg.len() - rl) as u64;
         self.reads.seg.close(pf.reads_lo, f.reads_lo);
         self.reads.lo = pf.reads_lo;
+        // WHICH NESTED GOALS (`update_parent_goal`: "once we've got goals which encountered
+        // overflow or a cycle, we track all goals whose behavior may depend changed if they're
+        // moved onto the stack"): this goal is kept in its parent's nested goals only when its
+        // own are not empty (it met a cycle head, a provisional answer, or such an entry) or it
+        // overflowed. A cycle-free goal's answer is the same with any goal on the stack: were a
+        // goal of its subtree on the stack and asking it, that goal's own evaluation would have
+        // met it as a cycle (evaluation is a function of the goal), so its subtree is not
+        // cycle-free. Before, every goal below was kept: an entry with more than `MAX_NESTED`
+        // applied only to an empty stack, and so did every entry above it, so a shared subtree
+        // under two parents was solved again under each, 2^depth times (tempo
+        // crates/consensus/src/follow/resolver/mod.rs `get_block`, `SolveError::Steps` at
+        // depth 30; tests/cost.rs `cost_shared_wide_subtree_is_solved_once`).
+        let depends = self.nested_ids.len() > nl || f.overflow || f.big;
         self.nested_ids.close(pf.nested_lo, f.nested_lo);
-        self.nested_ids.push(pf.nested_lo, f.input)?;
+        if depends {
+            self.nested_ids.push(pf.nested_lo, f.input)?;
+        }
         {
             let pf = &mut self.frames[p];
             pf.required_depth = pf.required_depth.max(f.required_depth + 1);
@@ -2156,7 +2475,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             pf.heads.union(&heads);
         }
         if !self.receive(tys, p, ans)? {
-            self.nested_failed(tys, probes, p);
+            self.nested_failed(tys, probes, p)?;
         }
         Ok(None)
     }
@@ -2204,7 +2523,7 @@ impl<'a, E: Emit> Solver<'a, E> {
 
 /// Calls `f` on every term of `p`.
 fn pred_terms<T: Tys>(tys: &T, p: Pred, f: &mut impl FnMut(Ty) -> Result<(), SolveError>) -> Result<(), SolveError> {
-    let mut list = |l: crate::term::List, f: &mut dyn FnMut(Ty) -> Result<(), SolveError>| -> Result<(), SolveError> {
+    let list = |l: crate::term::List, f: &mut dyn FnMut(Ty) -> Result<(), SolveError>| -> Result<(), SolveError> {
         for i in 0..l.len {
             f(tys.list_get(l, i))?;
         }
@@ -2382,7 +2701,7 @@ fn arg_shape<T: Tys>(tys: &T, t: Ty) -> crate::error::ArgShape {
 fn bad_pred_of<T: Tys>(tys: &T, p: Pred) -> crate::error::BadPred {
     use crate::error::{BadPred, PredKind};
     let mut out = BadPred { kind: PredKind::Other, def: Def(0), args: [None; 4], n_args: 0 };
-    let mut two = |out: &mut BadPred, kind: PredKind, a: Ty, b: Ty| {
+    let two = |out: &mut BadPred, kind: PredKind, a: Ty, b: Ty| {
         out.kind = kind;
         out.args[0] = Some(arg_shape(tys, a));
         out.args[1] = Some(arg_shape(tys, b));

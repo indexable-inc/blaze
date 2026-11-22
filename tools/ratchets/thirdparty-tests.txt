@@ -1,0 +1,14 @@
+# The third-party packages only tests, benches and examples name, each with why (D180, "Test-only
+# packages"): `<name><TAB><member><TAB><why>`. A name here is in a member's dev-dependencies and
+# named by no crate the binary reaches. Only falls: a person adds a line, with its reason; a
+# comparison that has done its job is deleted with its package. Checked by `reach-check`.
+blake3	blaze-blake3	the official crate the property test, tests/official.rs and the cost example (examples/cost.rs) hold blaze's BLAKE3 to; the normal graph has none
+blake3	blaze-ids	the reference the BLAKE3 tests and the bench hold blaze's to
+foldhash	blaze-hash	what `fold` is a port of: `fold_is_foldhash` holds it to this, and `hash_cost` measures its random-seeded form
+miniz_oxide	blaze-deflate	the reference the deflate tests compare against in both directions
+parking_lot	blaze-inproc-rt	library/blaze_inproc_rt/src/fence/tests.rs takes `parking_lot::Mutex`; it goes once that test moves to std's lock
+postcard	blaze-ids	src/wire/tests.rs: the serde wire form of `ContentId` and fingerprints round-trips through postcard; goes with the serde derives
+rcgen	blaze-http	the certificates of the in-memory rustls server the TLS test speaks to and of the h3 pair; goes with rustls
+rustc_apfloat	syntax	src/ast/token_ext.rs's tests parse f128 literals against rustc_apfloat's `ieee::Quad`
+tar	blaze-tar	the reference the tar tests compare against in both directions
+tempfile	astlog-core	src/tests.rs writes its sample files into a `tempfile::TempDir`

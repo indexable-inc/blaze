@@ -69,10 +69,57 @@ pub type PatDefs<'a> = Soa<(PatId, Def), Alloc<'a>>;
 pub type Fields<'a> = Soa<(ExprId, u32, u32), Alloc<'a>>;
 /// Each capture: the closure, the binding captured, how.
 pub type Captures<'a> = Soa<(ExprId, PatId, CaptureKind), Alloc<'a>>;
+/// Each captured PLACE of a closure or async block whose captures the place analysis decided
+/// (capture_places.rs, RFC 2229), in the environment's field order: the closure, the place's
+/// root binding, its projections ([`CaptureProjs`] rows `start..start + len`), how it is held,
+/// and the field's type as stored (`T`, `&T` or `&mut T`). Sorted by closure, stable, so a
+/// closure's rows are its fields in order. A closure the analysis did not decide has no row
+/// here and is read from [`Captures`] (whole bindings). Read with [`Checked::capture_places_of`].
+pub type CapturePlaceRows<'a> = Soa<(ExprId, PatId, u32, u32, CaptureKind, PTy), Alloc<'a>>;
+/// The projections of every captured place, each place's a run: the kind (0 a deref, 1 a field
+/// of a variant, 2 an index, never kept by the analysis), the variant, the field, and the type
+/// after the projection.
+pub type CaptureProjs<'a> = Soa<(u8, u32, u32, PTy), Alloc<'a>>;
 /// One row per closure expression of the body, row `i` the closure of ordinal `i`
 /// (`PNode::Closure`: closure expressions in `ExprId` order): its expression, its kind (the
-/// strongest `Fn*` trait it implements, from its captures) and its signature (a `FnPtr`).
-pub type Closures<'a> = Soa<(ExprId, ClosureKind, PTy), Alloc<'a>>;
+/// strongest `Fn*` trait it implements), signature, exact captured-place tuple when known, and
+/// where its signature's expectation came from ([`SigFrom`]).
+pub type Closures<'a> = Soa<(ExprId, ClosureKind, PTy, Option<PTy>, SigFrom), Alloc<'a>>;
+
+/// Where a closure's signature was expected from (D148, docs/v2/plan/design/flow.md "Lifetimes
+/// are produced once and carried beside the types", piece L5). The erased signature in
+/// [`Closures`] holds no region; the flow lowering reads a closure's regions from WHERE the
+/// expectation came from, never from a copy kept here: a clause's region column says which
+/// signature positions its `for<..>` binds (`Late`: universal in the closure's body), and every
+/// other position is a region of the closure's maker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SigFrom {
+    /// A pending `Fn*` obligation registered by clause `nth` of the item the path or method call
+    /// `expr` names (`Cause::Clause`): the inputs are that clause's argument tuple; the output is
+    /// clause `output`'s term (the `FnOnce::Output` projection of the same use) when one was
+    /// pending, else the body's own.
+    Clause { expr: ExprId, nth: u32, output: Option<u32> },
+    /// Every parameter's type and the return type written on the closure, no expectation used.
+    Written,
+    /// No expectation (or one the body itself made, not a declared clause): every region is the
+    /// maker's.
+    Inferred,
+    /// Expected as a trait object (`Box<dyn Fn(&T)>`): refused by name by the flow at first.
+    Object,
+    /// Expected as a fn pointer (`let f: fn(&u8) = |x| ..`): refused by name by the flow at first.
+    FnPtr,
+}
+
+/// Which information still separates the checked interior from the stored state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroutineWitness {
+    /// Binding rows alone could not establish the captured places and their modes.
+    NeedsCapturePlaces,
+    /// Captures are known. Flow must determine the values saved at suspension.
+    NeedsSavedLocals,
+    /// The checked tuple is the complete state even without a flow record.
+    Complete,
+}
 /// rustc's `fru_field_types`: each field a struct update `S { a: x, ..base }` takes from its
 /// base (every field not written), sorted by the struct expression, each expression's rows in
 /// field order: the expression, the field's index in the struct, its type at the struct's
@@ -104,9 +151,16 @@ pub struct Checked<'a> {
     pub pat_defs: PatDefs<'a>,
     pub fields: Fields<'a>,
     pub captures: Captures<'a>,
+    /// The captured places of each decided closure ([`CapturePlaceRows`]).
+    pub capture_places: CapturePlaceRows<'a>,
+    /// Their projections ([`CaptureProjs`]).
+    pub capture_projs: CaptureProjs<'a>,
     pub closures: Closures<'a>,
     /// The body's diagnostics, in the order found.
     pub diags: Vec<Diag, Alloc<'a>>,
+    /// The steps of every finding's why-chain ([`Diag::why`]), each chain's steps together,
+    /// root first; read with [`Checked::why_of`]. Empty with no diagnostic.
+    pub why: Vec<crate::diag::WhyStep, Alloc<'a>>,
     /// What the check read, and what to fetch next time.
     pub reads: ReadList<'a>,
     pub needs: Needs<'a>,
@@ -126,6 +180,8 @@ pub struct Checked<'a> {
     /// interior, left for the exact one (src/stalled.rs), in the order it failed. Empty except
     /// under `check_deferring`; a caller deciding them passes them to `decide_stalled`.
     pub stalled: Vec<crate::stalled::Stalled, Alloc<'a>>,
+    /// The precision of each block's checked interior, sorted by expression.
+    pub coroutine_witnesses: Vec<(ExprId, CoroutineWitness), Alloc<'a>>,
     /// Each `.await` and the future it holds while suspended, `<E as IntoFuture>::IntoFuture`
     /// (the Reference, "Await expressions", steps 1-2: `IntoFuture::into_future` of the
     /// operand, evaluated to the future `tmp` that is polled), as the check decided it
@@ -220,12 +276,39 @@ impl<'a> Checked<'a> {
         Some(self.awaited[at].1)
     }
 
+    /// The steps of the why-chain `w` (a finding's [`Diag::why`]), root first; `None` when
+    /// they are not this record's rows (a finding of another record).
+    pub fn why_of(&self, w: crate::diag::Why) -> Option<&[crate::diag::WhyStep]> {
+        self.why.get(w.start as usize..w.start.checked_add(w.len)? as usize)
+    }
+
+    pub fn coroutine_witness(&self, block: ExprId) -> Option<CoroutineWitness> {
+        let row = self.coroutine_witnesses.binary_search_by_key(&block, |r| r.0).ok()?;
+        Some(self.coroutine_witnesses[row].1)
+    }
+
     /// The projections the callee's signature named at the call `e`, in lowering order (row
     /// `i` has `at == i`); empty for an expression that is no call or whose callee names none.
     pub fn selected_at(&self, e: ExprId) -> &[crate::selected::Projected] {
+        let rows = self.call_selections(e);
+        &rows[..rows.partition_point(|r| r.name.is_some())]
+    }
+
+    /// The projections in signature order, followed by the callee's lifetime-bearing trait bounds.
+    pub fn call_selections(&self, e: ExprId) -> &[crate::selected::Projected] {
         let lo = self.selected.partition_point(|r| r.expr < e);
         let hi = self.selected.partition_point(|r| r.expr <= e);
         &self.selected[lo..hi]
+    }
+
+    /// The rows of [`Checked::capture_places`] of the closure or async block `e`, its
+    /// environment's fields in order: empty when the place analysis did not decide `e` (its
+    /// captures are then the whole bindings of [`Checked::captures`]).
+    pub fn capture_places_of(&self, e: ExprId) -> core::ops::Range<usize> {
+        let col = self.capture_places.column::<0>();
+        let lo = col.partition_point(|&x| x < e);
+        let hi = col.partition_point(|&x| x <= e);
+        lo..hi
     }
 
     /// The fields the struct update at `e` takes from its base, as `(field index, type)` in
@@ -266,12 +349,27 @@ impl<'a> Checked<'a> {
             && soa2_eq(&self.pat_defs, &other.pat_defs)
             && soa3_eq(&self.fields, &other.fields)
             && soa3_eq(&self.captures, &other.captures)
-            && soa3_eq(&self.closures, &other.closures)
+            && self.capture_places.column::<0>() == other.capture_places.column::<0>()
+            && self.capture_places.column::<1>() == other.capture_places.column::<1>()
+            && self.capture_places.column::<2>() == other.capture_places.column::<2>()
+            && self.capture_places.column::<3>() == other.capture_places.column::<3>()
+            && self.capture_places.column::<4>() == other.capture_places.column::<4>()
+            && self.capture_places.column::<5>() == other.capture_places.column::<5>()
+            && self.capture_projs.column::<0>() == other.capture_projs.column::<0>()
+            && self.capture_projs.column::<1>() == other.capture_projs.column::<1>()
+            && self.capture_projs.column::<2>() == other.capture_projs.column::<2>()
+            && self.capture_projs.column::<3>() == other.capture_projs.column::<3>()
+            && self.closures.column::<0>() == other.closures.column::<0>()
+            && self.closures.column::<1>() == other.closures.column::<1>()
+            && self.closures.column::<2>() == other.closures.column::<2>()
+            && self.closures.column::<3>() == other.closures.column::<3>()
+            && self.closures.column::<4>() == other.closures.column::<4>()
             && self.diags == other.diags
             && self.suggests == other.suggests
             && self.hidden == other.hidden
             && self.promoted == other.promoted
             && self.stalled == other.stalled
+            && self.coroutine_witnesses == other.coroutine_witnesses
             && self.awaited == other.awaited
             && self.selected == other.selected
             && soa3_eq(&self.fru_fields, &other.fru_fields)
@@ -301,12 +399,16 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("callees", &self.callees)
             .field("fields", &self.fields)
             .field("captures", &self.captures)
+            .field("capture_places", &self.capture_places)
+            .field("capture_projs", &self.capture_projs)
             .field("closures", &self.closures)
             .field("diags", &self.diags)
+            .field("why", &self.why)
             .field("suggests", &self.suggests)
             .field("hidden", &self.hidden)
             .field("promoted", &self.promoted)
             .field("stalled", &self.stalled)
+            .field("coroutine_witnesses", &self.coroutine_witnesses)
             .field("awaited", &self.awaited)
             .field("selected", &self.selected)
             .field("fru_fields", &self.fru_fields)

@@ -171,15 +171,19 @@ impl fmt::Debug for Procs {
     }
 }
 
+/// D177: one way to run a program hermetically.
+#[cfg(unix)]
+pub mod hermetic;
+
 // Children started linked to this process (test zygote, run parent): a native world's only.
 #[cfg(unix)]
 mod linked;
 #[cfg(unix)]
 pub use self::linked::{
-    BorrowedFd, Ended, Linked, LinkedSpec, Spawner,
+    BorrowedFd, Exit, Linked, LinkedSpec, Spawner, Waited,
     run::{
-        CHILD_FD, ChannelError, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Read, Run, RunChild, RunError,
-        RunFault, RunSpec, RunStep, Streams, whole_messages,
+        CHILD_FD, ChannelError, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Pipes, Read, Reaped, Run,
+        RunChild, RunError, RunFault, RunSpec, RunStep, RunWaited, Served, ServedEnd, Started, Streams, whole_messages,
     },
     sim_child::{Act, MOST_DELAY, SimChild},
     sim_term::{OnTerminate, SIGTERM, TermChild},

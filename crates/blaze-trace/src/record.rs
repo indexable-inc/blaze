@@ -16,7 +16,8 @@
 //!   thread writes. A span with fields, an explicit parent or a `record` writes more entries
 //!   (an [`Entry::Open`], then one [`Entry::Field`] a field): numbers as raw words; text
 //!   (`%`, `?`, `&str`) is the one thing formatted at the site, into [`Entry::Text`] entries of
-//!   16 bytes, at most [`MOST_TEXT`] bytes a field, the rest counted as cut.
+//!   16 bytes, at most [`TraceLimits::most_text`] bytes a field ([`MOST_TEXT`] shipped), the
+//!   rest counted as cut.
 //! - **The clock** is the CPU's counter, read in user space (`cntvct_el0` on arm64, `rdtsc` on
 //!   x86-64); the reader turns ticks to time ([`counter_hz`], or two (tick, time) pairs where
 //!   the counter's rate is not readable). A simulation passes its clock in
@@ -28,12 +29,36 @@
 //! - **A thread's ring** is claimed on its first entry and given back when the thread exits
 //!   (the thread-exit hook of the platform's C runtime). A thread that finds every lane held
 //!   records nothing, counted exactly ([`unrecorded`]).
+//!
+//! # The process's profile ring: the one static (C3)
+//!
+//! D170's C3 allows three statics with state, each named and capped: the allocator, the profile
+//! ring and the signal handler. This module holds the profile ring's, and nothing else of this
+//! crate has state in a `static`:
+//!
+//! - [`PROFILE`] ([`Profile`]): what the program's entry installed once (the rings' config and the
+//!   entry's sink, the flight recorder), the site table (capped at [`MOST_SITES`] rows, a site
+//!   past it recorded by nobody and counted in [`refused_sites`]), and its counters. Capped: its
+//!   size is fixed at compile time (`MOST_SITES` pointers and seven words), it never allocates.
+//! - [`THREAD`], the ring's per-thread half (`#[thread_local]`): the calling thread's producer of
+//!   one lane of the installed rings (capped by the rings' lanes, [`crate::ring::MOST_LANES`] at
+//!   most), its span depth, and the sink it set for itself. It is part of the profile ring, not a
+//!   fourth static: a producer is a lane of the one ring, held by the thread that writes it.
+//!
+//! Everything else is a value: the rings themselves are made by the entry from its allocator
+//! (`Rings::new_in(lanes, len, alloc)`) and handed in by reference ([`RingConfig::rings`]); the
+//! clock is a value of the config ([`RingConfig::clock`]); the caps of a text field are the
+//! config's [`TraceLimits`]; a sink is handed in by the entry ([`crate::install`]) or by a test
+//! ([`crate::with_thread_sink`]), or straight to [`crate::Span::new`] and
+//! [`crate::Event::dispatch`]. The sites are `static`s the macros write, but constant data: their
+//! one word of state is the site's row in [`PROFILE`]'s table and who records it.
 
-use alloc::alloc::Global;
 use core::cell::{Cell, UnsafeCell};
 use core::fmt;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+use blaze_own::SharedAlloc;
 
 use crate::ring::{Emitter, Producer};
 use crate::{Installed, Metadata, Parent, Sink, Value, Values};
@@ -43,14 +68,33 @@ pub const SLOT: usize = 4;
 /// The payload words of an entry.
 pub const WORDS: usize = SLOT - 1;
 
-/// The rings spans are recorded into.
-pub type Rings = Emitter<Global, SLOT>;
+/// The allocator the rings are in: the process's, handed by the entry as a handle that crosses
+/// threads (every thread pushes to its lane of them), named here because the rings are reached
+/// from the profile ring's static and so cannot be generic.
+pub type RingsAlloc = SharedAlloc<'static>;
 
-/// The most sites a process records: 2^15, 256 KB of table.
+/// The rings spans are recorded into.
+pub type Rings = Emitter<RingsAlloc, SLOT>;
+
+/// The most sites a process records: 2^15, 256 KB of table: the cap of [`PROFILE`]'s site table,
+/// fixed at compile time because the table is the static itself.
 pub const MOST_SITES: usize = 1 << 15;
 
-/// The most bytes of one text field kept; the rest are counted as cut.
+/// The most bytes of one text field kept; the rest are counted as cut: [`TraceLimits::SHIPPED`]'s.
 pub const MOST_TEXT: u64 = 256;
+
+/// The recording path's caps as one value (D165), carried by the [`RingConfig`] the entry
+/// installs; a simulation draws them down ([`TraceLimits::SHIPPED`] is the shipped instance).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TraceLimits {
+    /// The most bytes of one text field written into the rings, at least 0; the rest are cut.
+    pub most_text: u64,
+}
+
+impl TraceLimits {
+    /// The caps shipped: [`MOST_TEXT`] bytes a text field.
+    pub const SHIPPED: TraceLimits = TraceLimits { most_text: MOST_TEXT };
+}
 
 const RING: u32 = 1;
 const SINK: u32 = 2;
@@ -90,7 +134,7 @@ impl Site {
             return sink.enabled(self.meta).then_some(How::Sink(sink));
         }
         if state & RING != 0
-            && let Some(config) = RINGS.get()
+            && let Some(config) = PROFILE.rings.get()
         {
             return Some(How::Ring(config, state >> ID_SHIFT));
         }
@@ -124,33 +168,67 @@ pub enum How {
     Sink(&'static dyn Sink),
 }
 
-static SITES: [AtomicPtr<Site>; MOST_SITES] = [const { AtomicPtr::new(ptr::null_mut()) }; MOST_SITES];
-static NEXT_SITE: AtomicU32 = AtomicU32::new(1);
-static REFUSED_SITES: AtomicU64 = AtomicU64::new(0);
-/// Moved by every change of who records what, so a site registering meanwhile decides again.
-static GENERATION: AtomicU32 = AtomicU32::new(0);
+// --- The profile ring's static ----------------------------------------------------------
+
+/// The process's profile ring: the one `static` with state of blaze's tracing (the module's
+/// "The process's profile ring"), capped at compile time and never allocating.
+pub struct Profile {
+    /// The rings' config, written once by [`install_rings`].
+    rings: Once<RingConfig>,
+    /// The entry's sink (the flight recorder), written once by [`crate::install`].
+    pub(crate) entry: Once<&'static dyn Sink>,
+    /// The site table: row `id` is the site of that id, row 0 none.
+    sites: [AtomicPtr<Site>; MOST_SITES],
+    next_site: AtomicU32,
+    refused_sites: AtomicU64,
+    /// Moved by every change of who records what, so a site registering meanwhile decides again.
+    generation: AtomicU32,
+    /// Threads with a sink of their own ([`crate::set_thread`]): while any has, every site takes
+    /// the sink path, which asks the thread's sink.
+    pub(crate) thread_sinks: AtomicU32,
+    /// Entries not recorded because their thread found every lane held.
+    unrecorded: AtomicU64,
+}
+
+impl Profile {
+    const fn new() -> Profile {
+        Profile {
+            rings: Once::new(),
+            entry: Once::new(),
+            sites: [const { AtomicPtr::new(ptr::null_mut()) }; MOST_SITES],
+            next_site: AtomicU32::new(1),
+            refused_sites: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
+            thread_sinks: AtomicU32::new(0),
+            unrecorded: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The process's profile ring (C3's second allowed static): named, capped ([`Profile`]).
+pub static PROFILE: Profile = Profile::new();
 
 /// The site of id `id`, as the entries name it.
 pub fn site(id: u32) -> Option<&'static Metadata<'static>> {
-    let found = SITES.get(id as usize)?.load(Ordering::Acquire);
+    let found = PROFILE.sites.get(id as usize)?.load(Ordering::Acquire);
     // SAFETY: only `register` stores here, and only `&'static Site` pointers.
     unsafe { found.as_ref() }.map(|it| it.meta)
 }
 
 /// Sites past [`MOST_SITES`], which record nothing.
 pub fn refused_sites() -> u64 {
-    REFUSED_SITES.load(Ordering::Relaxed)
+    PROFILE.refused_sites.load(Ordering::Relaxed)
 }
 
 /// Who records `meta` now: the rings and a sink's bits.
 fn who(meta: &'static Metadata<'static>) -> u32 {
     let mut bits = 0;
-    if let Some(config) = RINGS.get()
+    if let Some(config) = PROFILE.rings.get()
         && (config.wants)(meta)
     {
         bits |= RING;
     }
-    if THREAD_SINKS.load(Ordering::Acquire) > 0 || crate::entry().is_some_and(|it| it.enabled(meta)) {
+    if PROFILE.thread_sinks.load(Ordering::Acquire) > 0 || crate::entry().is_some_and(|it| it.enabled(meta)) {
         bits |= SINK;
     }
     bits
@@ -160,20 +238,20 @@ fn who(meta: &'static Metadata<'static>) -> u32 {
 #[cold]
 #[inline(never)]
 fn register(site: &'static Site) -> u32 {
-    let id = NEXT_SITE.fetch_add(1, Ordering::Relaxed);
+    let id = PROFILE.next_site.fetch_add(1, Ordering::Relaxed);
     if id as usize >= MOST_SITES {
-        REFUSED_SITES.fetch_add(1, Ordering::Relaxed);
+        PROFILE.refused_sites.fetch_add(1, Ordering::Relaxed);
         _ = site.state.compare_exchange(UNSEEN, 0, Ordering::Relaxed, Ordering::Relaxed);
         return site.state.load(Ordering::Relaxed);
     }
-    SITES[id as usize].store(ptr::from_ref(site).cast_mut(), Ordering::Release);
-    let generation = GENERATION.load(Ordering::Acquire);
+    PROFILE.sites[id as usize].store(ptr::from_ref(site).cast_mut(), Ordering::Release);
+    let generation = PROFILE.generation.load(Ordering::Acquire);
     let state = id << ID_SHIFT | who(site.meta);
     if let Err(other) = site.state.compare_exchange(UNSEEN, state, Ordering::AcqRel, Ordering::Relaxed) {
         // Another thread registered it first; this id's table row names the same site.
         return other;
     }
-    if GENERATION.load(Ordering::Acquire) != generation {
+    if PROFILE.generation.load(Ordering::Acquire) != generation {
         decide(site);
     }
     site.state.load(Ordering::Relaxed)
@@ -196,19 +274,15 @@ fn decide(site: &'static Site) {
 
 /// Decides every known site's bits again: what installing a recorder does.
 pub(crate) fn decide_all() {
-    GENERATION.fetch_add(1, Ordering::AcqRel);
-    let known = (NEXT_SITE.load(Ordering::Acquire) as usize).min(MOST_SITES);
-    for row in &SITES[1..known] {
+    PROFILE.generation.fetch_add(1, Ordering::AcqRel);
+    let known = (PROFILE.next_site.load(Ordering::Acquire) as usize).min(MOST_SITES);
+    for row in &PROFILE.sites[1..known] {
         // SAFETY: as in `site`.
         if let Some(site) = unsafe { row.load(Ordering::Acquire).as_ref() } {
             decide(site);
         }
     }
 }
-
-/// Threads with a sink of their own ([`crate::set_thread`]): while any has, every site takes
-/// the sink path, which asks the thread's sink.
-pub(crate) static THREAD_SINKS: AtomicU32 = AtomicU32::new(0);
 
 // --- Written once -----------------------------------------------------------------------
 
@@ -254,17 +328,25 @@ impl<T> Once<T> {
 
 // --- The rings' config ------------------------------------------------------------------
 
-/// What the program's entry gives [`install_rings`].
+/// What the program's entry gives [`install_rings`]: every input of the recording path as a
+/// value (C3): the rings it made from its allocator, which sites they record, the clock and the
+/// caps.
 #[derive(Clone, Copy)]
 pub struct RingConfig {
     pub rings: &'static Rings,
     /// Which sites the rings record, decided once a site.
     pub wants: fn(&'static Metadata<'static>) -> bool,
     pub clock: Clock,
+    /// The recording path's caps: [`TraceLimits::SHIPPED`] in a program.
+    pub limits: TraceLimits,
 }
 
-/// Where an entry's tick comes from. Without the `sim-clock` feature (or a test of this crate)
-/// only the CPU's counter: one `mrs`/`rdtsc` a read, no branch and no call.
+/// Where an entry's tick comes from: a value of the [`RingConfig`] the entry installs, so time
+/// enters the recording path as the entry chose it, never read from anywhere else. `Counter` is
+/// the CPU's counter, the profile ring's own clock (a register read in user space, part of the
+/// allowed static's mechanism, as the ring's stamps are). `Sim` is a simulation's clock, a `fn`
+/// the simulation hands in; it exists only with the `sim-clock` feature (and in this crate's
+/// tests) so a program's tick is one `mrs`/`rdtsc` a read, no branch and no call.
 #[derive(Clone, Copy)]
 pub enum Clock {
     Counter,
@@ -283,8 +365,6 @@ impl RingConfig {
         }
     }
 }
-
-static RINGS: Once<RingConfig> = Once::new();
 
 /// Why the rings could not be installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,19 +392,19 @@ pub fn install_rings(config: RingConfig) -> Result<(), RingsRefused> {
     if matches!(config.clock, Clock::Counter) && !HAS_COUNTER {
         return Err(RingsRefused::NoCounter);
     }
-    RINGS.set(config).map_err(|Installed| RingsRefused::Installed)?;
+    PROFILE.rings.set(config).map_err(|Installed| RingsRefused::Installed)?;
     decide_all();
     Ok(())
 }
 
 /// The process's rings, for their reader.
 pub fn rings() -> Option<&'static Rings> {
-    RINGS.get().map(|it| it.rings)
+    PROFILE.rings.get().map(|it| it.rings)
 }
 
 /// The tick the rings' clock reads now: what an entry's word 1 is in.
 pub fn ticks() -> u64 {
-    RINGS.get().map_or_else(counter, RingConfig::tick)
+    PROFILE.rings.get().map_or_else(counter, RingConfig::tick)
 }
 
 // --- The counter ------------------------------------------------------------------------
@@ -375,24 +455,34 @@ pub fn counter_hz() -> Option<u64> {
 
 // --- The thread -------------------------------------------------------------------------
 
-/// The calling thread's state: the one thread-local of blaze's tracing. Its sink (when it set
-/// one), its ring's producer and its depth.
+/// Whether a thread may still claim a lane: a typed state, not a flag beside the producer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// It has not tried, or holds a lane.
+    Open,
+    /// Every lane was held when it tried: it records nothing more, each entry counted.
+    Refused,
+}
+
+/// The calling thread's state: the profile ring's per-thread half (the module's "The process's
+/// profile ring"), the one thread-local of blaze's tracing. Its sink (when it set one), its
+/// lane's producer and its depth.
 pub(crate) struct Thread {
     pub(crate) sink: Cell<Option<&'static dyn Sink>>,
-    producer: UnsafeCell<Option<Producer<'static, Global, SLOT>>>,
-    refused: Cell<bool>,
+    producer: UnsafeCell<Option<Producer<'static, RingsAlloc, SLOT>>>,
+    claim: Cell<Claim>,
     depth: Cell<u16>,
 }
 
+/// The calling thread's half of [`PROFILE`]: capped by the rings' lanes (a thread past them
+/// holds no producer and counts what it would have recorded, [`unrecorded`]).
 #[thread_local]
 pub(crate) static THREAD: Thread =
-    Thread { sink: Cell::new(None), producer: UnsafeCell::new(None), refused: Cell::new(false), depth: Cell::new(0) };
-
-static UNRECORDED: AtomicU64 = AtomicU64::new(0);
+    Thread { sink: Cell::new(None), producer: UnsafeCell::new(None), claim: Cell::new(Claim::Open), depth: Cell::new(0) };
 
 /// Entries not recorded because their thread found every lane held.
 pub fn unrecorded() -> u64 {
-    UNRECORDED.load(Ordering::Relaxed)
+    PROFILE.unrecorded.load(Ordering::Relaxed)
 }
 
 /// The bit a span id's lane starts at: lanes are under 2^12, entries under 2^51.
@@ -447,11 +537,11 @@ fn push(config: &RingConfig, thread: &Thread, payload: &[u64; WORDS]) -> Option<
 fn claim_and_push(
     config: &RingConfig,
     thread: &Thread,
-    slot: &mut Option<Producer<'static, Global, SLOT>>,
+    slot: &mut Option<Producer<'static, RingsAlloc, SLOT>>,
     payload: &[u64; WORDS],
 ) -> Option<u64> {
-    if thread.refused.get() {
-        UNRECORDED.fetch_add(1, Ordering::Relaxed);
+    if thread.claim.get() == Claim::Refused {
+        PROFILE.unrecorded.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     match config.rings.claim() {
@@ -461,8 +551,8 @@ fn claim_and_push(
             Some(span_id(producer.lane().0, producer.push(payload)))
         }
         Err(_) => {
-            thread.refused.set(true);
-            UNRECORDED.fetch_add(1, Ordering::Relaxed);
+            thread.claim.set(Claim::Refused);
+            PROFILE.unrecorded.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -623,7 +713,8 @@ pub fn decode(words: [u64; WORDS]) -> Entry {
     }
 }
 
-/// Text written into 16-byte entries as it is formatted, at most [`MOST_TEXT`] bytes.
+/// Text written into 16-byte entries as it is formatted, at most the config's
+/// [`TraceLimits::most_text`] bytes.
 struct Text<'c> {
     config: &'c RingConfig,
     chunk: [u8; 16],
@@ -648,7 +739,7 @@ impl Text<'_> {
 impl fmt::Write for Text<'_> {
     fn write_str(&mut self, text: &str) -> fmt::Result {
         for &byte in text.as_bytes() {
-            if self.kept == MOST_TEXT {
+            if self.kept >= self.config.limits.most_text {
                 self.cut += 1;
                 continue;
             }
@@ -698,7 +789,7 @@ fn field(config: &RingConfig, index: u16, value: &Value<'_>) {
 /// The rings' config, when installed.
 #[inline(always)]
 pub(crate) fn config() -> Option<&'static RingConfig> {
-    RINGS.get()
+    PROFILE.rings.get()
 }
 
 /// A span begins with fields or a named parent: its open entry and fields; its id.
@@ -751,7 +842,7 @@ pub(crate) unsafe fn exit(config: &RingConfig, here: *const Thread, site: u32, s
 /// A task's boundary on the calling thread, with the thread's CPU time as the driver read it:
 /// the reader shares the CPU between two boundaries among the spans between them by wall time.
 pub fn task_boundary(cpu_ns: u64) {
-    if let Some(config) = RINGS.get() {
+    if let Some(config) = PROFILE.rings.get() {
         push(config, &THREAD, &[head(kind::CPU, 0, 0, 0), config.tick(), cpu_ns]);
     }
 }
@@ -761,6 +852,6 @@ pub fn task_boundary(cpu_ns: u64) {
 /// Its span id, `None` when nothing was recorded.
 #[inline(always)]
 pub fn emit(words: [u64; WORDS]) -> Option<u64> {
-    let config = RINGS.get()?;
+    let config = PROFILE.rings.get()?;
     push(config, &THREAD, &words)
 }

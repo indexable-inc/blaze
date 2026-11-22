@@ -171,9 +171,12 @@ impl fmt::Display for PathError {
             Why::Empty => "no segments",
             Why::Refused { why, .. } => why.text(),
         };
-        write!(f, "a path in module {:x}: segment {}: {why}", self.module, self.at)?;
-        if let Why::Refused { module, call, .. } = self.why {
-            write!(f, " (macro call {call:x} in module {module:x})")?;
+        // No module or call key in the words (D191: one body's note in two views, whose block
+        // modules have two keys, prints once; rules 19 and 25: the note names the body and the
+        // path as written, and a key names nothing a reader can find and differs per unit).
+        write!(f, "a path in module where it is written: segment {}: {why}", self.at)?;
+        if let Why::Refused { .. } = self.why {
+            f.write_str(" (a macro call of a module the path passes through was refused)")?;
         }
         Ok(())
     }
@@ -451,11 +454,35 @@ fn lexical<'w, N: Name, W: World<N>>(
         return Ok(p.def);
     }
     if ns == Namespace::Macros {
+        // The `#[macro_use]` prelude: a `#[macro_use] extern crate` imports the macros the
+        // crate exports at its ROOT in the macro namespace, re-exports (`pub use`) included
+        // (rustc's `process_macro_use_imports`, every macro child of the crate's root module).
+        // std's `vec` is one: `pub use alloc_crate::vec;` (std lib.rs), so a `#![no_std]`
+        // crate's `#[macro_use] extern crate std;` (proptest) has `vec!`. A macro of a module
+        // under the root without `#[macro_export]` is no binding of the root: not imported.
+        //
+        // THE SAME RULE is the names step's layer (lookup.rs `lexical_layers`, the
+        // `self.macro_use` loop: `layer_name(root, Macros, ..)`), over live modules; this is it
+        // over records. Both walk the root's macro namespace by one walk, blaze-surface
+        // `through`: `in_source` here, `read_name` there; the `#[macro_export]` rows first are
+        // the records' index of the root's own macros (an exported macro is the root's binding
+        // for other crates, crate_scope.rs), read without a walk.
         let mut i = 0;
         while let Some(krate_root) = root.macro_use(i) {
             let Some(other) = world.root_of(krate_root) else { return Err(Why::NotRead { module: krate_root, layer: Unheld::MacroUse }) };
             if let Some((key, shapes)) = other.macro_export(name) {
                 return Ok(Def { key, kind: DefKind::Macro(shapes) });
+            }
+            let found = in_source(world, Def::module(krate_root), ns, name, scratch).map_err(|why| match why {
+                // The crate's root, or a module behind its globs, not held is this layer's.
+                Why::NotRead { module, .. } => Why::NotRead { module, layer: Unheld::MacroUse },
+                why => why,
+            })?;
+            if let Some(p) = found
+                && matches!(p.def.kind, DefKind::Macro(_))
+                && visible(p.vis, chain, head.krate)
+            {
+                return Ok(p.def);
             }
             i += 1;
         }

@@ -119,7 +119,7 @@ impl fmt::Display for CutRefused<'_> {
             CutRefused::NotRecorded { side, triple } => write!(
                 f,
                 "toolchain cut: `{triple}` ({}) is not a target the pinned nightly's recorded answers hold \
-                 (crates/blaze-units/src/stdlib/rustc.json `targets`); the pinned source is not cut for a target it was not asked about",
+                 (pins/answers/rustc.json `targets`); the pinned source is not cut for a target it was not asked about",
                 side.as_str()
             ),
             CutRefused::Alloc(failure) => write!(f, "toolchain cut: {failure}"),
@@ -243,7 +243,7 @@ mod tests {
     use crate::{ToolchainId, ToolchainView};
 
     /// The targets the pinned nightly's answers are recorded for: the keys of
-    /// crates/blaze-units/src/stdlib/rustc.json's `targets`, as read on 2026-11-16.
+    /// pins/answers/rustc.json's `targets`, as read on 2026-11-16.
     const RECORDED: [&str; 12] = [
         "aarch64-apple-darwin",
         "aarch64-pc-windows-msvc",

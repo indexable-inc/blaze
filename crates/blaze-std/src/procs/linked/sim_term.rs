@@ -16,8 +16,8 @@ use core::{alloc::Allocator, time::Duration};
 use blaze_core::wait::Deadline;
 
 use super::{
-    Ended,
-    run::{ChannelError, Message, PREFIX, RunChild, RunError, RunFault, RunStep},
+    Exit, Waited,
+    run::{ChannelError, Message, PREFIX, Reaped, RunChild, RunError, RunFault, RunStep, RunWaited},
     sim_child::SimChild,
 };
 use crate::procs::ProcId;
@@ -42,7 +42,7 @@ pub struct TermChild<'s> {
     /// When a heeded SIGTERM ends it.
     ends_at: Option<Duration>,
     /// Its end by a heeded SIGTERM (the inner child's own ends are the inner's).
-    ended: Option<Ended>,
+    ended: Option<Exit>,
     terminated_at: Option<Duration>,
     killed_at: Option<Duration>,
     terminations: u32,
@@ -95,7 +95,39 @@ impl<'s> TermChild<'s> {
     }
 }
 
-impl RunChild for TermChild<'_> {
+impl TermChild<'_> {
+    /// [`RunChild::wait`]: its end by `deadline`, or `None` with it still running.
+    fn wait_in(&mut self, deadline: Deadline) -> Result<Option<Exit>, RunError> {
+        if let Some(ended) = self.ended {
+            return Ok(Some(ended));
+        }
+        let (until, end_first) = self.cut(deadline);
+        match self.inner.wait_in(until)? {
+            None if end_first => {
+                self.ended = Some(Exit::Signaled(SIGTERM));
+                Ok(Some(Exit::Signaled(SIGTERM)))
+            }
+            ended => Ok(ended),
+        }
+    }
+
+    /// [`RunChild::kill`]: an end that came first is kept, as a reap's.
+    fn kill_in(&mut self) -> Exit {
+        if let Some(ended) = self.ended {
+            return ended;
+        }
+        let ended = self.inner.kill_in();
+        // Only a kill that ended it is one.
+        if self.inner.killed() && self.killed_at.is_none() {
+            self.killed_at = Some(self.inner.now());
+        }
+        ended
+    }
+}
+
+impl RunChild for &mut TermChild<'_> {
+    type Left = ();
+
     fn now(&self) -> Duration {
         self.inner.now()
     }
@@ -105,9 +137,9 @@ impl RunChild for TermChild<'_> {
             return self.closed(into);
         }
         let (until, end_first) = self.cut(deadline);
-        match self.inner.recv_message(into, most, until)? {
+        match self.inner.recv_in(into, most, until)? {
             Message::Deadline if end_first => {
-                self.ended = Some(Ended::Signaled(SIGTERM));
+                self.ended = Some(Exit::Signaled(SIGTERM));
                 self.closed(into)
             }
             message => Ok(message),
@@ -118,33 +150,18 @@ impl RunChild for TermChild<'_> {
         if self.ended.is_some() {
             return Err(RunError { step: RunStep::Send, proc: Some(self.id), fault: RunFault::Channel(ChannelError::Hangup) });
         }
-        self.inner.send(bytes, deadline)
+        self.inner.send_in(bytes, deadline)
     }
 
-    fn wait(&mut self, deadline: Deadline) -> Result<Ended, RunError> {
-        if let Some(ended) = self.ended {
-            return Ok(ended);
-        }
-        let (until, end_first) = self.cut(deadline);
-        match self.inner.wait(until)? {
-            Ended::Deadline if end_first => {
-                self.ended = Some(Ended::Signaled(SIGTERM));
-                Ok(Ended::Signaled(SIGTERM))
-            }
-            ended => Ok(ended),
-        }
+    fn wait(self, deadline: Deadline) -> Result<RunWaited<Self>, RunError> {
+        Ok(match self.wait_in(deadline)? {
+            Some(exit) => Waited::Ended(Reaped { exit, left: () }),
+            None => Waited::Running(self),
+        })
     }
 
-    fn kill(&mut self) -> Result<Ended, RunError> {
-        if let Some(ended) = self.ended {
-            return Ok(ended);
-        }
-        let ended = self.inner.kill()?;
-        // Only a kill that ended it is one (an end that came first is kept, as a reap's).
-        if self.inner.killed() && self.killed_at.is_none() {
-            self.killed_at = Some(self.inner.now());
-        }
-        Ok(ended)
+    fn kill(self) -> Result<Reaped<()>, RunError> {
+        Ok(Reaped { exit: self.kill_in(), left: () })
     }
 
     fn terminate(&mut self) -> Result<(), RunError> {

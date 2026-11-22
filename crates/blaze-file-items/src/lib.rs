@@ -185,6 +185,8 @@
 // `thread_local!`: the worker's scratch outline (crate::walk).
 extern crate std;
 
+// D189's surface pass: a body call's path and input, a block `use`'s bindings, by tokens.
+pub mod body_paths;
 mod chain;
 mod digest;
 mod flags;
@@ -204,7 +206,7 @@ use blaze_surface::{
 
 pub use blaze_ids::ContentId;
 pub use chain::{CHAIN_DOMAIN, chain_at, head_of, item_chain};
-pub use header::{HeaderError, ImplHeader, impl_header};
+pub use header::{GenericsError, HeaderError, ImplHeader, declared_lifetimes, impl_header};
 pub use walk::Bodies;
 pub use parser::SyntaxKind;
 
@@ -372,8 +374,9 @@ pub struct Outline<'a> {
 }
 
 impl Outline<'_> {
-    /// This outline in `alloc`, each column at its exact length.
-    fn copy_in<'b>(&self, alloc: Alloc<'b>) -> Outline<'b> {
+    /// Copy every column at its exact length into the caller's allocator. The names resolver
+    /// uses this to move a file worker's result into the owning crate's frame.
+    pub fn copy_in<'b>(&self, alloc: Alloc<'b>) -> Outline<'b> {
         fn exact<'b, T: Copy>(from: &[T], alloc: Alloc<'b>) -> AVec<'b, T> {
             let mut to = AVec::with_capacity_in(from.len(), alloc);
             to.extend_from_slice(from);

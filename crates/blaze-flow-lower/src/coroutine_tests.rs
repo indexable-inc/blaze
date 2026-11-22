@@ -1,6 +1,7 @@
 //! Async blocks lowered as their own flows, and their exact interiors (coroutine.rs; async plan
 //! P2, D-A2). Bodies are built with the type checker's fixture world, checked by the real type
-//! checker, lowered with [`lower_async`], and checked by blaze-flow. Each expectation is stated
+//! checker, lowered with [`crate::lower_async`] (through the call-rule oracle,
+//! `crate::oracle::lower_async_checked`), and checked by blaze-flow. Each expectation is stated
 //! from a written rule, quoted per test.
 
 use std::format;
@@ -16,13 +17,85 @@ use blaze_typeck::{
 };
 
 use crate::coroutine::{InteriorPlant, interior_planted};
-use crate::{AdtFacts, CalleeFacts, Facts, LoweredAsync, lower_async};
+use crate::region_fixture::{Decls, FnHead, Regions, WithRegions};
+use crate::{AdtFacts, CalleeFacts, Facts, LoweredAsync, Region};
+
+/// Fn `item`'s region head as its world declares it: `slots.len()` lifetimes, each elided
+/// (so late-bound, none in a bound), numbered in order of appearance; its column over
+/// `fn(inputs) -> output` `slots`. Laid into the checked record's own table
+/// ([`Decls::lay`]), never the world's.
+pub(super) fn declare(decls: &mut Decls, item: ItemKey, inputs: &[PTy], output: PTy, slots: &[Region]) {
+    let lifetimes = slots.iter().filter_map(|r| if let Region::Param(i) = *r { Some(i + 1) } else { None }).max().unwrap_or(0);
+    let late: vec::Vec<u32> = (0..lifetimes).collect();
+    decls.func(item, FnHead { lifetimes, late: &late, outlives: &[], inputs, output, slots });
+}
 
 /// Every ADT of the fixtures is a plain struct with no `Copy` impl, no lifetimes, needing drop.
 /// Nothing is said of futures: an `.await`'s future is the record's (`Checked::awaited`).
 struct AsyncFacts;
 
 impl Facts for AsyncFacts {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
@@ -53,8 +126,10 @@ struct Items {
 /// `fn ready() -> Ready`, `fn make_rc() -> Rc<i32>` (the Reference's `Rc::new(1)`),
 /// `fn drop_rc(_: Rc<i32>)` (its `drop(r)`), `fn read(_: &u8) -> u8`, `fn spawn<T>(_: T)`,
 /// `fn take(_: &Rc<i32>, _: ())` (a call whose first argument is a temporary made before an
-/// `.await` in its second), `fn owner()`.
-fn world() -> (Fx, Items) {
+/// `.await` in its second), `fn owner()`. With `read_laid` false, `read`'s head is not laid:
+/// a call of it with a reference is the borrow check's `RegionsUnread { why: NoHead }`, the
+/// region refusal the witness lowering must not wait on (typeck.md "Witness records").
+fn world(read_laid: bool) -> (Fx, Items, Decls) {
     let mut fx = Fx::new();
     let (p0, unit, u8_) = (fx.param(0), fx.unit(), fx.u8());
     let i32_ = fx.ty(PNode::Int(IntTy::I32));
@@ -84,16 +159,29 @@ fn world() -> (Fx, Items) {
     let rc = fx.strukt("Rc", 1, &[]);
     let rc_i32 = fx.adt(rc, &[i32_]);
     let ru8 = fx.r(Mutbl::Not, u8_);
-    fx.func("ready", 0, &[], ready_t, vec::Vec::new());
-    fx.func("make_rc", 0, &[], rc_i32, vec::Vec::new());
-    fx.func("drop_rc", 0, &[rc_i32], unit, vec::Vec::new());
-    fx.func("read", 0, &[ru8], u8_, vec::Vec::new());
-    fx.func("spawn", 1, &[p0], unit, vec::Vec::new());
+    let ready_f = fx.func("ready", 0, &[], ready_t, vec::Vec::new());
+    let make_rc = fx.func("make_rc", 0, &[], rc_i32, vec::Vec::new());
+    let drop_rc = fx.func("drop_rc", 0, &[rc_i32], unit, vec::Vec::new());
+    let read = fx.func("read", 0, &[ru8], u8_, vec::Vec::new());
+    let spawn = fx.func("spawn", 1, &[p0], unit, vec::Vec::new());
     let r_rc = fx.r(Mutbl::Not, rc_i32);
-    fx.func("take", 0, &[r_rc, unit], unit, vec::Vec::new());
+    let take = fx.func("take", 0, &[r_rc, unit], unit, vec::Vec::new());
     let owner = fx.func("owner", 0, &[], unit, vec::Vec::new());
     fx.finish();
-    (fx, Items { owner, ready, rc })
+    // The heads as written above: `read(_: &u8)` and `take(_: &Rc<i32>, _: ())` each one
+    // elided input lifetime, `Param(0)`, no output borrowing; the others none (`Rc` declares
+    // no lifetime).
+    let mut decls = Decls::new();
+    declare(&mut decls, ready_f, &[], ready_t, &[]);
+    declare(&mut decls, make_rc, &[], rc_i32, &[]);
+    declare(&mut decls, drop_rc, &[rc_i32], unit, &[]);
+    if read_laid {
+        declare(&mut decls, read, &[ru8], u8_, &[Region::Param(0)]);
+    }
+    declare(&mut decls, spawn, &[p0], unit, &[]);
+    declare(&mut decls, take, &[r_rc, unit], unit, &[Region::Param(0)]);
+    declare(&mut decls, owner, &[], unit, &[]);
+    (fx, Items { owner, ready, rc }, decls)
 }
 
 fn checked(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId) -> Checked<'static> {
@@ -120,11 +208,18 @@ struct Case {
     c: Checked<'static>,
     block: ExprId,
     facts: AsyncFacts,
+    /// The world's heads, laid in `c`'s own table.
+    regions: Regions,
     it: Items,
 }
 
 fn case(inner: fn(&mut Bb) -> ExprId) -> Case {
-    let (fx, it) = world();
+    case_with(inner, true)
+}
+
+/// [`case`], `read`'s head laid or not ([`world`]).
+fn case_with(inner: fn(&mut Bb) -> ExprId, read_laid: bool) -> Case {
+    let (fx, it, decls) = world(read_laid);
     let mut b = Bb::new();
     let e0 = b.path(&["spawn"]);
     let body = inner(&mut b);
@@ -132,15 +227,17 @@ fn case(inner: fn(&mut Bb) -> ExprId) -> Case {
     let call = b.call(e0, &[block]);
     let s = b.semi(call);
     let root = b.block(&[s], None);
-    let c = checked(&fx, &b, it.owner, root);
+    let mut c = checked(&fx, &b, it.owner, root);
+    let regions = decls.lay(fx.t.view(), &mut c.types);
     let facts = AsyncFacts;
-    Case { b, c, block, facts, it }
+    Case { b, c, block, facts, regions, it }
 }
 
 fn lowered(k: &Case) -> LoweredAsync<Alloc<'static>> {
     let root = k.block;
     let view = k.b.view(k.it.owner, root);
-    match lower_async(&view, &k.c, k.block, &k.facts, Alloc::global()) {
+    let with = WithRegions { base: &k.facts, regions: &k.regions };
+    match crate::oracle::lower_async_checked(&view, &k.c, k.block, &with, crate::region_fixture::alloc()) {
         Ok(l) => l,
         Err(r) => panic!("refused: {r:?}"),
     }
@@ -282,6 +379,50 @@ fn a_local_live_across_the_await_is_in_the_interior() {
     std::println!("interior with the live Rc: {} types", got.len());
 }
 
+/// W1 (typeck.md "Witness records"): an async block's witness is region-erased (the Reference,
+/// "Async blocks": the state "stores the data needed to resume", and "Auto traits" read only
+/// the types it holds; rustc computes it with regions erased), so a REGION refusal of the
+/// borrow check's lowering must not take it away. `async { let x = 1u8; let r = &x;
+/// ready().await; read(r) }` with `read`'s head not laid: the borrow check's lowering is refused
+/// `RegionsUnread { item: read, why: NoHead }` (it relates `r`'s region into a head it cannot
+/// read); the witness lowering (one_call.rs `Erased`) lowers it, and its statements and saved
+/// locals equal production's lowering of the same block with `read` laid (oracle.rs
+/// `witness_differs`). Control: production's lowering with one `StorageDead` turned into a
+/// `StorageLive` is told apart.
+/// Prints "witness despite RegionsUnread: equal to production's".
+#[test]
+fn a_region_refusal_leaves_the_witness() {
+    let unlaid = case_with(borrow_across, false);
+    let view = unlaid.b.view(unlaid.it.owner, unlaid.block);
+    let with = WithRegions { base: &unlaid.facts, regions: &unlaid.regions };
+    let refused = crate::lower_async(&view, &unlaid.c, unlaid.block, &with, crate::region_fixture::alloc());
+    match refused {
+        Err(r) => assert!(matches!(r.form, crate::Form::RegionsUnread { .. }), "the borrow check's lowering refuses by region: {r:?}"),
+        Ok(_) => panic!("the borrow check's lowering must refuse a call of an unlaid head with a reference"),
+    }
+    let w = match crate::lower_async_witness(&view, &unlaid.c, unlaid.block, &with, crate::region_fixture::alloc()) {
+        Ok(w) => w,
+        Err(r) => panic!("the witness lowering must not refuse for a region: {r:?}"),
+    };
+    let laid = case(borrow_across);
+    let production = lowered(&laid);
+    assert_eq!(crate::oracle::witness_differs(&production, w.lowered_for_oracle(), crate::region_fixture::alloc()), None);
+    assert_eq!(w.point_of().len(), 1, "one `.await`, one suspension");
+    std::println!("witness despite RegionsUnread: equal to production's");
+
+    // The control: one `StorageDead` changed.
+    let mut planted = lowered(&laid);
+    let at = planted.flow.stmts.iter().position(|s| matches!(s.kind, blaze_flow::StmtKind::StorageDead(_)));
+    let Some(at) = at else { panic!("the block's lowering ends some local's storage") };
+    if let blaze_flow::StmtKind::StorageDead(l) = planted.flow.stmts[at].kind {
+        planted.flow.stmts[at].kind = blaze_flow::StmtKind::StorageLive(l);
+    }
+    assert!(
+        crate::oracle::witness_differs(&planted, w.lowered_for_oracle(), crate::region_fixture::alloc()).is_some(),
+        "CONTROL: a lowering with one StorageDead changed must differ from the witness"
+    );
+}
+
 /// The whole path of an auto trait on an async block's future (async plan P13).
 mod send;
 
@@ -290,3 +431,7 @@ mod await_operand;
 
 /// What a block's state saves, as types (state_recipe.rs; ASYNC.md P8).
 mod state_recipe;
+
+/// The value of an `.await` of an `async fn`'s call, by its written return type (await_call.rs
+/// `awaited_shadow`).
+mod await_value;

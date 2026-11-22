@@ -97,7 +97,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Pat::Wild => Ok(expected),
             Pat::Bind { ann, name, sub } => {
                 let explicit = ann.mutable || ann.by_ref.is_some();
-                if explicit && mode != 0 && self.body.edition >= Edition::E2024 {
+                // By the edition of the pattern's own words, not the body's (rustc
+                // migration.rs `emit`: a hard error when a label's span is
+                // `at_least_rust_2024()`): a 2021 macro's `mut x` in a 2024 body is the
+                // migration lint's, which says nothing at check.
+                if explicit && mode != 0 && self.body.pat_edition(p) >= Edition::E2024 {
                     self.diag(DiagCode::BindingModifier2024, at, About::found_named(expected, name));
                 }
                 let by_ref = match ann.by_ref {
@@ -137,7 +141,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Ok(expected)
             }
             Pat::Ref { mutbl, inner } => {
-                if mode != 0 && self.body.edition >= Edition::E2024 {
+                if mode != 0 && self.body.pat_edition(p) >= Edition::E2024 {
                     self.diag(DiagCode::BindingModifier2024, at, About::found(expected));
                 }
                 let t = self.try_structurally_resolve(expected)?;
@@ -258,6 +262,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // against `[T]`, any number, and the `..` is `[T]`. Each element is `T`.
                 let pats = self.body.pat_list(elems)?;
                 let fixed = pats.len() as u64 - u64::from(rest.is_some());
+                // After peeling known references, an exact pattern constrains an unknown
+                // scrutinee to [T; k]. This supplies the target in `let [a, b] = v.try_into()?`.
+                // A rest pattern leaves the length open.
+                if rest.is_none() && self.is_ty_var(expected) {
+                    let elem = self.fresh()?;
+                    let len = self.len_value(fixed)?;
+                    let array = self.mk(TyView::Array(elem, len))?;
+                    self.demand_eq(at, expected, array)?;
+                }
                 let t = self.structurally_resolve(expected, at)?;
                 let (elem, rest_ty) = match self.view(t) {
                     // A length that is no value yet (a variable, a parameter): without `..` the

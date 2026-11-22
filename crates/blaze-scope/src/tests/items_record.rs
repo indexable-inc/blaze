@@ -21,7 +21,7 @@ use super::entry::{Texts, input};
 use crate::crate_scope::{Ready, resolve_by_records};
 use crate::graph::Sysroot;
 use crate::items_record::plant::{PLANT, Plant};
-use crate::items_record::{ItemsRecordError, LoadItems, RecordItems, SelfHead, encode};
+use crate::items_record::{CurrentFile, ItemsRecord, ItemsRecordError, LoadItems, RecordItems, SelfHead, encode};
 use crate::package_path::PackagePath;
 use crate::resolve::{At, CrateInput, CrateNames, Names, aligned};
 use crate::task::Serial;
@@ -130,6 +130,15 @@ impl LoadItems<'static> for Loaded {
         }
     }
 
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _: blaze_id::ContentId, edition: blaze_surface::Edition, alloc: Alloc<'static>) -> Result<Option<CurrentFile<'static>>, ItemsRecordError> {
+        let Some(file) = self.names.get(krate).and_then(|names| names.files.get(index as usize)) else { return Ok(None) };
+        assert_eq!(file.package, path);
+        if let Some((k, p, text)) = self.changed && k == krate && p == file.path {
+            return CurrentFile::from_text(index, text, edition, alloc).map(Some);
+        }
+        CurrentFile::from_outline(index, file.text, &file.outline, alloc).map(Some)
+    }
+
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
         self.names.get(krate)?.expansions.get(&call).and_then(|e| e.made).map(|m| m.text)
     }
@@ -162,14 +171,19 @@ fn ask(fresh: &Names<'static>, read: &RecordItems<'static, Loaded>, all: &[&'sta
         same(fresh.root(k), r.root_module(), &format!("`{c}`'s root module"))?;
         same(n.proc_key, r.proc_key(), &format!("`{c}`'s proc key"))?;
         same(c, rec(r.name(), "name")?, "a crate's name")?;
-        let marked = n.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"));
+        let marked = n.crate_root.features.contains(&"rustc_attrs") || n.files.first().is_none_or(|f| {
+            f.outline.file_attrs().iter().any(|a| crate::task::strip_attr(a.range.of(f.text)) == "rustc_coherence_is_core")
+        });
         same(marked, r.may_write_incoherent(), &format!("`{c}` may write incoherent impls"))?;
 
         // Question 19: every text, whole.
         same(n.files.len(), r.files(), &format!("`{c}`'s files"))?;
         for (i, f) in n.files.iter().enumerate() {
-            let row = rec(r.file(i as u32), "a file row")?.ok_or_else(|| differs(format!("`{c}` file {i}: no row")))?;
-            same((f.package, f.shown, f.id, f.text.len()), (row.path, row.shown, row.id, row.len as usize), &format!("`{c}` file {i}"))?;
+            let row = rec(r.file_surface(i as u32), "a file row")?.ok_or_else(|| differs(format!("`{c}` file {i}: no row")))?;
+            let digest = blaze_id::ContentId::of("blaze v2 vfs file 1", f.text.as_bytes());
+            same((f.package, f.shown, f.outline.surface()), (row.path, row.shown, row.surface), &format!("`{c}` file {i}'s surface"))?;
+            let now = rec(read.whole(k, At::File(i as u32)), "a file's text")?;
+            same((digest, f.text.len()), (blaze_id::ContentId::of("blaze v2 vfs file 1", now.as_bytes()), now.len()), &format!("`{c}` file {i}"))?;
             same(f.text, rec(read.whole(k, At::File(i as u32)), "a file's text")?, &format!("`{c}` file {i}'s text"))?;
         }
         let mut made = 0;
@@ -193,7 +207,11 @@ fn ask(fresh: &Names<'static>, read: &RecordItems<'static, Loaded>, all: &[&'sta
             same(Some((place.at, place.item)), row.text.map(|s| (s.at, row.outline)), &format!("{what}: place"))?;
             same(Some(it.text), rec(read.item_text(key), "an item's text")?, &format!("{what}: text"))?;
             let (_, outline) = fresh.outline_at(place.krate, place.at).ok_or_else(|| Broke::Harness(format!("{what}: no outline")))?;
-            let detail = outline.item(place.item).detail;
+            let entry = outline.item(place.item);
+            same(Some((entry.range.start, entry.range.len())), row.text.map(|s| (s.start, s.len)), &format!("{what}: byte range"))?;
+            let pieces = rec(r.pieces(key), "item digests")?.ok_or_else(|| differs(format!("{what}: missing item digests")))?;
+            same(entry.hash, pieces.body, &format!("{what}: body digest"))?;
+            let detail = entry.detail;
             same(detail.kind(), row.kind, &format!("{what}: kind"))?;
             let holds = format!("{detail:?}").contains("body_holds_items: true");
             same(holds, row.body_holds_items, &format!("{what}: body holds items"))?;
@@ -308,15 +326,15 @@ fn stale(tape: &Tape, records: &[&'static [u8]], all: &[&'static CrateNames<'sta
     let n = all[k];
     let file = tape.index(n.files.len(), "changed file");
     let f = n.files[file];
-    // Appended: every old range still lies inside the new text, so only the digest can tell.
-    let now = leak(format!("{}\n// edited after the solve\n", f.text));
+    // A new outline entry changes the file's surface and must refuse the old names record.
+    let now = leak(format!("{}\nfn added_after_solve() {{}}\n", f.text));
     let read = RecordItems::new(keys, Loaded { records: records.to_vec(), names: all.to_vec(), changed: Some((k, f.path, now)) }, g);
     let mut items: Vec<ItemKey> = n.tables.texts.iter().filter(|(_, t)| t.1 == At::File(file as u32)).map(|(key, _)| *key).collect();
     items.sort_unstable();
     let Some(&item) = items.first() else { return Ok(()) };
     for round in 0..2 {
         match read.item_text(item) {
-            Err(ItemsRecordError::Stale { file: Some(at), saw, found, .. }) if at == file as u32 && saw == f.id && found != f.id => {}
+            Err(ItemsRecordError::Stale { file: Some(at), saw, found, .. }) if at == file as u32 && saw == f.outline.surface() && found != f.outline.surface() => {}
             Ok(text) => return Err(Broke::Oracle(format!("a changed file was read through the stale record (ask {round}): `{}` gave {text:?}", f.path))),
             Err(e) => return Err(Broke::Oracle(format!("a changed file was read through the stale record (ask {round}): not refused as stale but as {e:?}"))),
         }
@@ -383,6 +401,39 @@ fn a_file_changed_under_the_record_is_refused_as_stale() {
     blaze_sim::control(Config::cases(300), Plant::None, Plant::SkipDigest, "read through the stale record", case);
 }
 
+#[test]
+fn a_body_only_edit_keeps_the_items_record_bytes() {
+    let tail = "\nstruct S; impl S { fn g() {} } macro_rules! make { () => { struct Made; } } make!();\n";
+    let before = solve_one(leak(format!("#![no_core]\nfn f() {{ 1 }}{tail}")), None);
+    let after = solve_one(leak(format!("#![no_core]\nfn f() {{ let rustc_attrs = 100; rustc_attrs }}{tail}")), None);
+    assert_eq!(before.files[0].outline.surface(), after.files[0].outline.surface());
+    assert_ne!(before.files[0].text.len(), after.files[0].text.len());
+    let g = Alloc::global();
+    let first = encode(before, g).unwrap_or_else(|e| panic!("encode before: {e:?}"));
+    let second = encode(after, g).unwrap_or_else(|e| panic!("encode after: {e:?}"));
+    assert_eq!(first, second, "a body-only edit changed the items record bytes");
+    let record = one_file(aligned(&first, g), after.files[0].text, g);
+    for (&key, (item, at)) in after.tables.texts.iter() {
+        if !matches!(at, At::File(_)) { continue; }
+        let row = record.item(key).expect("read joined row").expect("present item");
+        let span = row.text.expect("file item's range");
+        assert_eq!(record.slice(span, &|_| None).expect("current file slice"), item.text);
+        assert_eq!(record.pieces(key).expect("read pieces").expect("body hash").body, after.files[0].outline.item(row.outline).hash);
+    }
+    for (&key, src) in after.tables.macros.iter() {
+        let restored = record.macro_src(key, &|_| None).expect("the macro reads").expect("the macro is present");
+        assert_eq!(format!("{:?}", restored.body), format!("{:?}", src.body));
+    }
+}
+
+/// Open a single-file fixture with the same indexed join used by a multi-file loader.
+pub(super) fn one_file<'a>(bytes: &'a [u8], text: &'a str, alloc: Alloc<'a>) -> ItemsRecord<'a> {
+    ItemsRecord::open_with_files(bytes, alloc, move |index, _, _, edition| {
+        assert_eq!(index, 0);
+        CurrentFile::from_text(index, text, edition, alloc).map(Some)
+    }).expect("open the single-file fixture")
+}
+
 pub(super) fn solve_one(text: &'static str, sub: Option<&'static str>) -> &'static CrateNames<'static> {
     let g = Alloc::global();
     let mut of_crate = std::vec![("/k0/lib.rs", text)];
@@ -415,6 +466,57 @@ fn the_drawn_parts_fill_every_table() {
 /// ("impl<..> Type" is an inherent impl; "impl<..> !? Trait for Type" a trait impl) and
 /// "Types" (the forms of a type expression: a path, `&`, `&mut`, `*const`, `*mut`, `[T]`,
 /// `[T; N]`, `!`, a tuple, a trait object, a function pointer).
+/// Each struct, enum, union, trait, alias and associated type row holds the lifetimes its own
+/// generics declare (D155), read back in place by key (and an associated type by its trait
+/// and name); a fn's and an impl's rows hold none. Control (rule 23): a fn row answers `None`,
+/// not `Some(0)`, so the oracle's `Some(0)` rows are counted, not a default.
+#[test]
+fn item_rows_say_their_declared_lifetimes() {
+    const TEXT: &str = "#![no_core]
+pub struct Z;
+pub struct One<'a>(&'a u8);
+pub struct Mixed<T, 'a, const N: usize, 'b>(&'a T, &'b [u8; N]);
+pub struct Def<T, A = Z>(T, A);
+pub enum E<'x> { A(&'x u8) }
+pub union U<'u> { a: &'u u8 }
+pub trait Tr<'t> { type Gat<'g, 'h>; type Plain; fn f(&self); }
+pub type Al<'p, T> = Mixed<T, 'p, 1, 'p>;
+pub fn free<'f>(x: &'f u8) -> &'f u8 { x }
+impl<'i> Tr<'i> for Z { type Gat<'g, 'h> = u8; type Plain = u8; fn f(&self) {} }
+";
+    let g = Alloc::global();
+    let n = solve_one(TEXT, None);
+    let bytes = aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
+    let read = RecordItems::new(&[n.key], Loaded { records: std::vec![bytes], names: std::vec![n], changed: None }, g);
+    let r = read.record(0).unwrap_or_else(|| panic!("no record"));
+    let key_of = |name: &str| -> ItemKey {
+        (0..r.items())
+            .filter_map(|i| r.identity_at(i).unwrap_or_else(|e| panic!("item row {i}: {e:?}")))
+            .find(|it| it.name == Some(name))
+            .map(|it| it.key)
+            .unwrap_or_else(|| panic!("`{name}` has no item row"))
+    };
+    let lives = |name: &str| r.declared_lifetimes(key_of(name)).unwrap_or_else(|e| panic!("`{name}`'s lifetimes: {e:?}"));
+    for (name, want) in [("Z", 0), ("One", 1), ("Mixed", 2), ("Def", 0), ("E", 1), ("U", 1), ("Tr", 1), ("Al", 1)] {
+        assert_eq!(lives(name), Some(want), "ORACLE: `{name}`'s declared lifetimes");
+    }
+    assert_eq!(lives("free"), None, "CONTROL: a fn's row holds a count");
+    let tr = key_of("Tr");
+    let assoc = |name: &str| r.assoc_lifetimes(tr, |m| m == name).unwrap_or_else(|e| panic!("`Tr::{name}`: {e:?}"));
+    assert_eq!(assoc("Gat"), Some(2), "ORACLE: `Tr::Gat`'s own lifetimes");
+    assert_eq!(assoc("Plain"), Some(0), "ORACLE: `Tr::Plain`'s own lifetimes");
+    assert_eq!(assoc("f"), None, "CONTROL: a fn member answered as an associated type");
+    // The solved crate answers alike, from the same texts (the source over solved names).
+    for name in ["Z", "One", "Mixed", "Def", "E", "U", "Tr", "Al", "free"] {
+        let solved = crate::items_record::solved_lifetimes(n, key_of(name)).unwrap_or_else(|e| panic!("`{name}` solved: {e:?}"));
+        assert_eq!(solved, lives(name), "the solved names and the record disagree on `{name}`");
+    }
+    for name in ["Gat", "Plain", "f"] {
+        let solved = crate::items_record::solved_assoc_lifetimes(n, tr, |m| m == name).unwrap_or_else(|e| panic!("`Tr::{name}` solved: {e:?}"));
+        assert_eq!(solved, assoc(name), "the solved names and the record disagree on `Tr::{name}`");
+    }
+}
+
 #[test]
 fn impl_rows_say_what_each_header_writes() {
     const TEXT: &str = "#![no_core]

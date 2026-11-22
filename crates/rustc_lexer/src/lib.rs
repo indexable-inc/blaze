@@ -19,16 +19,24 @@
 //!
 //! [`rustc_parse::lexer`]: ../rustc_parse/lexer/index.html
 
-// tidy-alphabetical-start
-// We want to be able to build this crate with a stable compiler,
-// so no `#![feature]` attributes should be added.
-#![deny(unstable_features)]
-// tidy-alphabetical-end
+// blaze: upstream builds this crate on a stable compiler (`#![deny(unstable_features)]`); it is
+// blaze's own now, a sans-IO core on `core` alone, so it takes the tool attributes every
+// blaze crate does. Every line here that says `blaze` is blaze's, to keep at a re-vendor.
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
+#![forbid(unsafe_code)]
+
+// blaze: the tests' `format!`, `String` and `test_utils`.
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod tests;
 
-use std::str::Chars;
+use core::str::Chars;
 
 use LiteralKind::*;
 use TokenKind::*;
@@ -316,10 +324,27 @@ pub fn tokenize(
     frontmatter_allowed: FrontmatterAllowed,
 ) -> impl Iterator<Item = Token> {
     let mut cursor = Cursor::new(input, frontmatter_allowed);
-    std::iter::from_fn(move || {
+    core::iter::from_fn(move || {
         let token = cursor.advance_token();
         if token.kind != TokenKind::Eof { Some(token) } else { None }
     })
+}
+
+/// blaze: the byte index in `text` of the first `\n` followed by `dashes` dashes, as
+/// `text.find(&format!("\n{:-<1$}", "", dashes))` gives it, with no allocation.
+fn find_newline_fence(text: &str, dashes: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = memchr::memchr(b'\n', &bytes[from..]) {
+        let newline = from + at;
+        // Too few bytes left after this newline: none after a later one either.
+        let fence = bytes.get(newline + 1..newline + 1 + dashes)?;
+        if fence.iter().all(|&b| b == b'-') {
+            return Some(newline);
+        }
+        from = newline + 1;
+    }
+    None
 }
 
 /// True if `c` is considered a whitespace according to Rust language definition.
@@ -703,10 +728,12 @@ impl<'a> Cursor<'a> {
         let invalid_infostring = self.first() != '\n';
 
         let mut found = false;
-        let nl_fence_pattern = format!("\n{:-<1$}", "", length_opening as usize);
-        if let Some(closing) = self.as_str().find(&nl_fence_pattern) {
+        // blaze: upstream formats `"\n"` and the dashes into a `String` to `find` it; this finds
+        // the same first match with no allocation.
+        let fence_len = 1 + length_opening as usize;
+        if let Some(closing) = find_newline_fence(self.as_str(), length_opening as usize) {
             // candidate found
-            self.bump_bytes(closing + nl_fence_pattern.len());
+            self.bump_bytes(closing + fence_len);
             // in case like
             // ---cargo
             // --- blahblah

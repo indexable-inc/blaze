@@ -1,6 +1,7 @@
 //! The command's store on blaze-cas's plain store (D114 piece (b); drive.md, "D114 rulings",
-//! "The store under the command"): ONE store a user, one root (`<home>/.blaze/v2/store`), read
-//! and written by every checkout and worktree; records read IN PLACE.
+//! "The store under the command"): ONE store a user of each form, at `<home>/.blaze/`
+//! [`STORE_DIR`] (`v2/store/f5s2`, D160), read and written by every checkout and worktree;
+//! records read IN PLACE.
 //!
 //! Every byte a get lends is owned by blaze-cas's [`Lent`] (the plain store's segment mappings,
 //! never unmapped while it is open, and this command's puts in an arena of chunks that never
@@ -24,11 +25,12 @@ use std::alloc::Allocator;
 
 use blaze_cas::Key as CasKey;
 use blaze_own::Alloc;
-use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError};
+use blaze_cas::plain::{Driven, Lent, LentCounts, LentError, Liveness, PlaceName, PlainConfig, Probes, ROOT_LIFE_NS, Settings, Snapshot, SnapshotError};
 use blaze_core::{Driver, FileName};
 use blaze_drive::Key;
 use blaze_keyed::kind::{Namespace, Tag};
 use blaze_keyed::store::StoreError;
+use bstd::cx::Cx;
 
 use super::roots::{Answer, Rooted};
 
@@ -37,8 +39,57 @@ use super::roots::{Answer, Rooted};
 /// The `Lent`'s arena and every scratch list about the store are made in it.
 pub type StoreAlloc = Alloc<'static>;
 
-/// The store's folder under blaze's folder in the home (drive.md ruling 1).
-pub(crate) const STORE_DIR: &str = "v2/store";
+/// Stores of other forms beside this blaze's: the note said once, and what cleanup removes.
+#[path = "forms.rs"]
+pub(crate) mod forms;
+
+/// The root of every store's folder under blaze's folder in the home (drive.md ruling 1): it
+/// holds blaze's cache directory tag, the store of each form a blaze on this machine made
+/// ([`STORE_DIR`]), and, from format 4 and before, that store's files directly (the legacy
+/// layout, [`forms`]).
+pub(crate) const STORE_ROOT: &str = "v2/store";
+
+/// THE PLACE OF THIS BLAZE'S STORE (D160): `v2/store/<forms>`, the forms every blaze must agree
+/// on to read it, named by blaze-cas alone ([`PlaceName::THIS`], `f5s2` today: the store's
+/// files' format and its segments'). Nothing else names the store's folder: every reader of it
+/// goes through this constant, and a bump of either form moves it, so a blaze of a new form
+/// makes its own folder beside the old, and none stops because another wrote a store.
+//
+// Stable const code, no unsafe: `STORE_DIR_JOINED.bytes` is a constant of a type with no
+// `Drop` and no interior mutability, so a borrow of it is promoted to `'static` (RFC 1414);
+// `split_at` and `str::from_utf8` are `const fn`, and a name that is not UTF-8 fails the build.
+pub(crate) const STORE_DIR: &str = match core::str::from_utf8(STORE_DIR_JOINED.bytes.split_at(STORE_DIR_JOINED.len).0) {
+    Ok(it) => it,
+    Err(_) => panic!("the store's place is UTF-8"),
+};
+
+const STORE_DIR_JOINED: Joined = Joined::of(STORE_ROOT, PlaceName::THIS.as_str());
+
+/// Two names joined by a `/`, made at compile time (no allocator: rule 11).
+struct Joined {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl Joined {
+    const fn of(root: &str, leaf: &str) -> Joined {
+        let (root, leaf) = (root.as_bytes(), leaf.as_bytes());
+        assert!(root.len() + 1 + leaf.len() <= 64, "a store's place is short");
+        let mut bytes = [0u8; 64];
+        let mut i = 0;
+        while i < root.len() {
+            bytes[i] = root[i];
+            i += 1;
+        }
+        bytes[i] = b'/';
+        let mut j = 0;
+        while j < leaf.len() {
+            bytes[i + 1 + j] = leaf[j];
+            j += 1;
+        }
+        Joined { bytes, len: root.len() + 1 + leaf.len() }
+    }
+}
 
 /// The kind every drive record is filed under in the plain store's index. The drive record's
 /// own head says which drive kind it is; the store needs one number apart from its roots'
@@ -57,10 +108,6 @@ const STORE_TAGS: u64 = 1 << 50;
 
 /// Past this many uncommitted bytes in the arena, a put commits first.
 pub(crate) const COMMIT_BYTES: u64 = 256 << 20;
-
-/// Past this many segments named, compaction is behind: the open says so, naming the root
-/// (main's Q3 answer; blaze-cas compacts to [`blaze_cas::plain::SEGMENTS_MOST`]).
-pub(crate) const SEGMENTS_NAMED_MOST: u32 = 64;
 
 /// Why the store refused, by name (rule 19).
 #[derive(Debug)]
@@ -151,6 +198,30 @@ pub fn open<D: Driver>(driver: D, cfg: PlainConfig<StoreAlloc>, alloc: StoreAllo
 #[derive(Clone, Copy, Debug)]
 pub struct Checked<'m> {
     _private: PhantomData<&'m ()>,
+}
+
+impl<'s> Checked<'s> {
+    /// A snapshot read's bytes with their proof as this crate's [`Checked`] (way 1 above): the
+    /// store's [`blaze_cas::plain::Proof`] is made only from a segment proved this boot, so the
+    /// `Proved` it rides in is the evidence, and the `Checked` lives exactly as long as the bytes
+    /// it proves (`'s`, the snapshot's borrow). The way a pool worker's read
+    /// (`Snapshot::get_proved`) reaches the engine's `StoreProof`.
+    pub fn of_snapshot(proved: blaze_cas::plain::Proved<'s>) -> (&'s [u8], Checked<'s>) {
+        (proved.bytes, Checked { _private: PhantomData })
+    }
+}
+
+/// The record under `key` in `snapshot`, in place for the snapshot's borrow `'s`, with the
+/// store's proof beside its bytes ([`Checked::of_snapshot`]): a pool worker's [`PlainPlace::get`]
+/// (a `Snapshot` is `Send + Sync`, the `Lent` is not), so a reader hands the proof on (the
+/// engine's `Sealed::by_store`) instead of hashing the bytes again (rule 74). A snapshot lists
+/// committed segments alone, so `place` is never the arena's copy: only a misaligned payload
+/// (which the store's layout never writes) is not in place. `None`: absent.
+pub(crate) fn snapshot_get<'s, A: Allocator>(snapshot: &'s Snapshot<A>, key: Key) -> Result<Option<Held<'s>>, SnapshotError> {
+    Ok(snapshot.get_proved(&CasKey(key.0))?.map(|proved| {
+        let (bytes, proof) = Checked::of_snapshot(proved);
+        Held { bytes, proof, place: blaze_cas::plain::Aligned16::new(bytes).map_err(blaze_cas::plain::NotInPlace::Misaligned) }
+    }))
 }
 
 /// A record lent in place for `'m`, the life of the [`Lent`] borrowed.
@@ -381,27 +452,87 @@ pub struct AfterAnswer {
     pub segments_written: u32,
     /// Whether the exit tail's seal flipped.
     pub sealed: bool,
-    /// Cleanup slices the commit's flip named (0 or 1: one a command).
+    /// Cleanup slices this command's flips named (at most blaze-cas `CLEANUP_SLICES_MOST`).
     pub compaction_slices: u32,
     /// The cleanup line: roots set, keys named, what the slice swept, carried, leases.
     pub cleanup: super::roots::CleanupLine,
 }
 
 /// After the answer is printed, never waited on by it (the command's outer function calls it
-/// once every handle over `lent` is gone): with `slices` past zero, one cleanup slice (bounded
-/// by blaze-cas `SLICE_BYTES`) written with no lock; this command's lease let go of (its answer's
-/// roots, set before, keep what it made); the commit of what is left as one segment a namespace
-/// and ONE flip, which names the slice too; then the exit tail's seal. No lock is taken for
-/// cleanup, so no command waits on it (blaze-cas `Driven::fold_slice`).
-pub fn after_answer<D: Driver>(lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+/// once every handle over `lent` is gone): with `slices` past zero, one cleanup slice written
+/// with no lock (pruning and sweeping bounded by blaze-cas `SLICE_BYTES`; a size-tiered merge,
+/// `Tiers`, not cut by it, its bytes amortised to at most 16 a byte committed and 1.25 MiB a
+/// commit, and after it a namespace of `S` bytes names at most `segments_most(S)` segments;
+/// every copy a k-way merge streamed within blaze-cas `merge_holds_most`, 8 MiB of records,
+/// 1 MiB of index and 20 bytes an input at most at once); this
+/// command's lease let go of (its answer's roots, set before, keep what it made); the commit of
+/// what is left as one segment a namespace and ONE flip, which names the slice too; then, while
+/// blaze-cas `Plain::cleanup_goes_on` says so (only merges go on: a pruning slice ends the
+/// cleanup, and so does a sweep unless a namespace's merge is due next, which sweep mode plans
+/// before any sweep; so a cold build's dead records cost each command one slice),
+/// one more slice a namespace still over its bound,
+/// each named by a flip of its own, within the work budget (the bytes they read at most the
+/// amortisation's bound of what this command committed, and one slice more; the rest is the
+/// next command's); then the exit tail's seal. No lock is taken for writing cleanup, so no
+/// command waits on it (blaze-cas `Driven::fold_slice`); its flips hold the lock for
+/// milliseconds each, as a commit's.
+///
+/// THE PROFILE (rules 16, 17): each step is a span under `cx`, and a span's row carries the
+/// meter's numbers of its stretch (bstd telemetry/brief.rs: `hashed` the bytes fed to BLAKE3,
+/// `calls` and `in calls` the system calls and their time, `allocs` and `heap`), so the row
+/// names which step took the time, which hashed the segment digest's bytes and which made the
+/// syncs. Where each number comes from, as the code reads (blaze-cas plain/core.rs):
+/// - the fold: a size-tiered merge's copy (`stream_segment`), every byte of it hashed for its
+///   footer's digest as it is written, records already committed included; its `map_all`
+///   first (a parked segment of an earlier boot checked whole: a digest of every byte);
+/// - the commit: the arena's puts copied into one `Batch` a namespace (`Lent::commit`, a
+///   CRC-32C a record) and again into the layout (`lay_out`), the new segment's digest over
+///   all of it (`write_segment`, format.rs `seal_parts`), its writes, one flip; no sync
+///   unless durable;
+/// - more slices: each a merge's copy (hashed as the fold's) and a flip of its own;
+/// - the seal: ONE `Effect::Barrier` (`F_BARRIERFSYNC`, Linux `fdatasync`) on EACH local
+///   segment of this boot not sealed yet (`Plain::seal`), this command's phase commits'
+///   (store.rs `commit_puts`) and a merge's copy among them, then one flip: the "fsync" calls
+///   of a store that is not durable are these.
+pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+    let cx = cx.span("store after answer");
     if slices > 0 {
+        let _cx = cx.span("store after answer: fold a cleanup slice (map, merge copy hashed whole)");
         lent.fold_slice()?;
     }
     lent.release_lease();
-    let committed = lent.commit()?;
-    let sealed = lent.seal()?;
-    let cleanup = super::roots::CleanupLine::of(lent, lent.take_sliced());
+    let committed = {
+        let _cx = cx.span("store after answer: commit (batch copy, layout copy, segment digest, flip)");
+        lent.commit()?
+    };
+    let first = lent.take_sliced();
+    let (slice, swept) = if slices > 0 {
+        let _cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
+        lent.clean_on(first)?
+    } else {
+        (first, 0)
+    };
+    let sealed = {
+        let _cx = cx.span("store after answer: seal (a barrier a segment of this boot unsealed, a flip)");
+        lent.seal()?
+    };
+    let mut cleanup = {
+        let _cx = cx.span("store after answer: the cleanup line");
+        super::roots::CleanupLine::of(lent, slice)
+    };
+    if slices > 0 {
+        cleanup.slices = swept;
+    }
     Ok(AfterAnswer { segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX), sealed, compaction_slices: cleanup.slices, cleanup })
+}
+
+/// The tests' context for [`after_answer`] (its spans): a simulated world's root, its own
+/// world beside the test's `Sim` store driver. The one home of it for every test of the
+/// store's commit after the answer.
+#[cfg(test)]
+pub(crate) fn test_cx() -> Cx {
+    let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(1, bstd::io::Limits::USUAL));
+    io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context")
 }
 
 #[cfg(test)]

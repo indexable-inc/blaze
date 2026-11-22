@@ -18,7 +18,7 @@ doctest = false
 blaze-lir.workspace = true
 # The record form's output (`emit_record`): `CodeRecord`, its sites, words and targets. By
 # path, as blaze-code names its own dependencies: it has no workspace entry.
-blaze-code = { path = "../blaze-code" }
+blaze-code.workspace = true
 # `Vec` and `Alloc`: the record form's rows, in the allocator the caller names.
 blaze-own.workspace = true
 # The template table's form, `Pattern`, and the register descriptions (piece 0).

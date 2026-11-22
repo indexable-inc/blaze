@@ -42,7 +42,7 @@ use blaze_own::Alloc;
 use bstd::Cx;
 use bstd::Deadline;
 use blaze_screen::Step;
-use bstd::procs::{ChannelError, Ended, GRACE, Held, Message, ParentDeath, ParentSignals, Relay, RelayAct, RunChild, RunError, RunFault, RunSpec, SignalError, Spawner, Streams};
+use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, ParentDeath, ParentSignals, Relay, RelayAct, RunChild, RunError, RunFault, RunSpec, SignalError, Spawner, Started, Streams, Waited};
 
 use crate::run_parent::{Needs, ParentError, Resolve, TICK, WRITE_BOUND, status_of};
 
@@ -101,8 +101,9 @@ pub enum LoopError {
     Child(RunError),
     /// A need could not be answered (a bad message, a slot never declared, the table full).
     Parent(ParentError),
-    /// The run's deadline passed at `at`; the child was killed and ended as `killed`.
-    Deadline { at: Duration, killed: Ended },
+    /// The run's deadline passed at `at`; the child was killed and ended as `killed` (a kill
+    /// reaps: always an exit or a signal).
+    Deadline { at: Duration, killed: Exit },
     /// The parent's own signal dispositions could not be set (D103); the child was killed.
     Signals(SignalError),
 }
@@ -162,28 +163,29 @@ pub(crate) fn run_program<'a, R: Resolve + ?Sized>(
         env: launch.env,
         dir: launch.dir,
         streams: Streams::INHERIT,
-        channel: true,
         own_group: false,
         parent_death: ParentDeath::STRONGEST,
     };
     // The live line erased before the program can write (blaze-screen run_line.rs).
     resolve.watch().see(Step::Started);
-    let mut child = spawner.start_run(cx, &spec).map_err(LoopError::Start)?;
+    // Inherited streams: no pipes are given.
+    let Started { child, pipes: _ } = spawner.start_served(cx, &spec).map_err(LoopError::Start)?;
     // A hold refused returns here: the child's drop kills and reaps it (bstd `Run`).
     let mut held = Held::hold().map_err(LoopError::Signals)?;
     let mut inbox = std::vec::Vec::new_in(alloc);
     let mut out = std::vec::Vec::new_in(alloc);
-    let ran = drive(&mut child, needs, resolve, ahead, &Bounds::run(), &mut held, &mut inbox, &mut out);
+    let ran = drive(child, needs, resolve, ahead, &Bounds::run(), &mut held, &mut inbox, &mut out);
     // The dispositions back (on an unwind, the drop does the same), then the program's end.
     drop(held);
     ran
 }
 
 /// `child` served from `needs` (asking `resolve`) until it ends, `ahead` written first, the
-/// parent's SIGTERM read from `signals`: see the module's doc.
+/// parent's SIGTERM read from `signals`: see the module's doc. The child is taken: its wait
+/// and its kill take it in turn, so nothing steps it after its end.
 #[expect(clippy::too_many_arguments, reason = "the loop's edge: each argument one handle or buffer of it")]
 pub(crate) fn drive<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
-    child: &mut C,
+    child: C,
     needs: &mut Needs<'_>,
     resolve: &mut R,
     ahead: &[u8],
@@ -197,7 +199,7 @@ pub(crate) fn drive<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Alloc
 
 #[expect(clippy::too_many_arguments, reason = "`drive` and the test's plant")]
 fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
-    child: &mut C,
+    mut child: C,
     needs: &mut Needs<'_>,
     resolve: &mut R,
     ahead: &[u8],
@@ -225,7 +227,7 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
         let now = child.now();
         if bounds.until.passed(now) {
             let killed = child.kill().map_err(LoopError::Child)?;
-            return Err(LoopError::Deadline { at: now, killed });
+            return Err(LoopError::Deadline { at: now, killed: killed.exit });
         }
         // D103: a SIGTERM to the parent ends the program first. Forwarded once; then the
         // program's end is waited for the grace (the parent's own bounded step); then a kill,
@@ -234,12 +236,9 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
         match (relay.turn(now, terminate), plant) {
             (RelayAct::Nothing, _) => {}
             (RelayAct::Kill, _) | (RelayAct::Forward, Plant::KillAtOnce) => {
+                // A kill reaps: its end is always known.
                 let killed = child.kill().map_err(LoopError::Child)?;
-                // A kill reaps: its end is known (`Deadline` only from a wait that saw none,
-                // and then the wait below reads it).
-                if let Some(status) = status_of(killed) {
-                    return Ok(Ran { status, served, torn, terminated: true });
-                }
+                return Ok(Ran { status: status_of(killed.exit), served, torn, terminated: true });
             }
             (RelayAct::Forward, _) => child.terminate().map_err(LoopError::Child)?,
         }
@@ -295,10 +294,10 @@ fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
             true => Deadline::PASSED,
             false => Deadline::after(child.now(), bounds.tick).min(bounds.until).min(grace_end),
         };
-        let ended = child.wait(look).map_err(LoopError::Child)?;
-        if let Some(status) = status_of(ended) {
-            return Ok(Ran { status, served, torn, terminated: relay.forwarded() });
-        }
+        child = match child.wait(look).map_err(LoopError::Child)? {
+            Waited::Ended(ended) => return Ok(Ran { status: status_of(ended.exit), served, torn, terminated: relay.forwarded() }),
+            Waited::Running(running) => running,
+        };
     }
 }
 
@@ -467,7 +466,7 @@ mod tests {
         for seed in 0..SEEDS {
             let (ran, answers, killed, _, now) = run(&acts, seed, Duration::from_secs(2), Plant::None);
             match ran {
-                Err(LoopError::Deadline { at, killed: Ended::Signaled(9) }) => assert!(at >= Duration::from_secs(2)),
+                Err(LoopError::Deadline { at, killed: Exit::Signaled(9) }) => assert!(at >= Duration::from_secs(2)),
                 other => panic!("seed {seed}: the run's deadline, not {other:?}"),
             }
             assert!(killed, "seed {seed}: the child is killed at the deadline");

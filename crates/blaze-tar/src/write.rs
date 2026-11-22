@@ -8,12 +8,15 @@
 
 use core::{alloc::Allocator, fmt};
 
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::{
+    AllocFailure, Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
     error::{Name, PathWhy, Why},
     path::normalize,
-    plant::{self, Plant},
+    plant::TarPlant,
     read::BLOCK,
 };
 
@@ -64,21 +67,43 @@ impl fmt::Display for WriteError {
 
 impl core::error::Error for WriteError {}
 
-/// The tar writer: [`Writer::begin`], [`Writer::data`] to the size given, [`Writer::end`], for
-/// each entry, then [`Writer::finish`].
-pub struct Writer {
-    open: Option<(Name, u64, u64)>,
-    finished: bool,
+/// Where a writer is: one state, no flags beside it (C5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    /// Between entries: the next is begun, or the archive finished.
+    Between,
+    /// An entry is open: `written` of its `size` bytes so far.
+    Open { name: Name, size: u64, written: u64 },
+    /// The end blocks are written: nothing more is taken.
+    Finished,
 }
+
+/// The tar writer: [`Writer::begin`], [`Writer::data`] to the size given, [`Writer::end`], for
+/// each entry, then [`Writer::finish`]. `P` is the plant seam (D165): shipped code names
+/// [`Writer`], this with [`NoPlant`].
+pub struct PlantedWriter<P> {
+    stage: Stage,
+    plant: P,
+}
+
+/// The writer as it ships: [`PlantedWriter`] with no plant.
+pub type Writer = PlantedWriter<NoPlant>;
 
 /// The largest size an 11-digit octal field holds.
 const OCTAL_MOST: u64 = (1 << 33) - 1;
 const PAX_NAME: &[u8] = b"././@PaxHeader";
 
-impl Writer {
+impl PlantedWriter<NoPlant> {
     #[expect(clippy::new_without_default, reason = "blaze's types have no `Default`: a value is made by name")]
     pub const fn new() -> Writer {
-        Writer { open: None, finished: false }
+        PlantedWriter::new_planted(NoPlant)
+    }
+}
+
+impl<P: Planted<TarPlant>> PlantedWriter<P> {
+    /// [`Writer::new`] with its plant seam: `plant` is a control's [`TarPlant`].
+    pub const fn new_planted(plant: P) -> PlantedWriter<P> {
+        PlantedWriter { stage: Stage::Between, plant }
     }
 
     /// An entry's header (and a pax header before it, if its names need one).
@@ -91,10 +116,10 @@ impl Writer {
     ) -> Result<(), WriteError> {
         let name = Name::of(path.as_bytes());
         let fail = |why| WriteError { name, why };
-        if self.open.is_some() || self.finished {
+        if self.stage != Stage::Between {
             return Err(fail(WriteWhy::Order));
         }
-        check_path(path.as_bytes(), out.allocator().clone()).map_err(|why| fail(WriteWhy::Path(why)))?;
+        check_path(path.as_bytes(), out.allocator().clone(), self.plant).map_err(|why| fail(WriteWhy::Path(why)))?;
         let size = match make {
             Make::File { .. } => size,
             Make::Dir | Make::Symlink { .. } => 0,
@@ -148,20 +173,20 @@ impl Writer {
             Make::Dir => (b'5', 0o755),
             Make::Symlink { .. } => (b'2', 0o777),
         };
-        let field_size = match plant::on(Plant::SizeShort) && size > 0 {
+        let field_size = match self.plant.has(TarPlant::SizeShort) && size > 0 {
             true => size - 1,
             false => size,
         };
         let block = header(prefix, name_part, kind, mode, field_size.min(OCTAL_MOST), truncate(target, 100));
         out.try_reserve(BLOCK).map_err(alloc)?;
         out.extend_from_slice(&block);
-        self.open = Some((name, size, 0));
+        self.stage = Stage::Open { name, size, written: 0 };
         Ok(())
     }
 
     /// The next bytes of the open file.
     pub fn data<B: Allocator>(&mut self, bytes: &[u8], out: &mut Vec<u8, B>) -> Result<(), WriteError> {
-        let Some((name, size, written)) = self.open.as_mut() else {
+        let Stage::Open { name, size, written } = &mut self.stage else {
             return Err(WriteError { name: Name::NONE, why: WriteWhy::Order });
         };
         let now = *written + bytes.len() as u64;
@@ -175,9 +200,10 @@ impl Writer {
 
     /// The open entry ended: its bytes padded to a block.
     pub fn end<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), WriteError> {
-        let Some((name, size, written)) = self.open.take() else {
+        let Stage::Open { name, size, written } = self.stage else {
             return Err(WriteError { name: Name::NONE, why: WriteWhy::Order });
         };
+        self.stage = Stage::Between;
         if written != size {
             return Err(WriteError { name, why: WriteWhy::Size { declared: size, written } });
         }
@@ -188,11 +214,11 @@ impl Writer {
 
     /// The archive's end: two zero blocks.
     pub fn finish<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), WriteError> {
-        if self.open.is_some() || self.finished {
+        if self.stage != Stage::Between {
             return Err(WriteError { name: Name::NONE, why: WriteWhy::Order });
         }
         out.try_extend_from_slice(&[0; 2 * BLOCK]).map_err(|e| WriteError { name: Name::NONE, why: WriteWhy::Alloc(e) })?;
-        self.finished = true;
+        self.stage = Stage::Finished;
         Ok(())
     }
 
@@ -213,9 +239,9 @@ impl Writer {
 }
 
 /// A path the reader takes as it is: normal form, and nothing it refuses.
-fn check_path<B: Allocator>(path: &[u8], alloc: B) -> Result<(), PathWhy> {
+fn check_path<B: Allocator>(path: &[u8], alloc: B, plant: impl Planted<TarPlant>) -> Result<(), PathWhy> {
     let mut normal = Vec::new_in(alloc);
-    match normalize(path, u32::MAX, &mut normal) {
+    match normalize(path, u32::MAX, &mut normal, plant) {
         Ok(()) if normal.is_empty() => Err(PathWhy::Empty),
         Ok(()) if normal[..] != *path => Err(PathWhy::NotNormal),
         Ok(()) => Ok(()),

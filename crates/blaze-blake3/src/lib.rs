@@ -7,24 +7,34 @@
 //! No dependencies, so the bottom of the tree (`blaze-ids`, `blaze-id`) stands on nothing from
 //! outside the workspace (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
 //!
-//! How it is fast without assembly of its own: a hasher fed more than a batch of whole chunks
-//! hashes the batch's chunks side by side, a SIMD lane each ([`lanes::compress`], safe
-//! `core::simd` code): 16 chunks in AVX-512 registers where the CPU has them, 8 in AVX2 ones,
-//! and 8 at the target's baseline elsewhere (two NEON registers a word on AArch64). Many
-//! independent short inputs go the same way through [`hash_many`] (and [`keyed_hash_many`],
-//! [`derive_key_many`]), an input a lane. Parent nodes, the last chunk and one input of one
-//! chunk are compressed one block at a time by the scalar [`compress`], where they lie, with no
-//! copy. Which path runs is dispatch on the CPU, not a fallback: every path computes the same
-//! bytes, held to the official test vectors, to the `blake3` crate at every length to 4,097
-//! bytes and every alignment, and lane by lane to the scalar compression (`tests/`). The CPU's
-//! features are [`cpu`]'s, found on `core` alone: the crate is `no_std` and allocates nothing.
+//! How it is fast without assembly of its own:
+//!
+//! - An input of two chunks or more, one shot or streamed, is hashed as the largest
+//!   power-of-two subtrees that fit, straight from the caller's bytes (`src/tree.rs`): a subtree's
+//!   whole chunks side by side, a SIMD lane each ([`lanes::compress`], safe `core::simd` code),
+//!   then each level's parents side by side, up to the two children of the subtree's top node,
+//!   which waits on a lazily merged stack because it may be the root. So 2 KiB takes two lanes,
+//!   4 KiB four, 8 KiB eight, and no chunk of a whole-chunk input is hashed alone.
+//! - Many independent short inputs go side by side through [`hash_many`] (and
+//!   [`keyed_hash_many`], [`derive_key_many`]), an input a lane, each lane taking the next input
+//!   the step after its last block.
+//! - A lone block (an input of at most a chunk, a partial last chunk, a lone parent, the root)
+//!   is compressed where it lies by [`compress`], with no hasher and no copy.
+//!
+//! Which strategies run is one value, an [`Engine`] ([`engine`]): the lone-block form
+//! ([`Single`]), the lanes ([`Degree`]) and the instructions ([`Isa`]), chosen by the caller and
+//! passed to the `*_on` entries; the entries without one run [`Engine::detected`], this CPU's
+//! defaults. Every engine computes the same bytes, held to the official test vectors, to the
+//! `blake3` crate at every length to 4,097 bytes and every alignment, at every length to five
+//! chunks and a byte under every engine one shot and streamed in drawn pieces, and lane by lane
+//! to the scalar compression (`tests/`). The crate is `no_std` and allocates nothing.
 //!
 //! # Cost, and the floor (rule 67)
 //!
 //! `examples/cost.rs`, 2026-11-15, the owner's M5 Max (one P core at 4.25 GHz, measured by a
-//! chain of dependent adds), best of seven runs, hot in cache:
+//! chain of dependent adds), best of seven runs, hot in cache, before the wide tree:
 //!
-//! | input | before | now | floor | now / floor |
+//! | input | before | then | floor | then / floor |
 //! |---|---|---|---|---|
 //! | 64 B, one call | 63.2 ns | 46.6 ns | 46 ns | 1.01 |
 //! | 1 KiB, one call | 1,010 ns | 784 ns | 738 ns | 1.06 |
@@ -32,23 +42,35 @@
 //! | 64 B each, `hash_many` | 14.6 M/s | 41.6 M/s | 62.5 M/s | 1.50 |
 //! | 1 KiB each, `hash_many` | 0.93 M/s | 3.10 M/s | 3.91 M/s | 1.26 |
 //!
-//! The floor of one input is the latency of its chain of compressions: each block's seven
-//! rounds are fourteen half-rounds of fourteen dependent one-cycle operations, 196 cycles, 46
-//! ns a block, and a chunk's blocks run one after another. Only independent inputs (lanes) beat
-//! it. The floor of lanes is the compression alone at 8 lanes with nothing around it, 16.0 ns a
-//! block a lane (blaze-int-1112-notes/nightly-probes/blake3_lanes.rs), plus one parent block a
-//! chunk for a long input. What `hash_many` spends above it is gathering each lane's block,
-//! the transpose into columns and the lanes' bookkeeping.
+//! The floor of one input of a chunk or less is the latency of its chain of compressions: each
+//! block's seven rounds are fourteen half-rounds of fourteen dependent one-cycle operations,
+//! 196 cycles, 46 ns a block, and a chunk's blocks run one after another. Only independent
+//! chunks or inputs (lanes) beat it. The floor of lanes is the compression alone at 8 lanes
+//! with nothing around it, 16.0 ns a block a lane (blaze-int-1112-notes/nightly-probes/
+//! blake3_lanes.rs), plus a parent block a chunk for a long input, those too at lanes' cost
+//! now. Between one and sixteen chunks the old hasher ran every chunk but the batches of eight
+//! alone (4 KiB at half the official crate's speed); the wide tree runs them all side by side.
 
 #![no_std]
-#![feature(portable_simd)]
+#![feature(portable_simd, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// A core but for one site: [`cpu`]'s process-wide cache of the CPU's features (`FOUND`), which
+// D170 moves to blaze-sys as a value the driver reads once and hands in; blaze-sys has no CPU
+// call yet (wave-1124-sansio, W1 group a's report). The `*_on` entries take it handed in.
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![deny(unsafe_code)]
 
 pub mod cpu;
+pub mod engine;
 pub mod lanes;
 mod many;
+mod pair;
+mod rows;
+mod tree;
 
-pub use many::{CountMismatch, MANY_DEFAULT, Many, Mode, many_checked};
+pub use engine::{Degree, Engine, EngineOpts, Isa, Pair, Single};
+pub use many::{CountMismatch, MANY_DEFAULT, Many, Mode, many_checked, many_checked_on};
 
 use blaze_int::{Cast, Int};
 
@@ -105,15 +127,35 @@ pub(crate) const MESSAGE: [[usize; 16]; 7] = {
     table
 };
 
-/// The most chaining values a hasher holds: one per level of a tree of 2^54 chunks, 2^64 bytes.
+/// The most chaining values a hasher's stack holds: one per level of a tree of 2^54 chunks,
+/// 2^64 bytes, and one more, the subtree's right child that lazy merging leaves on top.
 const MAX_DEPTH: usize = 54;
 
-/// The most chunks hashed side by side (AVX-512's 16 lanes).
-const MOST_LANES: usize = 16;
+/// The most lanes of any degree ([`Degree::Sixteen`]).
+pub(crate) const MOST_LANES: usize = 16;
 
 /// The hash of `input`, BLAKE3's plain mode.
 pub fn hash(input: &[u8]) -> [u8; OUT_LEN] {
-    one_shot(&IV, 0, input)
+    by_default(&IV, 0, input)
+}
+
+/// [`one_shot`] by the engine the entries without one run: an input of at most a chunk by
+/// [`Single::Scalar`], [`Engine::detected`]'s lone-block form, without reading the CPU's
+/// features at all (on x86-64 a load or two a call, which a 64-byte hash of 50 ns would feel);
+/// a longer one by [`Engine::detected`].
+#[inline(always)]
+fn by_default(key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
+    if input.len() <= CHUNK_LEN {
+        return one_chunk(Engine::SCALAR, key, flags, input);
+    }
+    one_shot(Engine::detected(), key, flags, input)
+}
+
+/// The digest of `input` in `mode`, by `engine`: [`hash`], [`keyed_hash`] or
+/// [`derive_key_with`], with the strategies handed in.
+pub fn digest_on(engine: Engine, mode: Mode, input: &[u8]) -> [u8; OUT_LEN] {
+    let (key, flags) = mode.key_and_flags();
+    one_shot(engine, &key, flags, input)
 }
 
 /// [`hash`] of each of `inputs`, into the same place of `out`: inputs of at most a chunk side
@@ -136,7 +178,7 @@ pub fn derive_key_many(key: &[u8; OUT_LEN], inputs: &[&[u8]], out: &mut [[u8; OU
 
 /// The hash of `input` under `key`, BLAKE3's keyed mode.
 pub fn keyed_hash(key: &[u8; OUT_LEN], input: &[u8]) -> [u8; OUT_LEN] {
-    one_shot(&words_of(key), KEYED_HASH, input)
+    by_default(&words_of(key), KEYED_HASH, input)
 }
 
 /// The key `material` derives under `context`, BLAKE3's key derivation mode.
@@ -147,44 +189,44 @@ pub fn derive_key(context: &str, material: &[u8]) -> [u8; OUT_LEN] {
 /// `context`'s key: the hash of the context string in the context mode, the key every input
 /// under that context is hashed with (official BLAKE3's `hazmat::hash_derive_key_context`).
 pub fn context_key(context: &str) -> [u8; OUT_LEN] {
-    one_shot(&IV, DERIVE_KEY_CONTEXT, context.as_bytes())
+    by_default(&IV, DERIVE_KEY_CONTEXT, context.as_bytes())
 }
 
 /// The key `material` derives under the context whose [`context_key`] is `key`: what
 /// [`derive_key`] computes after the context's key, with the key already made.
 pub fn derive_key_with(key: &[u8; OUT_LEN], material: &[u8]) -> [u8; OUT_LEN] {
-    one_shot(&words_of(key), DERIVE_KEY_MATERIAL, material)
+    by_default(&words_of(key), DERIVE_KEY_MATERIAL, material)
 }
 
 /// An input of at most a chunk is its own root, compressed with no hasher (and no chaining
-/// value stack to set up); a longer one goes through [`Hasher`].
-fn one_shot(key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
+/// value stack to set up); a longer one is the parent of its tree's top two children, which
+/// the wide tree gives straight from `input` (the official crate's `hash_all_at_once`).
+fn one_shot(e: Engine, key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
     if input.len() <= CHUNK_LEN {
-        return one_chunk(key, flags, input);
+        return one_chunk(e, key, flags, input);
     }
-    let mut hasher = Hasher::with_key(*key, flags);
-    hasher.update(input);
-    hasher.finalize()
+    let [left, right] = tree::subtree_to_parent(e, key, flags, input, 0);
+    first_32(&parent_output(&left, &right, key, flags, e).root_block(0))
 }
 
 /// The root of an input of at most a chunk: its blocks compressed where they lie, the last one
-/// read by [`lanes::padded_words`], with no buffer and no copy.
-fn one_chunk(key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
+/// read by [`lanes::padded_words`], with no buffer and no copy. For an input of at most a block
+/// that is one compression, its words read by overlapping loads, and the 32 bytes written.
+fn one_chunk(e: Engine, key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
     let mut cv = *key;
     let mut start = CHUNK_START;
     let mut rest = input;
     while let Some((block, after)) = rest.split_first_chunk::<BLOCK_LEN>()
         && !after.is_empty()
     {
-        let full = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
-        cv = first_8(&compress(&cv, &lanes::block_words(block), 0, full, flags | start));
+        single_in_place(e, &mut cv, block, 0, flags | start);
         start = 0;
         rest = after;
     }
     // At most `BLOCK_LEN` (64) bytes are left: the length fits a `u32`.
     let len = rest.len().narrow_or_stop::<u32>();
     let flags = flags | start | CHUNK_END | ROOT;
-    bytes_of(&first_8(&compress(&cv, &lanes::padded_words(rest), 0, len, flags)))
+    bytes_of(&first_8(&single(e, &cv, &lanes::padded_words(rest), 0, len, flags)))
 }
 
 /// Eight words as their 32 little-endian bytes.
@@ -212,7 +254,7 @@ fn first_32(block: &[u8; BLOCK_LEN]) -> [u8; OUT_LEN] {
     core::array::from_fn(|byte| block[byte])
 }
 
-fn first_8(words: &[u32; 16]) -> [u32; 8] {
+pub(crate) fn first_8(words: &[u32; 16]) -> [u32; 8] {
     core::array::from_fn(|word| words[word])
 }
 
@@ -241,7 +283,8 @@ fn round(state: &mut [u32; 16], m: &[u32; 16], t: &[usize; 16]) {
 }
 
 /// BLAKE3's compression function, all sixteen words of its output: the first eight are the
-/// next chaining value, all sixteen a root's 64 bytes of output.
+/// next chaining value, all sixteen a root's 64 bytes of output. The scalar form,
+/// [`Single::Scalar`].
 pub fn compress(
     cv: &[u32; 8],
     block: &[u32; 16],
@@ -249,6 +292,29 @@ pub fn compress(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
+    let mut state = rounds(cv, block, counter, block_len, flags);
+    for word in 0..8 {
+        state[word] ^= state[word + 8];
+        state[word + 8] ^= cv[word];
+    }
+    state
+}
+
+/// [`compress`]'s next chaining value written over `cv`, the block read from its bytes: what a
+/// chunk's blocks before its last take, as the official crate's `compress_in_place`. Through
+/// `compress`, a block's words went to a stack array and all sixteen output words came back
+/// through memory for eight to be read. The twin is the first eight words of [`compress`] of
+/// [`lanes::block_words`] (`tests::in_place_is_the_first_eight_words`).
+pub(crate) fn compress_in_place(cv: &mut [u32; 8], block: &[u8; BLOCK_LEN], counter: u64, block_len: u32, flags: u32) {
+    let state = rounds(cv, &lanes::block_words(block), counter, block_len, flags);
+    for word in 0..8 {
+        cv[word] = state[word] ^ state[word + 8];
+    }
+}
+
+/// [`compress`]'s state after its seven rounds, before the feed-forward.
+#[inline(always)]
+fn rounds(cv: &[u32; 8], block: &[u32; 16], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
     let mut state = [
         cv[0],
         cv[1],
@@ -279,17 +345,56 @@ pub fn compress(
     round(&mut state, block, &MESSAGE[4]);
     round(&mut state, block, &MESSAGE[5]);
     round(&mut state, block, &MESSAGE[6]);
-    for word in 0..8 {
-        state[word] ^= state[word + 8];
-        state[word + 8] ^= cv[word];
-    }
     state
+}
+
+/// [`compress`] by `engine`'s [`Single`] form on its [`Isa`]: every form gives the same sixteen
+/// words for every input (`tests/engines.rs`, `single_forms_are_the_scalar_one`).
+pub fn compress_by(
+    engine: Engine,
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    single(engine, cv, block, counter, block_len, flags)
+}
+
+/// The one place a lone block's compression is chosen: the engine's [`Single`].
+#[inline(always)]
+pub(crate) fn single(e: Engine, cv: &[u32; 8], block: &[u32; 16], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
+    match e.single {
+        Single::Scalar => compress(cv, block, counter, block_len, flags),
+        Single::Rows => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                x86::rows(e.isa, cv, block, counter, block_len, flags)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                rows::compress(cv, block, counter, block_len, flags)
+            }
+        }
+    }
+}
+
+/// [`single`]'s next chaining value written over `cv`, for a block of a chunk before its last:
+/// the scalar form by [`compress_in_place`], the row form through its sixteen words.
+#[inline(always)]
+pub(crate) fn single_in_place(e: Engine, cv: &mut [u32; 8], block: &[u8; BLOCK_LEN], counter: u64, flags: u32) {
+    let full = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
+    match e.single {
+        Single::Scalar => compress_in_place(cv, block, counter, full, flags),
+        Single::Rows => *cv = first_8(&single(e, cv, &lanes::block_words(block), counter, full, flags)),
+    }
 }
 
 /// A node not yet compressed: the last block of a chunk, or a parent's two children. Its
 /// chaining value is what its parent takes; as the root, it gives the output.
 #[derive(Clone, Copy)]
-struct Output {
+pub(crate) struct Output {
+    engine: Engine,
     input_cv: [u32; 8],
     block: [u32; 16],
     counter: u64,
@@ -298,13 +403,13 @@ struct Output {
 }
 
 impl Output {
-    fn chaining_value(&self) -> [u32; 8] {
-        first_8(&compress(&self.input_cv, &self.block, self.counter, self.block_len, self.flags))
+    pub(crate) fn chaining_value(&self) -> [u32; 8] {
+        first_8(&single(self.engine, &self.input_cv, &self.block, self.counter, self.block_len, self.flags))
     }
 
     /// Output block `at` of the root: bytes `64 * at..64 * (at + 1)` of the extended output.
     fn root_block(&self, at: u64) -> [u8; BLOCK_LEN] {
-        let words = compress(&self.input_cv, &self.block, at, self.block_len, self.flags | ROOT);
+        let words = single(self.engine, &self.input_cv, &self.block, at, self.block_len, self.flags | ROOT);
         let mut out = [0; BLOCK_LEN];
         for (bytes, word) in out.chunks_exact_mut(4).zip(words) {
             bytes.copy_from_slice(&word.to_le_bytes());
@@ -314,13 +419,11 @@ impl Output {
 }
 
 /// A parent node of `left` and `right`.
-fn parent_output(left: &[u32; 8], right: &[u32; 8], key: &[u32; 8], flags: u32) -> Output {
-    let mut block = [0; 16];
-    block[..8].copy_from_slice(left);
-    block[8..].copy_from_slice(right);
+fn parent_output(left: &[u32; 8], right: &[u32; 8], key: &[u32; 8], flags: u32, engine: Engine) -> Output {
     Output {
+        engine,
         input_cv: *key,
-        block,
+        block: tree::parent_block(&[*left, *right]),
         counter: 0,
         block_len: const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) },
         flags: PARENT | flags,
@@ -328,9 +431,11 @@ fn parent_output(left: &[u32; 8], right: &[u32; 8], key: &[u32; 8], flags: u32) 
 }
 
 /// The chunk being fed: its chaining value after its compressed blocks, and the block after
-/// them, held back until more input shows it is not the chunk's last.
+/// them, held back until more input shows it is not the chunk's last. The bytes of `block`
+/// past `block_len` are zero (every write below keeps it so), which is the last block's
+/// padding.
 #[derive(Clone)]
-struct ChunkState {
+pub(crate) struct ChunkState {
     cv: [u32; 8],
     counter: u64,
     block: [u8; BLOCK_LEN],
@@ -340,7 +445,7 @@ struct ChunkState {
 }
 
 impl ChunkState {
-    fn new(key: &[u32; 8], counter: u64, flags: u32) -> ChunkState {
+    pub(crate) fn new(key: &[u32; 8], counter: u64, flags: u32) -> ChunkState {
         ChunkState {
             cv: *key,
             counter,
@@ -352,19 +457,35 @@ impl ChunkState {
     }
 
     fn len(&self) -> usize {
-        BLOCK_LEN * self.blocks_compressed.widen_to::<usize>() + self.block_len.widen_to::<usize>()
+        BLOCK_LEN * usize::from(self.blocks_compressed) + usize::from(self.block_len)
     }
 
     fn start_flag(&self) -> u32 {
         if self.blocks_compressed == 0 { CHUNK_START } else { 0 }
     }
 
+    /// Appends `input` to the held block when it fits there, compressing nothing: the common
+    /// case of a hasher fed a few bytes at a time, one bounds check and one copy. False, and
+    /// nothing changed, when it does not fit. Sound because the held block is compressed only
+    /// once input follows it, and a block of at most 64 bytes needs nothing after it yet; a
+    /// held block of 0 bytes is the chunk's first (`block_len` is 0 only before a chunk's
+    /// first byte), so the bytes go where the first block's do.
+    #[inline(always)]
+    fn append(&mut self, input: &[u8]) -> bool {
+        let held = usize::from(self.block_len);
+        let Some(room) = self.block.get_mut(held..held + input.len()) else {
+            return false;
+        };
+        room.copy_from_slice(input);
+        // `held + input.len()` is at most `BLOCK_LEN` (64), the room's end: it fits a `u8`.
+        self.block_len = (held + input.len()).narrow_or_stop::<u8>();
+        true
+    }
+
     /// Compresses `block` as one of the chunk's blocks before its last.
-    fn compress_block(&mut self, block: &[u8; BLOCK_LEN]) {
-        let words = lanes::block_words(block);
+    fn compress_block(&mut self, e: Engine, block: &[u8; BLOCK_LEN]) {
         let flags = self.flags | self.start_flag();
-        let block_len = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
-        self.cv = first_8(&compress(&self.cv, &words, self.counter, block_len, flags));
+        single_in_place(e, &mut self.cv, block, self.counter, flags);
         self.blocks_compressed += 1;
     }
 
@@ -372,28 +493,24 @@ impl ChunkState {
     /// block is topped up first; after it, every block with input after it is compressed where
     /// it lies, and only the last (at most a block) is copied, held back as maybe the chunk's
     /// last.
-    fn update(&mut self, mut input: &[u8]) {
-        if input.is_empty() {
+    pub(crate) fn update(&mut self, e: Engine, mut input: &[u8]) {
+        if self.append(input) {
             return;
         }
         if self.block_len > 0 {
-            let held = self.block_len.widen_to::<usize>();
-            let take = (BLOCK_LEN - held).min(input.len());
-            self.block[held..][..take].copy_from_slice(&input[..take]);
-            // `take` is at most `BLOCK_LEN` (64) less what the block holds, so it fits a `u8`.
-            self.block_len += take.narrow_or_stop::<u8>();
+            let held = usize::from(self.block_len);
+            let take = BLOCK_LEN - held;
+            self.block[held..].copy_from_slice(&input[..take]);
             input = &input[take..];
-            if input.is_empty() {
-                return;
-            }
+            // `append` refused, so more than `take` bytes came: the held block is not the last.
             let block = self.block;
-            self.compress_block(&block);
+            self.compress_block(e, &block);
             self.block_len = 0;
         }
         while let Some((block, after)) = input.split_first_chunk::<BLOCK_LEN>()
             && !after.is_empty()
         {
-            self.compress_block(block);
+            self.compress_block(e, block);
             input = after;
         }
         self.block = [0; BLOCK_LEN];
@@ -402,8 +519,9 @@ impl ChunkState {
         self.block_len = input.len().narrow_or_stop::<u8>();
     }
 
-    fn output(&self) -> Output {
+    pub(crate) fn output(&self, e: Engine) -> Output {
         Output {
+            engine: e,
             input_cv: self.cv,
             block: lanes::block_words(&self.block),
             counter: self.counter,
@@ -414,38 +532,48 @@ impl ChunkState {
 }
 
 /// A message fed in pieces: [`Hasher::new`] (the plain hash), [`Hasher::new_keyed`],
-/// [`Hasher::new_derive_key`] and [`Hasher::new_from_context_key`], then [`Hasher::update`]s
-/// and [`Hasher::finalize`] (or [`Hasher::finalize_xof`] for more than 32 bytes). Finalizing
-/// leaves the hasher as it was, so it can be fed more and finalized again.
+/// [`Hasher::new_derive_key`] and [`Hasher::new_from_context_key`] (or [`Hasher::on`], any mode
+/// by a handed engine), then [`Hasher::update`]s and [`Hasher::finalize`] (or
+/// [`Hasher::finalize_xof`] for more than 32 bytes). Finalizing leaves the hasher as it was, so
+/// it can be fed more and finalized again.
 #[derive(Clone)]
 pub struct Hasher {
+    engine: Engine,
     key: [u32; 8],
     flags: u32,
     chunk: ChunkState,
-    /// The chaining values of the complete subtrees left of `chunk`, largest first.
-    stack: [[u32; 8]; MAX_DEPTH],
+    /// The chaining values of the complete subtrees left of `chunk`, largest first, merged
+    /// lazily: the top one waits for what comes after it, since it may be a child of the root.
+    stack: [[u32; 8]; MAX_DEPTH + 1],
     stack_len: u8,
 }
 
 impl Hasher {
-    fn with_key(key: [u32; 8], flags: u32) -> Hasher {
+    fn with_key(engine: Engine, key: [u32; 8], flags: u32) -> Hasher {
         Hasher {
+            engine,
             key,
             flags,
             chunk: ChunkState::new(&key, 0, flags),
-            stack: [[0; 8]; MAX_DEPTH],
+            stack: [[0; 8]; MAX_DEPTH + 1],
             stack_len: 0,
         }
     }
 
     /// A hasher of BLAKE3's plain mode.
     pub fn new() -> Hasher {
-        Hasher::with_key(IV, 0)
+        Hasher::with_key(Engine::detected(), IV, 0)
+    }
+
+    /// A hasher of `mode` that runs by `engine`.
+    pub fn on(engine: Engine, mode: Mode) -> Hasher {
+        let (key, flags) = mode.key_and_flags();
+        Hasher::with_key(engine, key, flags)
     }
 
     /// A hasher of the keyed mode under `key`.
     pub fn new_keyed(key: &[u8; OUT_LEN]) -> Hasher {
-        Hasher::with_key(words_of(key), KEYED_HASH)
+        Hasher::with_key(Engine::detected(), words_of(key), KEYED_HASH)
     }
 
     /// A hasher deriving a key from what it is fed under `context`.
@@ -455,7 +583,7 @@ impl Hasher {
 
     /// [`Hasher::new_derive_key`] for the context whose [`context_key`] is `key`.
     pub fn new_from_context_key(key: &[u8; OUT_LEN]) -> Hasher {
-        Hasher::with_key(words_of(key), DERIVE_KEY_MATERIAL)
+        Hasher::with_key(Engine::detected(), words_of(key), DERIVE_KEY_MATERIAL)
     }
 
     /// Bytes fed so far.
@@ -465,66 +593,105 @@ impl Hasher {
 
     /// Feeds `input`.
     pub fn update(&mut self, mut input: &[u8]) -> &mut Hasher {
+        // A few bytes that fit the held block: one bounds check and a copy.
+        if self.chunk.append(input) {
+            return self;
+        }
+        let e = self.engine;
         // The current chunk first. It is closed only when input follows it, since the last
         // chunk is finalized differently (as the root when it is the only one).
         if self.chunk.len() > 0 {
             let take = (CHUNK_LEN - self.chunk.len()).min(input.len());
-            self.chunk.update(&input[..take]);
+            self.chunk.update(e, &input[..take]);
             input = &input[take..];
             if input.is_empty() {
                 return self;
             }
-            let cv = self.chunk.output().chaining_value();
-            let total = self.chunk.counter + 1;
-            self.push_chunk(cv, total);
-            self.chunk = ChunkState::new(&self.key, total, self.flags);
+            let counter = self.chunk.counter;
+            let cv = self.chunk.output(e).chaining_value();
+            self.push_cv(cv, counter);
+            self.chunk = ChunkState::new(&self.key, counter + 1, self.flags);
         }
-        // The chunk is empty here. Whole chunks with input after them, a batch side by side.
-        let width = lanes_for_this_cpu();
-        let batch = width * CHUNK_LEN;
-        let mut counter = self.chunk.counter;
-        while input.len() > batch {
-            let mut cvs = [[0; 8]; MOST_LANES];
-            hash_chunks(&self.key, &input[..batch], counter, self.flags, &mut cvs[..width]);
-            for cv in &cvs[..width] {
-                counter += 1;
-                self.push_chunk(*cv, counter);
-            }
-            input = &input[batch..];
-        }
+        // The chunk is empty here. While more than a chunk is left (so none of it is the last
+        // chunk), the largest power-of-two subtree that fits and that the chunks so far leave
+        // room for (a whole number of it so far), hashed wide straight from `input`: so a
+        // caller who feeds powers of two gets each as one subtree.
         while input.len() > CHUNK_LEN {
-            let mut chunk = ChunkState::new(&self.key, counter, self.flags);
-            chunk.update(&input[..CHUNK_LEN]);
-            counter += 1;
-            self.push_chunk(chunk.output().chaining_value(), counter);
-            input = &input[CHUNK_LEN..];
+            let counter = self.chunk.counter;
+            let so_far = counter * CHUNK_LEN.widen_to::<u64>();
+            let mut subtree = tree::largest_power_of_two_at_most(input.len());
+            while (subtree - 1).widen_to::<u64>() & so_far != 0 {
+                subtree /= 2;
+            }
+            let chunks = (subtree / CHUNK_LEN).widen_to::<u64>();
+            if subtree <= CHUNK_LEN {
+                let (chunk, _) = input.split_first_chunk::<CHUNK_LEN>().expect("more than a chunk is left");
+                self.push_cv(tree::chunk_cv(e, &self.key, self.flags, chunk, counter), counter);
+            } else {
+                let [left, right] = tree::subtree_to_parent(e, &self.key, self.flags, &input[..subtree], counter);
+                // Pushed one at a time, so the right one is never merged before what follows
+                // it is known: it may be a child of the root.
+                self.push_cv(left, counter);
+                self.push_cv(right, counter + chunks / 2);
+            }
+            self.chunk = ChunkState::new(&self.key, counter + chunks, self.flags);
+            input = &input[subtree..];
         }
-        if counter != self.chunk.counter {
-            self.chunk = ChunkState::new(&self.key, counter, self.flags);
-        }
-        self.chunk.update(input);
+        self.chunk.update(e, input);
         self
     }
 
-    /// Adds the chaining value of the chunk that makes `total` chunks, merging every subtree it
-    /// completes (one per trailing zero bit of `total`): eager merging, sound because more input
-    /// is known to follow.
-    fn push_chunk(&mut self, mut cv: [u32; 8], mut total: u64) {
-        while total & 1 == 0 {
+    /// Pushes the chaining value of the subtree whose first chunk is `counter`, after merging
+    /// what the chunks before it complete: each subtree that stays is a one bit of `counter`
+    /// (the official crate's "count the 1-bits" form of the paper's merge rule, which holds for
+    /// subtrees of any power-of-two size). The new value is not merged: it may be the root's
+    /// child, which only what follows it can say.
+    fn push_cv(&mut self, cv: [u32; 8], counter: u64) {
+        let keep = counter.count_ones();
+        while u32::from(self.stack_len) > keep {
+            let top = usize::from(self.stack_len);
+            let parent = parent_output(&self.stack[top - 2], &self.stack[top - 1], &self.key, self.flags, self.engine);
+            self.stack[top - 2] = parent.chaining_value();
             self.stack_len -= 1;
-            let left = self.stack[self.stack_len.widen_to::<usize>()];
-            cv = parent_output(&left, &cv, &self.key, self.flags).chaining_value();
-            total >>= 1;
         }
-        self.stack[self.stack_len.widen_to::<usize>()] = cv;
+        self.stack[usize::from(self.stack_len)] = cv;
         self.stack_len += 1;
     }
 
-    /// The root node: the current chunk folded with every subtree left of it, right to left.
+    /// The root node: the current chunk (or, if it is empty, the parent of the top two
+    /// subtrees) folded with every subtree left of it, right to left.
     fn root(&self) -> Output {
-        let mut output = self.chunk.output();
-        for left in self.stack[..self.stack_len.widen_to::<usize>()].iter().rev() {
-            output = parent_output(left, &output.chaining_value(), &self.key, self.flags);
+        let e = self.engine;
+        let depth = usize::from(self.stack_len);
+        if depth == 0 {
+            return self.chunk.output(e);
+        }
+        let (mut output, left) = if self.chunk.len() > 0 {
+            // `update` merges the stack lazily: bytes fed into a chunk after a pushed subtree
+            // (an update's tail, or `append` into the empty chunk an exactly fed subtree leaves)
+            // merge nothing, so the stack may hold more subtrees than the chunk's counter has one
+            // bits. The surplus at its top is one complete subtree left of the chunk and is
+            // merged first, as the official crate's `merge_cv_stack` does before it finalizes;
+            // folding each into the chunk one by one gives another tree, and another hash.
+            let keep = self.chunk.counter.count_ones();
+            let mut top = self.stack_len;
+            let mut merged = self.stack[depth - 1];
+            while u32::from(top) > keep {
+                assert!(top >= 2, "blaze_blake3::Hasher: a stack deeper than its chunk counter allows (a bug in `update`)");
+                let below = usize::from(top) - 2;
+                merged = parent_output(&self.stack[below], &merged, &self.key, self.flags, e).chaining_value();
+                top -= 1;
+            }
+            let chunk = self.chunk.output(e).chaining_value();
+            (parent_output(&merged, &chunk, &self.key, self.flags, e), usize::from(top) - 1)
+        } else {
+            // An empty chunk after input follows only a subtree's two children (`update`), so
+            // the stack holds two at least.
+            assert!(depth >= 2, "blaze_blake3::Hasher: an empty chunk over one subtree (a bug in `update`)");
+            (parent_output(&self.stack[depth - 2], &self.stack[depth - 1], &self.key, self.flags, e), depth - 2)
+        };
+        for cv in self.stack[..left].iter().rev() {
+            output = parent_output(cv, &output.chaining_value(), &self.key, self.flags, e);
         }
         output
     }
@@ -579,102 +746,38 @@ impl OutputReader {
     }
 }
 
-/// Chunks a batch hashes side by side at the target's baseline: 8, two NEON registers a word of
-/// the state (one AVX2 register, two SSE2 ones). On the owner's M5 Max a block a lane took
-/// 25.1 ns at 4 lanes, 16.0 at 8 and 14.3 at 16 (blaze-int-1112-notes/nightly-probes/
-/// blake3_lanes.rs): 8 is within 12% of 16 at half the batch, so inputs of 8 to 16 KiB get it.
-const CHUNK_LANES: usize = 8;
-
-/// Chunks a batch hashes side by side on this CPU: 16 where it has AVX-512F, else
-/// [`CHUNK_LANES`].
-fn lanes_for_this_cpu() -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if cpu::has(cpu::Feature::Avx512f) {
-            return 16;
-        }
-    }
-    CHUNK_LANES
-}
-
-/// The chaining values of `out.len()` whole chunks (`input`, `out.len() * CHUNK_LEN` bytes),
-/// numbered from `counter`, side by side: the widths [`lanes_for_this_cpu`] gives.
-fn hash_chunks(key: &[u32; 8], input: &[u8], counter: u64, flags: u32, out: &mut [[u32; 8]]) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if out.len() == 16 {
-            return x86::chunks_avx512(key, input, counter, flags, out);
-        }
-        if cpu::has(cpu::Feature::Avx2) {
-            return x86::chunks_avx2(key, input, counter, flags, out);
-        }
-    }
-    chunks_of::<CHUNK_LANES>(key, input, counter, flags, out);
-}
-
-/// [`hash_chunks`] at `N` lanes. Always inlined, so it is vectorized for the features of the
-/// function it is inlined into.
-#[inline(always)]
-fn chunks_of<const N: usize>(
-    key: &[u32; 8],
-    input: &[u8],
-    counter: u64,
-    flags: u32,
-    out: &mut [[u32; 8]],
-) {
-    assert_eq!(out.len(), N, "a batch of {N} chunks");
-    assert_eq!(input.len(), N * CHUNK_LEN, "a batch of {N} whole chunks");
-    let mut cv: [[u32; N]; 8] = key.map(|word| [word; N]);
-    // Each lane's counter, split into its low and high words: dropping the other half is the
-    // point.
-    let counter_low: [u32; N] =
-        core::array::from_fn(|lane| (counter + lane.widen_to::<u64>()).truncate_to::<u32>());
-    let counter_high: [u32; N] =
-        core::array::from_fn(|lane| ((counter + lane.widen_to::<u64>()) >> 32).truncate_to::<u32>());
-    let blocks = CHUNK_LEN / BLOCK_LEN;
-    for block in 0..blocks {
-        let rows: [[u32; 16]; N] = core::array::from_fn(|lane| {
-            let at = lane * CHUNK_LEN + block * BLOCK_LEN;
-            lanes::block_words(input[at..at + BLOCK_LEN].try_into().expect("a whole block"))
-        });
-        let mut block_flags = flags;
-        if block == 0 {
-            block_flags |= CHUNK_START;
-        }
-        if block == blocks - 1 {
-            block_flags |= CHUNK_END;
-        }
-        cv = lanes::compress(
-            &cv,
-            &lanes::columns(&rows),
-            counter_low,
-            counter_high,
-            [const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) }; N],
-            block_flags,
-        );
-    }
-    for (lane, slot) in out.iter_mut().enumerate() {
-        *slot = core::array::from_fn(|word| cv[word][lane]);
-    }
-}
-
-/// Short inputs [`many`] hashes side by side at the target's baseline: 8, as [`CHUNK_LANES`].
-const MANY_LANES: usize = 8;
-
-/// The roots of `inputs` under `key` and `flags`, into `out`: 16 lanes in AVX-512 registers
-/// and 8 in AVX2 ones where the CPU has them, else [`MANY_LANES`].
+/// The roots of `inputs` under `key` and `flags`, into `out`, by this CPU's engine.
 fn many(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+    many_on(Engine::detected(), key, flags, inputs, out);
+}
+
+/// The roots of `inputs` under `key` and `flags`, into `out`, at the engine's degree: one at a
+/// time at [`Degree::One`], else side by side ([`many_of`]).
+pub(crate) fn many_on(e: Engine, key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
     assert_eq!(inputs.len(), out.len(), "a digest for each input");
+    match e.degree {
+        Degree::One => {
+            for (input, slot) in inputs.iter().zip(out.iter_mut()) {
+                *slot = one_shot(e, key, flags, input);
+            }
+        }
+        Degree::Two => many_lanes::<2>(e, key, flags, inputs, out),
+        Degree::Four => many_lanes::<4>(e, key, flags, inputs, out),
+        Degree::Eight => many_lanes::<8>(e, key, flags, inputs, out),
+        Degree::Sixteen => many_lanes::<16>(e, key, flags, inputs, out),
+    }
+}
+
+/// [`many_of`] at `L` lanes on the instructions the engine's [`Isa`] proves.
+fn many_lanes<const L: usize>(e: Engine, key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
     #[cfg(target_arch = "x86_64")]
     {
-        if cpu::has(cpu::Feature::Avx512f) {
-            return x86::many_avx512(key, flags, inputs, out);
-        }
-        if cpu::has(cpu::Feature::Avx2) {
-            return x86::many_avx2(key, flags, inputs, out);
-        }
+        x86::many::<L>(e, key, flags, inputs, out)
     }
-    many_of::<MANY_LANES>(key, flags, inputs, out);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        many_of::<L>(e, key, flags, inputs, out)
+    }
 }
 
 /// No input in a lane of [`many_of`].
@@ -688,7 +791,7 @@ const IDLE: usize = usize::MAX;
 /// comes. Always inlined, so it is vectorized for the features of the function it is inlined
 /// into.
 #[inline(always)]
-fn many_of<const N: usize>(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+fn many_of<const N: usize>(e: Engine, key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
     let full = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
     let mut cv: [[u32; N]; 8] = key.map(|word| [word; N]);
     // Each lane's input (its place in `inputs`, or `IDLE`), the bytes of it not yet compressed,
@@ -704,7 +807,7 @@ fn many_of<const N: usize>(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &m
                 while let Some(input) = inputs.get(next)
                     && input.len() > CHUNK_LEN
                 {
-                    out[next] = one_shot(key, flags, input);
+                    out[next] = one_shot(e, key, flags, input);
                     next += 1;
                 }
                 if let Some(input) = inputs.get(next) {
@@ -761,92 +864,144 @@ fn many_of<const N: usize>(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &m
     }
 }
 
-/// [`chunks_of`] compiled for AVX-512F at 16 lanes (each word of the transposed state one
-/// 512-bit register, the rotates `vprord`) and for AVX2 at 8 (one 256-bit register a word),
-/// where the baseline would give them SSE2's two 128-bit registers a word and three
-/// instructions a rotate.
+/// The wide code compiled for AVX-512F (each word of the transposed state one 512-bit register
+/// at 16 lanes, the rotates `vprord`) and for AVX2 (one 256-bit register a word at 8), where
+/// the baseline would give them SSE2's 128-bit registers and three instructions a rotate; and
+/// the row-vector single compression with AVX2's `vpshufb` for its byte rotations.
+///
+/// Every `unsafe` call below rests on one assumption, the [`Isa`] contract: an `Isa` of kind
+/// `Avx2` is made only by [`Isa::avx2_unchecked`], whose caller promised the CPU has AVX2, or
+/// by [`Isa::detected`] after [`crate::cpu::has`] said so; one of kind `Avx512` likewise for AVX-512F
+/// and AVX2 both. A `#[target_feature]` function may run on such a CPU and on no other.
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod x86 {
-    pub(super) fn chunks_avx512(
+    use crate::engine::{Engine, Isa, IsaKind};
+    use crate::{CHUNK_LEN, OUT_LEN, rows, tree};
+
+    pub(crate) fn chunks<const L: usize>(
+        isa: Isa,
         key: &[u32; 8],
-        input: &[u8],
-        counter: u64,
         flags: u32,
+        whole: &[[u8; CHUNK_LEN]],
+        counter: u64,
         out: &mut [[u32; 8]],
     ) {
-        assert!(super::cpu::has(super::cpu::Feature::Avx512f), "AVX-512F lanes on a CPU without it");
-        // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
-        // one has AVX-512F, asserted just above.
-        unsafe { chunks_wide(key, input, counter, flags, out) }
+        match isa.kind {
+            IsaKind::Baseline => tree::chunks_of::<L>(key, flags, whole, counter, out),
+            // SAFETY: the `Isa` contract above: this CPU has AVX2.
+            IsaKind::Avx2 => unsafe { chunks_avx2::<L>(key, flags, whole, counter, out) },
+            // SAFETY: the `Isa` contract above: this CPU has AVX-512F.
+            IsaKind::Avx512 => unsafe { chunks_avx512::<L>(key, flags, whole, counter, out) },
+        }
     }
 
-    pub(super) fn chunks_avx2(
+    pub(crate) fn parents<const L: usize>(
+        isa: Isa,
         key: &[u32; 8],
-        input: &[u8],
-        counter: u64,
         flags: u32,
+        pairs: &[[[u32; 8]; 2]],
         out: &mut [[u32; 8]],
     ) {
-        assert!(super::cpu::has(super::cpu::Feature::Avx2), "AVX2 lanes on a CPU without it");
-        // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
-        // one has AVX2, asserted just above.
-        unsafe { chunks_narrow(key, input, counter, flags, out) }
+        match isa.kind {
+            IsaKind::Baseline => tree::parents_of::<L>(key, flags, pairs, out),
+            // SAFETY: the `Isa` contract above: this CPU has AVX2.
+            IsaKind::Avx2 => unsafe { parents_avx2::<L>(key, flags, pairs, out) },
+            // SAFETY: the `Isa` contract above: this CPU has AVX-512F.
+            IsaKind::Avx512 => unsafe { parents_avx512::<L>(key, flags, pairs, out) },
+        }
     }
 
-    pub(super) fn many_avx512(
+    pub(crate) fn many<const L: usize>(
+        e: Engine,
         key: &[u32; 8],
         flags: u32,
         inputs: &[&[u8]],
-        out: &mut [[u8; super::OUT_LEN]],
+        out: &mut [[u8; OUT_LEN]],
     ) {
-        assert!(super::cpu::has(super::cpu::Feature::Avx512f), "AVX-512F lanes on a CPU without it");
-        // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
-        // one has AVX-512F, asserted just above.
-        unsafe { many_wide(key, flags, inputs, out) }
+        match e.isa.kind {
+            IsaKind::Baseline => super::many_of::<L>(e, key, flags, inputs, out),
+            // SAFETY: the `Isa` contract above: this CPU has AVX2.
+            IsaKind::Avx2 => unsafe { many_avx2::<L>(e, key, flags, inputs, out) },
+            // SAFETY: the `Isa` contract above: this CPU has AVX-512F.
+            IsaKind::Avx512 => unsafe { many_avx512::<L>(e, key, flags, inputs, out) },
+        }
     }
 
-    pub(super) fn many_avx2(
-        key: &[u32; 8],
+    pub(crate) fn rows(
+        isa: Isa,
+        cv: &[u32; 8],
+        block: &[u32; 16],
+        counter: u64,
+        block_len: u32,
         flags: u32,
-        inputs: &[&[u8]],
-        out: &mut [[u8; super::OUT_LEN]],
-    ) {
-        assert!(super::cpu::has(super::cpu::Feature::Avx2), "AVX2 lanes on a CPU without it");
-        // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
-        // one has AVX2, asserted just above.
-        unsafe { many_narrow(key, flags, inputs, out) }
-    }
-
-    #[target_feature(enable = "avx512f")]
-    fn many_wide(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; super::OUT_LEN]]) {
-        super::many_of::<16>(key, flags, inputs, out);
+    ) -> [u32; 16] {
+        match isa.kind {
+            IsaKind::Baseline => rows::compress(cv, block, counter, block_len, flags),
+            // SAFETY: the `Isa` contract above: this CPU has AVX2 (an `Avx512` one has it too).
+            IsaKind::Avx2 | IsaKind::Avx512 => unsafe { rows_avx2(cv, block, counter, block_len, flags) },
+        }
     }
 
     #[target_feature(enable = "avx2")]
-    fn many_narrow(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; super::OUT_LEN]]) {
-        super::many_of::<8>(key, flags, inputs, out);
+    fn chunks_avx2<const L: usize>(key: &[u32; 8], flags: u32, whole: &[[u8; CHUNK_LEN]], counter: u64, out: &mut [[u32; 8]]) {
+        tree::chunks_of::<L>(key, flags, whole, counter, out);
     }
 
     #[target_feature(enable = "avx512f")]
-    fn chunks_wide(
-        key: &[u32; 8],
-        input: &[u8],
-        counter: u64,
-        flags: u32,
-        out: &mut [[u32; 8]],
-    ) {
-        super::chunks_of::<16>(key, input, counter, flags, out);
+    fn chunks_avx512<const L: usize>(key: &[u32; 8], flags: u32, whole: &[[u8; CHUNK_LEN]], counter: u64, out: &mut [[u32; 8]]) {
+        tree::chunks_of::<L>(key, flags, whole, counter, out);
     }
 
     #[target_feature(enable = "avx2")]
-    fn chunks_narrow(
-        key: &[u32; 8],
-        input: &[u8],
-        counter: u64,
-        flags: u32,
-        out: &mut [[u32; 8]],
-    ) {
-        super::chunks_of::<8>(key, input, counter, flags, out);
+    fn parents_avx2<const L: usize>(key: &[u32; 8], flags: u32, pairs: &[[[u32; 8]; 2]], out: &mut [[u32; 8]]) {
+        tree::parents_of::<L>(key, flags, pairs, out);
+    }
+
+    #[target_feature(enable = "avx512f")]
+    fn parents_avx512<const L: usize>(key: &[u32; 8], flags: u32, pairs: &[[[u32; 8]; 2]], out: &mut [[u32; 8]]) {
+        tree::parents_of::<L>(key, flags, pairs, out);
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn many_avx2<const L: usize>(e: Engine, key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+        super::many_of::<L>(e, key, flags, inputs, out);
+    }
+
+    #[target_feature(enable = "avx512f")]
+    fn many_avx512<const L: usize>(e: Engine, key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+        super::many_of::<L>(e, key, flags, inputs, out);
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn rows_avx2(cv: &[u32; 8], block: &[u32; 16], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
+        rows::compress(cv, block, counter, block_len, flags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use blaze_sim::{Config, Tape, check};
+
+    use super::{BLOCK_LEN, compress, compress_in_place, first_8, lanes};
+
+    /// The in-place form is the first eight words of [`compress`] of the block's words: drawn
+    /// chaining values, blocks, counters, lengths and flags.
+    #[test]
+    fn in_place_is_the_first_eight_words() {
+        check(Config::cases(2_000), |tape: &Tape| {
+            let cv: [u32; 8] = core::array::from_fn(|_| tape.next_u32("cv"));
+            let mut block = [0; BLOCK_LEN];
+            tape.fill(&mut block, "block");
+            let counter = tape.next_u64("counter");
+            let block_len = u32::try_from(tape.range(0..65, "block length")).expect("at most 64");
+            let flags = u32::try_from(tape.below(128, "flags")).expect("under 128");
+            let want = first_8(&compress(&cv, &lanes::block_words(&block), counter, block_len, flags));
+            let mut got = cv;
+            compress_in_place(&mut got, &block, counter, block_len, flags);
+            assert_eq!(got, want);
+        });
     }
 }

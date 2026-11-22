@@ -302,10 +302,18 @@ pub use self::native::{Asked, Held};
 
 #[cfg(unix)]
 mod native {
-    use core::ptr;
+    use blaze_sys::posix::{signal as sig, types::sighandler_t};
+    use core::ffi::c_int;
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use super::{By, ParentSignals, Requests, SignalError};
+
+    #[cfg(target_os = "macos")]
+    type Action = sig::sigaction;
+    // On Linux blaze-sys installs its own restorer even when putting back an action
+    // read from libc. Keep libc's install semantics for these saved dispositions.
+    #[cfg(target_os = "linux")]
+    type Action = libc::sigaction;
 
     /// A SIGTERM came while held and was not taken yet. Written by [`on_terminate`] (a
     /// lock-free store, async-signal-safe), read and cleared by [`Held::take_terminate`].
@@ -316,7 +324,7 @@ mod native {
 
     /// SIGTERM's handler while held: notes it, nothing else (signal-safety(7): only
     /// async-signal-safe work in a handler; a lock-free atomic store is).
-    extern "C" fn on_terminate(_: libc::c_int) {
+    extern "C" fn on_terminate(_: c_int) {
         TERMINATE.store(true, Ordering::Release);
     }
 
@@ -331,26 +339,35 @@ mod native {
     /// The parent's dispositions while a program runs; see the module's doc. Dropped, the
     /// dispositions it found are back.
     pub struct Held {
-        interrupt: libc::sigaction,
-        quit: libc::sigaction,
+        interrupt: Action,
+        quit: Action,
         /// SIGTERM's disposition before, where this hold caught it; `None` where it was
         /// ignored already (this process was started with SIGTERM ignored, so it stays so: the
         /// one who started it asked for that).
-        terminate: Option<libc::sigaction>,
+        terminate: Option<Action>,
         plant: Plant,
     }
 
     /// One `sigaction(signal, new, old)`: `new` none reads only.
-    fn sigaction(signal: libc::c_int, new: Option<&libc::sigaction>) -> Result<libc::sigaction, SignalError> {
-        // SAFETY: all zeros is a valid `sigaction` (a handler of 0 is SIG_DFL, an empty mask,
-        // no flags); the call writes it.
-        let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
-        let new = new.map_or(ptr::null(), |it| it as *const libc::sigaction);
-        // SAFETY: `new` is null or a `sigaction` that lives across the call; `old` is one on
-        // the stack to write. `signal` is SIGINT, SIGQUIT, SIGTERM, SIGUSR1 or SIGINFO, each
-        // catchable.
-        let done = unsafe { libc::sigaction(signal, new, &mut old) };
-        match done {
+    #[cfg(target_os = "macos")]
+    fn sigaction(signal: c_int, new: Option<&Action>) -> Result<Action, SignalError> {
+        match new {
+            None => sig::get_action(signal),
+            // SAFETY: this module installs SIG_IGN, a static one-argument async-signal-safe
+            // handler, or the original action read for this signal with its matching flags.
+            Some(action) => unsafe { sig::set_action(signal, action) },
+        }
+        .map_err(|error| SignalError::Sigaction { signal, os: i32::from(error.raw()) })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sigaction(signal: c_int, new: Option<&Action>) -> Result<Action, SignalError> {
+        // SAFETY: zero is a valid disposition with an empty mask and no flags.
+        let mut old: Action = unsafe { core::mem::zeroed() };
+        let new = new.map_or(core::ptr::null(), core::ptr::from_ref);
+        // SAFETY: old is writable, new is null or live, and each handler is either the
+        // previously installed one or a static async-signal-safe function with matching flags.
+        match unsafe { libc::sigaction(signal, new, &mut old) } {
             0 => Ok(old),
             _ => Err(SignalError::Sigaction { signal, os: std::io::Error::last_os_error().raw_os_error().unwrap_or(0) }),
         }
@@ -359,13 +376,14 @@ mod native {
     /// A disposition of `handler` (SIG_IGN, or a function's address), restarting interrupted
     /// calls (SA_RESTART: a read of another thread's is not cut by the parent's SIGTERM), with
     /// no signal blocked while it runs.
-    fn disposition(handler: libc::sighandler_t) -> libc::sigaction {
-        // SAFETY: all zeros is a valid `sigaction`.
-        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+    fn disposition(handler: sighandler_t) -> Action {
+        #[cfg(target_os = "macos")]
+        let mut action = Action::DEFAULT;
+        #[cfg(target_os = "linux")]
+        // SAFETY: the all-zero libc action has an empty mask, a default handler and no flags.
+        let mut action: Action = unsafe { core::mem::zeroed() };
         action.sa_sigaction = handler;
-        action.sa_flags = libc::SA_RESTART;
-        // SAFETY: a `sigset_t` inside `action` to empty.
-        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        action.sa_flags = sig::SA_RESTART;
         action
     }
 
@@ -381,34 +399,34 @@ mod native {
                 return Err(SignalError::AlreadyHeld);
             }
             TERMINATE.store(false, Ordering::Release);
-            let ignore = disposition(libc::SIG_IGN);
-            let interrupt = match sigaction(libc::SIGINT, Some(&ignore)) {
+            let ignore = disposition(sig::SIG_IGN);
+            let interrupt = match sigaction(sig::SIGINT, Some(&ignore)) {
                 Ok(old) => old,
                 Err(error) => {
                     HELD.store(false, Ordering::Release);
                     return Err(error);
                 }
             };
-            let quit = match sigaction(libc::SIGQUIT, Some(&ignore)) {
+            let quit = match sigaction(sig::SIGQUIT, Some(&ignore)) {
                 Ok(old) => old,
                 Err(error) => {
-                    put_back(libc::SIGINT, &interrupt);
+                    put_back(sig::SIGINT, &interrupt);
                     HELD.store(false, Ordering::Release);
                     return Err(error);
                 }
             };
             let undo = |error| {
-                put_back(libc::SIGQUIT, &quit);
-                put_back(libc::SIGINT, &interrupt);
+                put_back(sig::SIGQUIT, &quit);
+                put_back(sig::SIGINT, &interrupt);
                 HELD.store(false, Ordering::Release);
                 error
             };
-            let before = sigaction(libc::SIGTERM, None).map_err(undo)?;
-            let terminate = match before.sa_sigaction == libc::SIG_IGN {
+            let before = sigaction(sig::SIGTERM, None).map_err(undo)?;
+            let terminate = match before.sa_sigaction == sig::SIG_IGN {
                 true => None,
                 false => {
-                    let catch = disposition(on_terminate as extern "C" fn(libc::c_int) as libc::sighandler_t);
-                    Some(sigaction(libc::SIGTERM, Some(&catch)).map_err(undo)?)
+                    let catch = disposition(on_terminate as extern "C" fn(c_int) as sighandler_t);
+                    Some(sigaction(sig::SIGTERM, Some(&catch)).map_err(undo)?)
                 }
             };
             Ok(Held { interrupt, quit, terminate, plant })
@@ -419,7 +437,7 @@ mod native {
     /// (both pointers here are to live values) and EINVAL ("an invalid signal was specified",
     /// or SIGKILL or SIGSTOP), and `signal` is SIGINT, SIGQUIT or SIGTERM with a disposition
     /// this process read for it; a failure would be a broken C library, stopped by name.
-    fn put_back(signal: libc::c_int, old: &libc::sigaction) {
+    fn put_back(signal: c_int, old: &Action) {
         if let Err(error) = sigaction(signal, Some(old)) {
             panic!("{error}: putting back a disposition this process read for it");
         }
@@ -434,12 +452,12 @@ mod native {
     impl Drop for Held {
         fn drop(&mut self) {
             if let Some(terminate) = &self.terminate {
-                put_back(libc::SIGTERM, terminate);
+                put_back(sig::SIGTERM, terminate);
             }
             if self.plant != Plant::RestoreSkipsQuit {
-                put_back(libc::SIGQUIT, &self.quit);
+                put_back(sig::SIGQUIT, &self.quit);
             }
-            put_back(libc::SIGINT, &self.interrupt);
+            put_back(sig::SIGINT, &self.interrupt);
             TERMINATE.store(false, Ordering::Release);
             HELD.store(false, Ordering::Release);
         }
@@ -458,20 +476,20 @@ mod native {
 
     /// The stop signals' handler while asked: notes the request, nothing else (signal-safety(7):
     /// a lock-free atomic compare-exchange is async-signal-safe; the match is pure).
-    extern "C" fn on_stop(signal: libc::c_int) {
+    extern "C" fn on_stop(signal: c_int) {
         match signal {
-            libc::SIGINT => ASKED.ask_stop(By::Interrupt),
-            libc::SIGTERM => ASKED.ask_stop(By::Terminate),
+            sig::SIGINT => ASKED.ask_stop(By::Interrupt),
+            sig::SIGTERM => ASKED.ask_stop(By::Terminate),
             _ => {}
         }
     }
 
     /// The status signals' handler while asked: as [`on_stop`], a store and nothing else.
-    extern "C" fn on_status(signal: libc::c_int) {
+    extern "C" fn on_status(signal: c_int) {
         match signal {
-            libc::SIGUSR1 => ASKED.ask_status(By::User1),
+            sig::SIGUSR1 => ASKED.ask_status(By::User1),
             #[cfg(target_os = "macos")]
-            libc::SIGINFO => ASKED.ask_status(By::Info),
+            sig::SIGINFO => ASKED.ask_status(By::Info),
             _ => {}
         }
     }
@@ -483,20 +501,20 @@ mod native {
     /// [`SignalError::AlreadyHeld`]. A stop signal this process was started with ignored stays
     /// ignored (whoever started it asked for that: a `nohup` or a background job's SIGINT).
     pub struct Asked {
-        interrupt: Option<libc::sigaction>,
-        terminate: Option<libc::sigaction>,
-        user1: Option<libc::sigaction>,
-        info: Option<libc::sigaction>,
+        interrupt: Option<Action>,
+        terminate: Option<Action>,
+        user1: Option<Action>,
+        info: Option<Action>,
     }
 
     /// `signal` caught by `handler`, its disposition before returned; `None` (nothing changed)
     /// for a stop signal found ignored.
-    fn catch(signal: libc::c_int, handler: extern "C" fn(libc::c_int), keep_ignored: bool) -> Result<Option<libc::sigaction>, SignalError> {
+    fn catch(signal: c_int, handler: extern "C" fn(c_int), keep_ignored: bool) -> Result<Option<Action>, SignalError> {
         let before = sigaction(signal, None)?;
-        if keep_ignored && before.sa_sigaction == libc::SIG_IGN {
+        if keep_ignored && before.sa_sigaction == sig::SIG_IGN {
             return Ok(None);
         }
-        let caught = disposition(handler as libc::sighandler_t);
+        let caught = disposition(handler as sighandler_t);
         sigaction(signal, Some(&caught)).map(Some)
     }
 
@@ -510,12 +528,12 @@ mod native {
             }
             ASKED.clear();
             let mut asked = Asked { interrupt: None, terminate: None, user1: None, info: None };
-            asked.interrupt = catch(libc::SIGINT, on_stop, true)?;
-            asked.terminate = catch(libc::SIGTERM, on_stop, true)?;
-            asked.user1 = catch(libc::SIGUSR1, on_status, false)?;
+            asked.interrupt = catch(sig::SIGINT, on_stop, true)?;
+            asked.terminate = catch(sig::SIGTERM, on_stop, true)?;
+            asked.user1 = catch(sig::SIGUSR1, on_status, false)?;
             #[cfg(target_os = "macos")]
             {
-                asked.info = catch(libc::SIGINFO, on_status, false)?;
+                asked.info = catch(sig::SIGINFO, on_status, false)?;
             }
             Ok(asked)
         }
@@ -531,18 +549,18 @@ mod native {
         fn drop(&mut self) {
             if let Some(old) = &self.info {
                 #[cfg(target_os = "macos")]
-                put_back(libc::SIGINFO, old);
+                put_back(sig::SIGINFO, old);
                 #[cfg(not(target_os = "macos"))]
                 let _never_set = old;
             }
             if let Some(old) = &self.user1 {
-                put_back(libc::SIGUSR1, old);
+                put_back(sig::SIGUSR1, old);
             }
             if let Some(old) = &self.terminate {
-                put_back(libc::SIGTERM, old);
+                put_back(sig::SIGTERM, old);
             }
             if let Some(old) = &self.interrupt {
-                put_back(libc::SIGINT, old);
+                put_back(sig::SIGINT, old);
             }
             ASKED.clear();
             HELD.store(false, Ordering::Release);
@@ -569,9 +587,9 @@ mod native {
 
         /// SIGINT's and SIGQUIT's handler for the test's own "before" state: a distinct
         /// address to see come back, and a stray signal does not end the test binary.
-        extern "C" fn noted(_: libc::c_int) {}
+        extern "C" fn noted(_: c_int) {}
 
-        fn handler(signal: libc::c_int) -> libc::sighandler_t {
+        fn handler(signal: c_int) -> sighandler_t {
             sigaction(signal, None).expect("a read of a disposition").sa_sigaction
         }
 
@@ -581,64 +599,57 @@ mod native {
         /// the planted drop that skips SIGQUIT must leave it differing.
         #[test]
         fn held_ignores_catches_and_restores_on_every_path() {
-            let mine = noted as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            let mine = noted as extern "C" fn(c_int) as sighandler_t;
             let set = disposition(mine);
-            let first_int = sigaction(libc::SIGINT, Some(&set)).expect("SIGINT set");
-            let first_quit = sigaction(libc::SIGQUIT, Some(&set)).expect("SIGQUIT set");
-            let first_term = sigaction(libc::SIGTERM, None).expect("SIGTERM read");
+            let first_int = sigaction(sig::SIGINT, Some(&set)).expect("SIGINT set");
+            let first_quit = sigaction(sig::SIGQUIT, Some(&set)).expect("SIGQUIT set");
+            let first_term = sigaction(sig::SIGTERM, None).expect("SIGTERM read");
             {
                 let mut held = Held::hold().expect("a hold");
                 assert_eq!(Held::hold().map(drop), Err(SignalError::AlreadyHeld), "one holder per process");
-                assert_eq!(handler(libc::SIGINT), libc::SIG_IGN);
-                assert_eq!(handler(libc::SIGQUIT), libc::SIG_IGN);
-                // SAFETY: SIGINT and SIGQUIT are ignored (checked above): the calls return.
-                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-                // SAFETY: as above.
-                assert_eq!(unsafe { libc::raise(libc::SIGQUIT) }, 0);
+                assert_eq!(handler(sig::SIGINT), sig::SIG_IGN);
+                assert_eq!(handler(sig::SIGQUIT), sig::SIG_IGN);
+                assert_eq!(sig::raise_signal(sig::SIGINT), Ok(()));
+                assert_eq!(sig::raise_signal(sig::SIGQUIT), Ok(()));
                 assert!(!held.take_terminate(Duration::ZERO), "an ignored SIGINT or SIGQUIT is no SIGTERM");
-                // SAFETY: SIGTERM is caught by `on_terminate` (it was not ignored before: the
-                // test harness does not ignore it), which only stores a flag.
-                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+                assert_eq!(sig::raise_signal(sig::SIGTERM), Ok(()));
                 assert!(held.take_terminate(Duration::ZERO), "a caught SIGTERM is taken");
                 assert!(!held.take_terminate(Duration::ZERO), "taking it clears it");
             }
-            assert_eq!(handler(libc::SIGINT), mine, "SIGINT back after a return");
-            assert_eq!(handler(libc::SIGQUIT), mine, "SIGQUIT back after a return");
-            assert_eq!(handler(libc::SIGTERM), first_term.sa_sigaction, "SIGTERM back after a return");
+            assert_eq!(handler(sig::SIGINT), mine, "SIGINT back after a return");
+            assert_eq!(handler(sig::SIGQUIT), mine, "SIGQUIT back after a return");
+            assert_eq!(handler(sig::SIGTERM), first_term.sa_sigaction, "SIGTERM back after a return");
             let unwound = std::panic::catch_unwind(|| {
                 let _held = Held::hold().expect("a hold after the first ended");
                 panic!("an unwind through a hold");
             });
             assert!(unwound.is_err());
-            assert_eq!(handler(libc::SIGINT), mine, "SIGINT back after an unwind");
-            assert_eq!(handler(libc::SIGQUIT), mine, "SIGQUIT back after an unwind");
+            assert_eq!(handler(sig::SIGINT), mine, "SIGINT back after an unwind");
+            assert_eq!(handler(sig::SIGQUIT), mine, "SIGQUIT back after an unwind");
             drop(Held::hold_with(Plant::RestoreSkipsQuit).expect("a planted hold"));
-            let planted_caught = handler(libc::SIGQUIT) != mine;
+            let planted_caught = handler(sig::SIGQUIT) != mine;
             assert!(planted_caught, "the planted drop that skips SIGQUIT is seen by the after-check");
-            sigaction(libc::SIGQUIT, Some(&first_quit)).expect("the test's SIGQUIT back");
+            sigaction(sig::SIGQUIT, Some(&first_quit)).expect("the test's SIGQUIT back");
             // A command's own signals (`Asked`), in this one function for the same reason:
             // SIGINT and SIGTERM are a stop (the first kept), SIGUSR1 a status taken once.
-            let first_usr1 = sigaction(libc::SIGUSR1, None).expect("SIGUSR1 read");
+            let first_usr1 = sigaction(sig::SIGUSR1, None).expect("SIGUSR1 read");
             {
                 let asked = Asked::hold().expect("an asked hold");
                 assert_eq!(Held::hold().map(drop), Err(SignalError::AlreadyHeld), "one holder of the dispositions: Held beside Asked");
                 assert_eq!(Asked::hold().map(drop), Err(SignalError::AlreadyHeld), "one Asked");
                 let requests = asked.requests();
                 assert_eq!(requests.stop(), None);
-                // SAFETY: SIGUSR1 is caught by `on_status` (set above), which only stores.
-                assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+                assert_eq!(sig::raise_signal(sig::SIGUSR1), Ok(()));
                 assert_eq!(requests.take_status(), Some(By::User1), "a status asked by SIGUSR1");
                 assert_eq!(requests.take_status(), None, "taken once");
-                // SAFETY: SIGTERM is caught by `on_stop` (not ignored before), which only stores.
-                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-                // SAFETY: SIGINT is caught by `on_stop` (the test set its own handler, not SIG_IGN).
-                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                assert_eq!(sig::raise_signal(sig::SIGTERM), Ok(()));
+                assert_eq!(sig::raise_signal(sig::SIGINT), Ok(()));
                 assert_eq!(requests.stop(), Some(By::Terminate), "the first stop is kept");
             }
-            assert_eq!(handler(libc::SIGINT), mine, "SIGINT back after an asked hold");
-            assert_eq!(handler(libc::SIGTERM), first_term.sa_sigaction, "SIGTERM back after an asked hold");
-            assert_eq!(handler(libc::SIGUSR1), first_usr1.sa_sigaction, "SIGUSR1 back after an asked hold");
-            sigaction(libc::SIGINT, Some(&first_int)).expect("the test's SIGINT back");
+            assert_eq!(handler(sig::SIGINT), mine, "SIGINT back after an asked hold");
+            assert_eq!(handler(sig::SIGTERM), first_term.sa_sigaction, "SIGTERM back after an asked hold");
+            assert_eq!(handler(sig::SIGUSR1), first_usr1.sa_sigaction, "SIGUSR1 back after an asked hold");
+            sigaction(sig::SIGINT, Some(&first_int)).expect("the test's SIGINT back");
             println!("run signals: held ignores INT and QUIT, catches TERM, restores on return and unwind; the planted skipped restore is caught; asked takes INT and TERM as a stop, USR1 as a status, and restores");
         }
     }

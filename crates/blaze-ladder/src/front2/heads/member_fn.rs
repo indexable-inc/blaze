@@ -27,7 +27,9 @@ use blaze_typeck::{ItemKey, Name, PClause, PTy};
 use super::super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::super::source::NamesSource;
 use super::super::types::{Bounds, Env, ParamBound, SelfTy, Why};
-use super::{Signatures, Store, Vec, Want, format, members};
+// The parent's own imports of the allocator, `Vec` and `format!` (no new line naming `std`:
+// tools/ratchets/std-alloc.txt).
+use super::{Global, Store, Vec, Want, format, lower, members};
 
 /// What an impl's member fns are made in, kept when the impl's head is made (its module, its
 /// generic parameters, their bounds, its `Self`): a member fn's want reads it, never lowers
@@ -36,9 +38,9 @@ use super::{Signatures, Store, Vec, Want, format, members};
 pub struct MemberFrame {
     pub module: LibKey,
     pub generics: u32,
-    pub params: Vec<(Name, u32)>,
-    pub consts: Vec<(u32, PTy)>,
-    pub bounds: Vec<ParamBound>,
+    pub params: Vec<(Name, u32), Global>,
+    pub consts: Vec<(u32, PTy), Global>,
+    pub bounds: Vec<ParamBound, Global>,
     pub self_: SelfTy,
 }
 
@@ -83,7 +85,7 @@ impl<'n> Store<'n> {
     /// Makes the signature of `fn_`, a fn of impl `impl_` whose head is made: in the impl's
     /// kept frame, with its associated types and its clauses, as `Store::member_fn_head` (a
     /// refusal other than a need is the fn's own gap in `fn_gaps`, never the impl's).
-    pub(super) fn member_fn<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, impl_: LibKey, fn_: ItemKey, signatures: &Signatures<'n>) -> Result<(), Why> {
+    pub(super) fn member_fn<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, impl_: LibKey, fn_: ItemKey) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(impl_);
         let name = match keys.origin(fn_) {
@@ -95,25 +97,24 @@ impl<'n> Store<'n> {
             if !matches!(m.detail, ItemDetail::Fn { .. }) || m.name != &*name {
                 continue;
             }
-            let low = signatures.member(names, impl_, m)?;
+            let low = lower(names, impl_, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let v = low.view();
             if v.cfg_out() {
                 continue;
             }
             let frame = self.member_frames.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: its head is made but its members' frame is not kept").into_boxed_str(), whole))?;
             let (module, generics, self_) = (frame.module, frame.generics, frame.self_);
-            let scratch = self.tys.alloc();
-            let mut params = Vec::with_capacity_in(frame.params.len(), scratch);
+            let mut params = Vec::with_capacity_in(frame.params.len(), Global);
             params.extend_from_slice(&frame.params);
-            let mut consts = Vec::with_capacity_in(frame.consts.len(), scratch);
+            let mut consts = Vec::with_capacity_in(frame.consts.len(), Global);
             consts.extend_from_slice(&frame.consts);
-            let mut bounds = Vec::with_capacity_in(frame.bounds.len(), scratch);
+            let mut bounds = Vec::with_capacity_in(frame.bounds.len(), Global);
             bounds.extend_from_slice(&frame.bounds);
             let head = self.impls.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: a member fn asked before its head").into_boxed_str(), whole))?;
-            let mut self_assoc = Vec::with_capacity_in(head.assoc.len(), scratch);
+            let mut self_assoc = Vec::with_capacity_in(head.assoc.len(), Global);
             self_assoc.extend_from_slice(&head.assoc);
             let clauses = self.preds.get(&ck).ok_or_else(|| Why::Program(format!("impl {ck:?}: its head is made but its clauses are not filed").into_boxed_str(), whole))?;
-            let mut inherited: Vec<PClause, _> = Vec::with_capacity_in(clauses.clauses.len(), scratch);
+            let mut inherited: Vec<PClause, Global> = Vec::with_capacity_in(clauses.clauses.len(), Global);
             inherited.extend_from_slice(&clauses.clauses);
             let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
             let marks = super::super::item_site::member_marks(names, impl_, m.written_by, m.text).map_err(super::super::item_site::MarksLost::why)?;

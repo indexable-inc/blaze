@@ -32,7 +32,7 @@ blaze-git-fetch.workspace = true
 blaze-text.workspace = true
 # `record`: the source digest a graph's record is keyed by (`Hasher`, `ContentId`); by path, as
 # blaze-fetch takes it, without the workspace line's serde feature.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # `sources`: a git commit's manifests scanned for `package.name`, as cargo finds a git package.
 blaze-toml.workspace = true
 

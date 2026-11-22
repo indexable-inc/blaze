@@ -950,10 +950,6 @@ impl<'w> Ref<'w> {
         if self.rank(b, from) < self.rank(a, from) { b } else { a }
     }
 
-    fn pending_imp(&self, m: ItemKey, i: u32) -> bool {
-        self.imports.get(&(m, i)).copied().unwrap_or(Imp::Pending) == Imp::Pending
-    }
-
     fn pending_call(&self, c: ItemKey) -> bool {
         self.calls.get(&c).copied().unwrap_or(Call::Pending) == Call::Pending
     }

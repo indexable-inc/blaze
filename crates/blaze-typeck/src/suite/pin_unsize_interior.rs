@@ -111,6 +111,10 @@ fn world(superset_args: bool, target: Target) -> Fx {
     let interior = fx.tuple(&[held]);
     fx.hidden.push((o, hidden));
     fx.coroutines.push((wf, 0, u32_, interior));
+    // The `(Args,)` row is the superset a refused flow leaves; the `(u32,)` row is exact.
+    if superset_args {
+        fx.provisional_coroutines.push((wf, 0));
+    }
 
     let ex_fut = fx.ty(PNode::ExTrait(future, List::EMPTY));
     let ex_send = fx.ty(PNode::ExAuto(send));
@@ -148,7 +152,7 @@ fn run(fx: &Fx, target: Target) -> (ExprId, Result<Checked<'static>, CheckError>
 }
 
 fn is_interior_gap<T>(got: &Result<T, CheckError>) -> bool {
-    matches!(got, Err(CheckError::Unported(what)) if *what == crate::rules::async_fn::INTERIOR_GAP)
+    matches!(got, Err(CheckError::FutureWitness { reason, at }) if *reason == crate::INTERIOR_GAP && at.start < at.end)
 }
 
 /// (1) The opaque's hidden future holds `(u32,)`: `Pin<Box<O>>` to `Pin<Box<dyn Future<Output =
@@ -180,7 +184,7 @@ fn a_superset_interior_is_the_gap_not_a_mismatch() {
 }
 
 /// (3) Control: the target's `Output = u16`, the opaque's `u32`. Dropping the auto traits does
-/// not make the question hold, so the `No` is the answer: the coercion is refused (E0308) and
+/// not make the question hold, so the `No` is the answer: the coercion is refused (E0271) and
 /// no unsize is recorded, with the superset interior or without it. Passes with or without the
 /// fix: a fix that took every `No` near a future as the gap fails it.
 /// Should print: "test suite::pin_unsize_interior::control_a_wrong_output_stays_refused ... ok".
@@ -191,7 +195,7 @@ fn control_a_wrong_output_stays_refused() {
         let (call, got) = run(&fx, Target::PinBoxU16);
         let c = got.expect("a finding, not a gap");
         let codes: Vec<DiagCode> = c.diags.iter().map(|d| d.code).collect();
-        assert_eq!(codes, std::vec![DiagCode::Mismatch], "superset {superset}: {:?}", c.diags);
+        assert_eq!(codes, std::vec![DiagCode::ProjectionMismatch], "superset {superset}: {:?}", c.diags);
         assert!(!adjusts(&fx, &c, call).contains("unsize"));
     }
 }
@@ -210,4 +214,28 @@ fn a_boxed_opaque_future_without_pin() {
     let fx = world(true, Target::BoxU32);
     let (_, got) = run(&fx, Target::BoxU32);
     assert!(is_interior_gap(&got), "not the interior gap: {:?}", got.as_ref().err());
+}
+
+/// Vary the candidate types independently of the producer's precision. A provisional
+/// tuple of sendable values cannot establish Send. An exact tuple containing Args
+/// does establish the independent negative, through either pointer coercion.
+#[test]
+fn precision_controls_whether_the_stored_types_can_decide_send() {
+    for target in [Target::PinBoxU32, Target::BoxU32] {
+        let mut provisional = world(true, target);
+        let u32_ = provisional.u32();
+        let candidates = provisional.tuple(&[u32_]);
+        provisional.coroutines[0].3 = candidates;
+        let (_, got) = run(&provisional, target);
+        assert!(is_interior_gap(&got), "a provisional (u32,) decided Send");
+
+        let mut exact = world(false, target);
+        let args = exact.adt(exact.key_of("Args"), &[]);
+        let stored = exact.tuple(&[args]);
+        exact.coroutines[0].3 = stored;
+        let (_, got) = run(&exact, target);
+        let c = got.expect("an exact non-Send field decides the coercion");
+        let codes: Vec<_> = c.diags.iter().map(|d| d.code).collect();
+        assert_eq!(codes, [DiagCode::Unsatisfied]);
+    }
 }

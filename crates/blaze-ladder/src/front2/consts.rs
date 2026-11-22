@@ -25,7 +25,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use blaze_consteval::{
-    ConstError, ConstRecord, ConstWorld, FnKind, Intrinsic, LayoutFacts, Layouts, Lits, Missing as LayoutMissing, NeedKind, Refusal, ReprAttrs, Settle, Typed,
+    ConstError, ConstRecord, ConstWorld, FnKind, LayoutFacts, Layouts, Lits, Missing as LayoutMissing, NeedKind, Refusal, ReprAttrs, Settle, Typed,
     ValidRange,
 };
 use blaze_consteval::{Answer, Codes, Limits, Need, RecordKey, value_of};
@@ -33,7 +33,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_lower::scoped::Prepares;
 use blaze_lower::typeck::TypeckBody;
-use blaze_lower::{View, head};
+use blaze_lower::View;
 use blaze_own::Alloc;
 use super::source::NamesSource;
 use blaze_typeck as tc;
@@ -41,7 +41,7 @@ use blaze_typeck::{Checked, ExprId, Fetch, ItemKey, List, Missing, PatId, Portab
 
 use super::body::{BodyError, lower_fn, lower_member};
 use super::check::{CheckFail, Records, check_body};
-use super::heads::{CrateCfg, Store};
+use super::heads::Store;
 use super::index::Index;
 use super::keys::Keys;
 use super::spell::Spelling;
@@ -54,9 +54,47 @@ pub const MOST_NEEDS: u32 = 256;
 /// the needs do not settle (rule 18).
 pub const MOST_STEPS: u32 = 4096;
 
+/// The first failure encountered while preparing a body for interpretation.
+pub enum RequiredBodyCause {
+    Lower(BodyError),
+    Spelling(Why),
+    Check(CheckFail),
+    Diagnostic(Box<str>),
+    Literal,
+}
+
+// The body task prints its verdict through Debug. Use the checker's diagnostic
+// rendering there too, including the Rust error code, item and range.
+impl core::fmt::Debug for RequiredBodyCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+
+impl core::fmt::Display for RequiredBodyCause {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Lower(error) => write!(f, "{error}"),
+            Self::Spelling(why) => write!(f, "spelling the body's names: {why:?}"),
+            Self::Check(error) => write!(f, "{error}"),
+            Self::Diagnostic(code) => write!(f, "the body has the error {code}"),
+            Self::Literal => write!(f, "a literal's spelling is missing from the lowered body"),
+        }
+    }
+}
+
 /// Why a constant has no value.
 #[derive(Debug)]
 pub enum ConstFail {
+    /// Checking a body demanded by this anonymous constant stopped. The
+    /// expression is quoted source. The original failure retains its type.
+    RequiredBody {
+        constant: ItemKey,
+        expression: blaze_lower::typeck::GapText,
+        needed: ItemKey,
+        shown: Option<Box<str>>,
+        cause: RequiredBodyCause,
+    },
     /// A body the evaluation needs could not be lowered.
     Body { item: ItemKey, error: BodyError },
     /// Its names could not be spelled for the check.
@@ -67,6 +105,8 @@ pub enum ConstFail {
     Diag { item: ItemKey, code: Box<str> },
     /// A literal's written text could not be read back from the lowering.
     Literal { item: ItemKey },
+    /// The work list returned a record key absent from its own value table.
+    MissingRecord { item: ItemKey, key: RecordKey },
     /// A fn marked `#[rustc_intrinsic]` whose name blaze's intrinsics table does not hold.
     UnknownIntrinsic { item: ItemKey, name: Box<str> },
     /// The evaluator refused (a cycle of constants included): its error names the constant.
@@ -132,16 +172,55 @@ pub enum ConstFail {
     /// hold: `made` is the want made for it in this evaluation, if one was; `why` the store's or
     /// the head maker's own words, if any.
     FnFact { callee: ItemKey, shown: Box<str>, fact: blaze_consteval::Fact, made: Option<super::heads::Want>, why: Option<Box<str>> },
+    /// Constants whose values need each other (blaze-consteval's `Refusal::Cycle`), in the
+    /// order met, the first needed again last; `shown`: each by its path (rule 19). rustc's
+    /// E0391, "cycle detected when const-evaluating": no value, the program is refused.
+    Cycle { chain: Vec<ItemKey, Global>, shown: Box<str> },
+}
+
+impl ConstFail {
+    fn required_by<'n, S: NamesSource<'n>>(self, r: &Records<'_, 'n, S>, constant: ItemKey, needed: ItemKey) -> Self {
+        if super::const_open::needed_first(&self).is_some()
+            || !matches!(r.keys.origin(constant), Some(super::keys::Origin::Member { kind: super::keys::MemberKind::Anon, .. }))
+        {
+            return self;
+        }
+        let Some(head) = r.store.fns.get(&constant) else { return self };
+        let cause = match self {
+            Self::Body { error, .. } => RequiredBodyCause::Lower(error),
+            Self::Spelling { why, .. } => RequiredBodyCause::Spelling(why),
+            Self::Check { error, .. } => RequiredBodyCause::Check(error),
+            Self::Diag { code, .. } => RequiredBodyCause::Diagnostic(code),
+            Self::Literal { .. } => RequiredBodyCause::Literal,
+            other => return other,
+        };
+        let shown = if needed == constant {
+            None
+        } else if let Some(local) = r.store.locals.head(needed) {
+            r.store.locals.body(local.enclosing).and_then(|b| b.rows.iter().find(|row| row.key == local.lib)).map(|row| Box::from(row.name))
+        } else {
+            Some(super::check::key_shown(r, needed))
+        };
+        Self::RequiredBody { constant, expression: blaze_lower::typeck::GapText::of(head.text), needed, shown, cause }
+    }
 }
 
 impl core::fmt::Display for ConstFail {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            ConstFail::RequiredBody { constant, expression, needed, shown, cause } => {
+                write!(f, "constant {constant:?} `{expression}` needs body {needed:?}")?;
+                if let Some(name) = shown {
+                    write!(f, " ({name})")?;
+                }
+                write!(f, ": {cause}")
+            }
             ConstFail::Body { item, error } => write!(f, "constant {item:?}: a body it needs: {error}"),
             ConstFail::Spelling { item, why } => write!(f, "constant {item:?}: spelling its body's names: {why:?}"),
             ConstFail::Check { item, error } => write!(f, "constant {item:?}: a body it needs: {error}"),
             ConstFail::Diag { item, code } => write!(f, "constant {item:?}: the body of {item:?} has the error {code}"),
             ConstFail::Literal { item } => write!(f, "the body of {item:?}: a literal's text could not be read"),
+            ConstFail::MissingRecord { item, key } => write!(f, "constant {item:?} settled with missing value record {key:?}"),
             ConstFail::UnknownIntrinsic { item, name } => write!(f, "fn {item:?} is the intrinsic `{name}`, which blaze's intrinsics table does not hold"),
             ConstFail::Eval(e) => write!(f, "{e}"),
             ConstFail::Steps { item, last } => write!(f, "constant {item:?}: its needs did not settle in {MOST_STEPS} steps; the last: {last:?}"),
@@ -171,24 +250,49 @@ impl core::fmt::Display for ConstFail {
                     None => Ok(()),
                 }
             }
+            ConstFail::Cycle { shown, .. } => write!(f, "a cycle of constants (E0391): {shown}"),
         }
     }
+}
+
+/// The constants of a cycle the evaluator met (`Refusal::Cycle`'s chain, the first needed
+/// again last), each by its path: "`A` needs `B`, which needs `A`".
+fn cycle_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, chain: &[ItemKey]) -> ConstFail {
+    let mut shown = String::new();
+    for (i, &k) in chain.iter().enumerate() {
+        let name = super::check::key_shown(r, k);
+        match i {
+            0 => shown.push_str(&name),
+            1 => shown.push_str(&format!(" needs {name}")),
+            _ => shown.push_str(&format!(", which needs {name}")),
+        }
+    }
+    let mut kept = Vec::with_capacity_in(chain.len(), Global);
+    kept.extend_from_slice(chain);
+    ConstFail::Cycle { chain: kept, shown: shown.into_boxed_str() }
 }
 
 /// Makes the store's row of ADT `adt`, which the evaluator's layout asked for and did not find
 /// (`size_of::<S>()` in constant `item`): by `Store::ensure(Want::Adt)`, the one maker of an
 /// ADT's row (the run path's too: program.rs), so the evaluator and the code builder lay out
 /// the same row. A row that cannot be made, or that is made and still gives no layout, is the
-/// constant's refusal, naming the ADT. A
-/// row whose head names a constant (`struct S([u8; N])`) is refused here by that name: the
-/// evaluator is busy with `item` (owed: one work list over constants and heads).
+/// constant's refusal, naming the ADT. A row whose head names a constant (`struct S { b: [u8;
+/// LEN] }`: the evaluator is busy with `item`, so the store cannot evaluate `LEN` inside) is
+/// returned as the head's `NeedConst`, the form [`super::const_open::needed_first`] reads: the
+/// work list (`Consts::value_listed`) evaluates `LEN` first, then this need again, which makes
+/// the row (the Reference, "Constant evaluation": an array type's length is a const context,
+/// evaluated as a constant item is, to any depth).
 fn adt_row<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,item: ItemKey, adt: ItemKey) -> Result<(), ConstFail> {
     let refuse = |why: String| ConstFail::AdtRow { item, adt, why: why.into_boxed_str() };
     if r.store.adts.contains_key(&adt) {
         return Err(refuse(String::from("its row is made and the layout still does not find it")));
     }
     let lib = r.keys.library_in(r.names, adt).ok_or_else(|| refuse(String::from("it has no library key")))?;
-    r.store.ensure(r.names, &mut *r.keys, super::heads::Want::Adt(lib)).map_err(|e| refuse(format!("{e}")))?;
+    match r.store.ensure(r.names, &mut *r.keys, super::heads::Want::Adt(lib)) {
+        Ok(()) => {}
+        Err(error @ super::heads::HeadError::Item(_, Why::NeedConst(..))) => return Err(ConstFail::Body { item, error: BodyError::Head { item: lib, error } }),
+        Err(e) => return Err(refuse(format!("{e}"))),
+    }
     match r.store.adts.get(&adt) {
         Some(_) => Ok(()),
         None => Err(refuse(String::from("its head was made, but no row is filed under its key"))),
@@ -240,6 +344,7 @@ impl LitTable {
 /// One checked body the evaluator reads: its types in its own table (`Body::tys`).
 struct ConstBody<'n> {
     key: ItemKey,
+    inputs: Option<super::heads::ConstInputs>,
     text: &'n str,
     hash: ContentId,
     typeck: TypeckBody<'static>,
@@ -266,12 +371,20 @@ pub enum BodyRoot {
 /// The constants' state of one build: the bodies checked and the records made.
 pub struct Consts<'n> {
     bodies: Vec<ConstBody<'n>, Global>,
-    records: Vec<ConstRecord<Alloc<'static>>, Global>,
+    records: Vec<Evaluated>,
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
     /// The facts of every closure written in a body checked here ([`Consts::check_as`]: a
     /// constant's, a const block's owner's), made by the build's one rule
     /// (`run::ClosureTable::add`); `None` until the first body with a closure is checked.
     closures: Option<crate::run::ClosureTable>,
+}
+
+/// An instance's arguments refer to this evaluator's ground table. Only the
+/// content-keyed record leaves it.
+struct Evaluated {
+    instance: blaze_build::Instance,
+    record: ConstRecord<Alloc<'static>>,
+    inputs: Option<super::heads::ConstInputs>,
 }
 
 impl Default for Consts<'_> {
@@ -287,7 +400,7 @@ struct ConstsWorld<'w, 'n, S> {
     index: &'w Index<'n>,
     store: &'w Store<'n>,
     bodies: &'w [ConstBody<'n>],
-    records: &'w [ConstRecord<Alloc<'static>>],
+    records: &'w [Evaluated],
     /// The last trait's constant [`ConstWorld::resolve`] asked the solver for and had refused
     /// (const_select.rs): the step's typed refusal when the evaluation stops there.
     selected: core::cell::Cell<Option<super::const_select::ConstSelectRefused>>,
@@ -414,6 +527,14 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
 }
 
 impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
+    fn entered_body(&self, item: ItemKey) {
+        if self.store.maps.const_proofs.is_some()
+            && let Some(body) = self.bodies.iter().find(|body| body.key == item)
+        {
+            self.store.maps.read_inputs(body.inputs.as_ref());
+        }
+    }
+
     fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>> {
         let b = self.bodies.iter().find(|b| b.key == item).ok_or(Missing)?;
         // `store.tys` is a table of its own and only grows, so the body's base is in it whole
@@ -433,7 +554,7 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     /// `Refusal::FnFact`, and [`Consts::value`] makes the fact or names it (const_fn_fact.rs
     /// `answer`). `NotConst` only from a head read without `const`.
     fn fn_kind(&self, item: ItemKey) -> FnKind {
-        super::const_fn_fact::fn_fact(self.names, self.keys, self.index, self.store, item, self.alloc)
+        super::const_fn_fact::fn_fact(self.names, self.keys, self.index, self.store, item)
     }
 
     fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Option<(ItemKey, List)> {
@@ -472,7 +593,7 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
             // from its own text, so the text must be in the id: rule 21).
             (Some(local), _) => Some(local.text),
             (None, Some(lib)) => self.names.text_of(lib).map(|t| t.text),
-            (None, None) => self.store.fns.get(&item).map(|f| f.text),
+            (None, None) => self.store.fns.get(&item).map(|f| super::tables::head::member_definition(self.names, self.keys, item, f)),
         };
         item_code_id(item, text)
     }
@@ -483,7 +604,9 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     }
 
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> {
-        self.records.iter().find(|r| r.key == key).ok_or(Missing)
+        let row = self.records.iter().find(|r| r.record.key == key).ok_or(Missing)?;
+        self.store.maps.read_inputs(row.inputs.as_ref());
+        Ok(&row.record)
     }
 
     fn explicit_discriminant(&self, _: ItemKey, _: u32) -> Option<ItemKey> {
@@ -664,7 +787,7 @@ impl<'n> Consts<'n> {
     /// arguments as trees), so the first record naming it answers. `None`: no record names the
     /// key, or its arguments do not copy (a full table): the builder refuses by name.
     pub fn fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::Instance> {
-        let named = self.records.iter().find_map(|r| r.fn_named(key))?;
+        let named = self.records.iter().find_map(|r| r.record.fn_named(key))?;
         let (unit, _, _) = self.unit.as_ref()?;
         let from = unit.view();
         let args = from.list(named.instance.args).ok()?;
@@ -762,7 +885,7 @@ impl<'n> Consts<'n> {
                 }
             }
         };
-        self.records.iter().find(|x| x.key == key).ok_or(ConstFail::Eval(format!("constant {item:?}: its record was not kept").into_boxed_str()))
+        self.records.iter().find(|x| x.record.key == key).map(|x| &x.record).ok_or(ConstFail::MissingRecord { item, key })
     }
 
     /// Evaluates the constant `c` a head or a body's conversion needs before an evaluation
@@ -781,22 +904,27 @@ impl<'n> Consts<'n> {
         let anonymous = super::anon::need_key(item) == c;
         super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {item:?}: {e}").into_boxed_str()))?;
         let bits = match self.value_key(r, prepared, item, Root::Plain, None) {
-            Ok(key) => self.records.iter().find(|x| x.key == key).and_then(int_of),
+            Ok(key) => {
+                let row = self.records.iter().find(|x| x.record.key == key).ok_or(ConstFail::MissingRecord { item, key })?;
+                int_of(&row.record)
+            }
             Err(e) if !anonymous || super::const_open::needed_first(&e).is_some() => return Err(e),
             Err(e) => {
+                r.store.maps.noted_const_result(c);
                 r.store.maps.anon_failed.insert(c, format!("{e}").into_boxed_str());
                 return Ok(());
             }
         };
         match bits {
             Some(bits) => {
-                r.store.maps.const_bits.insert(c, bits);
+                r.store.maps.file_bits(c, bits);
                 if let Ok(v) = u64::try_from(bits) {
                     r.store.maps.const_lens.insert(c, v);
                 }
                 Ok(())
             }
             None if anonymous => {
+                r.store.maps.noted_const_result(c);
                 r.store.maps.anon_failed.insert(c, Box::from("its value is not an integer of at most 16 bytes"));
                 Ok(())
             }
@@ -821,6 +949,14 @@ impl<'n> Consts<'n> {
                 return Err(e);
             }
         };
+        // A root ask does not go through ConstWorld::record as a nested value
+        // read does. The same evaluator and ground table serve both.
+        let instance = blaze_build::Instance { item, args: root_args };
+        if let Some(done) = self.records.iter().find(|r| r.instance == instance) {
+            r.store.maps.read_inputs(done.inputs.as_ref());
+            self.unit = Some((ground, layout, codes));
+            return Ok(done.record.key);
+        }
         let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args: root_args }, MOST_NEEDS, alloc);
         let mut last = None;
         let mut out = Ok(());
@@ -845,8 +981,10 @@ impl<'n> Consts<'n> {
                 break;
             }
             if !self.bodies.iter().any(|b| b.key == n.item) && (n.kind == NeedKind::Body || n.item == item) {
-                if let Err(e) = self.check_one(r, prepared, n.item) {
-                    out = Err(e);
+                if let Err(cause) = self.check_one(r, prepared, n.item) {
+                    // Leave pending needs visible to the work list. Annotate a
+                    // final refusal while its item names and source are available.
+                    out = Err(cause.required_by(r, item, n.item));
                     break;
                 }
                 if n.kind == NeedKind::Body {
@@ -854,6 +992,7 @@ impl<'n> Consts<'n> {
                 }
                 continue;
             }
+            let capture = r.store.maps.capture_const(alloc);
             let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()), alloc, closures: Closures { own: self.closures.as_ref(), build } };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
             let selected = world.selected.take();
@@ -868,17 +1007,21 @@ impl<'n> Consts<'n> {
                 Ok(_) => None,
             };
             let asked = world.project.into_asked();
+            let inputs = r.store.maps.finish_capture(capture);
             let step = match answer {
                 Ok(Answer::Done(rec)) => {
                     let key = rec.key;
-                    if !self.records.iter().any(|x| x.key == key) {
-                        self.records.push(rec);
+                    if !self.records.iter().any(|x| x.record.key == key) {
+                        self.records.push(Evaluated { instance: blaze_build::Instance { item: n.item, args: n.args }, record: rec, inputs });
                     }
                     last = Some(key);
                     settle.done();
                     Ok(())
                 }
-                Ok(Answer::Need(m)) => settle.need(m).map_err(|e: ConstError<'_>| ConstFail::Eval(format!("{e}").into_boxed_str())),
+                Ok(Answer::Need(m)) => settle.need(m).map_err(|e: ConstError<'_>| match &e.refusal {
+                    Refusal::Cycle { chain } => cycle_of(&*r, chain),
+                    _ => ConstFail::Eval(format!("{e}").into_boxed_str()),
+                }),
                 Err(e) => {
                     // The layout met an ADT whose row the store has not made (`size_of::<S>()`:
                     // blaze-consteval's layout.rs turns the layout's `NoAdt` into this typed
@@ -964,13 +1107,27 @@ impl<'n> Consts<'n> {
     /// `block_key` / `promoted_key`). A `root` that is not a const block, or not a borrow the
     /// check here lists as promoted, of the body as lowered here is refused by name.
     fn check_as<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, key: ItemKey, root: Option<BodyRoot>) -> Result<(), ConstFail> {
+        let capture = r.store.maps.capture_const(r.store.tys.alloc());
+        let result = self.checked_body(r, prepared, item, key, root);
+        let inputs = r.store.maps.finish_capture(capture);
+        let mut body = result?;
+        body.inputs = inputs;
+        self.bodies.push(body);
+        Ok(())
+    }
+
+    fn checked_body<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, key: ItemKey, root: Option<BodyRoot>) -> Result<ConstBody<'n>, ConstFail> {
         // A constant declared in a body has its head made first (const_open.rs `local_head`).
         super::const_open::local_head(r, item)?;
         let lowered = match r.keys.library_in(r.names, item) {
             Some(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
             None => lower_member(r.names, prepared, r.keys, r.store, item),
-        }
-        .map_err(|error| ConstFail::Body { item, error })?;
+        };
+        // Lowering a member may make its head. Record the defining tokens even
+        // on a refusal, retaining lowering's original diagnostic when it failed.
+        let source = r.store.read_const_body(r.names, r.keys, item);
+        let lowered = lowered.map_err(|error| ConstFail::Body { item, error })?;
+        source.map_err(|error| ConstFail::Body { item, error })?;
         let (checked, lits) = {
             let view = lowered.lowered.view();
             let spell = Spelling::of(&view).map_err(|why| ConstFail::Spelling { item, why })?;
@@ -1000,7 +1157,7 @@ impl<'n> Consts<'n> {
             // it; body.rs `lower_fn_into` lowered it from the same text).
             (Some(local), _) => Some(local.text),
             (None, Some(lib)) => r.names.text_of(lib).map(|t| t.text),
-            (None, None) => r.store.fns.get(&item).map(|f| f.text),
+            (None, None) => r.store.fns.get(&item).map(|f| super::tables::head::member_definition(r.names, r.keys, item, f)),
         }
         .ok_or(ConstFail::Body { item, error: BodyError::NoHead(item) })?;
         // Its closures' facts, by the build's one rule (`run::ClosureTable::add`): a closure
@@ -1013,8 +1170,7 @@ impl<'n> Consts<'n> {
             let view = lowered.typeck.view(tys);
             self.closures.get_or_insert_with(|| crate::run::ClosureTable::new(alloc)).add(&view, &checked, generics, alloc);
         }
-        self.bodies.push(ConstBody { key, text, hash: hash_text(text), typeck: lowered.typeck, tys: lowered.tys, checked, lits, root });
-        Ok(())
+        Ok(ConstBody { key, inputs: None, text, hash: hash_text(text), typeck: lowered.typeck, tys: lowered.tys, checked, lits, root })
     }
 }
 

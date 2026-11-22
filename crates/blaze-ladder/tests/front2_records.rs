@@ -83,13 +83,13 @@ use std::time::Instant;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::body::lower_fn;
-use blaze_ladder::front2::buckets::{Ask, Buckets, Home, UNFILED_LIST, inherent_home, trait_home};
+use blaze_ladder::front2::buckets::{Ask, Buckets, Home, UNFILED_LIST, inherent_home, prepare_home, trait_home};
 use blaze_ladder::front2::check::{self, BuildOrder, CheckFail, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
 use blaze_ladder::front2::index::Index;
 use blaze_ladder::front2::keys::{Keys, checker_of};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Opened, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Opened, Records};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::world_items::Gap;
 use blaze_ladder::front2::{Front2, fill, langs};
@@ -173,18 +173,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 
@@ -263,16 +263,18 @@ fn lang_answers<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>) -> String {
 /// `Buckets::lazy`, which `admit` then fills for each question's home).
 fn impl_answers<'n, S: NamesSource<'n>>(names: S, sized: Option<ItemKey>, frame: &'n blaze_mem::Frame, root: ItemKey, b: &mut Buckets) -> (String, usize) {
     let mut keys = Keys::new();
-    let store = Store::new(sized, frame, blaze_own::Alloc::global());
+    let mut store = Store::new(sized, frame, blaze_own::Alloc::global());
     let clone = Paths { names }.path(root, false, &["Clone"], Ns::Type).unwrap_or_else(|e| panic!("`Clone` from the program's root: {e}"));
     assert_eq!(clone.kind, Kind::Trait, "`Clone` names a trait");
     keys.item(clone.key).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
     let trait_ = checker_of(clone.key);
-    let home = trait_home(names, &keys, &store, trait_, Shape::Bool);
+    // As production does before reading a home: the question's coherence wants are made first.
+    prepare_home(names, &mut keys, &mut store, Ask::Trait(trait_, Shape::Bool)).unwrap_or_else(|e| panic!("prepare coherence: {e}"));
+    let home = trait_home(names, &keys, &store, trait_, Shape::Bool).unwrap_or_else(|e| panic!("trait home: {e}"));
     b.admit(names, home);
     b.admit_asked(names, &keys, home, Ask::Trait(trait_, Shape::Bool));
     let of_trait = b.trait_candidates(trait_, Shape::Bool, home);
-    let inherent = inherent_home(names, &keys, Shape::Bool);
+    let inherent = inherent_home(names, &keys, &store, Shape::Bool).unwrap_or_else(|e| panic!("inherent home: {e}"));
     b.admit(names, inherent);
     b.admit_asked(names, &keys, inherent, Ask::Inherent(Shape::Bool));
     let of_bool = b.inherent_candidates(Shape::Bool, inherent);
@@ -479,6 +481,8 @@ fn heads_dump<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>) 
                     format!("Projection {trait_:?} {name:?}:{} =={}", terms(t, &t.list(*args).map(|s| s.to_vec()).unwrap_or_default()), terms(t, &[*term]))
                 }
                 PClause::Const { cond, args } => format!("Const {cond:?}:{}", terms(t, &t.list(*args).map(|s| s.to_vec()).unwrap_or_default())),
+                PClause::TypeOutlives { ty, region } => format!("TypeOutlives {region:?}:{}", terms(t, &[*ty])),
+                PClause::RegionOutlives { long, short } => format!("RegionOutlives {long:?}: {short:?}"),
             })
             .collect();
         out.insert(format!("Predicates {k:?}"), format!("conds {}\n  {}\n  {}", p.conds.len(), clauses.join("\n  "), text(*k)));
@@ -717,10 +721,12 @@ fn records_answer_what_the_solved_names_answer() {
     let before_alone = asked.opened();
     let (alone_opened, alone_rows, alone_text, alone_index, alone_asked, alone_reads, alone_home, clone_lib, alone_candidates) = {
         let mut alone_keys = Keys::new();
-        let alone_store = Store::new(asked_front.index.lang("sized"), asked_frame, blaze_own::Alloc::global());
+        let mut alone_store = Store::new(asked_front.index.lang("sized"), asked_frame, blaze_own::Alloc::global());
         let clone = Paths { names: asked }.path(root, false, &["Clone"], Ns::Type).unwrap_or_else(|e| panic!("`Clone` from the program's root over records: {e}"));
         alone_keys.item(clone.key).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
-        let home = trait_home(asked, &alone_keys, &alone_store, checker_of(clone.key), Shape::Bool);
+        // As production does before reading a home: the question's coherence wants are made first.
+        prepare_home(asked, &mut alone_keys, &mut alone_store, Ask::Trait(checker_of(clone.key), Shape::Bool)).unwrap_or_else(|e| panic!("prepare coherence: {e}"));
+        let home = trait_home(asked, &alone_keys, &alone_store, checker_of(clone.key), Shape::Bool).unwrap_or_else(|e| panic!("trait home: {e}"));
         asked_lazy.admit(asked, home);
         asked_lazy.admit_asked(asked, &alone_keys, home, Ask::Trait(checker_of(clone.key), Shape::Bool));
         let candidates = asked_lazy.trait_candidates(checker_of(clone.key), Shape::Bool, home);
@@ -771,7 +777,7 @@ fn records_answer_what_the_solved_names_answer() {
     asked.plant_no_bucket_impl(in_bucket[0]);
     let planted_candidates = {
         let mut planted_index = Buckets::lazy(asked);
-        let mut planted_keys = Keys::new();
+        let planted_keys = Keys::new();
         planted_keys.item(clone_lib).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
         planted_index.admit_asked(asked, &planted_keys, alone_home, Ask::Trait(checker_of(clone_lib), Shape::Bool));
         planted_index.trait_candidates(checker_of(clone_lib), Shape::Bool, alone_home)
@@ -868,9 +874,11 @@ fn records_answer_what_the_solved_names_answer() {
     let mut display_keys = Keys::new();
     display_keys.item(display.key).unwrap_or_else(|e| panic!("filing `Display`: {e}"));
     display_keys.item(io).unwrap_or_else(|e| panic!("filing `Io`: {e}"));
-    let display_store = Store::new(asked_front.index.lang("sized"), asked_frame, blaze_own::Alloc::global());
+    let mut display_store = Store::new(asked_front.index.lang("sized"), asked_frame, blaze_own::Alloc::global());
     let (display_trait, io_shape) = (checker_of(display.key), Shape::Adt(checker_of(io)));
-    let display_home = trait_home(asked, &display_keys, &display_store, display_trait, io_shape);
+    // As production does before reading a home: the question's coherence wants are made first.
+    prepare_home(asked, &mut display_keys, &mut display_store, Ask::Trait(display_trait, io_shape)).unwrap_or_else(|e| panic!("prepare coherence: {e}"));
+    let display_home = trait_home(asked, &display_keys, &display_store, display_trait, io_shape).unwrap_or_else(|e| panic!("trait home: {e}"));
     let before_display = asked.opened();
     let mut display_index = Buckets::lazy(asked);
     display_index.admit_asked(asked, &display_keys, display_home, Ask::Trait(display_trait, io_shape));

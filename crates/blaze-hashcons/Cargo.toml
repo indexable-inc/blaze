@@ -23,6 +23,8 @@ blaze-mem.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# `testing::heap()`, the allocator `to_bytes` is handed in the tests (D170 C1: no `Global`).
+blaze-own = { workspace = true, features = ["testing"] }
 blaze-sim.workspace = true
 
 [lints]

@@ -45,6 +45,8 @@
 #![no_std]
 #![feature(portable_simd, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![blaze::trust(
     unsafe,
     reason = "three kinds, each stated where it is: `vpshufb` called from code that runs only when an `Avx2` value proves the CPU has AVX2; `from_utf8_unchecked` on bytes the validator proved; and `Cpu::avx2_unchecked`, whose caller promises the feature"

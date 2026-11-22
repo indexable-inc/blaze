@@ -245,17 +245,24 @@ fn carries<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, role: Rol
 }
 
 /// The `#[link_name]` written on the lowered item `text`, when it names a symbol other than
-/// `name`: such a declaration is not bound by name here.
-fn renamed<'n, S: NamesSource<'n>>(names: S, krate: usize, text: &str, name: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
+/// `name`: such a declaration is not bound by name here. `lib` is the key holding the item's
+/// value rows (links.rs `values_key`): a value written as a macro call is the names' row of it
+/// (links.rs `symbol_of`).
+fn renamed<'n, S: NamesSource<'n>>(names: S, krate: usize, lib: LibKey, text: &str, name: &str, alloc: Alloc<'_>) -> Result<bool, ()> {
     if !text.contains("link_name") {
         return Ok(false);
     }
     let atoms = names.cfg_atoms(krate).ok_or(())?;
-    let sig = blaze_lower::lower_signature(text, names.edition_of(krate).ok_or(())?, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
+    let edition = names.edition_of(krate).ok_or(())?;
+    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| ())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| ())? {
         let a = v.attr(n).map_err(|_| ())?;
-        if v.text_at(a.path).map_err(|_| ())?.trim() == "link_name" && crate::front::unquote(v.text_at(a.args).map_err(|_| ())?) != name {
+        // The value cooked as the native image reads it (links.rs `symbol_of`: a value written
+        // as a macro call is the names' row of the item, as the link table's).
+        if v.text_at(a.path).map_err(|_| ())?.trim() == "link_name"
+            && super::links::symbol_of(v.text_at(a.args).map_err(|_| ())?, Some(lib), |item| names.attr_value(item, "link_name"), edition, alloc).map_err(|_| ())? != name
+        {
             return Ok(true);
         }
     }
@@ -289,28 +296,6 @@ fn marked_runtime<'n, S: NamesSource<'n>>(names: S, krate: usize, alloc: Alloc<'
     let text = names.file_text(krate, 0)?;
     let edition = names.edition_of(krate)?;
     Some(runtime_attr(text, &blaze_file_items::outline(text, edition, alloc)))
-}
-
-/// The module segment of a panic runtime entry's row. Use the definition's own
-/// module so the path and key identify the same provider in either front end.
-pub(crate) fn runtime_definition_module<'n, S: NamesSource<'n>>(
-    names: S, lib: LibKey, name: &str, alloc: Alloc<'_>,
-) -> Result<Option<&'n str>, InternalRefused> {
-    if !is_runtime_name(name) {
-        return Ok(None);
-    }
-    let krate = names.crate_of(lib).ok_or_else(|| InternalRefused::Unplaced { name: name.into() })?;
-    let unread = || InternalRefused::Unread { name: name.into(), krate };
-    let root = names.root_module(krate).and_then(|module| names.module_path(module)).ok_or_else(unread)?;
-    if !matches!(root, PANIC_ABORT_CRATE | PANIC_UNWIND_CRATE)
-        || names.proc_macro(krate).ok_or_else(unread)?
-        || !marked_runtime(names, krate, alloc).ok_or_else(unread)?
-        || !candidate(names, krate, lib, name, alloc)?
-    {
-        return Ok(None);
-    }
-    let module = names.home_of(lib).and_then(|home| names.module_path(home)).ok_or_else(unread)?;
-    Ok(Some(module))
 }
 
 /// The definition a call of the std-internal declaration named `name` runs, under the
@@ -467,7 +452,7 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'n>, key: ItemKe
     if abi != "Rust" {
         return Err(InternalRefused::NotInRustBlock { name: Box::from(name) });
     }
-    if renamed(names, krate, h.text, name, alloc).map_err(|()| attrs())? {
+    if renamed(names, krate, super::links::values_key(names, store, h.lib), h.text, name, alloc).map_err(|()| attrs())? {
         return Ok(None);
     }
     Ok(Some(Declared { lib: h.lib, name }))

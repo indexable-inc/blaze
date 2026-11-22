@@ -114,6 +114,9 @@ pub struct Bin<'a> {
     pub name: Text<'a>,
     /// Relative to the package's directory.
     pub root: Text<'a>,
+    /// `required-features`, sorted: a root's binary whose features are not all on is no unit
+    /// (resolve.rs `required_on`).
+    pub required_features: AVec<'a, Text<'a>>,
 }
 
 /// What the rules read of one package.
@@ -151,7 +154,14 @@ impl<'a> Package<'a> {
         let lib = member.lib.as_ref().map(|lib| Lib { crate_name: own(&lib.name), root: relative(&lib.root), proc_macro: lib.proc_macro });
         let mut bins = Vec::with_capacity_in(member.bins.len(), alloc);
         for bin in member.bins.iter() {
-            bins.push(Bin { name: own(&bin.name), root: relative(&bin.root) });
+            let mut required_features = Vec::with_capacity_in(bin.required_features.len(), alloc);
+            for feature in bin.required_features.iter() {
+                required_features.push(own(feature));
+            }
+            // Sorted at the boundary, as an extra's are: the written order means nothing.
+            required_features.sort_by(|a: &Text<'a>, b: &Text<'a>| a.as_str().cmp(b.as_str()));
+            required_features.dedup();
+            bins.push(Bin { name: own(&bin.name), root: relative(&bin.root), required_features });
         }
         // The layout keeps every such root under the package's directory, so `relative` never
         // leaves one anchor-relative here (a unit's root holds nothing of the checkout).

@@ -147,6 +147,9 @@ impl Tag {
     }
 }
 
+// The meter counts frames by a tag's index: every tag has its cell (blaze-meter `TAGS`).
+const _: () = assert!(Tag::COUNT <= blaze_meter::TAGS, "raise blaze-meter's TAGS");
+
 const _: () = {
     let mut i = 0;
     while i < Tag::COUNT {
@@ -543,6 +546,8 @@ pub fn task_ended(tag: Tag, peak: usize, copied: Copied) {
             it.set(Copied { copies: was.copies + copied.copies, bytes: was.bytes + copied.bytes });
         });
     }
+    // The thread's meter (D169): a task's frame reset, and the most it held, by its tag.
+    blaze_meter::frame_reset(tag.index(), as_u64(peak));
     if peak == 0 {
         return;
     }
@@ -559,6 +564,8 @@ pub fn task_ended(tag: Tag, peak: usize, copied: Copied) {
 const FREES_FOLD_AT: usize = 256 << 10;
 
 pub(crate) fn committed(bytes: usize) {
+    // The thread's meter (D169): pages committed on the thread that asked for them.
+    blaze_meter::add(blaze_meter::Count::Mapped, as_u64(bytes));
     let now = COMMITTED.now.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
     raise(&COMMITTED.high_water, now);
 }

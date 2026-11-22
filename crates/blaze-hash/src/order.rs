@@ -29,16 +29,11 @@
 //! insert appends; iteration is a walk of a vector. [`OrderMap::with_capacity_in`] makes two
 //! allocations (the entries, the table) and none after while the map stays within it.
 
-use core::{
-    alloc::Allocator,
-    fmt,
-    hash::{BuildHasher, Hash},
-    ops::Index,
-};
+use core::{alloc::Allocator, fmt, ops::Index};
 
 use blaze_own::Vec;
 
-use crate::{Equivalent, raw::RawTable};
+use crate::{Equivalent, KeyHash, raw::RawTable};
 
 /// One entry: the key's hash, kept so that the table is rebuilt and searched without the key.
 struct Slot<K, V> {
@@ -125,7 +120,7 @@ impl<K, V, S: Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
+impl<K: Eq, V, S: KeyHash<K> + Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
     /// The map of `iter`'s pairs in `alloc` on `S::default()`, in `iter`'s order; a key given
     /// twice keeps its first place and its last value.
     ///
@@ -315,11 +310,17 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// Where `key` is, and its hash.
+impl<K: Eq, V, S: KeyHash<K>, A: Allocator + Clone> OrderMap<K, V, S, A> {
+    /// Where `key` is, and its hash: by the one seam every table hashes at ([`KeyHash`]), so a
+    /// `PlainKey` on `FixedState` is hashed by its bytes and a `DigestKey` on `DigestState` is
+    /// its word, as in [`HashMap`](crate::HashMap).
     #[inline]
-    fn find<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> (u64, Option<usize>) {
-        let hash = self.hasher.hash_one(key);
+    fn find<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> (u64, Option<usize>)
+    where
+        S: KeyHash<Q>,
+    {
+        // Named, as `S` is `KeyHash` of both `K` and `Q` here.
+        let hash = <S as KeyHash<Q>>::hash_key(&self.hasher, key);
         let entries = &self.entries;
         let slot = self.table.find(hash, |&at| key.equivalent(&entries[at as usize].key));
         (hash, slot.map(|slot| *self.table.get(slot) as usize))
@@ -362,18 +363,27 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     }
 
     #[inline]
-    pub fn get<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<&V> {
+    pub fn get<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1.map(|at| &self.entries[at].value)
     }
 
     #[inline]
-    pub fn get_mut<Q: Hash + Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<&mut V> {
+    pub fn get_mut<Q: Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1.map(|at| &mut self.entries[at].value)
     }
 
     /// The entry of `key` with its index.
     #[inline]
-    pub fn get_full<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<(usize, &K, &V)> {
+    pub fn get_full<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<(usize, &K, &V)>
+    where
+        S: KeyHash<Q>,
+    {
         let at = self.find(key).1?;
         let entry = &self.entries[at];
         Some((at, &entry.key, &entry.value))
@@ -381,24 +391,36 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
 
     /// The index of `key` in insertion order.
     #[inline]
-    pub fn get_index_of<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<usize> {
+    pub fn get_index_of<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<usize>
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1
     }
 
     #[inline]
-    pub fn contains_key<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> bool {
+    pub fn contains_key<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1.is_some()
     }
 
     /// Removes `key` as [`OrderMap::swap_remove_index`] does: O(1), the last entry takes its
     /// place.
-    pub fn swap_remove<Q: Hash + Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V> {
+    pub fn swap_remove<Q: Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        S: KeyHash<Q>,
+    {
         let at = self.find(key).1?;
         self.swap_remove_index(at).map(|(_, value)| value)
     }
 
     /// Removes `key` as [`OrderMap::shift_remove_index`] does: O(n), the order is kept.
-    pub fn shift_remove<Q: Hash + Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V> {
+    pub fn shift_remove<Q: Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        S: KeyHash<Q>,
+    {
         let at = self.find(key).1?;
         self.shift_remove_index(at).map(|(_, value)| value)
     }
@@ -529,7 +551,7 @@ impl<'a, K, V, S, A: Allocator + Clone> IntoIterator for &'a mut OrderMap<K, V, 
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> Extend<(K, V)>
+impl<K: Eq, V, S: KeyHash<K>, A: Allocator + Clone> Extend<(K, V)>
     for OrderMap<K, V, S, A>
 {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
@@ -639,7 +661,7 @@ impl<T, S: Default, A: Allocator + Clone> OrderSet<T, S, A> {
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Clone> OrderSet<T, S, A> {
+impl<T: Eq, S: KeyHash<T> + Default, A: Allocator + Clone> OrderSet<T, S, A> {
     /// The set of `iter`'s values in `alloc` on `S::default()`, each at the place it first came.
     ///
     /// D126: goes at the sweep; write `OrderSet::new(OrderSetOpts { hasher, alloc, capacity })`,
@@ -751,7 +773,7 @@ impl<'a, T, S, A: Allocator + Clone> IntoIterator for &'a OrderSet<T, S, A> {
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> OrderSet<T, S, A> {
+impl<T: Eq, S: KeyHash<T>, A: Allocator + Clone> OrderSet<T, S, A> {
     /// Adds `value` at the end if it is not held: whether it was added.
     #[inline]
     pub fn insert(&mut self, value: T) -> bool {
@@ -765,29 +787,44 @@ impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> OrderSet<T, S, A> {
     }
 
     #[inline]
-    pub fn contains<Q: Hash + Equivalent<T> + ?Sized>(&self, value: &Q) -> bool {
+    pub fn contains<Q: Equivalent<T> + ?Sized>(&self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.contains_key(value)
     }
 
     /// The value held that equals `value`.
     #[inline]
-    pub fn get<Q: Hash + Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<&T> {
+    pub fn get<Q: Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<&T>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.get_full(value).map(|(_, it, ())| it)
     }
 
     /// The index of `value` in insertion order.
     #[inline]
-    pub fn get_index_of<Q: Hash + Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<usize> {
+    pub fn get_index_of<Q: Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<usize>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.get_index_of(value)
     }
 
     /// Removes `value` as [`OrderMap::swap_remove`] does: whether it was held.
-    pub fn swap_remove<Q: Hash + Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool {
+    pub fn swap_remove<Q: Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.swap_remove(value).is_some()
     }
 
     /// Removes `value` as [`OrderMap::shift_remove`] does: whether it was held.
-    pub fn shift_remove<Q: Hash + Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool {
+    pub fn shift_remove<Q: Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.shift_remove(value).is_some()
     }
 
@@ -829,7 +866,7 @@ impl<T, S, A: Allocator + Clone> IntoIterator for OrderSet<T, S, A> {
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> Extend<T> for OrderSet<T, S, A> {
+impl<T: Eq, S: KeyHash<T>, A: Allocator + Clone> Extend<T> for OrderSet<T, S, A> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         let iter = iter.into_iter();
         self.reserve(iter.size_hint().0);

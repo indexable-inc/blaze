@@ -18,10 +18,10 @@ use std::vec;
 use std::vec::Vec;
 
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{ExprId, ItemKey, Mutbl, Name, PNode, PatId};
+use blaze_typeck::{ExprId, ItemKey, Mutbl, Name, PNode, PTy, PatId};
 
-use crate::tests::findings_with;
-use crate::{AdtFacts, CalleeFacts, Facts, FieldLead, Form, Plant};
+use crate::region_fixture::{Decls, FnHead, findings};
+use crate::{AdtFacts, CalleeFacts, Facts, FieldLead, Form, Plant, Region};
 
 /// The world's ADTs as the census reads them: each enum's variants with each field's lead;
 /// every other ADT a plain struct with no `Copy` and no `Drop`. `leads` false: no field's
@@ -38,6 +38,61 @@ impl Peel {
 }
 
 impl Facts for Peel {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         let is_enum = self.enums.iter().any(|(e, _)| *e == k);
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum, is_box: false })
@@ -74,6 +129,8 @@ impl Facts for Peel {
 struct World {
     fx: Fx,
     facts: Peel,
+    /// Every fn's region head, laid in the checked record's own table.
+    decls: Decls,
     /// `fn f(o: Option<&E>)`.
     opt_ref: ItemKey,
     /// `fn f(t: (&u8, &E))`.
@@ -101,10 +158,10 @@ fn world() -> World {
     let unit = fx.unit();
     let boolean = fx.ty(PNode::Bool);
     let rs = fx.r(Mutbl::Not, st);
-    let _ = fx.func("g", 0, &[rs], unit, vec![]);
-    let _ = fx.func("h", 0, &[st], unit, vec![]);
-    let _ = fx.func("p", 0, &[rs], boolean, vec![]);
-    let _ = fx.func("take", 0, &[wt], unit, vec![]);
+    let g = fx.func("g", 0, &[rs], unit, vec![]);
+    let h = fx.func("h", 0, &[st], unit, vec![]);
+    let p = fx.func("p", 0, &[rs], boolean, vec![]);
+    let take = fx.func("take", 0, &[wt], unit, vec![]);
     let re = fx.r(Mutbl::Not, et);
     let opt_re = fx.adt(option, &[re]);
     let opt_ref = fx.func("opt_ref", 0, &[opt_re], unit, vec![]);
@@ -123,6 +180,29 @@ fn world() -> World {
     let double = fx.func("double", 0, &[opt_r_opt_re], unit, vec![]);
     let wrap = fx.func("wrap", 0, &[wt], unit, vec![]);
     fx.finish();
+    // Every head as declared above: each reference its own elided, late-bound lifetime,
+    // numbered in order of appearance; no output borrows; no ADT declares a lifetime.
+    let (p0, p1) = (Region::Param(0), Region::Param(1));
+    let mut decls = Decls::new();
+    let mut head = |item: ItemKey, inputs: &[PTy], output: PTy, slots: &[Region]| {
+        let lifetimes = slots.len() as u32;
+        let late: vec::Vec<u32> = (0..lifetimes).collect();
+        decls.func(item, FnHead { lifetimes, late: &late, outlives: &[], inputs, output, slots });
+    };
+    // `fn g(_: &S)`, `fn h(_: S)`, `fn p(_: &S) -> bool`, `fn take(_: Wrapper)`.
+    head(g, &[rs], unit, &[p0]);
+    head(h, &[st], unit, &[]);
+    head(p, &[rs], boolean, &[p0]);
+    head(take, &[wt], unit, &[]);
+    // `fn opt_ref(o: Option<&E>)`, `fn pair(t: (&u8, &E))`, `fn wrap_ref(w: &Wrapper)`.
+    head(opt_ref, &[opt_re], unit, &[p0]);
+    head(pair, &[pair_ty], unit, &[p0, p1]);
+    head(wrap_ref, &[rw], unit, &[p0]);
+    // `fn mut_under_shared(o: &Option<&mut E>)`, `fn double(o: Option<&Option<&E>>)`,
+    // `fn wrap(w: Wrapper)`.
+    head(mut_under_shared, &[r_opt_rme], unit, &[p0, p1]);
+    head(double, &[opt_r_opt_re], unit, &[p0, p1]);
+    head(wrap, &[wt], unit, &[]);
     let facts = Peel {
         enums: vec![
             (option, vec![vec![], vec![FieldLead::Param(0)]]),
@@ -131,7 +211,7 @@ fn world() -> World {
         ],
         leads: true,
     };
-    World { fx, facts, opt_ref, pair, wrap_ref, mut_under_shared, double, wrap }
+    World { fx, facts, decls, opt_ref, pair, wrap_ref, mut_under_shared, double, wrap }
 }
 
 /// `name(local)`.
@@ -161,7 +241,7 @@ fn ev(b: &mut Bb, inner: PatId) -> PatId {
 
 /// The findings of `root` under `facts`, printed; a refusal fails the test by name.
 fn lowered(w: &World, b: &Bb, owner: ItemKey, root: ExprId, facts: &Peel, plant: Plant, case: &str) -> Vec<std::string::String> {
-    match findings_with(&w.fx, b, owner, root, facts, plant) {
+    match findings(&w.fx, b, owner, root, facts, &w.decls, plant) {
         Ok(got) => {
             std::println!("{case}: {got:?}");
             got
@@ -186,7 +266,7 @@ fn a_variant_under_option_of_a_reference_peels() {
     let got = lowered(&w, &b, w.opt_ref, root, &w.facts, Plant::None, "option of a reference");
     assert!(got.is_empty(), "{got:?}");
     let blind = Peel { enums: w.facts.enums.clone(), leads: false };
-    let control = findings_with(&w.fx, &b, w.opt_ref, root, &blind, Plant::None);
+    let control = findings(&w.fx, &b, w.opt_ref, root, &blind, &w.decls, Plant::None);
     std::println!("option of a reference, no leads: {control:?}");
     assert!(matches!(control, Err(ref r) if r.form == Form::PeelUnderAdtField), "{control:?}");
 }

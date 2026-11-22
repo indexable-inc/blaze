@@ -15,7 +15,7 @@
 
 use super::*;
 
-use super::engine_check_tests::{entries, said, why};
+use super::engine_check_tests::{entries, engine_opts, opts};
 use blaze_engine::Stage;
 
 /// What one request listed, printed (its closing line dropped) and counted.
@@ -27,8 +27,52 @@ pub(super) struct Answer {
 
 /// One `engine-check` request on 2 workers, from the stored answer unless `fresh`.
 pub(super) fn request(io: &Io, fresh: bool) -> Answer {
-    let (ids, lines, checked) = said(io, fresh);
+    let before = stdout(io).len();
+    let (ids, checked) = engine_opts(io, lang_opts(io, fresh));
+    let text = stdout(io).split_off(before);
+    let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+    lines.pop();
     Answer { ids, lines, checked }
+}
+
+/// One engine-check request with a head read plant, for a row's causal control: on the same
+/// lang-item shelf as [`request`], so the control differs from its row by the plant alone.
+fn request_with_head_plant(io: &Io, fresh: bool, plant: crate::engine_heads::ListingsPlant) -> Answer {
+    let mut options = lang_opts(io, fresh);
+    options.head_jobs.listings = plant;
+    let before = stdout(io).len();
+    let (ids, checked) = super::engine_check_tests::engine_opts(io, options);
+    let text = stdout(io).split_off(before);
+    let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+    lines.pop();
+    Answer { ids, lines, checked }
+}
+
+/// The edit-rows fixture's toolchain, with the lang items needed to check borrows of its ADTs.
+fn lang_opts(io: &Io, fresh: bool) -> engine_check::Opts<'static> {
+    let mut options = opts(io, 2, fresh);
+    let (id, files) = blaze_world::fixture::shelf_with_langs(graph::TRIPLE, blaze_world::fixture::STD, SHELF_CFG, options.heap.alloc());
+    for (name, bytes) in files {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("fixture shelf write context");
+        let path = Path::new(&format!("h/{}/{name}", toolchain::SHELF)).expect("fixture shelf path");
+        io.need_fs().expect("files").root().publish(&cx, &path, Content::bytes(&bytes), Durable::No).expect("write fixture shelf");
+    }
+    options.toolchain = id;
+    options
+}
+
+/// `blaze why <target>` using the same lang-item shelf as [`request`].
+pub(super) fn why(io: &Io, target: &str) -> std::string::String {
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("open checkout")).expect("open checkout");
+    let out = io.need_out().expect("out");
+    let err = io.need_err().expect("err");
+    let mut phases = Phases::new(io.need_clock().expect("clock"));
+    let before = stdout(io).len();
+    if let Err(error) = crate::engine_why::explain(&cx, io, &root, &lang_opts(io, false), target, &mut phases, &out, &err) {
+        panic!("why {target} answers: {error:?}");
+    }
+    stdout(io).split_off(before)
 }
 
 /// The tasks of `stage` entered by one request.
@@ -448,7 +492,9 @@ fn r5_a_literal_edited_enters_its_body_alone() {
     assert_eq!(base, Seen::Last, "R5: the edited body `base` was entered");
     // K1 kept RX5's one head. CX17 drops it because the literal contributes only to the
     // value of `base`. Its return type is still the declared `u32`.
-    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "R5: 1 outline, 0 names, 0 heads, 1 body: {FLOOR}");
+    // D191: every unit that holds a body checks it, so the one body is 2 rows, `a`'s library's
+    // and its test build's (the floor in rows is the body's holders).
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 2), "R5: 1 outline, 0 names, 0 heads, 1 body in its 2 units' rows (D191): {FLOOR}");
 }
 
 fn head_body_world(text: &str) -> Io {
@@ -466,7 +512,8 @@ fn only_fn_body_enters(label: &str, before: &str, after: &str) {
     let now = request(&io, false);
     let row = settle(&head_body_world(after), label, &now, Oracle::Equal);
     assert!(now.checked.from_last, "{label}: the edit used the stored answer");
-    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "{label}: {}", entries(&now.checked));
+    // The one body's 2 rows (D191: the library's and its test build's).
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 2), "{label}: 1 body in its 2 units' rows (D191): {}", entries(&now.checked));
     assert_eq!(now.checked.seeds.bodies.refused, 0, "{label}: the body must import its frozen head");
     for answer in [&first, &now] {
         assert!(findings(&answer.lines).all(|line| !line.contains("error[")), "{label}: {:?}", answer.lines);
@@ -520,7 +567,7 @@ fn r5_a_refused_async_method_uses_its_signature_range() {
     let now = request(&io, false);
     let fresh = head_body_world(AFTER);
     let row = settle(&fresh, "R5 refused async method", &now, Oracle::Equal);
-    assert_eq!((row.heads, row.bodies), (0, 1));
+    assert_eq!((row.heads, row.bodies), (0, 2), "the trait's default body in its 2 units' rows (D191: the library's and its test build's)");
     let (_, after) = super::engine_heads_once_tests::frozen_runs(&fresh, name);
     assert_eq!(before, after, "a signature refusal must have the same bytes in a fresh world");
 }
@@ -548,9 +595,19 @@ fn r5_a_block_impl_reaches_its_caller_through_names() {
     let now = request(&io, false);
     let row = settle(&head_body_world(AFTER), "R5 first block impl", &now, Oracle::Equal);
     assert!(now.checked.from_last && row.names > 0);
+    assert!(row.heads > 0, "the covering head task reruns to freeze the new block impl");
     assert!(now.checked.because.iter().any(|(group, _)| group.stage == Stage::Heads && group.cause == "read moved" && group.definer.is_some_and(|n| n.kind == blaze_drive::Kind::CrateScope)));
     assert!(findings(&now.lines).all(|line| !line.contains("error[")), "the block's impl supplies S::value: {:?}", now.lines);
     assert_eq!(now.checked.seeds.bodies.refused, 0, "the caller can read the new method's frozen head");
+
+    // CONTROL: dropping the covering function's own names read leaves its head task standing,
+    // so the first block impl is absent and the warm answer diverges from a fresh request.
+    let planted = head_body_world(BEFORE);
+    let _ = request_with_head_plant(&planted, false, crate::engine_heads::ListingsPlant::DropOwnNames);
+    write(&planted, "src/lib.rs", AFTER);
+    let stale = request_with_head_plant(&planted, false, crate::engine_heads::ListingsPlant::DropOwnNames);
+    let fresh = request(&head_body_world(AFTER), true);
+    assert!(!same_answer(&stale, &fresh), "the planted edit path must expose a missing block-impl head");
 }
 
 /// R6, A PRIVATE FN ADDED TO `a` (row "A private fn added": 1 names group, 1 head, 1 body): its
@@ -573,7 +630,9 @@ fn r6_a_private_fn_added_enters_its_head_and_body() {
     // identical), 3 heads (2 by a `CrateScope` read, 1 new), and 6 names tasks (4 by
     // `CrateScope`, 2 by `FileItems`).
     assert_eq!((from_base, total, existing), (Seen::Earlier, Seen::Earlier, 2), "R6: floor no existing body of a, b or c entered: {PINNED}");
-    assert_eq!((row.outlines, row.heads, row.bodies), (1, 3, 3), "R6: floor 1 outline, 1 head, 1 body: {PINNED}");
+    // D191: the new body is 2 rows (`a`'s library's and its test build's): the floor in rows is
+    // (1, 1, 2), and today's 3 bodies are 4 rows.
+    assert_eq!((row.outlines, row.heads, row.bodies), (1, 3, 4), "R6: floor 1 outline, 1 head, 1 body (its 2 units' rows, D191): {PINNED}");
     assert_eq!(row.names, 6, "R6: floor at most `a`'s two units' names (1 names group a unit): {PINNED}");
 }
 
@@ -597,8 +656,12 @@ fn r7_a_parameter_type_changed_enters_its_callers() {
     assert_eq!((twice, doubled), (Seen::Last, Seen::Last), "R7: the edited fn and its caller in `b` were entered (the answer is a fresh world's)");
     assert_ne!(test, Seen::Earlier, "R7: `a`'s test calling `twice`, a task, was entered");
     assert_eq!((from_base, total, one), (Seen::Earlier, Seen::Earlier, Seen::Earlier), "R7: no body that does not call `twice` entered: {FLOOR}");
-    let callers = 2 + u32::from(test == Seen::Last);
-    assert_eq!((row.heads, row.bodies), (1, callers), "R7: 1 head (`twice`'s) and its body and its callers' bodies: {FLOOR}");
+    // D191: "Every unit that holds a body checks it; the first holder in rank keeps the body's
+    // plain name (the base), each other holder's row is the name at its view". `twice` and
+    // `b::doubled` are held by their library and its test build: 2 rows each. The test body is
+    // `#[cfg(test)]`: no library row (engine_plan_cfg.rs), 1 row.
+    let callers = 4 + u32::from(test == Seen::Last);
+    assert_eq!((row.heads, row.bodies), (1, callers), "R7: 1 head (`twice`'s) and its body and its callers' bodies, 2 rows a shared body and 1 for the test's (D191): {FLOOR}");
 }
 
 /// R8, A PUB FN ADDED TO `a` THAT NOTHING USES: its head and its body; no body of `b` or `c`.
@@ -617,7 +680,9 @@ fn r8_an_unused_pub_fn_added_enters_its_head_and_body() {
     // FLOOR: 0 existing bodies, (1 head, 1 body). Today as R6: 2 existing bodies by a
     // `CrateScope` read (identical), 3 heads, 6 names tasks.
     assert_eq!((doubled, total, existing), (Seen::Earlier, Seen::Earlier, 2), "R8: floor no existing body entered: {PINNED}");
-    assert_eq!((row.heads, row.bodies), (3, 3), "R8: floor its head and its body (1, 1): {PINNED}");
+    // D191: the new body is 2 rows (`a`'s library's and its test build's): the floor in rows is
+    // (1, 2), and today's 3 bodies are 4 rows.
+    assert_eq!((row.heads, row.bodies), (3, 4), "R8: floor its head and its body (1, 1; its body's 2 units' rows, D191): {PINNED}");
 }
 
 /// R9, A GENERIC FN'S BODY EDITED (row "A generic fn's body edited": at check time no caller is
@@ -636,7 +701,7 @@ fn r9_a_generic_body_edited_enters_that_body_alone() {
     assert_eq!((first, same), (Seen::Earlier, Seen::Earlier), "R9: no caller of the generic fn checked again: {FLOOR}");
     // K1 kept RX5's one head. CX17 drops it because the local binding leaves `pick<T>(T) -> T`
     // and the heads visible to its callers unchanged.
-    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "R9: 1 outline, 0 names, 0 heads, the generic body alone: {FLOOR}");
+    assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 2), "R9: 1 outline, 0 names, 0 heads, the generic body alone in its 2 units' rows (D191): {FLOOR}");
 }
 
 /// R10, A STRUCT'S PRIVATE FIELD ADDED IN `a`, THE STRUCT ONLY NAMED IN `b` (plan row A5 "head
@@ -657,7 +722,9 @@ fn r10_a_private_field_added_enters_no_body_that_names_the_type() {
     // Today `holds` is entered by `Marker`'s `Signature` cell, 2 more bodies by a `CrateScope`
     // read, and 3 heads (`Marker`'s by its key, 2 by `FileItems`).
     assert_eq!((holds, area_of, unit), (Seen::Last, Seen::Earlier, Seen::Earlier), "R10: floor no body that only names `Marker` entered (plan row A5): {PINNED}");
-    assert_eq!((row.heads, row.bodies), (3, 3), "R10: floor `Marker`'s head alone, 0 bodies (plan row A5): {PINNED}");
+    // D191: today's bodies are counted in rows, a body `a`'s or `b`'s library and its test build
+    // both hold being 2: 3 rows before D191, 4 now.
+    assert_eq!((row.heads, row.bodies), (2, 4), "R10: floor `Marker`'s head alone, 0 bodies (plan row A5); bodies in rows (D191): {PINNED}");
 }
 
 /// R11, AN IMPL OF A TRAIT ADDED IN `b` FOR A NEW TYPE (plan row D3: "an unrelated impl enters
@@ -680,7 +747,9 @@ fn r11_an_unrelated_impl_added_enters_no_existing_body() {
     // for Boxed` and entered its readers too, `c::measured` among them: 4 existing, 5 in all.)
     assert_eq!((measured, area_of), (Seen::Earlier, Seen::Earlier), "R11: floor no existing body that asks a trait question entered (plan row D3): {PINNED}");
     assert_eq!(existing, 2, "R11: floor 0 existing bodies entered (plan row D3): {PINNED}");
-    assert_eq!(row.bodies, 3, "R11: floor at most the new impl's one method body: {PINNED}");
+    // D191: the new method's body is 2 rows (`b`'s library's and its test build's): 2 existing
+    // and 2 new rows.
+    assert_eq!(row.bodies, 4, "R11: floor at most the new impl's one method body (its 2 units' rows, D191): {PINNED}");
 }
 
 /// R12, X1 "A BRANCH SWITCHED AWAY AND BACK": R5's edit, a request, then the original bytes
@@ -698,8 +767,9 @@ fn r12_switched_away_and_back_makes_no_record() {
     let (entered_back, puts_back) = (back.checked.entered, back.checked.puts);
     println!("row R12: back: entered {entered_back}, records made (put) {puts_back}, records lines {:?}", back.checked.records.lines);
     let _ = settle(&io, "R12 X1 switched away and back", &back, Oracle::Equal);
-    // As in R5, the outline and body enter. Only the outline contributes a put
-    // (engine_check.rs, the phase's record loop has no stored record for Stage::Bodies).
+    // As in R5, the outline and body enter. Only the outline contributes a put: the body's facts
+    // record (engine_body_facts.rs) is identical to the stored one, found by its key, and the
+    // Bodies arm of engine_check.rs's record loop does not put a record the store holds.
     assert_eq!(puts_back, 1, "R12 (X1): floor back on the original bytes, every record is found by its key: 0 made ({entered_back} entered): {PINNED}");
 }
 
@@ -720,6 +790,80 @@ fn r13_a_test_body_edited_enters_that_body_alone() {
     // K1 kept RX5's one head. CX17 drops it because adding zero inside the test changes
     // neither its signature nor the items it declares.
     assert_eq!((row.outlines, row.names, row.heads, row.bodies), (1, 0, 0, 1), "R13: 1 outline, 0 names, 0 heads, the test's body alone: {FLOOR}");
+}
+
+#[test]
+fn identical_bytes_moved_between_module_forms_equal_fresh() {
+    use super::engine_heads_once_tests::frozen_runs;
+    use crate::store::Store as _;
+    use blaze_drive::{Kind, Name};
+
+    const FLAT: &str = "a/src/storage.rs";
+    const DIR: &str = "a/src/storage/mod.rs";
+    const SOURCE: &str = "pub fn value() -> u8 { 7 }\n";
+    let workspace = |path: &str| {
+        let io = Io::simulated(SimWorld::new(17, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", A_MANIFEST);
+        write(&io, "b/Cargo.toml", B_MANIFEST);
+        write(&io, "a/src/lib.rs", "pub mod storage;\n");
+        write(&io, "b/src/lib.rs", "pub fn caller() -> u8 { a::storage::value() }\n");
+        write(&io, path, SOURCE);
+        io
+    };
+    let outline = blaze_file_items::outline(SOURCE, blaze_surface::Edition::E2024, blaze_own::testing::heap().alloc());
+    let signature = |path| crate::signature::signature_name(crate::signature::file_subject(path), &outline, &outline.items()[0], SOURCE);
+    assert_ne!(signature(FLAT), signature(DIR));
+
+    // Read the signature part out of the current logical slot's actual stored outline.
+    let stored_signature = |io: &Io| super::engine_answer_rows_tests::with_store(io, |cx, store, opts, _| {
+        let root = crate::engine_answer::root_name(opts.place.checkout, cx.frame());
+        let pointer = crate::engine_answer::load_pointer(cx, store, &root).expect("open pointer").expect("stored answer").expect("read pointer");
+        let (kept, _) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("open pages").expect("read rows");
+        let slot = Name::file(FLAT.as_bytes());
+        let key = kept.records[&slot];
+        let held = store.get(cx, key).expect("open outline").expect("the slot has a record");
+        let record = crate::engine_store::outline_from(slot, key, held.bytes, opts.heap.shared()).expect("decode storage's outline");
+        let mut heads = record.parts.iter().filter(|part| part.name.kind == Kind::Signature);
+        let name = heads.next().expect("value has a signature").name;
+        assert!(heads.next().is_none(), "value is the only entry in the module");
+        name
+    });
+    let io = workspace(FLAT);
+    let first = cold(&io, "module form move");
+    assert_eq!(first.checked.bodies.1, 2, "value and caller check clean");
+    assert_eq!(first.checked.seeds.bodies.refused, 0);
+    assert_eq!(stored_signature(&io), signature(FLAT));
+
+    for (from, to) in [(FLAT, DIR), (DIR, FLAT)] {
+        remove(&io, from);
+        write(&io, to, SOURCE);
+        let warm = request(&io, false);
+        let fresh_io = workspace(to);
+        let fresh = request(&fresh_io, false);
+        assert!(warm.checked.from_last && !warm.checked.certified, "the move reopens the previous answer");
+        assert!(same_answer(&warm, &fresh), "move to {to}: {}", Difference { now: &warm, fresh: &fresh });
+        assert_eq!(fresh.checked.bodies.1, 2, "value and caller check clean at {to}");
+        for (answer, world) in [(&warm, &io), (&fresh, &fresh_io)] {
+            assert_eq!(answer.checked.seeds.bodies.refused, 0, "{to}: {:?}", answer.lines);
+            assert_eq!(stored_signature(world), signature(to), "the restored outline must name value's physical file");
+            let (missing, defined) = super::engine_check_tests::head_reads_of_bodies(world);
+            assert!(missing.is_empty() && defined >= 3, "the two bodies' own heads and caller's read of value at {to}: {missing:?}, {defined} defined");
+        }
+        assert_eq!(frozen_runs(&io, signature(to)).1, frozen_runs(&fresh_io, signature(to)).1, "{to}: stored per-unit head bytes");
+    }
+
+    crate::engine_check::with_text_only_outlines(|| {
+        let io = workspace(FLAT);
+        let _ = cold(&io, "text-only outline");
+        remove(&io, FLAT);
+        write(&io, DIR, SOURCE);
+        let stale = request(&io, false);
+        assert!(stale.checked.from_last && !stale.checked.certified);
+        assert_eq!(stale.checked.files.outlined, 0, "the text-only key lets the flat outline stand after the move");
+        assert_eq!(stored_signature(&io), signature(FLAT), "the planted source restores the old signature part");
+    });
+    println!("flat → directory → flat: warm equals fresh; all head reads defined");
 }
 
 /// R14, A FILE MOVED: `c/src/use_b.rs` renamed `counting.rs`, its `mod` line changed to match.
@@ -768,4 +912,141 @@ fn edit_rows_fixture_edits_differ() {
     assert_ne!(B_WRAP, B_WRAP_IMPL);
     assert_ne!(C_LIB, C_LIB_MOVED);
     assert_ne!(C_MANIFEST, C_MANIFEST_REFORMATTED);
+}
+
+/// The persisted caller row. Every observation must agree with its own world's committed cell.
+fn directory_caller_row(io: &Io, caller: blaze_drive::Name) -> blaze_engine::Row<'static> {
+    super::engine_answer_rows_tests::with_store(io, |cx, store, opts, _| {
+        let root = crate::engine_answer::root_name(opts.place.checkout, cx.frame());
+        let pointer = crate::engine_answer::load_pointer(cx, store, &root).expect("open pointer").expect("stored answer").expect("read pointer");
+        let (mut kept, _) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("open answer").expect("read rows");
+        let row = kept.answer.rows.remove(&caller).expect("stored caller");
+        for (id, digest) in &row.reads {
+            assert_eq!(*digest, kept.answer.cell(id), "caller saw {id:?} at {digest:?}");
+            if id.of.kind == blaze_drive::Kind::Signature {
+                let owner = &kept.answer.rows[&id.of];
+                assert!(!owner.failed && owner.defines.contains(&(id.cell, *digest)), "caller saw {id:?} at {digest:?}, head defined {:?}", owner.defines);
+            }
+        }
+        row
+    })
+}
+
+/// Find the frozen signature the caller imported, and verify it also looked up that function.
+fn directory_value_head(io: &Io, value: blaze_drive::Name, caller: &blaze_engine::Row<'_>) -> blaze_engine::CellId {
+    use blaze_drive::cells::Cell;
+    use blaze_engine::CellId;
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::tables::head::FrozenHead;
+    use blaze_scope::names_cells::NameCell;
+
+    let (_, runs) = super::engine_heads_once_tests::frozen_runs(io, value);
+    let mut imported = None;
+    crate::engine_seeds::each_run(&runs, &mut |_, cell, at, len| {
+        let head = CellId { of: value, cell: Cell(cell.try_into().expect("signature cell width")) };
+        if caller.read_of(&head).0.is_some() {
+            assert_ne!(head.cell, crate::engine_tasks::WHOLE, "caller reads value's frozen signature cell");
+            let frozen = FrozenHead::read(&runs[at..at + len]).expect("value's frozen signature");
+            let Want::Fn(key) = frozen.want() else { panic!("value is a function") };
+            let cell = Cell(NameCell::Item { key }.key());
+            assert!(caller.reads.iter().any(|(id, _)| id.of.kind == blaze_drive::Kind::CrateScope && id.cell == cell), "caller looked up value");
+            assert!(imported.replace(head).is_none(), "caller imports value from one unit");
+        }
+    }).expect("value's frozen runs");
+    imported.expect("caller imported value's signature")
+}
+
+/// Independent request histories can have different serials. The caller's result and every
+/// dependency it observed must agree.
+fn assert_fresh_directory_caller(warm: &blaze_engine::Row<'_>, fresh: &blaze_engine::Row<'_>) {
+    assert_eq!((warm.key, warm.phase, warm.file, warm.source), (fresh.key, fresh.phase, fresh.file, fresh.source));
+    assert_eq!((warm.out, &warm.defines, warm.findings, warm.failed, warm.inline), (fresh.out, &fresh.defines, fresh.findings, fresh.failed, fresh.inline));
+    assert_eq!(warm.reads, fresh.reads, "the caller observes the same digest for every read");
+    assert_eq!(warm.by_cell, fresh.by_cell);
+}
+
+/// A tail expression of type `u16` cannot coerce to a declared `u8` return. The caller and
+/// its file stay unchanged throughout the edits. Its only reason to recheck is a read.
+#[test]
+fn directory_module_head_edit_rechecks_dependents() {
+    const STORAGE: &str = "a/src/storage/mod.rs";
+    const A_ROOT: &str = "pub mod storage;\n";
+    const B_ROOT: &str = "pub fn caller() -> u8 {\n    a::storage::value()\n}\n";
+    const VALUE_U8: &str = "pub fn value() -> u8 {\n    1\n}\n";
+    const VALUE_U16: &str = "pub fn value() -> u16 {\n    2\n}\n";
+    const VALUE_U8_BODY: &str = "pub fn value() -> u8 {\n    2\n}\n";
+
+    let make = |value: &str| {
+        let io = Io::simulated(SimWorld::new(113, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", A_MANIFEST);
+        write(&io, "a/src/lib.rs", A_ROOT);
+        write(&io, STORAGE, value);
+        write(&io, "b/Cargo.toml", B_MANIFEST);
+        write(&io, "b/src/lib.rs", B_ROOT);
+        io
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let outline = blaze_file_items::outline(B_ROOT, blaze_surface::Edition::E2024, alloc);
+    let caller = crate::work::body_name(blaze_drive::Name::file(b"b/src/lib.rs"), &outline, &outline.items()[0], B_ROOT);
+    let outline = blaze_file_items::outline(VALUE_U8, blaze_surface::Edition::E2024, alloc);
+    let value = crate::signature::signature_name(crate::signature::file_subject(STORAGE), &outline, &outline.items()[0], VALUE_U8);
+
+    let io = make(VALUE_U8);
+    let first = cold(&io, "directory module head edit");
+    // Rows seeded (D191: `value` and `caller` each checked by its library and its test build).
+    assert_eq!(first.checked.seeds.bodies.seeded, 4, "value and caller, 2 rows each (D191)");
+    assert_eq!(first.checked.seeds.bodies.refused, 0);
+    assert_eq!(first.checked.bodies.1, 2, "value and caller check cleanly");
+    let original = directory_caller_row(&io, caller);
+    let value_head = directory_value_head(&io, value, &original);
+
+    write(&io, STORAGE, VALUE_U8_BODY);
+    let body_edit = request(&io, false);
+    assert!(body_edit.checked.from_last);
+    assert_eq!((entered(&body_edit.checked, Stage::Names), entered(&body_edit.checked, Stage::Heads), entered(&body_edit.checked, Stage::Bodies)), (0, 0, 2), "value's body alone, in its 2 units' rows (D191)");
+    assert_eq!(body_edit.checked.bodies.1, 1);
+    assert_eq!(seen(&io, "directory body edit", "b/src/lib.rs::caller"), Seen::Earlier);
+    let standing = directory_caller_row(&io, caller);
+    assert_eq!(standing, original, "the body-only edit preserves the entire caller row");
+    assert!(findings(&body_edit.lines).all(|line| !line.contains("error[")), "{:?}", body_edit.lines);
+    let fresh_body = make(VALUE_U8_BODY);
+    settle(&fresh_body, "directory body edit", &body_edit, Oracle::Equal);
+    assert_fresh_directory_caller(&standing, &directory_caller_row(&fresh_body, caller));
+    println!("body-only edit: caller stays valid");
+
+    write(&io, STORAGE, VALUE_U16);
+    let edited = request(&io, false);
+    assert!(edited.checked.from_last);
+    assert_eq!(edited.checked.seeds.bodies.refused, 0);
+    assert_eq!(seen(&io, "directory signature edit", "b/src/lib.rs::caller"), Seen::Last);
+    let errors: std::vec::Vec<_> = findings(&edited.lines).filter(|line| line.contains("error[")).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("b/src/lib.rs:2:") && errors[0].contains("error[types]: found `u16`, expected `u8`"), "{errors:?}");
+    let edited_row = directory_caller_row(&io, caller);
+    let observed_type = |row: &blaze_engine::Row<'_>| row.read_of(&value_head).0.expect("caller reads the original signature cell");
+    assert_ne!(observed_type(&edited_row), observed_type(&original), "value's frozen type moved at its original cell");
+    let fresh = make(VALUE_U16);
+    settle(&fresh, "directory signature edit", &edited, Oracle::Equal);
+    assert_fresh_directory_caller(&edited_row, &directory_caller_row(&fresh, caller));
+    println!("signature edit: caller type mismatch; warm equals fresh");
+
+    // Plant a caller that treats every dependency as settled. It drops the very read the
+    // signature edit needs, leaving the original clean answer standing on the wrong type.
+    let planted = make(VALUE_U8_BODY);
+    crate::engine_bodies::PLANT_ALL_DEPENDENCIES_SETTLED.with(|p| {
+        p.set(true);
+        let answer = request(&planted, false);
+        p.set(false);
+        assert_eq!(answer.checked.bodies.1, 2);
+    });
+    assert!(directory_caller_row(&planted, caller).reads.iter().all(|(id, _)| id.of != value));
+    write(&planted, STORAGE, VALUE_U16);
+    let stale = request(&planted, false);
+    assert_eq!(seen(&planted, "planted directory signature edit", "b/src/lib.rs::caller"), Seen::Earlier);
+    assert!(findings(&stale.lines).all(|line| !line.contains("error[")), "{:?}", stale.lines);
+    let fresh = request(&make(VALUE_U16), true);
+    assert!(!same_answer(&stale, &fresh));
+    assert!(findings(&fresh.lines).any(|line| line.contains("b/src/lib.rs:2:") && line.contains("error[types]: found `u16`, expected `u8`")));
 }

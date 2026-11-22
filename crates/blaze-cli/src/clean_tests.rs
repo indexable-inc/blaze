@@ -55,16 +55,63 @@ fn usual() -> Io {
         ("ws/.blaze/v2/records/r1", "0123456789"),
         ("ws/.blaze/v2/leaves/deep/l1", "abc"),
         ("h/.blaze/v2/store/CACHEDIR.TAG", TAG),
-        ("h/.blaze/v2/store/seg-0000000000000001", "segment bytes"),
-        ("h/.blaze/v2/store/head", "head"),
+        (OWN_SEG, "segment bytes"),
+        (OWN_HEAD, "head"),
         ("h/.blaze/v2/toolchain/abc/lib.rlib", "toolchain"),
         ("h/.blaze/v2/sources/x.crate", "source"),
     ])
 }
 
+/// This blaze's store files in the fixtures: under plain_place.rs `STORE_DIR` (a test below
+/// holds them there).
+const OWN_SEG: &str = "h/.blaze/v2/store/f5s2/seg-0000000000000001";
+const OWN_HEAD: &str = "h/.blaze/v2/store/f5s2/head";
+
+#[test]
+fn the_fixtures_name_this_blazes_store() {
+    assert!(OWN_HEAD.starts_with(&format!("h/.blaze/{}/", crate::store::plain_place::STORE_DIR)), "update OWN_SEG and OWN_HEAD to {}", crate::store::plain_place::STORE_DIR);
+    assert!(OWN_SEG.starts_with(&format!("h/.blaze/{}/", crate::store::plain_place::STORE_DIR)));
+}
+
+/// No flag, a home holding the legacy layout and an older blaze's folder beside this one's:
+/// both other forms go (the legacy layout's own files alone), this blaze's folder, the cache
+/// tag, a name of no store's shape and the checkout's sources stay.
+#[test]
+fn clean_removes_the_other_forms_and_keeps_this_blazes_store() {
+    let io = world(&[
+        ("ws/src/lib.rs", "fn f() {}\n"),
+        ("h/.blaze/v2/store/CACHEDIR.TAG", TAG),
+        (OWN_HEAD, "head"),
+        ("h/.blaze/v2/store/head", "old head"),
+        ("h/.blaze/v2/store/seg-0000000000000009", "old segment"),
+        ("h/.blaze/v2/store/f4s2/head", "older"),
+        ("h/.blaze/v2/store/notes", "mine"),
+    ]);
+    let (result, said) = clean(&io, &["ws"]);
+    println!("blaze clean ws, with other forms:\n{said}");
+    assert!(result.is_ok(), "{result:?}");
+    let legacy = "old head".len() + "old segment".len();
+    assert_eq!(
+        said,
+        format!(
+            "removed the format 4 store's files directly in /h/.blaze/v2/store: 2 files, {legacy} bytes freed\nremoved /h/.blaze/v2/store/f4s2, a store of another blaze's forms: 1 file, 5 bytes freed\n"
+        )
+    );
+    for gone in ["h/.blaze/v2/store/head", "h/.blaze/v2/store/seg-0000000000000009", "h/.blaze/v2/store/f4s2"] {
+        assert!(!there(&io, gone), "{gone} was kept");
+    }
+    for kept in [OWN_HEAD, "h/.blaze/v2/store/CACHEDIR.TAG", "h/.blaze/v2/store/notes", "ws/src/lib.rs"] {
+        assert!(there(&io, kept), "{kept} was removed");
+    }
+    let (again, said) = clean(&io, &["ws"]);
+    assert!(again.is_ok(), "{again:?}");
+    assert_eq!(said, format!("{NOTHING}\n"));
+}
+
 #[test]
 fn the_tag_blaze_writes_is_the_tag_clean_wants() {
-    assert_eq!(super::HOME_STORE, format!(".blaze/{}", crate::store::plain_place::STORE_DIR));
+    assert_eq!(super::HOME_STORE, format!(".blaze/{}", crate::store::plain_place::STORE_ROOT));
+    assert!(crate::store::plain_place::STORE_DIR.starts_with(&format!("{}/", crate::store::plain_place::STORE_ROOT)), "this blaze's store is not a folder of the root");
     assert_eq!(TAG.as_bytes(), blaze_cas::plain::CACHEDIR_SIGNATURE, "the test's copy of the tag");
     assert!(super::blazes_tag(TAG.as_bytes()));
     assert!(!super::blazes_tag(b"Signature: 8a477f597d28d172789f06886806bc55\n# made by another tool\n"));
@@ -164,6 +211,81 @@ fn a_store_without_blazes_tag_is_refused_and_nothing_goes() {
         assert!(there(&io, "h/.blaze/v2/store/seg-0000000000000001"));
         assert!(there(&io, "ws/.blaze/v2/profile.txt"));
     }
+}
+
+/// Every entry of the one list is a name under `CHECKOUT_STATE`, its path that name there, and
+/// the writers name theirs from it.
+#[test]
+fn the_checkout_list_is_the_writers_list() {
+    use super::{CHECKOUT_ENTRIES, CHECKOUT_STATE, CheckoutEntry};
+    for (entry, name) in CheckoutEntry::ALL.iter().zip(CHECKOUT_ENTRIES) {
+        assert_eq!(entry.name(), name);
+        assert_eq!(entry.path(), format!("{CHECKOUT_STATE}/{name}"), "{entry:?}'s path is not its name under {CHECKOUT_STATE}");
+    }
+    for written in [crate::print::PROFILE, crate::engine_start::START_PROFILE, crate::store::OLD_CHECKOUT[0], crate::store::OLD_CHECKOUT[1]] {
+        let name = written.strip_prefix(&format!("{CHECKOUT_STATE}/")).unwrap_or_else(|| panic!("{written} is not under {CHECKOUT_STATE}"));
+        assert!(CHECKOUT_ENTRIES.contains(&name), "{written} is written but `clean` refuses it");
+    }
+}
+
+/// `run`'s writer (engine_start.rs `write_start_profile`, which every `run` and `test` calls after
+/// its start, well or not) and the check's profile, then `clean`: both are blaze's, removed, and
+/// the clean succeeds. Before the one list, `start.txt` was refused by name after any `run`.
+#[test]
+fn clean_after_run_removes_the_starts_profile() {
+    let io = world(&[("ws/Cargo.toml", "[package]\n"), ("ws/src/main.rs", "fn main() {}\n")]);
+    {
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let fs = io.need_fs().expect("files");
+        let ws = fs.open_dir(&cx, &Path::new("ws").expect("a path")).expect("the checkout");
+        ws.make_dir(&cx, &Path::new(".blaze").expect("a path"), Durable::No).expect("a folder");
+        ws.make_dir(&cx, &Path::new(super::CHECKOUT_STATE).expect("a path"), Durable::No).expect("a folder");
+        ws.publish(&cx, &Path::new(crate::print::PROFILE).expect("a path"), Content::bytes(b"check profile\n"), Durable::No).expect("the check's profile");
+        let phases = crate::phases::Phases::new(io.need_clock().expect("a clock"));
+        crate::engine_start::write_start_profile(&cx, &ws, &phases, cx.frame()).expect("the start's profile");
+    }
+    assert!(there(&io, "ws/.blaze/v2/start.txt"), "run's writer wrote no start.txt");
+    let (result, said) = clean(&io, &["ws"]);
+    println!("blaze clean ws, after a run:\n{said}");
+    assert!(result.is_ok(), "clean refused after a run: {result:?}");
+    assert!(said.starts_with("removed ws/.blaze/v2: 2 files, "), "{said}");
+    assert!(!there(&io, "ws/.blaze/v2"));
+    assert!(there(&io, "ws/src/main.rs"));
+}
+
+/// A home with no store root at all (a new user, one who never ran blaze), and a home that
+/// does not exist (HOME names a folder never made): `clean` without and with `--store`
+/// succeeds, nothing of the home to remove.
+#[test]
+fn a_home_with_no_store_is_nothing_to_remove() {
+    for words in [&["ws"][..], &["ws", "--store"][..]] {
+        let io = world(&[("ws/src/lib.rs", "fn f() {}\n"), ("h/.blaze/v2/toolchain/abc/lib.rlib", "toolchain")]);
+        let (result, said) = clean(&io, words);
+        assert!(matches!(result, Ok(bstd::entry::Status::OK)), "{words:?}: {result:?}");
+        assert_eq!(said, format!("{NOTHING}\n"), "{words:?}");
+        assert!(there(&io, "h/.blaze/v2/toolchain/abc/lib.rlib"));
+        let io = world(&[("ws/src/lib.rs", "fn f() {}\n")]);
+        assert!(!there(&io, "h"), "the fixture has a home");
+        let (result, said) = clean(&io, words);
+        assert!(matches!(result, Ok(bstd::entry::Status::OK)), "{words:?}, no home folder: {result:?}");
+        assert_eq!(said, format!("{NOTHING}\n"), "{words:?}, no home folder");
+    }
+}
+
+/// Without `--store`, a home's store root with no blaze tag is not looked into, said so; the
+/// checkout is still cleaned, and the root's files stay. (`--store` refuses it: the test above.)
+#[test]
+fn an_untagged_store_root_is_said_and_left_without_store() {
+    let io = world(&[("ws/.blaze/v2/profile.txt", "profile\n"), ("h/.blaze/v2/store/seg-0000000000000001", "segment bytes")]);
+    let (result, said) = clean(&io, &["ws"]);
+    println!("blaze clean ws, an untagged home store:\n{said}");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        said,
+        "removed ws/.blaze/v2: 1 file, 8 bytes freed\nthe home's .blaze/v2/store holds no CACHEDIR.TAG, so it is not shown to be blaze's store: no store in it was looked at or removed\n"
+    );
+    assert!(there(&io, "h/.blaze/v2/store/seg-0000000000000001"));
+    assert!(!there(&io, "ws/.blaze/v2"));
 }
 
 /// A checkout with no state at all, and no home store: nothing to remove, status 0.

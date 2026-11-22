@@ -27,10 +27,58 @@ use blaze_scope::task::{ItemText, MacroBody};
 use blaze_surface::{Edition, ItemDetail, ItemKind, Namespace};
 
 use super::super::buckets::TableSet;
+use super::super::heads::{AdtRow, CoherenceMarks, Store};
 use super::super::index::ImplAt;
+use super::super::keys::checker_of;
 use super::super::project_records::BodySource;
 use super::super::source::{self, MacroAt, MemberOf, NamesSource};
 use super::recorder::{INCOHERENT, NamesInto, ReadSink, TableRead, UNFILED, bucket_cell};
+
+#[derive(Clone, Copy)]
+pub struct BodyHeadFacts<'s, 't, S> {
+    store: &'s Store<'t>,
+    names: S,
+}
+
+impl<'s, 't, 'n, S: NamesSource<'n>> BodyHeadFacts<'s, 't, S> {
+    pub fn new(store: &'s Store<'t>, names: S) -> Self {
+        Self { store, names }
+    }
+
+    pub(in crate::front2) fn library(self, keys: &super::super::keys::Keys, key: blaze_typeck::ItemKey) -> Option<ItemKey> {
+        keys.library_in(self.names, key)
+    }
+
+    pub(in crate::front2) fn crate_of(self, lib: ItemKey) -> Option<usize> {
+        self.names.crate_of(lib)
+    }
+
+    fn read(self, key: blaze_typeck::ItemKey) {
+        // A block-local item's head belongs to the enclosing body. Only an item with
+        // its own Signature task has a distinct head cell (task.rs `fact_read`).
+        if self.store.locals.head(key).is_none() {
+            self.names.impls_read(TableRead::Head { item: key.0.to_be_bytes(), part: 0 });
+        }
+    }
+
+    pub fn adt(self, key: blaze_typeck::ItemKey) -> Option<&'s AdtRow> {
+        self.read(key);
+        self.store.adts.get(&key)
+    }
+
+    pub fn marks(self, lib: ItemKey) -> Option<CoherenceMarks> {
+        let key = checker_of(lib);
+        self.read(key);
+        self.store.adt_declarations.get(&key).map(|decl| decl.marks).or_else(|| self.store.maps.traits.get(&lib).map(|row| row.marks))
+    }
+
+    /// Type and const parameter count (including `Self`), and whether every parameter
+    /// after `Self` defaults to it. A bare impl path uses those defaults.
+    pub fn trait_parameters(self, lib: ItemKey) -> Option<(u32, bool)> {
+        self.read(checker_of(lib));
+        self.store.maps.traits.get(&lib).map(|head| (head.generics, head.all_self_defaults))
+    }
+}
 
 /// What a [`Tables`] is made from.
 pub struct TablesOpts<'t, 'n> {
@@ -89,6 +137,14 @@ impl<'t, 'n> Tables<'t, 'n> {
         self.cell(NameCell::Item { key });
     }
 
+    fn member_source(self, key: ItemKey, written_by: Option<ItemKey>, facet: TableRead) {
+        self.cell(NameCell::MemberOf { member: key });
+        match written_by {
+            Some(call) => self.cell(NameCell::Expansion { call }),
+            None => self.reads.read(facet),
+        }
+    }
+
     /// The 8 bytes every key of crate `krate` begins with; `None` for no such crate.
     fn prefix(self, krate: usize) -> Option<[u8; 8]> {
         self.records.crate_key(krate).map(|k: CrateItemKey| k.prefix())
@@ -135,6 +191,10 @@ impl<'t, 'n> Tables<'t, 'n> {
 }
 
 impl<'n> NamesSource<'n> for Tables<'_, 'n> {
+    fn head_lowerings(self) -> Option<&'n super::super::heads::HeadLowerings> {
+        NamesSource::head_lowerings(self.records)
+    }
+
     fn solved(self) -> Option<&'n Names<'n>> {
         None
     }
@@ -250,7 +310,29 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn text_of(self, key: ItemKey) -> Option<ItemText<'n>> {
         self.item(key);
+        self.reads.read(TableRead::Text { key });
         self.records.text_of(key)
+    }
+
+    fn signature_text_of(self, key: ItemKey) -> Option<ItemText<'n>> {
+        self.item(key);
+        self.reads.read(TableRead::Signature { key });
+        self.records.text_of(key)
+    }
+
+    fn seeded_text_of(self, key: ItemKey) -> Option<ItemText<'n>> {
+        // The frozen record authenticates the source span it needs when it is imported.
+        // Its producer owns that signature. Evaluation records the body when it uses it.
+        self.item(key);
+        self.records.text_of(key)
+    }
+
+    fn read_member_body(self, member: ItemKey, written_by: Option<ItemKey>) {
+        self.member_source(member, written_by, TableRead::Text { key: member });
+    }
+
+    fn read_member_signature(self, member: ItemKey, written_by: Option<ItemKey>) {
+        self.member_source(member, written_by, TableRead::Signature { key: member });
     }
 
     fn name_of(self, key: ItemKey) -> Option<&'n str> {
@@ -287,14 +369,31 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.file_text(krate, file)
     }
 
-    /// Over records always refused by name: nothing is read.
+    /// The expansion's cell (its record: the call part and the column, as `call_text` reads
+    /// them) and the WHOLE items section: the answer finds the calling entry among the items
+    /// rows and in today's text of the calling file (seam_rules.rs `recorded_call_origin`), and
+    /// a finding filed through it holds that entry's line (expansion_origin.rs `file_range`), so
+    /// an edit that moves the entry moves the reader. A `#[track_caller]` site asks it too, and
+    /// already reads that section for the file's shown path (`file_paths`).
     fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::super::expansion_origin::CallOrigin<'n>, super::super::expansion_origin::Unmapped> {
+        self.cell(NameCell::Expansion { call });
+        self.whole(krate, Section::Items);
         self.records.call_origin(krate, call)
     }
 
     fn text_marks(self, krate: usize, call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::super::item_site::MarksLost> {
         self.cell(NameCell::Expansion { call });
         self.records.text_marks(krate, call)
+    }
+
+    /// The text the expansion `call` is written in, from the call part of its record's origins
+    /// (source.rs `Records::call_text`), read in the expansion's cell as its marks are. Before,
+    /// this view kept the trait's default, which asks `call_origin`, refused over records by
+    /// design: a macro-made body's `include_str!` was `Refused` (body_host.rs `body_file`;
+    /// body_host_include_tests.rs, run t67 2026-11-21).
+    fn call_text(self, krate: usize, call: ItemKey) -> Option<blaze_scope::resolve::At> {
+        self.cell(NameCell::Expansion { call });
+        self.records.call_text(krate, call)
     }
 
     /// The item's cell alone, for an item of a file and of a macro call's expansion alike: the
@@ -363,6 +462,10 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.reads.read(read);
     }
 
+    fn asking(self, ask: Option<blaze_typeck::Asking>) {
+        self.reads.asking(ask);
+    }
+
     fn bucket(self, krate: usize, key: &blaze_scope::items_record::buckets::BucketKey, each: &mut dyn FnMut(blaze_scope::items_record::buckets::BucketImpl)) -> Option<blaze_id::ContentId> {
         self.reads.read(TableRead::Impls { krate: self.crate16(krate), bucket: bucket_cell(key.bytes()) });
         self.records.bucket(krate, key, each)
@@ -389,6 +492,7 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn impl_with_header(self, krate: usize, key: ItemKey, module: ItemKey) -> Option<ImplAt<'n>> {
         self.item(key);
+        self.reads.read(TableRead::Signature { key });
         self.records.impl_with_header(krate, key, module)
     }
 
@@ -405,6 +509,7 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         let found = self.walked(module, Namespace::Macros, written)?;
         if let Some(def) = found.whole(written.segments.len()) {
             self.item(def.key);
+            self.reads.read(TableRead::Text { key: def.key });
         }
         self.records.macro_body_of(module, written)
     }
@@ -415,6 +520,7 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         let found = self.walked(module, Namespace::Macros, written)?;
         if let Some(def) = found.whole(written.segments.len()) {
             self.item(def.key);
+            self.reads.read(TableRead::Text { key: def.key });
             self.cell(NameCell::Root { krate: def.key.crate_prefix() });
         }
         self.records.macro_at(module, written)
@@ -441,6 +547,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_item(krate, each)
     }
 
+    fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>> {
+        self.cell(NameCell::Module { module });
+        blaze_scope::names_cells::CellSink::put_binding(&NamesInto(self.reads), module, ns, name);
+        self.records.block_binding(module, ns, name)
+    }
+
     fn binds(self, module: ItemKey, ns: Namespace, name: &'n str) -> bool {
         let _ = self.walked(module, ns, Written { kind: blaze_surface::PathKind::SelfMod, segments: &[name] });
         self.records.binds(module, ns, name)
@@ -452,6 +564,26 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     fn key_beginning(self, first: [u8; 16]) -> Option<ItemKey> {
         self.cell(NameCell::Beginning { first });
         self.records.key_beginning(first)
+    }
+
+    /// The item's `Item` cell: its row holds the count (D155), and the row's digest covers
+    /// its text, so an edit to its generics moves the cell.
+    fn declared_lifetimes(self, key: ItemKey) -> Option<u32> {
+        self.item(key);
+        self.records.declared_lifetimes(key)
+    }
+
+    /// The item's `Item` cell: its digest covers the item's value rows (blaze-scope
+    /// names_cells.rs `item_digest`), so a value that moves while the item's text stays moves it.
+    fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<blaze_scope::attr_values::RowValue<'n>>> {
+        self.item(key);
+        self.records.attr_value(key, attr)
+    }
+
+    /// The trait's `Members` cell: the member rows hold each associated type's count (D155).
+    fn assoc_lifetimes(self, trait_: ItemKey, name: blaze_typeck::Name) -> Option<u32> {
+        self.cell(NameCell::Members { owner: trait_ });
+        self.records.assoc_lifetimes(trait_, name)
     }
 }
 

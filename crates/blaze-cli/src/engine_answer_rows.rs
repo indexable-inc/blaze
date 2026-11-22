@@ -5,9 +5,10 @@
 //! one type parameter (rule 78).
 //!
 //! ```text
-//! names           engine.<16 hex>.rows            the root's key alone (engine_answer.rs `root_name`)
-//!                 engine.<16 hex>.rows.segments   every live segment's key and the lines record's
-//!                 engine.tree.<16 hex of H(tree digest, every kind's tool)>   and its `.segments`:
+//! names           engine.<16 hex>.<64 hex>.rows   the root's key alone (engine_answer.rs `root_name`,
+//!                                                 then `tools_digest`: [`root_names`])
+//!                 engine.<16 hex>.<64 hex>.rows.segments   an indexed root of the live segments, lines and row payloads
+//!                 engine.tree.<64 hex of H(tree digest, every kind's tool)>   and its `.segments`:
 //!                 the same keys, so a second worktree at the same tree finds the answer
 //! the root        blaze-answer's root bytes, under the key of its bytes ([`root_key`])
 //! a segment       its bytes, under its `SegmentRef::id` (the digest of its bytes)
@@ -41,12 +42,11 @@
 #![cfg_attr(not(test), expect(dead_code, reason = "the rows form waits on the switch (runtime.md D5); its tests use it today"))]
 
 use core::fmt;
-use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use blaze_answer::{
     AnswerError, AnswerView, CellDigest, CellNo, Commit, DEFINE_BYTES, Effects, Flags, LinesKey, MAX_READS_PER_ROW, Plant, ROW_COLD_BYTES, ROW_FIXED_BYTES, RowIn, RowView, RunWriter, SegmentKind,
-    SegmentRef, Serial, TaskId, TreeDigest, Write, has_findings,
+    RootView, SegmentRef, Serial, TaskId, TreeDigest, Write, has_findings,
 };
 use blaze_core::Driver;
 use blaze_drive::cells::Cell;
@@ -123,22 +123,18 @@ pub(crate) struct RootNames<'f> {
 
 /// The names of the checkout's rows answer for `tools`, and of the answer of the tree `tree`.
 /// A checkout's name is local (its path is hashed in, engine_answer.rs `root_name`); the tree's
-/// holds only the tree's digest and the tools (rule 25).
+/// holds only the tree's digest and the tools (rule 25). The page form's root no longer holds
+/// the tools (its pointer does, engine_answer.rs "THE TOOLS"); this form's [`certified`] reads
+/// no tools, so its checkout names keep them: the tools' digest after `.rows`.
 pub(crate) fn root_names<'f>(checkout: &str, tools: &Tools, tree: &TreeDigest, frame: &'f Frame) -> RootNames<'f> {
-    let pages = crate::engine_answer::root_name(checkout, tools, frame);
-    let mut input: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::new_in(frame);
-    input.extend_from_slice(&tree.0);
+    let checkout_root = crate::engine_answer::root_name(checkout, frame);
+    let pages = bstd::mem::format_in!(frame, "{}.{:x}", checkout_root.as_str(), crate::engine_answer::tools_digest(tools));
+    let mut input = blaze_ids::Hasher::new(TREE_DOMAIN);
+    input.update(&tree.0);
     for tool in tools.0.iter() {
-        input.extend_from_slice(&tool.0.0);
+        input.id(&tool.0);
     }
-    let id = ContentId::of(TREE_DOMAIN, &input);
-    let mut tree_name = blaze_own::String::new_in(frame);
-    tree_name.push_str("engine.tree.");
-    for byte in &id.0[..8] {
-        // A frame string's write fails only when the frame is full: the name is then short and
-        // names no root, so the request answers in full (as engine_answer.rs `root_name`).
-        let _ = write!(tree_name, "{byte:02x}");
-    }
+    let tree_name = bstd::mem::format_in!(frame, "engine.tree.{:x}", input.finish());
     RootNames {
         checkout: bstd::mem::format_in!(frame, "{}.rows", pages.as_str()),
         checkout_segments: bstd::mem::format_in!(frame, "{}.rows.segments", pages.as_str()),
@@ -154,6 +150,8 @@ pub(crate) enum RowsUnreadable {
     Names { bytes: usize },
     /// A record the name names is not in the store.
     Missing { key: Key },
+    /// The bytes under the named key do not authenticate as that root.
+    RootDigest { expected: Key, found: Key },
     /// The root or a segment (blaze-answer), or the seam's reading of a row.
     Answer(LastError),
     /// The root's summary is not this form's.
@@ -169,6 +167,7 @@ impl fmt::Display for RowsUnreadable {
         match self {
             RowsUnreadable::Names { bytes } => write!(f, "its name holds {bytes} bytes, not its root's one key")?,
             RowsUnreadable::Missing { key } => write!(f, "{key:?}, which its name names, is not in the store")?,
+            RowsUnreadable::RootDigest { expected, found } => write!(f, "the named root {expected:?} has digest {found:?}")?,
             RowsUnreadable::Answer(why) => write!(f, "{why}")?,
             RowsUnreadable::Summary { bytes } => write!(f, "its root's summary is {bytes} bytes, not the certificate's {SUMMARY_BYTES}")?,
         }
@@ -179,7 +178,25 @@ impl fmt::Display for RowsUnreadable {
 /// The root the checkout's name names, as stored.
 pub(crate) struct RowsRoot<'m> {
     pub(crate) key: Key,
-    pub(crate) bytes: &'m [u8],
+    directory: RootView<'m>,
+    facts: Facts,
+}
+
+impl<'m> RowsRoot<'m> {
+    pub(crate) fn open(key: Key, bytes: &'m [u8]) -> Result<Self, RowsUnreadable> {
+        if bytes.len() > RootView::MAX_BYTES {
+            let why = AnswerError::Cap { what: "root bytes", cap: RootView::MAX_BYTES as u64 };
+            return Err(RowsUnreadable::Answer(why.into()));
+        }
+        let found = root_key(bytes);
+        if found != key {
+            return Err(RowsUnreadable::RootDigest { expected: key, found });
+        }
+        let directory = RootView::parse(bytes).map_err(|why| RowsUnreadable::Answer(why.into()))?;
+        let summary = directory.summary();
+        let facts = facts_of(summary).ok_or(RowsUnreadable::Summary { bytes: summary.len() })?;
+        Ok(Self { key, directory, facts })
+    }
 }
 
 /// The root the name `name` names, in place: `None` when there is none.
@@ -193,16 +210,13 @@ pub(crate) fn load_root<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandS
     let key = Key(ContentId(id));
     let Some(held) = store.get(cx, key)? else { return Ok(Some(Err(RowsUnreadable::Missing { key }))) };
     let bytes: &'m [u8] = held.bytes;
-    Ok(Some(Ok(RowsRoot { key, bytes })))
+    Ok(Some(RowsRoot::open(key, bytes)))
 }
 
 /// The certificate from the root alone, no segment read: the root answers `tree`, nothing is
 /// owed, and the last request's every line is in its lines record.
-pub(crate) fn certified(root: &RowsRoot<'_>, tree: &TreeDigest) -> Result<bool, RowsUnreadable> {
-    let same = blaze_answer::nothing_changed(root.bytes, tree).map_err(|why| RowsUnreadable::Answer(why.into()))?;
-    let held = blaze_answer::summary_of(root.bytes).map_err(|why| RowsUnreadable::Answer(why.into()))?;
-    let facts = facts_of(held).ok_or(RowsUnreadable::Summary { bytes: held.len() })?;
-    Ok(same && facts.owed == 0 && facts.printed.replayable)
+pub(crate) fn certified(root: &RowsRoot<'_>, tree: &TreeDigest) -> bool {
+    root.directory.tree() == *tree && root.facts.owed == 0 && root.facts.printed.replayable
 }
 
 /// The answer `root` names, its segments as the store holds them (mapped where committed). A
@@ -210,7 +224,7 @@ pub(crate) fn certified(root: &RowsRoot<'_>, tree: &TreeDigest) -> Result<bool, 
 pub(crate) fn load_rows<'m: 'a, 'a, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, root: &RowsRoot<'m>, alloc: SharedAlloc<'a>) -> Result<Result<RowsAnswer<'a>, RowsUnreadable>, CliError> {
     let mut failed: Option<CliError> = None;
     let opened = RowsAnswer::open(
-        root.bytes,
+        root,
         |one: &SegmentRef| match store.get(cx, Key(one.id)) {
             Ok(found) => found.map(|held| held.bytes),
             Err(error) => {
@@ -339,17 +353,15 @@ impl Iterator for RowDefines<'_> {
 }
 
 impl<'a> RowsAnswer<'a> {
-    /// The answer `root` names, each segment's bytes from `fetch`: blaze-answer's `open` (each
-    /// bound checked once), then the summary read as the certificate's facts.
-    pub(crate) fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<RowsAnswer<'a>, RowsUnreadable> {
-        let view = AnswerView::open(root, fetch, plant, alloc).map_err(|why| RowsUnreadable::Answer(why.into()))?;
-        let facts = facts_of(view.summary()).ok_or(RowsUnreadable::Summary { bytes: view.summary().len() })?;
+    /// Open children of an authenticated root, reusing the checked directory and summary.
+    pub(crate) fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &RowsRoot<'a>, fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<RowsAnswer<'a>, RowsUnreadable> {
+        let view = AnswerView::from_root(root.directory, fetch, plant, alloc).map_err(|why| RowsUnreadable::Answer(why.into()))?;
         let segments = view.segments();
         let count = |kind: SegmentKind| len64(segments.iter().filter(|one| one.kind == kind).count());
-        let bytes = len64(root.len()) + segments.iter().map(|one| one.len).sum::<u64>();
+        let bytes = len64(root.directory.byte_len()) + segments.iter().map(|one| one.len).sum::<u64>();
         let (rows_segments, cells_segments, dicts, runs) = (count(SegmentKind::Rows), count(SegmentKind::Cells), count(SegmentKind::Dict), count(SegmentKind::Run));
         let (plans, findings) = (count(SegmentKind::Plans), count(SegmentKind::Findings));
-        Ok(RowsAnswer { view, facts, bytes, rows_segments, cells_segments, dicts, runs, plans, findings, counters: Counters::default() })
+        Ok(RowsAnswer { view, facts: root.facts, bytes, rows_segments, cells_segments, dicts, runs, plans, findings, counters: Counters::default() })
     }
 
     /// No answer yet (a first request, or one the store could not read): no row, no segment,
@@ -506,12 +518,8 @@ impl<'a> LastAnswer for RowsAnswer<'a> {
         self.view.digest(cell)
     }
 
-    /// The kept prefix padded with zeros (last.rs `content`): `CellDigest::of` maps it back.
     fn content(&self, cell: CellNo) -> ContentId {
-        let kept = LastAnswer::digest(self, cell);
-        let mut whole = [0u8; 32];
-        whole[..kept.0.len()].copy_from_slice(&kept.0);
-        ContentId(whole)
+        ContentId(self.digest(cell).0)
     }
 
     fn moved(&self, cell: CellNo) -> Serial {
@@ -606,16 +614,21 @@ impl<'v, 'a, 'm> RowsNext<'v, 'a, 'm> {
     }
 
     /// The counts with `old` replaced by `new` (stage, flags, key, findings).
-    fn recount(&mut self, old: Option<RowView<'_>>, new: Option<(u8, Flags, Key, u32)>) {
+    fn recount(&mut self, task: Name, old: Option<RowView<'_>>, new: Option<(u8, Flags, Key, u32)>) -> Result<(), LastError> {
         let (was_file, was_finding) = old.map_or((false, false), |row| (is_file(row.stage(), row.flags(), row.key()), has_findings(row.findings(), row.flags())));
         let (is_file_now, finding_now) = new.map_or((false, false), |(stage, flags, key, findings)| (is_file(stage, flags, key), has_findings(findings, flags)));
-        let step = |count: u32, was: bool, now: bool| match (was, now) {
-            (false, true) => count.saturating_add(1),
-            (true, false) => count.saturating_sub(1),
-            _ => count,
+        let step = |column, previous: u32, was, now| {
+            match (was, now) {
+                (false, true) => previous.checked_add(1),
+                (true, false) => previous.checked_sub(1),
+                _ => Some(previous),
+            }.ok_or(LastError::CertificateCount { task, column, previous })
         };
-        self.counts.files = step(self.counts.files, was_file, is_file_now);
-        self.counts.findings = step(self.counts.findings, was_finding, finding_now);
+        self.counts = Counts {
+            files: step("files", self.counts.files, was_file, is_file_now)?,
+            findings: step("findings", self.counts.findings, was_finding, finding_now)?,
+        };
+        Ok(())
     }
 
     /// The owed cells from this request on, whole, each with the request it moved in (engine
@@ -674,8 +687,7 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
         let from = old.map_or(self.commit.serial(), |row| row.serial());
         self.commit.put_row_from(task, &input, &self.reads, &self.defines, from)?;
         // Its reads are its last row's: no reverse entry changes.
-        self.recount(old, Some((stage, flags, key, findings)));
-        Ok(())
+        self.recount(planned.name, old, Some((stage, flags, key, findings)))
     }
 
     fn retire(&mut self, name: Name) -> Result<(), LastError> {
@@ -684,8 +696,7 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
         let Some(old) = last.row(task) else { return Ok(()) };
         self.commit.retire(task)?;
         self.run.row_retired(task, old);
-        self.recount(Some(old), None);
-        Ok(())
+        self.recount(name, Some(old), None)
     }
 
     fn finish(self, tree: &TreeDigest, summary: &[u8], lines: &LinesKey) -> Result<Effects<'m>, LastError> {
@@ -698,6 +709,46 @@ impl<'m> NextAnswer for RowsNext<'_, '_, 'm> {
 }
 
 impl<'m> RowsNext<'_, '_, 'm> {
+    /// Reserve this delta's new dictionary entries before writing any row. Task names sort by
+    /// (kind, subject), and cell names by (definer name, selector). Previously assigned numbers
+    /// survive. Sorting dictionary keys leaves each task's observation order intact.
+    fn assign_ids<'r, 'w: 'r>(
+        &mut self,
+        rows: impl Iterator<Item = (&'r Name, &'r Row<'w>)> + Clone,
+        owed: &blaze_engine::SMap<'_, Name, Planned>,
+        other_cells: impl Iterator<Item = CellId>,
+    ) -> Result<(), LastError> {
+        let mut cells = blaze_own::BTreeSet::new_in(self.alloc);
+        let definitions = rows.clone().flat_map(|(name, row)| row.defines.iter().map(move |(cell, _)| CellId { of: *name, cell: *cell }));
+        for id in definitions.chain(other_cells) {
+            if self.last.cell(&id.of, &id.cell).is_none() {
+                cells.insert(id);
+                if cells.len() > (blaze_answer::MAX_CELLS - self.last.cells()) as usize {
+                    return Err(AnswerError::Cap { what: "cell numbers", cap: u64::from(blaze_answer::MAX_CELLS) }.into());
+                }
+            }
+        }
+        let mut tasks = blaze_own::BTreeSet::new_in(self.alloc);
+        let made = rows.filter(|(name, _)| !owed.contains_key(*name)).flat_map(|(name, row)| [*name, row.file]);
+        let planned = owed.values().flat_map(|plan| [plan.name, plan.file]);
+        for name in made.chain(planned).chain(cells.iter().map(|id| id.of)) {
+            if self.last.task(&name).is_none() {
+                tasks.insert(name);
+                if tasks.len() > (blaze_answer::MAX_TASKS - self.last.tasks()) as usize {
+                    return Err(AnswerError::Cap { what: "task ids", cap: u64::from(blaze_answer::MAX_TASKS) }.into());
+                }
+            }
+        }
+        for name in tasks {
+            self.commit.task(name)?;
+        }
+        for id in cells {
+            let definer = self.commit.task(id.of)?;
+            self.commit.cell(definer, id.cell)?;
+        }
+        Ok(())
+    }
+
     /// [`NextAnswer::put`] with the serial the row stands from (blaze-answer
     /// `Commit::put_row_from`): this request's, or the one before for a row already stale.
     pub(crate) fn put_from<R: IntoIterator<Item = CellId>>(&mut self, name: Name, row: &NextRow, reads: R, defines: &[(Cell, ContentId)], from: Serial) -> Result<(), LastError> {
@@ -720,8 +771,7 @@ impl<'m> RowsNext<'_, '_, 'm> {
         let input = RowIn { key: row.key, out: row.out, file, stage, wave: row.phase.wave, flags: row.flags, source: row.source, findings: row.findings, record: row.record };
         self.commit.put_row_from(task, &input, &self.reads, &self.defines, from)?;
         self.run.row_reads(task, old, &self.reads);
-        self.recount(old, Some((stage, row.flags, row.key, row.findings)));
-        Ok(())
+        self.recount(name, old, Some((stage, row.flags, row.key, row.findings)))
     }
 
     /// `name` is owed no more though this request did not enter it: a plan never made is
@@ -743,8 +793,7 @@ impl<'m> RowsNext<'_, '_, 'm> {
         let flags = Flags(old.flags().0 & !Flags::OWED);
         let input = RowIn { key: old.key(), out: old.out(), file: old.file(), stage: old.stage(), wave: old.wave(), flags, source: old.source(), findings: old.findings(), record: old.record() };
         self.commit.put_row_from(task, &input, &self.reads, &self.defines, old.serial())?;
-        self.recount(Some(old), Some((old.stage(), flags, old.key(), old.findings())));
-        Ok(())
+        self.recount(name, Some(old), Some((old.stage(), flags, old.key(), old.findings())))
     }
 
     /// `id` moves in this request though no define of it changed (blaze-answer
@@ -761,6 +810,8 @@ impl<'m> RowsNext<'_, '_, 'm> {
 /// with no row is owed; the owed cells are given whole. `records` is the command's record key of
 /// each row (pages.rs `records`); a row it holds none for keeps zeros, as an unmade plan does.
 pub(crate) fn put_whole(answer: &Answer<'_>, records: &dyn Fn(&Name) -> Option<Key>, next: &mut RowsNext<'_, '_, '_>) -> Result<(), LastError> {
+    let reads = answer.rows.values().flat_map(|row| row.reads.iter().map(|(id, _)| *id));
+    next.assign_ids(answer.rows.iter(), &answer.owed_tasks, reads.chain(answer.owed_cells.keys().copied()))?;
     for (name, row) in answer.rows.iter() {
         let put = next_row(row, answer.owed_tasks.get(name), records(name).unwrap_or_default());
         next.put(*name, &put, row.reads.iter().map(|(id, _)| *id), &row.defines)?;
@@ -771,6 +822,93 @@ pub(crate) fn put_whole(answer: &Answer<'_>, records: &dyn Fn(&Name) -> Option<K
         }
     }
     next.owe_cells(answer.owed_cells.iter().map(|(id, at)| (*id, Serial(at.0))))
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+    use blaze_drive::Kind;
+    use blaze_sim::{Broke, Config, Tape};
+
+    fn bytes_of<'b>(write: &'b Write<'_>) -> &'b [u8] {
+        match write {
+            Write::Segment { bytes, .. } | Write::Root { bytes } => bytes.as_slice(),
+        }
+    }
+
+    fn segment<'b>(writes: &'b [Write<'_>], one: &SegmentRef) -> Option<&'b [u8]> {
+        writes.iter().find_map(|write| match write {
+            Write::Segment { at, bytes } if at == one => Some(bytes.as_slice()),
+            _ => None,
+        })
+    }
+
+    fn same_writes(tape: &Tape, arrival_ids: bool) -> Result<(), Broke> {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let shared = heap.shared();
+        let empty = AnswerView::empty(Plant::None, shared);
+        let name = |v| Name::new(Kind::BodyCheck, ContentId([v; 32]));
+        let file = Name::new(Kind::FileItems, ContentId([7; 32]));
+        let selector = Cell([1; 16]);
+        // The high-sorting name already owns id 0. New keys must be appended to that dictionary.
+        let mut base = Commit::new(&empty, Plant::None, alloc);
+        let existing = base.task(name(9)).expect("intern the existing task");
+        base.cell(existing, selector).expect("intern the existing cell");
+        let base = base.finish(&TreeDigest([0; 32]), &[], &LinesKey([0; 32])).expect("commit the base");
+        let last = AnswerView::open(base.root(), |one| segment(base.writes(), one), Plant::None, shared).expect("open the base");
+        let names = [name(3), name(1), name(2)];
+        let rows = names.map(|task| {
+            let reads = [name(9), name(8)].map(|of| (CellId { of, cell: selector }, ABSENT));
+            Row {
+                key: Key(task.subject), phase: Phase::new(Stage::Bodies, 0), file, source: task.subject, out: task.subject,
+                serial: blaze_engine::Gen(2), defines: Vec::from_iter_in([(selector, task.subject)], shared),
+                reads: Vec::from_iter_in(reads, shared), by_cell: Vec::from_iter_in([1, 0], shared),
+                findings: 0, inline: false, failed: false,
+            }
+        });
+        let owed = blaze_own::BTreeMap::new_in(shared);
+        let encode = |order: &[usize], reserve: bool| {
+            let mut next = RowsNext::new(&last, Counts::default(), Plant::None, alloc);
+            let arrivals = order.iter().map(|&i| (&names[i], &rows[i]));
+            if reserve {
+                let reads = arrivals.clone().flat_map(|(_, row)| row.reads.iter().map(|(id, _)| *id));
+                next.assign_ids(arrivals.clone(), &owed, reads).expect("assign ids from stable keys");
+            }
+            for (task, row) in arrivals {
+                next.put(*task, &next_row(row, None, row.key), row.reads.iter().map(|(id, _)| *id), &row.defines).expect("put the changed row");
+            }
+            next.finish(&TreeDigest([1; 32]), &[], &LinesKey([0; 32])).expect("encode the delta")
+        };
+        let canonical = encode(&[0, 1, 2], true);
+        let mut order = [0, 1, 2];
+        tape.shuffle(&mut order, "worker completion order");
+        let scheduled = encode(&order, !arrival_ids);
+        if !canonical.writes().iter().map(bytes_of).eq(scheduled.writes().iter().map(bytes_of)) {
+            return Err(Broke::Oracle(std::string::String::from("worker order changed immutable answer bytes")));
+        }
+        let fetch = |one: &SegmentRef| segment(scheduled.writes(), one).or_else(|| segment(base.writes(), one));
+        let opened = AnswerView::open(scheduled.root(), fetch, Plant::None, shared).expect("open the delta over its base");
+        let tasks = [name(9), file, name(1), name(2), name(3), name(8)];
+        let cells = [name(9), name(1), name(2), name(3), name(8)];
+        for (i, task) in tasks.iter().enumerate() {
+            assert_eq!(opened.task(task), Some(TaskId(i as u32)), "existing task numbers persist and new tasks follow stable name order");
+        }
+        for (i, of) in cells.iter().enumerate() {
+            assert_eq!(opened.cell(of, &selector), Some(CellNo(i as u32)), "existing cell numbers persist and new cells follow stable key order");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_order_preserves_answer_bytes() {
+        blaze_sim::check(Config::cases(24), |tape| same_writes(tape, false));
+    }
+
+    #[test]
+    fn the_oracle_catches_arrival_order_ids() {
+        blaze_sim::control(Config::cases(24), false, true, "worker order changed immutable answer bytes", same_writes);
+    }
 }
 
 /// A row of the engine's as the rows form's [`NextRow`]: its flags from the row and whether it
@@ -796,7 +934,15 @@ pub(crate) struct Close<'c> {
     pub(crate) tree: TreeDigest,
     pub(crate) printed: Printed,
     pub(crate) lines: LinesKey,
-    pub(crate) records: &'c dyn Fn(&Name) -> Option<Key>,
+    /// The phase driver's final disposition for each changed row. A missing disposition stops
+    /// publication so a previously reachable record cannot disappear through a missing lookup.
+    pub(crate) records: &'c dyn Fn(&Name) -> Option<RowPayload>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RowPayload {
+    Stored(Key),
+    NoPayload,
 }
 
 /// A request's end in the rows form (blaze-engine overlay.rs `Fold`): the last answer and the
@@ -846,11 +992,23 @@ impl<'w, 'a> RowsFolded<'w, 'a> {
         let view = self.last.view();
         let generations = self.work.generations();
         let mut next = RowsNext::new(view, self.last.counts(), plant, alloc);
+        let before = |id: &CellId| view.cell(&id.of, &id.cell).map_or(CellDigest::ABSENT, |cell| view.digest(cell));
+        let moved = generations.moved(before);
+        // Every newly named read contributes an addition to the reverse index. Unchanged
+        // memberships already have dictionary entries, including reads of absent values.
+        let additions = self.work.readers.iter().filter_map(|(id, edits)| edits.iter().any(|(_, reads)| *reads).then_some(*id));
+        let cells = additions.chain(self.work.owed_cells.keys().copied()).chain(moved.iter().copied());
+        let made = self.work.rows.iter().filter_map(|(name, row)| row.as_ref().map(|row| (name, row)));
+        next.assign_ids(made, &self.work.owed_tasks, cells)?;
         let mut written = RowsWritten::default();
         for (name, row) in self.work.rows.iter() {
             match row {
                 Some(row) => {
-                    let record = (close.records)(name).unwrap_or_default();
+                    let record = match (close.records)(name) {
+                        Some(RowPayload::Stored(key)) if key != Key::default() => key,
+                        Some(RowPayload::NoPayload) => Key::default(),
+                        _ => return Err(LastError::RowPayload { task: *name }),
+                    };
                     let put = next_row(row, self.work.owed_tasks.get(name), record);
                     next.put_from(*name, &put, row.reads.iter().map(|(id, _)| *id), &row.defines, Serial(generations.row(row).0))?;
                     written.put += 1;
@@ -881,15 +1039,14 @@ impl<'w, 'a> RowsFolded<'w, 'a> {
             }
         }
         next.owe_cells(self.work.owed_cells.iter().map(|(id, at)| (*id, Serial(at.0))))?;
-        let before = |id: &CellId| self.last.view().cell(&id.of, &id.cell).map_or(CellDigest::ABSENT, |cell| view.digest(cell));
-        let moved = generations.moved(before);
         for id in moved.iter() {
             if next.move_cell(id)? {
                 written.stale_moves += 1;
             }
         }
         let counts = next.counts();
-        let owed = len32(self.work.owed_tasks.len() + self.work.owed_cells.len());
+        let owed = self.work.owed_tasks.len().checked_add(self.work.owed_cells.len()).and_then(|n| u32::try_from(n).ok())
+            .ok_or(AnswerError::Cap { what: "obligations in a certificate", cap: u64::from(u32::MAX) })?;
         let facts = Facts { files: counts.files, printed: close.printed, findings: counts.findings, owed };
         let effects = NextAnswer::finish(next, &close.tree, &summary(&facts), &close.lines)?;
         Ok((effects, written))
@@ -901,6 +1058,9 @@ pub(crate) trait AnswerSink {
     type Error;
     fn put(&mut self, key: Key, bytes: &[u8]) -> Result<(), Self::Error>;
     fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), Self::Error>;
+    fn index_rows(&mut self, owner: Key, records: &[Key], scopes: &[(Name, Key)], alloc: Alloc<'_>) -> Result<(), Self::Error>;
+    fn pin_children(&mut self, names: &RootNames<'_>, segments: &[SegmentRef], lines: Key, alloc: Alloc<'_>) -> Result<(), Self::Error>;
+    fn keep_toolchain(&mut self, scopes: &[(Name, Key)], alloc: Alloc<'_>) -> Result<(), Self::Error>;
 }
 
 /// The command's store as a sink: its puts and pins, visible from its one commit after the
@@ -908,17 +1068,101 @@ pub(crate) trait AnswerSink {
 pub(crate) struct StoreSink<'s, 'c, 'm, 'r, D: Driver, S: Sharing> {
     pub(crate) cx: &'c Cx,
     pub(crate) store: &'s mut CommandStore<'m, 'r, D, S>,
+    pub(crate) lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    pub(crate) toolchain: blaze_toolchain::ToolchainId,
+}
+
+#[derive(Debug)]
+pub(crate) enum PublishError {
+    Command(CliError),
+    Cas(blaze_cas::plain::LentError),
+    ExpansionIndex { record: Key, index: Key, namespace: u64, tag: u16, bytes: usize },
+    RowsIndex { segment: Key, index: Key },
+    RowsReach { segment: Key, cap: usize },
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Command(why) => write!(f, "{why}"),
+            Self::Cas(why) => write!(f, "answer publication: {why}"),
+            Self::ExpansionIndex { record, index, namespace, tag, bytes } => write!(f, "expansion index {index:?} of record {record:?} has namespace {namespace}, tag {tag} and {bytes} bytes"),
+            Self::RowsIndex { segment, index } => write!(f, "rows segment {segment:?} is missing its admitted local payload index {index:?}"),
+            Self::RowsReach { segment, cap } => write!(f, "rows segment {segment:?} reaches more than {cap} record keys"),
+        }
+    }
 }
 
 impl<D: Driver, S: Sharing> AnswerSink for StoreSink<'_, '_, '_, '_, D, S> {
-    type Error = CliError;
+    type Error = PublishError;
 
-    fn put(&mut self, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        self.store.put(self.cx, key, bytes)
+    fn put(&mut self, key: Key, bytes: &[u8]) -> Result<(), PublishError> {
+        self.store.put(self.cx, key, bytes).map_err(PublishError::Command)
     }
 
-    fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), CliError> {
-        self.store.pin(name, keys)
+    fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), PublishError> {
+        self.store.pin(name, keys).map_err(PublishError::Command)
+    }
+
+    fn index_rows(&mut self, owner: Key, records: &[Key], scopes: &[(Name, Key)], alloc: Alloc<'_>) -> Result<(), PublishError> {
+        use blaze_cas::plain::{INDEX_KEYS_MOST, INDEX_TAG, beside_key};
+
+        // CAS reach follows one index level. Include each expansion's key and its owner's
+        // side index so a later carried names row can be indexed again after compaction.
+        let mut keys = blaze_own::BTreeSet::new_in(alloc);
+        let mut keep = |key| {
+            keys.insert(key);
+            if keys.len() > INDEX_KEYS_MOST {
+                return Err(PublishError::RowsReach { segment: owner, cap: INDEX_KEYS_MOST });
+            }
+            Ok(())
+        };
+        for key in records {
+            keep(*key)?;
+        }
+        for &(_, record) in scopes {
+            let index = beside_key(blaze_cas::Key(record.0));
+            // put_all creates this optional local index only for a nonempty expansion set.
+            let Some(held) = self.lent.get(&index).map_err(PublishError::Cas)? else { continue };
+            if held.namespace != blaze_cas::plain::Namespace::LOCAL || held.tag != INDEX_TAG || held.bytes.len() % 32 != 0 || held.bytes.len() / 32 > INDEX_KEYS_MOST {
+                return Err(PublishError::ExpansionIndex { record, index: Key(index.0), namespace: held.namespace.0, tag: held.tag.0, bytes: held.bytes.len() });
+            }
+            keep(Key(index.0))?;
+            for bytes in held.bytes.chunks_exact(32) {
+                keep(Key(ContentId(bytes.try_into().expect("a whole index key"))))?;
+            }
+        }
+        let keys = Vec::from_iter_in(keys.iter().copied(), alloc);
+        self.store.index_beside(self.cx, owner, &keys).map_err(PublishError::Command)
+    }
+
+    fn pin_children(&mut self, names: &RootNames<'_>, segments: &[SegmentRef], lines: Key, alloc: Alloc<'_>) -> Result<(), PublishError> {
+        use blaze_cas::plain::{INDEX_KEYS_MOST, INDEX_TAG, Namespace, ROOT_LIFE_NS, beside_key};
+
+        let mut direct = Vec::with_capacity_in(segments.len() + 1, alloc);
+        direct.extend(segments.iter().map(|one| blaze_cas::Key(one.id)));
+        direct.push(blaze_cas::Key(lines.0));
+        let mut indexes = Vec::with_capacity_in(segments.len() + 1, alloc);
+        indexes.push(self.lent.index(&direct).map_err(PublishError::Cas)?);
+        for one in segments.iter().filter(|one| one.kind == SegmentKind::Rows) {
+            let index = beside_key(blaze_cas::Key(one.id));
+            // A portable segment may arrive before its local reach index. root_through
+            // accepts index names, so check presence before publishing those names.
+            let held = self.lent.get(&index).map_err(PublishError::Cas)?;
+            if !held.is_some_and(|held| held.namespace == Namespace::LOCAL && held.tag == INDEX_TAG && held.bytes.len() % 32 == 0 && held.bytes.len() / 32 <= INDEX_KEYS_MOST) {
+                return Err(PublishError::RowsIndex { segment: Key(one.id), index: Key(index.0) });
+            }
+            indexes.push(index);
+        }
+        for name in [names.checkout_segments.as_str(), names.tree_segments.as_str()] {
+            self.lent.root_through(name, &indexes, ROOT_LIFE_NS).map_err(PublishError::Cas)?;
+        }
+        Ok(())
+    }
+
+    fn keep_toolchain(&mut self, scopes: &[(Name, Key)], alloc: Alloc<'_>) -> Result<(), PublishError> {
+        let keys = Vec::from_iter_in(scopes.iter().filter_map(|(name, key)| self.store.is_toolchain(*name).then_some(*key)), alloc);
+        self.store.keep_toolchain(self.toolchain, &keys).map_err(PublishError::Command)
     }
 }
 
@@ -933,24 +1177,20 @@ pub(crate) struct RowsSaved {
     pub(crate) new_bytes: u64,
 }
 
-/// `effects` written to `sink` in their order (every new segment, then the root), the root
-/// then pinned under the checkout's and the tree's names, with every live segment (the new and
-/// `last`, the last answer's) and the lines record `lines` kept under their `.segments` names.
-pub(crate) fn write_effects<K: AnswerSink>(sink: &mut K, names: &RootNames<'_>, last: &[SegmentRef], effects: &Effects<'_>, lines: Key, alloc: Alloc<'_>) -> Result<RowsSaved, K::Error> {
+/// Each rows segment gets one immutable CAS index at creation. A new root shares the
+/// indexes of every rows segment it carries. Compaction drops the shadowed row records
+/// when it publishes a root that no longer names their segments.
+pub(crate) fn write_effects<K: AnswerSink>(sink: &mut K, names: &RootNames<'_>, effects: &Effects<'_>, alloc: Alloc<'_>) -> Result<RowsSaved, K::Error> {
     let root = root_key(effects.root());
-    let mut kept: AVec<'_, Key> = Vec::with_capacity_in(effects.writes().len() + last.len() + 1, alloc);
-    for write in effects.writes() {
-        if let Write::Segment { at, .. } = write {
-            kept.push(Key(at.id));
-        }
-    }
-    kept.extend(last.iter().map(|one| Key(one.id)));
-    let mut saved = RowsSaved { segments: len32(kept.len()), ..RowsSaved::default() };
-    kept.push(lines);
+    let (records, scopes) = effects.row_records();
+    let mut saved = RowsSaved { segments: len32(effects.segments().len()), ..RowsSaved::default() };
     for write in effects.writes() {
         match write {
             Write::Segment { at, bytes } => {
                 sink.put(Key(at.id), &bytes[..])?;
+                if at.kind == SegmentKind::Rows {
+                    sink.index_rows(Key(at.id), records, scopes, alloc)?;
+                }
                 saved.puts += 1;
                 saved.new_segments += 1;
                 saved.new_bytes += at.len;
@@ -958,10 +1198,10 @@ pub(crate) fn write_effects<K: AnswerSink>(sink: &mut K, names: &RootNames<'_>, 
             Write::Root { bytes } => {
                 sink.put(root, &bytes[..])?;
                 saved.puts += 1;
+                sink.keep_toolchain(scopes, alloc)?;
+                sink.pin_children(names, effects.segments(), Key(ContentId(effects.lines().0)), alloc)?;
                 sink.pin(names.checkout.as_str(), &[root])?;
-                sink.pin(names.checkout_segments.as_str(), &kept)?;
                 sink.pin(names.tree.as_str(), &[root])?;
-                sink.pin(names.tree_segments.as_str(), &kept)?;
             }
         }
     }

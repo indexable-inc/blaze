@@ -16,14 +16,14 @@
 //!   what an answer's status means, `config.json` and its `dl` template, and where the cache
 //!   record of a file lives under the directory grant.
 //! - [`machine`]: the [`machine::Index`] state machine: a batch of asks in, the cache read, one
-//!   batch of conditional requests, retries by [`crate::Limits`], and each ask's files out.
+//!   batch of conditional requests, each tried once (D172), and each ask's files out.
 //!
 //! Why a machine of its own and not new states of [`crate::Machine`]: that machine's unit is a
 //! lock entry with a pin (a SHA-256 or a commit) checked before anything is kept, its requests
 //! carry fixed headers, and its answers carry no headers. An index file has no pin (the
 //! registry's answer is the truth, as cargo takes it), needs a header made per request (the
-//! validator) and reads two of the answer's headers. The two share [`crate::Limits`]'s retry
-//! policy and [`crate::NetFailure`], and a driver runs both over one HTTP client.
+//! validator) and reads two of the answer's headers. The two share [`crate::Limits`] (one try
+//! each, a deadline, a byte limit) and [`crate::NetFailure`], and a driver runs both over one HTTP client.
 
 pub mod line;
 pub mod machine;

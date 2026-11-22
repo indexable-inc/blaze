@@ -18,9 +18,11 @@ fn printed_with(io: &Io, opts: engine_check::Opts<'static>) -> (std::string::Str
     (stdout(io).split_off(before), checked)
 }
 
-/// The note lines of `text` that say a body was not checked.
-fn body_notes(text: &str) -> std::vec::Vec<&str> {
-    text.lines().filter(|line| line.contains("the body of `") && line.contains("was not checked")).collect()
+/// The records of the bodies the last check of `io` did not check (D164): its noted findings
+/// that count a body unchecked, whatever their rule.
+fn refused(io: &Io) -> std::vec::Vec<super::world_run::Noted> {
+    use blaze_report::frame::words::Kind;
+    super::world_run::noted(io).into_iter().filter(|one| matches!(one.kind, Kind::Unchecked | Kind::Grouped | Kind::Failure)).collect()
 }
 
 /// (a) A DEPENDENCY'S NAMES RECORD THAT CANNOT BE READ IS NAMED, WITH ITS ERROR: `a`'s names
@@ -40,23 +42,27 @@ fn an_unreadable_dependency_record_is_named_with_its_error() {
     planted.unreadable = Some("a");
     let (text, checked) = printed_with(&io, planted);
     println!("`a` unreadable: {}\n{text}", entries(&checked));
-    let notes = body_notes(&text);
+    // The records (D164): each refused body's cause key names `a` and the read error.
+    let notes = refused(&io);
     for member in ["b/src/lib.rs", "c/src/lib.rs"] {
-        let mine: std::vec::Vec<&&str> = notes.iter().filter(|line| line.contains(member)).collect();
-        assert!(!mine.is_empty(), "{member}'s bodies are refused (`a` is in its scope):\n{text}");
-        for line in mine {
-            assert!(line.contains("`a`") && line.contains("could not be read"), "{member}'s note names `a` and the read error: {line}");
+        let mine: std::vec::Vec<&super::world_run::Noted> = notes.iter().filter(|one| one.file == member).collect();
+        assert!(!mine.is_empty(), "{member}'s bodies are refused (`a` is in its scope): {notes:?}\n{text}");
+        for one in mine {
+            assert!(one.of.contains("`a`") && one.of.contains("could not be read"), "{member}'s cause names `a` and the read error: {one:?}");
         }
     }
-    assert!(!text.contains("has no names record"), "a record that was there but did not read is not said as none:\n{text}");
-    // (c) `a`'s own bodies, refused at planning.
-    let own: std::vec::Vec<&&str> = notes.iter().filter(|line| line.contains("a/src/lib.rs") || line.contains("a/src/m.rs")).collect();
-    assert!(!own.is_empty(), "`a`'s own bodies are refused (its own record did not read):\n{text}");
-    assert!(!text.contains("the body of `` "), "a body refused at planning prints its label:\n{text}");
-    assert!(own.iter().any(|line| line.contains("the body of `f`")) && own.iter().any(|line| line.contains("the body of `k`")), "`a`'s bodies by their labels: {own:?}");
+    assert!(notes.iter().all(|one| !one.of.contains("has no names record")), "a record that was there but did not read is not said as none: {notes:?}");
+    // (c) `a`'s own bodies, refused at planning: their subjects are their labels.
+    let own: std::vec::Vec<(&str, &str)> = notes.iter().filter(|one| one.file == "a/src/lib.rs" || one.file == "a/src/m.rs").map(|one| (one.file.as_str(), one.item.as_str())).collect();
+    assert!(!own.is_empty(), "`a`'s own bodies are refused (its own record did not read): {notes:?}");
+    assert!(own.iter().all(|(_, item)| !item.is_empty()), "a body refused at planning has its label: {own:?}");
+    assert!(own.contains(&("a/src/lib.rs", "f")) && own.contains(&("a/src/m.rs", "k")), "`a`'s bodies by their labels: {own:?}");
+    // The renderer's snapshot: the default view's line names a body by its label.
+    assert!(!text.contains("the body of `` ") && text.contains("`f` (a/src/lib.rs)"), "a body refused at planning prints its label:\n{text}");
     // CONTROL: unplanted, the same project checks clean (the plant is the cause).
     let (clean, _) = printed_with(&io, opts(&io, 2, true));
-    assert!(body_notes(&clean).is_empty(), "control: no body refused without the plant:\n{clean}");
+    let after = refused(&io);
+    assert!(after.is_empty(), "control: no body refused without the plant: {after:?}\n{clean}");
 }
 
 /// (b) A CRATE WHOSE NAMES TASK REALLY FAILED IS SAID AS SUCH: `p` (a proc-macro crate the
@@ -69,11 +75,11 @@ fn a_failed_names_task_is_named_in_its_dependents_notes() {
     failed_dep(&io);
     let (text, checked) = printed_with(&io, opts(&io, 2, true));
     println!("p fails: {}\n{text}", entries(&checked));
-    let notes = body_notes(&text);
+    let notes = refused(&io);
     for member in ["b/src/lib.rs", "c/src/lib.rs"] {
         assert!(
-            notes.iter().any(|line| line.contains(member) && line.contains("holds `p`") && line.contains("its `CrateScope` task failed")),
-            "{member}'s note names `p` and its failed task:\n{text}"
+            notes.iter().any(|one| one.file == member && one.of.contains("holds `p`") && one.of.contains("its `CrateScope` task failed")),
+            "{member}'s cause names `p` and its failed task: {notes:?}\n{text}"
         );
     }
 }
@@ -154,14 +160,14 @@ fn a_head_asked_again_quotes_its_own_reason() {
     asked_twice(&io);
     let (text, checked) = printed_with(&io, opts(&io, 1, true));
     println!("{}\n{text}", entries(&checked));
-    // A body refused at a seed prints "body `one`: not checked because ..", not `body_notes`'s
-    // planning form ("the body of `..` was not checked").
-    let notes: std::vec::Vec<&str> = text.lines().collect();
-    let readers: std::vec::Vec<&&str> = notes.iter().filter(|line| line.contains("body `one`: not checked") || line.contains("body `two`: not checked")).collect();
-    assert!(!readers.is_empty(), "control: the bodies that call `bad` are refused:\n{text}");
-    for line in readers {
-        assert!(line.contains("the value of a constant its type holds") || line.contains("needs the value of constant `"), "the note quotes `bad`'s own reason: {line}");
-        assert!(!line.contains("failed when first frozen"), "never only that it failed before: {line}");
+    // The records (D164): each body that reads `bad`'s head is refused, its cause key quoting
+    // the head's own reason.
+    let notes = refused(&io);
+    let readers: std::vec::Vec<&super::world_run::Noted> = notes.iter().filter(|one| one.item == "one" || one.item == "two").collect();
+    assert!(!readers.is_empty(), "control: the bodies that call `bad` are refused: {notes:?}\n{text}");
+    for one in readers {
+        assert!(one.of.contains("the value of a constant its type holds") || one.of.contains("needs the value of constant `"), "the cause quotes `bad`'s own reason: {one:?}");
+        assert!(!one.of.contains("failed when first frozen"), "never only that it failed before: {one:?}");
     }
 }
 
@@ -243,8 +249,10 @@ fn a_failed_dependency_head_keeps_its_reason_for_every_reader() {
         two_readers_of_a_failed_dependency_head(&io);
         let (text, checked) = printed_with(&io, opts(&io, workers, true));
         println!("{workers} worker(s): {}\n{text}", entries(&checked));
+        let notes = refused(&io);
         for (member, body) in [("a/src/lib.rs", "first"), ("b/src/lib.rs", "second")] {
-            let note = text.lines().find(|line| line.contains(member) && line.contains(body)).unwrap_or_else(|| panic!("{workers}: `{body}` is refused with a note:\n{text}"));
+            // Its record (D164), said in its own words.
+            let note = notes.iter().find(|one| one.file == member && one.item == body).map(|one| one.words.as_str()).unwrap_or_else(|| panic!("{workers}: `{body}` is refused with a record: {notes:?}\n{text}"));
             // Since a body never freezes a member's head itself (lanes RU1..RU3), `first` is
             // refused for ITS OWN head (`a::first`, whose signature names `FixtureBad`: its head
             // task failed for the constant's reason), not for `core::FixtureBad` frozen by its
@@ -265,4 +273,37 @@ fn a_failed_dependency_head_keeps_its_reason_for_every_reader() {
         // `b::second`): no body's seed reaches `core::FixtureBad` any more (see above).
         assert!(grouped[0].contains("head(s) failed: ") && grouped[0].contains("the value of a constant its type holds") && grouped[0].contains("`a::first`") && grouped[0].contains("`b::second`"), "{workers}: the group names each failed head once: {}", grouped[0]);
     }
+}
+
+/// Refusal classes ignore item keys, expression IDs, type IDs and byte ranges, while keeping
+/// distinct words separate. The most frequent class is printed first, as the profile promises.
+#[test]
+fn refusal_profile_groups_normalized_causes() {
+    use crate::engine_bodies::{refused_cause, Said};
+    use bstd::mem::{Frame, Tag};
+
+    let frame = Frame::with_reserve(1 << 16, Tag::Other).expect("the profile test's frame");
+    let notes = [
+        Said::Refused("scope ItemKey(abcdef1234) at ExprId(3): PTy(4), bytes 12..24"),
+        Said::Refused("scope ItemKey(deadbeef) at ExprId(9): PTy(17), bytes 88..99"),
+        Said::Refused("different ItemKey(aa55) at ExprId(2): PTy(6)"),
+    ];
+    let mut grouped = std::collections::BTreeMap::<std::string::String, usize>::new();
+    for note in &notes {
+        let cause = refused_cause(note, None, &frame);
+        *grouped.entry(std::string::String::from(cause.as_str())).or_default() += 1;
+    }
+    let mut lines: std::vec::Vec<std::string::String> = grouped
+        .into_iter()
+        .map(|(cause, count)| std::format!("bodies: refused by cause: {count} {cause}"))
+        .collect();
+    lines.sort_by(|left, right| right.cmp(left));
+    assert_eq!(
+        lines,
+        [
+            "bodies: refused by cause: 2 Refused: scope ItemKey(#) at ExprId(#): PTy(#), bytes #..#",
+            "bodies: refused by cause: 1 Refused: different ItemKey(#) at ExprId(#): PTy(#)",
+        ],
+        "the profile classes normalize keys and IDs, then order by count",
+    );
 }

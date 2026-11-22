@@ -34,6 +34,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
+use blaze_sys::posix::{io, proc, thread};
+use blaze_sys::{Errno as SysErrno, Path as SysPath};
+
 pub use super::unix::{
     Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize,
     wait_answer,
@@ -127,7 +130,7 @@ pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
             micros,
         )
     };
-    got != -libc::ETIMEDOUT
+    got != -i32::from(SysErrno::TimedOut.raw())
 }
 
 pub fn wake(word: &AtomicU64) {
@@ -163,24 +166,12 @@ pub fn page() -> u64 {
 
 fn sysctl_int(name: &CStr) -> Result<i64, Error> {
     let mut value = [0u8; 8];
-    let mut len = value.len();
-    // SAFETY: `name` is NUL-terminated; `value` has `len` writable bytes and `len` is live.
-    let got = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if got != 0 {
-        return Err(Error::new(format!(
-            "sysctl {}: {}",
-            name.to_string_lossy(),
-            std::io::Error::last_os_error()
-        )));
-    }
+    let len = thread::sysctl_bytes(name, &mut value)
+        .and_then(|len| len.ok_or(SysErrno::NoEnt))
+        .map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("sysctl {}: {error}", name.to_string_lossy()))
+        })?;
     match len {
         4 => Ok(i64::from(i32::from_ne_bytes([value[0], value[1], value[2], value[3]]))),
         8 => Ok(i64::from_ne_bytes(value)),
@@ -505,7 +496,7 @@ impl Drop for Exec {
     fn drop(&mut self) {
         // SAFETY: `at..at + len` is this `Exec`'s own mapping; every slice of it borrowed `self`
         // or ended with `Exec::new`'s `write`.
-        unsafe { libc::munmap(self.at.cast(), self.len) };
+        let _ = unsafe { io::munmap(std::ptr::NonNull::new_unchecked(self.at), self.len) };
     }
 }
 
@@ -521,22 +512,19 @@ impl Exec {
         let len = code_pages + data.next_multiple_of(page);
         // SAFETY: an anonymous mapping at no fixed address: nothing of this process is replaced.
         let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
+            io::mmap(
+                None,
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
+                io::Prot::READ | io::Prot::WRITE,
+                io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS,
+                None,
                 0,
             )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(Error::new(format!(
-                "mmap of {len:#x} bytes of code and data: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let exec = Exec { at: at.cast(), code_pages, len, data };
+        }.map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("mmap of {len:#x} bytes of code and data: {error}"))
+        })?;
+        let exec = Exec { at: at.as_ptr(), code_pages, len, data };
         // SAFETY: the fresh mapping of `len` readable and writable bytes, which nothing else
         // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
         // disjoint and in it. `write` can't keep them past its return (they borrow for the call).
@@ -545,14 +533,10 @@ impl Exec {
         let data_bytes = unsafe { std::slice::from_raw_parts_mut(exec.at.add(code_pages), data) };
         write(code_bytes, data_bytes);
         // SAFETY: the code's pages of the mapping above, which nothing writes from here on.
-        if unsafe { libc::mprotect(exec.at.cast(), code_pages, libc::PROT_READ | libc::PROT_EXEC) }
-            != 0
-        {
-            return Err(Error::new(format!(
-                "mprotect of {code_pages:#x} bytes of code to read and execute: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        unsafe { io::mprotect(at, code_pages, io::Prot::READ | io::Prot::EXEC) }.map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("mprotect of {code_pages:#x} bytes of code to read and execute: {error}"))
+        })?;
         // SAFETY: the code's pages, mapped; the maintenance changes no value.
         unsafe { sys_icache_invalidate(exec.at.cast(), code) };
         Ok(exec)
@@ -580,8 +564,7 @@ fn check_unsigned_code() -> Result<(), Error> {
     CHECKED
         .get_or_init(|| {
             let mut flags: u32 = 0;
-            // SAFETY: getpid has no preconditions.
-            let pid = unsafe { libc::getpid() };
+            let pid = thread::getpid();
             // SAFETY: CS_OPS_STATUS writes this process's 4-byte code-signing status to `flags`,
             // which is live and writable.
             let got = unsafe { csops(pid, CS_OPS_STATUS, (&raw mut flags).cast(), size_of::<u32>()) };
@@ -756,14 +739,13 @@ pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
             .map_err(|_| Error::new(format!("{} has a NUL", it.display())))
     };
     let (source, target) = (path(from)?, path(to)?);
-    // SAFETY: both are NUL-terminated paths live for the call; clonefile makes `target` new.
-    if unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ENOTSUP | libc::EXDEV) => Ok(false),
-        _ => Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display()))),
+    match proc::clone_file(SysPath::new(&source), SysPath::new(&target)) {
+        Ok(()) => Ok(true),
+        Err(SysErrno::NotSup | SysErrno::XDev) => Ok(false),
+        Err(errno) => {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display())))
+        }
     }
 }
 
@@ -777,12 +759,12 @@ pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
             .map_err(|_| Error::new(format!("{capacity} threads in process {pid}")))?;
         // SAFETY: `out` has `capacity` writable u64s, `bytes` bytes, for the IDs.
         let got = unsafe {
-            libc::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, out.as_mut_ptr().cast(), bytes)
+            thread::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, out.as_mut_ptr().cast(), bytes)
         };
         if got <= 0 {
             let error = std::io::Error::last_os_error();
             out.clear();
-            if got == 0 || error.raw_os_error() == Some(libc::ESRCH) {
+            if got == 0 || error.raw_os_error() == Some(SysErrno::Srch.raw().into()) {
                 return Ok(());
             }
             return Err(Error::new(format!(
@@ -803,8 +785,5 @@ pub fn service() -> Option<String> {
 }
 
 pub fn thread_id() -> u64 {
-    let mut id = 0u64;
-    // SAFETY: a null thread is the calling one; `id` is a live out-pointer.
-    unsafe { libc::pthread_threadid_np(0, &raw mut id) };
-    id
+    thread::thread_id()
 }

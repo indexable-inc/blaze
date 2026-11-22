@@ -10,25 +10,24 @@
 //! Cost: two reads of each pair, one write of each item and two of each row's counter; it is
 //! the radix sort's single pass with the digit as wide as the rows.
 
-use std::{
-    alloc::{Allocator, Global},
-    fmt,
-};
+use core::{alloc::Allocator, fmt};
+use std::alloc::Global;
 
 #[cfg(test)]
 mod tests;
 
 /// Lists of items by row, in compressed sparse row form, both columns in `A` (a query's frame,
-/// say).
-pub struct Csr<T, A: Allocator = Global> {
+/// say). `A` has no default: each use names where the columns live.
+pub struct Csr<T, A: Allocator> {
     /// One more than the rows, or empty for no rows: row `r` is `starts[r]..starts[r + 1]`.
     starts: Vec<u32, A>,
     items: Vec<T, A>,
 }
 
-impl<T> Default for Csr<T> {
-    fn default() -> Csr<T> {
-        Csr::new()
+/// No rows, in `A`'s default value: for an allocator that is a handle with one value.
+impl<T, A: Allocator + Clone + Default> Default for Csr<T, A> {
+    fn default() -> Csr<T, A> {
+        Csr::new_in(A::default())
     }
 }
 
@@ -54,42 +53,35 @@ impl<T, A: Allocator + Clone> Csr<T, A> {
     }
 }
 
-impl<T> Csr<T> {
-    /// No rows, allocating nothing.
-    pub const fn new() -> Csr<T> {
-        Csr { starts: Vec::new(), items: Vec::new() }
+impl<T> Csr<T, Global> {
+    /// No rows on the global heap, allocating nothing.
+    ///
+    /// Deprecated: names no allocator; use [`Csr::new_in`]. Goes with its last caller,
+    /// blaze-ids' many.rs.
+    pub const fn new() -> Csr<T, Global> {
+        Csr { starts: Vec::new_in(Global), items: Vec::new_in(Global) }
     }
+}
 
+impl<T, A: Allocator + Clone> Csr<T, A> {
     /// The lists of `rows` rows from `(row, item)` pairs, each row's items in the order of their
-    /// pairs. Allocates its two columns exactly and the cursors for the walk. A row at or past
-    /// `rows`, or more than `u32::MAX` pairs, is a bug and panics.
-    pub fn build<I>(rows: usize, pairs: I) -> Csr<T>
+    /// pairs, both columns in `alloc` and the walk's cursors in `scratch` (a query's frame,
+    /// say). Allocates the two columns exactly. A row at or past `rows`, or more than
+    /// `u32::MAX` pairs, is a bug and panics.
+    pub fn build_in<I, S>(rows: usize, pairs: I, alloc: A, scratch: S) -> Csr<T, A>
     where
         I: IntoIterator<Item = (u32, T)>,
         I::IntoIter: Clone,
+        S: Allocator,
     {
-        let mut csr = Csr::new();
-        // alloc: the walk's cursors, one per row, freed on return
-        csr.rebuild(rows, pairs, &mut Vec::new());
-        csr
-    }
-
-    /// [`Csr::build`] with the walk's cursors in `scratch` (a query's frame, say): the two
-    /// columns are its only allocations on the heap.
-    pub fn build_in<I, A>(rows: usize, pairs: I, scratch: A) -> Csr<T>
-    where
-        I: IntoIterator<Item = (u32, T)>,
-        I::IntoIter: Clone,
-        A: Allocator,
-    {
-        let mut csr = Csr::new();
+        let mut csr = Csr::new_in(alloc);
         csr.rebuild(rows, pairs, &mut Vec::with_capacity_in(rows, scratch));
         csr
     }
 }
 
 impl<T, A: Allocator> Csr<T, A> {
-    /// [`Csr::build`] in place, its columns and `cursors` (left unspecified, in any allocator)
+    /// [`Csr::build_in`] in place, its columns and `cursors` (left unspecified, in any allocator)
     /// reused: no allocation once they have the room.
     pub fn rebuild<I, B>(&mut self, rows: usize, pairs: I, cursors: &mut Vec<u32, B>)
     where
@@ -156,7 +148,7 @@ impl<T, A: Allocator> Csr<T, A> {
 
     /// Where row `row`'s items are in [`Csr::items`].
     #[inline]
-    pub fn range(&self, row: usize) -> std::ops::Range<usize> {
+    pub fn range(&self, row: usize) -> core::ops::Range<usize> {
         self.starts[row] as usize..self.starts[row + 1] as usize
     }
 
@@ -190,25 +182,26 @@ impl<T, A: Allocator> Csr<T, A> {
     }
 }
 
-impl Csr<u32> {
-    /// The graph of `edges` (`(source, target)`) over `nodes` nodes: row `s` holds the targets
-    /// of `s` ascending, repeats kept, which is the order a sort of the edges by
-    /// `(source, target)` gives. Two counting passes, by target and then stably by source,
-    /// with no comparison.
-    pub fn graph<I>(nodes: usize, edges: I) -> Csr<u32>
+impl<A: Allocator + Clone> Csr<u32, A> {
+    /// The graph of `edges` (`(source, target)`) over `nodes` nodes, in `alloc`, with the
+    /// sources by target and the walks' cursors in `scratch`: row `s` holds the targets of `s`
+    /// ascending, repeats kept, which is the order a sort of the edges by `(source, target)`
+    /// gives. Two counting passes, by target and then stably by source, with no comparison.
+    pub fn graph_in<I, S>(nodes: usize, edges: I, alloc: A, scratch: S) -> Csr<u32, A>
     where
         I: IntoIterator<Item = (u32, u32)>,
         I::IntoIter: Clone,
+        S: Allocator + Clone,
     {
-        let mut graph = Csr::new();
-        // alloc: the sources by target and the walks' cursors, freed on return
-        graph.rebuild_graph(nodes, edges, &mut Csr::new(), &mut Vec::new());
+        let mut graph = Csr::new_in(alloc);
+        let mut cursors = Vec::new_in(scratch.clone());
+        graph.rebuild_graph(nodes, edges, &mut Csr::new_in(scratch), &mut cursors);
         graph
     }
 }
 
 impl<A: Allocator> Csr<u32, A> {
-    /// [`Csr::graph`] in place, with `by_target` and `cursors` as the reused scratch (left
+    /// [`Csr::graph_in`] in place, with `by_target` and `cursors` as the reused scratch (left
     /// unspecified), each in any allocator.
     pub fn rebuild_graph<I, S: Allocator, B: Allocator>(
         &mut self,

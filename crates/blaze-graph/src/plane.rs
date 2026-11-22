@@ -842,7 +842,7 @@ struct Batch {
     /// For Kahn's order: each place's deps of the batch not yet placed; the places that wait
     /// for each, as CSR; the places that can go, least first.
     waiting: Vec<u32>,
-    then: radix::Csr<u32>,
+    then: radix::Csr<u32, Global>,
     /// `then`'s rebuild cursors, kept.
     cursors: Vec<u32>,
     /// A 4-ary min-heap: the places are distinct, so the order is the places' own.

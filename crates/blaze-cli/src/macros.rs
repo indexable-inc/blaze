@@ -77,7 +77,7 @@ impl Place<'_, '_> {
 }
 
 /// A macro crate's subject: its name and version.
-fn subject(unit: &Unit<'_>) -> ContentId {
+pub(crate) fn subject(unit: &Unit<'_>) -> ContentId {
     let mut text = std::vec::Vec::new_in(Global);
     text.extend_from_slice(unit.name.as_str().as_bytes());
     text.push(b' ');
@@ -90,17 +90,39 @@ fn subject(unit: &Unit<'_>) -> ContentId {
 /// graph is scratch, made over `scratch` and dropped here.
 pub(crate) fn parts(graph_source: ContentId, graph_record: &[u8], scratch: Alloc<'_>) -> Result<std::vec::Vec<(Name, ContentId), Global>, blaze_unit_graph::record::RecordRefused> {
     let decoded = blaze_unit_graph::record::decode(graph_record, scratch)?;
-    let mut parts = std::vec::Vec::new_in(Global);
-    for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
-        let subject = subject(unit);
-        let mut source = std::vec::Vec::new_in(Global);
-        source.extend_from_slice(&graph_source.0);
-        source.extend_from_slice(&subject.0);
+    let made = parts_of(graph_source, &decoded.graph, scratch);
+    let mut parts = std::vec::Vec::with_capacity_in(made.len(), Global);
+    parts.extend_from_slice(&made);
+    Ok(parts)
+}
+
+/// The `MacroModule` parts of the decoded graph `graph` over the graph source `graph_source`
+/// ([`parts`]'s one maker): for a reader that already holds the decoded graph (engine_units.rs
+/// discover, over the names world's), so the graph section is decoded once a command.
+pub(crate) fn parts_of<A: core::alloc::Allocator>(graph_source: ContentId, graph: &blaze_unit_graph::UnitGraph<'_>, alloc: A) -> blaze_own::Vec<(Name, ContentId), A> {
+    parts_of_subjects(graph_source, macro_subjects(graph), alloc)
+}
+
+/// Each proc-macro unit's subject ([`subject`]), in the graph's order (repeats kept).
+pub(crate) fn macro_subjects<'g>(graph: &'g blaze_unit_graph::UnitGraph<'_>) -> impl Iterator<Item = ContentId> + 'g {
+    graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)).map(subject)
+}
+
+/// The `MacroModule` parts of the proc-macro crates `subjects` over the graph source
+/// `graph_source`: [`parts_of`] without the graph, for a reader of the crate list's macro table
+/// (crate_list.rs version 6, engine_units.rs `read_back`: no graph decoded under a standing
+/// graph). Sorted by subject, each once.
+pub(crate) fn parts_of_subjects<A: core::alloc::Allocator>(graph_source: ContentId, subjects: impl Iterator<Item = ContentId>, alloc: A) -> blaze_own::Vec<(Name, ContentId), A> {
+    let mut parts = blaze_own::Vec::new_in(alloc);
+    for subject in subjects {
+        let mut source = [0u8; 64];
+        source[..32].copy_from_slice(&graph_source.0);
+        source[32..].copy_from_slice(&subject.0);
         parts.push((Name::new(Kind::MacroModule, subject), ContentId::of(SOURCE_DOMAIN, &source)));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);
-    Ok(parts)
+    parts
 }
 
 /// Why the macro crates of a command could not be listed.

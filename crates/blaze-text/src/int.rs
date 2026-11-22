@@ -6,8 +6,10 @@
 //! `{:b}` are.
 
 use blaze_int::{Int as _, idx};
+use blaze_own::planted::{NoPlant, Planted};
 
 use crate::ascii::{Ascii, LOWER, UPPER};
+use crate::plant::TextPlant;
 
 /// Room for any integer in any form here: 128 binary digits.
 pub(crate) const ROOM: usize = 128;
@@ -36,29 +38,42 @@ pub trait Integer: Copy + sealed::Sealed {
     /// Its bits, two's complement at its own width, zero-extended.
     #[doc(hidden)]
     fn bits(self) -> u128;
+    /// Its decimal digits (no sign) before the first of `out`, under a control's plant
+    /// ([`NoPlant`] where it ships).
+    #[doc(hidden)]
+    fn decimal_into_planted<P: Planted<TextPlant>>(self, out: &mut Decimal, plant: P);
     /// Its decimal digits (no sign) before the first of `out`.
     #[doc(hidden)]
-    fn decimal_into(self, out: &mut Decimal);
+    #[inline(always)]
+    fn decimal_into(self, out: &mut Decimal) {
+        self.decimal_into_planted(out, NoPlant);
+    }
 }
 
 /// `n`'s decimal digits before the first of `out`, two at a time.
 #[inline]
-pub(crate) fn u64_into<const N: usize>(mut n: u64, out: &mut Ascii<N>) {
+pub(crate) fn u64_into<const N: usize>(n: u64, out: &mut Ascii<N>) {
+    u64_into_planted(n, out, NoPlant);
+}
+
+/// [`u64_into`] under a control's plant, which reaches every two-digit table read.
+#[inline]
+pub(crate) fn u64_into_planted<const N: usize, P: Planted<TextPlant>>(mut n: u64, out: &mut Ascii<N>, plant: P) {
     // Past eight digits, the low eight at a time: one 64-bit division, then 32-bit arithmetic
     // on two independent halves of four, which the core overlaps.
     while n >= 100_000_000 {
         let low = (n % 100_000_000).truncate_to::<u32>();
         n /= 100_000_000;
-        eight_into(low, out);
+        eight_into(low, out, plant);
     }
     let mut m = n.truncate_to::<u32>();
     while m >= 100 {
         let r = m % 100;
         m /= 100;
-        out.front_pair(idx(r));
+        out.front_pair(idx(r), plant);
     }
     if m >= 10 {
-        out.front_pair(idx(m));
+        out.front_pair(idx(m), plant);
     } else {
         out.front_digit(&LOWER, idx(m));
     }
@@ -66,28 +81,34 @@ pub(crate) fn u64_into<const N: usize>(mut n: u64, out: &mut Ascii<N>) {
 
 /// Exactly eight digits of `n` (below 10^8), zeros kept.
 #[inline(always)]
-fn eight_into<const N: usize>(n: u32, out: &mut Ascii<N>) {
+fn eight_into<const N: usize, P: Planted<TextPlant>>(n: u32, out: &mut Ascii<N>, plant: P) {
     let (high, low) = (n / 10_000, n % 10_000);
-    out.front_pair(idx(low % 100));
-    out.front_pair(idx(low / 100));
-    out.front_pair(idx(high % 100));
-    out.front_pair(idx(high / 100));
+    out.front_pair(idx(low % 100), plant);
+    out.front_pair(idx(low / 100), plant);
+    out.front_pair(idx(high % 100), plant);
+    out.front_pair(idx(high / 100), plant);
 }
 
 const TEN_19: u64 = 10_000_000_000_000_000_000;
 
 /// `n`'s decimal digits before the first of `out`: 19 digits at a time through `u64`.
 #[inline]
-pub(crate) fn u128_into<const N: usize>(mut n: u128, out: &mut Ascii<N>) {
+pub(crate) fn u128_into<const N: usize>(n: u128, out: &mut Ascii<N>) {
+    u128_into_planted(n, out, NoPlant);
+}
+
+/// [`u128_into`] under a control's plant.
+#[inline]
+pub(crate) fn u128_into_planted<const N: usize, P: Planted<TextPlant>>(mut n: u128, out: &mut Ascii<N>, plant: P) {
     loop {
         if let Ok(small) = n.narrow::<u64>() {
-            u64_into(small, out);
+            u64_into_planted(small, out, plant);
             return;
         }
         let chunk = (n % u128::from(TEN_19)).truncate_to::<u64>();
         n /= u128::from(TEN_19);
         let before = out.len();
-        u64_into(chunk, out);
+        u64_into_planted(chunk, out, plant);
         // Each chunk below the top one is exactly 19 digits.
         for _ in out.len() - before..19 {
             out.front_digit(&LOWER, 0);
@@ -165,8 +186,8 @@ macro_rules! small_unsigned {
                 self.widen_to::<u128>()
             }
             #[inline(always)]
-            fn decimal_into(self, out: &mut Decimal) {
-                u64_into(self.to64(), out);
+            fn decimal_into_planted<P: Planted<TextPlant>>(self, out: &mut Decimal, plant: P) {
+                u64_into_planted(self.to64(), out, plant);
             }
         }
     )*};
@@ -190,8 +211,8 @@ macro_rules! small_signed {
                 self.cast_unsigned().widen_to::<u128>()
             }
             #[inline(always)]
-            fn decimal_into(self, out: &mut Decimal) {
-                u64_into(self.unsigned_abs().to64(), out);
+            fn decimal_into_planted<P: Planted<TextPlant>>(self, out: &mut Decimal, plant: P) {
+                u64_into_planted(self.unsigned_abs().to64(), out, plant);
             }
         }
     )*};
@@ -216,8 +237,8 @@ impl Integer for u128 {
         self
     }
     #[inline(always)]
-    fn decimal_into(self, out: &mut Decimal) {
-        u128_into(self, out);
+    fn decimal_into_planted<P: Planted<TextPlant>>(self, out: &mut Decimal, plant: P) {
+        u128_into_planted(self, out, plant);
     }
 }
 
@@ -237,16 +258,22 @@ impl Integer for i128 {
         self.cast_unsigned()
     }
     #[inline(always)]
-    fn decimal_into(self, out: &mut Decimal) {
-        u128_into(self.unsigned_abs(), out);
+    fn decimal_into_planted<P: Planted<TextPlant>>(self, out: &mut Decimal, plant: P) {
+        u128_into_planted(self.unsigned_abs(), out, plant);
     }
 }
 
 /// `x` in decimal with its sign.
 #[inline(always)]
 pub(crate) fn decimal<I: Integer>(x: I) -> Decimal {
+    decimal_planted(x, NoPlant)
+}
+
+/// [`decimal`] under a control's plant: the path every decimal writer takes.
+#[inline(always)]
+pub(crate) fn decimal_planted<I: Integer, P: Planted<TextPlant>>(x: I, plant: P) -> Decimal {
     let mut out = Decimal::at_end();
-    x.decimal_into(&mut out);
+    x.decimal_into_planted(&mut out, plant);
     if x.negative() {
         out.front(b'-');
     }

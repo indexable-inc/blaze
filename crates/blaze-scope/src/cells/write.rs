@@ -59,7 +59,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// A `#[macro_export]` macro of the root that the record writer publishes after the solve
     /// (task/exports.rs): one an expansion wrote, or one in the text of a module an expansion
     /// or a block made. The root's own scope is written without it, as the old core's is.
-    fn published_later(&self, origin: Origin, frag: FragId) -> bool {
+    pub(super) fn published_later(&self, origin: Origin, frag: FragId) -> bool {
         origin == Origin::MacroExport && (self.depth(frag) > 0 || self.frags[frag as usize].module >= self.walked)
     }
 

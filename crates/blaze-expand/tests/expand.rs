@@ -470,6 +470,31 @@ fn cfg_reads_its_outcome() {
     assert_eq!(show(&exp.tokens), "false");
 }
 
+/// `cfg!` evaluates its predicate itself and records one read per atom, in evaluation order
+/// (every atom, no short cut), each with its own outcome; the predicate's text is no subject.
+/// Control: a lone atom is one read whose subject is that atom.
+#[test]
+fn cfg_records_each_atom_it_evaluated() {
+    let cx = TestCx::new();
+    let exp = call_fn(&builtin(BuiltinFn::Cfg), "any(windows, all(unix, not(feature = \"a\\\"b\")))", &cx);
+    assert_eq!(show(&exp.tokens), "true");
+    let reads: Vec<_> = exp.reads.list().iter().map(|it| (it.kind, exp.reads.subject(it).to_string(), it.answer)).collect();
+    assert_eq!(
+        reads,
+        [
+            (ReadKind::Cfg, "windows".to_string(), ReadAnswer::Bool(false)),
+            (ReadKind::Cfg, "unix".to_string(), ReadAnswer::Bool(true)),
+            (ReadKind::Cfg, "feature = \"a\\\"b\"".to_string(), ReadAnswer::Bool(false)),
+        ]
+    );
+    assert!(reads.iter().all(|(_, subject, _)| !subject.contains("any")), "the predicate's text is no subject");
+    let lone = call_fn(&builtin(BuiltinFn::Cfg), "unix", &cx);
+    assert_eq!(lone.reads.list().len(), 1);
+    // A predicate that is none is the builtin's own error, never a host's.
+    let bad = call_fn(&builtin(BuiltinFn::Cfg), "not(unix, windows)", &cx);
+    assert!(matches!(bad.diagnostics[..], [Diagnostic::Builtin { .. }]));
+}
+
 #[test]
 fn env_records_its_read() {
     let cx = TestCx::new();
@@ -1062,6 +1087,102 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
     assert!(matches!(eval("unix test").0, Err(CfgPredicateError::Malformed { .. })));
     assert!(matches!(eval("feature = 3").0, Err(CfgPredicateError::Malformed { .. })));
     assert_eq!(eval("any(unix, unknown)").0, Err(CfgPredicateError::Atom(())));
+}
+
+/// A predicate drawn from `tape` over the four atoms of [`TRI_ATOMS`], at most `depth` groups
+/// deep (`any`, `all`, `not`, each with a trailing comma sometimes).
+fn drawn_predicate(tape: &Tape, depth: u32) -> String {
+    if depth == 0 || !tape.bool("a group") {
+        return (*tape.pick(&TRI_ATOMS, "atom").unwrap_or(&TRI_ATOMS[0])).to_owned();
+    }
+    match tape.below(3, "group") {
+        0 => format!("not({})", drawn_predicate(tape, depth - 1)),
+        op => {
+            let parts: Vec<String> = (0..tape.below(4, "members")).map(|_| drawn_predicate(tape, depth - 1)).collect();
+            let comma = if !parts.is_empty() && tape.bool("trailing comma") { "," } else { "" };
+            format!("{}({}{comma})", if op == 1 { "any" } else { "all" }, parts.join(", "))
+        }
+    }
+}
+
+/// The atoms of [`drawn_predicate`], as written.
+const TRI_ATOMS: [&str; 4] = ["test", "unix", "feature = \"x\"", "target_os = \"macos\""];
+
+/// The atom of [`TRI_ATOMS`] that `name` and `value` are.
+fn tri_atom(name: &str, value: Option<&str>) -> usize {
+    match (name, value) {
+        ("test", None) => 0,
+        ("unix", None) => 1,
+        ("feature", Some("x")) => 2,
+        ("target_os", Some("macos")) => 3,
+        other => panic!("an atom the generator does not write: {other:?}"),
+    }
+}
+
+/// THE ONE EVALUATOR'S TWO FORMS AGREE (rule 30): wherever every atom is known, the Kleene
+/// outcome (`cfg_predicate_tri`) is the two-valued one; and where some are not, a known outcome
+/// (`Yes` or `No`) is what EVERY completion of the unknown atoms gives: plan time never says a
+/// wrong `No`. Controls: a predicate whose outcome turns on its unknown atom is `Unknown`, and
+/// `any(test, unix)` with `test` known true is `Yes` though `unix` is not known.
+#[test]
+fn a_cfg_predicate_in_three_values_agrees_with_two() {
+    use blaze_expand::{Tri, cfg_predicate_tri};
+    let tri_of = |text: &str, known: [Option<bool>; 4]| {
+        let tokens = lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the predicate lexes");
+        cfg_predicate_tri(&tokens, 0..tokens.tokens().len(), blaze_own::testing::heap().alloc(), &mut |n, v| match known[tri_atom(n, v)] {
+            Some(value) => Tri::of(value),
+            None => Tri::Unknown,
+        })
+    };
+    let two_of = |text: &str, set: [bool; 4]| {
+        let tokens = lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the predicate lexes");
+        cfg_predicate(&tokens, blaze_own::testing::heap().alloc(), &mut |n, v| Ok::<bool, ()>(set[tri_atom(n, v)]))
+    };
+    blaze_sim::check(Config::cases(400), |tape: &Tape| {
+        let text = drawn_predicate(tape, 3);
+        let known: [Option<bool>; 4] = core::array::from_fn(|_| match tape.below(3, "atom value") {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        });
+        let tri = tri_of(&text, known);
+        let mut outcomes = [false; 2];
+        for completion in 0..16u32 {
+            let set: [bool; 4] = core::array::from_fn(|at| known[at].unwrap_or(completion & (1 << at) != 0));
+            if (0..4).any(|at| known[at].is_some_and(|value| value != (completion & (1 << at) != 0))) {
+                continue;
+            }
+            let two = two_of(&text, set);
+            match (&tri, &two) {
+                (Ok(_), Ok(b)) => outcomes[usize::from(*b)] = true,
+                (Err(_), Err(_)) => return Ok(()),
+                _ => return Err(Broke::Oracle(format!("`{text}`: one form refused it and the other did not: {tri:?} against {two:?}"))),
+            }
+        }
+        let tri = tri.map_err(|why| Broke::Oracle(format!("`{text}` refused: {why:?}")))?;
+        let want = match outcomes {
+            [true, false] => Tri::No,
+            [false, true] => Tri::Yes,
+            _ => Tri::Unknown,
+        };
+        // Kleene is sound, not complete: `all(unix, not(unix))` is `No` in every completion and
+        // `Unknown` here. So a known outcome must be every completion's, and with every atom
+        // known (one completion) the two forms are equal.
+        let all_known = known.iter().all(Option::is_some);
+        let fine = match tri {
+            Tri::Unknown => !all_known,
+            known_tri => known_tri == want,
+        };
+        if !fine {
+            return Err(Broke::Oracle(format!("`{text}` under {known:?}: three values say {tri:?}, its completions say {want:?}")));
+        }
+        Ok(())
+    });
+    // Controls.
+    assert_eq!(tri_of("unix", [None, None, None, None]), Ok(Tri::Unknown), "an unknown atom's own outcome is unknown");
+    assert_eq!(tri_of("any(test, unix)", [Some(true), None, None, None]), Ok(Tri::Yes), "`any` with one known `Yes` is `Yes`");
+    assert_eq!(tri_of("all(test, unix)", [Some(false), None, None, None]), Ok(Tri::No), "`all` with one known `No` is `No`");
+    assert_eq!(tri_of("not(test)", [Some(true), None, None, None]), Ok(Tri::No));
 }
 
 /// A CRLF file lexes as rustc reads it, each `\r\n` a `\n` (the reference's CRLF

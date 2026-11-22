@@ -12,7 +12,6 @@ use blaze_surface::{
 
 use crate::facts::Name;
 use crate::read::{Answer, NameAnswer, Read};
-use crate::resolver::MAX_MODULE_DEPTH;
 
 const HELPERS_DOMAIN: &str = "blaze-scope derive helpers 1";
 

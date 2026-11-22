@@ -11,9 +11,12 @@
 
 use core::{alloc::Allocator, fmt, mem};
 
-use blaze_own::{String, Vec};
+use blaze_own::{
+    String, Vec,
+    planted::{NoPlant, Planted},
+};
 
-use crate::Value;
+use crate::{DataPlant, Value};
 
 pub struct Map<A: Allocator> {
     entries: Vec<(String<A>, Value<A>), A>,
@@ -86,8 +89,19 @@ impl<A: Allocator> Map<A> {
     /// `key` set to `value`: a new key goes last in insertion order; a present one keeps its
     /// place and its old value is handed back.
     pub fn insert(&mut self, key: String<A>, value: Value<A>) -> Option<Value<A>> {
+        self.insert_planted(key, value, NoPlant)
+    }
+
+    /// [`Map::insert`] with a control's plant: [`DataPlant::DuplicateOnHit`] adds a present key
+    /// a second time. Shipped code calls [`Map::insert`].
+    pub fn insert_planted(
+        &mut self,
+        key: String<A>,
+        value: Value<A>,
+        plant: impl Planted<DataPlant>,
+    ) -> Option<Value<A>> {
         match self.find(key.as_str()) {
-            Ok(slot) if crate::plant::replace_on_hit() => {
+            Ok(slot) if !plant.has(DataPlant::DuplicateOnHit) => {
                 let index = self.order[slot];
                 Some(mem::replace(&mut self.entries[index].1, value))
             }

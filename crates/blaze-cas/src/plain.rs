@@ -4,7 +4,7 @@
 //! existing get/put"), shaped by the owner's targets (128-core servers, 8-16-core Macs):
 //! readers take no lock, each process writes its own segment, the flip is the only lock, no
 //! sync on the edit path, compaction never stops a build. Chosen per store root by
-//! `<root>/store.json` ([`settings`]); [`Opened`] is either form.
+//! `<root>/store.json` ([`settings`]) sets its cap, durability and namespaces.
 //!
 //! # Allocation (rule 75)
 //!
@@ -49,6 +49,26 @@
 //!   (`format::find_ranged`: about one 64 KiB read per lookup in a shard of a million).
 //! - `flip`: the lock file. `CACHEDIR.TAG`: the cache directory tag; on macOS the directory
 //!   also carries Time Machine's exclusion attribute ([`Driven`]).
+//!
+//! # Durable names
+//!
+//! THE INVARIANT: the store's folder and every folder above it that the store made are
+//! durable before the first head slot is. The first effect a store asks in a folder whose
+//! head is short or missing is the durable `Effect::Write` of `CACHEDIR.TAG` (core.rs
+//! `HEAD_MAKE` 0), which makes each missing folder of its path, from the top, and syncs each
+//! one's name into its parent (blaze-core `make_parent_durably`): a store three levels down
+//! (`.blaze/v2/store/f5s2`) a fresh home makes whole is as durable as one in a folder its
+//! caller made. Only then is the head made (a Truncate, which then makes no folder), synced,
+//! and its name synced into the store's folder; a SyncDir of a folder makes its CONTENTS'
+//! names durable, never its own, which is why the tag's write comes first. Below that, every
+//! name the store makes is a file in its own folder (segments, `manifests-<id>`, the lock, the
+//! tag), and a durable flip syncs the folder before its slot (`DIR_SYNC`), so a slot never
+//! names a file a power cut can take. No control of the store's plants this: since blaze-core's
+//! folders rule (2026-11-20, on `Effect`: every effect that makes a folder, `WriteUnsynced` and
+//! `Truncate` too, syncs its name into its parent before it completes) no effect the store can
+//! ask makes a folder a power cut takes, so the store's former `Plant::FolderNotDurable` (the
+//! tag through `WriteUnsynced`) was harmless and caught nothing. The rule's control is
+//! blaze-core's (`sim/host.rs`, `Plant::MadeParentsNotSynced`, with `sim/host/dir_names/tests.rs`).
 //!
 //! # A commit, in order
 //!
@@ -117,8 +137,17 @@
 //! first read. A slice: the directory is listed (files no generation names are retired, so
 //! what a crash left is swept a grace period later); while the segments hold more than the
 //! cap, the oldest segments older than [`WINDOW`] generations, at most [`SLICE_BYTES`], are
-//! copied keeping what roots name; while a generation names more than [`SEGMENTS_MOST`]
-//! segments, the oldest are merged keeping everything. The copy is written with no lock; the
+//! copied keeping what roots name (pruning and sweeping are all [`SLICE_BYTES`] bounds); else
+//! a namespace with a tier over `K` segments gets the size-tiered merge (`core::Tiers`,
+//! keeping everything), which [`SLICE_BYTES`] does not cut: the invariant needs every row of a
+//! tier. Tier `t` holds segments of `[B * G^t, B * G^(t+1))` (tier 0 from 0; `B` 1 MiB, `G` 4,
+//! `K` 4: `TIER_FLOOR_BYTES`, `TIER_GROWTH`, `TIER_SEGMENTS_MOST`). THE BOUND: after a cleanup,
+//! a namespace of `S` bytes names at most `K` segments in each of its open tiers (those under
+//! 1 GiB), one closed row (1 to 4 GiB, never merged again: no segment passes the format's
+//! 4 GiB, and no merge is planned that could) for each GiB, and the flip's commit
+//! (`segments_most`; [`SEGMENTS_MOST`], 276, under 256 GiB), what a miss probes; the bytes merges copy are
+//! amortised to at most `16 W + 1.25 MiB * C` over `C` commits of `W` bytes, all after the
+//! answer. The copy is written with no lock; the
 //! flip replaces them only if they are all still named (else the slice aborts and removes its
 //! copy), and retires them. A retired file is unlinked [`GRACE_NS`] after: a process that read
 //! a head maps what it names within milliseconds, and a mapping outlives an unlink. A
@@ -154,6 +183,7 @@
 
 pub mod settings;
 
+pub mod bottom;
 mod core;
 mod driven;
 mod format;
@@ -171,6 +201,8 @@ mod cleanup_tests;
 mod index_tests;
 #[cfg(test)]
 mod beside_tests;
+#[cfg(test)]
+mod bottom_tests;
 #[cfg(test)]
 mod lazy_tests;
 #[cfg(test)]
@@ -194,15 +226,15 @@ pub(crate) fn test_root() -> blaze_mem::Frame {
 pub use self::core::{
     Batch, CACHEDIR_SIGNATURE, CACHEDIR_TAG, CARRY_ROUNDS, Committed, Found, GRACE_NS, Got, INDEX_KEYS_MOST, INDEX_TAG, INDEXED_ROOT_TAG, LEASE_NS, Liveness, Lost, Named, POINTER_LEN, POINTER_TAG,
     Placed, Plain, PlainConfig, Probe, Probes, PutError, ROOT_INDEXES_MOST, ROOT_LIFE_NS, ROOT_TAG, Report, SEGMENTS_MOST, SLICE_BYTES, SWEEP_BYTES, Scrubbed, Sliced, TAGS, TOUCH_NS, WINDOW,
-    beside_key,
+    beside_key, store_leaf,
 };
 pub use self::lent::{Aligned16, Lend, Lent, LentCounts, LentError, Misaligned, NotInPlace, first_difference};
-pub use self::snapshot::{SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};
-pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
-pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
+pub use self::snapshot::{Proved, SNAPSHOT_SEGMENTS_MOST, Snapshot, SnapshotError};
+pub use self::driven::{Driven, LocalDir, lower_this_thread};
+pub use self::format::{Described, Entry, FORMAT, FORMS, PlaceName, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};
 pub use self::image::{IMAGE_TAG, ImageError, Placement, StartupImage};
-pub use self::settings::{Form, Settings};
+pub use self::settings::Settings;
 pub use self::verified::{Checks, Proof};
 // The vocabulary is blaze-keyed's (rule 30): re-exported where the remote lane looks for it.
 pub use blaze_keyed::{

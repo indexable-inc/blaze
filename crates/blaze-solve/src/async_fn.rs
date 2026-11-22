@@ -183,7 +183,7 @@ pub(crate) fn normalize<T: Tys, F: Facts>(
         Assoc::CallOnceFuture | Assoc::CallRefFuture => output,
         Assoc::Output => match cx.kind(output) {
             TyKind::Coroutine(_, a) => {
-                if a.len != 2 {
+                if a.len < 2 {
                     return Err(builtin::malformed());
                 }
                 cx.arg(a, 0)

@@ -34,6 +34,8 @@ blaze-core.workspace = true
 blaze-spawn.workspace = true
 # A build script's environment, outputs, key and compiler answers (`script.rs`).
 blaze-build-script = { workspace = true, optional = true }
+# The pinned nightly in a module's key and the clang pin table (pins/, read at compile time).
+blaze-pins.workspace = true
 # The macOS SDK's version from its `SDKSettings.json`: the native runs' key holds it (native_unit.rs).
 blaze-apple-sdk.workspace = true
 # `TokenStream`, `Produced`, `ProcDiagnostic`, `TokenOrigin`, `lex`: the hook's types.
@@ -48,6 +50,8 @@ blaze-id = { workspace = true, optional = true }
 blaze-record.workspace = true
 # The module record's key, as the bootstrap builder computes it.
 blaze-sha256.workspace = true
+# A compiler probe's answer is read into a frame (spawn_route.rs `spawn_probe`).
+blaze-mem.workspace = true
 # The bridge's byte cursor (`wire.rs`).
 blaze-format = { workspace = true, optional = true }
 # WASI preview 1's calls, over the sandbox's `System`.
@@ -60,15 +64,15 @@ blaze-unit-graph = { workspace = true, optional = true }
 # The source corrections (`blaze_fetch::correct`, D58): a corrected package's pin in a module's
 # closure names the row's digest, so the module key changes when the row does.
 blaze-fetch.workspace = true
-# `native_sandbox.rs` (D65): killing a native script's process group; on Linux Landlock,
-# seccomp and the namespaces, by system call.
+# `native_script.rs` (D177): a native script's hermetic spec names its roots, mounts and
+# read paths (blaze-roots: blaze-own and blaze-blake3 only, already below blaze-std).
+blaze-roots.workspace = true
+# `jobserver.rs`, `fact_pins.rs`: the fifo and the pins' files, by system call.
 libc.workspace = true
 
 [dev-dependencies]
 # `blaze_own::testing::heap()`: a test's root allocator (D102).
 blaze-own = { workspace = true, features = ["std", "testing"] }
-# The examples' entry frame and each test's top frame: memory from the OS, handed down.
-blaze-mem.workspace = true
 # `clang_shelf`: the pinned C toolchain's archive fetched over HTTPS, streamed (D69).
 blaze-http.workspace = true
 # A test's table of source corrections, read with the lexer's scalar width.
@@ -90,7 +94,7 @@ blaze-world = { workspace = true, features = ["procs-run"] }
 blaze-toolchain.workspace = true
 # `tempo_pipeline`: the real expansion pipeline (`lower_file`, `ByName::with_procs`) over a
 # checkout, the hook behind it. By path, as blaze-real takes it.
-blaze-lower = { path = "../blaze-lower" }
+blaze-lower.workspace = true
 blaze-surface.workspace = true
 # `tempo_pipeline`: each body checked as blaze-real's stage h does (`to_typeck`'s table).
 blaze-typeck.workspace = true

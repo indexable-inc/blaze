@@ -96,13 +96,13 @@ fn record_of(texts: &'static Texts) -> (&'static [u8], ItemsRecord<'static>) {
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
     let bytes: &'static [u8] = aligned(&a, g);
-    (bytes, ItemsRecord::open(bytes, g).unwrap_or_else(|e| panic!("open: {e:?}")))
+    (bytes, super::items_record::one_file(bytes, names.files[0].text, g))
 }
 
 /// The key of the item of `kind` named `name`.
 fn key_of(record: &ItemsRecord<'static>, kind: ItemKind, name: &str) -> ItemKey {
     (0..record.items())
-        .filter_map(|i| record.item_at(i).ok().flatten())
+        .filter_map(|i| record.identity_at(i).ok().flatten())
         .find(|row| row.kind == kind && row.name == Some(name))
         .unwrap_or_else(|| panic!("no item row for the {kind:?} `{name}`"))
         .key

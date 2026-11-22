@@ -7,6 +7,7 @@
 //! whose contract (`unsafe trait Record`) makes what it accepts a valid value. Each one first
 //! names [`Record::VERIFIED`], so a record declared in safe code ([`crate::declared`]) is
 //! never viewed until the compiler has checked its declaration against the type itself.
+#![blaze::sans_io]
 
 use core::mem::{align_of, size_of, size_of_val};
 
@@ -123,7 +124,6 @@ pub(crate) fn enum_byte<S: FromByte>(value: &S) -> u8 {
 }
 
 /// The first `len` bytes of `blocks`.
-#[cfg(feature = "alloc")]
 pub(crate) fn blocks_bytes(blocks: &[crate::writer::Block], len: usize) -> &[u8] {
     assert!(len <= blocks.len() * crate::ALIGN, "{len} bytes of {} blocks", blocks.len());
     // SAFETY: a `Block` is `ALIGN` initialised bytes with no padding, so `blocks` holds at
@@ -207,12 +207,14 @@ mod tests {
         assert!(view::<bool, false>(two, two).is_err(), "a bool of 2, shallow");
     }
 
-    #[cfg(feature = "alloc")]
     #[test]
     fn blocks_give_their_first_bytes() {
         let bytes: Vec<u8> = (0..=255).collect();
+        let alloc = blaze_own::testing::heap().alloc();
         for len in [0, 1, 15, 16, 17, 255] {
-            assert_eq!(&*crate::Aligned::copy_from(&bytes[..len]), &bytes[..len]);
+            let aligned = crate::AlignedIn::copy_from(&bytes[..len], alloc);
+            assert_eq!(&*aligned, &bytes[..len]);
+            assert!((aligned.as_ptr() as usize).is_multiple_of(crate::ALIGN) || len == 0);
         }
     }
 }

@@ -1,4 +1,4 @@
-//! A commit's files: its tree walked from an [`Index`], each file handed out with its path,
+//! A commit's files: its tree walked from an [`Index`](crate::Index), each file handed out with its path,
 //! mode and the blob to read. A name that could leave the checkout or mean something to git (`..`, `.`, `.git`
 //! in any case, a `/` or `\`, not UTF-8) is refused naming its path, as is a submodule (a
 //! gitlink), which needs a second fetch this walk does not make.
@@ -7,22 +7,30 @@
 
 use core::{alloc::Allocator, fmt};
 
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::{AllocFailure, Vec, planted::Planted};
 
 use crate::{
     oid::{Kind, Oid},
-    pack::{Found, Index, PackError, PackWhy},
-    plant::{self, Plant},
+    pack::{Found, PackError, PackWhy, PlantedIndex},
+    plant::GitFetchPlant,
 };
 
-/// How much a tree may hold: every field is the caller's choice.
+/// How much a tree may hold: every field is the caller's choice, [`Limits::SHIPPED`] the values
+/// a real repository is walked under (D165).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
+    /// The most files (not directories) handed out.
     pub most_files: u32,
     /// The most bytes of one path.
     pub most_path: u16,
-    /// The most directories deep.
+    /// The most directories deep: a directory of `k` components past it is refused.
     pub most_depth: u16,
+}
+
+impl Limits {
+    /// For real repositories: 200,000 files, 4 KiB paths, 128 directories deep (blaze-fetch's
+    /// `Limits::REAL` names the same values).
+    pub const SHIPPED: Limits = Limits { most_files: 200_000, most_path: 4096, most_depth: 128 };
 }
 
 /// A file's mode.
@@ -41,7 +49,7 @@ pub struct File<'a> {
     pub path: &'a str,
     pub mode: Mode,
     pub oid: Oid,
-    /// The blob: its size, and what [`Index::read`] takes.
+    /// The blob: its size, and what [`Index::read`](crate::Index::read) takes.
     pub object: Found,
 }
 
@@ -133,9 +141,11 @@ struct Open<B: Allocator> {
 }
 
 /// Every file of `commit`'s tree, handed to `visit` in tree order: its path, mode and the
-/// object to read ([`Index::read`]). Only the trees on the path being walked are held.
-pub fn files<A: Allocator + Clone, B: Allocator + Clone>(
-    index: &mut Index<'_, A>,
+/// object to read ([`Index::read`](crate::Index::read)). Only the trees on the path being
+/// walked are held. The walk's plant is the index's ([`PlantedIndex::plant`]): `NoPlant` for a
+/// shipped [`Index`](crate::Index).
+pub fn files<A: Allocator + Clone, B: Allocator + Clone, P: Planted<GitFetchPlant>>(
+    index: &mut PlantedIndex<'_, A, P>,
     commit: Oid,
     limits: Limits,
     alloc: B,
@@ -166,7 +176,7 @@ pub fn files<A: Allocator + Clone, B: Allocator + Clone>(
             path.try_push(b'/').map_err(|r| TreeError::new(&[], TreeWhy::Alloc(r.why)))?;
         }
         path.try_extend_from_slice(name).map_err(|e| TreeError::new(&[], TreeWhy::Alloc(e)))?;
-        let good = good_name(name);
+        let good = good_name(name, index.plant());
         let refuse = |why| TreeError::new(&path, why);
         if !good {
             return Err(refuse(TreeWhy::Name));
@@ -202,7 +212,12 @@ pub fn files<A: Allocator + Clone, B: Allocator + Clone>(
     Ok(())
 }
 
-fn find<A: Allocator + Clone>(index: &Index<'_, A>, oid: Oid, want: Kind, path: &[u8]) -> Result<Found, TreeError> {
+fn find<A: Allocator + Clone, P: Planted<GitFetchPlant>>(
+    index: &PlantedIndex<'_, A, P>,
+    oid: Oid,
+    want: Kind,
+    path: &[u8],
+) -> Result<Found, TreeError> {
     let found = index.find(&oid).ok_or(TreeError::new(path, TreeWhy::Missing { oid }))?;
     if found.kind != want {
         return Err(TreeError::new(path, TreeWhy::NotKind { oid, want }));
@@ -211,8 +226,8 @@ fn find<A: Allocator + Clone>(index: &Index<'_, A>, oid: Oid, want: Kind, path: 
 }
 
 /// The object `oid`, of kind `want`, read whole into `out`.
-fn object<A: Allocator + Clone, B: Allocator>(
-    index: &mut Index<'_, A>,
+fn object<A: Allocator + Clone, B: Allocator, P: Planted<GitFetchPlant>>(
+    index: &mut PlantedIndex<'_, A, P>,
     oid: Oid,
     want: Kind,
     path: &[u8],
@@ -238,8 +253,8 @@ fn entry(bytes: &[u8]) -> Option<(u32, &[u8], Oid, usize)> {
     Some((mode, name, Oid(oid), nul + 21))
 }
 
-fn good_name(name: &[u8]) -> bool {
-    if name == b".." && plant::on(Plant::ParentNameTaken) {
+fn good_name(name: &[u8], plant: impl Planted<GitFetchPlant>) -> bool {
+    if name == b".." && plant.has(GitFetchPlant::ParentNameTaken) {
         return true;
     }
     !name.is_empty()

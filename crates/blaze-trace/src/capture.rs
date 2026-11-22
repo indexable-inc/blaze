@@ -1,16 +1,18 @@
-//! A sink that keeps every span and event as plain data, its times from a clock passed in: a
-//! test's oracle and a simulation's trace. One thread at a time: the span it is inside is the
-//! one entered last on any thread.
+//! A sink that keeps every span and event as plain data, its times from a clock passed in and
+//! its memory from an allocator passed in: a test's oracle and a simulation's trace. One thread
+//! at a time: the span it is inside is the one entered last on any thread.
+//!
+//! Nothing is ambient: the clock is a [`Clock`] value and the allocator an `A` the caller names
+//! (a test hands `blaze_own::testing::heap().shared()`, a simulation its frame's handle).
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
 use core::{
+    alloc::Allocator,
     cell::UnsafeCell,
     fmt::{self, Write as _},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
+
+use blaze_own::{String, Vec};
 
 use crate::{
     Attributes, Event, Id, Level, Metadata, Parent, Record, Sink,
@@ -45,21 +47,31 @@ impl Clock for Counter {
 }
 
 /// A field's value as kept: a number as itself, anything else as its text (`Display` for `%`
-/// and a message, `Debug` for `?`).
+/// and a message, `Debug` for `?`), in the capture's allocator.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Kept {
+pub enum Kept<A: Allocator> {
     I64(i64),
     U64(u64),
     F64(f64),
     Bool(bool),
     I128(i128),
     U128(u128),
-    Text(String),
+    Text(String<A>),
+}
+
+impl<A: Allocator> Kept<A> {
+    /// Its text, when it is text.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Kept::Text(text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// One span or event kept.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Captured {
+pub struct Captured<A: Allocator> {
     /// From 1, in the order they began: a span's [`Id`].
     pub id: u64,
     pub name: &'static str,
@@ -69,7 +81,7 @@ pub struct Captured {
     /// The span it is inside; `None` at the root.
     pub parent: Option<u64>,
     /// Each field given, in the order given; a later `record` of one replaces it in place.
-    pub fields: Vec<(&'static str, Kept)>,
+    pub fields: Vec<(&'static str, Kept<A>), A>,
     pub start: u64,
     /// When its last handle dropped (an event's is its start); `None` while open.
     pub end: Option<u64>,
@@ -77,49 +89,55 @@ pub struct Captured {
     pub entered: u32,
 }
 
-impl Captured {
+impl<A: Allocator> Captured<A> {
     /// The value of its field `name`.
-    pub fn field(&self, name: &str) -> Option<&Kept> {
+    pub fn field(&self, name: &str) -> Option<&Kept<A>> {
         self.fields.iter().find(|it| it.0 == name).map(|it| &it.1)
     }
 }
 
-struct State {
-    kept: Vec<(Captured, u32)>,
-    entered: Vec<u64>,
+struct State<A: Allocator> {
+    kept: Vec<(Captured<A>, u32), A>,
+    entered: Vec<u64, A>,
 }
 
 /// The sink: [`crate::with_thread_sink`] it for the code under test, then read
 /// [`Capture::records`].
-pub struct Capture<C: Clock> {
+pub struct Capture<C: Clock, A: Allocator + Copy> {
     clock: C,
     most: Level,
-    state: Spin<State>,
+    alloc: A,
+    state: Spin<State<A>>,
 }
 
-impl<C: Clock> Capture<C> {
-    /// Keeps every site compiled in.
-    pub const fn new(clock: C) -> Capture<C> {
-        Capture::at(clock, Level::TRACE)
+impl<C: Clock, A: Allocator + Copy> Capture<C, A> {
+    /// Keeps every site compiled in, in `alloc`.
+    pub const fn new(clock: C, alloc: A) -> Capture<C, A> {
+        Capture::at(clock, Level::TRACE, alloc)
     }
 
-    /// Keeps the sites at `most` or less verbose.
-    pub const fn at(clock: C, most: Level) -> Capture<C> {
-        Capture { clock, most, state: Spin::new(State { kept: Vec::new(), entered: Vec::new() }) }
+    /// Keeps the sites at `most` or less verbose, in `alloc`.
+    pub const fn at(clock: C, most: Level, alloc: A) -> Capture<C, A> {
+        Capture { clock, most, alloc, state: Spin::new(State { kept: Vec::new_in(alloc), entered: Vec::new_in(alloc) }) }
     }
 
-    /// What it kept, in the order each began.
-    pub fn records(&self) -> Vec<Captured> {
-        // alloc: a test's copy of what was kept
-        self.state.with(|state| state.kept.iter().map(|it| it.0.clone()).collect())
+    /// What it kept, in the order each began: a copy in the capture's allocator.
+    pub fn records(&self) -> Vec<Captured<A>, A> {
+        self.state.with(|state| {
+            let mut copy = Vec::with_capacity_in(state.kept.len(), self.alloc);
+            for (kept, _) in state.kept.iter() {
+                copy.push(kept.clone());
+            }
+            copy
+        })
     }
 
     /// The first span or event named `name`.
-    pub fn named(&self, name: &str) -> Option<Captured> {
+    pub fn named(&self, name: &str) -> Option<Captured<A>> {
         self.records().into_iter().find(|it| it.name == name)
     }
 
-    fn parent(state: &State, parent: Parent) -> Option<u64> {
+    fn parent(state: &State<A>, parent: Parent) -> Option<u64> {
         match parent {
             Parent::Current => state.entered.last().copied(),
             Parent::Root => None,
@@ -127,11 +145,17 @@ impl<C: Clock> Capture<C> {
         }
     }
 
-    fn keep(&self, meta: &'static Metadata<'static>, parent: Parent, fields: Vec<(&'static str, Kept)>, event: bool) -> u64 {
+    fn keep(
+        &self,
+        meta: &'static Metadata<'static>,
+        parent: Parent,
+        fields: Vec<(&'static str, Kept<A>), A>,
+        event: bool,
+    ) -> u64 {
         self.state.with(|state| {
             let id = state.kept.len() as u64 + 1;
             let start = self.clock.ticks();
-            let parent = Capture::<C>::parent(state, parent);
+            let parent = Capture::<C, A>::parent(state, parent);
             state.kept.push((
                 Captured {
                     id,
@@ -150,67 +174,73 @@ impl<C: Clock> Capture<C> {
             id
         })
     }
+
+    fn gather(&self) -> Gather<A> {
+        Gather { fields: Vec::new_in(self.alloc), alloc: self.alloc }
+    }
 }
 
 /// Reads values into [`Kept`]s: formats them here, before the capture's lock is taken, so a
 /// value whose `Debug` records a span of its own does not wait on itself.
-#[derive(Default)]
-struct Gather(Vec<(&'static str, Kept)>);
+struct Gather<A: Allocator + Copy> {
+    fields: Vec<(&'static str, Kept<A>), A>,
+    alloc: A,
+}
 
-impl Visit for Gather {
+impl<A: Allocator + Copy> Visit for Gather<A> {
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.0.push((field.name(), Kept::I64(value)));
+        self.fields.push((field.name(), Kept::I64(value)));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.0.push((field.name(), Kept::U64(value)));
+        self.fields.push((field.name(), Kept::U64(value)));
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.0.push((field.name(), Kept::F64(value)));
+        self.fields.push((field.name(), Kept::F64(value)));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.0.push((field.name(), Kept::Bool(value)));
+        self.fields.push((field.name(), Kept::Bool(value)));
     }
 
     fn record_i128(&mut self, field: &Field, value: i128) {
-        self.0.push((field.name(), Kept::I128(value)));
+        self.fields.push((field.name(), Kept::I128(value)));
     }
 
     fn record_u128(&mut self, field: &Field, value: u128) {
-        self.0.push((field.name(), Kept::U128(value)));
+        self.fields.push((field.name(), Kept::U128(value)));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.push((field.name(), Kept::Text(value.to_string())));
+        self.fields.push((field.name(), Kept::Text(String::from_str_in(value, self.alloc))));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        let mut text = String::new();
-        // Writing to a `String` does not fail.
+        let mut text = String::new_in(self.alloc);
+        // Writing to a `String` fails only as its allocator does, which panics in `push_str`.
         _ = write!(text, "{value:?}");
-        self.0.push((field.name(), Kept::Text(text)));
+        self.fields.push((field.name(), Kept::Text(text)));
     }
 }
 
-impl<C: Clock> Sink for Capture<C> {
+impl<C: Clock, A: Allocator + Copy + Send + Sync> Sink for Capture<C, A> {
     fn enabled(&self, meta: &'static Metadata<'static>) -> bool {
         *meta.level() <= self.most
     }
 
     fn new_span(&self, span: &Attributes<'_>) -> Id {
-        let mut fields = Gather::default();
+        let mut fields = self.gather();
         span.record(&mut fields);
-        Id::from_u64(self.keep(span.metadata(), span.parent_of(), fields.0, false))
+        Id::from_u64(self.keep(span.metadata(), span.parent_of(), fields.fields, false))
     }
 
     fn record(&self, span: &Id, values: &Record<'_>) {
-        let mut fields = Gather::default();
+        let mut fields = self.gather();
         values.record(&mut fields);
         self.state.with(|state| {
             let Some((kept, _)) = state.kept.get_mut(span.into_u64() as usize - 1) else { return };
-            for (name, value) in fields.0 {
+            for (name, value) in fields.fields {
                 match kept.fields.iter_mut().find(|it| it.0 == name) {
                     Some(it) => it.1 = value,
                     None => kept.fields.push((name, value)),
@@ -220,9 +250,9 @@ impl<C: Clock> Sink for Capture<C> {
     }
 
     fn event(&self, event: &Event<'_>) {
-        let mut fields = Gather::default();
+        let mut fields = self.gather();
         event.record(&mut fields);
-        self.keep(event.metadata(), event.parent_of(), fields.0, true);
+        self.keep(event.metadata(), event.parent_of(), fields.fields, true);
     }
 
     fn enter(&self, span: &Id) {

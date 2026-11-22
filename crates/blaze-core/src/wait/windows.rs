@@ -3,12 +3,11 @@
 
 use std::{convert::Infallible, io, time::Duration};
 
-use windows_sys::Win32::{
-    Foundation::{GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::{
-        IO::{GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY},
-        Threading::{INFINITE, Sleep, WaitForSingleObject},
-    },
+use blaze_sys::windows::{
+    Bool, Handle,
+    foundation::{GetLastError, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    io::{GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY},
+    threading::{INFINITE, Sleep, WaitForSingleObject},
 };
 
 use super::{Clock, Deadline, Once, WaitError, Waited, until};
@@ -29,7 +28,7 @@ fn ms(left: Option<Duration>) -> u32 {
 /// `deadline` on `clock` (forever for `None`): `Ready` with how many came.
 pub(crate) fn completions(
     what: &'static str,
-    port: HANDLE,
+    port: Handle,
     entries: &mut [OVERLAPPED_ENTRY],
     deadline: Option<Deadline>,
     clock: &impl Clock,
@@ -38,7 +37,7 @@ pub(crate) fn completions(
     until(what, clock, deadline, |left| {
         let mut got = 0;
         let ok = take(port, entries, room, &mut got, ms(left));
-        if ok != 0 {
+        if ok.is_true() {
             return Ok(match got {
                 0 => Once::Spurious,
                 got => Once::Ready(got as usize),
@@ -57,17 +56,17 @@ pub(crate) fn completions(
     clippy::disallowed_methods,
     reason = "the one take of `wait::completions`, its timeout recomputed from the deadline"
 )]
-fn take(port: HANDLE, entries: &mut [OVERLAPPED_ENTRY], room: u32, got: &mut u32, ms: u32) -> i32 {
+fn take(port: Handle, entries: &mut [OVERLAPPED_ENTRY], room: u32, got: &mut u32, ms: u32) -> Bool {
     // SAFETY: room for `room` entries (at most `entries.len()`) and a count to write; a port
     // that is not open is an error the call returns.
-    unsafe { GetQueuedCompletionStatusEx(port, entries.as_mut_ptr(), room, got, ms, 0) }
+    unsafe { GetQueuedCompletionStatusEx(port, entries.as_mut_ptr(), room, got, ms, Bool::FALSE) }
 }
 
 /// Waits for `handle` (a process, an event) to be signaled, until `deadline` on `clock`
 /// (forever for `None`). An abandoned mutex counts as signaled.
 pub fn signaled(
     what: &'static str,
-    handle: HANDLE,
+    handle: Handle,
     deadline: Option<Deadline>,
     clock: &impl Clock,
 ) -> Result<Waited<()>, WaitError> {
@@ -85,7 +84,7 @@ pub fn signaled(
     clippy::disallowed_methods,
     reason = "the one wait of `wait::signaled`, its timeout recomputed from the deadline"
 )]
-fn wait_one(handle: HANDLE, ms: u32) -> u32 {
+fn wait_one(handle: Handle, ms: u32) -> u32 {
     // SAFETY: a handle of the caller's; one that is not open is an error the call returns.
     unsafe { WaitForSingleObject(handle, ms) }
 }

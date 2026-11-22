@@ -47,8 +47,10 @@ use core::mem::type_info::{self, TypeKind};
 use core::ops::{Range, RangeInclusive};
 use core::ptr::{self, DynMetadata, NonNull};
 
+use blaze_own::planted::{NoPlant, Planted};
 use blaze_own::{Arc, BTreeMap, BTreeSet, Box, FixedString, Rc, SortedMap, SortedSet, String, Vec, VecDeque};
 
+use crate::plant::TextPlant;
 use crate::put::Put;
 use crate::write::Writes;
 
@@ -59,27 +61,41 @@ pub trait DebugForm {
     fn debug_form(&self, out: &mut dyn Put);
 }
 
-/// Every sized type's debug form, as a vtable the walk finds from a field's `TypeId`.
+/// Every sized type's debug form, as a vtable the walk finds from a field's `TypeId`. The walk
+/// crosses these vtables, so its plant is a value ([`TextPlant`]), not a type: one argument
+/// and one compare a named field, where the shipped walk passes [`TextPlant::None`].
 trait Reflect {
-    fn reflect(&self, out: &mut dyn Put);
+    fn reflect(&self, out: &mut dyn Put, plant: TextPlant);
 }
 
 impl<T> Reflect for T {
     #[inline]
-    fn reflect(&self, out: &mut dyn Put) {
-        sized(self, out);
+    fn reflect(&self, out: &mut dyn Put, plant: TextPlant) {
+        sized(self, out, plant);
     }
 }
 
 /// `x` in `{:?}`'s layout.
 #[inline]
 pub(crate) fn debug<T: ?Sized>(x: &T, out: &mut dyn Put) {
+    debug_planted(x, out, NoPlant);
+}
+
+/// [`debug`] with a control's plant: [`TextPlant::DebugFieldNameLost`] writes every named
+/// field as `field`. A type's own [`DebugForm`] calls [`debug`], so the plant reaches the
+/// fields reflection reads, not those inside a type's own form.
+#[inline]
+pub(crate) fn debug_planted<T: ?Sized>(x: &T, out: &mut dyn Put, plant: impl Planted<TextPlant>) {
+    let plant = match plant.has(TextPlant::DebugFieldNameLost) {
+        true => TextPlant::DebugFieldNameLost,
+        false => TextPlant::None,
+    };
     // A reference is sized whatever it points at, and its form follows it.
-    sized::<&T>(&x, out);
+    sized::<&T>(&x, out, plant);
 }
 
 /// A sized value's form: its own [`DebugForm`], else the one reflection reads.
-fn sized<T>(x: &T, out: &mut dyn Put) {
+fn sized<T>(x: &T, out: &mut dyn Put, plant: TextPlant) {
     // One constant per type, its own form found first: a type with one is never reflected on,
     // so a field reflection cannot read (`NonNull`'s pattern type in a `Vec`) is never asked.
     let form: Form = const { form::<T>() };
@@ -88,7 +104,7 @@ fn sized<T>(x: &T, out: &mut dyn Put) {
         _ => 0,
     };
     // SAFETY: `form` was read from `T`'s own reflection, and `x` is a live, aligned `T`.
-    unsafe { walk(form, ptr::from_ref(x).cast::<u8>(), variant, out) }
+    unsafe { walk(form, ptr::from_ref(x).cast::<u8>(), variant, out, plant) }
 }
 
 /// The index of `x`'s variant: its discriminant, read at the discriminant's own width.
@@ -155,7 +171,7 @@ enum Form {
 ///
 /// `at` points at a live value whose type `form` was read from; for an enum, `variant` is the
 /// value's discriminant.
-unsafe fn walk(form: Form, at: *const u8, variant: u128, out: &mut dyn Put) {
+unsafe fn walk(form: Form, at: *const u8, variant: u128, out: &mut dyn Put, plant: TextPlant) {
     // SAFETY (every read below): the form says what type is at `at`, and it is aligned for it.
     unsafe {
         match form {
@@ -180,25 +196,25 @@ unsafe fn walk(form: Form, at: *const u8, variant: u128, out: &mut dyn Put) {
             Form::Str => str_debug(&*at.cast::<*const str>().read(), out),
             Form::Slice { element, stride } => {
                 let slice = at.cast::<*const [u8]>().read();
-                elements(slice.cast::<u8>(), slice.len(), stride, element, out);
+                elements(slice.cast::<u8>(), slice.len(), stride, element, out, plant);
             }
-            Form::Array { element, stride, len } => elements(at, len, stride, element, out),
-            Form::To(write) => field(at.cast::<*const u8>().read(), write, out),
+            Form::Array { element, stride, len } => elements(at, len, stride, element, out, plant),
+            Form::To(write) => field(at.cast::<*const u8>().read(), write, out, plant),
             Form::Address => {
                 out.put_str("0x");
                 out.hex(at.cast::<usize>().read());
             }
             Form::Tuple(fields) => {
                 out.put_byte(b'(');
-                list(at, fields, out);
+                list(at, fields, out, plant);
                 if fields.len() == 1 {
                     out.put_byte(b',');
                 }
                 out.put_byte(b')');
             }
-            Form::Struct(parts) => self::parts(at, parts, out),
+            Form::Struct(parts) => self::parts(at, parts, out, plant),
             Form::Enum { type_name, variants } => match usize::try_from(variant).ok().and_then(|i| variants.get(i)) {
-                Some(parts) => self::parts(at, *parts, out),
+                Some(parts) => self::parts(at, *parts, out, plant),
                 _ => panic!(
                     "blaze-text: a `{type_name}` has discriminant {variant}, which names no variant by index: an enum with \
                      discriminants set by hand implements `blaze_text::DebugForm`"
@@ -213,14 +229,21 @@ unsafe fn walk(form: Form, at: *const u8, variant: u128, out: &mut dyn Put) {
 /// # Safety
 ///
 /// `at` points at `len` live values of the type `write` is for, `stride` bytes apart.
-unsafe fn elements(at: *const u8, len: usize, stride: usize, write: DynMetadata<dyn Reflect>, out: &mut dyn Put) {
+unsafe fn elements(
+    at: *const u8,
+    len: usize,
+    stride: usize,
+    write: DynMetadata<dyn Reflect>,
+    out: &mut dyn Put,
+    plant: TextPlant,
+) {
     out.put_byte(b'[');
     for i in 0..len {
         if i > 0 {
             out.put_str(", ");
         }
         // SAFETY: element `i` of `len`, per the caller.
-        unsafe { field(at.add(i * stride), write, out) };
+        unsafe { field(at.add(i * stride), write, out, plant) };
     }
     out.put_byte(b']');
 }
@@ -230,7 +253,7 @@ unsafe fn elements(at: *const u8, len: usize, stride: usize, write: DynMetadata<
 /// # Safety
 ///
 /// `at` points at a live value with these parts.
-unsafe fn parts(at: *const u8, parts: Parts, out: &mut dyn Put) {
+unsafe fn parts(at: *const u8, parts: Parts, out: &mut dyn Put, plant: TextPlant) {
     out.put_str(parts.name);
     if parts.fields.is_empty() {
         return;
@@ -239,13 +262,13 @@ unsafe fn parts(at: *const u8, parts: Parts, out: &mut dyn Put) {
         true => {
             out.put_str(" { ");
             // SAFETY: per the caller.
-            unsafe { list(at, parts.fields, out) };
+            unsafe { list(at, parts.fields, out, plant) };
             out.put_str(" }");
         }
         false => {
             out.put_byte(b'(');
             // SAFETY: per the caller.
-            unsafe { list(at, parts.fields, out) };
+            unsafe { list(at, parts.fields, out, plant) };
             out.put_byte(b')');
         }
     }
@@ -256,30 +279,26 @@ unsafe fn parts(at: *const u8, parts: Parts, out: &mut dyn Put) {
 /// # Safety
 ///
 /// `at` points at a live value with these fields.
-unsafe fn list(at: *const u8, fields: &[Field], out: &mut dyn Put) {
+unsafe fn list(at: *const u8, fields: &[Field], out: &mut dyn Put, plant: TextPlant) {
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             out.put_str(", ");
         }
         if !is_index(f.name) {
-            out.put_str(field_name(f.name));
+            out.put_str(field_name(f.name, plant));
             out.put_str(": ");
         }
         // SAFETY: the field's offset in a live value, per the caller.
-        unsafe { field(at.add(f.offset), f.write, out) };
+        unsafe { field(at.add(f.offset), f.write, out, plant) };
     }
 }
 
-/// The name a field is written with; the tests plant a bug here.
+/// The name a field is written with: its own, or `field` under the control's plant.
 #[inline(always)]
-fn field_name(name: &'static str) -> &'static str {
-    #[cfg(test)]
-    {
-        crate::plant::field_name(name)
-    }
-    #[cfg(not(test))]
-    {
-        name
+fn field_name(name: &'static str, plant: TextPlant) -> &'static str {
+    match plant.has(TextPlant::DebugFieldNameLost) {
+        true => "field",
+        false => name,
     }
 }
 
@@ -288,10 +307,10 @@ fn field_name(name: &'static str) -> &'static str {
 /// # Safety
 ///
 /// `at` points at a live, aligned value of the type `write` is for.
-unsafe fn field(at: *const u8, write: DynMetadata<dyn Reflect>, out: &mut dyn Put) {
+unsafe fn field(at: *const u8, write: DynMetadata<dyn Reflect>, out: &mut dyn Put, plant: TextPlant) {
     // SAFETY: per the caller; `write` is that type's vtable for `Reflect`.
     let value: &dyn Reflect = unsafe { &*ptr::from_raw_parts(at.cast::<()>(), write) };
-    value.reflect(out);
+    value.reflect(out, plant);
 }
 
 fn is_index(name: &str) -> bool {

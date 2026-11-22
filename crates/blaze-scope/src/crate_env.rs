@@ -193,7 +193,7 @@ impl<'a> CrateEnv<'a> {
     pub fn of(facts: EnvFacts<'a>, alloc: Alloc<'a>) -> Result<CrateEnv<'a>, CrateEnvError<'a>> {
         // (name, value, the order it was given in): a later pair of one name wins.
         let mut given: AVec<'a, (AString<'a>, AString<'a>, u32)> = AVec::new_in(alloc);
-        let mut put = |given: &mut AVec<'a, (AString<'a>, AString<'a>, u32)>, name: &str, value: &str| {
+        let put = |given: &mut AVec<'a, (AString<'a>, AString<'a>, u32)>, name: &str, value: &str| {
             let order = given.len() as u32;
             given.push((AString::from_str_in(name, alloc), AString::from_str_in(value, alloc), order));
         };

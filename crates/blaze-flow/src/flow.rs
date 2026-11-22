@@ -161,6 +161,14 @@ pub enum StmtKind {
     StorageDead(Local),
     Drop(Place),
     Activate(Loan),
+    /// A place MENTIONED, neither read nor moved (`let _ = place;`, `_ = place;`; rustc's
+    /// `PlaceMention`). The Reference, "Wildcard pattern": it "does not copy, move or borrow
+    /// the value it matches"; but the place expression is evaluated, and evaluating `*r`
+    /// dereferences `r`, which must then be a live reference. So: no access (it conflicts with
+    /// no loan, `let m = &mut x; let _ = x; *m = 1;` is accepted) and no move; for liveness,
+    /// a use of the place's local exactly when the place passes through a `Deref`
+    /// ([`Flow::mention_use`]): `let _ = *r;` keeps `r` live there, `let _ = r;` does not.
+    Mention(Place),
     Goto(Block),
     /// A switch on a place's discriminant; targets are a range of the successor array.
     Switch { on: Place, targets: Ops },
@@ -314,6 +322,14 @@ impl<A: Allocator> Flow<A> {
         false
     }
 
+    /// The local a [`StmtKind::Mention`] of `p` uses (liveness): `p`'s local when `p` passes
+    /// through a `Deref` (each reference dereferenced on the way must be live at the mention;
+    /// liveness is per local, so the whole local's origins are), `None` when it does not
+    /// (naming a place reads nothing of it).
+    pub fn mention_use(&self, p: Place) -> Option<Local> {
+        if self.deref_below(p, 0) { Some(self.place(p).local) } else { None }
+    }
+
     pub fn entry(&self) -> Stmt {
         Stmt(self.blocks[0].start)
     }
@@ -429,6 +445,10 @@ impl<A: Allocator> Flow<A> {
                         self.write_place(p, f)?;
                     }
                     StmtKind::Activate(l) => write!(f, "activate {l}")?,
+                    StmtKind::Mention(p) => {
+                        f.write_str("mention ")?;
+                        self.write_place(p, f)?;
+                    }
                     StmtKind::Goto(b) => write!(f, "goto {b}")?,
                     StmtKind::Switch { on, targets } => {
                         f.write_str("switch ")?;
@@ -636,6 +656,11 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
     pub fn call(&mut self, args: &[Operand], dest: Place, span: Span) -> Stmt {
         let args = self.ops(args);
         self.push(StmtKind::Call { args, dest }, span)
+    }
+
+    /// `place` mentioned ([`StmtKind::Mention`]).
+    pub fn mention(&mut self, place: Place, span: Span) -> Stmt {
+        self.push(StmtKind::Mention(place), span)
     }
 
     pub fn stmt(&mut self, kind: StmtKind, span: Span) -> Stmt {

@@ -4,9 +4,12 @@
 use core::alloc::Allocator;
 
 use blaze_data::{Build, Order, Value, Visit, Walk};
-use blaze_own::{String, Vec};
+use blaze_own::{
+    String, Vec,
+    planted::{NoPlant, Planted},
+};
 
-use crate::{Decoder, Error, Event, Limits, wide, why, write};
+use crate::{CborPlant, Decoder, Error, Event, Limits, wide, why, write};
 
 /// The most room reserved for a list or map ahead of its elements: a head's length is checked
 /// against the bytes left, but each byte may become a whole `Value`, so the reservation is
@@ -23,11 +26,22 @@ pub fn to_vec_in<A: Allocator, B: Allocator + Clone>(value: &Value<A>, alloc: B)
 /// `value`'s deterministic CBOR appended to `out`; the walk's stack and each map's key order
 /// are kept in `scratch`. Every `Value` has a CBOR form, so this cannot fail.
 pub fn write_into<A: Allocator, B: Allocator, S: Allocator + Clone>(value: &Value<A>, out: &mut Vec<u8, B>, scratch: S) {
+    write_into_planted(value, out, scratch, NoPlant);
+}
+
+/// [`write_into`] with its plant seam: `plant` is [`NoPlant`] where it ships and a
+/// [`CborPlant`] under the round trip's control (D165).
+pub fn write_into_planted<A: Allocator, B: Allocator, S: Allocator + Clone>(
+    value: &Value<A>,
+    out: &mut Vec<u8, B>,
+    scratch: S,
+    plant: impl Planted<CborPlant>,
+) {
     // A text key's encoding is its length's head then its bytes, and heads grow with the
     // length: the encodings' bytewise order is the shorter key first, then bytes.
-    let order = match crate::plant::length_first() {
-        true => Order::LengthFirst,
-        false => Order::Sorted,
+    let order = match plant.has(CborPlant::KeysBytewise) {
+        false => Order::LengthFirst,
+        true => Order::Sorted,
     };
     for visit in Walk::new_in(value, order, scratch) {
         match visit {

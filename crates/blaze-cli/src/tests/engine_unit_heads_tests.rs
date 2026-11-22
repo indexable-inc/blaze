@@ -10,6 +10,51 @@ use super::*;
 
 use crate::engine_heads::HeadUnits;
 
+const SELECT_ITEMS: &str = concat!(
+    "#[cfg(test)] pub type Width = u16;\n#[cfg(not(test))] pub type Width = u8;\n",
+    "pub struct Value { pub field: Width }\n#[cfg(test)] pub const TEST_ONLY: u16 = 7;\n",
+    "macro_rules! make_generated { () => { pub fn generated() -> u8 { 1 } }; }\nmake_generated!();\n",
+);
+const SELECT_A: &str = "pub mod storage;\n#[cfg(test)] pub fn local(v: &storage::Value) -> u16 { let field: u16 = v.field; field + storage::TEST_ONLY }\n";
+const SELECT_B: &str = concat!(
+    "pub fn dependent(v: &a::storage::Value) -> u8 { let field: u8 = v.field; field + a::storage::generated() }\n",
+    "#[cfg(test)] pub fn dependent_test(v: &a::storage::Value) -> u8 { let field: u8 = v.field; field + a::storage::generated() }\n",
+);
+
+#[test]
+fn directory_module_heads_select_the_defining_instance() {
+    use super::engine_heads_once_tests::{clean_module, fixture_body, fixture_signature, module_checked, module_members, module_reads, path_plant_refused};
+    use crate::engine_heads::ListingsPlant;
+    use std::collections::BTreeSet;
+
+    let physical = "a/src/storage/mod.rs";
+    let slot = "a/src/storage.rs";
+    let world = || module_members(physical, SELECT_ITEMS, SELECT_A, SELECT_B);
+    let io = world();
+    clean_module(&module_checked(&io, HeadUnits::Each, ListingsPlant::Rule));
+    let reads = module_reads(&io, physical, slot, SELECT_ITEMS);
+    let value = fixture_signature(physical, SELECT_ITEMS, "Value");
+    let constant = fixture_signature(physical, SELECT_ITEMS, "TEST_ONLY");
+    let generated = fixture_signature(physical, SELECT_ITEMS, "make_generated!");
+    let local = fixture_body("a/src/lib.rs", SELECT_A, "local");
+    reads.check_read(local, value, reads.a_test);
+    reads.check_read(local, constant, reads.a_test);
+    let constant_owners: BTreeSet<_> = reads.owners.iter().filter(|(id, _)| id.of == constant).map(|(_, &unit)| unit).collect();
+    assert_eq!(constant_owners, [reads.a_test].into_iter().collect(), "TEST_ONLY exists only in the test instance");
+    for word in ["dependent", "dependent_test"] {
+        let body = fixture_body("b/src/lib.rs", SELECT_B, word);
+        reads.check_read(body, value, reads.a_library);
+        reads.check_read(body, generated, reads.a_library);
+    }
+    for units in [HeadUnits::OnlyFirst, HeadUnits::OnlyLast] {
+        let plant = module_checked(&world(), units, ListingsPlant::Rule);
+        assert!(plant.seeds.bodies.refused > 0);
+        assert!(plant.bodies.0.iter().any(|note| note.contains("was frozen by its head task under unit(s)") && note.contains("requested defining unit")), "{units:?}: {:?}", plant.bodies.0);
+    }
+    path_plant_refused(&module_checked(&world(), HeadUnits::Each, ListingsPlant::SlotSignature), slot, physical);
+    println!("local test reads test instance; dependent reads library instance; generated head defined");
+}
+
 /// The ids a request listed, by the helpers' own form (engine_check_tests.rs `engine_opts`).
 type Ids = std::vec::Vec<(std::string::String, std::string::String)>;
 
@@ -17,21 +62,23 @@ type Ids = std::vec::Vec<(std::string::String, std::string::String)>;
 /// the findings it listed, what it printed and its counts. Its text and ids are the existing
 /// helpers' (`stdout`, `engine_opts`); this file allocates nothing of its own.
 fn run(io: &Io, workers: u32, fresh: bool, units: HeadUnits) -> (Ids, std::string::String, engine_check::Checked) {
-    let mut opts = opts(io, workers, fresh);
+    run_units(io, opts(io, workers, fresh), units)
+}
+
+fn run_units(io: &Io, mut opts: engine_check::Opts<'static>, units: HeadUnits) -> (Ids, std::string::String, engine_check::Checked) {
     opts.head_units = units;
     let before = stdout(io).len();
     let (ids, checked) = engine_opts(io, opts);
     (ids, stdout(io).split_off(before), checked)
 }
 
-/// One package: `f`, held by both units, and `helper`, a body ONLY the test unit holds,
-/// calling `f` (so it asks `f`'s head under the test unit's keys).
+/// Both units hold the file declaring `f`. Only the test unit holds the file declaring
+/// `helper`, so either plant freezes the caller's own head and it can ask for `f`.
 fn one_crate(io: &Io) {
     write(io, "Cargo.toml", "[package]\nname = \"one\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
-    write(io, "src/lib.rs", ONE);
+    write(io, "src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests;\n");
+    write(io, "src/tests.rs", "pub fn helper() -> u8 {\n    super::f()\n}\n");
 }
-
-const ONE: &str = "pub fn f() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    pub fn helper() -> u8 {\n        super::f()\n    }\n}\n";
 
 /// Two members: `c` calls `b::g()` from a lib body (`h`) AND from a body only its test unit
 /// holds (`t`): both of `c`'s units read `b`'s lib unit's `g`.
@@ -105,33 +152,47 @@ fn every_unit_reads_heads_frozen_under_its_own_keys() {
 /// CONTROL: the rule's run on the same fixture is clean (case (a)).
 #[test]
 fn a_head_frozen_under_one_unit_alone_is_refused_by_path() {
-    let mut refused = 0u32;
+    let on_lang_shelf = |io: &Io, units| {
+        let mut options = opts(io, 2, true);
+        options.toolchain = lang_shelf(io);
+        run_units(io, options, units)
+    };
+    let mut refused_callers = (0, 0);
     for plant in [HeadUnits::OnlyFirst, HeadUnits::OnlyLast] {
         let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
         one_crate(&io);
-        let (_, text, checked) = run(&io, 2, true, plant);
+        let (_, text, checked) = on_lang_shelf(&io, plant);
         println!("{plant:?}: {}\n{}\n{text}\nnotes: {:?}", entries(&checked), heads_lines(&checked), checked.bodies.0);
         assert_eq!(checked.seeds.units.shared, 0, "{plant:?}: the plant freezes no item under two units:\n{}", heads_lines(&checked));
         assert!(!text.contains("holds no path for"), "{plant:?}: no body is handed another unit's bytes:\n{text}");
         // A body never freezes a member's head (engine_seeds.rs `StretchHeads::known`): the
         // head the table lacks for its unit is a refusal, never "frozen now ... a member's".
         assert_eq!(checked.seeds.not_put.member, 0, "{plant:?}: no member head frozen by a body:\n{}", heads_lines(&checked));
-        // Either plant leaves one unit uncovered: the lib unit alone refuses `helper` (`f`'s
-        // head and its own, the test unit's), the test unit alone refuses `f`'s own body.
-        assert!(checked.seeds.bodies.refused > 0, "{plant:?}: a body of the unit the plant left out is refused: {:?}\n{}", checked.bodies.0, heads_lines(&checked));
-        if let Some(note) = checked.bodies.0.iter().find(|note| note.contains(OTHER_UNITS)) {
-            assert!(note.contains("the head of `") && note.contains("was frozen by its head task under unit(s) "), "{plant:?}: the refusal names the head by path and the units that froze it: {note}");
-            refused += 1;
+        for note in checked.bodies.0.iter() {
+            assert!(note.contains("the head of `one::f (key ") && note.contains("was frozen by its head task under unit(s) ") && note.contains(OTHER_UNITS) && note.contains("requested defining unit "), "{plant:?}: the refusal names f and the frozen and requested units: {note}");
+        }
+        // D191: every unit that holds a body checks it, so `f`'s body is checked in both units'
+        // rows and `helper`'s in the test unit's. Whichever unit froze `f`, every row of the
+        // OTHER unit that asks `f`'s head is refused: frozen under the lib alone, `f`'s test row
+        // and `helper` (seeded 1, refused 2, two notes); under the test unit alone, `f`'s lib
+        // row (seeded 2, refused 1, one note).
+        let counts = (checked.seeds.bodies.seeded, checked.seeds.bodies.refused);
+        let helper = checked.bodies.0.iter().any(|note| note.contains("the body of `helper`"));
+        let own = checked.bodies.0.iter().any(|note| note.contains("the body of `f`"));
+        match (counts, helper, own, checked.bodies.0.len()) {
+            ((1, 2), true, true, 2) => refused_callers.0 += 1,
+            ((2, 1), false, true, 1) => refused_callers.1 += 1,
+            other => panic!("{plant:?}: only the readers in the uncovered unit are refused, a row each (D191); (seeded, refused), helper refused, f refused, notes: {other:?}\n{:?}\n{}", checked.bodies.0, heads_lines(&checked)),
         }
     }
-    assert_eq!(refused, 2, "each plant leaves a unit's body asking a head frozen under the other unit only: refused as `NotInItsUnit`");
+    assert_eq!(refused_callers, (1, 1), "freezing f only in the lib refuses helper and f's test row, freezing it only in the test unit refuses f's lib row (D191)");
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     one_crate(&io);
-    let (_, text, checked) = run(&io, 2, true, HeadUnits::Each);
+    let (_, text, checked) = on_lang_shelf(&io, HeadUnits::Each);
     all_clean("CONTROL: the rule", &text, &checked, 2);
 }
 
-/// `ONE` with a lib body `user` that calls `f` too.
+/// `f` with both a lib body `user` and a test-only body `helper` that call it.
 const WITH_USER: &str = "pub fn f() -> u8 {\n    1\n}\n\npub fn user() -> u8 {\n    f()\n}\n\n#[cfg(test)]\nmod tests {\n    pub fn helper() -> u8 {\n        super::f()\n    }\n}\n";
 /// [`WITH_USER`] with `f`'s head moved: it returns `u16`.
 const WITH_USER_U16: &str = "pub fn f() -> u16 {\n    1\n}\n\npub fn user() -> u8 {\n    f()\n}\n\n#[cfg(test)]\nmod tests {\n    pub fn helper() -> u8 {\n        super::f()\n    }\n}\n";
@@ -174,7 +235,8 @@ fn a_head_edit_and_a_cfg_move_each_unit_s_readers() {
     let (now_ids, now_text, now) = run(&io, 2, false, HeadUnits::Each);
     println!("a head changed: {}\n{}", entries(&now), heads_lines(&now));
     assert!(now.stages[blaze_engine::Stage::Heads.index()].entered >= 1, "`f`'s head task entered: {}", entries(&now));
-    assert_eq!(bodies_by_cause(&now), (1, 2), "`f` by its key; `user` and `helper` by their read of `f`'s head (each its own unit's cell): {}", entries(&now));
+    // D191: `f` and `user` are checked in both units' rows, `helper` in the test unit's.
+    assert_eq!(bodies_by_cause(&now), (2, 3), "`f`'s 2 rows by its key; `user`'s 2 rows and `helper`'s 1 by their read of `f`'s head (each its own unit's cell; D191): {}", entries(&now));
     let (bad, _) = head_reads_of_bodies(&io);
     assert!(bad.is_empty(), "a head changed: head reads no head task answers: {bad:?}");
     let (fresh_ids, fresh_text, fresh) = run(&io, 2, true, HeadUnits::Each);

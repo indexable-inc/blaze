@@ -18,7 +18,7 @@ use crate::{
     Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, MacroCallDecl,
     MacroRulesDecl, ModuleInfo, Namespace, Path, PathKind, Rename,
     Resolved, ScopeBuilder, ScopeError, ScopeFacts,
-    TextualDef, UseDecl, UseForm, WrittenVis,
+    UseDecl, UseForm, WrittenVis,
 };
 
 mod asked;
@@ -47,6 +47,7 @@ mod expansion_records;
 mod exports;
 mod fixtures;
 mod global_allocator;
+mod proc_macro_harness;
 mod helper_in_taker_output;
 mod nested_input_tokens;
 mod items;
@@ -70,6 +71,7 @@ mod names_inplace;
 mod names_cells;
 mod names_cells_keys;
 mod names_scratch;
+mod names_macro_use;
 mod names_groups;
 mod names_groups_edit;
 mod names_groups_lazy;

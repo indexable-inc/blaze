@@ -6,7 +6,7 @@
 //! the same value load, writing nothing, is timed first and subtracted. Values come from a
 //! table indexed by `i & 1023`, so no generator or division runs in the timed loop.
 
-use std::{alloc::Global, fmt::Write as _, hint::black_box, time::Instant};
+use std::{fmt::Write as _, hint::black_box, time::Instant};
 
 use blaze_own::String;
 use blaze_text::{Parse, Writes, twins};
@@ -59,7 +59,9 @@ fn ints(digits: u32) -> std::vec::Vec<u64> {
 }
 
 fn main() {
-    let mut ours = String::with_capacity_in(128, Global);
+    // The program's entry: the process's heap, handed down.
+    let alloc = blaze_own::Heap::process().alloc();
+    let mut ours = String::with_capacity_in(128, alloc);
     let mut theirs = std::string::String::with_capacity(128);
     let spread = ints(0);
     let floor = raw(|i| {
@@ -185,7 +187,7 @@ fn main() {
         "text_in: \"{}: {} of {}\" into a new string",
         |i| {
             let (name, done) = (names[i & 3], spread[i] >> 40);
-            let made = blaze_text::text_in(Global, |out| out.str(black_box(name)).str(": ").int(done).str(" of ").int(done + 7));
+            let made = blaze_text::text_in(alloc, |out| out.str(black_box(name)).str(": ").int(done).str(" of ").int(done + 7));
             black_box(made.as_str());
         },
         |i| {
@@ -198,7 +200,7 @@ fn main() {
         "text_exact_in: the same, one exact allocation",
         |i| {
             let (name, done) = (names[i & 3], spread[i] >> 40);
-            let made = blaze_text::text_exact_in(Global, |out| out.str(black_box(name)).str(": ").int(done).str(" of ").int(done + 7));
+            let made = blaze_text::text_exact_in(alloc, |out| out.str(black_box(name)).str(": ").int(done).str(" of ").int(done + 7));
             black_box(made.as_str());
         },
         |i| {

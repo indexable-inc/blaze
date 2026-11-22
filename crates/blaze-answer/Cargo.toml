@@ -17,7 +17,7 @@ doctest = false
 # Vec and BTreeMap with the allocator always named: the crate's only collections.
 blaze-own.workspace = true
 # `ContentId`: keys, outs, sources and segment ids.
-blaze-id = { path = "../blaze-id" }
+blaze-id.workspace = true
 # `Name`, `Kind`, `Key` and `Cell`: what the dictionary maps to dense ids, kept as the engine has them.
 blaze-drive.workspace = true
 

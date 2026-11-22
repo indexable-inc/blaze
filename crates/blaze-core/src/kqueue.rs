@@ -37,11 +37,18 @@ use std::{
 
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{MemError, Slab, Tag as MemTag};
+use blaze_sys::{
+    Errno, Fd,
+    posix::{
+        io::{self as sys_io, Filter, KeventFlags, NoteFlags},
+        net as sys_net,
+    },
+};
 use crate::chan::{Receiver, SendTimeoutError, Sender};
 use std::alloc::Global;
 
 use crate::{
-    Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
+    Address, Command, Completion, Confine, Conn, Cursor, DirName, Done, Driver, Effect, IoError,
     Tag,
     descriptors::Descriptors,
     fsevents::{self, Tell},
@@ -100,8 +107,8 @@ struct Kevent {
 }
 
 const _: () = assert!(
-    size_of::<Kevent>() == size_of::<libc::kevent>()
-        && align_of::<Kevent>() == align_of::<libc::kevent>()
+    size_of::<Kevent>() == size_of::<sys_io::Kevent>()
+        && align_of::<Kevent>() == align_of::<sys_io::Kevent>()
 );
 
 /// The kqueue and the channels, shared with the file threads and the watches' queues.
@@ -159,7 +166,7 @@ impl Notify {
         if self.woke.wake() {
             #[cfg(test)]
             self.triggers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
+            _ = self.change(TRIGGER as usize, Filter::USER.0, 0, NoteFlags::TRIGGER.bits(), 0, TRIGGER);
         }
     }
 }
@@ -272,7 +279,7 @@ impl Ids {
 
 struct Spawned {
     tag: Tag,
-    pid: libc::pid_t,
+    pid: blaze_sys::posix::types::pid_t,
     /// Open until its input is all written.
     stdin: Option<OwnedFd>,
     written: usize,
@@ -485,13 +492,10 @@ impl Kqueue {
     /// A driver whose files are under `root`, with `threads` threads for the file calls.
     pub fn new(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue> {
         let root: Arc<Path> = root.into().into();
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+        let kq = sys_io::kqueue()
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))?;
+        // SAFETY: into_raw transfers sole ownership of the new kqueue descriptor.
+        let kq = unsafe { OwnedFd::from_raw_fd(kq.into_raw()) };
         net::set_cloexec(kq.as_raw_fd())?;
         // alloc: setup, once per driver: each channel's slots.
         let (files_done, files) = crate::chan::bounded(FILES);
@@ -510,8 +514,8 @@ impl Kqueue {
         });
         notify.change(
             TRIGGER as usize,
-            libc::EVFILT_USER,
-            libc::EV_ADD | libc::EV_CLEAR,
+            Filter::USER.0,
+            (KeventFlags::ADD | KeventFlags::CLEAR).bits(),
             0,
             0,
             TRIGGER,
@@ -695,7 +699,7 @@ impl Kqueue {
                 self.timers.as_mut().expect("made just above").insert(due, tag);
                 Ok(())
             }
-            Effect::Watch { dir, tag } => self.watch(dir, None, tag),
+            Effect::Watch { dir, tag } => self.watch(DirName::Named(dir), None, tag),
             Effect::Journal { dir, since, tag } => self.watch(dir, Some(since), tag),
             // Told through the watches' channel by the stream, after the changes it heard first.
             Effect::Flush { watch, tag } => {
@@ -743,7 +747,7 @@ impl Kqueue {
                     Owner::Pressure(tag),
                     0,
                     EVFILT_MEMORYSTATUS,
-                    libc::EV_ADD | libc::EV_CLEAR,
+                    (KeventFlags::ADD | KeventFlags::CLEAR).bits(),
                     NOTE_MEMORYSTATUS_PRESSURE_WARN | NOTE_MEMORYSTATUS_PRESSURE_CRITICAL,
                 );
                 self.pressure = Some((tag, id));
@@ -800,14 +804,14 @@ impl Kqueue {
     /// Watches `dir` as `tag`, a journal of it from `since`: on a stopped watch kept from an
     /// earlier one where there is one. A watch of `tag` already ends first, telling nothing
     /// more.
-    fn watch(&mut self, dir: FileName, since: Option<Cursor>, tag: Tag) -> io::Result<()> {
+    fn watch(&mut self, dir: DirName, since: Option<Cursor>, tag: Tag) -> io::Result<()> {
         if let Some(old) = self.watch_tags.remove(&tag) {
             self.retire(old);
         }
         let watch = match self.spare.pop() {
             Some(watch) => watch,
             // clone: one count per watch made, only when no spare one is left; never per event.
-            None => fsevents::Watch::new(Watched(Arc::clone(&self.notify)))?,
+            None => fsevents::Watch::new(Watched(Arc::clone(&self.notify)), &self.root)?,
         };
         let id = self.watches.insert(watch);
         let watch = self.watches.get_mut(id).expect("inserted above");
@@ -921,7 +925,7 @@ impl Kqueue {
         for (fd, err) in outputs {
             set_nonblocking(fd)?;
             let owner = Owner::Output { spawn, err };
-            let id = self.register(owner, fd as usize, libc::EVFILT_READ, libc::EV_ADD, 0);
+            let id = self.register(owner, fd as usize, Filter::READ.0, KeventFlags::ADD.bits(), 0);
             self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
         if let Some(fd) = stdin {
@@ -929,14 +933,14 @@ impl Kqueue {
             let id = self.register(
                 Owner::Input(spawn),
                 fd as usize,
-                libc::EVFILT_WRITE,
-                libc::EV_ADD,
+                Filter::WRITE.0,
+                KeventFlags::ADD.bits(),
                 0,
             );
             self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
-        let (pid, flags) = (pid as usize, libc::EV_ADD | libc::EV_ONESHOT);
-        let id = self.register(Owner::Exit(spawn), pid, libc::EVFILT_PROC, flags, libc::NOTE_EXIT);
+        let (pid, flags) = (pid as usize, (KeventFlags::ADD | KeventFlags::ONESHOT).bits());
+        let id = self.register(Owner::Exit(spawn), pid, Filter::PROC.0, flags, NoteFlags::EXIT.bits());
         self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         Ok(())
     }
@@ -953,16 +957,14 @@ impl Kqueue {
             self.buffer.resize(64 << 10, 0);
         }
         loop {
-            // SAFETY: an open descriptor and a buffer of the length given.
-            let n = unsafe { libc::read(fd, self.buffer.as_mut_ptr().cast(), self.buffer.len()) };
-            match n {
-                1.. => into.extend_from_slice(&self.buffer[..n as usize]),
-                0 => {
+            match sys_io::read(Fd::new(fd), &mut self.buffer) {
+                Ok(0) => {
                     *pipe = None;
                     break;
                 }
-                _ => {
-                    let error = io::Error::last_os_error();
+                Ok(n) => into.extend_from_slice(&self.buffer[..n]),
+                Err(errno) => {
+                    let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
                     match error.kind() {
                         io::ErrorKind::Interrupted => continue,
                         io::ErrorKind::WouldBlock => break,
@@ -984,16 +986,14 @@ impl Kqueue {
         let input = &spawned.finish.command.stdin;
         while spawned.written < input.len() {
             let rest = &input[spawned.written..];
-            // SAFETY: an open descriptor and `rest.len()` bytes to read.
-            let n = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
-            match n {
-                1.. => spawned.written += n as usize,
-                0 => {
+            match sys_io::write(Fd::new(fd), rest) {
+                Ok(0) => {
                     spawned.failed.get_or_insert(io::ErrorKind::WriteZero.into());
                     break;
                 }
-                _ => {
-                    let error = io::Error::last_os_error();
+                Ok(n) => spawned.written += n,
+                Err(errno) => {
+                    let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
                     match error.kind() {
                         io::ErrorKind::Interrupted => {}
                         io::ErrorKind::WouldBlock => return,
@@ -1047,7 +1047,7 @@ impl Kqueue {
         listener.set_nonblocking(true).map_err(context)?;
         let fd = listener.fd() as usize;
         let listen = self.listens.insert(Listening { tag, listener, id: TRIGGER });
-        let id = self.register(Owner::Listen(listen), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
+        let id = self.register(Owner::Listen(listen), fd, Filter::READ.0, KeventFlags::ADD.bits(), 0);
         self.listens.get_mut(listen).expect("inserted above").id = id;
         // A listen of `tag` already ends, as the one it is replaced by begins.
         if let Some(old) = first_use(&mut self.listen_tags).insert(tag, listen)
@@ -1126,22 +1126,16 @@ impl Kqueue {
             .map_err(context)?;
         set_nonblocking(fd.as_raw_fd()).map_err(context)?;
         no_sigpipe(fd.as_raw_fd()).map_err(context)?;
-        let unix = address.domain == libc::AF_UNIX;
-        // SAFETY: an address of `len` bytes, of the socket's domain.
-        let connected = unsafe {
-            libc::connect(fd.as_raw_fd(), (&raw const address.storage).cast(), address.len)
-        };
-        if connected == 0 {
-            return self.connected(tag, fd, unix).map_err(context);
-        }
-        let error = io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::EINPROGRESS | libc::EINTR)) {
-            return Err(context(error));
+        let unix = address.domain == sys_net::AF_UNIX;
+        match sys_net::connect(Fd::new(fd.as_raw_fd()), &address.storage, address.len) {
+            Ok(()) => return self.connected(tag, fd, unix).map_err(context),
+            Err(Errno::InProgress | Errno::Intr) => {}
+            Err(errno) => return Err(context(io::Error::from_raw_os_error(i32::from(errno.raw())))),
         }
         let ident = fd.as_raw_fd() as usize;
-        let flags = libc::EV_ADD | libc::EV_ONESHOT;
+        let flags = (KeventFlags::ADD | KeventFlags::ONESHOT).bits();
         let connecting = self.connecting.insert(Connecting { tag, fd, at, unix });
-        self.register(Owner::Connecting(connecting), ident, libc::EVFILT_WRITE, flags, 0);
+        self.register(Owner::Connecting(connecting), ident, Filter::WRITE.0, flags, 0);
         Ok(())
     }
 
@@ -1177,8 +1171,8 @@ impl Kqueue {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.changes.push(Kevent {
                         ident: connection.socket.fd() as usize,
-                        filter: libc::EVFILT_READ,
-                        flags: libc::EV_ADD | libc::EV_ONESHOT,
+                        filter: Filter::READ.0,
+                        flags: (KeventFlags::ADD | KeventFlags::ONESHOT).bits(),
                         fflags: 0,
                         data: 0,
                         udata: connection.read as usize,
@@ -1213,8 +1207,8 @@ impl Kqueue {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         self.changes.push(Kevent {
                             ident: connection.socket.fd() as usize,
-                            filter: libc::EVFILT_WRITE,
-                            flags: libc::EV_ADD | libc::EV_ONESHOT,
+                            filter: Filter::WRITE.0,
+                            flags: (KeventFlags::ADD | KeventFlags::ONESHOT).bits(),
                             fflags: 0,
                             data: 0,
                             udata: connection.write as usize,
@@ -1315,7 +1309,7 @@ impl Kqueue {
             return;
         }
         let Some(owner) = self.owners.get(id) else { return };
-        if event.flags & libc::EV_ERROR != 0 {
+        if event.flags & KeventFlags::ERROR.bits() != 0 {
             if event.data != 0 {
                 self.refused(id, owner, io::Error::from_raw_os_error(event.data as i32));
             }
@@ -1354,7 +1348,7 @@ impl Kqueue {
                 let Some(spawned) = self.spawns.get_mut(spawn) else { return };
                 // `ESRCH`: exited already, a child not reaped, which the kernel no longer
                 // follows. Anything else: its end cannot be heard, so it does not run on.
-                if error.raw_os_error() != Some(libc::ESRCH) {
+                if error.raw_os_error() != Some(i32::from(Errno::Srch.raw())) {
                     process::kill(spawned.pid);
                     if let Err(waiting) = process::wait_exited(spawned.pid) {
                         spawned.failed.get_or_insert(waiting);
@@ -1491,7 +1485,7 @@ impl Driver for Kqueue {
                 Effect::Unwatch { tag } if self.pressure.is_some_and(|(it, _)| it == tag) => {
                     let (_, id) = self.pressure.take().expect("matched above");
                     self.disown(id);
-                    self.change(0, EVFILT_MEMORYSTATUS, libc::EV_DELETE, 0, 0, id);
+                    self.change(0, EVFILT_MEMORYSTATUS, KeventFlags::DELETE.bits(), 0, 0, id);
                     self.ready.push(Completion { tag, done: Done::Unwatched });
                 }
                 // Its end after every change it told, which `retire` moves to `ready` first.
@@ -1671,45 +1665,21 @@ fn no_connection(conn: Conn) -> io::Error {
 /// `O_NONBLOCK` set on `fd`: one `FIONBIO`, which sets the flag `fcntl`'s `F_SETFL` would,
 /// where a read-modify-write of the flags is two calls.
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let mut on: libc::c_int = 1;
-    // SAFETY: an open descriptor and an int the call reads.
-    if unsafe { libc::ioctl(fd, libc::FIONBIO, &raw mut on) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    sys_io::fionbio(Fd::new(fd), true)
+        .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
 }
 
 /// A write to a socket whose peer is gone fails rather than raising SIGPIPE.
 fn no_sigpipe(fd: RawFd) -> io::Result<()> {
-    let on: libc::c_int = 1;
-    // SAFETY: an open socket and an int of the size given.
-    let set = unsafe {
-        libc::setsockopt(fd,
-        libc::SOL_SOCKET,
-        libc::SO_NOSIGPIPE,
-        (&raw const on).cast(),
-        size_of::<libc::c_int>() as libc::socklen_t,)
-    };
-    if set != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    sys_net::setsockopt_int(Fd::new(fd), sys_net::SOL_SOCKET, sys_net::SO_NOSIGPIPE, 1)
+        .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
 }
 
 /// How a nonblocking connect of `fd` ended.
 fn socket_error(fd: RawFd) -> io::Result<()> {
-    let mut error: libc::c_int = 0;
-    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: an open socket and an int of the size given to write.
-    let got = unsafe {
-        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, (&raw mut error).cast(), &mut len)
-    };
-    if got != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    match error {
-        0 => Ok(()),
-        error => Err(io::Error::from_raw_os_error(error)),
+    match sys_net::pending_error(Fd::new(fd)) {
+        Ok(None) => Ok(()),
+        Ok(Some(errno)) | Err(errno) => Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
     }
 }
 
@@ -1718,7 +1688,7 @@ mod tests {
     use std::{collections::BTreeMap, ffi::OsString, sync::atomic::Ordering};
 
     use super::*;
-    use crate::{Confined, Exit, Sandbox, Traced, run_until_idle, sim::Rng, threads::Threads};
+    use crate::{Confined, Exit, FileName, Sandbox, Traced, run_until_idle, sim::Rng, threads::Threads};
 
     fn name(it: &str) -> FileName {
         FileName::new(it).unwrap()
@@ -1922,9 +1892,9 @@ mod tests {
         assert_eq!((one.stdout.as_slice(), one.stderr.as_slice()), (&b"hello"[..], &b"err\n"[..]));
         assert!(one.peak_memory > 0);
         let two = exit(&seen[&2]);
-        assert_eq!((two.code, two.signal), (None, Some(libc::SIGTERM)));
+        assert_eq!((two.code, two.signal), (None, Some(blaze_sys::posix::signal::SIGTERM)));
         let three = exit(&seen[&3]);
-        assert_eq!((three.code, three.signal), (None, Some(libc::SIGKILL)));
+        assert_eq!((three.code, three.signal), (None, Some(blaze_sys::posix::signal::SIGKILL)));
         assert!(
             matches!(&seen[&4], Done::Failed(why) if why.0.contains("Confine")),
             "{:?}",
@@ -2346,17 +2316,18 @@ mod tests {
         use std::os::fd::AsRawFd;
         let (read, write) = std::io::pipe().unwrap();
         for fd in [read.as_raw_fd(), write.as_raw_fd()] {
-            // SAFETY: an open descriptor.
-            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+            let nonblocking = || {
+                sys_io::status_flags(Fd::new(fd))
+                    .map(|flags| flags.contains(sys_io::OpenFlags::NONBLOCK))
+            };
+            assert_eq!(nonblocking(), Ok(false));
             set_nonblocking(fd).unwrap();
-            // SAFETY: as above.
-            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+            assert_ne!(nonblocking(), Ok(false));
         }
         let mut byte = [0u8; 1];
-        // SAFETY: an open descriptor and a buffer of the length given.
-        let n = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
-        let error = io::Error::last_os_error();
-        assert_eq!((n, error.kind()), (-1, io::ErrorKind::WouldBlock));
+        let n = sys_io::read(Fd::new(read.as_raw_fd()), &mut byte)
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())).kind());
+        assert_eq!(n, Err(io::ErrorKind::WouldBlock));
         drop(write);
     }
 
@@ -2525,33 +2496,70 @@ mod tests {
             &mut driver,
             vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
         );
+        let src = || crate::DirName::Named(name("src"));
         driver.submit(&mut vec![Effect::Journal {
-            dir: name("src"),
+            dir: src(),
             since: crate::Cursor::None,
             tag: Tag(7),
         }]);
         let batches = journal_until(&mut driver, Tag(7), |it| it.caught_up);
         assert!(matches!(batches[0].cursor, crate::Cursor::FsEvents { .. }), "{batches:?}");
-        assert!(!batches[0].caught_up && batches[0].lost.is_empty());
+        assert!(!batches[0].caught_up && batches[0].lost.is_empty() && batches[0].whole.is_none());
         // A batch does not end it.
         assert_eq!(driver.in_flight(), 1);
         let cursor = batches.last().unwrap().cursor;
         unwatch(&mut driver, Tag(7));
         std::fs::write(root.join("src/while-down.rs"), b"fn f() {}").unwrap();
         fsevents::fseventsd_keeps(Duration::from_secs(1));
-        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: cursor, tag: Tag(8) }]);
+        driver.submit(&mut vec![Effect::Journal { dir: src(), since: cursor, tag: Tag(8) }]);
         let batches = journal_until(&mut driver, Tag(8), |it| it.caught_up);
         let told: Vec<_> = batches.iter().flat_map(|it| &it.files).collect();
         assert!(told.contains(&&name("src/while-down.rs")), "{batches:?}");
-        assert!(batches.iter().all(|it| it.lost.is_empty()), "{batches:?}");
+        assert!(batches.iter().all(|it| it.lost.is_empty() && it.whole.is_none()), "{batches:?}");
         assert_eq!(driver.in_flight(), 1);
         unwatch(&mut driver, Tag(8));
         // Of another store: lost, the whole directory.
         let other = crate::Cursor::FsEvents { event: 1, volume: [7; 16] };
-        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: other, tag: Tag(9) }]);
+        driver.submit(&mut vec![Effect::Journal { dir: src(), since: other, tag: Tag(9) }]);
         let batches = journal_until(&mut driver, Tag(9), |_| true);
-        assert_eq!(batches[0].lost, [(name("src"), crate::Lost::Reset)]);
+        assert_eq!((batches[0].lost.as_slice(), batches[0].whole), (&[][..], Some(crate::Lost::Reset)));
         unwatch(&mut driver, Tag(9));
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A journal of the driver's ROOT (a checkout run from its own folder) resumes from its
+    /// cursor and names what changed at the root's own level, not only beneath its folders: a
+    /// file made there, one removed, and one renamed in from a folder (named at its source and
+    /// at its destination). CONTROL: a file written in a folder is named as before.
+    #[test]
+    fn a_journal_of_the_root_names_its_own_entries() {
+        let root = dir("journal-root");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        run(
+            &mut driver,
+            vec![
+                Effect::Write { file: name("gone.toml"), bytes: Vec::new(), tag: Tag(1) },
+                Effect::Write { file: name("src/moved.rs"), bytes: Vec::new(), tag: Tag(2) },
+            ],
+        );
+        driver.submit(&mut vec![Effect::Journal { dir: crate::DirName::Root, since: crate::Cursor::None, tag: Tag(7) }]);
+        let batches = journal_until(&mut driver, Tag(7), |it| it.caught_up);
+        let cursor = batches.last().unwrap().cursor;
+        unwatch(&mut driver, Tag(7));
+        std::fs::write(root.join("made.toml"), b"[a]").unwrap();
+        std::fs::remove_file(root.join("gone.toml")).unwrap();
+        std::fs::rename(root.join("src/moved.rs"), root.join("moved.rs")).unwrap();
+        std::fs::write(root.join("src/edited.rs"), b"fn f() {}").unwrap();
+        fsevents::fseventsd_keeps(Duration::from_secs(1));
+        driver.submit(&mut vec![Effect::Journal { dir: crate::DirName::Root, since: cursor, tag: Tag(8) }]);
+        let batches = journal_until(&mut driver, Tag(8), |it| it.caught_up);
+        let told: Vec<_> = batches.iter().flat_map(|it| &it.files).collect();
+        for wanted in ["made.toml", "gone.toml", "moved.rs", "src/moved.rs", "src/edited.rs"] {
+            assert!(told.contains(&&name(wanted)), "{wanted}: {batches:?}");
+        }
+        assert!(batches.iter().all(|it| it.whole.is_none()), "{batches:?}");
+        unwatch(&mut driver, Tag(8));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2697,7 +2705,7 @@ mod tests {
         let root = dir("stale");
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let connecting = |driver: &mut Kqueue, tag| {
-            let fd = net::stream_socket(libc::AF_UNIX).unwrap();
+            let fd = net::stream_socket(sys_net::AF_UNIX).unwrap();
             driver.connecting.insert(Connecting {
                 tag,
                 fd,
@@ -2716,9 +2724,9 @@ mod tests {
         assert_ne!(ended, live);
         // An `EVFILT_USER` of its own, its `udata` the ended registration's, then triggered.
         let user = |driver: &Kqueue, id: u64| {
-            let flags = libc::EV_ADD | libc::EV_CLEAR;
-            driver.notify.change(1, libc::EVFILT_USER, flags, 0, 0, id).unwrap();
-            driver.notify.change(1, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, id).unwrap();
+            let flags = (KeventFlags::ADD | KeventFlags::CLEAR).bits();
+            driver.notify.change(1, Filter::USER.0, flags, 0, 0, id).unwrap();
+            driver.notify.change(1, Filter::USER.0, 0, NoteFlags::TRIGGER.bits(), 0, id).unwrap();
         };
         user(&driver, ended);
         driver.wait(Some(Deadline::after(driver.now(), Duration::from_millis(50))));

@@ -33,11 +33,14 @@ and their features are written once, as the specification, in the doc of
 - `new(&Lock, &target, &host, &Ask, Resolver, alloc)` sets up the request;
 - `member(id, Package)` hands in the workspace members;
 - `pass()` gives `Pass::Need(Vec<LockId>)` (the locked packages whose manifests it must read
-  next) or `Pass::Done(UnitGraph)`;
+  next), `Pass::Done(UnitGraph)`, or `Pass::Partial(PartialGraph)` when a package the graph
+  reaches could not be read;
 - `package(id, Option<Package>)` answers a need. `None` means the package's sources could not
-  be read (the caller has a `SourceError` naming it, which the driver keeps as a finding): the
-  package is listed in `unavailable`, the units that needed it are marked `incomplete`, and
-  nothing is guessed.
+  be read (the caller has a `SourceError` naming it, which the driver keeps as a finding). The
+  resolution then ends in `Pass::Partial`, which names every missing package and offers no
+  `units()`: its consumer fetches them or refuses naming them, and no unit is ever resolved
+  with a dependency quietly absent (states.md item 35; before 2026-11-20 the graph answered
+  `Done` with `unavailable` and `incomplete` fields nothing read).
 
 ## Where manifests come from
 

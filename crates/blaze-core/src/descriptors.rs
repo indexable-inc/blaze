@@ -173,6 +173,9 @@ impl Descriptors {
         // alloc: an error path.
         .map_err(|error| io::Error::new(error.kind(), format!("{name}: {error}")))?;
         self.opened.fetch_add(1, Ordering::Relaxed);
+        // The meter (D169): an open, on the thread that ran the read that needed it (the
+        // asker's for an inline call, an IO thread's for a queued one).
+        blaze_meter::call(blaze_meter::Call::Open);
         Ok(opened)
     }
 

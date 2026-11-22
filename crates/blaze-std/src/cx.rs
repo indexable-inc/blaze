@@ -39,6 +39,7 @@ use core::{
 
 use blaze_core::{Done, Tag, wait::Deadline};
 use blaze_mem::Frame;
+use blaze_own::planted::NoPlant;
 
 use crate::{
     Plant, Stopped,
@@ -49,7 +50,49 @@ use crate::{
         threads::{Class, Pool},
     },
     trace::RecordKind,
+    telemetry::{Begun, Slot as OpenSlot, SpanPath},
+    workers::{Lease, Worker, WorkerId, Workers, charge_wait_at},
 };
+
+/// A reading of the world's clock as nanoseconds: what the telemetry hooks record.
+#[inline]
+fn ns_of(at: core::time::Duration) -> u64 {
+    u64::try_from(at.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The end of a span opened by [`Cx::span`] (decision 1 of [`crate::telemetry`]'s doc): held
+/// by the context `span` returned and by nothing else (a child of it, `until`, `scoped`, a
+/// task's context, takes `None`), so the span is exactly that value's life, and its drop is
+/// the close: no close call to forget (rule 76). `Cx` is not `Send`, so it drops on the thread,
+/// and the worker cell, that opened it.
+struct SpanEnd {
+    slot: OpenSlot,
+    world: Io,
+    placed: Placement,
+    span: &'static str,
+}
+
+impl Drop for SpanEnd {
+    fn drop(&mut self) {
+        let workers = self.world.workers();
+        let placed = match &self.placed {
+            Placement::Task(placed) => &**placed,
+            Placement::HostedRoot => crate::guest::Run::current().placed(),
+        };
+        let id = placed.cell(workers, self.span);
+        let wall = ns_of(self.world.now());
+        let slot = self.slot;
+        // A close the cell refuses (its world's workers were replaced while the span was
+        // open: `Io::on_workers`) is counted by the cell in `unrecorded`, which the report
+        // prints; a drop cannot return it, and a panic here could abort an unwind.
+        workers.enter(id, |w| {
+            if let Some((tally, cell)) = w.telemetry() {
+                let now = cell.snapshot(tally);
+                cell.span_close(slot, wall, now);
+            }
+        });
+    }
+}
 
 /// The task's context. Not `Send`: it shares its task's frame, which is not `Sync`, and its
 /// placement, an `Rc`; a task on another thread gets its own from a [`Seed`].
@@ -75,6 +118,12 @@ pub struct Cx {
     /// Where its task runs, its task's lock-order token and its frame: one per task, shared
     /// by the task's contexts.
     placed: Placement,
+    /// The span path it is in for the telemetry (from `Spans`; the root below): copied by
+    /// every child and handed to the tasks it spawns, so their use is charged under it.
+    path: SpanPath,
+    /// The end of the span this context is (only the one [`Cx::span`] returned, and only when
+    /// its worker keeps spans): dropping it closes the span.
+    end: Option<SpanEnd>,
 }
 
 /// Where a context's task placement is held.
@@ -123,21 +172,68 @@ pub(crate) struct Placed {
     /// fails the spawn), or, for a root, made at its first use with `scratch` bytes.
     frame: OnceCell<Frame>,
     scratch: usize,
+    /// Which worker cell its `on_worker` holds (D171, crate::workers): read at each
+    /// `on_worker`, never kept across a wait.
+    seat: Seat,
+}
+
+/// Which cell of the world's [`Workers`] a task's `on_worker` holds.
+enum Seat {
+    /// Pool worker `at`'s: the task runs on that worker's thread for its life.
+    Pool(u32),
+    /// A cell taken from an enclosing task on the same thread (an `Inline` child of a root
+    /// that leased a caller cell, or of a pool task): one closure holds it at a time.
+    Fixed(WorkerId),
+    /// A simulated world's: the simulated worker the task's model worker is on now, which
+    /// changes at a resume ([`Cx::resumed`]).
+    Model,
+    /// A root's, or a task a thread outside the pool runs: a simulated world's model worker,
+    /// else a caller cell leased at the first `on_worker` and given back with the placement.
+    Root(OnceCell<Lease>),
 }
 
 impl Placed {
-    fn on(worker: u32, pool: Option<Pool>, here: Here, frame: Option<Frame>, scratch: usize) -> Placement {
+    fn on(worker: u32, pool: Option<Pool>, here: Here, seat: Seat, frame: Option<Frame>, scratch: usize) -> Placement {
         // alloc: once per task, where it runs and its frame.
-        Placement::Task(Rc::new(Placed::new(worker, pool, here, frame, scratch)))
+        Placement::Task(Rc::new(Placed::new(worker, pool, here, seat, frame, scratch)))
     }
 
     /// A hosted run's root task's placement, held by the run: on no pool, outside, its frame
     /// of `scratch` bytes made at its first use.
     pub(crate) fn hosted_root(scratch: usize) -> Placed {
-        Placed::new(0, None, Here::Outside, None, scratch)
+        Placed::new(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, scratch)
     }
 
-    fn new(worker: u32, pool: Option<Pool>, here: Here, frame: Option<Frame>, scratch: usize) -> Placed {
+    /// The cell of `workers` (the world's) this task holds in `on_worker` now. `span` names the
+    /// task in a refusal.
+    fn cell(&self, workers: &Workers, span: &'static str) -> WorkerId {
+        match &self.seat {
+            Seat::Pool(at) => workers.pool_worker(*at),
+            Seat::Fixed(id) => *id,
+            Seat::Model => workers.model(self.worker.get()),
+            Seat::Root(_) if workers.simulated() => workers.model(self.worker.get()),
+            Seat::Root(lease) => lease
+                .get_or_init(|| match workers.lease() {
+                    Ok(lease) => lease,
+                    Err(error) => panic!("bstd::cx {span}: no worker cell for a thread outside the pool: {error}"),
+                })
+                .id(),
+        }
+    }
+
+    /// The seat of an `Inline` child of this task: on its thread, so the same cell, or in a
+    /// simulated world a model worker of its own.
+    fn child_seat(&self, workers: &Workers, span: &'static str) -> Seat {
+        match &self.seat {
+            Seat::Pool(at) => Seat::Pool(*at),
+            Seat::Fixed(id) => Seat::Fixed(*id),
+            Seat::Model => Seat::Model,
+            Seat::Root(_) if workers.simulated() => Seat::Model,
+            Seat::Root(_) => Seat::Fixed(self.cell(workers, span)),
+        }
+    }
+
+    fn new(worker: u32, pool: Option<Pool>, here: Here, seat: Seat, frame: Option<Frame>, scratch: usize) -> Placed {
         let made = OnceCell::new();
         if let Some(frame) = frame {
             // A fresh cell takes its value: `set` cannot find one there.
@@ -152,6 +248,7 @@ impl Placed {
             here,
             frame: made,
             scratch,
+            seat,
         }
     }
 
@@ -191,6 +288,8 @@ pub(crate) struct Seed {
     /// The placement model's worker, for a task grown outside the pool (a joiner that runs its
     /// task itself): what the spawner would have counted under `Inline`.
     worker: u32,
+    /// The spawner's span path: the task's use is charged under it (telemetry).
+    path: SpanPath,
 }
 
 // A `Seed` crosses threads; the bound is stated where it is defined, so a field that is not
@@ -205,12 +304,14 @@ impl Seed {
     /// The task's context on the thread that runs it, which is `here`: its frame shared from
     /// now on by the task's contexts on this thread, its placement made here.
     pub(crate) fn grow(self, here: Here) -> Cx {
-        let Seed { deadline, cancel, span, frame, world, plant, pool, class, worker } = self;
-        let worker = match here {
-            Here::Worker(at) => at,
-            Here::Outside => worker,
+        let Seed { deadline, cancel, span, frame, world, plant, pool, class, worker, path } = self;
+        // The seat (D171): a pool worker's own cell, or, on a thread outside the pool (a
+        // joiner that runs its task itself), a caller cell of the task's own.
+        let (worker, seat) = match here {
+            Here::Worker(at) => (at, Seat::Pool(at)),
+            Here::Outside => (worker, Seat::Root(OnceCell::new())),
         };
-        Cx { deadline, cancel, span, world, plant, class, placed: Placed::on(worker, pool, here, Some(frame), 0) }
+        Cx { deadline, cancel, span, world, plant, class, placed: Placed::on(worker, pool, here, seat, Some(frame), 0), path, end: None }
     }
 }
 
@@ -263,7 +364,9 @@ impl Cx {
             world,
             plant,
             class: Class::Foreground,
-            placed: Placed::on(0, None, Here::Outside, None, scratch),
+            placed: Placed::on(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, scratch),
+            path: SpanPath::ROOT,
+            end: None,
         }
     }
 
@@ -273,7 +376,7 @@ impl Cx {
     pub(crate) fn hosted_root(deadline: Option<Deadline>, world: Io) -> Cx {
         let plant = world.plant();
         world.record_trace("main", RecordKind::Opened { parent: "main" });
-        Cx { deadline, cancel: None, span: "main", world, plant, class: Class::Foreground, placed: Placement::HostedRoot }
+        Cx { deadline, cancel: None, span: "main", world, plant, class: Class::Foreground, placed: Placement::HostedRoot, path: SpanPath::ROOT, end: None }
     }
 
     /// Where its task runs: shared by the task's contexts, or the hosted run's root's.
@@ -297,7 +400,9 @@ impl Cx {
             world,
             plant,
             class: Class::Foreground,
-            placed: Placed::on(0, Some(pool), Here::Outside, Some(frame), 0),
+            placed: Placed::on(0, Some(pool), Here::Outside, Seat::Root(OnceCell::new()), Some(frame), 0),
+            path: SpanPath::ROOT,
+            end: None,
         }
     }
 
@@ -312,9 +417,33 @@ impl Cx {
 
     /// A child named `name`, inside this one's span: its waits say they are `name`'s, and the
     /// span's opening is recorded.
+    ///
+    /// For the telemetry ([`crate::telemetry`], "Spans across tasks") the span is the life of
+    /// the value returned: from `Spans` its worker's cell opens it now and its drop closes it;
+    /// its children and the tasks it spawns are charged under its path. At `Totals`, or on a
+    /// world with no cells, nothing more than the trace's record is done.
     pub fn span(&self, name: &'static str) -> Cx {
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        Cx { span: name, ..self.child() }
+        let child = Cx { span: name, ..self.child() };
+        let workers = self.world.workers();
+        if !workers.telemetry_level().is_some_and(|level| level.keeps(crate::telemetry::Level::Spans)) {
+            return child;
+        }
+        let wall = ns_of(self.world.now());
+        let parent = self.path;
+        let opened = self.on_worker(|w| {
+            let (tally, cell) = w.telemetry()?;
+            let at = cell.snapshot(tally);
+            cell.span_open(&parent, name, wall, at)
+        });
+        match opened {
+            Some((slot, path)) => Cx {
+                path,
+                end: Some(SpanEnd { slot, world: self.world.clone(), placed: self.placed.clone(), span: self.span }),
+                ..child
+            },
+            None => child,
+        }
     }
 
     /// `what` happened, in this span: recorded on the driver's clock.
@@ -424,6 +553,39 @@ impl Cx {
     /// In S1's `Inline` layout it polls the driver on the calling thread ([`Io::poll`]); a
     /// fiber layout parks the task here instead.
     pub(crate) fn wait(&self, io: &Io, tag: Tag, ends: Ends) -> Result<Done, Stopped> {
+        self.charged(io, self.span, None, || self.wait_now(io, tag, ends))
+    }
+
+    /// `f` with the cell of the worker this task is on now held, `&mut` (D171,
+    /// [`crate::workers`]): its registered slots ([`Worker::slot`]), its scratch frame, its
+    /// meter, its trace rows and its random stream. The closure cannot wait: it is `Send`, so
+    /// it captures no `&Cx`; what it returns cannot borrow the cell. The worker is found from
+    /// the task's placement, read now, so a task that moved since its last call finds the
+    /// worker it is on now.
+    ///
+    /// # Panics
+    ///
+    /// When the cell is held already (an `on_worker` reached from inside another's on the
+    /// same cell), a slot's make panicked, or a thread outside the pool finds every caller
+    /// cell leased: the task fails naming it (rule 20).
+    pub fn on_worker<R>(&self, f: impl FnOnce(&mut Worker<'_>) -> R + Send) -> R {
+        let workers = self.world.workers();
+        let id = self.placed().cell(workers, self.span);
+        workers.enter(id, f)
+    }
+
+    /// `wait` run, and the time it took on the world's clock charged to the worker this task
+    /// is on as it returns, under `on` (`id`): every wait of bstd accounts itself this way
+    /// (D171), whatever it ends in.
+    pub(crate) fn charged<R>(&self, io: &Io, on: &'static str, id: Option<u64>, wait: impl FnOnce() -> R) -> R {
+        let began = ns_of(io.now());
+        let out = wait();
+        let ended = ns_of(io.now()).max(began);
+        self.on_worker(|w| charge_wait_at(w, on, id, began, ended, NoPlant));
+        out
+    }
+
+    fn wait_now(&self, io: &Io, tag: Tag, ends: Ends) -> Result<Done, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
             Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.deadline(),
@@ -470,7 +632,11 @@ impl Cx {
     /// In S1's `Inline` layout nothing else runs while a task waits, so a condition only
     /// another task could make true ends here at the deadline; a fiber layout parks the task
     /// on the condition's key instead, and its maker wakes it.
-    pub(crate) fn wait_for<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
+    pub(crate) fn wait_for<T>(&self, io: &Io, ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
+        self.charged(io, self.span, None, || self.wait_for_now(io, ready))
+    }
+
+    fn wait_for_now<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
             Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.deadline(),
@@ -512,6 +678,10 @@ impl Cx {
         }
     }
 
+    /// Where the placement is updated at a resume (D171): the next `on_worker` reads the seat
+    /// again, so a task moved here finds the worker it is on now. A simulated move changes the
+    /// model worker below; a fiber layout's scheduler sets the seat to the worker it resumes
+    /// the fiber on, here.
     fn resumed(&self) {
         if self.plant == Plant::TaskMigrates {
             let placed = self.placed();
@@ -592,7 +762,8 @@ impl Cx {
     /// It is placed on `worker` and stays there (std.md, "Layouts").
     pub(crate) fn task(&self, name: &'static str, frame: Frame, worker: u32) -> Cx {
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        let placed = Placed::on(worker, self.placed().pool.clone(), self.placed().here, Some(frame), 0);
+        let seat = self.placed().child_seat(self.world.workers(), self.span);
+        let placed = Placed::on(worker, self.placed().pool.clone(), self.placed().here, seat, Some(frame), 0);
         Cx { span: name, placed, ..self.child() }
     }
 
@@ -612,6 +783,7 @@ impl Cx {
             pool: self.placed().pool.clone(),
             class,
             worker,
+            path: self.path,
         }
     }
 
@@ -689,6 +861,36 @@ impl Cx {
         self.cancellation().set.store(true, Ordering::Release);
     }
 
+    /// The telemetry hook of a task's start, on the context the task runs in: its worker's cell
+    /// counts it and, from `Spans`, makes it the worker's current task (what its waits' records
+    /// name) and takes its snapshot. `None` on a world with no cells.
+    pub(crate) fn task_began(&self, name: &'static str) -> Option<Begun> {
+        self.world.workers().telemetry_level()?;
+        let wall = ns_of(self.world.now());
+        let path = self.path;
+        self.on_worker(|w| {
+            let (tally, cell) = w.telemetry()?;
+            let at = cell.snapshot(tally);
+            Some(cell.task_open(name, &path, wall, at))
+        })
+    }
+
+    /// The telemetry hook of a task's end (`failed`: its panic or error failed it), on the
+    /// same context as its [`Cx::task_began`]: the pool counts it; from `Spans` its use is
+    /// charged under its path and its record kept for the chain.
+    pub(crate) fn task_ended(&self, begun: Option<Begun>, failed: bool) {
+        let Some(begun) = begun else { return };
+        let wall = ns_of(self.world.now());
+        self.on_worker(|w| {
+            if let Some((tally, cell)) = w.telemetry() {
+                let now = cell.snapshot(tally);
+                // A task's slot is its own cell's (began on this context's worker, which a
+                // started task never leaves): a refusal is counted by the cell.
+                cell.task_close(begun, wall, now, failed);
+            }
+        });
+    }
+
     fn child(&self) -> Cx {
         Cx {
             deadline: self.deadline,
@@ -698,6 +900,9 @@ impl Cx {
             plant: self.plant,
             class: self.class,
             placed: self.placed.clone(),
+            path: self.path,
+            // The span's end is its own context's alone.
+            end: None,
         }
     }
 }

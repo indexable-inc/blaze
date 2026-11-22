@@ -1,0 +1,33 @@
+[package]
+name = "blaze-comptime"
+description = "Compile-time code on blaze's own execution path (D175): the grants of one proc-macro or build-script run, the typed calls and answers between the run and blaze, their capped deterministic-CBOR wire, the host's and the guest's sans-IO machines, the read list that keys the record (blaze-roots), and the equality harness's first difference between the wasm and native engines; no_std, the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` in the caller's allocator; the plant seam.
+blaze-own.workspace = true
+# The wire: deterministic CBOR, every length capped.
+blaze-cbor.workspace = true
+# Content digests, the seed's derivation and the random stream.
+blaze-blake3.workspace = true
+# Roots, mounts, RelPath and the read list with its one check.
+blaze-roots.workspace = true
+
+[dev-dependencies]
+# The simulation: a drawn model guest, the oracle, planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), never `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

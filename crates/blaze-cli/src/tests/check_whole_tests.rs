@@ -34,10 +34,10 @@ fn test_code_is_checked_by_its_test_unit_alone() {
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", LIB);
     write(&io, "src/in_file.rs", IN_FILE);
-    let seen = check(&io, work::Sizes::USUAL);
+    let seen = check(&io);
     let out = stdout(&io);
-    std::println!("failed {:?}; errors {}; words {:?}", seen.failed, seen.errors, seen.words);
-    assert!(seen.failed.is_empty(), "{:?}\n{out}", seen.failed);
+    std::println!("failures {}; errors {}; words {:?}", seen.failures, seen.errors, seen.words);
+    assert_eq!(seen.failures, 0, "{out}\n{}", seen.profile);
     assert!(!out.contains("front2 lists no body"), "the library's owner named a test fn it does not hold:\n{out}");
     assert!(!out.contains("no longer lists this file"), "the library's owner named a test-only file it does not hold:\n{out}");
     assert!(!out.contains("could not check"), "an item was left unchecked:\n{out}");
@@ -67,10 +67,10 @@ fn a_wrong_typed_initializer_is_an_error_at_its_item() {
     let io = Io::simulated(SimWorld::new(62, Limits::USUAL));
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", VALUES);
-    let seen = check(&io, work::Sizes::USUAL);
+    let seen = check(&io);
     let out = stdout(&io);
-    std::println!("failed {:?}; errors {}; words {:?}", seen.failed, seen.errors, seen.words);
-    assert!(seen.failed.is_empty(), "{:?}\n{out}", seen.failed);
+    std::println!("failures {}; errors {}; words {:?}", seen.failures, seen.errors, seen.words);
+    assert_eq!(seen.failures, 0, "{out}\n{}", seen.profile);
     assert!(!out.contains("front2 checks fn bodies only"), "an initializer was left to a note:\n{out}");
     assert!(!out.contains("could not check"), "an item was left unchecked:\n{out}");
     let lines: std::vec::Vec<u32> =
@@ -102,10 +102,10 @@ fn a_block_use_a_macro_wrote_names_the_macros_crate() {
     );
     write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nd = { path = \"../d\" }\n");
     write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    let _x: u8 = true;\n    d::go!(3u8)\n}\n");
-    let seen = check(&io, work::Sizes::USUAL);
+    let seen = check(&io);
     let out = stdout(&io);
-    std::println!("failed {:?}; errors {}; words {:?}", seen.failed, seen.errors, seen.words);
-    assert!(seen.failed.is_empty(), "{:?}\n{out}", seen.failed);
+    std::println!("failures {}; errors {}; words {:?}", seen.failures, seen.errors, seen.words);
+    assert_eq!(seen.failures, 0, "{out}\n{}", seen.profile);
     assert!(!out.contains("cannot answer yet"), "the block's `use` was not read:\n{out}");
     assert!(!out.contains("could not check"), "an item was left unchecked:\n{out}");
     std::println!("block use: errors {}", seen.errors);
@@ -122,15 +122,18 @@ fn an_initializer_edit_rechecks_that_initializer_alone() {
     let io = Io::simulated(SimWorld::new(63, Limits::USUAL));
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", "pub fn f() -> u8 {\n    1\n}\npub const C: u8 = 1;\npub static S: u8 = 3;\n");
-    let cold = check(&io, work::Sizes::USUAL);
+    let cold = check(&io);
     let out = stdout(&io);
-    assert!(cold.failed.is_empty(), "{:?}\n{out}", cold.failed);
+    assert_eq!(cold.failures, 0, "{out}\n{}", cold.profile);
     assert!(!out.contains("could not check"), "cold, every body is checked:\n{out}");
     write(&io, "src/lib.rs", "pub fn f() -> u8 {\n    1\n}\npub const C: u8 = 2;\npub static S: u8 = 3;\n");
-    let edit = check(&io, work::Sizes::USUAL);
+    let edit = check(&io);
     let out = stdout(&io);
-    assert!(edit.failed.is_empty(), "{:?}\n{out}", edit.failed);
-    let (before, after) = (made(&cold.profile, "BodyCheck"), made(&edit.profile, "BodyCheck"));
-    std::println!("initializer edit: BodyCheck made {before} then {after}");
-    assert_eq!((before, after), (3, 1), "cold: f, C and S; after C's value moved: C alone\n{}\n{out}", edit.profile);
+    assert_eq!(edit.failures, 0, "{out}\n{}", edit.profile);
+    // The engine's `Bodies` entries (the old checker's `BodyCheck` made rows until 2026-11-19).
+    let (before, after) = (cold.entered(blaze_engine::Stage::Bodies), edit.entered(blaze_engine::Stage::Bodies));
+    std::println!("initializer edit: Bodies entered {before} then {after}");
+    // D191: every unit that holds a body checks it, a row each; the library and its test build
+    // hold all three, so a body is 2 rows.
+    assert_eq!((before, after), (6, 2), "cold: f, C and S; after C's value moved: C alone; each body in its 2 units' rows (D191)\n{}\n{out}", edit.profile);
 }

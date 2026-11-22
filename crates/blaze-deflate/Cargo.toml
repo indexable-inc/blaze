@@ -18,6 +18,8 @@ doctest = false
 blaze-own.workspace = true
 
 [dev-dependencies]
+# The tests' root allocator capability (`testing::heap()`, D102) in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
 # Property tests and planted-bug controls.
 blaze-sim.workspace = true
 # The reference the tests compare against (both directions); a dev-dependency only, so it is in

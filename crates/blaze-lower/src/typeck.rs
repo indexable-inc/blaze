@@ -99,6 +99,12 @@ pub trait Types {
         self.const_term(view, c, tys)
     }
 
+    /// A method has no path row. Its scope places the expansion's tokens when the
+    /// caller copies this argument into an anonymous constant.
+    fn method_const_term(&mut self, view: &View<'_>, c: ConstIdx, _scope: ScopeId, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        self.const_term(view, c, tys)
+    }
+
     /// The repeat length `len` of `[x; len]` as a const term (the Reference, "Array
     /// expressions": "the length operand must be either an inferred const or a constant
     /// expression of type `usize` (e.g. a literal or a constant item)", and a const parameter
@@ -163,11 +169,8 @@ impl ConstGapWhy {
     }
 }
 
-/// The text of an [`ConstGapWhy::AnonInBody`] gap: the constant as written and, when the
-/// caller's evaluator refused it, why (`{ A + 1 }: no impl ..`). Kept inline so the gap stays
-/// `Copy` (it is a column of the conversion's record, blaze-lower is `no_std` and holds no
-/// allocator here): a text past [`GapText::MOST`] bytes is cut at a char boundary, and
-/// [`GapText::cut`] says so, so a reader never takes a part for the whole.
+/// Quoted source for a constant whose type is unknown. An evaluation error belongs
+/// to the caller. Only a quotation may be shortened in the inline gap column.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GapText {
     len: u8,
@@ -181,6 +184,14 @@ impl GapText {
 
     /// An empty text: the converter knew no more than the gap's kind.
     pub const EMPTY: GapText = GapText { len: 0, cut: false, bytes: [0; GapText::MOST] };
+
+    /// A builder may name a bare expression or the braced argument surrounding
+    /// it. Any additional diagnostic belongs to the original refusal.
+    pub fn quote(written: &str, reported: &str) -> Option<Self> {
+        let written = written.trim();
+        let inner = written.strip_prefix('{').and_then(|s| s.strip_suffix('}')).map(str::trim);
+        (reported == written || Some(reported) == inner).then(|| Self::of(reported))
+    }
 
     /// `text`, its first [`GapText::MOST`] bytes at most, cut at a char boundary.
     pub fn of(text: &str) -> GapText {
@@ -196,7 +207,7 @@ impl GapText {
     /// The text kept.
     pub fn text(&self) -> &str {
         // The bytes are a prefix of a `str` cut at a char boundary (`of`).
-        core::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("GapText contains a UTF-8 prefix")
     }
 
     /// Whether the text was cut at [`GapText::MOST`] bytes.
@@ -238,8 +249,7 @@ pub enum ConstGapWhy {
     /// An anonymous constant in a body (`{ A + 1 }`, `{ u32::MAX }`, `Ty::LEN`) whose type is
     /// not known where the body is converted (the parameter it is an argument of is the
     /// checker's to find: a method call's, an associated fn's; a path's item's parameter is
-    /// the caller's, [`Types::const_term_at`]), so no constant item can be made of it, or that
-    /// the caller's evaluator refused. Its text: the constant as written, and the refusal.
+    /// the caller's, [`Types::const_term_at`]), so no constant item can be made of it.
     AnonInBody(GapText),
     /// A negated literal with no suffix (`Foo::<-1>`): its bits depend on the width of the
     /// parameter's type, which the checker finds.
@@ -256,6 +266,12 @@ pub struct ArgAt {
     pub path: PathIdx,
     pub segment: u32,
     pub index: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ArgList {
+    Path { path: PathIdx, segment: u32 },
+    Method(ScopeId),
 }
 
 /// Where a const term of a body is written.
@@ -350,6 +366,12 @@ pub struct TypeckBody<'a> {
     /// Every block written `unsafe` (`BlockKind::Unsafe`), ascending: expressions are converted
     /// in ascending order (`BodyView::unsafe_blocks`, blaze-typeck rules/unsafety.rs).
     pub unsafe_blocks: AVec<'a, ExprId>,
+    /// The edition of each expression's first word as canonical runs over ascending ids
+    /// (`BodyView::expr_editions`): `to_typeck`'s one loop visits every id in ascending order
+    /// and [`push_run`] adds a row only where the edition changes.
+    pub expr_editions: AVec<'a, (ExprId, tc::Edition)>,
+    /// As `expr_editions`, for patterns (`BodyView::pat_editions`).
+    pub pat_editions: AVec<'a, (PatId, tc::Edition)>,
     pub coroutine: Option<tc::CoroutineKind>,
     /// The `super let` statements, ascending (super_let.rs).
     pub super_lets: AVec<'a, StmtId>,
@@ -394,6 +416,8 @@ impl<'a> TypeckBody<'a> {
             asm_text: self.asm_text.as_str(),
             call_arg_ints: &self.call_arg_ints,
             unsafe_blocks: &self.unsafe_blocks,
+            expr_editions: &self.expr_editions,
+            pat_editions: &self.pat_editions,
         }
     }
 }
@@ -489,6 +513,16 @@ pub(crate) fn fmt_spec(spec: &str) -> Option<Spec<'_>> {
 
 const fn range(r: blaze_surface::Range) -> tc::Range {
     tc::Range { start: r.start, end: r.end }
+}
+
+/// Adds `id` of edition `ed` to the canonical runs `runs` (`BodyView::expr_editions`): a row
+/// only where the edition differs from the run `id` would otherwise fall in (the last row's,
+/// or `body` before any). Called with ascending ids, so the rows ascend.
+fn push_run<I>(runs: &mut AVec<'_, (I, tc::Edition)>, id: I, ed: tc::Edition, body: tc::Edition) {
+    let cur = runs.last().map_or(body, |&(_, e)| e);
+    if ed != cur {
+        runs.push((id, ed));
+    }
 }
 
 const fn edition(e: blaze_surface::Edition) -> tc::Edition {
@@ -724,10 +758,9 @@ impl Conv<'_, '_, '_, '_, '_> {
     ///
     /// Lifetime arguments are dropped: the checker erases regions (rustc's typeck sees none),
     /// and a list of lifetimes alone leaves the types to inference, as `Cow::<'a>::from`
-    /// does in Rust (lifetimes may be written without the types after them). `on`: the path
-    /// and segment the arguments are written on (`None` for a method call's), so a const
-    /// argument there is asked with its place ([`Types::const_term_at`]).
-    fn type_args(&mut self, l: List, r: BodyRange, on: Option<(PathIdx, u32)>) -> Result<(List, bool), Refused> {
+    /// does in Rust (lifetimes may be written without the types after them). The path
+    /// segment or method scope places each written constant in its enclosing block.
+    fn type_args(&mut self, l: List, r: BodyRange, on: ArgList) -> Result<(List, bool), Refused> {
         let rows = self.v.rows(l)?;
         let mut at: AVec<'_, PTy> = Vec::new_in(*self.out.type_lists.allocator());
         // Where each argument in `at` is written (BodyView::type_list_ranges), index for index.
@@ -753,8 +786,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                 GenericArg::Lifetime(_) => {}
                 GenericArg::Const(c) => {
                     ranges.push(range(self.v.site(self.v.const_range(c)?)?));
-                    let place = on.map(|(path, segment)| ArgAt { path, segment, index });
-                    at.push(self.const_arg(c, place)?);
+                    at.push(self.const_arg(c, on, index)?);
                 }
                 _ => return self.refuse("an associated item constraint", r),
             }
@@ -792,15 +824,14 @@ impl Conv<'_, '_, '_, '_, '_> {
     /// `ConstValue`. An unsuffixed integer's type is a hole the checker fills from the
     /// parameter's declared type. A block or a path is the caller's ([`Types::const_term`]);
     /// what it cannot value, and a negated literal without a suffix, is a hole with its gap
-    /// listed ([`Conv::term`]), never the body's refusal. `place`: where on a path it is
-    /// written ([`Types::const_term_at`]); `None` on a method call.
-    fn const_arg(&mut self, c: ConstIdx, place: Option<ArgAt>) -> Result<PTy, Refused> {
+    /// listed ([`Conv::term`]), never the body's refusal.
+    fn const_arg(&mut self, c: ConstIdx, place: ArgList, index: u32) -> Result<PTy, Refused> {
         let r = self.v.const_range(c)?;
         let text = self.v.text_at(r)?.trim();
         let Some(value) = const_literal(text) else {
             let term = match place {
-                Some(at) => self.types.const_term_at(self.v, c, at, self.tys)?,
-                None => self.types.const_term(self.v, c, self.tys)?,
+                ArgList::Path { path, segment } => self.types.const_term_at(self.v, c, ArgAt { path, segment, index }, self.tys)?,
+                ArgList::Method(scope) => self.types.method_const_term(self.v, c, scope, self.tys)?,
             };
             return self.term(term, ConstSite::Arg, r);
         };
@@ -968,14 +999,14 @@ impl Conv<'_, '_, '_, '_, '_> {
             if s.parenthesized || s.return_notation {
                 return self.refuse("parenthesized arguments in a body path", r);
             }
-            let (generic_args, has_args) = if s.has_args { self.type_args(s.args, r, Some((p, segment)))? } else { (List::EMPTY, false) };
+            let (generic_args, has_args) = if s.has_args { self.type_args(s.args, r, ArgList::Path { path: p, segment })? } else { (List::EMPTY, false) };
             segs.push(tc::Segment { name, generic_args, has_args });
             ranges.push(written);
         }
         Ok(())
     }
 
-    fn lit(&self, l: Lit, r: BodyRange) -> Result<tc::Lit, Refused> {
+    fn lit(&self, l: Lit, _r: BodyRange) -> Result<tc::Lit, Refused> {
         // The body's ranges are sites (rule 71): a literal an expansion made sits at its
         // outermost call. Its value is never read at a range of the typeck body: its readers
         // take it from the view (`View::text_at` of the node's own range), as consteval's
@@ -1002,15 +1033,17 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Local { pat, .. } => tc::Expr::Local(pat),
             Expr::Path(p) => tc::Expr::Path(self.path(p, true)?),
             Expr::Paren(i) => tc::Expr::Paren(i),
-            Expr::Block { stmts, tail, scope, kind } => match kind {
-                // A `try` block is a block its `?`s break to, its tail already `Try::from_output`.
-                BlockKind::Unsafe => {
-                    self.out.unsafe_blocks.push(e);
-                    tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope }
+            Expr::Block { stmts, tail, scope, kind } => {
+                match kind {
+                    // A `try` block is a block its `?`s break to, its tail already `Try::from_output`.
+                    BlockKind::Unsafe => {
+                        self.out.unsafe_blocks.push(e);
+                        tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope }
+                    }
+                    BlockKind::Plain | BlockKind::Try => tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope },
+                    BlockKind::Const => tc::Expr::ConstBlock { stmts: self.stmts(stmts)?, tail, scope },
                 }
-                BlockKind::Plain | BlockKind::Try => tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope },
-                BlockKind::Const => tc::Expr::ConstBlock { stmts: self.stmts(stmts)?, tail, scope },
-            },
+            }
             Expr::If { cond, then, else_ } => tc::Expr::If { cond, then, else_ },
             Expr::Let { pat, init } => tc::Expr::Let { pat, init },
             Expr::Match { scrutinee, arms, .. } => {
@@ -1035,7 +1068,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::MethodCall { row, scope } => {
                 let m = MethodCall::decode(self.v.row(row)?)?;
-                let generic_args = if m.has_args { self.type_args(m.generic_args, r, None)?.0 } else { List::EMPTY };
+                let generic_args = if m.has_args { self.type_args(m.generic_args, r, ArgList::Method(scope))?.0 } else { List::EMPTY };
                 // Ascending: expressions are converted in id order (`to_typeck`). An entry out of
                 // order is never misread: blaze-typeck's binary search returns only `e`'s own.
                 self.out.method_name_ranges.push((e, range(self.v.site(self.v.name_range(m.name)?)?)));
@@ -1309,6 +1342,8 @@ pub fn to_typeck<'a>(
         asm_text: blaze_own::AString::new_in(alloc),
         call_arg_ints: Vec::new_in(alloc),
         unsafe_blocks: Vec::new_in(alloc),
+        expr_editions: Vec::new_in(alloc),
+        pat_editions: Vec::new_in(alloc),
         coroutine: None,
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
@@ -1348,8 +1383,15 @@ pub fn to_typeck<'a>(
             None => return Err(Refused::Form { what: "a parameter with no pattern", range: Default::default() }),
         }
     }
+    // Each expression's edition is its first word's (rustc's `expr.span.edition()`): a word a
+    // macro wrote is in its defining crate's edition (the mark's), any other the body's;
+    // tracing's `valueset!` (2018) in a 2024 body. Ids ascend here, so the runs do.
+    let body_edition = c.out.edition;
     for i in 0..view.exprs.len() {
-        let e = c.expr(ExprId(len(i)))?;
+        let id = ExprId(len(i));
+        let ed = view.mark_of_expr(id)?.map_or(body_edition, |m| edition(m.edition));
+        push_run(&mut c.out.expr_editions, id, ed, body_edition);
+        let e = c.expr(id)?;
         c.out.exprs.push(e);
     }
     // `[x; _]`'s `_` is no expression of the checker's body: its repeat has no count
@@ -1370,7 +1412,10 @@ pub fn to_typeck<'a>(
     // one call, so no id repeats.
     c.out.call_arg_ints.sort_unstable_by_key(|&(x, _)| x);
     for i in 0..view.pats.len() {
-        let p = c.pat(PatId(len(i)))?;
+        let id = PatId(len(i));
+        let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));
+        push_run(&mut c.out.pat_editions, id, ed, body_edition);
+        let p = c.pat(id)?;
         c.out.pats.push(p);
     }
     for i in 0..view.stmts.len() {

@@ -251,19 +251,20 @@ fn rate(count: usize, total_ns: u64) -> f64 {
 
 /// Peak resident set so far, in MB (macOS reports `ru_maxrss` in bytes).
 fn maxrss_mb() -> f64 {
-    // SAFETY: getrusage writes one `rusage` into the zeroed value we pass; no other effect.
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    if r != 0 {
-        return -1.0;
-    }
-    let b = ru.ru_maxrss as f64;
+    let Ok(ru) = blaze_sys::posix::thread::process_rusage() else { return -1.0 };
+    #[cfg(target_os = "macos")]
+    let b = ru.max_rss_bytes as f64;
+    #[cfg(target_os = "linux")]
+    let b = (ru.max_rss_kb as f64) * 1000.0;
     if cfg!(target_os = "macos") { b / 1e6 } else { b / 1e3 }
 }
 
 fn load() -> f64 {
     let mut l = [0f64; 3];
     // SAFETY: getloadavg writes at most 3 doubles into the array.
+    #[cfg(target_os = "macos")]
+    let n = unsafe { blaze_sys::posix::proc::getloadavg(l.as_mut_ptr(), 3) };
+    #[cfg(not(target_os = "macos"))]
     let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
     if n < 1 { -1.0 } else { l[0] }
 }

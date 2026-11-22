@@ -259,7 +259,7 @@ fn a_vtable_address_in_code_is_a_relocation_to_the_placed_table() {
     let func = b.finish_checked().expect("builds");
     assert!(blaze_lir::print(func.view()).contains("= vtable 0"), "{}", blaze_lir::print(func.view()));
     let mut code = Code::new_in(Global);
-    emit(func.view(), &[], Isa { lse: true, os: Os::MacOs }, &mut code).expect("emits");
+    emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &[], Isa { lse: true, os: Os::MacOs }, &mut code).expect("emits");
     let named: Vec<RelocTo> = code.relocs.iter().map(|r| r.to).collect();
     assert_eq!(named, [RelocTo::Vtable(0)], "one literal word, the table's");
     let table = place_table(&f, C, concrete, 24, 8, &mut g);

@@ -1,0 +1,15 @@
+{
+ "id": "checkout-root-has-no-journal-unit",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), journal writer",
+ "where": "crates/blaze-core effects Effect::Journal { dir: FileName }; bstd fs/journal.rs changes_since; blaze-cli journal_sweep.rs plan_units",
+ "what": "when blaze starts in the checkout's root, the root is DirName::Root and changes_since refuses it (JournalError::Root), because the effect names a FileName, which is never empty. The sweep then makes one unit per large top-level folder, and every root-level row, every small folder's row and every served script row is statted on every request.",
+ "cost": "the floor the brief asked for ('the files of the folders told') cannot be reached for tempo, nor for any checkout run from its root",
+ "cause": "Effect::Journal took a FileName, not a DirName",
+ "whys": "the journal was first written for a named folder under the root",
+ "class": "an effect whose argument type cannot name a value the driver hands out (the root)",
+ "prevention": "to do: Effect::Journal { dir: DirName } across blaze-core's drivers and its sim (another writer owns crates/blaze-core/src/sim), then plan_units gives [\"\"] for the root too",
+ "annoyance": "the sim is off limits to this lane, so the port waits",
+ "workaround": "none",
+ "state": "open"
+}

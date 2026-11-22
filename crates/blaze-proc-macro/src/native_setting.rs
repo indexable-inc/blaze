@@ -10,7 +10,7 @@
 //! never looks anywhere else (rule 3).
 //!
 //! - The shelf is `<home>/.blaze/v2/toolchain/clang/<sha256 hex>`, the hex being the host's row of
-//!   the clang pin table ([`PIN`], `crates/blaze-toolchain/pins/clang.json`); its folder name is the
+//!   the clang pin table ([`CLANG_JSON`], `pins/clang.json`); its folder name is the
 //!   compiler's digest in a native run's key, so the resolved folder must keep that name.
 //! - The SDK is the folder the command was given (its own argument, or the edge's reading of the
 //!   machine), resolved once; its `SDKSettings.json` must give a `Version`, which the run key
@@ -26,7 +26,8 @@
 use core::time::Duration;
 use std::{fs, io};
 
-use blaze_build_script::toolchain::{self, PIN, PinError, Sysroot};
+use blaze_build_script::toolchain::{self, PinError, Sysroot};
+use blaze_pins::{CLANG_JSON, CLANG_PATH};
 use blaze_own::{AString, Alloc, String};
 
 use crate::native_unit::{NativeSetting, sdk_version};
@@ -161,13 +162,13 @@ impl core::fmt::Display for NativeSettingError<'_> {
             NativeSettingError::PinnedSysroot { host } => write!(
                 f,
                 "{}: {host}'s sysroot is a pinned archive, which native scripts do not take yet (only `macos-sdk` is built, D112)",
-                toolchain::PIN_PATH
+                CLANG_PATH
             ),
             NativeSettingError::NoShelf { path, error } => write!(
                 f,
                 "{}: {error}: the pinned C toolchain ({}) is not unpacked there, so the tool-spawning build scripts cannot run (D112)",
                 path.as_str(),
-                toolchain::PIN_PATH
+                CLANG_PATH
             ),
             NativeSettingError::ShelfNotPin { path, real } => write!(
                 f,
@@ -179,7 +180,7 @@ impl core::fmt::Display for NativeSettingError<'_> {
                 f,
                 "{}/{member}: not on the shelf: the pinned archive ({}) was unpacked there without this member (toolchain::SHELF_MEMBERS, nm-row); unpack it from the same archive beside the rest, so the tool-spawning build scripts cannot run (D112)",
                 shelf.as_str(),
-                toolchain::PIN_PATH
+                CLANG_PATH
             ),
             NativeSettingError::NoSdk { path, error } => write!(f, "{}: {error}: the macOS SDK the native build scripts compile against (D112)", path.as_str()),
             NativeSettingError::SdkVersion { path } => write!(f, "{}: no `Version`, which a native script's key holds (D69)", path.as_str()),
@@ -232,7 +233,7 @@ pub fn command_native_setting<'a>(
     host: &'a str,
     alloc: Alloc<'a>,
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
-    let digest = hex(&toolchain::clang_pin(PIN, host).map_err(NativeSettingError::Pin)?.sha256, alloc);
+    let digest = hex(&toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?.sha256, alloc);
     let shelf = text(&[home, "/", SHELF_DIR, "/", digest.as_str()], alloc);
     let work = text(&[home, "/", NATIVE_WORK_DIR, "/", command], alloc);
     native_setting(shelf.as_str(), sdk, work.as_str(), host, alloc)
@@ -249,8 +250,8 @@ pub fn native_setting<'a>(
     host: &'a str,
     alloc: Alloc<'a>,
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
-    let pin = toolchain::clang_pin(PIN, host).map_err(NativeSettingError::Pin)?;
-    match toolchain::sysroot(PIN, host).map_err(NativeSettingError::Pin)? {
+    let pin = toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
+    match toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)? {
         Sysroot::MacosSdk => {}
         Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
     }

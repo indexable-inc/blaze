@@ -12,9 +12,17 @@
 //! [`crate::tag::Snapshot::heap_committed`] (`malloc_zone_statistics`), so the gap between what
 //! live blocks hold and what the zones keep is seen too.
 //!
-//! The cost: one thread-local add per call, and two relaxed atomic adds once per [`BATCH`] bytes
-//! a thread's count moves. Each count is exact to [`BATCH`] per thread; what a thread had not
-//! folded when it exited is not counted (at most [`BATCH`] each).
+//! The thread's counts are the meter's (blaze-meter, D169; rule 30, one counter of a thread's
+//! heap): an allocation adds its size class's count and its bytes to the meter's cells, a free
+//! its count and bytes, and a `realloc` is a free of the old size and an allocation of the new
+//! (the allocator's own two acts: a block given back, a block handed out). This file keeps only
+//! the meter's totals at the last fold, and folds into blaze-mem's shared counters when the
+//! thread's bytes held moved by [`BATCH`] since.
+//!
+//! The cost: two thread-local adds per call (the meter's), a compare against the last fold,
+//! and two relaxed atomic adds once per [`BATCH`] bytes a thread's count moves. Each shared
+//! count is exact to [`BATCH`] per thread; what a thread had not folded when it exited is not in
+//! the shared counters (at most [`BATCH`] each), though it is in the thread's meter.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -25,9 +33,8 @@ pub const BATCH: i64 = 256 << 10;
 /// The system allocator, every call counted ([module docs](self)).
 pub struct Counted;
 
-/// What one thread allocated less what it freed, and the churn, not yet folded.
+/// The meter's heap totals of this thread ([`blaze_meter::heap_totals`]) when last folded.
 struct Local {
-    moved: Cell<i64>,
     allocated: Cell<u64>,
     freed: Cell<u64>,
 }
@@ -35,31 +42,45 @@ struct Local {
 std::thread_local! {
     // `const` and no destructor: reached from inside the allocator, it must neither allocate
     // nor register anything at a thread's first use.
-    static LOCAL: Local = const { Local { moved: Cell::new(0), allocated: Cell::new(0), freed: Cell::new(0) } };
+    static LOCAL: Local = const { Local { allocated: Cell::new(0), freed: Cell::new(0) } };
 }
 
-/// Counts `bytes` allocated (positive) or freed (negative) on this thread.
+/// `bytes` handed out on this thread.
 #[inline(always)]
-fn count(bytes: i64) {
+fn allocated(bytes: usize) {
+    blaze_meter::heap_allocated(bytes);
+    moved();
+}
+
+/// `bytes` taken back on this thread.
+#[inline(always)]
+fn freed(bytes: usize) {
+    blaze_meter::heap_freed(bytes);
+    moved();
+}
+
+/// Folds when the bytes held since the last fold moved by [`BATCH`].
+#[inline(always)]
+fn moved() {
+    let (allocated, freed) = blaze_meter::heap_totals();
     LOCAL.with(|local| {
-        let moved = local.moved.get().wrapping_add(bytes);
-        local.moved.set(moved);
-        match bytes >= 0 {
-            true => local.allocated.set(local.allocated.get().wrapping_add(bytes.unsigned_abs())),
-            false => local.freed.set(local.freed.get().wrapping_add(bytes.unsigned_abs())),
-        }
+        let into = allocated.wrapping_sub(local.allocated.get());
+        let out = freed.wrapping_sub(local.freed.get());
+        let moved = (into as i64).wrapping_sub(out as i64);
         if moved >= BATCH || moved <= -BATCH {
-            fold(local);
+            fold(local, (allocated, freed), (into, out), moved);
         }
     });
 }
 
 #[cold]
 #[inline(never)]
-fn fold(local: &Local) {
+fn fold(local: &Local, totals: (u64, u64), churn: (u64, u64), moved: i64) {
     committed_said();
-    crate::tag::heap_moved(None, local.moved.replace(0));
-    crate::tag::heap_churned(None, local.allocated.replace(0), local.freed.replace(0));
+    local.allocated.set(totals.0);
+    local.freed.set(totals.1);
+    crate::tag::heap_moved(None, moved);
+    crate::tag::heap_churned(None, churn.0, churn.1);
 }
 
 /// Tells blaze-mem how to read what the malloc zones committed, at the first fold: takes no
@@ -101,14 +122,10 @@ mod zones {
     }
 }
 
-/// A layout's size as a signed count: at most `isize::MAX`.
-fn signed(bytes: usize) -> i64 {
-    bytes as i64
-}
-
 // SAFETY: every call goes to `System` with the caller's own arguments, so `System`'s guarantees
-// hold; the counting beside it touches only this thread's `const` thread-local, which has no
-// destructor and so registers nothing, and relaxed atomics (`tag::heap_moved`,
+// hold; the counting beside it touches only this thread's `const` thread-locals (this file's and
+// blaze-meter's `#[thread_local]` cells), which have no destructor and so register nothing, and
+// relaxed atomics (`tag::heap_moved`,
 // `tag::heap_churned`, `tag::heap_committed_by`'s `OnceLock::set` of a `fn` pointer, which
 // allocates nothing). Nothing here allocates, so no call reenters the allocator.
 #[allow(unsafe_code)]
@@ -117,7 +134,7 @@ unsafe impl GlobalAlloc for Counted {
         // SAFETY: the caller upholds `alloc`'s contract for `layout`.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
-            count(signed(layout.size()));
+            allocated(layout.size());
         }
         ptr
     }
@@ -126,7 +143,7 @@ unsafe impl GlobalAlloc for Counted {
         // SAFETY: the caller upholds `alloc_zeroed`'s contract for `layout`.
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() {
-            count(signed(layout.size()));
+            allocated(layout.size());
         }
         ptr
     }
@@ -135,14 +152,15 @@ unsafe impl GlobalAlloc for Counted {
         // SAFETY: the caller says `ptr` was allocated by this allocator, which is `System`'s,
         // with `layout`.
         unsafe { System.dealloc(ptr, layout) };
-        count(-signed(layout.size()));
+        freed(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
         let new = unsafe { System.realloc(ptr, layout, new_size) };
         if !new.is_null() {
-            count(signed(new_size) - signed(layout.size()));
+            blaze_meter::heap_freed(layout.size());
+            allocated(new_size);
         }
         new
     }

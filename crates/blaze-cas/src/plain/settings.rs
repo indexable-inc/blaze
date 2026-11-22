@@ -1,36 +1,15 @@
-//! Which store a root opens: `<root>/store.json`, one typed value. No file is the
-//! content-addressed store of packs, as before; `{"form": "plain"}` is the plain store.
+//! How a root's plain store is kept: `<root>/store.json`, one typed value. No file is every
+//! default. The packs' store is gone, so an old file naming `"form"` is refused naming it.
 
 use std::alloc::Allocator;
 use std::{alloc::Global, path::Path};
 
-use blaze_data::{Cursor, FromValue, Shape, ShapeError};
+use blaze_data::{Cursor, FromValue, ShapeError};
 use blaze_keyed::kind::Namespace;
-
-/// The store's form: `"packs"` or `"plain"` in the file.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Form {
-    /// The content-addressed store of packs ([`crate::Store`]).
-    #[default]
-    Packs,
-    /// The plain store ([`super::Plain`]).
-    Plain,
-}
-
-impl<A: core::alloc::Allocator + Clone> FromValue<A> for Form {
-    fn from_value(c: &Cursor<'_, '_, A>) -> Result<Form, ShapeError<A>> {
-        match c.text()? {
-            "packs" => Ok(Form::Packs),
-            "plain" => Ok(Form::Plain),
-            _ => Err(c.error(Shape::OutOfRange { ty: "Form (\"packs\" or \"plain\")" })),
-        }
-    }
-}
 
 /// `<root>/store.json`: every field optional (the default), unknown fields refused.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Settings {
-    pub form: Form,
     /// The plain store's byte cap, in MiB: compaction prunes past it. None: no cap.
     pub cap_mib: Option<u64>,
     /// Sync every commit (a caller that needs a commit to survive a power cut; none today).
@@ -46,13 +25,12 @@ pub struct Settings {
 
 impl<A: core::alloc::Allocator + Clone> FromValue<A> for Settings {
     fn from_value(c: &Cursor<'_, '_, A>) -> Result<Settings, ShapeError<A>> {
-        c.deny_unknown(&["form", "cap_mib", "durable", "org", "trusted_writer"])?;
+        c.deny_unknown(&["cap_mib", "durable", "org", "trusted_writer"])?;
         let org = match c.field_opt("org")? {
             Some(org) if !org.is_null() => Some(org.text()?.to_owned()),
             _ => None,
         };
         Ok(Settings {
-            form: c.opt("form")?.unwrap_or_default(),
             cap_mib: c.opt("cap_mib")?,
             durable: c.opt("durable")?.unwrap_or(false),
             org,
@@ -77,7 +55,7 @@ impl Settings {
                 .and_then(|value| Cursor::root(&value, Global).get::<Settings>().map_err(|error| error.to_string()))
                 .map_err(|error| {
                     format!(
-                        "{}: {error}: it is `{{\"form\": \"packs\" | \"plain\", \"cap_mib\": N, \"durable\": bool, \"org\": \"name\", \"trusted_writer\": bool}}`",
+                        "{}: {error}: it is `{{\"cap_mib\": N, \"durable\": bool, \"org\": \"name\", \"trusted_writer\": bool}}`",
                         path.display()
                     )
                 }),

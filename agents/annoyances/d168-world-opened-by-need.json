@@ -1,0 +1,15 @@
+{
+ "id": "d168-world-opened-by-need",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer for D168 mechanism 2 and the typed put",
+ "where": "crates/blaze-cli/src/engine_bodies.rs (`groups`, `scope_of`, `run_stretch`, `join_slices`), engine_records.rs, engine_seeds.rs `RequestTable`, engine_body_record.rs",
+ "what": "(1) The brief named engine_body_memory*.rs as files of mine; no such file is in src/, it is src/tests/engine_body_memory_tests.rs. (2) The `typed put` brief said the body rows are put 'around line 2192': that line is the member listing row's put; body rows are never put by the stage, they go to the engine's buffer, so the typed put went in run_phase's merge loop. (3) `typed_key` was written here and by the run writer at the same minute in engine_body_record.rs, with two different hash domains ('checked record key 1' in the brief, 'typed body key 1' in the run writer's); mine was removed. (4) An outline's `name` is NOT `Name::file(its path)` when the sweep's real path differs from the slot (`mod.rs` forms), so the per-file linear `position` over the outlines in `groups` cannot be turned into a binary search by name; I nearly shipped that. (5) Line numbers in engine_bodies.rs moved under me all session (another writer in the slicing code).",
+ "cost": "about twenty minutes of re-locating code and one reverted edit",
+ "cause": "the scope of a member's world was decided at the phase's start by a loop over every member, and the brief's file list and line numbers were written from an older tree",
+ "whys": "scope_of was the one way to get a member's own records, so every reader of a member's items record paid for its whole scope; no type says 'a member read, not opened'",
+ "class": "eager setup hidden behind a helper that returns more than its caller needs",
+ "prevention": "the OpenWorld seam (Whole/ByNeed) with an oracle test; the outlines want a path-sorted view made once a phase (or the items record's file rows carrying the outline's name) so the file match is one lookup",
+ "annoyance": "an exact line number in a brief for a file another writer is editing",
+ "workaround": "find by text with rg before each edit, never by the brief's line",
+ "state": "open"
+}

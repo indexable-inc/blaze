@@ -5,13 +5,14 @@
 
 use blaze_code::record::Symbol as CodeSymbol;
 use blaze_launch::wire::RecordId;
+use blaze_sys::posix::signal::{SIGSEGV, SIGTRAP};
 
 use super::fault_report::{Kind, Row, Struck, code_window};
 
 const AREA: u64 = 0x70_0000_6000;
 
 fn trap(pc: u64) -> Struck {
-    Struck { sig: libc::SIGTRAP, pc: Some(pc), address: pc, write: None }
+    Struck { sig: SIGTRAP, pc: Some(pc), address: pc, write: None }
 }
 
 /// The std-hello stop's shape (+0x3fc in a function's code): the whole 32 bytes; a pc 8 bytes
@@ -33,9 +34,9 @@ fn the_code_window_stays_in_its_row_and_its_page() {
     assert_eq!(code_window(trap(AREA + 0xffc), &[long]), Some((AREA + 0xfec, 20)));
     assert_eq!(code_window(trap(AREA + 0x48), &rows), None, "a pc in a datum");
     assert_eq!(code_window(trap(AREA + 0x4000), &rows), None, "a pc in no row");
-    assert_eq!(code_window(Struck { sig: libc::SIGTRAP, pc: None, address: 0, write: None }, &rows), None);
-    let fetch = Struck { sig: libc::SIGSEGV, pc: Some(pc), address: pc, write: None };
+    assert_eq!(code_window(Struck { sig: SIGTRAP, pc: None, address: 0, write: None }, &rows), None);
+    let fetch = Struck { sig: SIGSEGV, pc: Some(pc), address: pc, write: None };
     assert_eq!(code_window(fetch, &rows), None, "the fetch of the pc's page");
-    let data = Struck { sig: libc::SIGSEGV, pc: Some(pc), address: 0x10, write: Some(false) };
+    let data = Struck { sig: SIGSEGV, pc: Some(pc), address: 0x10, write: Some(false) };
     assert_eq!(code_window(data, &rows), Some((pc - 16, 32)));
 }

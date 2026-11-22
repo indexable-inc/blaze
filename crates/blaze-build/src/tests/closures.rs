@@ -20,7 +20,7 @@ use blaze_typeck::{
 };
 
 use super::run_native_with;
-use crate::layout::{ClosureFacts, LayoutFacts, Missing, ReprAttrs, ValidRange};
+use crate::layout::{ClosureFacts, LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
 use crate::{Abi, Adts, Built, FnTrait, Subst};
 
 struct World {
@@ -36,11 +36,35 @@ struct World {
     drop_d: ItemKey,
     mk_d: ItemKey,
     dip: ItemKey,
+    /// `fn drops() -> u64` (host: the drops of `D` counted so far): where a program reads the
+    /// ORDER of its drops.
+    drops: ItemKey,
+    /// `struct S { a: u8, b: u64, c: u8 }` and `fn mk_s() -> S` (host: `S { a: 7, b: 40, c: 2
+    /// }` at the offsets [`S_AT`] holds): an aggregate whose `repr(Rust)` layout REORDERS its
+    /// fields (`b` first, by decreasing alignment).
+    s: ItemKey,
+    mk_s: ItemKey,
 }
 
 std::thread_local! {
     /// How many `D`s the host's `Drop` saw.
     static DROPS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    /// The offsets of `S`'s fields `a`, `b`, `c` as the builder's layout places them (the test
+    /// reads them from `Layouts` before it runs: [`s_offsets`]).
+    static S_AT: core::cell::Cell<[usize; 3]> = const { core::cell::Cell::new([0; 3]) };
+}
+
+/// `mk_s()`: `S { a: 7, b: 40, c: 2 }` through the result pointer, each field at the offset
+/// the builder's layout gives it ([`S_AT`]).
+extern "C" fn host_mk_s(out: *mut u8) {
+    let [a, b, c] = S_AT.with(core::cell::Cell::get);
+    // SAFETY: `out` is the caller's result slot of one `S` (16 bytes), and each offset is one
+    // of its fields' inside it.
+    unsafe {
+        out.add(a).write(7);
+        out.add(b).cast::<u64>().write_unaligned(40);
+        out.add(c).write(2);
+    }
 }
 
 /// `D`'s `Drop::drop(&mut self)` on the host: counts one drop.
@@ -55,6 +79,11 @@ extern "C" fn host_drop_d(p: *const u64) {
 extern "C" fn host_mk_d(out: *mut u64) {
     // SAFETY: `out` is the caller's result slot of one D.
     unsafe { out.write(5) };
+}
+
+/// `drops()`: the drops of `D` counted so far (a `u64` returned in a register).
+extern "C" fn host_drops() -> u64 {
+    DROPS.with(core::cell::Cell::get)
 }
 
 fn world() -> World {
@@ -103,7 +132,12 @@ fn open_world() -> World {
     let raw = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
     let dip = fx.func("drop_in_place", 1, &[raw], unit, Vec::new());
     fx.unsized_fn_param(dip, 0);
-    World { fx, main, methods: [call, call_mut, call_once], traits: [fn_, fn_mut, fn_once], d, drop_d, mk_d, dip }
+    let drops = fx.func("drops", 0, &[], u64_, Vec::new());
+    let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+    let s = fx.strukt("S", 0, &[("a", u8_), ("b", u64_), ("c", u8_)]);
+    let st = fx.adt(s, &[]);
+    let mk_s = fx.func("mk_s", 0, &[], st, Vec::new());
+    World { fx, main, methods: [call, call_mut, call_once], traits: [fn_, fn_mut, fn_once], d, drop_d, mk_d, dip, drops, s, mk_s }
 }
 
 /// One fn item's body: its item, its builder, its root and its literals.
@@ -355,7 +389,12 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
     }
     assert!(placed.iter().all(|&p| p), "a cycle among the built bodies");
     fns.push((w.main, None, &main));
-    let host = [(w.drop_d, host_drop_d as usize as u64), (w.mk_d, host_mk_d as usize as u64)];
+    let host = [
+        (w.drop_d, host_drop_d as usize as u64),
+        (w.mk_d, host_mk_d as usize as u64),
+        (w.drops, host_drops as usize as u64),
+        (w.mk_s, host_mk_s as usize as u64),
+    ];
     (run_native_with(&host, &fns), closures)
 }
 
@@ -1037,4 +1076,364 @@ fn a_closure_of_a_generic_owner_is_one_instance_per_owner_argument() {
         Prog { item: via, b: &vb, root: vroot, lits: &vlits },
     ];
     assert_eq!(run_progs(&w, &progs), (42032, 2));
+}
+
+// Captured PLACES (RFC 2229, "Capture precision": "a closure captures the precise path used
+// ... rather than the entire variable"): stage 2 of blaze's captures, a closure's field holding
+// `x.0` rather than `x` (walk/moves/env_places.rs). Ignored until the stage-2 switch sets
+// blaze-typeck env_fields.rs `ActiveEnv` to `Places`; the switch removes each `ignore`. Under
+// `WholeBindings` each one fails: the first two capture `x` whole, the third reads `x.1` while
+// the closure borrows all of `x` mutably.
+
+/// `base.index`, a tuple's field.
+fn tuple_field(b: &mut Bb, base: ExprId, index: u32) -> ExprId {
+    let at = b.int(None);
+    b.exprs[at.ix()] = Expr::TupleField { base, index };
+    at
+}
+
+/// `base.name`, a struct's field.
+fn named_field(b: &mut Bb, base: ExprId, name: &str) -> ExprId {
+    let at = b.int(None);
+    b.exprs[at.ix()] = Expr::Field { base, name: blaze_typeck::Name::of(name) };
+    at
+}
+
+/// `let x = (mk_d(), mk_d());` in `b`.
+fn let_pair_of_d(b: &mut Bb) -> (StmtId, PatId) {
+    let x = b.bind("x");
+    let (m0, m1) = (b.path(&["mk_d"]), b.path(&["mk_d"]));
+    let (d0, d1) = (b.call(m0, &[]), b.call(m1, &[]));
+    let pair = b.tuple(&[d0, d1]);
+    (b.let_(x, None, pair), x)
+}
+
+/// `move || { let r = &x.0; r.x }` in `b`.
+fn move_reads_first(b: &mut Bb, x: PatId) -> ExprId {
+    let xe = b.local(x);
+    let x0 = tuple_field(b, xe, 0);
+    let rx0 = b.borrow(Mutbl::Not, x0);
+    let r = b.bind("r");
+    let sr = b.let_(r, None, rx0);
+    let re = b.local(r);
+    let rx = named_field(b, re, "x");
+    let body = b.block(&[sr], Some(rx));
+    b.move_closure(&[], body)
+}
+
+/// "Capture precision" and "Capture modes": a `move` closure captures the place `x.0` by
+/// value, so it moves `x.0` alone ("Destructors": "If a variable has been partially
+/// initialized, only its initialized fields are dropped") and `x.1` stays usable. `let x =
+/// (mk_d(), mk_d()); let c = move || { let r = &x.0; r.x }; c() + x.1.x` is 10 with TWO drops
+/// of `D`: `x.0` with `c` and `x.1` with `x`, each once. NEGATIVE: under `WholeBindings` `c`
+/// moves `x` whole and `x.1.x` is a use after the move (E0382).
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn a_move_closure_takes_one_field_and_the_owner_keeps_using_the_other() {
+    let w = world();
+    let mut b = Bb::new();
+    let lits: StdVec<(ExprId, u128)> = StdVec::new();
+    let (s0, x) = let_pair_of_d(&mut b);
+    let clo = move_reads_first(&mut b, x);
+    let c = b.bind("c");
+    let s1 = b.let_(c, None, clo);
+    let ce = b.local(c);
+    let call = b.call(ce, &[]);
+    let xe = b.local(x);
+    let x1 = tuple_field(&mut b, xe, 1);
+    let x1x = named_field(&mut b, x1, "x");
+    let sum = bin(&mut b, BinOp::Add, call, x1x);
+    let root = b.block(&[s0, s1], Some(sum));
+    assert_eq!(run_counting(&w, &b, root, &lits), (10, 1, 2));
+}
+
+/// "Drop order" and "Destructors": the closure's captured field is dropped when the closure
+/// is, and the variable's scope end drops only what was not moved out of it. `let x =
+/// (mk_d(), mk_d()); let n: u64 = { let c = move || { let r = &x.0; r.x }; c() }; let k: u64
+/// = drops(); k * 100 + n` is 105 with two drops in all: at `c`'s scope end exactly ONE `D` was
+/// dropped (`x.0`, the closure's), and `x`'s end drops `x.1` alone (not `x.0` again: three
+/// drops, and the host's check of a live `D` would see a dead one). NEGATIVE: a closure moving
+/// `x` whole drops both at `c`'s end: 205.
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn a_captured_field_drops_with_the_closure_and_the_rest_with_its_variable() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, x) = let_pair_of_d(&mut b);
+    let clo = move_reads_first(&mut b, x);
+    let c = b.bind("c");
+    let sc = b.let_(c, None, clo);
+    let ce = b.local(c);
+    let call = b.call(ce, &[]);
+    let inner = b.block(&[sc], Some(call));
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    let n = b.bind("n");
+    let s1 = b.let_(n, Some(u64_), inner);
+    let k = b.bind("k");
+    let callee = b.path(&["drops"]);
+    let counted = b.call(callee, &[]);
+    let s2 = b.let_(k, Some(u64_), counted);
+    let hundred = lit(&mut b, &mut lits, 100);
+    let ke = b.local(k);
+    let scaled = bin(&mut b, BinOp::Mul, ke, hundred);
+    let ne = b.local(n);
+    let out = bin(&mut b, BinOp::Add, scaled, ne);
+    let root = b.block(&[s0, s1, s2], Some(out));
+    assert_eq!(run_counting(&w, &b, root, &lits), (105, 1, 2));
+}
+
+/// "Capture modes": a closure assigning `x.0` captures that place by mutable borrow, and the
+/// write lands in `x`; "Capture precision": `x.1` is not borrowed, so the owner reads it while
+/// the closure lives. `let x: (u64, u64) = (1, 2); let c = || x.0 = x.0 + 5; let k: u64 =
+/// x.1; c(); k * 100 + x.0 * 10 + x.1` is 262 (a copy of `x.0` in the closure would leave
+/// 212). NEGATIVE: under `WholeBindings` the closure borrows all of `x` mutably and `let k =
+/// x.1` while it lives is E0503.
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn a_closure_borrowing_one_field_mutably_writes_through_to_its_variable() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    let pair_ty = {
+        let l = b.t.intern_list(&[u64_, u64_]).expect("intern");
+        b.ty(PNode::Tuple(l))
+    };
+    let x = b.bind("x");
+    let (one, two) = (lit(&mut b, &mut lits, 1), lit(&mut b, &mut lits, 2));
+    let pair = b.tuple(&[one, two]);
+    let s0 = b.let_(x, Some(pair_ty), pair);
+    let (xl, xr) = (b.local(x), b.local(x));
+    let (lhs, rhs0) = (tuple_field(&mut b, xl, 0), tuple_field(&mut b, xr, 0));
+    let five = lit(&mut b, &mut lits, 5);
+    let rhs = bin(&mut b, BinOp::Add, rhs0, five);
+    let set = assign(&mut b, lhs, rhs);
+    let clo = b.closure(&[], set);
+    let c = b.bind("c");
+    let s1 = b.let_(c, None, clo);
+    let k = b.bind("k");
+    let xk = b.local(x);
+    let x1 = tuple_field(&mut b, xk, 1);
+    let s2 = b.let_(k, Some(u64_), x1);
+    let ce = b.local(c);
+    let call = b.call(ce, &[]);
+    let s3 = b.semi(call);
+    let (ke, hundred) = (b.local(k), lit(&mut b, &mut lits, 100));
+    let a = bin(&mut b, BinOp::Mul, ke, hundred);
+    let xa = b.local(x);
+    let xa0 = tuple_field(&mut b, xa, 0);
+    let ten = lit(&mut b, &mut lits, 10);
+    let bb = bin(&mut b, BinOp::Mul, xa0, ten);
+    let xb = b.local(x);
+    let xb1 = tuple_field(&mut b, xb, 1);
+    let ab = bin(&mut b, BinOp::Add, a, bb);
+    let out = bin(&mut b, BinOp::Add, ab, xb1);
+    let root = b.block(&[s0, s1, s2, s3], Some(out));
+    assert_eq!(run(&w, &b, root, &lits), (262, 1));
+}
+
+/// `|| { let e = x.0; e.x }` in `b`: a closure that moves the field `x.0` out of its
+/// environment (FnOnce: "Closure types", a closure that moves a capture out implements only
+/// `FnOnce`).
+fn consumes_first(b: &mut Bb, x: PatId) -> ExprId {
+    let xe = b.local(x);
+    let x0 = tuple_field(b, xe, 0);
+    let e = b.bind("e");
+    let se = b.let_(e, None, x0);
+    let ee = b.local(e);
+    let ex = named_field(b, ee, "x");
+    let body = b.block(&[se], Some(ex));
+    b.closure(&[], body)
+}
+
+/// `let k: u64 = drops();` in `b`.
+fn let_drops(b: &mut Bb, name: &str) -> (StmtId, PatId) {
+    let k = b.bind(name);
+    let callee = b.path(&["drops"]);
+    let counted = b.call(callee, &[]);
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    (b.let_(k, Some(u64_), counted), k)
+}
+
+/// "Capture precision" and "Capture modes": a closure moving `x.0` out captures that PLACE by
+/// value, its environment owns `x.0` alone, and its call (FnOnce) moves the field into `e`,
+/// dropped at the body's end ("Destructors"). `let x = (mk_d(), mk_d()); let f = || { let e =
+/// x.0; e.x }; let v: u64 = f(); let k: u64 = drops(); v * 100 + k * 10 + x.1.x` is 515 with
+/// TWO drops in all: `x.0` once, by the call (k is 1 right after it), and `x.1` once, at `x`'s
+/// scope end (not `x.0` again: a third drop, and the host's check of a live `D` would see a
+/// moved one). NEGATIVE twin: under `WholeBindings` the closure takes `x` whole and `x.1.x` is a
+/// use after the move (E0382); a body that also dropped its env field at its end would count 3.
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn an_fn_once_closure_consumes_a_captured_field_and_the_owner_drops_the_rest() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, x) = let_pair_of_d(&mut b);
+    let clo = consumes_first(&mut b, x);
+    let f = b.bind("f");
+    let s1 = b.let_(f, None, clo);
+    let fe = b.local(f);
+    let call = b.call(fe, &[]);
+    let v = b.bind("v");
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    let s2 = b.let_(v, Some(u64_), call);
+    let (s3, k) = let_drops(&mut b, "k");
+    let (ve, hundred) = (b.local(v), lit(&mut b, &mut lits, 100));
+    let vs = bin(&mut b, BinOp::Mul, ve, hundred);
+    let (ke, ten) = (b.local(k), lit(&mut b, &mut lits, 10));
+    let ks = bin(&mut b, BinOp::Mul, ke, ten);
+    let xe = b.local(x);
+    let x1 = tuple_field(&mut b, xe, 1);
+    let x1x = named_field(&mut b, x1, "x");
+    let sum = bin(&mut b, BinOp::Add, vs, ks);
+    let out = bin(&mut b, BinOp::Add, sum, x1x);
+    let root = b.block(&[s0, s1, s2, s3], Some(out));
+    assert_eq!(run_counting(&w, &b, root, &lits), (515, 1, 2));
+}
+
+/// The same closure dropped UNCALLED ("Drop order": a closure's captures are dropped with it):
+/// its environment's `x.0` is dropped at `f`'s scope end, `x.1` at `x`'s. `let x = (mk_d(),
+/// mk_d()); let n: u64 = { let f = || { let e = x.0; e.x }; drops() }; let k: u64 = drops(); k
+/// * 100 + n * 10 + x.1.x` is 105 (none dropped while `f` lives, one right after) with TWO drops
+/// in all, each `D` once. NEGATIVE twin: an owner that also dropped `x.0` at its end (the field
+/// moved into the environment not marked moved) counts 3, and the host's check of a live `D`
+/// fails on the second drop of `x.0`; a closure that took `x` whole drops both at `f`'s end
+/// (205).
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn an_fn_once_closure_dropped_uncalled_drops_its_captured_field_once() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, x) = let_pair_of_d(&mut b);
+    let clo = consumes_first(&mut b, x);
+    let f = b.bind("f");
+    let sf = b.let_(f, None, clo);
+    let callee = b.path(&["drops"]);
+    let counted = b.call(callee, &[]);
+    let inner = b.block(&[sf], Some(counted));
+    let n = b.bind("n");
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    let s1 = b.let_(n, Some(u64_), inner);
+    let (s2, k) = let_drops(&mut b, "k");
+    let (ke, hundred) = (b.local(k), lit(&mut b, &mut lits, 100));
+    let ks = bin(&mut b, BinOp::Mul, ke, hundred);
+    let (ne, ten) = (b.local(n), lit(&mut b, &mut lits, 10));
+    let ns = bin(&mut b, BinOp::Mul, ne, ten);
+    let xe = b.local(x);
+    let x1 = tuple_field(&mut b, xe, 1);
+    let x1x = named_field(&mut b, x1, "x");
+    let sum = bin(&mut b, BinOp::Add, ks, ns);
+    let out = bin(&mut b, BinOp::Add, sum, x1x);
+    let root = b.block(&[s0, s1, s2], Some(out));
+    assert_eq!(run_counting(&w, &b, root, &lits), (105, 0, 2));
+}
+
+// Field ORDER (walk.rs `decl_field`, the one lookup of a field by declaration index, closure.rs
+// `field_offset` and walk/moves/env_places.rs `env_field_offset`): `layout` pushes an
+// aggregate's rows in DECLARATION order and gives each the offset `ls` placed it at; a
+// `repr(Rust)` aggregate's OFFSETS are reordered by decreasing alignment (layout.rs
+// `univariant`, `Order::Decreasing`), never its rows. Each program below reads a `(u8, u64,
+// u8)`-shaped value whose `u64` is placed FIRST: an index read as a placement order, or an
+// offset taken from the wrong row, reads 40 where 7 is and the sum is wrong.
+
+/// `operand as u64`.
+fn as_u64(b: &mut Bb, operand: ExprId) -> ExprId {
+    let ty = b.ty(PNode::Uint(UintTy::U64));
+    let at = b.int(None);
+    b.exprs[at.ix()] = Expr::Cast { operand, ty };
+    at
+}
+
+/// `x as u64 * 10000 + y * 10 + z as u64` (a `u8` `x` and `z`, a `u64` `y`): 70402 for (7,
+/// 40, 2), and a different number for any other order of the three.
+fn weigh(b: &mut Bb, lits: &mut StdVec<(ExprId, u128)>, x: ExprId, y: ExprId, z: ExprId) -> ExprId {
+    let xw = as_u64(b, x);
+    let big = lit(b, lits, 10000);
+    let xs = bin(b, BinOp::Mul, xw, big);
+    let ten = lit(b, lits, 10);
+    let ys = bin(b, BinOp::Mul, y, ten);
+    let zw = as_u64(b, z);
+    let s = bin(b, BinOp::Add, xs, ys);
+    bin(b, BinOp::Add, s, zw)
+}
+
+/// The offsets of `S`'s fields `a`, `b`, `c` as the builder's `Layouts` places them.
+fn s_offsets(w: &World) -> [usize; 3] {
+    let table = PortableTys::new_in(Alloc::global());
+    let adts = FxAdts { w, progs: &[], closures: &[], table: table.view() };
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let none = ground.intern_list(&[]).expect("the empty list");
+    let st = ground.intern(PNode::Adt(w.s, none)).expect("`S`");
+    let mut ls = Layouts::new_in(Global);
+    let id = ls.of(st, &mut LayoutCx { ground: &mut ground, facts: &adts, scratch: Alloc::global() }).unwrap_or_else(|e| panic!("`S` has no layout: {e}"));
+    let at = |j: u32| usize::try_from(ls.field_offset(id, j).expect("`S`'s field has an offset")).expect("an offset");
+    [at(0), at(1), at(2)]
+}
+
+/// Three readers of one reordered shape, each `f()` 70402: (1) a `move` closure over `let a:
+/// u8 = 7; let b: u64 = 40; let c: u8 = 2;`, whose ENVIRONMENT is `(u8, u64, u8)`
+/// (closure.rs `field_offset`); (2) a `move` closure over `let t: (u8, u64, u8) = (7, 40, 2);`
+/// reading `t.0`, `t.1`, `t.2` (a TUPLE: whole, its fields by walk.rs `field`; by places,
+/// three environment fields made from `t`'s rows by `env_field_offset`); (3) the same over `let
+/// s = mk_s();` reading `s.a`, `s.b`, `s.c` (a STRUCT, `S { a: u8, b: u64, c: u8 }`, written by
+/// the host at the offsets `Layouts` gives). First the premise: `S`'s `b` IS placed first (`[8,
+/// 0, 9]`), so the order is really changed. NEGATIVE twin: rows pushed in placement order would
+/// fail `decl_field`'s name check (`BuildError::FieldOrder`), and offsets read by placement
+/// index give 400072 or another number, never 70402.
+#[test]
+fn a_reordered_aggregate_is_read_by_declaration_index_in_a_closure() {
+    let w = world();
+    let offsets = s_offsets(&w);
+    assert_eq!(offsets, [8, 0, 9], "`S {{ a: u8, b: u64, c: u8 }}` is placed `b`, `a`, `c` (decreasing alignment)");
+    S_AT.with(|s| s.set(offsets));
+    for form in 0..3 {
+        let mut b = Bb::new();
+        let mut lits = StdVec::new();
+        let u8_ = b.ty(PNode::Uint(UintTy::U8));
+        let u64_ = b.ty(PNode::Uint(UintTy::U64));
+        let mut stmts = StdVec::new();
+        let (x, y, z) = match form {
+            0 => {
+                let mut put = |b: &mut Bb, lits: &mut StdVec<(ExprId, u128)>, name: &str, ty: PTy, v: u128| {
+                    let p = b.bind(name);
+                    let e = lit(b, lits, v);
+                    stmts.push(b.let_(p, Some(ty), e));
+                    p
+                };
+                let a = put(&mut b, &mut lits, "a", u8_, 7);
+                let bp = put(&mut b, &mut lits, "b", u64_, 40);
+                let c = put(&mut b, &mut lits, "c", u8_, 2);
+                (b.local(a), b.local(bp), b.local(c))
+            }
+            1 => {
+                let l = b.t.intern_list(&[u8_, u64_, u8_]).expect("intern");
+                let tt = b.ty(PNode::Tuple(l));
+                let t = b.bind("t");
+                let (seven, forty, two) = (lit(&mut b, &mut lits, 7), lit(&mut b, &mut lits, 40), lit(&mut b, &mut lits, 2));
+                let tup = b.tuple(&[seven, forty, two]);
+                stmts.push(b.let_(t, Some(tt), tup));
+                let (t0, t1, t2) = (b.local(t), b.local(t), b.local(t));
+                (tuple_field(&mut b, t0, 0), tuple_field(&mut b, t1, 1), tuple_field(&mut b, t2, 2))
+            }
+            _ => {
+                let s = b.bind("s");
+                let callee = b.path(&["mk_s"]);
+                let made = b.call(callee, &[]);
+                stmts.push(b.let_(s, None, made));
+                let (sa, sb, sc) = (b.local(s), b.local(s), b.local(s));
+                (named_field(&mut b, sa, "a"), named_field(&mut b, sb, "b"), named_field(&mut b, sc, "c"))
+            }
+        };
+        let weighed = weigh(&mut b, &mut lits, x, y, z);
+        let clo = b.move_closure(&[], weighed);
+        let f = b.bind("f");
+        stmts.push(b.let_(f, None, clo));
+        let fe = b.local(f);
+        let call = b.call(fe, &[]);
+        let root = b.block(&stmts, Some(call));
+        assert_eq!(run(&w, &b, root, &lits), (70402, 1), "form {form}");
+    }
 }

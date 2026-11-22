@@ -43,7 +43,9 @@ pub fn recipes_of<'n, S: NamesSource<'n>>(
     let owner = body.typeck.owner;
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, owner, done, langs, alloc);
-    let nested = NestedFacts::new(&facts);
+    // Every fn's signature regions are its head record's, read in place (D148).
+    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let nested = NestedFacts::new(facts.read_by(&reader, r.store.tys.view()));
     let tys = body.tys.view(&r.store.tys)?;
     let view = body.typeck.view(tys);
     for (ordinal, block) in blaze_build::coroutines_in(&view) {

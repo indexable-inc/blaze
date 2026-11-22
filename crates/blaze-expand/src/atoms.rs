@@ -135,7 +135,10 @@ fn word_of(kind: TokenKind) -> (u32, u32) {
 #[derive(Clone, Copy, Debug)]
 pub struct Atoms<'t> {
     atoms: &'t [u8],
-    text: &'t [u8],
+    /// The text section, proved a whole `str` by [`Atoms::of`] (or, through
+    /// [`Checked::atoms`], by an earlier `Atoms::of` of the same bytes): held as one, so an
+    /// atom's text is a `str` slice and its push needs no second check.
+    text: &'t str,
 }
 
 impl<'t> Atoms<'t> {
@@ -162,7 +165,7 @@ impl<'t> Atoms<'t> {
         if start != text.len() {
             return Err(AtomsError::TextLeft { end: start, len: text.len() });
         }
-        Ok(Atoms { atoms, text })
+        Ok(Atoms { atoms, text: whole })
     }
 
     /// How many atoms the table holds.
@@ -191,7 +194,8 @@ impl<'t> Atoms<'t> {
         }
         let (word, start, end, suffix_len) = self.part(id);
         let kind = kind_of(word, suffix_len).expect("`Atoms::of` checked every atom's word");
-        let text = core::str::from_utf8(&self.text[start..end]).expect("`Atoms::of` checked every atom's text");
+        // `Atoms::of` checked every atom's end is a character boundary of the text.
+        let text = &self.text[start..end];
         Some((kind, text))
     }
 
@@ -216,7 +220,8 @@ impl<'t> Atoms<'t> {
         for (row, id) in rows.chunks_exact(ROW).enumerate() {
             let (word, start, end, suffix_len) = self.part(wide(u32_at(id, 0)));
             let kind = kind_of(word, suffix_len).expect("`Atoms::of` checked every atom's word");
-            out.push_bytes(kind, &self.text[start..end], ctx_of(row)).map_err(AtomsError::Stream)?;
+            let text = crate::tokens::WholeText::of(&self.text[start..end]);
+            out.push_whole(kind, text, ctx_of(row)).map_err(AtomsError::Stream)?;
         }
         Ok(())
     }
@@ -239,8 +244,24 @@ impl Checked {
 
     /// The table these two sections were proved to be; `None` for sections of other lengths
     /// than the proved ones.
-    pub fn atoms<'t>(&self, atoms: &'t [u8], text: &'t [u8]) -> Option<Atoms<'t>> {
-        (atoms.len() == self.atoms && text.len() == self.text).then_some(Atoms { atoms, text })
+    ///
+    /// # Safety
+    ///
+    /// `atoms` and `text` are the very bytes this proof was taken of ([`Atoms::checked`] of an
+    /// [`Atoms::of`] that returned `Ok`), unchanged since. Only their lengths are checked here;
+    /// the text is then read as a `str` with no UTF-8 check, and its atoms' ends as character
+    /// boundaries, so other bytes of the same lengths would put non-UTF-8 into a token
+    /// stream's text table, which [`crate::tokens::TokenStream::text_of`] reads unchecked.
+    pub unsafe fn atoms<'t>(&self, atoms: &'t [u8], text: &'t [u8]) -> Option<Atoms<'t>> {
+        if atoms.len() != self.atoms || text.len() != self.text {
+            return None;
+        }
+        // SAFETY: by this function's contract `text` is the text section `Atoms::of` proved
+        // with `core::str::from_utf8` (the proof's only maker), unchanged since, so it is
+        // valid UTF-8; and `atoms` is the section whose every end it proved a character
+        // boundary of that text.
+        let text = unsafe { core::str::from_utf8_unchecked(text) };
+        Some(Atoms { atoms, text })
     }
 }
 

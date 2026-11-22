@@ -19,6 +19,10 @@ pub enum Plant {
     /// A trait whose dyn compatibility the world did not decide is taken as not compatible
     /// (builtin.rs `dyn_compatible`): the state before the gap stopped the goal.
     DynUndecidedAsNo,
+    /// The last argument of a declaration is lost before its type or bound is instantiated.
+    MissingHeadArgument,
+    /// A portable reachability walk drops every child instead of visiting it.
+    ParamsReachedDropsChild,
 }
 
 std::thread_local! {
@@ -27,6 +31,13 @@ std::thread_local! {
 
 pub fn on(p: Plant) -> bool {
     PLANT.with(|c| c.get() == p)
+}
+
+pub fn head_args(mut args: crate::term::List) -> crate::term::List {
+    if on(Plant::MissingHeadArgument) {
+        args.len = args.len.saturating_sub(1);
+    }
+    args
 }
 
 /// Runs `f` with `p` planted.

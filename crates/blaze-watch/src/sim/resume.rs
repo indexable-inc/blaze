@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
-use super::{harness, key, oracle};
+use super::{Lap, harness, key, oracle};
 use crate::conn::{Conn, Grant, INITIAL_CREDIT};
 use crate::feed::{Feed, Follow, Item, Subscriber};
 use crate::frame::{self, Frame};
@@ -122,12 +122,14 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 #[test]
 fn a_resumed_feed_delivers_each_item_once_or_a_gap() {
-    check(Config::cases(2000), |tape| run(tape, Plant::None));
+    let lap = Lap::new("resume: each item once or a gap");
+    check(Config::cases(2000), |tape| lap.case(run(tape, Plant::None)));
 }
 
 #[test]
 fn the_oracle_catches_a_resume_that_repeats_an_item() {
-    control(Config::cases(3000), Plant::None, Plant::ResumeInclusive, "duplicate", run);
+    let lap = Lap::new("resume: control, a repeated item");
+    control(Config::cases(3000), Plant::None, Plant::ResumeInclusive, "duplicate", |tape, plant| lap.case(run(tape, plant)));
 }
 
 #[test]

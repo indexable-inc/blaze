@@ -4,7 +4,7 @@
 
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Slice, Writer};
+use blaze_format::{FormatError, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc};
 
@@ -60,7 +60,7 @@ impl<'a> TextualEntry<'a> {
             row.name = strings.moved(&self.staging, row.name, "TextualEntry strings")?;
         }
         let mut out =
-            Writer::new_in(<TextualEntryRoot as blaze_format::Record>::SCHEMA, self.alloc);
+            Writer::new(WriterOpts { schema: <TextualEntryRoot as blaze_format::Record>::SCHEMA, alloc: self.alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let macros = Column::push(&mut out, &self.rows);
         Ok(finish_with(out, |at| TextualEntryRoot {
@@ -169,7 +169,7 @@ impl<'a> ModuleFile<'a> {
             *text = strings.moved(&self.staging, *text, "ModuleFile strings")?;
         }
         let mut out =
-            Writer::new_in(<ModuleFileRoot as blaze_format::Record>::SCHEMA, self.alloc);
+            Writer::new(WriterOpts { schema: <ModuleFileRoot as blaze_format::Record>::SCHEMA, alloc: self.alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let absent = Column::push(&mut out, &self.absent);
         Ok(finish_with(out, |at| ModuleFileRoot {

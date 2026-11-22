@@ -21,7 +21,7 @@ use blaze_own::Alloc;
 
 use crate::assembly::{Clause, Goal};
 use crate::eval::{Answer, Off, Solver, Stats};
-use crate::facts::{Facts, Read};
+use crate::facts::Read;
 use crate::term::TypingMode;
 use crate::testing::parse::{CheckA, DeclA, parse_file};
 use crate::testing::run::PRELUDE;
@@ -106,7 +106,8 @@ impl crate::facts::Facts for Shy<'_> {
         self.world.assoc(seal, d)
     }
     fn opaque(&self, seal: crate::facts::Seal, d: crate::term::Def) -> crate::facts::Fetch<crate::facts::OpaqueDef<'_>> {
-        self.gate(crate::facts::Question::Opaque(d))?;
+        // One fact, two kinds of question (`Question::OpaqueHidden`): either fill gives it.
+        self.gate(crate::facts::Question::Opaque(d)).or_else(|_| self.gate(crate::facts::Question::OpaqueHidden(d)))?;
         self.world.opaque(seal, d)
     }
     fn lang(&self, seal: crate::facts::Seal, l: crate::term::Lang) -> crate::facts::Fetch<Option<crate::term::Def>> {
@@ -679,4 +680,62 @@ fn pull_equals_stop_deep() {
 #[test]
 fn pull_equals_stop_controls() {
     pull_equals_stop("controls", &controls_text());
+}
+
+/// Tempo's `get_block` (crates/consensus/src/follow/resolver/mod.rs, run a0612: `SolveError::
+/// Steps` for `{coroutine}: Send`, the top goal `Send` of an alloy_consensus ADT at depth 30),
+/// reduced. The Reference ("Auto traits"): an ADT is `Send` when its fields are; a cycle
+/// through an ADT's own fields holds (coinduction). A wide subtree (`Wide`: 68 groups of 64
+/// leaves, more than `MAX_NESTED` goals below it) under a ladder of 20 levels where each level
+/// names the next level's two ADTs, so each ADT has two parents. The env names `Send` (`T:
+/// Send`), so no auto-trait summary sees through a field: each field is a goal, as in tempo's
+/// trait impl fns, whose env names `Send` through `Send + Sync` supertraits.
+///
+/// Before (eval.rs `finish` kept every goal below as a nested goal): `Wide`'s entry had more
+/// than `MAX_NESTED`, so it and every entry above it applied only to an empty stack, and each
+/// ladder ADT was solved again under each parent: 2^20 solves of `Wide`, `Steps`. Now a
+/// cycle-free goal keeps no nested goals and its entry applies anywhere: each distinct goal is
+/// solved once. TWINS, decided: `R` (recursive through `Option<Box<R>>`, over the ladder) is
+/// `Send`; `Rn`, the same with an `Rc<u8>` field, is NOT `Send` (a real `!Send` field: a
+/// decided no, never a limit).
+fn wide_text() -> String {
+    let mut s = String::new();
+    for k in 0..68 * 64 {
+        s.push_str(&format!("struct K{k}(u8)\n"));
+    }
+    for g in 0..68 {
+        let fields: Vec<String> = (0..64).map(|i| format!("K{}", g * 64 + i)).collect();
+        s.push_str(&format!("struct G{g}({})\n", fields.join(", ")));
+    }
+    let groups: Vec<String> = (0..68).map(|g| format!("G{g}")).collect();
+    s.push_str(&format!("struct Wide({})\n", groups.join(", ")));
+    s.push_str("struct A20(Wide, u8)\nstruct B20(Wide, u16)\n");
+    for k in (0..20).rev() {
+        s.push_str(&format!("struct A{k}(A{n}, B{n})\nstruct B{k}(B{n}, A{n})\n", n = k + 1));
+    }
+    s.push_str("struct R(Option<Box<R>>, A0)\n");
+    s.push_str("struct Rn(Option<Box<Rn>>, A0, Rc<u8>)\n");
+    s.push_str("case wide = fixture (cost.rs)\nparams T\nenv T: Send\n");
+    s.push_str("goal A0: Send => yes\n");
+    s.push_str("goal R: Send => yes\n");
+    s.push_str("goal Rn: Send => no\n");
+    s
+}
+
+/// On failure panics naming the counters (or the solver's stop: before, `Steps`).
+#[test]
+fn cost_shared_wide_subtree_is_solved_once() {
+    let text = wide_text();
+    let r = match run(&text) {
+        Ok(r) => r,
+        Err(e) => panic!("wide: {e}"),
+    };
+    let line = show("wide", &r);
+    std::println!("WIDE {line}");
+    assert_eq!(r.answers, [Answer::Yes, Answer::Yes, Answer::No], "wide: `A0` and `R` are Send, `Rn` (an `Rc<u8>` field) is not\n{line}");
+    // Each distinct goal is solved once, but `Rn`'s cycle reruns once (its first answer `no`
+    // differs from the coinductive start `yes`): its members are solved again, a handful.
+    assert!(r.stats.frames <= r.stats.distinct_goals + 8, "wide: a goal was solved more than once\n{line}");
+    // The same answers and read sets with a fresh solver per goal and with every shortcut off.
+    same_reads("wide", &text);
 }

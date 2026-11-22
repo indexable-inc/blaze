@@ -45,7 +45,6 @@ use core::fmt;
 use blaze_code::record::Symbol;
 use blaze_native::Platform as NativePlatform;
 use blaze_native::image::{FixTo as NativeFix, Image, Region};
-use blaze_native::libraries;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
 use crate::input::CExport;
@@ -86,7 +85,8 @@ pub enum MergeError {
     TwoExports { first: Symbol, second: Symbol },
     /// `ProgramIn::exports` is not sorted by name at row `at` (the front end sorts it).
     ExportsUnsorted { at: u32 },
-    /// Library `library` (`Image::libraries[library]`) has no install name (NATIVE.md 3.5).
+    /// Library `library` (`Image::libraries[library]`) was resolved for another platform than
+    /// macOS: its install name is no Mach-O load command's (NATIVE.md 3.5).
     Library { library: u32 },
     /// An image laid for another platform than the executable's.
     Platform,
@@ -109,7 +109,7 @@ impl fmt::Display for MergeError {
             ),
             MergeError::TwoExports { first, second } => write!(f, "functions {first} and {second} export one C name (Reference, abi: no_mangle)"),
             MergeError::ExportsUnsorted { at } => write!(f, "the program's C exports are not sorted by name at row {at}"),
-            MergeError::Library { library } => write!(f, "the native image's library {library} has no install name (NATIVE.md 3.5)"),
+            MergeError::Library { library } => write!(f, "the native image's library {library} was resolved for another platform than macOS (NATIVE.md 3.5)"),
             MergeError::Platform => write!(f, "the native image was laid for another platform than the executable's"),
             MergeError::NoRegion { region } => write!(f, "the native image has no {region:?} region"),
             MergeError::Unaligned { at } => write!(f, "the native image's GOT at {at:#x} does not start a page"),
@@ -193,13 +193,16 @@ fn up(n: u64, to: u64) -> u64 {
 /// depends on them ([`command_room`]).
 pub fn libraries<'a>(image: &Image<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, AString<'a>>, MergeError> {
     let mut paths: AVec<'a, AString<'a>> = Vec::new_in(alloc);
-    for (k, &library) in image.libraries.iter().enumerate() {
-        let mut path: AString<'a> = String::new_in(alloc);
-        libraries::write_install_name(NativePlatform::MacosArm64, library, &mut path)
-            .map_err(|_| MergeError::Library { library: k as u32 })?;
-        if path.as_str() == macho::LIB_SYSTEM || paths.iter().any(|p| p.as_str() == path.as_str()) {
+    for (k, library) in image.libraries.iter().enumerate() {
+        if library.platform() != NativePlatform::MacosArm64 {
+            return Err(MergeError::Library { library: k as u32 });
+        }
+        let install = library.install();
+        if install == macho::LIB_SYSTEM || paths.iter().any(|p| p.as_str() == install) {
             continue;
         }
+        let mut path: AString<'a> = String::new_in(alloc);
+        path.push_str(install);
         paths.push(path);
     }
     Ok(paths)
@@ -353,7 +356,7 @@ mod tests {
     use blaze_code::record::Symbol;
     use blaze_native::Platform as NativePlatform;
     use blaze_native::image::{EhPointer, FixTo, Fixup, Frame, Image, Import, Placed, Region};
-    use blaze_native::libraries::{Library, LibraryKind};
+    use blaze_native::libraries::{Library, LibraryKind, Linked, Source, source};
     use blaze_native::unwind::Row;
     use blaze_own::{AVec, Alloc, Vec};
 
@@ -372,6 +375,14 @@ mod tests {
 
     fn alloc() -> Alloc<'static> {
         blaze_own::testing::heap().alloc()
+    }
+
+    /// `-l<name>` linked as the SDK's stub states `install` (blaze-native libraries.rs: a macOS
+    /// library's install name is its stub's, read).
+    fn mac_dylib(name: &'static str, install: &'static str) -> Linked<'static> {
+        let Ok(Source::Stub(at)) = source(NativePlatform::MacosArm64, Library { kind: LibraryKind::Dylib, name }) else { panic!("`{name}` is named by its stub") };
+        let stub = std::format!("--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\ninstall-name: '{install}'\n...\n");
+        at.linked(std::boxed::Box::leak(stub.into_bytes().into_boxed_slice())).unwrap_or_else(|e| panic!("the stub of `{name}`: {e}"))
     }
 
     fn put32(bytes: &mut [u8], at: u64, value: u32) {
@@ -433,9 +444,9 @@ mod tests {
         exports.push((b"_c_entry", 0x4000));
         let mut words: AVec<'static, &'static [u8]> = Vec::new_in(a);
         words.push(b"_rust_six");
-        let mut libraries: AVec<'static, Library<'static>> = Vec::new_in(a);
-        libraries.push(Library { kind: LibraryKind::Dylib, name: "c" });
-        libraries.push(Library { kind: LibraryKind::Dylib, name: "c++" });
+        let mut libraries: AVec<'static, Linked<'static>> = Vec::new_in(a);
+        libraries.push(mac_dylib("c", "/usr/lib/libSystem.B.dylib"));
+        libraries.push(mac_dylib("c++", "/usr/lib/libc++.1.dylib"));
         let mut unwind: AVec<'static, Row> = Vec::new_in(a);
         unwind.push(Row { start: 0x4000, length: 4, encoding: 0x0400_0000, personality: Some(0x8000), lsda: Some(0x4008) });
         unwind.push(Row { start: 0x4004, length: 4, encoding: 0x0300_0000 | 8, personality: None, lsda: None });

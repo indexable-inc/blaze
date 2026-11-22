@@ -29,17 +29,33 @@
 //!   cannot link them, and its import check refuses their module.
 //! - **Descriptors.** Every embedder preopens one directory, `/` ([`ROOT`]), at [`ROOT_FD`];
 //!   0, 1 and 2 are stdio.
+//!
+//! **Core and driver.** The core is the `layout` module (`#![blaze::sans_io]`): every call's decoding,
+//! address checks and encoding, pure functions over the guest's memory and a [`System`] handed
+//! in, refusing with a typed [`Fault`]. The rest is the driver, Wasmtime's side, holding nothing
+//! but handles and straight-line calls: `calls` (each call defined in a `Linker`, its arguments
+//! handed to the core) and [`seed`] (the seed's calls and its fibers on Wasmtime's).
+
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![deny(blaze::sans_io_core)]
 
 mod calls;
+mod layout;
 pub mod seed;
 
 use std::fmt;
 
 pub use calls::{bytes, link, put};
+pub use layout::{Fault, Halt, Pointers, bytes_at, put_at};
 use wasmtime::{Caller, WasmTy};
 
 /// Why a guest was stopped that is not its own trap: what it did, said so that the embedder's
 /// error names the guest before it ("the proc macro `x` <what>").
+///
+/// Still words at the [`Embed`] seam: blaze-proc-macro makes one of its own text at about a
+/// dozen sites. This crate's own refusals are typed ([`Fault`], [`Halt`]) up to that seam, and
+/// become a `Stop` of the same text there.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Stop(pub String);
 
@@ -49,12 +65,26 @@ impl fmt::Display for Stop {
     }
 }
 
-/// The width of a guest's pointers and sizes, and the module it imports WASI from.
-pub trait Width: Send + Sync + 'static {
+impl From<Fault> for Stop {
+    fn from(fault: Fault) -> Stop {
+        Stop(fault.to_string()) // alloc: error path, at the embedder's seam
+    }
+}
+
+impl From<Halt> for Stop {
+    fn from(halt: Halt) -> Stop {
+        match halt {
+            Halt::Stop(stop) => stop,
+            fault @ Halt::Fault { .. } => Stop(fault.to_string()), // alloc: error path, at the seam
+        }
+    }
+}
+
+/// The width of a guest's pointers and sizes ([`Pointers::BYTES`], what the core needs), and
+/// what Wasmtime passes them as and the module the guest imports WASI from.
+pub trait Width: Pointers + Send + Sync + 'static {
     /// A pointer or size argument as the guest passes it: `i32` or `i64`.
     type Ptr: WasmTy + Copy + Into<u64> + Send + Sync + 'static;
-    /// The bytes of a pointer or a `size` in the guest's memory.
-    const BYTES: u64;
     /// The import module the guest's calls come from.
     const MODULE: &'static str;
 }
@@ -65,15 +95,21 @@ pub enum W32 {}
 /// memory64: 64-bit pointers and sizes, from `wasi_snapshot_preview1_64`.
 pub enum W64 {}
 
+impl Pointers for W32 {
+    const BYTES: u64 = 4;
+}
+
 impl Width for W32 {
     type Ptr = u32;
-    const BYTES: u64 = 4;
     const MODULE: &'static str = "wasi_snapshot_preview1";
+}
+
+impl Pointers for W64 {
+    const BYTES: u64 = 8;
 }
 
 impl Width for W64 {
     type Ptr = u64;
-    const BYTES: u64 = 8;
     const MODULE: &'static str = "wasi_snapshot_preview1_64";
 }
 

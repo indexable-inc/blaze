@@ -353,6 +353,12 @@ impl<'r> ProcMacros<'r> {
         Ok(self.runtime.compiles() - before)
     }
 
+    /// What the runtime's module loads came to so far: the profile's `macro modules` line
+    /// ([`crate::host::ModuleLoads`]).
+    pub fn module_loads(&self) -> crate::host::ModuleLoads {
+        self.runtime.module_loads()
+    }
+
     /// Where the calls' time went so far ([`crate::parts`]).
     pub fn parts(&self) -> &crate::parts::Parts {
         self.runtime.parts()

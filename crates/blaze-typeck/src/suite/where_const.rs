@@ -12,7 +12,7 @@
 
 use std::vec::Vec;
 
-use super::{Want, check_body, differences, expect};
+use super::{Want, check_body, check_body_by, differences, expect};
 use crate::body::IntSuffix;
 use crate::diag::{Because, DiagCode};
 use crate::fixture::{Bb, Fx};
@@ -94,6 +94,21 @@ fn a_false_condition_is_an_unmet_bound_naming_it() {
     let mut because: Vec<Because> = c.diags.iter().filter_map(|d| d.because).collect();
     because.sort_by_key(|b| matches!(b, Because::Generic(_)));
     assert_eq!(because, [Because::False(cond), Because::Generic(cond)], "{:?}", c.diags);
+}
+
+/// D161 loop 3: a `where const` condition is answered where the solver meets it (infer
+/// `fill_const_holds` through the pull), so no goal is asked again from its root for it
+/// (`Solve::refills` 0). The control removes the cause: the stop strategy, which fills
+/// nothing mid-step, asks goals again for the same body (rule 23).
+#[test]
+fn a_condition_is_pulled_and_no_goal_is_asked_again() {
+    let (fx, main, _) = world();
+    let (b, root) = body();
+    let (pulled, rounds) = check_body_by(&fx, &b, main, root, Plant::None, InferPlant::None, false);
+    let (stopped, again) = check_body_by(&fx, &b, main, root, Plant::None, InferPlant::None, true);
+    assert_eq!(rounds, 0, "the pull asked goals again for a `where const` condition");
+    assert!(again > 0, "the stop asked no goal again: the comparison compares nothing");
+    assert!(pulled == stopped, "the pull and the stop answer the condition differently");
 }
 
 /// The control: the clause dropped where the impl's where-clauses are read, the impl holds for

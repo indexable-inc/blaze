@@ -202,6 +202,19 @@ goal <u32 as Tr>::A == ?0 => yes ?0 = _
 
 # --- GATs ---
 
+case owner_impl_and_gat_args = normalizes_to.rs consider_impl_candidate
+trait Arrange<H> { type Out<C>; }
+impl<A, B> Arrange<B> for (B, A) { type Out<C> = (A, B, C); }
+goal <(u8, u16) as Arrange<u8>>::Out<bool> == ?0 => yes ?0 = (u16, u8, bool)
+goal <(u8, u16) as Arrange<u8>>::Out<bool> == (u8, u16, bool) => no
+
+case owner_alias_bound_args = assembly/mod.rs assemble_alias_bound_candidates
+trait Family<A> { type Out<B>: Iterator<Item = (B, A)>; }
+params X
+env X: Family<u16>
+goal <<X as Family<u16>>::Out<bool> as Iterator>::Item == ?0 => yes ?0 = (bool, u16)
+goal <<X as Family<u16>>::Out<bool> as Iterator>::Item == (u16, bool) => no
+
 case gat_unconstrained_arg = normalizes_to.rs compute_normalizes_to_goal (inject_forced_ambiguity_candidate)
 trait G { type A<X>; }
 params T
@@ -232,13 +245,50 @@ case opaque_rigid_infer = project_goals/opaque_types.rs normalize_opaque_type (n
 opaque Op: Clone
 goal opaque#Op == ?0 => yes ?0 = rigid opaque#Op
 
-case opaque_hidden = project_goals/opaque_types.rs normalize_opaque_type (hidden type visible)
+# In analysis a hidden type the world gives is still not seen by normalization (a caller may
+# not know it: `let x: u32 = make();` for `fn make() -> impl Sized { 0u32 }` is E0308); after
+# analysis it is. Each pair differs in the mode alone.
+case opaque_hidden_analysis_rigid = project_goals/opaque_types.rs normalize_opaque_type (analysis: rigid though a hidden type is known)
+opaque Oh: Clone = u32
+goal opaque#Oh == u32 => no
+
+case opaque_hidden_analysis_rigid_infer = project_goals/opaque_types.rs normalize_opaque_type (analysis: rigid though a hidden type is known)
+opaque Oh: Clone = u32
+goal opaque#Oh == ?0 => yes ?0 = rigid opaque#Oh
+
+case opaque_hidden = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: hidden type visible)
+mode post_analysis
 opaque Oh: Clone = u32
 goal opaque#Oh == u32 => yes
 
-case opaque_hidden_infer = project_goals/opaque_types.rs normalize_opaque_type (hidden type visible)
+case opaque_hidden_infer = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: hidden type visible)
+mode post_analysis
 opaque Oh: Clone = u32
 goal opaque#Oh == ?0 => yes ?0 = u32
+
+# A hidden type that names its own opaque (a recursive future's `Pin<Box<O>>`, here `Vec<O>`):
+# after analysis the opaque is its unfolding, so a term one layer more revealed is equal and a
+# term that differs at any depth is not; both decided (alias.rs `eq_revealing`), never the
+# overflow the lazy relation's `Projection { O, Vec<?y> }` cycle gave.
+case opaque_recursive_unfolded = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: a recursive hidden type is its unfolding)
+mode post_analysis
+opaque Or: Clone = Vec<opaque#Or>
+goal opaque#Or == Vec<Vec<opaque#Or>> => yes
+
+case opaque_recursive_unfolded_twin = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: a recursive hidden type is no finite type)
+mode post_analysis
+opaque Or: Clone = Vec<opaque#Or>
+goal opaque#Or == Vec<Vec<u8>> => no
+
+# The item bound answers the projection in analysis, the hidden type's impl does not: `Vec<u8>`
+# iterates `u8`, the bound says `u32`.
+case opaque_bound_not_hidden = assembly/mod.rs assemble_alias_bound_candidates (analysis: the bound, not the hidden type)
+opaque Ob: Iterator<Item = u32> = Vec<u8>
+goal <opaque#Ob as Iterator>::Item == u32 => yes
+
+case opaque_bound_not_hidden_twin = assembly/mod.rs assemble_alias_bound_candidates (analysis: the hidden type's item is not seen)
+opaque Ob: Iterator<Item = u32> = Vec<u8>
+goal <opaque#Ob as Iterator>::Item == u8 => no
 
 case opaque_alias_bound = assembly/mod.rs assemble_alias_bound_candidates (opaque SelfBounds)
 opaque Op: Clone

@@ -25,7 +25,7 @@ blaze-own.workspace = true
 # that the library never depends on either. By path: blaze-body-lower may not be in the
 # workspace table when this is first built.
 blaze-flow-lower = { workspace = true, optional = true }
-blaze-body-lower = { path = "../blaze-body-lower", optional = true }
+blaze-body-lower = { workspace = true, optional = true }
 
 [features]
 # `cargo test -p blaze-body-flow --features oracle --test equal_flows`: once blaze-body-lower

@@ -127,7 +127,9 @@ fn a_request_reads_only_the_dependency_heads_its_bodies_ask() {
     write(&io, "c/src/lib.rs", C_EDITED);
     let (_, second) = engine_from(&io, 2, false);
     println!("second: {}\n{}", entries(&second), seeds_line(&second));
-    assert_eq!(second.stages[blaze_engine::Stage::Bodies.index()].entered, 1, "one body entered, `c::h`'s: {}", entries(&second));
+    // D191: `c::h` is held by `c`'s library and its test build, a row each; the head record
+    // both rows ask is still read once (the request's table, rule 77).
+    assert_eq!(second.stages[blaze_engine::Stage::Bodies.index()].entered, 2, "one body entered, `c::h`'s, in its 2 units' rows (D191): {}", entries(&second));
     assert_eq!(second.seeds.bodies.refused, 0, "no body refused at a seed: {:?}", second.bodies.0);
     assert_eq!(second.seeds.listed, first.seeds.put, "the root lists each head the first request put:\n{}", seeds_line(&second));
     assert_eq!(second.seeds.looked, 1, "one dependency head record read, the one `c::h` asks:\n{}", seeds_line(&second));

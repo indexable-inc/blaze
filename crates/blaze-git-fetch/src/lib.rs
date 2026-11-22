@@ -13,9 +13,15 @@
 
 #![no_std]
 #![cfg_attr(test, feature(allocator_api))]
-// `#![blaze::sans_io]` in the modules names blaze's tool; inert under rustc.
+// `#![blaze::sans_io]` names blaze's tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
 #[cfg(test)]
 extern crate std;
@@ -33,7 +39,8 @@ mod tree;
 mod tests;
 
 pub use oid::{Kind, Oid};
-pub use pack::{CacheStats, DeltaWhy, Found, Index, Limits as PackLimits, PackError, PackWhy};
+pub use pack::{CacheStats, DeltaWhy, Found, Index, Limits as PackLimits, PackError, PackWhy, PlantedIndex};
+pub use plant::GitFetchPlant;
 pub use pkt::{Lines, Pkt, PktWhy};
 pub use protocol::{check_advertisement, fetch as fetch_request, fetched_pack, find_ref, ls_refs};
 pub use tree::{File, Limits as TreeLimits, Mode, TreeError, TreeWhy, files};

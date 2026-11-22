@@ -1,0 +1,15 @@
+{
+ "id": "checked-record-not-the-kept-body",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), joiner lane, D163 request R1",
+ "where": "crates/blaze-typeck/src/checked_record.rs (new), crates/blaze-body/src/kept.rs, crates/blaze-cli/src/engine_body_record.rs, crates/blaze-ladder/src/front2/program/lazy/typed.rs",
+ "what": "D119's written-and-unwired body record (blaze-body kept.rs, put/read in engine_body_record.rs, made by front2 tables/task.rs `keep_checked`, which nothing calls) holds the LOWERED body (blaze-body rows), not the checker's columns, so it cannot answer `TypedRecords::typed(key) -> Checked`. A second record of the checked columns was written (blaze-typeck checked_record.rs). Both are made from one check; neither is put by the engine yet.",
+ "cost": "two records per clean body once both are wired; the checked record is encoded on every finished clean check (front2 borrows.rs `check_borrows_in`), put or not",
+ "cause": "the run path still builds from `Checked` (blaze-build reads the checker's columns), while D119's end state builds from the kept body",
+ "whys": "the run writer's lazy front end needs `Checked` today; the kept body is the end-state input whose builder (blaze-body-build) has no dependents",
+ "class": "two records of one value while a switch is half done (rule 30)",
+ "prevention": "when blaze-body-build becomes the run's builder, the run reads the kept body and the checked record goes, with `TypedRecords`; until then the checked record is the one the run reads",
+ "annoyance": "write-only lane: the round-trip property (every suite body through `check_body`) cannot be run here",
+ "workaround": "the suite's one entry (`check_body`) asserts the round trip and two-checks-equal on every clean body; controls in suite/checked_record.rs",
+ "state": "open"
+}

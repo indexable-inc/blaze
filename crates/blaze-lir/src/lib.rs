@@ -88,7 +88,7 @@ pub use op::{End, Field, Info, Layout, Op, Operands, Res};
 pub use parse::{ParseError, parse};
 pub use print::print;
 pub use ty::{Scalar, Ty};
-pub use verify::{VerifyError, verify};
+pub use verify::{Verified, VerifiedFunc, VerifyError, verify};
 
 /// The version of what LIR's bytes mean: its operations, their operands and flags, its types
 /// and tables. Part of the record's schema ([`persist::SCHEMA`]) and of every key of a LIR, so

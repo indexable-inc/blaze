@@ -25,7 +25,6 @@ use blaze_own::Alloc;
 use super::entry::{Texts, input};
 use crate::crate_scope::{Ready, resolve_by_records};
 use crate::graph::Sysroot;
-use crate::items_record::grain::today;
 use crate::items_record::{ItemNow, ItemRow, ItemsRecord, LoadItems, RecordItems, encode};
 use crate::resolve::{At, aligned};
 use crate::task::Serial;
@@ -68,9 +67,9 @@ impl LoadItems<'static> for Now {
 }
 
 /// `key`'s row against `text`, through a reader that has checked nothing yet.
-fn now(record: &'static [u8], krate: CrateItemKey, text: &'static str, key: ItemKey) -> ItemNow<'static> {
+fn now(before: &ItemsRecord<'_>, record: &'static [u8], krate: CrateItemKey, text: &'static str, key: ItemKey) -> ItemNow<'static> {
     let read = RecordItems::new(&[krate], Now { record, text }, Alloc::global());
-    read.item_now(key).unwrap_or_else(|e| panic!("item {key:?} against today's text: {e:?}")).unwrap_or_else(|| panic!("no row for item {key:?}"))
+    read.item_now_since(key, before).unwrap_or_else(|e| panic!("item {key:?} against today's text: {e:?}")).unwrap_or_else(|| panic!("no row for item {key:?}"))
 }
 
 fn key_of(record: &ItemsRecord<'_>, name: &str) -> ItemKey {
@@ -110,15 +109,16 @@ fn an_edit_voids_only_the_items_it_touches() {
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
     let bytes = aligned(&a, g);
-    let record = ItemsRecord::open(bytes, g).unwrap_or_else(|e| panic!("open: {e:?}"));
-    let (f, gk) = (key_of(&record, "f"), key_of(&record, "g"));
+    let original = RecordItems::new(&[names.key], Now { record: bytes, text: BEFORE }, g);
+    let record = original.record(0).expect("the original items record");
+    let (f, gk) = (key_of(record, "f"), key_of(record, "g"));
     let was_f = record.item(f).ok().flatten().unwrap_or_else(|| panic!("no row for `f`"));
     let was_g = record.item(gk).ok().flatten().unwrap_or_else(|| panic!("no row for `g`"));
     let pieces_g = record.pieces(gk).ok().flatten().unwrap_or_else(|| panic!("no grain row for `g`"));
 
     // 1. The same text: every row as written.
     for (key, was, want) in [(f, &was_f, F_TEXT), (gk, &was_g, G_TEXT)] {
-        match now(bytes, names.key, BEFORE, key) {
+        match now(record, bytes, names.key, BEFORE, key) {
             ItemNow::Same(row) => {
                 assert!(row == *was, "an unchanged row reads back otherwise: {row:?} against {was:?}");
                 assert!(text_of(BEFORE, &row) == want, "the row's text is `{}`, want `{want}`", text_of(BEFORE, &row));
@@ -128,20 +128,20 @@ fn an_edit_voids_only_the_items_it_touches() {
     }
 
     // 2. `g`'s body edited.
-    fresh("`f` after `g`'s body edit", now(bytes, names.key, G_BODY, f), &was_f, F_TEXT, false);
-    fresh("`g` after its body edit", now(bytes, names.key, G_BODY, gk), &was_g, "fn g() -> u8 { 2 }", true);
+    fresh("`f` after `g`'s body edit", now(record, bytes, names.key, G_BODY, f), &was_f, F_TEXT, false);
+    fresh("`g` after its body edit", now(record, bytes, names.key, G_BODY, gk), &was_g, "fn g() -> u8 { 2 }", true);
     let outline = blaze_file_items::outline(G_BODY, record.edition(), g);
-    let g_now = today(&outline, G_BODY, pieces_g.chain).unwrap_or_else(|| panic!("`g`'s chain is not in the edited text"));
-    assert!(g_now.item.hash != pieces_g.body, "`g`'s body piece did not change with its body");
+    let g_now = outline.item(was_g.outline);
+    assert!(g_now.hash != pieces_g.body, "`g`'s body piece did not change with its body");
 
     // 3. `f`'s signature edited: `f` is fresh at today's place, its body changed (the row
     // holds no head; the edit moves `f`'s `Signature`, not its row).
-    fresh("`f` after its signature edit", now(bytes, names.key, F_SIGNATURE, f), &was_f, "fn f(a: u8, b: u8) -> u8 { a }", true);
-    fresh("`g` after `f`'s signature edit", now(bytes, names.key, F_SIGNATURE, gk), &was_g, G_TEXT, false);
+    fresh("`f` after its signature edit", now(record, bytes, names.key, F_SIGNATURE, f), &was_f, "fn f(a: u8, b: u8) -> u8 { a }", true);
+    fresh("`g` after `f`'s signature edit", now(record, bytes, names.key, F_SIGNATURE, gk), &was_g, G_TEXT, false);
 
     // 4. Lines inserted above `f`: nothing stale, each row at its new place.
-    let moved = fresh("`f` moved down", now(bytes, names.key, MOVED, f), &was_f, F_TEXT, false);
+    let moved = fresh("`f` moved down", now(record, bytes, names.key, MOVED, f), &was_f, F_TEXT, false);
     let (old, new) = (was_f.text.map(|s| s.start), moved.text.map(|s| s.start));
     assert!(new == old.map(|s| s + INSERTED), "`f` moved from {old:?} to {new:?}, want {INSERTED} bytes on");
-    fresh("`g` moved down", now(bytes, names.key, MOVED, gk), &was_g, G_TEXT, false);
+    fresh("`g` moved down", now(record, bytes, names.key, MOVED, gk), &was_g, G_TEXT, false);
 }

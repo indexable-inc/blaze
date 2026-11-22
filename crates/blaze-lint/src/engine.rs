@@ -149,6 +149,27 @@ pub(crate) const FORMAT_MACROS: [&str; 8] =
 /// compile-time check there holds, since a word not in the table is never dispatched.
 pub(crate) const DISPATCHED: [&str; 16] =
     ["use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std", "alloc", "unsafe"];
+/// The words `process-static` starts at ([`Pass::process_static`]).
+pub(crate) const STATIC_WORDS: [&str; 2] = ["static", "thread_local"];
+/// The words `sans-io-core` starts at in a core ([`Pass::sans_io_word`]): the IO modules, the
+/// IO types and crates, the blocking calls, the clock types, the print macros.
+pub(crate) const SANS_IO_WORDS: [&str; 25] = [
+    "fs", "net", "process", "io", "os", "thread", "env", "File", "TcpStream", "TcpListener", "UdpSocket", "libc", "rustix",
+    "recv", "join", "wait", "lock", "block_on", "Instant", "SystemTime", "print", "println", "eprint", "eprintln", "dbg",
+];
+/// The modules of `std` a core never names: a path through one is IO, a thread or the process.
+/// Their order is [`crate::OwnHeads`]'s bits.
+pub(crate) const IO_MODULES: [&str; 7] = ["fs", "net", "process", "io", "os", "thread", "env"];
+/// The IO types a core never names, and the system-call crates.
+const IO_TYPES: [&str; 5] = ["TcpStream", "TcpListener", "UdpSocket", "libc", "rustix"];
+/// What a `File::` call does that is IO.
+const FILE_CALLS: [&str; 4] = ["open", "create", "create_new", "options"];
+const PRINT_MACROS: [&str; 5] = ["print", "println", "eprint", "eprintln", "dbg"];
+/// The lock types `lock-without-reason` starts at ([`Pass::lock_ctor`]): blaze-core's lock.rs
+/// (`Lock`, `ReadLock`), bstd's (`Lock`, `RwLock`, `RankedLock`) and `SharedMap`.
+pub(crate) const LOCK_TYPES: [&str; 5] = ["Lock", "ReadLock", "RwLock", "RankedLock", "SharedMap"];
+/// The values of a `lock_exception`'s `tried`: D179's three shapes, as written.
+const LOCK_SHAPES: [&str; 3] = ["\"published\"", "\"gathered\"", "\"claimed\""];
 
 pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &mut Findings<'a>) -> Result<Linted<'a>, LintError> {
     if u32::try_from(unit.text.len()).is_err() {
@@ -163,6 +184,7 @@ pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &
         toks: AVec::with_capacity_in(own_bytes(unit) / 5 + 8, alloc),
         cands: AVec::new_in(alloc),
         regions: AVec::new_in(alloc),
+        reasons: AVec::new_in(alloc),
         frames: AVec::new_in(alloc),
         bodies: AVec::new_in(alloc),
         fns: AVec::new_in(alloc),
@@ -203,6 +225,9 @@ struct Pass<'u, 'a> {
     cands: AVec<'a, Cand>,
     /// Test code: each region's range and which test code it is.
     regions: AVec<'a, (Span, TestBits)>,
+    /// What each `#[blaze::lock_exception(..)]` covers (D179): the statement, field, `static`,
+    /// `const` or item after it ([`Pass::reason_end`]).
+    reasons: AVec<'a, Span>,
     frames: AVec<'a, Frame>,
     /// The functions whose bodies are open, innermost last (indices of `fns`).
     bodies: AVec<'a, u32>,
@@ -600,6 +625,10 @@ impl<'u, 'a> Pass<'u, 'a> {
             in_module: self.in_module(),
             bin_root: self.scope.bin_root,
             build_script: self.scope.build_script,
+            sans_io: self.scope.sans_io,
+            own_heads: self.scope.own_heads,
+            statics: self.scope.statics,
+            lock_reason: self.scope.lock_reason || self.reasoned(t.start),
             context,
         };
         self.children.push(scope);
@@ -684,6 +713,18 @@ impl<'u, 'a> Pass<'u, 'a> {
             self.cost.add(Rule::Renamed);
             self.renamed(i, t, w);
         }
+        if rules.runs(Rule::ProcessStatic) && STATIC_WORDS.contains(&w) {
+            self.cost.add(Rule::ProcessStatic);
+            self.process_static(i, t, w);
+        }
+        if self.scope.sans_io && rules.runs(Rule::SansIoCore) && SANS_IO_WORDS.contains(&w) {
+            self.cost.add(Rule::SansIoCore);
+            self.sans_io_word(i, t, w);
+        }
+        if rules.runs(Rule::LockWithoutReason) && LOCK_TYPES.contains(&w) {
+            self.cost.add(Rule::LockWithoutReason);
+            self.lock_ctor(i, t, w);
+        }
         if rules.runs(Rule::Recursion) {
             self.cost.add(Rule::Recursion);
             self.recursion_name(i, t, w);
@@ -701,6 +742,9 @@ impl<'u, 'a> Pass<'u, 'a> {
     /// an `allow` or `expect` of `blaze::implicit_allocator` is allocs.rs's `expect`.
     fn attribute(&mut self, i: usize, t: Tok) {
         let pos = t.start as usize;
+        if self.rules.runs(Rule::LockWithoutReason) && self.lock_exception(i, t) {
+            return;
+        }
         if !self.first_on_line(pos) {
             return;
         }
@@ -1395,6 +1439,300 @@ impl<'u, 'a> Pass<'u, 'a> {
         }
     }
 
+    // ---- process statics and sans-IO cores -------------------------------------------------
+
+    /// `thread_local!`, `static mut`, or `static NAME: T` where a word of `T` names interior
+    /// state ([`stateful`]): D170 C3's state the process keeps. A static of
+    /// [`crate::ALLOWED_STATICS`] in its crate (the scope's `statics` rows, by name) is one of
+    /// C3's three and not reported; a `thread_local!` is not when every `static` it declares is
+    /// such a row. Text cannot see a stateful type behind a name of the crate's own
+    /// (`static X: Table`), so the rule says less, never more.
+    fn process_static(&mut self, i: usize, t: Tok, w: &str) {
+        let next = self.tok(i + 1);
+        if w == "thread_local" {
+            if let Some(bang) = next
+                && bang.k == K::P(b'!')
+                && !self.method(i)
+                && !self.thread_local_allowed(i + 2)
+            {
+                self.push(Template::StaticThreadLocal, t.start, bang.end, None);
+            }
+            return;
+        }
+        // `static` the word (`'static` is a lifetime token, never this word).
+        let named = if self.is_word(next, "mut") { self.word(self.tok(i + 2)) } else { self.word(next) };
+        if named.is_some_and(|name| crate::allowed::allows(self.scope.statics, name)) {
+            return;
+        }
+        if let Some(m) = next
+            && self.is_word(next, "mut")
+        {
+            self.push(Template::StaticMut, t.start, m.end, None);
+            return;
+        }
+        if self.word(next).is_none() || !matches!(self.tok(i + 2), Some(c) if c.k == K::P(b':')) {
+            return;
+        }
+        let mut depth = 0usize;
+        let mut j = i + 3;
+        // Bounded: each turn moves `j` forward, to the item's last token at most.
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'<' | b'(' | b'[') => depth += 1,
+                K::P(b'>' | b')' | b']') => depth = depth.saturating_sub(1),
+                K::P(b'=' | b';') if depth == 0 => return,
+                K::Ident if stateful(self.str_of(tok)) => {
+                    self.push(Template::StaticState, t.start, tok.end, Some(Arg::Span(Span::new(tok.start, tok.end))));
+                    return;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+
+    /// The `thread_local!` whose bracket is at token `open` declares one `static` or more, and
+    /// each is an allowed static of the scope's crate. A body that does not close in this item
+    /// is not allowed.
+    fn thread_local_allowed(&self, open: usize) -> bool {
+        let Some(close) = self.closing(open) else { return false };
+        let mut any = false;
+        // Bounded: one turn per token of the macro's body.
+        for k in open + 1..close {
+            if self.is_word(self.tok(k), "static") {
+                let name = if self.is_word(self.tok(k + 1), "mut") { self.word(self.tok(k + 2)) } else { self.word(self.tok(k + 1)) };
+                match name {
+                    Some(name) if crate::allowed::allows(self.scope.statics, name) => any = true,
+                    _ => return false,
+                }
+            }
+        }
+        any
+    }
+
+    /// In a sans-IO core, a word of [`SANS_IO_WORDS`]: a path through an IO module of std
+    /// (`std::fs`, or `fs::` as a path's head), an IO type or system-call crate, `File::open`
+    /// and its kin, a blocking call (`.recv()`, `.join()`, `.lock()` with no argument, `.wait(`,
+    /// `block_on(`), the wall clock (`Instant::now`, `SystemTime::now`), a print macro. A bare head
+    /// `io::` is not reported in a file that declares or imports `io` as its own module
+    /// ([`crate::OwnHeads`], in the scope): there the name cannot be std's.
+    fn sans_io_word(&mut self, i: usize, t: Tok, w: &str) {
+        let next = self.tok(i + 1);
+        let open_next = matches!(next, Some(n) if n.k == K::P(b'('));
+        let (template, end) = if IO_MODULES.contains(&w) {
+            if self.method(i) {
+                return;
+            }
+            let after_std = self.colons_before(i) && self.is_word(self.back(i, 3), "std");
+            // A bare head is std's only when the file does not make that name its own
+            // (`mod io;`, `use crate::io;`: the scope's `own_heads`, read by `OwnHeads::read`).
+            let own = IO_MODULES.iter().position(|m| *m == w).is_some_and(|at| self.scope.own_heads.0 & (1 << at) != 0);
+            let head = !self.colons_before(i) && self.colons_at(i + 1) && !own;
+            if !after_std && !head {
+                return;
+            }
+            (Template::SansIoPath, t.end)
+        } else if IO_TYPES.contains(&w) {
+            let crate_path = matches!(w, "libc" | "rustix");
+            if self.method(i) || (crate_path && !self.colons_at(i + 1)) {
+                return;
+            }
+            (Template::SansIoPath, t.end)
+        } else if w == "File" {
+            let call = self.tok(i + 3).filter(|c| self.colons_at(i + 1) && FILE_CALLS.contains(&self.str_of(*c)));
+            match call {
+                Some(call) => (Template::SansIoPath, call.end),
+                None => return,
+            }
+        } else if matches!(w, "recv" | "join" | "lock") {
+            let no_arg = matches!(self.tok(i + 2), Some(c) if c.k == K::P(b')'));
+            if !self.method(i) || !open_next || !no_arg {
+                return;
+            }
+            (Template::SansIoBlocking, t.end)
+        } else if w == "wait" {
+            if !self.method(i) || !open_next {
+                return;
+            }
+            (Template::SansIoBlocking, t.end)
+        } else if w == "block_on" {
+            if !open_next || self.is_word(self.back(i, 1), "fn") {
+                return;
+            }
+            (Template::SansIoBlocking, t.end)
+        } else if matches!(w, "Instant" | "SystemTime") {
+            let now = self.tok(i + 3).filter(|n| self.colons_at(i + 1) && self.str_of(*n) == "now");
+            match now {
+                Some(now) => (Template::SansIoClock, now.end),
+                None => return,
+            }
+        } else if PRINT_MACROS.contains(&w) {
+            match next {
+                Some(bang) if bang.k == K::P(b'!') && !self.method(i) => (Template::SansIoPrint, bang.end),
+                _ => return,
+            }
+        } else {
+            return;
+        };
+        self.push(template, t.start, end, None);
+    }
+
+    // ---- locks (D179) -------------------------------------------------------------------
+
+    /// The `#` at token `i` starts `#[blaze::lock_exception(..)]`: what follows it, to
+    /// [`Pass::reason_end`], has its reason. One whose arguments are not `tried` with one of
+    /// D179's three shapes and a `why` that says something, each once and nothing else, is
+    /// refused naming the attribute; it still covers what follows, so one mistake is one finding.
+    fn lock_exception(&mut self, i: usize, t: Tok) -> bool {
+        let named = matches!(self.tok(i + 1), Some(b) if b.k == K::P(b'['))
+            && self.is_word(self.tok(i + 2), "blaze")
+            && self.colons_at(i + 3)
+            && self.is_word(self.tok(i + 5), "lock_exception");
+        if !named {
+            return false;
+        }
+        let open = i + 6;
+        let args = match self.tok(open) {
+            Some(p) if p.k == K::P(b'(') => self.closing(open),
+            _ => None,
+        };
+        let close = match args {
+            Some(close) => close,
+            None => i + 5,
+        };
+        let Some(bracket) = self.tok(close + 1).filter(|b| b.k == K::P(b']')) else {
+            // Not an attribute this reads to its end: the whole of it is the finding, and it
+            // covers nothing.
+            let end = self.tok(close).map_or(t.end, |c| c.end);
+            self.push(Template::LockBadReason, t.start, end, None);
+            return true;
+        };
+        if args.is_none() || !self.lock_reason_well_formed(open, close) {
+            self.push(Template::LockBadReason, t.start, bracket.end, None);
+        }
+        let end = self.reason_end(close + 2);
+        self.reasons.push(Span::new(t.start, end));
+        true
+    }
+
+    /// The tokens strictly between `open` and `close` are `tried = "<shape>", why = "<text>"`,
+    /// in either order, a trailing comma allowed: each key once, `tried` one of
+    /// [`LOCK_SHAPES`], `why` a string literal with something in it.
+    fn lock_reason_well_formed(&self, open: usize, close: usize) -> bool {
+        let (mut tried, mut why) = (false, false);
+        let mut j = open + 1;
+        // Bounded: each turn moves `j` forward by three or four tokens, to `close` at most.
+        while j < close {
+            let (Some(key), Some(eq), Some(value)) = (self.word(self.tok(j)), self.tok(j + 1), self.tok(j + 2)) else {
+                return false;
+            };
+            if eq.k != K::P(b'=') || value.k != K::Lit || j + 2 >= close {
+                return false;
+            }
+            let text = self.str_of(value);
+            match key {
+                "tried" if !tried && LOCK_SHAPES.contains(&text) => tried = true,
+                "why" if !why && says_something(text) => why = true,
+                _ => return false,
+            }
+            j += 3;
+            match self.tok(j) {
+                Some(c) if j < close && c.k == K::P(b',') => j += 1,
+                _ if j == close => {}
+                _ => return false,
+            }
+        }
+        tried && why
+    }
+
+    /// The end of what a `lock_exception` whose `]` ends just before token `from` covers: the
+    /// first `;` or `,` outside brackets (a statement, a `static` or `const`, a field and its
+    /// value), a child item (its hole), the `}` that closes the first brace unless `else`
+    /// follows it, or a closing bracket of an enclosing expression; the item's end when none.
+    fn reason_end(&self, from: usize) -> u32 {
+        let mut depth = 0usize;
+        let mut j = from;
+        // Bounded: each turn moves `j` forward, to the last token at most.
+        while let Some(t) = self.tok(j) {
+            match t.k {
+                K::Hole if depth == 0 => return t.end,
+                K::P(b'{' | b'(' | b'[') => depth += 1,
+                K::P(c @ (b'}' | b')' | b']')) => {
+                    if depth == 0 {
+                        return t.start;
+                    }
+                    depth -= 1;
+                    if c == b'}' && depth == 0 && !self.is_word(self.tok(j + 1), "else") {
+                        return t.end;
+                    }
+                }
+                K::P(b';' | b',') if depth == 0 => return t.end,
+                _ => {}
+            }
+            j += 1;
+        }
+        // `run` refused a text longer than `u32::MAX` bytes, so this is its length.
+        u32::try_from(self.text.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Byte `pos` is in what a `lock_exception` of this item covers.
+    fn reasoned(&self, pos: u32) -> bool {
+        self.reasons.iter().any(|span| span.start <= pos && pos < span.end)
+    }
+
+    /// A word of [`LOCK_TYPES`]: `Type::ctor` (a turbofish between allowed, `Lock::<T>::new`)
+    /// naming one of D179's constructors, called or named as a function, outside a `use`. With
+    /// no reason over it, here or on an ancestor item ([`crate::Scope::lock_reason`]), it is
+    /// one finding over the path. `Self::new` inside the type's own impl is not seen (the rule
+    /// says less, never more).
+    fn lock_ctor(&mut self, i: usize, t: Tok, w: &str) {
+        if self.in_use || self.method(i) || (self.colons_before(i) && !self.lock_path_head(i)) || !self.colons_at(i + 1) {
+            return;
+        }
+        let mut at = i + 3;
+        if matches!(self.tok(at), Some(lt) if lt.k == K::P(b'<')) {
+            let Some(gt) = self.closing_angle(at, self.toks.len()) else { return };
+            if !self.colons_at(gt + 1) {
+                return;
+            }
+            at = gt + 3;
+        }
+        let Some(ctor) = self.tok(at).filter(|c| c.k == K::Ident) else { return };
+        let name = self.str_of(ctor);
+        let constructs = match w {
+            "Lock" => matches!(name, "new" | "unrecorded" | "probed"),
+            "ReadLock" => matches!(name, "new" | "unrecorded"),
+            "RwLock" | "RankedLock" => name == "new",
+            "SharedMap" => name == "new_in",
+            _ => false,
+        };
+        if !constructs || self.scope.lock_reason || self.reasoned(t.start) {
+            return;
+        }
+        // The lock's name, when its first argument is a plain string literal (lock-policy.md):
+        // the text between its quotes, which the message says in place of the path.
+        let name = match (self.tok(at + 1), self.tok(at + 2), self.tok(at + 3)) {
+            (Some(open), Some(lit), Some(after))
+                if open.k == K::P(b'(')
+                    && lit.k == K::Lit
+                    && matches!(after.k, K::P(b',' | b')'))
+                    && self.str_of(lit).len() >= 2
+                    && self.str_of(lit).starts_with('"') =>
+            {
+                Some(Arg::Span(Span::new(lit.start + 1, lit.end - 1)))
+            }
+            _ => None,
+        };
+        self.push(Template::LockNoReason, t.start, ctor.end, name);
+    }
+
+    /// The `::` before token `i` follows a path whose words are lowercase modules
+    /// (`bstd::sync::Lock`, `blaze_core::lock::Lock`): the type is still the path's last type.
+    /// A type's associated item (`Outer::Lock::new`) is not this.
+    fn lock_path_head(&self, i: usize) -> bool {
+        self.word(self.back(i, 3)).is_some_and(|m| m.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_'))
+    }
+
     // ---- unsafe -------------------------------------------------------------------------
 
     /// An `unsafe` block or impl with no `// SAFETY:` comment on its line or above it (the
@@ -1841,6 +2179,30 @@ enum Called {
     SelfType,
     SelfMethod,
     Other,
+}
+
+/// A type name that holds interior state: a cell (`Cell`, `RefCell`, `UnsafeCell`, `OnceCell`,
+/// `LazyCell`), a lock (`Mutex`, `RwLock`, `OnceLock`, `LazyLock`, any `..Lock`), an atomic,
+/// a once or lazy value, a condition variable. scripts/src/bin/ambient/sansio.rs's `statics`
+/// column reads the same names.
+fn stateful(word: &str) -> bool {
+    word.starts_with("Atomic")
+        || word.ends_with("Cell")
+        || word.ends_with("Lock")
+        || matches!(word, "Mutex" | "Condvar" | "Lazy" | "Once" | "Barrier")
+}
+
+/// A string literal's text (`"x"`, `r"x"`, `r#"x"#`) has something in it but whitespace: a
+/// `lock_exception`'s `why`. A byte or C string, or a char, is not one.
+fn says_something(literal: &str) -> bool {
+    let body = match literal.strip_prefix('r') {
+        Some(raw) => raw.trim_matches('#'),
+        None => literal,
+    };
+    match body.strip_prefix('"').and_then(|it| it.strip_suffix('"')) {
+        Some(inner) => !inner.trim().is_empty(),
+        None => false,
+    }
 }
 
 // ---- marks and attributes, on text ------------------------------------------------------

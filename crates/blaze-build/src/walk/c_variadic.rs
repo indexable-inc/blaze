@@ -112,7 +112,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         let v = match (result, rets.len()) {
             (Some(at), _) => V::Place(at.0, at.1),
-            (None, 0) => V::None,
+            (None, 0) => self.take_passed(rrepr, rpass, &mut core::iter::empty())?,
             (None, 1) => self.take_passed(rrepr, rpass, &mut core::iter::once(r))?,
             (None, k) => {
                 let mut parts = Vec::with_capacity_in(k, self.alloc.clone());

@@ -413,11 +413,41 @@ impl ScriptRuntime {
         for (name, bytes) in sandbox.out_files() {
             outputs.add_file(name, bytes, file_limits, alloc).map_err(|error| named(ScriptWhy::File { name: name.to_owned(), error }))?;
         }
-        for request in &sandbox.c_requests {
-            outputs.c_requests.push(blaze_own::String::from_str_in(request, alloc));
-        }
+        c_inputs(sandbox, &mut outputs, alloc);
         let reads = std::mem::take(&mut host.sandbox.reads);
         Ok(ScriptRun { outputs, base, reads, fuel, peak_memory: host.limiter.peak, spawns: host.sandbox.spawns })
+    }
+}
+
+/// The sandbox's deferred requests and the `OUT_DIR` states they saw, into `outputs`, after
+/// its files (blaze-build-script outputs.rs, THE C INPUTS): a state's file whose bytes are the
+/// record's own file of that name is [`Snap::Final`], any other held once by digest.
+pub(crate) fn c_inputs<'a>(sandbox: &ScriptSandbox, outputs: &mut Outputs<'a>, alloc: Alloc<'a>) {
+    use blaze_build_script::outputs::{CRequest, CState, Snap, snap_digest};
+    for (argv, state) in &sandbox.c_requests {
+        outputs.c_requests.push(CRequest { argv: blaze_own::String::from_str_in(argv, alloc), state: *state });
+    }
+    // Each final file's digest, taken once and only for a name a state holds.
+    let mut finals: std::collections::BTreeMap<&str, Option<[u8; 32]>> = std::collections::BTreeMap::new();
+    for state in &sandbox.c_states {
+        let mut entries = blaze_own::Vec::with_capacity_in(state.len(), alloc);
+        for (name, digest) in state {
+            let snap = match digest {
+                None => Snap::Folder,
+                Some(digest) => {
+                    let last = *finals.entry(name.as_str()).or_insert_with(|| outputs.file(name).map(snap_digest));
+                    if last == Some(*digest) {
+                        Snap::Final
+                    } else {
+                        let bytes = sandbox.c_held.get(digest).expect("c_inputs: snap_out holds every digest a state names");
+                        outputs.hold_c_bytes(*digest, bytes, alloc);
+                        Snap::Held(*digest)
+                    }
+                }
+            };
+            entries.push((blaze_own::String::from_str_in(name, alloc), snap));
+        }
+        outputs.c_states.push(CState { entries });
     }
 }
 
@@ -444,7 +474,7 @@ fn stopped_by(host: &mut ScriptHost, error: &wasmtime::Error, out_of_fuel: bool)
         });
     }
     let deferred = |failure: String| {
-        host.sandbox.c_requests.last().map(|request| ScriptWhy::NeedsDeferred { request: request.replace('\0', " "), failure, stderr: stderr() })
+        host.sandbox.c_requests.last().map(|(request, _)| ScriptWhy::NeedsDeferred { request: request.replace('\0', " "), failure, stderr: stderr() })
     };
     match host.sandbox.exit {
         Some(0) => return Ok(()),

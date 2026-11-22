@@ -129,6 +129,8 @@ pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut Lay
         if tl.is_zst() {
             continue;
         }
+        // A transparent value has its field's ABI, including when it is a member of an HFA.
+        let t = tl.call_ty;
         let node = cx.ground.view().get(t).copied();
         match node {
             // A short vector (layout/simd.rs) is a fundamental type of its own (AAPCS64 5.9):

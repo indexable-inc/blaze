@@ -34,6 +34,8 @@ pub mod term;
 pub mod trait_goals;
 pub mod tys;
 pub mod witness;
+pub mod why_no;
+pub mod why_maybe;
 
 // The helpers' modules (solve.md, "Candidates and merging").
 pub mod alias;

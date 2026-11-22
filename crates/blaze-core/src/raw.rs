@@ -51,6 +51,11 @@ pub(crate) use unix::*;
 
 #[cfg(unix)]
 mod unix {
+    use blaze_sys::{
+        Fd,
+        posix::{io as sys_io, proc, signal, types::{nfds_t, pid_t, uid_t}},
+    };
+    use core::ffi::c_int;
     use std::{
         ffi::CStr,
         io,
@@ -58,42 +63,36 @@ mod unix {
     };
 
     /// `n` of a call that returns -1 and sets `errno` on failure.
-    fn checked(n: libc::c_int) -> io::Result<libc::c_int> {
+    #[cfg(target_os = "macos")]
+    fn checked(n: c_int) -> io::Result<c_int> {
         match n {
             -1 => Err(io::Error::last_os_error()),
             n => Ok(n),
         }
     }
 
-    /// `n` of a call that returns a `ssize_t`, -1 on failure.
-    fn checked_size(n: libc::ssize_t) -> io::Result<usize> {
-        usize::try_from(n).map_err(|_| io::Error::last_os_error())
-    }
-
     /// The user the process runs as, for what it trusts as its own.
-    pub(crate) fn euid() -> libc::uid_t {
-        // SAFETY: no arguments and no memory; `geteuid` always succeeds.
-        unsafe { libc::geteuid() }
+    pub(crate) fn euid() -> uid_t {
+        blaze_sys::posix::thread::geteuid()
     }
 
     /// `SIGKILL` to `pid`. Memory-safe for any pid; the caller names a child it has not reaped,
     /// so that the pid is no one else's.
-    pub(crate) fn kill(pid: libc::pid_t) {
-        // SAFETY: no pointers; signalling a pid touches no memory of this process.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+    pub(crate) fn kill(pid: pid_t) {
+        let _ = signal::kill(pid, signal::SIGKILL);
     }
 
     /// Linux waits for a child on its wait ring (`blaze_core::wait::reap`).
     #[cfg(not(target_os = "linux"))]
     /// One `wait4` of `pid`, blocking until it exits: its status and what it used. `EINTR` is
     /// the caller's to retry.
-    pub(crate) fn wait4(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
+    pub(crate) fn wait4(pid: pid_t) -> io::Result<(c_int, libc::rusage)> {
         let mut status = 0;
         // SAFETY: `rusage` is a C struct of integers, for which all-zero bytes is a valid value.
         let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
         // SAFETY: `status` and `rusage` are live locals the call writes and does not keep; a
         // pid that is not a child fails with `ECHILD`, touching neither.
-        let reaped = unsafe { libc::wait4(pid, &mut status, 0, (&raw mut rusage).cast()) };
+        let reaped = unsafe { proc::wait4(pid, &mut status, 0, (&raw mut rusage).cast()) };
         match reaped == pid {
             true => Ok((status, rusage)),
             false => Err(io::Error::last_os_error()),
@@ -104,43 +103,28 @@ mod unix {
     #[cfg(not(target_os = "linux"))]
     /// One `waitid(WEXITED | WNOWAIT)` of `pid`: returns once it has exited, leaving it
     /// unreaped. `EINTR` is the caller's to retry.
-    pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
-        // SAFETY: `siginfo_t` is a C struct of integers and unions of them, for which all-zero
-        // bytes is a valid value.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a live local the call writes and does not keep.
-        let waited = unsafe {
-            libc::waitid(libc::P_PID, pid as libc::id_t, (&raw mut info).cast(), libc::WEXITED | libc::WNOWAIT)
-        };
-        checked(waited).map(drop)
+    pub(crate) fn wait_exited(pid: pid_t) -> io::Result<()> {
+        proc::wait_id(pid, proc::WaitFlags::EXITED | proc::WaitFlags::NO_WAIT)
+            .map(drop)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
     }
 
     /// One `waitid(WEXITED | WNOHANG | WNOWAIT)` of `pid`: whether it has exited, leaving it
     /// unreaped either way. `ECHILD` (no child `pid`: reaped already) is the caller's to read.
-    pub(crate) fn has_exited(pid: libc::pid_t) -> io::Result<bool> {
-        // SAFETY: as in `wait_exited`: all-zero bytes is a valid `siginfo_t`.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a live local the call writes and does not keep.
-        let waited = unsafe {
-            libc::waitid(libc::P_PID,
-            pid as libc::id_t,
-            (&raw mut info).cast(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,)
-        };
-        checked(waited)?;
-        // With `WNOHANG` a child that has not exited leaves `info` as it was: its pid 0.
-        // SAFETY: `info` is whole and initialized (zeroed, then written by the call); `si_pid`
-        // reads the field of a `SIGCHLD`'s record, which is what `waitid` fills.
-        Ok(unsafe { info.si_pid() } != 0)
+    pub(crate) fn has_exited(pid: pid_t) -> io::Result<bool> {
+        let options = proc::WaitFlags::EXITED | proc::WaitFlags::NO_HANG | proc::WaitFlags::NO_WAIT;
+        proc::wait_id(pid, options)
+            .map(|child| child.is_some())
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
     }
 
     /// `O_NONBLOCK` added to `fd`'s status flags.
     pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
-        // SAFETY: `fd` is borrowed open for the call; `F_GETFL` takes no pointer.
-        let flags = checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) })?;
-        // SAFETY: as above; `F_SETFL` takes an integer.
-        checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) })
-            .map(drop)
+        let fd = Fd::new(fd.as_raw_fd());
+        let flags = sys_io::status_flags(fd)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+        sys_io::set_status_flags(fd, flags | sys_io::OpenFlags::NONBLOCK)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
     }
 
     /// Waits for one of `fds` to be ready, up to `ms` milliseconds from now (negative: no
@@ -149,7 +133,7 @@ mod unix {
     /// through `crate::wait::readable` on a deadline made here, so an interrupted wait goes on
     /// for what is left of `ms`, never anew; a caller that waits again in a loop holds its own
     /// `Deadline` and calls `wait::readable` itself.
-    pub(crate) fn poll(fds: &mut [libc::pollfd], ms: libc::c_int) -> io::Result<usize> {
+    pub(crate) fn poll(fds: &mut [libc::pollfd], ms: c_int) -> io::Result<usize> {
         use crate::wait::{self, Clock as _, Deadline, Monotonic, Waited};
         if ms == 0 {
             return ready_now(fds);
@@ -166,24 +150,22 @@ mod unix {
     }
 
     /// Which of `fds` are ready now: one `poll` with a timeout of 0, which never blocks.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a timeout of 0 asks which descriptors are ready now and never blocks, so no deadline applies (rule deadline-waits)"
-    )]
     fn ready_now(fds: &mut [libc::pollfd]) -> io::Result<usize> {
-        let n = libc::nfds_t::try_from(fds.len())
+        nfds_t::try_from(fds.len())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: `fds` is a live, exclusive slice of `n` pollfds; the kernel writes only their
-        // `revents` and keeps no pointer after the call returns.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), n, 0) };
-        checked(ready).map(|it| it as usize)
+        // SAFETY: both types are repr(C) pollfd with the same int, short, short fields.
+        // The cast keeps the exclusive borrow and length, including room to write revents.
+        let fds = unsafe {
+            std::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<sys_io::PollFd>(), fds.len())
+        };
+        sys_io::poll(fds, Some(blaze_sys::Timespec::ZERO))
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
     }
 
     /// One `read` of `fd` into `into`: how many bytes, 0 at its end.
     pub(crate) fn read(fd: BorrowedFd<'_>, into: &mut [u8]) -> io::Result<usize> {
-        // SAFETY: `into` is a live, exclusive buffer of `into.len()` bytes the call writes at
-        // most that many of, and `fd` is borrowed open for the call.
-        checked_size(unsafe { libc::read(fd.as_raw_fd(), into.as_mut_ptr().cast(), into.len()) })
+        sys_io::read(Fd::new(fd.as_raw_fd()), into)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
     }
 
     /// One `preadv` of `fd` at `at` into `into`, in order: how many bytes, fewer at the file's
@@ -193,105 +175,119 @@ mod unix {
         into: &mut [io::IoSliceMut<'_>],
         at: u64,
     ) -> io::Result<usize> {
-        let count = libc::c_int::try_from(into.len()).map_err(|_| {
+        core::ffi::c_int::try_from(into.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "a preadv of more buffers than an int counts")
         })?;
-        let at = libc::off_t::try_from(at).map_err(|_| {
+        blaze_sys::posix::types::off_t::try_from(at).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "a preadv at an offset past off_t")
         })?;
-        // SAFETY: `IoSliceMut` is ABI-compatible with `iovec` on unix (std documents it), each
-        // a live, exclusive buffer the call writes at most its length of; `into` outlives the
-        // call, which keeps none of them, and `fd` is borrowed open for it.
-        checked_size(unsafe { libc::preadv(fd.as_raw_fd(), into.as_ptr().cast(), count, at) })
+        // SAFETY: both IoSliceMut types have the Unix iovec ABI. The exclusive borrow covers
+        // every descriptor and its writable buffer for this call, which retains neither.
+        let slices =
+            unsafe { std::slice::from_raw_parts_mut(into.as_mut_ptr().cast(), into.len()) };
+        blaze_sys::posix::io::preadv(blaze_sys::Fd::new(fd.as_raw_fd()), slices, at)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))
     }
 
     /// The process's soft limit of open descriptors (`RLIMIT_NOFILE`), `u64::MAX` where it
     /// has none.
     pub(crate) fn nofile() -> io::Result<u64> {
-        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: `&mut limit` is a live, aligned `rlimit` the call writes and does not keep.
-        checked(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) })?;
-        Ok(match limit.rlim_cur == libc::RLIM_INFINITY {
+        use blaze_sys::posix::thread;
+        let limit = thread::resource_limit(thread::RLIMIT_NOFILE)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        Ok(match limit.rlim_cur == thread::RLIM_INFINITY {
             true => u64::MAX,
-            false => u64::try_from(limit.rlim_cur).unwrap_or(u64::MAX),
+            false => limit.rlim_cur,
         })
     }
 
     /// One `write` of `bytes` to `fd`: how many it took.
     pub(crate) fn write(fd: BorrowedFd<'_>, bytes: &[u8]) -> io::Result<usize> {
-        // SAFETY: `bytes` is a live buffer of `bytes.len()` bytes the call only reads, and `fd`
-        // is borrowed open for the call.
-        checked_size(unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) })
+        blaze_sys::posix::io::write(blaze_sys::Fd::new(fd.as_raw_fd()), bytes)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))
     }
 
     /// The `timespec` of `seconds` and `nanos` (below 10^9).
-    pub(crate) fn timespec(seconds: libc::time_t, nanos: u32) -> libc::timespec {
+    pub(crate) fn timespec(seconds: blaze_sys::posix::types::time_t, nanos: u32) -> libc::timespec {
         debug_assert!(nanos < 1_000_000_000);
-        // SAFETY: `timespec` is integers, and private padding on some targets (so it cannot be
-        // written as a literal): all-zero bytes is a valid value.
-        let mut time: libc::timespec = unsafe { std::mem::zeroed() };
-        time.tv_sec = seconds;
-        // Below 10^9, which every target's `tv_nsec` holds.
-        time.tv_nsec = nanos as _;
-        time
+        let time = blaze_sys::Timespec { sec: seconds, nsec: i64::from(nanos) };
+        // SAFETY: both are the C timespec of two signed 64-bit integers, seconds then nanoseconds.
+        unsafe { std::mem::transmute(time) }
     }
 
     /// The access and modification times of `path` (relative to the working directory, a link
     /// followed) set to `times`, in that order: one `utimensat`.
     pub(crate) fn utimens(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
-        // SAFETY: a NUL-terminated path and two `timespec`s, both borrowed across the call,
-        // which reads them and keeps neither; no flags.
-        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr().cast(), 0) })
-            .map(drop)
+        #[cfg(target_os = "linux")]
+        {
+            use blaze_sys::linux::{AtFlags, CWD, FileTime};
+            let [access, modified] =
+                times.map(|t| FileTime::At(blaze_sys::Timespec { sec: t.tv_sec, nsec: t.tv_nsec }));
+            blaze_sys::linux::utimensat(
+                CWD, blaze_sys::Path::new(path), access, modified, AtFlags::NONE,
+            )
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: the path and both C timespecs are live and readable for the call.
+            checked(unsafe {
+                blaze_sys::posix::proc::utimensat(
+                    blaze_sys::posix::thread::AT_FDCWD, path.as_ptr(), times.as_ptr().cast(), 0,
+                )
+            }).map(drop)
+        }
     }
 
     /// The directory at `path` opened read-only, close-on-exec, as a descriptor of its own.
     pub(crate) fn open_dir(path: &CStr) -> io::Result<OwnedFd> {
-        // SAFETY: a NUL-terminated path, borrowed across the call; the result is a new
-        // descriptor or -1, checked below.
-        let fd = checked(unsafe {
-            libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        })?;
-        // SAFETY: `open` succeeded, so `fd` is a new descriptor nothing else owns; owned once,
-        // here. Owning one twice would close it under the other owner.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        use blaze_sys::posix::io::OpenFlags;
+        let flags = OpenFlags::READ | OpenFlags::DIRECTORY | OpenFlags::CLOSE_ON_EXEC;
+        let fd = blaze_sys::posix::io::open(blaze_sys::Path::new(path), flags, 0)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        // SAFETY: into_raw transfers sole ownership of the newly opened directory.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) })
     }
 
     /// The `stat` of `name` relative to the directory `dir`, not followed through a symlink.
     #[inline]
     pub(crate) fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `dir` is borrowed open, `name` NUL-terminated, and `stat` room for one
-        // `libc::stat` the call writes whole on success and does not keep.
-        let failed = unsafe {
-            libc::fstatat(dir.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr().cast(), libc::AT_SYMLINK_NOFOLLOW)
-        };
-        checked(failed)?;
-        // SAFETY: the call succeeded, so it filled the `stat`; read before then it would be
-        // uninitialized.
-        Ok(unsafe { stat.assume_init() })
+        #[cfg(target_os = "linux")]
+        let flags = blaze_sys::linux::AtFlags::NO_FOLLOW.bits() as i32;
+        #[cfg(target_os = "macos")]
+        let flags = blaze_sys::posix::thread::AT_SYMLINK_NOFOLLOW;
+        let stat = blaze_sys::posix::proc::stat_at(
+            blaze_sys::Fd::new(dir.as_raw_fd()), blaze_sys::Path::new(name), flags,
+        )
+        .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        // SAFETY: both stat types have the target's C stat layout and integer fields.
+        Ok(unsafe { std::mem::transmute(stat) })
     }
 
     /// `target`, a new empty file, made to share `source`'s blocks: `FICLONE`.
     #[cfg(target_os = "linux")]
     pub(crate) fn ficlone(target: BorrowedFd<'_>, source: BorrowedFd<'_>) -> io::Result<()> {
-        /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
-        const FICLONE: libc::c_ulong = 0x4004_9409;
-        // SAFETY: two descriptors borrowed open for the call; `FICLONE` takes the source's
-        // number as its argument, no pointer.
-        checked(unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) })
-            .map(drop)
+        blaze_sys::linux::ficlone(
+            blaze_sys::Fd::new(target.as_raw_fd()), blaze_sys::Fd::new(source.as_raw_fd()),
+        )
+        .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))
     }
 
     /// The `statfs` of the file system that holds `path`.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn statfs(path: &CStr) -> io::Result<libc::statfs> {
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: `path` NUL-terminated and borrowed across the call, `stat` room for one
-        // `libc::statfs` the call writes whole on success and does not keep.
-        checked(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr().cast()) })?;
-        // SAFETY: the call succeeded, so it filled the `statfs`.
-        Ok(unsafe { stat.assume_init() })
+        #[cfg(target_os = "linux")]
+        let stat = blaze_sys::linux::task::statfs(blaze_sys::Path::new(path))
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        #[cfg(target_os = "macos")]
+        let stat = {
+            let mut stat = blaze_sys::posix::proc::statfs::zeroed();
+            // SAFETY: path is NUL-terminated and stat is writable for one C statfs.
+            checked(unsafe { blaze_sys::posix::proc::statfs(path.as_ptr(), (&raw mut stat).cast()) })?;
+            stat
+        };
+        // SAFETY: both statfs types represent the target's C statfs, with the same fields and layout.
+        Ok(unsafe { std::mem::transmute(stat) })
     }
 
     /// `to` made a clone of the open file `from` (`fclonefileat`, no flags).
@@ -299,8 +295,12 @@ mod unix {
     pub(crate) fn fclonefileat(from: BorrowedFd<'_>, to: &CStr) -> io::Result<()> {
         // SAFETY: a descriptor borrowed open for the call and a NUL-terminated path borrowed
         // across it, which keeps neither.
-        checked(unsafe { libc::fclonefileat(from.as_raw_fd(), libc::AT_FDCWD, to.as_ptr(), 0) })
-            .map(drop)
+        checked(unsafe {
+            blaze_sys::posix::proc::fclonefileat(
+                from.as_raw_fd(), blaze_sys::posix::thread::AT_FDCWD, to.as_ptr(), 0,
+            )
+        })
+        .map(drop)
     }
 
     /// `path`'s permission bits set to `mode`, a symbolic link not followed (`fchmodat` with
@@ -310,7 +310,10 @@ mod unix {
     pub(crate) fn chmod_no_follow(path: &CStr, mode: u32) -> io::Result<()> {
         // SAFETY: a NUL-terminated path borrowed across the call.
         checked(unsafe {
-            libc::fchmodat(libc::AT_FDCWD, path.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW)
+            blaze_sys::posix::proc::fchmodat(
+                blaze_sys::posix::thread::AT_FDCWD, path.as_ptr(), mode as blaze_sys::posix::types::mode_t,
+                blaze_sys::posix::thread::AT_SYMLINK_NOFOLLOW,
+            )
         })
         .map(drop)
     }
@@ -321,7 +324,10 @@ mod unix {
     pub(crate) fn touch(path: &CStr) -> io::Result<()> {
         // SAFETY: a NUL-terminated path borrowed across the call; a null `times` means now.
         checked(unsafe {
-            libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), libc::AT_SYMLINK_NOFOLLOW)
+            blaze_sys::posix::proc::utimensat(
+                blaze_sys::posix::thread::AT_FDCWD, path.as_ptr(), std::ptr::null(),
+                blaze_sys::posix::thread::AT_SYMLINK_NOFOLLOW,
+            )
         })
         .map(drop)
     }
@@ -331,33 +337,31 @@ mod unix {
     /// the attributes `common` names, a directory's data length and a file's, as many as fit;
     /// how many, 0 once none is left. `getattrlistbulk(2)`, in libSystem from macOS 10.10: it
     /// wins over `readdir` and an `fstatat` per name by being one system call for a buffer of
-    /// entries where those are one per name. The libc crate's declaration is the header's
-    /// (`int getattrlistbulk(int, void *, void *, size_t, uint64_t)`). A system without it
-    /// does not start blaze (dyld names the symbol); the test below resolves it at run time.
+    /// entries where those are one per name. blaze-sys resolves the libSystem symbol on its
+    /// first call. The test below checks the symbol at run time.
     #[cfg(target_os = "macos")]
     pub(crate) fn attrs_bulk(
         dir: BorrowedFd<'_>,
         common: u32,
         into: &mut [u8],
     ) -> io::Result<usize> {
-        let mut list = libc::attrlist {
-            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        use blaze_sys::posix::proc;
+        let mut list = proc::attrlist {
+            bitmapcount: proc::ATTR_BIT_MAP_COUNT,
             reserved: 0,
             commonattr: common,
             volattr: 0,
-            dirattr: libc::ATTR_DIR_DATALENGTH,
-            fileattr: libc::ATTR_FILE_DATALENGTH,
+            dirattr: proc::ATTR_DIR_DATALENGTH,
+            fileattr: proc::ATTR_FILE_DATALENGTH,
             forkattr: 0,
         };
         // SAFETY: `dir` is borrowed open, `list` a live `attrlist` the call reads, and `into`
         // room for `into.len()` bytes the call writes and does not keep. No option is set:
         // an entry holds only the attributes its returned set names.
         let count = checked(unsafe {
-            libc::getattrlistbulk(dir.as_raw_fd(),
-            (&raw mut list).cast(),
-            into.as_mut_ptr().cast(),
-            into.len(),
-            0,)
+            proc::getattrlistbulk(
+                dir.as_raw_fd(), (&raw mut list).cast(), into.as_mut_ptr().cast(), into.len(), 0,
+            )
         })?;
         Ok(count as usize)
     }
@@ -365,9 +369,8 @@ mod unix {
     /// `F_NOCACHE` on `fd`: its reads and writes stay out of the unified buffer cache.
     #[cfg(target_os = "macos")]
     pub(crate) fn no_cache(fd: BorrowedFd<'_>) -> io::Result<()> {
-        // SAFETY: `fd` is borrowed open for the call; the flag takes an integer and changes only
-        // how its I/O uses the cache.
-        checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) }).map(drop)
+        blaze_sys::posix::io::set_no_cache(blaze_sys::Fd::new(fd.as_raw_fd()), true)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))
     }
 
     /// `f` run with the calling thread's disk IO at idle priority, which is put back after: a
@@ -375,9 +378,9 @@ mod unix {
     /// `IOPRIO_CLASS_IDLE` (`who` 0 is the calling thread).
     #[cfg(target_os = "linux")]
     pub(crate) fn idle_io<R>(f: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
-        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
-        const IOPRIO_CLASS_IDLE: libc::c_long = 3;
-        const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+        const IOPRIO_WHO_PROCESS: core::ffi::c_long = 1;
+        const IOPRIO_CLASS_IDLE: core::ffi::c_long = 3;
+        const IOPRIO_CLASS_SHIFT: core::ffi::c_long = 13;
         // SAFETY: no pointers; asks the calling thread's IO priority.
         let was = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
         if was < 0 {
@@ -399,17 +402,11 @@ mod unix {
     /// IOPOL_THROTTLE)` (`<sys/resource.h>`, public), what the store's prefetch threads read with.
     #[cfg(target_os = "macos")]
     pub(crate) fn idle_io<R>(f: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
-        const IOPOL_TYPE_DISK: libc::c_int = 0;
-        const IOPOL_SCOPE_THREAD: libc::c_int = 1;
-        const IOPOL_THROTTLE: libc::c_int = 3;
-        unsafe extern "C" {
-            fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
-            fn setiopolicy_np(
-                iotype: libc::c_int,
-                scope: libc::c_int,
-                policy: libc::c_int,
-            ) -> libc::c_int;
-        }
+        use blaze_sys::macos::cold::{getiopolicy_np, setiopolicy_np};
+        use core::ffi::c_int;
+        const IOPOL_TYPE_DISK: c_int = 0;
+        const IOPOL_SCOPE_THREAD: c_int = 1;
+        const IOPOL_THROTTLE: c_int = 3;
         // SAFETY: no pointers; asks the calling thread's disk policy.
         let was = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
         if was < 0 {
@@ -426,11 +423,11 @@ mod unix {
     /// A new eventfd, count 0, close-on-exec and nonblocking.
     #[cfg(target_os = "linux")]
     pub(crate) fn eventfd() -> io::Result<OwnedFd> {
-        // SAFETY: no pointers; the result is a new descriptor or -1, checked below.
-        let fd = checked(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) })?;
-        // SAFETY: `eventfd` succeeded, so `fd` is a new descriptor nothing else owns; owned
-        // once, here.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        use blaze_sys::linux::{EventFlags, eventfd2};
+        let fd = eventfd2(0, EventFlags::CLOSE_ON_EXEC | EventFlags::NONBLOCK)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        // SAFETY: into_raw transfers sole ownership of the new descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) })
     }
 
     /// A pipe, its read end first, both ends close-on-exec: on Linux at once (`pipe2`), on the
@@ -438,60 +435,46 @@ mod unix {
     /// of another thread's in between could inherit them; blaze's spawns close what they are
     /// not given).
     pub(crate) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut ends = [0; 2];
         #[cfg(target_os = "linux")]
-        // SAFETY: room for the two descriptors the call writes.
-        checked(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) })?;
+        let ends = blaze_sys::linux::pipe2(blaze_sys::linux::PipeFlags::CLOSE_ON_EXEC);
         #[cfg(not(target_os = "linux"))]
-        // SAFETY: room for the two descriptors the call writes.
-        checked(unsafe { libc::pipe(ends.as_mut_ptr()) })?;
-        // SAFETY: the call succeeded, so both are new descriptors nothing else owns; each is
-        // owned once, here.
-        let (read, write) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let ends = blaze_sys::posix::io::pipe();
+        let (read, write) = ends.map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
         #[cfg(not(target_os = "linux"))]
         for fd in [&read, &write] {
-            // SAFETY: `fd` is open, owned above; `F_SETFD` takes an integer.
-            checked(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) })?;
+            blaze_sys::posix::io::set_close_on_exec(fd.fd(), true)
+                .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
         }
-        Ok((read, write))
+        // SAFETY: each into_raw transfers sole ownership of one open pipe end.
+        Ok(unsafe { (OwnedFd::from_raw_fd(read.into_raw()), OwnedFd::from_raw_fd(write.into_raw())) })
     }
 
     /// The running kernel's `uname`.
     #[cfg(target_os = "linux")]
     pub(crate) fn uname() -> io::Result<libc::utsname> {
-        // SAFETY: `utsname` is arrays of C chars, for which all-zero bytes is a valid value.
-        let mut name: libc::utsname = unsafe { std::mem::zeroed() };
-        // SAFETY: `name` is a live local the call fills and does not keep.
-        checked(unsafe { libc::uname(&mut name) })?;
-        Ok(name)
+        let name = blaze_sys::linux::host::uname()
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        // SAFETY: both Linux utsname structures are the kernel's six consecutive 65-byte
+        // character arrays. All bytes are initialized and valid in either signedness.
+        Ok(unsafe { core::mem::transmute(name) })
     }
 
     /// `pid`'s physical footprint now and the most it has been: `proc_pid_rusage`'s
     /// `RUSAGE_INFO_V4`.
     #[cfg(target_os = "macos")]
-    pub(crate) fn footprint(pid: libc::pid_t) -> io::Result<(u64, u64)> {
-        // SAFETY: `rusage_info_v4` is a C struct of integers, for which all-zero bytes is a
-        // valid value.
-        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a live local of the size `RUSAGE_INFO_V4` names, which the call
-        // writes and does not keep; a smaller buffer would be written past its end.
-        let read = unsafe {
-            libc::proc_pid_rusage(
-                pid,
-                libc::RUSAGE_INFO_V4,
-                (&raw mut info).cast::<libc::rusage_info_t>(),
-            )
-        };
+    pub(crate) fn footprint(pid: blaze_sys::posix::types::pid_t) -> io::Result<(u64, u64)> {
+        use blaze_sys::posix::thread::{RUSAGE_INFO_V4, proc_pid_rusage, rusage_info_v4};
+        let mut info = rusage_info_v4 { uuid: [0; 16], words: [0; 35] };
+        // SAFETY: info is writable for the full RUSAGE_INFO_V4 structure.
+        let read = unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V4, (&raw mut info).cast()) };
         checked(read)?;
-        Ok((info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint))
+        Ok((info.words[rusage_info_v4::FOOTPRINT], info.words[rusage_info_v4::MOST_FOOTPRINT]))
     }
 
     /// This process's physical footprint now and at most ([`footprint`] of itself).
     #[cfg(target_os = "macos")]
     pub(crate) fn own_footprint() -> io::Result<(u64, u64)> {
-        // SAFETY: no arguments and no memory; `getpid` always succeeds.
-        footprint(unsafe { libc::getpid() })
+        footprint(blaze_sys::posix::thread::getpid())
     }
 
     /// This process's resident set now (`/proc/self/statm`'s second field, in pages, read into
@@ -508,11 +491,9 @@ mod unix {
         // SAFETY: no arguments and no memory; -1 is its failure.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).map_err(|_| io::Error::last_os_error())?;
-        // SAFETY: `rusage` is a C struct of integers, for which all-zero bytes is a valid value.
-        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-        // SAFETY: `usage` is a live local the call fills and does not keep.
-        checked(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) })?;
-        let most = u64::try_from(usage.ru_maxrss).unwrap_or(0).saturating_mul(1024);
+        let usage = blaze_sys::linux::getrusage(blaze_sys::linux::Who::Process)
+            .map_err(|e| io::Error::from_raw_os_error(i32::from(e.raw())))?;
+        let most = u64::try_from(usage.max_rss_kb).unwrap_or(0).saturating_mul(1024);
         let now = pages.saturating_mul(page);
         Ok((now, most.max(now)))
     }
@@ -543,7 +524,7 @@ mod tests {
         assert_eq!(super::write(writer.as_fd(), b"blaze").unwrap(), 5);
         let mut fds = [libc::pollfd {
             fd: std::os::fd::AsRawFd::as_raw_fd(&reader),
-            events: libc::POLLIN,
+            events: blaze_sys::posix::io::PollEvents::IN.bits(),
             revents: 0,
         }];
         assert_eq!(super::poll(&mut fds, 0).unwrap(), 1);
@@ -559,10 +540,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn getattrlistbulk_is_in_libsystem() {
-        // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"getattrlistbulk".as_ptr()) };
+        use blaze_sys::posix::thread::{RTLD_DEFAULT, symbol};
+        // SAFETY: RTLD_DEFAULT is the documented handle for a lookup in every loaded image.
+        let found = unsafe { symbol(RTLD_DEFAULT, c"getattrlistbulk") };
         assert!(
-            !found.is_null(),
+            found.is_some(),
             "getattrlistbulk is gone from this macOS (it is there from 10.10): \
              Effect::Entries needs it, and there is no other listing"
         );
@@ -575,7 +557,8 @@ mod tests {
         use std::os::fd::AsFd as _;
         let dir = super::open_dir(c"/").unwrap();
         let mut into = vec![0_u8; 8 << 10];
-        let common = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME;
+        use blaze_sys::posix::proc::{ATTR_CMN_NAME, ATTR_CMN_RETURNED_ATTRS};
+        let common = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME;
         let count = super::attrs_bulk(dir.as_fd(), common, &mut into).unwrap();
         assert!(count > 0, "the root lists nothing");
         let first = u32::from_ne_bytes(into[..4].try_into().unwrap()) as usize;
@@ -589,6 +572,6 @@ mod tests {
         let dir = super::open_dir(c"/").unwrap();
         assert!(super::stat_at(dir.as_fd(), c"tmp").is_ok());
         let missing = super::stat_at(dir.as_fd(), c"blaze-no-such-name-at-the-root").unwrap_err();
-        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(missing.raw_os_error(), Some(i32::from(blaze_sys::Errno::NoEnt.raw())));
     }
 }

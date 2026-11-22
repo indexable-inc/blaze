@@ -31,17 +31,48 @@ fn a_hosted_entry_line_reads_as_the_hosted_form() {
     assert_eq!(Start::parse(format!("c-main:{HEX}").as_bytes()).map(|it| it.form), Ok(EntryForm::CMain));
 }
 
-/// An unknown form is refused, naming the three there are; a hosted line with a short symbol or
+/// `comptime:<64 hex>` (D175) reads as [`EntryForm::Comptime`] with the symbol's bytes; a
+/// compile-time line with a short symbol is refused as any other form's is. Before this piece it
+/// was refused as a form none of the three.
+#[test]
+fn a_comptime_entry_line_reads_as_the_comptime_form() {
+    let line = format!("comptime:{HEX}");
+    assert_eq!(Start::parse(line.as_bytes()), Ok(Start { entry: symbol(), form: EntryForm::Comptime }));
+    assert_eq!(Start::parse(b"comptime:abcd").map_err(|why| why.why), Err("the symbol is not 64 hex digits"));
+}
+
+/// An unknown form is refused, naming the four there are; a hosted line with a short symbol or
 /// a byte that is no hex digit is refused as any other form's is.
 #[test]
 fn an_unknown_form_or_a_bad_symbol_is_refused_by_name() {
     let refused = |line: &str| Start::parse(line.as_bytes()).map_err(|why| why.why);
-    assert_eq!(refused(&format!("lib:{HEX}")), Err("the form is none of `unit`, `c-main` and `hosted`"));
-    assert_eq!(refused(&format!("Hosted:{HEX}")), Err("the form is none of `unit`, `c-main` and `hosted`"));
+    let none = "the form is none of `unit`, `c-main`, `hosted` and `comptime`";
+    assert_eq!(refused(&format!("lib:{HEX}")), Err(none));
+    assert_eq!(refused(&format!("Hosted:{HEX}")), Err(none));
+    assert_eq!(refused(&format!("comptime-{HEX}")), Err(none));
     assert_eq!(refused("hosted:abcd"), Err("the symbol is not 64 hex digits"));
     assert_eq!(refused(&format!("hosted:{}", "g".repeat(64))), Err("the symbol holds a character that is no hex digit"));
     let said = Start::parse(b"lib:00").expect_err("an unknown form").to_string();
-    assert!(said.contains("`unit`, `c-main` or `hosted`"), "{said}");
+    assert!(said.contains("`unit`, `c-main`, `hosted` or `comptime`"), "{said}");
+}
+
+/// A compile-time entry is called as C `main` with the host's arguments, not the process's:
+/// handed two arguments it answers 2; the control, handed none, answers 0.
+#[test]
+fn a_comptime_entry_is_called_with_the_hosts_arguments() {
+    use super::ComptimeArgs;
+    extern "C" fn count(argc: c_int, argv: *const *const core::ffi::c_char) -> c_int {
+        // SAFETY: `argv` holds `argc` strings and a null (the test's words below).
+        if unsafe { !(*argv.add(argc as usize)).is_null() } { -1 } else { argc }
+    }
+    let words: [*const core::ffi::c_char; 3] = [c"macro".as_ptr(), c"--derive".as_ptr(), core::ptr::null()];
+    // SAFETY: two C-string literals (static) and a null, alive across the call.
+    let two = unsafe { ComptimeArgs::new(2, words.as_ptr()) };
+    assert_eq!(call_entry(count as usize as u64, Handed::Comptime(two)), 2);
+    let empty: [*const core::ffi::c_char; 1] = [core::ptr::null()];
+    // SAFETY: as above.
+    let none = unsafe { ComptimeArgs::new(0, empty.as_ptr()) };
+    assert_eq!(call_entry(count as usize as u64, Handed::Comptime(none)), 0);
 }
 
 /// A stand-in for bstd's host table: only its address is compared, never read.

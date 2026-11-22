@@ -470,6 +470,22 @@ impl<'a> blaze_solve::Tys for Terms<'a> {
         SFlags(out)
     }
 
+    fn shift_in(&mut self, _: &mut blaze_solve::fold::Scratch<'_>, t: STy, by: u32) -> Result<STy, SolveError> {
+        let n = self.node(t)?;
+        Ok(STy(self.cx.shift_in(n, by).bits()))
+    }
+
+    fn reindex_bound(&mut self, original: STy, depth: u32, var: u32) -> Result<STy, SolveError> {
+        let n = self.node(original)?;
+        let shifted = match met(n) {
+            Met::Ty => self.cx.tys.bound(depth, var).node(),
+            Met::Region => self.cx.tys.re_bound(depth, var).node(),
+            Met::Const => self.cx.tys.const_bound(depth, var).node(),
+            other => return Err(sort(original.0, other)),
+        };
+        Ok(STy(shifted.bits()))
+    }
+
     /// The solver's own encoding, kept verbatim in blaze-ty's marker column (the solver is
     /// its only reader).
     fn markers(&self, t: STy) -> Markers {
@@ -689,4 +705,26 @@ impl<'a> blaze_solve::Tys for Terms<'a> {
             .unwrap_or(0);
         (most as u32) * 8
     }
+}
+
+#[cfg(test)]
+#[test]
+fn reindexing_a_bound_variable_preserves_its_sort() -> Result<(), SolveError> {
+    use blaze_solve::Tys as _;
+
+    let mut terms = Terms::new_in(blaze_own::testing::heap().alloc());
+    let old = [
+        terms.cx.tys.bound(2, 3).node(),
+        terms.cx.tys.re_bound(2, 3).node(),
+        terms.cx.tys.const_bound(2, 3).node(),
+    ];
+    let expected = [
+        terms.cx.tys.bound(1, 3).node(),
+        terms.cx.tys.re_bound(1, 3).node(),
+        terms.cx.tys.const_bound(1, 3).node(),
+    ];
+    for (var, shifted) in old.into_iter().zip(expected) {
+        assert_eq!(terms.reindex_bound(STy(var.bits()), 1, 3)?, STy(shifted.bits()));
+    }
+    Ok(())
 }

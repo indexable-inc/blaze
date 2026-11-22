@@ -1812,3 +1812,51 @@ fn macro_exports_are_in_text_order_whatever_the_expansion_order() {
     let pb = written_scope(&w, root, root, CellPlant::ExportsByExpansionTime, true);
     assert_ne!(names(&pf), names(&pb), "the control: the schedules differ: {:?} {:?}", names(&pf), names(&pb));
 }
+
+/// A call in a block reads the scope around the block, not a glob. The Reference, "Macros By
+/// Example", `macro.decl.scope` (a one-segment call: the textual scope first, then the
+/// path-based scope) and `names.preludes`: "Prelude names are not part of any module or block
+/// ... Names in the preludes can be shadowed by declarations in a module": `use e::other as
+/// format;` in the module shadows the `#[macro_use]` prelude's `format` for every block of the
+/// module's bodies; a block reaches its module lexically, through no glob import, so the
+/// glob-vs-outer ambiguity does not arise. The world (the D189 surface test's, reduced:
+/// `use dep::emits_impl as format; fn g() { format!(); }`): dependency `e` exports `format`
+/// and `other`; the crate's root has `use e::other as format;` and the block's module
+/// `__blaze_block_0` (its lexical `use super::*;` first, as expanded_blocks.rs renders it)
+/// calls `format!`. The call is `other`. Twin: without the import the same call is the
+/// prelude's `format`. Control (rule 23): `LexicalGlobIsAGlob` reads the lexical glob as a glob
+/// and fails the call as ambiguous (the cause of the missing impl).
+/// Prints: "test cells::tests::a_blocks_call_reads_its_modules_named_import_before_the_prelude ... ok".
+#[test]
+fn a_blocks_call_reads_its_modules_named_import_before_the_prelude() {
+    let world = |renamed: bool| {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep = w.root(2, Edition::E2021);
+        let format = w.rules_with(dep, "format", true);
+        let other = w.rules_with(dep, "other", true);
+        w.cr(dep).macro_exports.push(("format", format, crate::MacroShapes::FN_LIKE));
+        w.cr(dep).macro_exports.push(("other", other, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "e", dep);
+        w.cr(root).macro_use.push(dep);
+        if renamed {
+            w.use_as(root, "e::other", "format", V::Priv);
+        }
+        let block = w.module(root, "__blaze_block_0", V::Priv);
+        w.glob(block, "super", V::Priv);
+        let call = w.call(block, "format", crate::CallShape::FnLike);
+        (w, root, dep, call, format, other)
+    };
+    let called = |c: &Cells<'static, N>, call: ItemKey| match c.call_outcome(call) {
+        Some(Outcome::Called(d)) => Some(d.key),
+        _ => None,
+    };
+    let (w, root, dep, call, _, other) = world(true);
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(called(&ok, call), Some(other), "the module's `use e::other as format;`: {:?}", ok.call_outcome(call));
+    let bad = with_dep(&w, root, dep, CellPlant::LexicalGlobIsAGlob);
+    assert!(matches!(bad.call_outcome(call), Some(Outcome::Failed(Unresolved::Ambiguous(_)))), "the control: {:?}", bad.call_outcome(call));
+    let (w, root, dep, call, format, _) = world(false);
+    let twin = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(called(&twin, call), Some(format), "the twin: the prelude's `format`: {:?}", twin.call_outcome(call));
+}

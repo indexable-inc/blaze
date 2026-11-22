@@ -19,7 +19,7 @@ use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
 
-use super::buckets::{Ask, Buckets, Seen, TablesReadError, Unfilled, inherent_home, trait_home};
+use super::buckets::{Ask, Buckets, Seen, TablesReadError, Unfilled, inherent_home, prepare_coherence, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -93,9 +93,12 @@ impl core::fmt::Display for CheckFail {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CheckFail::Gap { owner, gaps } => {
+                // On ONE line: a note is read a line at a time (the run's not-checked report
+                // kept "1 gaps" and lost the gap itself on the next line).
                 write!(f, "checking {owner:?}: {} gaps", gaps.len())?;
-                for gap in gaps {
-                    write!(f, "\n  {gap}")?;
+                for (i, gap) in gaps.iter().enumerate() {
+                    let sep = if i == 0 { ": " } else { "; " };
+                    write!(f, "{sep}{gap}")?;
                 }
                 Ok(())
             }
@@ -114,7 +117,13 @@ impl core::fmt::Display for CheckFail {
                 }
                 Ok(())
             }
-            CheckFail::Rounds { owner, last } => write!(f, "checking {owner:?}: still needs {last:?} after {MOST_ROUNDS} rounds"),
+            CheckFail::Rounds { last, .. } => {
+                let need = last.first().map_or("a record", |question| match question.record_kind() {
+                    tc::RecordKind::Body => "the checked body record of a dependency item",
+                    tc::RecordKind::Item => "an item record",
+                });
+                write!(f, "checking the body in its source file: still needs {need} after {MOST_ROUNDS} rounds")
+            }
             CheckFail::ReadsDiffer { owner, diff } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21): {diff}"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
             CheckFail::Const { owner, key, shown, error } => write!(f, "checking {owner:?}: the constant {key:?} ({shown}) an array length names: {error:?}"),
@@ -195,6 +204,15 @@ pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
     check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap, root_keys)
 }
 
+/// The E0412s and E0405s of `owner`'s OWN signature (its head's [`super::type_miss::HeadMiss`]es, in the
+/// store the head was made in or one filed from its record), as findings of its body's check:
+/// item-relative in the fn's text, as its body's own misses are. A caller's check never asks
+/// for its callee's, so each is said once, by the fn's own body.
+fn signature_misses<'r, 'n, S: NamesSource<'n>>(r: &'r Records<'_, 'n, S>, owner: ItemKey) -> impl Iterator<Item = (tc::DiagCode, tc::Range, Box<str>)> + use<'r, 'n, S> {
+    let misses: &'r [super::type_miss::HeadMiss] = r.store.type_misses.get(&owner).map_or(&[], |m| &m[..]);
+    misses.iter().map(super::type_miss::HeadMiss::finding)
+}
+
 /// The body `owner` finished with the findings `diags`: each filed where its tokens came from,
 /// before it leaves the task that made it (drive.md, ruled 20:57), in `alloc` (the store's).
 fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
@@ -213,6 +231,15 @@ fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: V
     }));
     CheckFail::Diags { owner, diags, filed }
 }
+
+/// One round's inference context, made in this frame and boxed in `alloc`: the caller's frame
+/// holds the box's two words ([`check_rounds_as`]).
+#[inline(never)]
+fn infer_boxed(alloc: blaze_own::Alloc<'static>) -> blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>> {
+    blaze_own::Box::new_in(InferCtx::analysis_in(alloc), alloc)
+}
+
+const _: () = assert!(core::mem::size_of::<blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>>>() == 2 * core::mem::size_of::<usize>());
 
 /// [`check_rounds`] with the check's entry for an auto-trait goal of an async block's future
 /// that fails only on the superset interior named (front2 stalled_goals.rs `Stalls`): only
@@ -243,15 +270,20 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     if r.store.seeds.is_some() && r.buckets.is_none() {
         *r.buckets = Some(Buckets::for_source(r.names, r.index));
     }
+    // The body's gate (front2 asks.rs `Gate`): round 0's syntactic prefetch, before the walk.
+    r.store.gate.borrow_mut().start(alloc);
     for round in 0..MOST_ROUNDS {
         r.store.hidden.set_leaking(&leaks);
-        // Heads imported on the spot this round (world_items.rs `BodyWorld::store_want`).
-        let imported_at = r.store.imported.get();
+        // Facts made on the spot this round (world_items.rs `BodyWorld::store_want`; under the
+        // one ask, what it made: `Store::imports`).
+        let imported_at = r.store.imports();
         let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
         let view: BodyView<'_> = body.typeck.view(tys);
         let trace_ask = r.store.trace;
         let world = world_at(r, scope);
-        let mut cx = InferCtx::new_in(alloc);
+        // Boxed, made in a frame of its own: this frame stays on the stack under the whole
+        // check (blaze-int notes t29 overflow-bt4.txt: 48,576 bytes).
+        let mut cx = infer_boxed(alloc);
         if root_keys.is_some() {
             cx.keep_root_keys();
         }
@@ -260,11 +292,13 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             cx.trace_trait_goals(ask);
         }
         let out = match &mut count {
-            Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, alloc),
+            Some((tally, clock)) => tc::check_counted(&view, &world, &mut *cx, &hints, tally, *clock, alloc),
             // Stalled goals decided after the async bodies' flows (front2 stalled_goals.rs).
-            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut cx, &hints, alloc),
-            None => tc::check(&view, &world, &mut cx, &hints, alloc),
+            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut *cx, &hints, alloc),
+            None => tc::check(&view, &world, &mut *cx, &hints, alloc),
         };
+        // Round 0's walk is over: what its prefetch named is the gate's set.
+        r.store.gate.borrow_mut().freeze(alloc);
         // An auto trait of another fn's opaque: its defining body filed (checked only if no
         // clean check of it is filed yet), the opaque leaked to this check, the round again.
         let out = match out {
@@ -274,16 +308,27 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 if trace_ask.is_some() {
                     r.store.traced = cx.take_trace();
                 }
-                if super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks)? {
-                    continue;
+                match super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(why) => {
+                        // The round stopped before a finished list could be filed.
+                        // Its reader still needs to hear when the defining body is repaired.
+                        if let (Some(asked), tc::CheckError::OpaqueHiddenUnknown { opaque, .. }) = (asked.as_deref_mut(), &error) {
+                            asked.questions.push(tc::Question::Opaque(*opaque));
+                        }
+                        return Err(why);
+                    }
                 }
                 // A body with no diagnostic of the checker's that recorded the error type, where
                 // the front end gave it that type for a written type that named nothing (its own,
                 // or its signature's: front2 type_miss.rs): no clean body, and no invariant
-                // broken. Its findings are its own misses (the signature's are its `Signature`
-                // task's); the checker said nothing else.
+                // broken. Its findings are its signature's misses (said here, by the fn's own
+                // body alone: its callers' checks never say them) and its own; the checker said
+                // nothing else.
                 if matches!(error, tc::CheckError::UnknownInCleanBody { .. }) && (!body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
                     let mut diags = Vec::with_capacity_in(body.type_misses.len(), Global);
+                    diags.extend(signature_misses(r, owner));
                     diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
                     return Err(said(r, owner, diags, alloc));
                 }
@@ -331,12 +376,26 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         let needs = match out {
             // A finished check with a diagnostic is not a checked body: each is a finding.
             // A written type that named nothing (E0412, front2 type_miss.rs) is a finding too,
-            // before the checker's: the body was checked with the error type in its place.
-            Outcome::Done(done) if !round_gaps && (!done.diags.is_empty() || !body.type_misses.is_empty()) => {
+            // before the checker's: the body was checked with the error type in its place. So is
+            // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
+            // head holds the error type is never a clean check, even where the walk read none.
+            Outcome::Done(done) if !round_gaps && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) => {
                 let mut diags = Vec::with_capacity_in(body.type_misses.len() + done.diags.len(), Global);
+                diags.extend(signature_misses(r, owner));
                 diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
                 let tys = done.types.view();
-                diags.extend(done.diags.iter().map(|d| (d.code, d.at, diag_about(r, scope.spell, tys, &view, d))));
+                let mut future_goals = Vec::with_capacity_in(done.diags.len(), Global);
+                for d in done.diags.iter() {
+                    if let Some(trait_) = future_goal_trait(tys, d)
+                        && future_goals.iter().any(|&(at, seen)| at == d.at && seen == trait_)
+                    {
+                        continue;
+                    }
+                    if let Some(trait_) = future_goal_trait(tys, d) {
+                        future_goals.push((d.at, trait_));
+                    }
+                    diags.push((d.code, d.at, diag_about(r, scope.spell, tys, &view, d, &done.why)));
+                }
                 if let Some(asked) = asked.as_deref_mut() {
                     asked.finished = Some(done.reads.clone());
                 }
@@ -360,7 +419,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             Outcome::Need(needs) => needs,
         };
         if let Some(cost) = meter {
-            cost.again(&needs);
+            cost.again(&needs, &r.store.gate.borrow());
         }
         if let Some(asked) = asked.as_deref_mut() {
             asked.questions.clear();
@@ -371,7 +430,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         }
         // A question that met more than `MOST_IMPORTS_A_QUESTION` heads stands `Missing` with
         // its heads imported: the next round finds them made (the cost test counts the round).
-        if fills.is_empty() && r.store.imported.get() != imported_at {
+        if fills.is_empty() && r.store.imports() != imported_at {
             hints = needs;
             continue;
         }
@@ -394,6 +453,23 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     let mut last = Vec::new_in(Global);
     last.extend_from_slice(&hints.questions);
     Err(CheckFail::Rounds { owner, last })
+}
+
+/// A future-like opaque can make the same auto-trait obligation surface once through its
+/// opaque and once through its coroutine interior. They are one obligation at one place, so
+/// retain the first diagnostic and do not report a duplicate.
+fn future_goal_trait(tys: tc::PTys<'_>, d: &tc::Diag) -> Option<ItemKey> {
+    if d.code != tc::DiagCode::Unsatisfied {
+        return None;
+    }
+    let Some(tc::Because::Unmet { goal: tc::UnmetGoal::Trait { trait_, .. }, .. }) = d.because else {
+        return None;
+    };
+    let Some(found) = d.found else { return None };
+    match tys.node(found) {
+        Ok(tc::PNode::Opaque(..) | tc::PNode::Coroutine { .. }) => Some(trait_),
+        _ => None,
+    }
 }
 
 /// Makes every fill a round of the check noted; the number dropped.
@@ -436,9 +512,56 @@ pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: Item
 /// What `k` names, for an error beside its key (rule 19: an error names the item; the key
 /// stays, as tools grep it): a library item's module path and name, an anonymous constant's
 /// text as filed in `store.fns` (front2/anon.rs `file_asked`), a member's container's path
-/// and its name; else that the store gives no path.
+/// and its name, a body-local item's declared name and the item whose body declares it; else
+/// that the store gives no path. An item named by its library key is [`lib_shown`]'s.
 pub(crate) fn key_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Box<str, Global> {
     key_shown_in(r.names, &*r.keys, &*r.store, k)
+}
+
+/// Opaque type `opaque` as a person names it, by the item whose head made it (rule 19): an
+/// opaque key is no item of the names source, so [`item_shown`] of it said only "an item the
+/// names source holds no path for (key ..)". An `async fn`'s opaque 0 with its `Output`
+/// projection is `the future of `f`` (front2 async_output.rs `of`, heads.rs `fn_head`); an
+/// alias's is `an `impl Trait` of type alias `A`` (front2 tait.rs `of_alias`); any other is
+/// `the `impl Trait` type #i of `f``. A trait fn's `impl Trait` (not an `async fn`'s future) is
+/// its trait's synthetic associated type (RFC 3425; front2 rpitit.rs): the type of `s.make()`
+/// at a generic `S: Tr` keeps the opaque, and reads as the projection it reveals does,
+/// [`synthetic_shown`]. A key no head made keeps its key, said so.
+pub(crate) fn opaque_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, opaque: ItemKey) -> String {
+    // The default of a provided trait fn's `impl Trait` (front2 rpitit.rs `Twin`).
+    if let Some(twin) = r.store.rpitit_defaults.get(&opaque) {
+        return format!("the default body's type for {}", opaque_shown(r, twin.source));
+    }
+    if let Some(trait_fn) = rpitit_fn(r, opaque) {
+        return synthetic_shown(r, trait_fn);
+    }
+    match r.store.opaques.get(&opaque) {
+        Some(&(owner, 0)) if super::async_output::of(&*r.store, owner).is_some() => format!("the future of {}", key_shown(r, owner)),
+        Some(&(owner, ordinal)) if super::tait::of_alias(ordinal) => format!("an `impl Trait` of type alias {}", key_shown(r, owner)),
+        Some(&(owner, ordinal)) => format!("the `impl Trait` type #{ordinal} of {}", key_shown(r, owner)),
+        None => format!("an `impl Trait` type no head made (key {:032x})", opaque.0),
+    }
+}
+
+/// The trait fn whose return type holds `opaque` when it is a trait fn's `impl Trait`, its
+/// trait's synthetic associated type (front2 rpitit.rs): its fn is a member of a trait whose
+/// head is made. Not an `async fn`'s future (opaque 0 with an `Output` projection), which is
+/// named as `the future of `f`` wherever its fn is.
+fn rpitit_fn<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, opaque: ItemKey) -> Option<ItemKey> {
+    let &(owner, ordinal) = r.store.opaques.get(&opaque)?;
+    if ordinal == 0 && super::async_output::of(&*r.store, owner).is_some() {
+        return None;
+    }
+    let Some(Origin::Member { container, kind: super::keys::MemberKind::Fn, .. }) = r.keys.origin(owner) else { return None };
+    let lib = r.keys.library_in(r.names, *container)?;
+    r.store.maps.traits.contains_key(&lib).then_some(owner)
+}
+
+/// A trait fn's `impl Trait` as a person names it, the opaque and the synthetic projection
+/// `<S as Tr>::{..}` alike (rustc prints both as the `impl Trait` the trait fn wrote, "found
+/// associated type"): `{the impl Trait returned by `path::Tr::f`}`.
+fn synthetic_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, trait_fn: ItemKey) -> String {
+    format!("{{the impl Trait returned by {}}}", key_shown(r, trait_fn))
 }
 
 /// [`key_shown`] over the parts a body's world holds (`BodyWorld`: its names, key map and
@@ -456,26 +579,131 @@ pub(crate) fn key_shown_in<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store:
             Some(h) => format!("the anonymous constant `{}`", h.text),
             None => String::from("an anonymous constant not filed in the store"),
         },
-        Some(Origin::Member { container, name, .. }) => match keys.library_in(names, *container).and_then(path_of) {
-            Some(c) => format!("`{c}::{name}`"),
-            None => format!("`{name}` of {}", super::item_shown::ItemShown::of(names, keys, *container)),
-        },
-        _ => match keys.library_in(names, k).and_then(path_of) {
+        // A member by its container's path and its name (item_shown.rs `lib_path`): a trait's
+        // module path and name, an impl's header as written (`core::num::<impl u32>::MAX`, a
+        // constant core's `uint_impl!` writes in that impl's body). Before, an impl container
+        // (no name) printed the member as "`MAX` of" the impl's `ItemShown`.
+        Some(Origin::Member { container, name, .. }) => match super::item_shown::ItemShown::of(names, keys, k).path() {
             Some(p) => format!("`{p}`"),
-            None => super::item_shown::ItemShown::of(names, keys, k).to_string(),
+            None => format!("`{name}` of {}", super::row_path::shown_name(names, keys, store, *container)),
+        },
+        _ => match store.locals.head(k) {
+            // An item declared in a body (a static a macro call writes in a block, tracing's
+            // `callsite2!`'s `static __CALLSITE`) has no row of the names source, so it printed
+            // "an item the names source holds no path for": its declared name (the body's own
+            // local rows) and the item whose body declares it, by row_path.rs's bounded walk.
+            Some(local) => match super::row_path::RowPath::of(names, keys, store, k) {
+                Ok(p) => format!("`{}`, declared in the body of `{}`", p.ident(), super::row_path::shown_name(names, keys, store, local.enclosing)),
+                Err(no) => no.item.to_string(),
+            },
+            None => match keys.library_in(names, k).and_then(path_of) {
+                Some(p) => format!("`{p}`"),
+                None => super::item_shown::ItemShown::of(names, keys, k).to_string(),
+            },
         },
     };
     shown.into_boxed_str()
 }
 
-/// `t` of `tys` as Rust spells it (`Result<Out, Missing>`), by a work list; a node with no
-/// spelling here is its `Debug`.
-fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t: tc::PTy) -> String {
+/// [`key_shown`] of an item named by its LIBRARY key (a head's `Why::NeedConst`, so
+/// [`MakeFail::Const`] and `ConstFail::Nested`). `checker_of(lib)` is the item's checker key
+/// only where the key map files it as [`Origin::Item`] (a module-level item, a body-local one);
+/// a member's checker key is made from its container, kind and name (keys.rs `member_key`), so
+/// `checker_of` of a member's library key has no origin, and the names source's
+/// `key_beginning` searches items, modules and variants, no member: tempo's tests (2026-11-21,
+/// reports/tempo-tests/t0850) printed `Const { .. shown: "an item the names source holds no path
+/// for (key a606c28d..)", error: Nested { .. } }`. Such an item is named from its library key
+/// through the member owners table: its container (a trait's path, an impl's header as
+/// written) and its name ([`super::item_shown::ItemShown::of_lib`]), a member a macro wrote
+/// included (`impl u32 { uint_impl! { .. } }`: its rows are in that table too).
+pub(crate) fn lib_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, lib: LibKey) -> Box<str, Global> {
+    let k = checker_of(lib);
+    if r.keys.origin(k).is_some() || r.store.locals.head(k).is_some() {
+        return key_shown(r, k);
+    }
+    // An anonymous constant a head asked for and anon.rs `file_asked` has not filed yet (no
+    // origin: `eval_len_inner` returns `ConstFail::Nested` before it files the asks), such as
+    // the `size_of::<Self>()` of `[u8; size_of::<Self>()]` in a fn head core's `uint_impl!`
+    // writes in `impl u32`: its text as written, and the module whose head wrote it.
+    let asked = r.store.maps.anon_asked.borrow().iter().find(|a| a.need == lib).map(|a| match r.names.module_path(a.module) {
+        Some("") => format!("the anonymous constant `{}` (written in a head in its crate's root module)", a.text),
+        Some(module) => format!("the anonymous constant `{}` (written in a head in `{module}`)", a.text),
+        None => format!("the anonymous constant `{}` (written in a head in a module the names source gives no path for)", a.text),
+    });
+    if let Some(text) = asked {
+        return text.into_boxed_str();
+    }
+    let shown = super::item_shown::ItemShown::of_lib(r.names, lib);
+    let text = match shown.path() {
+        Some(p) => format!("`{p}`"),
+        None => shown.to_string(),
+    };
+    text.into_boxed_str()
+}
+
+/// How many of ADT `k`'s arguments `args` (of `tys`) a type is shown with: a trailing argument
+/// equal to the default its parameter writes is left out, as a person writes the type and as
+/// rustc prints it (`Rc<u8>`, not `Rc<u8, Global>`: alloc's `Rc<T, A: Allocator = Global>`).
+/// Only a default that names no parameter (`Global`) is compared; one that does
+/// (`struct S<T, U = T>`) is in the ADT's own parameters and is kept shown. Equal by spelling:
+/// both sides are said by [`ty_shown`], the default in the heads' table. An ADT whose head row
+/// the store does not hold shows every argument.
+fn adt_args_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>, k: ItemKey, args: &[tc::PTy]) -> usize {
+    let Some(lib) = r.keys.library_in(r.names, k) else { return args.len() };
+    let Some((_, defaults)) = r.store.maps.generics.get(&lib) else { return args.len() };
+    let heads = r.store.tys.view();
+    let mut shown = args.len();
+    while let Some(&arg) = shown.checked_sub(1).and_then(|i| args.get(i)) {
+        let Some(&Some(d)) = defaults.get(shown - 1) else { break };
+        if !names_no_param(heads, d, r.store.tys.alloc()) || ty_shown(r, heads, d) != ty_shown(r, tys, arg) {
+            break;
+        }
+        shown -= 1;
+    }
+    shown
+}
+
+/// Whether `t` of `tys` reaches no parameter, hole or error type (a work list, capped: a
+/// malformed table is "names one").
+fn names_no_param(tys: tc::PTys<'_>, t: tc::PTy, alloc: blaze_own::Alloc<'_>) -> bool {
+    let mut todo: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+    let mut kids: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+    todo.push(t);
+    let mut steps = 0u32;
+    while let Some(t) = todo.pop() {
+        steps += 1;
+        let Ok(node) = tys.node(t) else { return false };
+        if steps > 4096 || matches!(node, tc::PNode::Param(_) | tc::PNode::ConstParam(_) | tc::PNode::Infer | tc::PNode::Error) {
+            return false;
+        }
+        kids.clear();
+        if blaze_build::instance::each_child(tys, node, &mut kids).is_err() {
+            return false;
+        }
+        todo.extend_from_slice(&kids);
+    }
+    true
+}
+
+/// `t` of `tys` as Rust spells it (`Result<Out, Missing>`), by a work list: one arm per node,
+/// no `Debug` of a node (rule 19). What has no source spelling is said by what it is: a
+/// closure `{closure #0 of main}`, a fn item `fn item foo`, a hole `_`.
+pub(super) fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>, t: tc::PTy) -> String {
     enum Step {
         Ty(tc::PTy),
         Lit(&'static str),
+        Text(String),
     }
-    let mut out = String::new();
+    /// `items` in order, `sep` between them, onto `seq`.
+    fn joined(seq: &mut Vec<Step, Global>, items: &[tc::PTy], sep: &'static str) {
+        for (i, &k) in items.iter().enumerate() {
+            if i > 0 {
+                seq.push(Step::Lit(sep));
+            }
+            seq.push(Step::Ty(k));
+        }
+    }
+    let mut out = String::with_capacity(64);
     let mut todo = Vec::new_in(Global);
     todo.push(Step::Ty(t));
     // Each node is visited once per occurrence; the cap bounds a malformed (cyclic) table.
@@ -491,97 +719,302 @@ fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t:
                 out.push_str(s);
                 continue;
             }
+            Step::Text(s) => {
+                out.push_str(&s);
+                continue;
+            }
             Step::Ty(t) => t,
         };
-        let (open, close, list) = match tys.node(t) {
+        // What the node prints as, in order; pushed onto the work list reversed.
+        let mut seq: Vec<Step, Global> = Vec::new_in(Global);
+        let list = |l: tc::List| tys.list(l).unwrap_or(&[]);
+        match tys.node(t) {
             Ok(tc::PNode::Adt(k, l)) => {
-                out.push_str(&item_shown(r, k));
-                if l.len == 0 {
-                    continue;
+                seq.push(Step::Text(item_shown(r, k)));
+                let args = list(l);
+                let args = &args[..adt_args_shown(r, tys, k, args)];
+                if !args.is_empty() {
+                    seq.push(Step::Lit("<"));
+                    joined(&mut seq, args, ", ");
+                    seq.push(Step::Lit(">"));
                 }
-                ("<", ">", l)
             }
-            Ok(tc::PNode::Tuple(l)) => ("(", ")", l),
+            Ok(tc::PNode::Tuple(l)) => {
+                let kids = list(l);
+                seq.push(Step::Lit("("));
+                joined(&mut seq, kids, ", ");
+                // `(T,)`: a one-element tuple, not a parenthesized type.
+                if kids.len() == 1 {
+                    seq.push(Step::Lit(","));
+                }
+                seq.push(Step::Lit(")"));
+            }
             Ok(tc::PNode::Ref(m, i)) => {
-                out.push_str(if m == tc::Mutbl::Mut { "&mut " } else { "&" });
-                todo.push(Step::Ty(i));
-                continue;
+                seq.push(Step::Lit(if m == tc::Mutbl::Mut { "&mut " } else { "&" }));
+                seq.push(Step::Ty(i));
             }
-            Ok(tc::PNode::Param(i)) => {
-                out.push_str(&format!("Param({i})"));
-                continue;
+            Ok(tc::PNode::Ptr(m, i)) => {
+                seq.push(Step::Lit(if m == tc::Mutbl::Mut { "*mut " } else { "*const " }));
+                seq.push(Step::Ty(i));
             }
-            Ok(tc::PNode::Never) => {
-                out.push('!');
-                continue;
+            Ok(tc::PNode::Param(i)) => seq.push(Step::Text(format!("Param({i})"))),
+            Ok(tc::PNode::ConstParam(i)) => seq.push(Step::Text(format!("const parameter #{i}"))),
+            // As a person names it, `impl Trait (the future of `f`)`: the bare fn's name said
+            // the type was the fn's. A trait fn's `impl Trait` reads as its synthetic
+            // associated type does, one text for one type (`assoc_shown`, rule 30).
+            Ok(tc::PNode::Opaque(k, _)) => match rpitit_fn(r, k) {
+                Some(trait_fn) => seq.push(Step::Text(synthetic_shown(r, trait_fn))),
+                None if r.store.opaques.contains_key(&k) || r.store.rpitit_defaults.contains_key(&k) => {
+                    seq.push(Step::Text(format!("impl Trait ({})", opaque_shown(r, k))));
+                }
+                None => seq.push(Step::Lit("impl Trait")),
+            },
+            Ok(tc::PNode::Coroutine { owner, .. }) => seq.push(Step::Text(item_shown(r, owner))),
+            Ok(tc::PNode::Future(..)) => seq.push(Step::Lit("impl Future")),
+            Ok(tc::PNode::Closure { owner, ordinal, .. }) => seq.push(Step::Text(format!("{{closure #{ordinal} of {}}}", item_shown(r, owner)))),
+            Ok(tc::PNode::FnDef(k, l)) => {
+                seq.push(Step::Text(format!("fn item {}", item_shown(r, k))));
+                if l.len != 0 {
+                    seq.push(Step::Lit("::<"));
+                    joined(&mut seq, list(l), ", ");
+                    seq.push(Step::Lit(">"));
+                }
             }
+            // `unsafe extern "C" fn(A, ...) -> R`: the inputs, then the output last.
+            Ok(tc::PNode::FnPtr(l, h)) => {
+                if h.safety == tc::Safety::Unsafe {
+                    seq.push(Step::Lit("unsafe "));
+                }
+                if h.abi != tc::Abi::Rust {
+                    seq.push(Step::Text(format!("extern \"{}\" ", h.abi.name())));
+                }
+                seq.push(Step::Lit("fn("));
+                let kids = list(l);
+                let (output, inputs) = match kids.split_last() {
+                    Some((&o, i)) => (Some(o), i),
+                    None => (None, kids),
+                };
+                joined(&mut seq, inputs, ", ");
+                if h.c_variadic {
+                    seq.push(Step::Lit(if inputs.is_empty() { "..." } else { ", ..." }));
+                }
+                seq.push(Step::Lit(")"));
+                if let Some(o) = output
+                    && !matches!(tys.node(o), Ok(tc::PNode::Tuple(u)) if u.len == 0)
+                {
+                    seq.push(Step::Lit(" -> "));
+                    seq.push(Step::Ty(o));
+                }
+            }
+            // `<Self as Trait<..>>::Name`.
+            Ok(tc::PNode::Alias { trait_, name, args }) => {
+                let kids = list(args);
+                seq.push(Step::Lit("<"));
+                match kids.split_first() {
+                    Some((&self_, rest)) => {
+                        seq.push(Step::Ty(self_));
+                        seq.push(Step::Text(format!(" as {}", item_shown(r, trait_))));
+                        if !rest.is_empty() {
+                            seq.push(Step::Lit("<"));
+                            joined(&mut seq, rest, ", ");
+                            seq.push(Step::Lit(">"));
+                        }
+                    }
+                    None => seq.push(Step::Text(format!("? as {}", item_shown(r, trait_)))),
+                }
+                seq.push(Step::Text(format!(">::{}", assoc_shown(r, trait_, name))));
+            }
+            Ok(tc::PNode::Infer) => seq.push(Step::Lit("_")),
+            Ok(tc::PNode::ConstValue { ty, bits }) => seq.push(Step::Text(const_shown(r, tys, ty, bits))),
+            Ok(tc::PNode::Never) => seq.push(Step::Lit("!")),
             Ok(n @ (tc::PNode::Bool | tc::PNode::Char | tc::PNode::Str | tc::PNode::Int(_) | tc::PNode::Uint(_) | tc::PNode::Float(_))) => {
                 // types.rs `PRIMS` is the one table of built-in names; it covers all 19.
                 match super::types::PRIMS.iter().find(|(_, p)| *p == n) {
-                    Some(&(name, _)) => out.push_str(name),
-                    None => out.push_str(&format!("{n:?} (a built-in type missing from types.rs PRIMS)")),
+                    Some(&(name, _)) => seq.push(Step::Lit(name)),
+                    None => seq.push(Step::Text(format!("{n:?} (a built-in type missing from types.rs PRIMS)"))),
                 }
-                continue;
             }
             Ok(tc::PNode::Slice(e)) => {
-                out.push('[');
-                todo.push(Step::Lit("]"));
-                todo.push(Step::Ty(e));
-                continue;
+                seq.push(Step::Lit("["));
+                seq.push(Step::Ty(e));
+                seq.push(Step::Lit("]"));
             }
-            Ok(tc::PNode::Ptr(m, i)) => {
-                out.push_str(if m == tc::Mutbl::Mut { "*mut " } else { "*const " });
-                todo.push(Step::Ty(i));
-                continue;
+            Ok(tc::PNode::Array(e, n)) => {
+                seq.push(Step::Lit("["));
+                seq.push(Step::Ty(e));
+                seq.push(Step::Lit("; "));
+                seq.push(Step::Ty(n));
+                seq.push(Step::Lit("]"));
             }
-            Ok(n) => {
-                out.push_str(&format!("{n:?}"));
-                continue;
+            // `u8 is 1..=9 | 20..=29`: the ranges in pairs.
+            Ok(tc::PNode::Pat(base, ranges)) => {
+                seq.push(Step::Ty(base));
+                seq.push(Step::Lit(" is "));
+                for (i, pair) in list(ranges).chunks(2).enumerate() {
+                    if i > 0 {
+                        seq.push(Step::Lit(" | "));
+                    }
+                    joined(&mut seq, pair, "..=");
+                }
             }
-            Err(e) => {
-                out.push_str(&format!("<{e:?}>"));
-                continue;
+            // `dyn Trait<A, Name = T> + Send`: the principal with its arguments and
+            // projections, then the auto traits (portable.rs `Dynamic`'s one order).
+            Ok(tc::PNode::Dynamic(l)) => {
+                let kids = list(l);
+                seq.push(Step::Lit("dyn "));
+                let mut first = true;
+                if let Some(&p) = kids.first()
+                    && let Ok(tc::PNode::ExTrait(tr, a)) = tys.node(p)
+                {
+                    first = false;
+                    seq.push(Step::Text(item_shown(r, tr)));
+                    let args = list(a);
+                    let mut open = false;
+                    for (i, &k) in args.iter().enumerate() {
+                        seq.push(Step::Lit(if i == 0 { "<" } else { ", " }));
+                        seq.push(Step::Ty(k));
+                        open = true;
+                    }
+                    for &k in kids {
+                        if let Ok(tc::PNode::ExProj { trait_, name, term, .. }) = tys.node(k) {
+                            seq.push(Step::Lit(if open { ", " } else { "<" }));
+                            seq.push(Step::Text(format!("{} = ", assoc_shown(r, trait_, name))));
+                            seq.push(Step::Ty(term));
+                            open = true;
+                        }
+                    }
+                    if open {
+                        seq.push(Step::Lit(">"));
+                    }
+                }
+                for &k in kids {
+                    if let Ok(tc::PNode::ExAuto(a)) = tys.node(k) {
+                        if !first {
+                            seq.push(Step::Lit(" + "));
+                        }
+                        first = false;
+                        seq.push(Step::Text(item_shown(r, a)));
+                    }
+                }
             }
-        };
-        let kids = tys.list(list).unwrap_or(&[]);
-        out.push_str(open);
-        todo.push(Step::Lit(close));
-        for (i, &k) in kids.iter().enumerate().rev() {
-            todo.push(Step::Ty(k));
-            if i > 0 {
-                todo.push(Step::Lit(", "));
+            // A trait object's predicate met outside its `Dynamic` (never in a well-formed
+            // table): said as it reads inside one.
+            Ok(tc::PNode::ExTrait(tr, a)) => {
+                seq.push(Step::Text(item_shown(r, tr)));
+                if a.len != 0 {
+                    seq.push(Step::Lit("<"));
+                    joined(&mut seq, list(a), ", ");
+                    seq.push(Step::Lit(">"));
+                }
             }
+            Ok(tc::PNode::ExProj { trait_, name, term, .. }) => {
+                seq.push(Step::Text(format!("{} = ", assoc_shown(r, trait_, name))));
+                seq.push(Step::Ty(term));
+            }
+            Ok(tc::PNode::ExAuto(a)) => seq.push(Step::Text(item_shown(r, a))),
+            // A type the check left undecided (the error type): rustc's `{unknown}`, never
+            // the node's `Debug` name `Error`, which reads as a type named `Error`.
+            Ok(tc::PNode::Error) => seq.push(Step::Lit("{unknown}")),
+            Err(e) => seq.push(Step::Text(format!("<a type the table does not hold: {e}>"))),
         }
+        todo.extend(seq.into_iter().rev());
     }
     out
+}
+
+/// The associated item `name` of `trait_` by its declared name, from the trait's members as
+/// filed (rule 19: never its hash alone).
+fn assoc_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, trait_: ItemKey, name: Name) -> String {
+    if let Some(a) = r.store.trait_defs.get(&trait_).and_then(|t| t.assoc.iter().find(|a| a.name == name)) {
+        return item_shown(r, a.item);
+    }
+    // A synthetic associated type (rpitit.rs `name_of`): the `impl Trait` of a trait fn's
+    // return type, filed with its trait's rows (`Store::rpitit_traits`), not with the written
+    // members, and named by that fn (no written name exists). Without this every such type
+    // printed as "not filed" though it was (tempo a0700, executed_state.rs:123; rule 19).
+    if let Some(s) = r.store.rpitit_traits.get(&trait_).and_then(|t| t.rows.iter().find(|s| s.name == name)) {
+        return synthetic_shown(r, s.trait_fn);
+    }
+    format!("{name:?} (an associated type of a trait whose members are not filed, so its name is not known here)")
+}
+
+/// A const generic's value as Rust writes it: `true`, `'a'`, `-3`, `255`; an enum's variant
+/// by its index (`adt_const_params`). `isize` is read as 64 bits wide (the hosts in scope).
+fn const_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>, ty: tc::PTy, bits: u128) -> String {
+    match tys.node(ty) {
+        Ok(tc::PNode::Bool) => String::from(if bits != 0 { "true" } else { "false" }),
+        Ok(tc::PNode::Char) => match u32::try_from(bits).ok().and_then(char::from_u32) {
+            Some(c) => format!("{c:?}"),
+            None => format!("a `char` of bits {bits:#x}, no scalar value"),
+        },
+        Ok(tc::PNode::Uint(_)) => format!("{bits}"),
+        Ok(tc::PNode::Int(w)) => {
+            let width: u32 = match w {
+                tc::IntTy::I8 => 8,
+                tc::IntTy::I16 => 16,
+                tc::IntTy::I32 => 32,
+                tc::IntTy::I64 | tc::IntTy::Isize => 64,
+                tc::IntTy::I128 => 128,
+            };
+            let v = ((bits << (128 - width)) as i128) >> (128 - width);
+            format!("{v}")
+        }
+        Ok(tc::PNode::Adt(k, _)) => format!("variant #{bits} of {}", item_shown(r, k)),
+        _ => format!("a constant of bits {bits:#x}"),
+    }
 }
 
 /// What a diagnostic is about, printed: an unmet goal entire, the leaf where-clause first when
 /// the checker names one (`Error: From<Other>` because `Result<u8, Error>: FromResidual<..>`).
 /// `v`: the body, which says whether a path that named nothing is a call's callee (a function,
 /// as rustc says it) or another value.
-pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, v: &BodyView<'_>, d: &tc::Diag) -> Box<str> {
+pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, v: &BodyView<'_>, d: &tc::Diag, why: &[tc::WhyStep]) -> Box<str> {
+    diag_about_held(r, spell, tys, v, d, why, &[])
+}
+
+/// An unmet goal as a finding says it: "`Self: Trait<..>`", or "`<Self as Trait<..>>::Name == T`".
+fn unmet_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>, g: tc::UnmetGoal) -> String {
+    let (tc::UnmetGoal::Trait { trait_, args } | tc::UnmetGoal::Projection { trait_, args, .. }) = g;
+    let all: Vec<String> = tys.list(args).map(|l| l.iter().map(|&t| ty_shown(r, tys, t)).collect()).unwrap_or_default();
+    let (self_, rest) = all.split_first().map_or(("?", &[][..]), |(s, rest)| (s.as_str(), rest));
+    let tr = if rest.is_empty() { item_shown(r, trait_).to_string() } else { format!("{}<{}>", item_shown(r, trait_), rest.join(", ")) };
+    match g {
+        tc::UnmetGoal::Trait { .. } => format!("`{self_}: {tr}`"),
+        tc::UnmetGoal::Projection { trait_, name, term, .. } => {
+            format!("`<{self_} as {tr}>::{} == {}`", assoc_shown(r, trait_, name), ty_shown(r, tys, term))
+        }
+    }
+}
+
+/// What a value an async block holds across an `.await` is, for a why-chain's
+/// `CoroutineSlot` step: known only where the exact interior was made (front2
+/// stalled_goals.rs, from the witness's storage rows). `words` is the whole phrase ("`r`
+/// (`Rc<u8>`) is held across `tick().await`"); the places it names are `declared` and
+/// `awaits`, item-relative ranges, filed as the finding's notes (`BodyDiagnostic::notes`) for
+/// whoever prints findings to turn into `file:line:col`.
+pub(super) struct HeldSlot {
+    pub coroutine: tc::WhyDef,
+    pub slot: u32,
+    pub words: String,
+    pub declared: Vec<tc::Range>,
+    pub awaits: Vec<tc::Range>,
+}
+
+/// [`diag_about`] with what the exact interior says of each held slot (`held`): a stalled
+/// goal's finding decided on the exact interior (front2 stalled_goals.rs) names WHICH value.
+pub(super) fn diag_about_held<'n, S: NamesSource<'n>>(
+    r: &Records<'_, 'n, S>,
+    spell: &Spelling<'_>,
+    tys: tc::PTys<'_>,
+    v: &BodyView<'_>,
+    d: &tc::Diag,
+    why: &[tc::WhyStep],
+    held: &[HeldSlot],
+) -> Box<str> {
     let ty = |t: Option<tc::PTy>| t.map(|t| ty_shown(r, tys, t));
     let s = match d.because {
         Some(tc::Because::Unmet { goal, leaf }) => {
-            let shown = |g: tc::UnmetGoal| {
-                let (tc::UnmetGoal::Trait { trait_, args } | tc::UnmetGoal::Projection { trait_, args, .. }) = g;
-                let all: Vec<String> = tys.list(args).map(|l| l.iter().map(|&t| ty_shown(r, tys, t)).collect()).unwrap_or_default();
-                let (self_, rest) = all.split_first().map_or(("?", &[][..]), |(s, rest)| (s.as_str(), rest));
-                let tr = if rest.is_empty() { item_shown(r, trait_).to_string() } else { format!("{}<{}>", item_shown(r, trait_), rest.join(", ")) };
-                match g {
-                    tc::UnmetGoal::Trait { .. } => format!("`{self_}: {tr}`"),
-                    tc::UnmetGoal::Projection { trait_, name, term, .. } => {
-                        // Rule 19: the associated type by its name, from the trait's members
-                        // as filed; never its hash alone.
-                        let assoc = match r.store.trait_defs.get(&trait_).and_then(|t| t.assoc.iter().find(|a| a.name == name)) {
-                            Some(a) => item_shown(r, a.item),
-                            None => format!("{name:?} (an associated type of a trait whose members are not filed, so its name is not known here)"),
-                        };
-                        format!("`<{self_} as {tr}>::{assoc} == {}`", ty_shown(r, tys, term))
-                    }
-                }
-            };
+            let shown = |g: tc::UnmetGoal| unmet_shown(r, tys, g);
             let unmet = match leaf {
                 Some(l) => format!("{} because {}", shown(l), shown(goal)),
                 None => shown(goal),
@@ -631,6 +1064,9 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
         None => node_about(None, ty(d.found), ty(d.expected), d.name.map(|n| name_about(r, spell, tys, d.found, n))),
     };
     let mut s = s;
+    // Rule 19: the finding's kind by its code, so a finding with little else in it (`found
+    // `{unknown}``) still says what was refused.
+    s.push_str(&format!(" ({} {:?})", d.code.code(), d.code));
     // Rule 19: a finding whose range other nodes share (every node an expansion wrote has the
     // call's range) names its node: its index, kind and shape (blaze-typeck diag/node.rs).
     if let Some(node) = d.node {
@@ -639,7 +1075,211 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
             node_words(&mut s, spell, v, node, shared);
         }
     }
+    // The solver's chain of why the unmet goal has no solution (blaze-typeck `Diag::why`): each
+    // step under the goal, then why the last one fails by itself.
+    if let Some(w) = d.why {
+        match why.get(w.start as usize..(w.start as usize).saturating_add(w.len as usize)) {
+            Some(steps) => why_words(&mut s, r, spell, tys, v, steps, w.leaf, held),
+            None => s.push_str(&format!("; its chain of why is rows {}..+{} of a `why` column of {} rows: not this record's", w.start, w.len, why.len())),
+        }
+    }
+    // Rule 19: an E0282 says WHAT is undecided (where its variable was made) and which goals
+    // still wait on it (blaze-typeck `Diag::undecided`).
+    if let Some(u) = d.undecided {
+        undecided_words(&mut s, r, spell, tys, v, u);
+    }
     s.into_boxed_str()
+}
+
+/// The words [`diag_about`] adds for an E0282's undecided variable: where it was made (a
+/// generic argument by its item's path, a closure's parameter or return by the closure's text),
+/// then each pending goal that names it, and how many more there are.
+fn undecided_words<'n, S: NamesSource<'n>>(s: &mut String, r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, v: &BodyView<'_>, u: tc::UndecidedVar) {
+    use core::fmt::Write;
+    // A `String`'s `write!` cannot fail.
+    let closure = |s: &mut String, e| {
+        s.push_str("the closure `");
+        let _ = tc::sketch(v, tc::Node::Expr(e), &|n| spell.get(n).ok(), s);
+        s.push('`');
+    };
+    s.push_str("\n  undecided: ");
+    match u.origin {
+        tc::VarOrigin::GenericArg { item, index } => {
+            let _ = write!(s, "generic argument #{index} of {} (none written at this use)", item_shown(r, item));
+        }
+        tc::VarOrigin::ClosureParam { closure: e, index } => {
+            let _ = write!(s, "the type of parameter #{index} of ");
+            closure(s, e);
+            s.push_str(" (none written, none expected)");
+        }
+        tc::VarOrigin::ClosureReturn { closure: e } => {
+            s.push_str("the return type of ");
+            closure(s, e);
+            s.push_str(" (none written, none expected)");
+        }
+        tc::VarOrigin::Projection { trait_, name } => {
+            let _ = match spell.get(name) {
+                Ok(text) => write!(s, "the associated type `{text}` of {}, not normalized yet (its arguments hold a variable)", item_shown(r, trait_)),
+                Err(unspelled) => write!(s, "an associated type ({unspelled:?}) of {}, not normalized yet (its arguments hold a variable)", item_shown(r, trait_)),
+            };
+        }
+        tc::VarOrigin::Other => s.push_str("a type the check made for a value, no written place named"),
+    }
+    let mut shown = 0u32;
+    for g in u.pending.iter().flatten() {
+        shown += 1;
+        let _ = write!(s, "\n  pending on it: {}", unmet_shown(r, tys, *g));
+    }
+    if u.pending_count == 0 {
+        s.push_str("\n  no goal is pending on it: nothing written here decides it");
+    } else if u.pending_count > shown {
+        let _ = write!(s, "\n  and {} more goals pending on it", u.pending_count - shown);
+    }
+}
+
+/// The words [`diag_about`] adds for a finding's why-chain (blaze-typeck `Diag::why`): a line
+/// per step under the goal, what the step is of the one above (an impl's where-clause by the
+/// impl's path, a field by its ADT's, a closure or async block by its text, another body's by
+/// its owner's path, a held value by what the exact interior says of it in `held`) and the
+/// goal it needs, then why the last fails by itself. Rule 19: each thing by what it is, never
+/// Debug.
+#[expect(clippy::too_many_arguments, reason = "diag_about's, and the chain's")]
+fn why_words<'n, S: NamesSource<'n>>(s: &mut String, r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, v: &BodyView<'_>, steps: &[tc::WhyStep], leaf: tc::WhyLeaf, held: &[HeldSlot]) {
+    use core::fmt::Write;
+    // A `String`'s `write!` cannot fail.
+    let def = |s: &mut String, what: &str, d: tc::WhyDef| match d {
+        tc::WhyDef::Expr(e) => {
+            let _ = write!(s, "the {what} `");
+            let _ = tc::sketch(v, tc::Node::Expr(e), &|n| spell.get(n).ok(), s);
+            s.push('`');
+        }
+        tc::WhyDef::Of { owner, ordinal } => {
+            let _ = write!(s, "{what} #{ordinal} of {}", item_shown(r, owner));
+        }
+    };
+    for step in steps.iter().skip(1) {
+        s.push_str("\n  because ");
+        match step.reached {
+            tc::WhyReached::Root => s.push_str("the goal itself"),
+            tc::WhyReached::ImplClause { impl_, clause } => {
+                let _ = write!(s, "where-clause #{clause} of {}", item_shown(r, impl_));
+            }
+            tc::WhyReached::Field { adt, field } => {
+                let _ = write!(s, "field #{field} of {}", item_shown(r, adt));
+            }
+            tc::WhyReached::AdtArg { adt, arg } => {
+                let _ = write!(s, "type argument #{arg} of {} (its fields hold it)", item_shown(r, adt));
+            }
+            tc::WhyReached::RefTarget => s.push_str("the target of the reference"),
+            tc::WhyReached::PtrTarget => s.push_str("the pointee of the raw pointer"),
+            tc::WhyReached::Element => s.push_str("the element type"),
+            tc::WhyReached::TupleElement { index } => {
+                let _ = write!(s, "tuple element #{index}");
+            }
+            tc::WhyReached::Capture { closure, capture } => {
+                let _ = write!(s, "capture #{capture} of ");
+                def(s, "closure", closure);
+            }
+            // On the exact interior (front2 stalled_goals.rs) the slot is a value a person
+            // wrote, said from its storage row; on the check's superset interior (blaze-typeck
+            // rules/coroutine.rs) it names none, so the value is said by its type (the goal).
+            tc::WhyReached::CoroutineSlot { coroutine, slot } => match held.iter().find(|h| h.coroutine == coroutine && h.slot == slot) {
+                Some(h) => {
+                    let _ = write!(s, "{} by ", h.words);
+                    def(s, "async block", coroutine);
+                }
+                None => {
+                    s.push_str("a value held by ");
+                    def(s, "async block", coroutine);
+                }
+            },
+            tc::WhyReached::Captures { closure } => {
+                s.push_str("the captures of ");
+                def(s, "closure", closure);
+            }
+            tc::WhyReached::Interior { coroutine } => {
+                s.push_str("what is held by ");
+                def(s, "async block", coroutine);
+            }
+            tc::WhyReached::Phantom => s.push_str("the type `PhantomData` stands for"),
+            tc::WhyReached::Hidden { opaque } => {
+                let _ = write!(s, "the hidden type of {}", opaque_shown(r, opaque));
+            }
+            tc::WhyReached::Other { nth: u32::MAX } => s.push_str("a goal a nested goal's answer added"),
+            tc::WhyReached::Other { nth } => {
+                let _ = write!(s, "requirement #{nth} of the rule that applied");
+            }
+        }
+        match step.goal {
+            Some(g) => {
+                let _ = write!(s, " needs {}", unmet_shown(r, tys, g));
+            }
+            None => s.push_str(" needs a goal that is no trait bound, or names a type the walk left open"),
+        }
+    }
+    s.push_str("\n  and ");
+    match leaf {
+        tc::WhyLeaf::NoImpl => s.push_str("no impl, bound or rule gives that"),
+        tc::WhyLeaf::NegativeImpl { impl_ } => {
+            let _ = write!(s, "{} says it does not hold (a negative impl)", item_shown(r, impl_));
+        }
+        tc::WhyLeaf::Refused { first_impl: Some(i), count } => {
+            let _ = write!(s, "each of its {count} candidates is for other types (the first: {})", item_shown(r, i));
+        }
+        tc::WhyLeaf::Refused { first_impl: None, count } => {
+            let _ = write!(s, "each of its {count} candidates was refused by its rule");
+        }
+        tc::WhyLeaf::BuiltinNo => s.push_str("the language's own rule for that type refuses it"),
+        tc::WhyLeaf::Cycle => s.push_str("that needs itself (a cycle)"),
+        tc::WhyLeaf::NotKept => s.push_str("the solver's walk stops there (its bound on rows or depth)"),
+        // An undecided goal's leaves: why the last goal cannot be decided yet.
+        tc::WhyLeaf::Unresolved { term } => {
+            let _ = write!(s, "its type #{term} is not known yet (annotate it)");
+        }
+        tc::WhyLeaf::Ambiguous { first, second, count } => {
+            let _ = write!(s, "{count} candidates may each hold and none is chosen: {} and {}", cand_shown(r, first), cand_shown(r, second));
+        }
+        tc::WhyLeaf::Limit { hit: tc::WhyLimit::Depth { depth, limit } } => {
+            let _ = write!(s, "the goals stand {depth} deep, at the recursion limit {limit}");
+        }
+        tc::WhyLeaf::Limit { hit: tc::WhyLimit::Fixpoint { reruns } } => {
+            let _ = write!(s, "a cycle's answer did not settle in {reruns} reruns");
+        }
+        tc::WhyLeaf::Limit { hit: tc::WhyLimit::Rounds { rounds } } => {
+            let _ = write!(s, "its nested goals kept changing for {rounds} rounds");
+        }
+        tc::WhyLeaf::HiddenUnknown { opaque } => {
+            let _ = write!(s, "the hidden type of {} is not known yet", opaque_shown(r, opaque));
+        }
+        tc::WhyLeaf::InteriorUnknown { coroutine } => {
+            s.push_str("what is held by ");
+            def(s, "async block", coroutine);
+            s.push_str(" is not decided yet");
+        }
+        tc::WhyLeaf::CapturesUnknown { closure } => {
+            s.push_str("the captures of ");
+            def(s, "closure", closure);
+            s.push_str(" are not decided yet");
+        }
+        tc::WhyLeaf::Unnormalized { alias } => {
+            let _ = write!(s, "the associated type {} does not normalize yet", item_shown(r, alias));
+        }
+        tc::WhyLeaf::RuleUndecided { cand } => {
+            let _ = write!(s, "the rule of {} cannot decide it yet", cand_shown(r, cand));
+        }
+    }
+}
+
+/// A candidate a why-chain's leaf names, by what it is: an impl by its path, a where-clause
+/// by its place among those in scope.
+fn cand_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, c: tc::WhyCand) -> String {
+    match c {
+        tc::WhyCand::Impl { impl_ } => format!("the impl {}", item_shown(r, impl_)),
+        tc::WhyCand::WhereClause { nth } => format!("where-clause #{nth} in scope"),
+        tc::WhyCand::AliasBound => String::from("a bound of the alias or opaque type"),
+        tc::WhyCand::Builtin => String::from("the language's own rule"),
+        tc::WhyCand::Unknowable => String::from("an impl another crate may write"),
+    }
 }
 
 /// `, at expression #i (a cast; its range is shared by n nodes): `{integer} as _``: the words
@@ -718,7 +1358,7 @@ fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>
     use super::on_unimplemented::{Lit, Words, find, write_value};
     let tc::UnmetGoal::Trait { trait_, args } = g else { return None };
     let lib = r.keys.library_in(r.names, trait_)?;
-    let text = r.names.text_of(lib)?;
+    let text = r.names.signature_text_of(lib)?;
     let this = item_shown(r, trait_);
     // The goal's arguments shown, `Self` first: `{Self}` is the first, a parameter's name
     // (`{Rhs}`) its own, by the index the trait's header gives it (heads.rs `param_names`).
@@ -742,7 +1382,7 @@ fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>
         Err(e) => return unread(&e),
     };
     let mut out = String::new();
-    let mut put = |lit: Lit<'_>, out: &mut String| match write_value(lit, 0, &fill, out) {
+    let put = |lit: Lit<'_>, out: &mut String| match write_value(lit, 0, &fill, out) {
         Ok(read) => read.map_err(|e| format!("{e}")),
         Err(core::fmt::Error) => Err(String::from("a String refused a write")),
     };
@@ -1047,7 +1687,7 @@ impl MakeFail {
             MakeFail::Head(error) => CheckFail::Head { owner, error },
             MakeFail::Buckets(error) => CheckFail::Buckets { owner, error },
             MakeFail::Tables(error) => CheckFail::Tables { owner, error },
-            MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: key_shown(r, checker_of(key)), error: Box::new_in(error, Global) },
+            MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: lib_shown(r, key), error: Box::new_in(error, Global) },
         }
     }
 }
@@ -1102,6 +1742,18 @@ fn make<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result
 /// `Maps::const_lens`. The evaluator is taken out of `r` meanwhile, so a length met inside
 /// that evaluation is [`ConstFail::Nested`]: never a nested evaluation.
 pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) -> Result<(), ConstFail> {
+    let Some(start) = r.store.maps.const_proofs.as_ref().map(|p| p.filled.len()) else {
+        return eval_len_inner(r, c);
+    };
+    if r.consts.is_none() { return eval_len_inner(r, c) }
+    let capture = r.store.maps.capture_const(r.store.tys.alloc());
+    let result = eval_len_inner(r, c);
+    let inputs = r.store.maps.finish_capture(capture).expect("the pooled world's source recorder");
+    r.store.maps.const_proofs.as_mut().expect("the pooled world's source proofs").finish(start, c, inputs);
+    result
+}
+
+fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey) -> Result<(), ConstFail> {
     // A qualified constant leaf of a head's expression (`<B4 as Spec>::BITS`:
     // front2/const_qpath.rs) is answered by selection, with every leaf asked beside it; its
     // refusal is filed for the head that wrote it, as an anonymous constant's is below.
@@ -1115,7 +1767,7 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
         return Ok(());
     }
     let Some((consts, prepared)) = r.consts.take() else {
-        return Err(ConstFail::Nested { item: checker_of(c), shown: key_shown(r, checker_of(c)) });
+        return Err(ConstFail::Nested { item: checker_of(c), shown: lib_shown(r, c) });
     };
     // An anonymous constant a head asked for (`1 << 0`, `u8::MAX`: front2/anon.rs) is made a
     // constant item's head first; `c` may be one's need key, whose checker key is that head's.
@@ -1146,9 +1798,10 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
     }
     r.consts = Some((consts, prepared));
     for &(o, bits) in more.iter() {
-        r.store.maps.const_bits.insert(o, bits);
+        r.store.maps.file_bits(o, bits);
     }
     for (o, why) in failed {
+        r.store.maps.noted_const_result(o);
         r.store.maps.anon_failed.insert(o, why);
     }
     let value = match value {
@@ -1161,7 +1814,7 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
     // The value's bits in its own type's width (at most 16 bytes): every reader knows the
     // type. `const_lens` keeps those of 64 bits for `Heads::const_len`.
     let bits = value?.ok_or(ConstFail::NotUsize { item: checker_of(c) })?;
-    r.store.maps.const_bits.insert(c, bits);
+    r.store.maps.file_bits(c, bits);
     if let Ok(v) = u64::try_from(bits) {
         r.store.maps.const_lens.insert(c, v);
     }
@@ -1310,6 +1963,16 @@ impl<'n> ImplHeads<'n> for Importing<'_, 'n> {
         if self.store.made(want) {
             return Ok(Made::Made);
         }
+        // The one ask (front2 asks.rs, D161 step 3): the head's need claimed once on the store's
+        // board; a refusal is kept on the store, where `BodyWorld::impl_question` makes it the
+        // question's gap.
+        if self.store.asks.once() {
+            use super::asks::Imported;
+            return Ok(match super::asks::ask_seed(self.store, self.keys, self.seeds, want) {
+                Ok(Imported::Made | Imported::Read) if self.store.made(want) => Made::Made,
+                Ok(_) | Err(_) => Made::Later(NotHere),
+            });
+        }
         let _cost = super::tables::cost::Cost::enter_want(self.store.cost, want);
         let filed = self.seeds.seed(self.store, self.keys, want, self.store.tys.alloc());
         if matches!(filed, Ok(super::heads::Seeded::Filed)) && self.store.made(want) {
@@ -1329,28 +1992,15 @@ impl<'n> ImplHeads<'n> for Importing<'_, 'n> {
 /// `seen` says whose impls may answer ([`Seen`]): a checked body's crate's link closure, or
 /// the whole program's; the answer is filed under it.
 pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, trait_: ItemKey, shape: tc::Shape, seen: Seen, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
-    // `trait_home` reads the trait's head when one is made (whether each parameter
-    // defaults to `Self`) and the text's count when none is. A head made only after a
-    // question's first answer gave a later answer of the same question another home,
-    // other candidates and another gap, so two checks of one body read two answers
-    // under one key (rule 21; census 7: k256's `<impl ProjectivePoint>::GENERATOR`).
-    // So the head is made first, and the home is the head's whenever it can be made. A
-    // head its text refuses (`TransmuteFrom`'s const parameter) is refused at every
-    // ask, so its question's home is the text's at every ask; one that waits on a
-    // constant goes up as any head's wait does (`make` evaluates it and asks again).
-    if let Some(lib) = heads.keys().library_in(names, trait_) {
-        match heads.make(Want::Head(lib)) {
-            Ok(Made::Made) => {}
-            Ok(Made::Later(why)) => return Ok(Made::Later(why)),
-            Err(wait @ HeadError::Item(_, Why::NeedConst(..))) => return Err(MakeFail::Head(wait)),
-            Err(_refused_by_its_text) => {}
-        }
+    let ask = Ask::Trait(trait_, shape);
+    if let Made::Later(why) = prepare_coherence(names, heads, ask).map_err(MakeFail::Head)? {
+        return Ok(Made::Later(why));
     }
     let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
     // Only impls written where the orphan rules allow (`trait_home`) are candidates.
-    let home = trait_home(names, heads.keys(), heads.store(), trait_, shape);
+    let home = trait_home(names, heads.keys(), heads.store(), trait_, shape).map_err(MakeFail::Head)?;
     // Over a bucket index: this question's buckets of the crates `home` admits.
-    b.admit_shared(names, heads.keys(), home, Ask::Trait(trait_, shape)).map_err(MakeFail::Tables)?;
+    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::Tables)?;
     // And only impls of the crates the asking body sees (`Seen`): none of a crate downstream
     // of a checked body's, whose headers are then never made for it either.
     let sight = b.sight(names, seen, heads.store().tys.alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
@@ -1371,10 +2021,14 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
 
 /// Answers `Inherent(shape, name)` into `b`, as [`trait_question`] answers a trait's.
 pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H, b: &Buckets, shape: tc::Shape, name: Name, order: BuildOrder) -> Result<Made<H::Later>, MakeFail> {
+    let ask = Ask::Inherent(shape);
+    if let Made::Later(why) = prepare_coherence(names, heads, ask).map_err(MakeFail::Head)? {
+        return Ok(Made::Later(why));
+    }
     let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
     // Only impls written in the type's own crate (`inherent_home`) are candidates.
-    let home = inherent_home(names, heads.keys(), shape);
-    b.admit_shared(names, heads.keys(), home, Ask::Inherent(shape)).map_err(MakeFail::Tables)?;
+    let home = inherent_home(names, heads.keys(), heads.store(), shape).map_err(MakeFail::Head)?;
+    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::Tables)?;
     // The name filters first, from the impls' member rows (no header made): an impl
     // that declares no member of the name is never the answer, so its header is not
     // lowered for it. rustc finds an inherent item by name before it unifies self

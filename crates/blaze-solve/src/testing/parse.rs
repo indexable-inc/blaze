@@ -7,7 +7,7 @@ use std::vec::Vec;
 use std::boxed::Box;
 use std::format;
 
-use crate::term::{FloatTy, IntTy, Mutbl, UintTy};
+use crate::term::{FloatTy, IntTy, Mutbl, TypingMode, UintTy};
 
 /// A parse or lowering error: the line (1-based, in its file) and what is wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,7 +262,8 @@ pub struct CaseA {
     pub decls: Vec<(u32, DeclA)>,
     pub params: Vec<String>,
     pub env: Vec<PredA>,
-    pub coherence: bool,
+    /// Its `mode` line's typing mode; `None`: no such line (the runner checks it in analysis).
+    pub mode: Option<TypingMode>,
     pub goals: Vec<GoalA>,
 }
 
@@ -322,10 +323,11 @@ pub fn parse_file(text: &str) -> Parsed<FileA> {
                     },
                     "mode" => {
                         let m = p.ident()?;
-                        if m != "coherence" {
-                            return Err(p.err("mode is `coherence`"));
-                        }
-                        case.coherence = true;
+                        case.mode = Some(match m.as_str() {
+                            "coherence" => TypingMode::Coherence,
+                            "post_analysis" => TypingMode::PostAnalysis,
+                            _ => return Err(p.err("mode is `coherence` or `post_analysis`")),
+                        });
                     }
                     "goal" => {
                         let pred = p.pred()?;

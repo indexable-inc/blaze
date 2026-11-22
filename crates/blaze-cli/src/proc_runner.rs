@@ -125,7 +125,6 @@ mod with_sandbox {
     use super::*;
 
     use std::alloc::Global;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use blaze_proc_macro::hook::{ProcMacros, RunRefused, crate_key};
@@ -192,6 +191,11 @@ mod with_sandbox {
         pub(crate) fn keep(&self) -> Result<blaze_proc_macro::hook::KeptAll, super::KeepError> {
             self.procs.keep_all().map_err(|error| super::KeepError { error })
         }
+
+        /// The command's macro-module loads so far: the profile's `macro modules` line.
+        pub(crate) fn module_loads(&self) -> blaze_proc_macro::host::ModuleLoads {
+            self.procs.module_loads()
+        }
     }
 
     /// The runner for `names`' world: each proc-macro crate of a unit registered by its module
@@ -199,7 +203,7 @@ mod with_sandbox {
     /// expansion records kept under `<home>/.blaze/v2/proc-macro/expansions`, and each crate of
     /// the checkout (tree 0) given its folder as its package. Leaked: it lives to the end of
     /// the command, as the names world does.
-    pub(crate) fn make(names: &crate::names::Names<'_>, side: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
+    pub(crate) fn make(names: &crate::names::NamesWorld<'_>, side: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
         let home = side.place.home.ok_or(MakeError::NoHome)?;
         let modules = std::path::Path::new(home).join(".blaze/v2");
         let text = core::str::from_utf8(side.lock.text).map_err(|_| MakeError::LockText)?;
@@ -296,9 +300,15 @@ mod without_sandbox {
                 ProcRunner::Never(never, _) => match *never {},
             }
         }
+
+        pub(crate) fn module_loads(&self) -> blaze_proc_macro::host::ModuleLoads {
+            match self {
+                ProcRunner::Never(never, _) => match *never {},
+            }
+        }
     }
 
-    pub(crate) fn make(_: &crate::names::Names<'_>, _: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
+    pub(crate) fn make(_: &crate::names::NamesWorld<'_>, _: &MacroSide<'_, '_, '_>) -> Result<&'static ProcRunner<'static>, MakeError> {
         Err(MakeError::NoSandbox)
     }
 }

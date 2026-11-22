@@ -19,22 +19,132 @@ tables are references, not the spec (rule 5): nothing here calls `test::test_mai
 - Cargo, Specifying dependencies: dev-dependencies "are not used when compiling a package for
   building, but are used for compiling tests, examples, and benchmarks."
 
-## A test unit
+## A test build is a view of its crate (D152, coordinator, 2026-11-19; NOT built; order changed by D191 below)
 
-A package's library compiled for tests is a second UNIT (`UnitKind::Test { bin: None }`; a
-binary's is `Test { bin: Some(name) }`): the same root file, `test` in its cfg set, the
-dev-dependencies among its dependencies. The unit graph makes it only when tests are asked
-(`Ask::tests`), and its cfg, kind and binary name are in its key, so no record of it mixes with
-the plain library's. What is shared between the two today, and what is not:
+**What is there today, and why it fails.** A package's library compiled for tests is a second
+UNIT (`UnitKind::Test { bin: None }`; a binary's is `Test { bin: Some(name) }`) with a crate key
+of its own: the kind (`unit_key`, blaze-scope units.rs) and the atom `test` (`unit_crate_key`,
+blaze-world list.rs) are hashed into it, every `ItemKey` starts with that key's prefix and
+hashes its parent's whole key (task/lower.rs `make_key`, `key_of`), so one text has two keys.
+Nothing but a file's outline is shared; a body both units hold is checked under the first alone
+(engine_bodies.rs `Holders::decide`). Seen on 2026-11-19 (rounds/wave-1119/t5): a test that
+calls an ordinary library fn asks the run's table for the test unit's key, finds no row, and is
+NOT RUN. Every real test calls library code.
 
-- shared: every record keyed by text alone (a file's outline) and every dependency unit whose
-  own key is equal (the toolchain's crates, each dependency built once for both);
-- NOT shared: anything keyed by an `ItemKey`. An item's key starts with its crate key's prefix
-  (`make_key`), and the two units have two crate keys, so an item with no `cfg(test)` in or under
-  it has the same text and two keys, and is solved, checked and built twice. The fix belongs to
-  the key, not to a special case: a body's records keyed by code identity (code-identity.md), under
-  which an instance that reaches nothing the `test` cfg changes is one record for both units.
-  Until then a test unit costs a second front-end pass over its crate; say so in any measurement.
+**The design.** The test build is the SAME crate under one more fact, `test`, and its answer is
+the base answer plus what that fact moves. It is the two-value case of conditions.md, built first.
+
+1. **One crate key.** The kind `test`, the atom `test` and the dev-dependencies leave the crate
+   key (the features resolved for the request stay). An item has one `ItemKey` in both views, so
+   an answer that names an own item is equal bytes in both, and no key is mapped between units
+   (front2 `shared_keys.rs` and its `PrefixSwap`/`ByPlace` are deleted).
+2. **A key counts what is written, not what cfg keeps.** Today `Lower::item` drops a cfg'd-out
+   item before `Lower::key` counts siblings per (owner, tag, name), so `#[cfg(test)] fn f` and
+   `#[cfg(not(test))] fn f` would share a key and a `#[cfg(test)] impl` would renumber the impls
+   after it. A key's own part becomes the outline's: the entry's sibling key and disambiguator
+   (blaze-file-items digest.rs `sibling_keys`: cfg-blind, an unnamed entry's key holds its
+   head), the bytes `item_chain` hashes. One scheme (rule 30); the second and later impls of a
+   module get new keys once.
+3. **A view is (crate, test).** The crate's names record (`CrateScope`) is made per view from
+   the same outline records. Each name of the extern prelude is its own cell (today `Root(crate)`
+   holds the extern prelude, the `macro_use` prelude and the exported macros as one, so a
+   dev-dependency would move every path walk).
+4. **cfg is read, never folded in.** `Cfg::eval` (names lowering) and `CrateCfg` (heads, bodies)
+   become a host that records each atom asked with its outcome, after expansion (a `cfg!(test)`
+   out of a dependency's macro is the calling crate's read). A record that read `test` is stored
+   under the stable variable of ITS crate's `test` (conditions.md `VarKey`, which today spells
+   `cfg:<name>` with no crate: a per-crate key is added; the drive's request-local `Var` number
+   is not stored). blaze-lower already records its asks (`CfgRead`, read by nothing); blaze-expand
+   records a `cfg!` as its whole predicate, and records the atoms instead. `cfg_attr`, a field, variant, statement or arm
+   under cfg, and a crate attribute (`#![cfg_attr(not(test), no_std)]`) are reads of the record
+   that lowers them.
+5. **One engine, one answer: a view's rows are lifted from the base's.** The view is not a
+   second request and not a second answer. A task's name and a cell's id may carry a view
+   (`test` of one crate; the drive's `at_condition`, keyed by the stable variable). The rules,
+   which are the whole mechanism (rule 53):
+   - **A view cell exists only where it differs.** A cell `c@v` whose digest equals `c`'s is
+     absent: the merge drops it. A read of `c` in view `v` is a read of `c@v` when it exists,
+     else of `c`, and the row records both (the absence is a read).
+   - **The cfg atom is a cell.** `cfg:test` of a crate is false in the base and true in its
+     view; a file not held and an item not present are cells too (`not_held_cell` is there).
+     So an item that exists only under `test` has a base row that says "absent" and read
+     `cfg:test`.
+   - **The lift.** When a view cell `c@v` appears, moves or goes, the engine enters the view
+     rows that read it and, for each BASE row `T` that read `c` and has no `T@v`, plans `T@v`
+     from `T`'s own plan entry (`planned_of`) and enters it. Nothing else plans a view row.
+     `T@v` whose reads all fall back to the base again is taken out.
+   - **The roots of a view** are entered by key: its names record (`CrateScope@v`, made whole
+     from the same outline records, with the dev-dependencies) and its `cfg:test` cell. Their
+     cells that differ from the base's are the first view cells; everything else follows by
+     the lift. A test-only item, a `cfg!(test)` in a body, a test-only impl in a bucket a
+     shared body read (front2 reads.rs lists the buckets), a `#[cfg(test)] use` that moves a
+     name: each is a reader of a view cell and nothing more.
+   - **Time needs no second rule.** A view row is a row: it stands or is entered by its reads
+     as any row, so an edit costs in the view what it moved in the view.
+   `Holders` and "the first holder checks" are deleted. The engine's proof is its simulation
+   (blaze-engine sim.rs): the oracle is the same history with the view checked as a crate of its
+   own, every row; the lifted answer's rows equal that one's wherever they exist and the base's
+   wherever they do not; the control drops the lift.
+6. **A view reads through to the base.** A worker in view `v` finds a record by `name@v`, then
+   by `name` (`RecordKeys::get` already reads changes over a base this way). `blaze test`'s
+   body-id table is made the same way. Code is keyed by content and a callee is found by id
+   through the view's table at first call, so a shared fn's code is one record even where a
+   callee differs. The entry point is per view (the harness replaces a binary's `main`);
+   coherence is checked per view.
+7. **Others read the base.** A dependent crate, an integration test, an example and a bench read
+   the package's base view (resolve.rs: "never the library's test unit"). `test` is a variable
+   only its own crate's items see as true. Doctests are a third view (`doctest`), later.
+8. **A package that reaches itself through a dev-dependency** (`zone-node` and
+   `tempo-precompiles` in tempo; 16 of reth's 152 packages) has BOTH builds in one test program,
+   with distinct types and statics. The unit graph gives such a package's test build a crate key
+   of its own and a FULL view: every task of its files is planned in the view (its keys differ,
+   so nothing falls back). Correct at the old cost, for those packages alone, by the same path.
+
+**Not covered until built, each refused by name:** a body's macro resolution is not in its read
+list (`NotListed::LoweringMacros`), so until the lowering records it, a body under a module whose
+textual macro scope differs between the views is entered in the test view.
+
+**Against conditions.md.** That design keeps ONE variational record a key, its entries under
+conditions, and forks a task per distinct outcome. A view row is that fork for the one variable
+`test`, stored as a row of its own; nothing here is thrown away when rows become variational
+(the key scheme, cfg as a read, the cells, the lift's reads are all its inputs), and a second
+variable is not added by this mechanism (it would multiply rows): features and targets wait for
+the variational record.
+
+**To port first** (found by the inventory, rounds/wave-1120/SEAMS.md): two units with one crate
+key are merged or refused today (blaze-world list.rs:296-305, crate_list.rs `SameKey`,
+run_ids.rs `PrefixClash`); the items record stores the crate's cfg set (`items_record.rs`
+`cfg_atoms`), so its bytes are per view until cfg is a read.
+
+**The first slice** (nothing thrown away): 2, then 1; 3; 4; the engine's view cells and lift
+with its simulation; 5's roots; 6; 8; delete `shared_keys.rs`. Its judge: a test that calls a library fn runs; a package with tests
+enters, in its test view, only the bodies that read `test` or a moved cell (a fixture counts
+them; the control is a `cfg!(test)` added to one body, which adds exactly that body); tempo's
+check enters no more bodies than its base view plus its test-only code.
+
+## The order as built (D191, coordinator, 2026-11-21)
+
+The first slice above put point 8 last. The real run (`blaze test -p tempo-hardfork`, 2026-11-21)
+needs none of the key port, cfg-as-read or the lift to run a test: it needs a ROW under the test
+unit's keys for each library body the test calls. So the FULL view (point 8's permanent case) is
+built first, for every package, on today's keys:
+
+- **Every holder checks.** A body's plain name is its base row: the first holder in rank (a
+  non-test unit first). Each other unit that holds the body has the row `name@view`, the view
+  being that unit (one name function, beside `at_condition`). "The first holder checks"
+  (`Holders::decide`) is deleted: it reported a body checked that it never checked under `test`.
+- **Run and test ask by view.** The body-id table of a unit asks `name@view` where that unit is
+  not the base holder. No read-through to the base while keys differ (the base's keys are another
+  crate's): a missing view row is the typed refusal, never the base's row.
+- **Findings print once.** One body's finding with equal item-relative range and text in several
+  views is one line; a finding in one view alone names the view.
+- **The seam.** `ViewPlan` with `Full` and `Lifted` (rule 78). `Lifted` is point 5 and needs
+  one key a crate (points 2, 1); its oracle is `Full`, in the engine's simulation.
+- **Cost, stated.** On tempo at most 9,221 more body tasks on 16,586; heads and names add
+  nothing (a test unit's heads are frozen per unit today already).
+
+Then: point 2; the unit's identity in every name; the point 1 flip; point 4; the lift; `Lifted`
+for the packages whose keys are one.
 
 ## The tests record
 
@@ -177,7 +287,7 @@ protocol to the parent; better: a crash fails one test, and results are kept.
 | Sandbox per test | blaze-proc-macro native_sandbox.rs `run`: build scripts only | a test profile, temporary folder, refusals named | nothing |
 | Outside reads traced | place.rs `symbol` binds imports by `dlsym` (the seam); blaze-std hosting.rs `Hold` for hosted bstd programs | recording wrappers, not-kept classes | nothing |
 | Effect facts per instance | no match for an effect fact in front2 | the precheck of not-kept | nothing |
-| Lib and test unit share records | none: two crate keys (above, "A test unit") | code-identity keys | the command |
+| Lib and test unit share records | none: two crate keys (above, "A test build is a view of its crate") | the view (D152) | the command |
 | Integration tests, doctests | unit graph has no kind for `tests/`; blaze-doc doctest.rs is the old path's | units, records | nothing |
 | Shared results | blaze-remote serves records; nothing for `TestRun` | CI writer, signed statements | nothing |
 
@@ -212,7 +322,8 @@ protocol to the parent; better: a crash fails one test, and results are kept.
     (blaze-drive; DRIVER runner 10). After 1 to 7.
 17. Shared results: CI puts `TestRun` in its namespace, signed; lookups through the remote
     source. After 16 and the store lane.
-18. Records shared between a lib unit and its test unit, by code-identity keys (front end). Large.
+18. The test build as a view of its crate (D152, above): one crate key, cfg as a read, the
+    overlay. Large; first, because no test that calls library code runs without it.
 
 ## End state: property, differential and end-to-end tests (architect, 2026-11-16)
 

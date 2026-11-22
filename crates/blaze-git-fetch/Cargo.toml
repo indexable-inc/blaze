@@ -23,6 +23,8 @@ blaze-deflate.workspace = true
 [dev-dependencies]
 # Property tests and planted-bug controls.
 blaze-sim.workspace = true
+# The test heap (`blaze_own::testing::heap`), never `Global` (D102).
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

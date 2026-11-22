@@ -32,7 +32,7 @@ blaze on PATH (the stage 0 `.github/blaze-version` names), for this machine's ta
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do, linking the LLVM 23 blaze pins in statically ([which
 LLVM](contributing.md#llvm)). blaze itself fetches that LLVM, by the sha256
-`crates/blaze-toolchain/pins/llvm.json` pins, and hands it to llvm-sys's build script: the root
+`pins/llvm.json` pins, and hands it to llvm-sys's build script: the root
 manifest declares it a [pinned native input](#pinned-native-inputs), so a plain
 `blaze build -p blaze-engine --release` on a clean Mac or Linux machine needs no Nix and no
 variable. A stage 0 from before that change does not read the table, and still needs
@@ -41,7 +41,7 @@ blaze-engine --release` is the quicker build the harnesses and CI use while work
 it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in
-`harness/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
+`pins/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
 blaze ships. It ignores `rust-toolchain`/`rust-toolchain.toml`, `rustup override`,
 `+toolchain`, `RUSTUP_TOOLCHAIN`, rustup's default and `RUSTC`, and never runs or asks a rustc
 to learn anything ([toolchain.md](toolchain.md)). The nightly builds
@@ -60,7 +60,7 @@ own servers (the standard library's source is blaze's own `library/`, a 6.0 MB a
 blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 122 MB on macOS, 159 MB on Linux x86-64 and 143 MB on Linux ARM64 (about 654 MB on macOS
 and 816 MB on Linux x86-64 once unpacked, wasm32-wasip1's 106 MB of it). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
-`crates/blaze-cargo/src/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
+`pins/rust.txt`), and a file with other bytes is refused. Concurrent
 builds download it once; a download that stopped goes on from where it stopped the next time.
 A build script is given blaze itself as `CARGO`, and as `RUSTC` and `RUSTDOC` links to blaze
 in the daemon's tools directory, which answer what a script asks of rustc with no rustc run
@@ -280,7 +280,7 @@ the same resolve (another encoding or spacing) is the same, as cargo's `--locked
 
 - `[blaze] release`, `toolchain`: only for a workspace that pins a blaze version
   (`[workspace.metadata.blaze] version = "0.YYYYMMDD.N"`): that release and the nightly it ships
-  (`harness/toolchain`), recorded when that release runs it. An unpinned workspace, or one pinned
+  (`pins/toolchain`), recorded when that release runs it. An unpinned workspace, or one pinned
   to a channel, has no `[blaze]`: it runs whichever blaze it gets, and a lock naming one would
   change with every upgrade. Run by another blaze (a build of blaze's tree, or `--ignore-pin`),
   the entry is kept as it is; one that names another release than the pin disagrees with it and
@@ -655,7 +655,7 @@ workspace's root manifest, pinned by its digest, in place of a variable each mac
 
 ```toml
 [workspace.metadata.blaze.native.llvm]
-pin = "crates/blaze-toolchain/pins/llvm.json"     # the pin file, relative to the root manifest
+pin = "pins/llvm.json"     # the pin file, relative to the root manifest
 env = "LLVM_SYS_231_PREFIX"                 # the variable the script reads the directory from
 packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 ```

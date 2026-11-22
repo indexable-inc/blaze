@@ -32,7 +32,7 @@ use crate::{
 };
 
 const HOST: &str = "aarch64-apple-darwin";
-/// The aarch64-apple-darwin row's sha256 in crates/blaze-toolchain/pins/clang.json.
+/// The aarch64-apple-darwin row's sha256 in pins/clang.json.
 const PIN_HEX: &str = "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef";
 
 /// A fresh folder under the system's temporary one, by this process and `name`.
@@ -134,7 +134,6 @@ fn unit(name: &str, kind: UnitKind<'static>, deps: &[u32], build_script: Option<
         deps: d,
         build_script: build_script.map(UnitId),
         links: None,
-        incomplete: false,
     }
 }
 
@@ -167,7 +166,7 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
     units.push(unit("zstd-sys", UnitKind::BuildScript, &[1], None)); // 0
     units.push(unit("cc", UnitKind::Lib, &[], None)); // 1
     units.push(unit("zstd-sys", UnitKind::Lib, &[], Some(0))); // 2
-    let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3, meta: AVec::new_in(alloc) };
+    let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc) };
 
     let store = folder("reaches-store");
     let runtime = ScriptRuntime::new(&store).unwrap_or_else(|e| panic!("{e}"));

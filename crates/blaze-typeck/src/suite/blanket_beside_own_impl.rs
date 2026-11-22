@@ -31,7 +31,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use super::check_body;
-use crate::diag::{Because, DiagCode, UnmetGoal};
+use crate::diag::{Because, UnmetGoal};
 use crate::fixture::{Bb, Fx};
 use crate::ids::{ItemKey, Mutbl};
 use crate::infer::InferPlant;

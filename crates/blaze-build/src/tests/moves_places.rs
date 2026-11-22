@@ -235,10 +235,10 @@ fn place_scrutinees_through_a_reference_move_nothing() {
 
 /// A by-value binding of a part that needs drop, out of a place behind a reference, is a move
 /// Rust refuses (E0507; the Reference, [expr.move.movable-place] lists no place behind a
-/// shared reference). Out of a `Box` (`match *b { (_, a) => .. }`) it is allowed, and stays
-/// REFUSED BY NAME here: the box's partial move (its allocation freed without the moved part's
-/// drop) is not built; both reach `move_out` with no owner. The build must fail naming the
-/// move, never build a copy that would be dropped twice:
+/// shared reference). Out of a `Box` owned by a local (`match *b { (_, a) => .. }`) it is
+/// allowed and built (tests/box_moves/scrutinee.rs); behind a reference no one here owns the
+/// place, `move_out` finds no owner. The build must fail naming the move, never build a copy
+/// that would be dropped twice:
 /// ```text
 /// fn main() { let t = (1, G { x: 1 }); let r = &t; let x = match *r { (_, a) => a.x }; }
 /// ```

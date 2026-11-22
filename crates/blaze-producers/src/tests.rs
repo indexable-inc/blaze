@@ -67,7 +67,8 @@ unreached = { path = "vendor/unreached" }
 const TREE: &[(&str, &str)] = &[
     ("Cargo.toml", ROOT),
     ("Cargo.lock", LOCK),
-    ("harness/toolchain", "nightly-2026-11-01\n"),
+    ("pins/toolchain", "nightly-2026-11-01\n"),
+    ("pins/answers/rustc.json", "{}\n"),
     ("docs/readme.md", "words\n"),
     ("crates/parked/src/lib.rs", "// parked\n"),
     ("crates/blaze-own/Cargo.toml", "[package]\nname = \"blaze-own\"\n"),
@@ -216,7 +217,14 @@ fn one_producers_source_moves_its_rows_alone() {
         ("Cargo.lock", unused_moved.as_str(), &[]),
         ("Cargo.toml", entry_moved.as_str(), &["lowering"]),
         ("Cargo.toml", edition_moved.as_str(), all),
-        ("harness/toolchain", "nightly-2026-11-02\n", all),
+        ("pins/toolchain", "nightly-2026-11-02\n", all),
+        // Every file under pins/ is an input of every row, at any depth, new ones too: blaze-pins
+        // includes them from outside its own directory.
+        ("pins/answers/rustc.json", "{\"version\": 2}\n", all),
+        ("pins/llvm.json", "{}\n", all),
+        ("pins/.DS_Store", "finder moved\n", &[]),
+        // Prose about the pins is not a pin.
+        ("pins/README.md", "other words about the pins\n", &[]),
         ("crates/blaze-other/src/lib.rs", "pub fn other() { 4; }\n", &[]),
         ("crates/blaze-expand/tests/expand.rs", "#[test] fn u() {}\n", &[]),
         ("crates/blaze-expand/.DS_Store", "finder moved\n", &[]),
@@ -245,7 +253,7 @@ fn watch_names_the_digested_entries_and_every_manifest() {
     for path in [
         "Cargo.toml",
         "Cargo.lock",
-        "harness/toolchain",
+        "pins",
         "crates/blaze-expand/src",
         "crates/blaze-expand/Cargo.toml",
         "crates/blaze-cli/Cargo.toml",
@@ -335,7 +343,7 @@ fn a_row_covers_every_crate_its_producer_calls() {
     const SMALL: &[(&str, &str)] = &[
         ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nedition = \"2024\"\n"),
         ("Cargo.lock", "version = 4\n"),
-        ("harness/toolchain", "nightly-2026-11-01\n"),
+        ("pins/toolchain", "nightly-2026-11-01\n"),
         (
             "crates/cli/Cargo.toml",
             "[package]\nname = \"cli\"\n\n[package.metadata.blaze]\nproducer = [\"names\"]\n\n[dependencies]\nwriter = { path = \"../writer\" }\n",

@@ -87,7 +87,6 @@
 //! | `record` (ConstWorld) | record key, `Fetch<&ConstRecord>` | every world (required) | none | [`Fact::Value`] (the key the world derives) |
 //! | `const_block_value` (Adts) | owner, block, args, `Option<&DataRecord>` | FrontAdts | every test world | [`Fact::Value`] (`ConstOf::Block`) |
 //! | `promoted_value` (Adts) | owner, borrow, args, `Option<&DataRecord>` | FrontAdts, TestAdts | feature test worlds | [`Fact::Value`] (`ConstOf::Promoted`) |
-//! | `promoted_fn_key` (Adts) | instance, ground, `Option<InstanceKey>` | FrontAdts | every test world | [`Fact::InstanceKey`] |
 //! | `const_fn_instance` (Adts) | instance key, ground, `Option<Instance>` | FrontAdts, TestAdts | feature test worlds | [`Fact::KeyedInstance`] |
 //! | `format_template` (Adts, FrontEnd) | owner, expr, `Option<&[FmtPiece]>` | FrontAdts, fmt; Front2Program, LazyProgram | other test worlds; Front | [`Fact::FormatTemplate`] |
 //! | `track_caller` (Adts, FrontEnd) | instance, ground / key, `Option<bool>` | FrontAdts, TestAdts; Front2Program | feature test worlds; Front, LazyProgram | [`Fact::TrackCaller`] |

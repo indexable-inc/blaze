@@ -22,13 +22,13 @@
 
 use blaze_flow::Flow;
 use blaze_flow_lower::{
-    AdtFacts, CallBounds, CalleeFacts, ClosureFlow, Facts, FieldRegion, ParamOrigin, Refusal, Requirement, Shape, SigLife, lower, lower_async,
+    AdtFacts, CallBounds, CalleeFacts, ClosureFlow, Facts, FieldRegion, ParamOrigin, Refusal, Requirement, Shape, lower, lower_async,
     lower_async_fn, lower_closure, lower_closure_external,
 };
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 
-use super::borrows::BorrowFacts;
+use super::borrows::ReadBy;
 
 /// Which flow of a body: its own, or the body of one of its closures or async blocks (by the
 /// expression that makes it).
@@ -56,7 +56,7 @@ impl FlowOf {
 /// The body's facts, saying that closure and async block bodies are checked on their own
 /// (module doc: only `borrows_of`, which checks each, asks with these).
 pub struct NestedFacts<'f, 'a> {
-    facts: &'f BorrowFacts<'a>,
+    facts: ReadBy<'f, 'a>,
     /// Each closure's requirements, from its own flow checked first ([`Requirements`]): two
     /// columns sorted by (closure, requirement), `needs[i]` closure `closures[i]`'s.
     closures: &'f [tc::ExprId],
@@ -65,12 +65,12 @@ pub struct NestedFacts<'f, 'a> {
 
 impl<'f, 'a> NestedFacts<'f, 'a> {
     /// No closure's requirements known: what a caller that checks no closure first asks with.
-    pub fn new(facts: &'f BorrowFacts<'a>) -> NestedFacts<'f, 'a> {
+    pub fn new(facts: ReadBy<'f, 'a>) -> NestedFacts<'f, 'a> {
         NestedFacts { facts, closures: &[], needs: &[] }
     }
 
     /// With the requirements of every closure checked so far.
-    pub fn with_requirements(facts: &'f BorrowFacts<'a>, requirements: &'f Requirements<'_>) -> NestedFacts<'f, 'a> {
+    pub fn with_requirements(facts: ReadBy<'f, 'a>, requirements: &'f Requirements<'_>) -> NestedFacts<'f, 'a> {
         NestedFacts { facts, closures: &requirements.closures, needs: &requirements.needs }
     }
 }
@@ -117,29 +117,46 @@ fn run_of(closures: &[tc::ExprId], closure: tc::ExprId) -> (usize, usize) {
 }
 
 /// Every nested flow of the body whose outlives results are its maker's to prove: each closure
-/// (not `async`, whose flow is no closure's: `Form::AsyncClosure`) and each async block but an
-/// `async fn`'s root ([`FlowOf::is_nested`]), innermost first: by the length of its range,
-/// shorter first (one written inside another's body has a range strictly inside it), then by
-/// expression. What [`Requirements`] is filled in the order of, so every maker is lowered with
-/// the requirements of what it makes (lane B14: async blocks in the one mechanism of closures,
-/// rule 30; a closure inside an async block, or an async block inside a closure, either way).
+/// (an actual `async ||` is refused by `lower_closure_external`) and each async block but an
+/// `async fn`'s root ([`FlowOf::is_nested`]), innermost first: by strict range containment,
+/// then by range length and expression. What [`Requirements`] is filled in the order of, so
+/// every maker is lowered with the requirements of what it makes (lane B14: async blocks in the
+/// one mechanism of closures, rule 30; a closure inside an async block, or an async block inside
+/// a closure, either way).
 pub fn nested_inner_first<'a>(view: &tc::BodyView<'_>, alloc: Alloc<'a>) -> AVec<'a, FlowOf> {
-    let mut out: AVec<'a, (u32, tc::ExprId)> = AVec::new_in(alloc);
+    // Span length is normally enough, but macro expansion can give two nested expressions
+    // overlapping ranges.  The owner must still be lowered after every body it contains, so
+    // order by strict containment depth first and use length only as the stable tie-breaker.
+    let mut out: AVec<'a, (u32, u32, u32, tc::ExprId)> = AVec::new_in(alloc);
     for (i, x) in view.exprs.iter().enumerate() {
         let e = tc::ExprId(i as u32);
         let nested = match x {
-            tc::Expr::Closure { is_async: false, .. } => true,
+            tc::Expr::Closure { .. } => true,
             tc::Expr::AsyncBlock { .. } => FlowOf::AsyncBlock(e).is_nested(view),
             _ => false,
         };
         if nested {
-            let len = view.expr_ranges.get(i).map_or(u32::MAX, |r| r.end - r.start);
-            out.push((len, e));
+            let range = view.expr_ranges.get(i).copied().unwrap_or_default();
+            out.push((range.start, range.end, range.end.saturating_sub(range.start), e));
         }
     }
-    out.sort_unstable();
+    let mut depths: AVec<'a, u32> = AVec::new_in(alloc);
+    for i in 0..out.len() {
+        let (start, end, _, _) = out[i];
+        let depth = out
+            .iter()
+            .filter(|&&(outer_start, outer_end, _, _)| {
+                (outer_start < start || outer_end > end) && outer_start <= start && end <= outer_end
+            })
+            .count() as u32;
+        depths.push(depth);
+    }
+    for (row, &depth) in out.iter_mut().zip(depths.iter()) {
+        row.0 = depth;
+    }
+    out.sort_unstable_by_key(|&(depth, _, len, e)| (u32::MAX - depth, len, core::cmp::Reverse(e)));
     let mut flows: AVec<'a, FlowOf> = AVec::new_in(alloc);
-    for &(_, e) in out.iter() {
+    for &(_, _, _, e) in out.iter() {
         flows.push(match view.exprs.get(e.ix()) {
             Some(tc::Expr::AsyncBlock { .. }) => FlowOf::AsyncBlock(e),
             _ => FlowOf::Closure(e),
@@ -167,11 +184,15 @@ impl Facts for NestedFacts<'_, '_> {
     fn callee(&self, item: tc::ItemKey) -> Option<CalleeFacts> {
         self.facts.callee(item)
     }
-    fn sig(&self, item: tc::ItemKey) -> Option<SigLife<'_>> {
-        self.facts.sig(item)
+    // The head records' regions (D148), forwarded: a callee's signature (`Facts::sig`'s one
+    // source) and the clause columns a closure's signature is read from (closure.rs
+    // `sig_slots`) are the owner's facts. Without it a nested flow read `NoRegions` and every
+    // closure a clause expected was refused `ClosureClauseUnread`.
+    fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts {
+        self.facts.regions()
     }
-    fn own_text(&self) -> Option<&str> {
-        self.facts.own_text()
+    fn region_tys(&self) -> Option<tc::PTys<'_>> {
+        self.facts.region_tys()
     }
     fn fn_binders(&self) -> bool {
         self.facts.fn_binders()
@@ -209,15 +230,38 @@ impl Facts for NestedFacts<'_, '_> {
     fn object_trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<bool> {
         self.facts.object_trait_lifetimes(trait_)
     }
+    // The one call rule's counts (one_call.rs `FactsArity`, `CallSel::impl_at`), forwarded:
+    // every flow the command and the census lower is lowered through these facts, and the
+    // trait's default answers `None`. Unforwarded, every alias and trait reference the one
+    // rule counted was refused `Count` and every selected impl with an associated value
+    // `HeadUnread`, though the gather had filed them all (census wave-1119: 30,061 and 758
+    // `Count`, "the read answers: the gather did not file it"; 9,512 `HeadUnread`).
+    fn trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<u32> {
+        self.facts.trait_lifetimes(trait_)
+    }
+    fn alias_lifetimes(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<u32> {
+        self.facts.alias_lifetimes(trait_, name)
+    }
+    // Forwarded for the same reason: unforwarded, every `F: [const] Destruct` of a closure
+    // argument (`Option::map`) asked a selection typeck files no row for, refused `Unanswered`.
+    fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.trait_relates_nothing(trait_)
+    }
     // Every fact the body's facts answer, forwarded (a nested flow asks what the owner's does).
     fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
         self.facts.ties(item)
     }
-    fn impl_source(&self, imp: tc::ItemKey) -> Option<blaze_flow_lower::ImplSource<'_>> {
-        self.facts.impl_source(imp)
-    }
     fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
         self.facts.adt_variances(adt)
+    }
+    // The owner's implied bounds and kind, forwarded: the owner's own flow is lowered through
+    // these facts too (borrows.rs `flow_of(.., &nested, ..)`). A closure's or async block's
+    // flow does not read them (its signature is its own; its temporaries are not the item's).
+    fn implied_bounds(&self) -> Option<(&[(u32, tc::regions::Region)], &[(tc::regions::Region, tc::regions::Region)])> {
+        self.facts.implied_bounds()
+    }
+    fn constant_initializer(&self) -> bool {
+        self.facts.constant_initializer()
     }
     fn field_regions(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<&[FieldRegion]> {
         self.facts.field_regions(adt, variant, field)
@@ -267,14 +311,15 @@ pub fn flow_of<'a>(
     done: &tc::Checked<'_>,
     facts: &NestedFacts<'_, '_>,
     alloc: Alloc<'a>,
-) -> Result<(Flow<Alloc<'a>>, AVec<'a, ParamOrigin>), Refusal> {
+) -> Result<(Flow<Alloc<'a>>, AVec<'a, ParamOrigin>, Option<Refusal>), Refusal> {
     // With each flow, its placeholders for the body's type parameters (blaze-flow-lower
     // param_outlives.rs): an `UnprovenOutlives` from one is E0310 or a refusal by name. An async
-    // block's lowering makes none.
+    // block's lowering makes none. And the first stricter relation it used
+    // (blaze-flow-lower `Lowered::coarse`): the body is refused by it only on a finding.
     match of {
-        FlowOf::Owner if view.coroutine.is_some() => lower_async_fn(view, done, facts, alloc).map(|l| (l.flow, l.params)),
-        FlowOf::Owner => lower(view, done, facts, alloc).map(|l| (l.flow, l.params)),
-        FlowOf::Closure(e) => lower_closure(view, done, e, facts, alloc).map(|l| (l.flow, l.params)),
-        FlowOf::AsyncBlock(e) => lower_async(view, done, e, facts, alloc).map(|l| (l.flow, AVec::new_in(alloc))),
+        FlowOf::Owner if view.coroutine.is_some() => lower_async_fn(view, done, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
+        FlowOf::Owner => lower(view, done, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
+        FlowOf::Closure(e) => lower_closure(view, done, e, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
+        FlowOf::AsyncBlock(e) => lower_async(view, done, e, facts, alloc).map(|l| (l.flow, AVec::new_in(alloc), l.coarse)),
     }
 }

@@ -41,28 +41,26 @@ pub enum Verdict {
 
 /// Runs `f` with fd 1 on a pipe; its status and what it wrote there. As ladder_front2.rs's.
 pub fn capture(f: impl FnOnce() -> u8) -> (u8, Vec<u8>) {
-    let mut fds = [0; 2];
-    // SAFETY: as tests/ladder.rs: `pipe` fills the array; fd 1 is restored before returning
-    // (`f` cannot unwind past here: the caller catches its panics inside `f`).
+    let (read_owned, write_owned) = blaze_sys::posix::io::pipe().expect("a pipe");
+    let read_end = read_owned.into_raw();
+    let write_end = write_owned.into_raw();
+    let saved = blaze_sys::posix::io::dup(blaze_sys::Fd::new(1)).expect("a copy of fd 1").into_raw();
+    blaze_sys::posix::io::dup2(blaze_sys::Fd::new(write_end), blaze_sys::Fd::new(1)).expect("fd 1 onto the pipe");
+    let status = f();
+    blaze_sys::posix::io::dup2(blaze_sys::Fd::new(saved), blaze_sys::Fd::new(1)).expect("fd 1 back");
     unsafe {
-        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "a pipe");
-        let saved = libc::dup(1);
-        assert!(saved >= 0, "a copy of fd 1");
-        assert!(libc::dup2(fds[1], 1) >= 0, "fd 1 onto the pipe");
-        let status = f();
-        assert!(libc::dup2(saved, 1) >= 0, "fd 1 back");
-        libc::close(saved);
-        libc::close(fds[1]);
+        let _ = blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(saved));
+        let _ = blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(write_end));
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
-            let n = libc::read(fds[0], buf.as_mut_ptr().cast(), buf.len());
+            let n = blaze_sys::posix::io::read(blaze_sys::Fd::new(read_end), &mut buf).map_or(-1isize, |n| n as isize);
             if n <= 0 {
                 break;
             }
             out.extend_from_slice(&buf[..n as usize]);
         }
-        libc::close(fds[0]);
+        let _ = blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(read_end));
         (status, out)
     }
 }

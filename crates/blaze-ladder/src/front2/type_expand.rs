@@ -78,7 +78,7 @@ pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(
     let edition = names.edition_of(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the edition of the crate of module {module:x} is not read").into_boxed_str(), r))?;
     // A path an expansion wrote is read by its token's mark (`$crate` in the defining crate):
     // front2/type_marks.rs.
-    let scoped = super::type_marks::Marked { scoped: ScopedBy { names, module, prepared: None, blocks: &[] }, marks };
+    let scoped = super::type_marks::Marked { scoped: ScopedBy { names, module, prepared: None, blocks: None }, marks };
     let mut expand = ByName::with_names(&scoped, NoHost, alloc);
     let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, alloc)
         .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;

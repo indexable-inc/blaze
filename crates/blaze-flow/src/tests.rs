@@ -10,7 +10,7 @@ use std::vec::Vec;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use crate::flow::{BorrowKind, Flow, FlowBuilder, Local, Operand, Origin, Place, Point, Proj, Span, Stmt, StmtKind};
-use crate::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
+use crate::loans::{BorrowFinding, Kept, LoanParts, TierOne, facts, tier_one, tier_two};
 use crate::moves::{DropKind, MoveFindingKind, MoveOut, check_moves, check_moves_planted, drop_kind, inits, move_out};
 use crate::record::{Plant, check as check_body};
 
@@ -602,9 +602,154 @@ fn live_mutable_loan_then_shared_borrow_is_refused() {
         (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(2)), loan: l, span: S, returned: false }])
     );
     match check_body(&flow, Global) {
-        Ok(r) => assert!(r.proof.is_none() && r.borrows.len() == 1),
+        Ok(r) => {
+            assert!(r.proof.is_none() && r.borrows.len() == 1);
+            // The finding's three parts: the mutable borrow of `_1` at s1, the conflict at s2,
+            // and the call at s3 reading `_2` (the reference holding the loan) that keeps it live.
+            assert_eq!(
+                r.loan_parts.as_slice(),
+                &[LoanParts {
+                    at: Point::start(Stmt(2)),
+                    loan: l,
+                    place: Place(1),
+                    issued: S,
+                    kept: Kept::Use { stmt: Stmt(3), local: Local(2), span: S },
+                }]
+            );
+        }
         Err(e) => panic!("{e:?}"),
     }
+}
+
+/// The later use is the nearest along the flow, not the first in the statement array, and a
+/// redefinition of the holding local ends the search along its path: `r = &mut x` (s1),
+/// `s = &x` (s2, the conflict), then `switch` to bb1 (`r = const; ret`, the redefinition
+/// first) or bb2 (`use(r); ret`). Only bb2's call keeps the loan live: the part names it,
+/// though bb1's statements come first in the array. CONTROL (rule 23): with bb2's call reading
+/// a local the loan never reaches, no finding is made and no part is filed.
+#[test]
+fn the_later_use_is_the_one_that_keeps_the_loan_live() {
+    for control in [false, true] {
+        // _0 return, _1 x, _2 r, _3 s, _4 a call's result, _5 an unrelated reference.
+        let mut b = FlowBuilder::new_in(6, 1, Global);
+        let (or, os, ou) = (b.origin(false), b.origin(false), b.origin(false));
+        b.mentions(2, or);
+        b.mentions(3, os);
+        b.mentions(5, ou);
+        let (bb0, bb1, bb2) = (b.block(), b.block(), b.block());
+        b.start(bb0);
+        b.assign(Place(0), Operand::Const, S);
+        let l = b.borrow(Place(2), BorrowKind::Mut, Place(1), or, S);
+        b.borrow(Place(3), BorrowKind::Shared, Place(1), os, S);
+        b.switch(Place(0), &[bb1, bb2], S);
+        b.start(bb1);
+        b.assign(Place(2), Operand::Const, S);
+        b.ret(S);
+        b.start(bb2);
+        let read = if control { Place(5) } else { Place(2) };
+        let used = b.call(&[Operand::Copy(read)], Place(4), S);
+        b.ret(S);
+        let flow = finish(b);
+        let r = match check_body(&flow, Global) {
+            Ok(r) => r,
+            Err(e) => panic!("{e:?}"),
+        };
+        if control {
+            assert!(r.borrows.is_empty() && r.loan_parts.is_empty(), "control: {:?} {:?}", r.borrows, r.loan_parts);
+            continue;
+        }
+        assert_eq!(
+            r.loan_parts.as_slice(),
+            &[LoanParts {
+                at: Point::start(Stmt(2)),
+                loan: l,
+                place: Place(1),
+                issued: S,
+                kept: Kept::Use { stmt: used, local: Local(2), span: S },
+            }]
+        );
+    }
+}
+
+/// The loans invalidated in `flow`, both tiers checked equal first.
+fn invalidated(flow: &Flow<Global>) -> Vec<(Stmt, crate::flow::Loan)> {
+    let (_, two) = tiers(flow);
+    two.iter()
+        .filter_map(|f| match *f {
+            BorrowFinding::Invalidated { at, loan, .. } => Some((at.stmt(), loan)),
+            BorrowFinding::UnprovenOutlives { .. } => None,
+        })
+        .collect()
+}
+
+/// `a = const; r = &a; dead a; mention *r` (`deref`) or `mention r`: the Reference, "Wildcard
+/// pattern" (`let _ = *r;`, `let _ = r;`) with `r` dangling. _1 a, _2 r.
+fn mention_flow(deref: bool) -> (Flow<Global>, crate::flow::Loan) {
+    let mut b = FlowBuilder::new_in(3, 0, Global);
+    let o = b.origin(false);
+    b.mentions(2, o);
+    let star = b.project(Place(2), Proj::Deref);
+    let bb = b.block();
+    b.start(bb);
+    b.assign(Place(0), Operand::Const, S);
+    b.stmt(StmtKind::StorageLive(Local(1)), S);
+    b.assign(Place(1), Operand::Const, S);
+    let l = b.borrow(Place(2), BorrowKind::Shared, Place(1), o, S);
+    b.stmt(StmtKind::StorageDead(Local(1)), S);
+    b.mention(if deref { star } else { Place(2) }, S);
+    b.ret(S);
+    (finish(b), l)
+}
+
+/// A mention through a `Deref` is a use of its local (`StmtKind::Mention`): `let _ = *r;` keeps
+/// `r`, so `a`'s loan, live at `dead a`: the loan is invalidated there (E0597). Naming `r` reads
+/// nothing through it: `let _ = r;` keeps nothing live, no finding. The pair is the control:
+/// the same flow, the `Deref` removed, and the finding goes (rule 23).
+#[test]
+fn a_mention_through_a_deref_keeps_the_reference_live() {
+    let (flow, l) = mention_flow(true);
+    let mut text = String::new();
+    let _ = flow.print(&mut text);
+    assert!(text.contains("mention "), "printed: {text}");
+    assert_eq!(invalidated(&flow), [(Stmt(4), l)], "{text}");
+    let (flow, _) = mention_flow(false);
+    assert_eq!(invalidated(&flow), [], "a mention of the reference itself");
+}
+
+/// `x = const; m = &mut x; (mention x | _0 = copy x); *m = const`. _1 x, _2 m.
+fn mention_under_mut_flow(read: bool) -> (Flow<Global>, crate::flow::Loan) {
+    let mut b = FlowBuilder::new_in(3, 0, Global);
+    let o = b.origin(false);
+    b.mentions(2, o);
+    let star = b.project(Place(2), Proj::Deref);
+    let bb = b.block();
+    b.start(bb);
+    b.assign(Place(1), Operand::Const, S);
+    let l = b.borrow(Place(2), BorrowKind::Mut, Place(1), o, S);
+    if read {
+        b.assign(Place(0), Operand::Copy(Place(1)), S);
+    } else {
+        b.mention(Place(1), S);
+        b.assign(Place(0), Operand::Const, S);
+    }
+    b.assign(star, Operand::Const, S);
+    b.ret(S);
+    (finish(b), l)
+}
+
+/// A mention is no access: `let m = &mut x; let _ = x; *m = 1;` invalidates nothing (the
+/// Reference, "Wildcard pattern": it "does not copy, move or borrow the value it matches").
+/// Control: the same flow with the mention a read (`_0 = copy x`) is the conflict (E0503).
+#[test]
+fn a_mention_conflicts_with_no_loan() {
+    let (flow, _) = mention_under_mut_flow(false);
+    assert_eq!(invalidated(&flow), [], "a mention under a live `&mut`");
+    match check_moves(&flow, Global) {
+        Ok(v) => assert!(v.is_empty(), "a mention moves nothing: {v:?}"),
+        Err(b) => panic!("{b:?}"),
+    }
+    let (flow, l) = mention_under_mut_flow(true);
+    assert_eq!(invalidated(&flow), [(Stmt(2), l)], "CONTROL: a read under a live `&mut`");
 }
 
 // ---------------------------------------------------------------- fixtures: the signature's origins

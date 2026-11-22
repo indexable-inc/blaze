@@ -41,7 +41,7 @@ pub fn head_failed<'n, S: NamesSource<'n>>(names: S, k: LibKey, e: &HeadError) -
         format!("the head of {}, needed by the header of {}: {why:?}", ItemShown::of_lib(names, *item), ItemShown::of_lib(names, k))
     };
     let Why::Resolve(_, r) = why else { return out.into_boxed_str() };
-    if *item != k && names.text_of(*item).is_none_or(|t| t.impl_header.is_none()) {
+    if *item != k && names.signature_text_of(*item).is_none_or(|t| t.impl_header.is_none()) {
         out.push_str(&format!("; at {}..{} of its text", r.start, r.end));
         return out.into_boxed_str();
     }
@@ -62,7 +62,7 @@ pub fn head_failed<'n, S: NamesSource<'n>>(names: S, k: LibKey, e: &HeadError) -
 
 /// The text at `start..end` of impl `k`'s text, when that range is inside its header.
 fn written_in_header<'n, S: NamesSource<'n>>(names: S, k: LibKey, start: u32, end: u32) -> Result<&'n str, &'static str> {
-    let it = names.text_of(k).ok_or("the impl has no text")?;
+    let it = names.signature_text_of(k).ok_or("the impl has no text")?;
     let header = it.impl_header.ok_or("the impl's row has no header text")?;
     let at = header_at(it.text, header).ok_or("the header's text is not in the impl's text")?;
     let (start, end) = (start as usize, end as usize);

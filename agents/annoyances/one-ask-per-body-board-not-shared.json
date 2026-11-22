@@ -1,0 +1,15 @@
+{
+ "id": "one-ask-per-body-board-not-shared",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), joiner lane, D161 step 3",
+ "where": "crates/blaze-ladder/src/front2/asks.rs, world_items.rs (`store_want`, `impl_question`, `again`), check.rs (`Importing::make`, the round loop), tables/task.rs (`compare_asks`)",
+ "what": "Loop (1) moved onto the one ask behind `AsksMet`, but the board is per body store, not per request: a body's heads are filed into its own store, so a head another body published cannot be read from the board without filing it again. The ask therefore saves no work across bodies yet; it bounds and names (cycles, depth, board full) and counts.",
+ "cost": "no cross-body saving from loop (1) until a store can take a published head by reference; the question is still read again after a made fact (a read, no work redone)",
+ "cause": "the store owns its head rows (`Store<'n>` with `RefCell` and `Cell` fields): a fact made by one task is not readable by another task's store in place",
+ "whys": "heads are filed per store from frozen records; the frozen table is shared, the filed rows are not",
+ "class": "a per-task cache where a shared record belongs (rule 51)",
+ "prevention": "the request's board over the FrozenTable's cells, with a store reading filed heads from the table in place (no per-store copy); then one board per request and `ONE_TASK` goes",
+ "annoyance": "write-only lane: the oracle (`--features asks-oracle`) and its control cannot be run here",
+ "workaround": "the seam keeps both paths; the oracle runs every body any test checks both ways",
+ "state": "open"
+}

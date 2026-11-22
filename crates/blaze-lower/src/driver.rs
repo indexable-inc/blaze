@@ -91,12 +91,88 @@ pub struct BodyCall<'s> {
     /// The whole call's range in the body's text (past the item's length: in an expansion
     /// appended to it), for a finding about it.
     pub range: Range,
+    /// The call written in the item's own text that this call is in (item-relative, rule 71):
+    /// `range` for a call written there; for a call an expansion wrote, the written call it
+    /// came from, followed out through every expansion. A path read at the call site is read
+    /// in the innermost block of the text around it (tempo's `use serde_json::json;` in a test
+    /// fn, then `assert_eq!(.., json!(..))`: `json!` is a call in `assert_eq!`'s expansion,
+    /// and `json` is bound in the fn's block, not its module).
+    pub written: Range,
     /// What its position takes; the expansion is parsed as this.
     pub fragment: blaze_expand::Fragment,
     pub edition: Edition,
     /// The `macro_rules!` and `macro` the body defines that are in scope at the call, in the
     /// order written (the last of a name wins): tried before any path-based resolution.
     pub locals: &'s [LocalMacro<'s>],
+    /// The expansions appended to the body's text before this call, which hold the call when
+    /// an expansion wrote it. A path read at the call site is read in the innermost block
+    /// around it, and that block may be one an expansion wrote (the Reference, "Statements":
+    /// "Declaring an item within a statement block restricts its scope to the block containing
+    /// the statement"; proptest 1.11.0's `prop_assert!` writes `if !$cond { extern crate alloc;
+    /// let message = alloc::format!(..); .. }`).
+    pub expansions: Expansions<'s>,
+}
+
+/// The expansions a body's lowering has appended to the item's text so far, as a reader of
+/// their blocks needs them: each one's text and where its call stands. These are the same
+/// columns, read the same way, as the finished record's [`View::expansion_text`] and
+/// [`View::expansion_call_at`]. An expansion is appended whole, after every earlier one, so
+/// the text holding an offset past the item is the last expansion starting at or before it.
+#[derive(Clone, Copy, Debug)]
+pub struct Expansions<'s> {
+    /// The body's text: the item's own, then each expansion's words with the spaces between
+    /// them.
+    pub text: &'s str,
+    /// The item's own text's length: offsets from here on are in the expansions.
+    pub item_len: u32,
+    /// Where each expansion's text starts, counted from `item_len`.
+    pub starts: &'s [u32],
+    /// Each expansion's call, as a range of `text`.
+    pub calls: &'s [Range],
+}
+
+impl<'s> Expansions<'s> {
+    /// How many expansions there are.
+    pub fn len(&self) -> u32 {
+        u32::try_from(self.starts.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// The text of expansion `j` alone. `None` when there is no expansion `j`, or its range is
+    /// not on a character boundary of the body's text.
+    pub fn text(&self, j: u32) -> Option<&'s str> {
+        let start = self.item_len as usize + *self.starts.get(j as usize)? as usize;
+        let end = match self.starts.get(j as usize + 1) {
+            Some(next) => self.item_len as usize + *next as usize,
+            None => self.text.len(),
+        };
+        self.text.get(start..end)
+    }
+
+    /// The expansion holding the body offset `at`, and `at`'s offset in that expansion's
+    /// text. `None` for an offset in the item's own text.
+    pub fn holding(&self, at: u32) -> Option<(u32, u32)> {
+        let offset = at.checked_sub(self.item_len)?;
+        let j = self.starts.partition_point(|s| *s <= offset).checked_sub(1)?;
+        Some((u32::try_from(j).ok()?, offset - self.starts[j]))
+    }
+
+    /// Where the call that made expansion `j` stands: in the item's own text, or in the text of
+    /// an earlier expansion. `None` when there is no expansion `j`, or its call's writer is not
+    /// an earlier one (a call is read before the expansion it makes).
+    pub fn call_at(&self, j: u32) -> Option<crate::scope_origin::CallAt> {
+        use crate::scope_origin::CallAt;
+        let call = *self.calls.get(j as usize)?;
+        if call.end <= self.item_len {
+            return Some(CallAt::Item { start: call.start });
+        }
+        let (writer, start) = self.holding(call.start)?;
+        (writer < j).then_some(CallAt::Expansion { expansion: writer, start })
+    }
 }
 
 /// A `macro_rules!` or `macro` written in a body: its name and its definition's text.

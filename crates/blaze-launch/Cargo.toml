@@ -13,10 +13,15 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# No dependency: `core` and `alloc` alone. Not bstd yet (src/lib.rs says why and when it moves).
+# `core`, and blaze-own: the core's tables are blaze-own `Vec`s in the allocator its maker
+# names, and its planted bugs come through blaze-own's seam (`planted`). blaze-own depends on
+# blaze-memchr and blaze-int alone, so no cycle. Not bstd yet (src/lib.rs says why and when).
 [dependencies]
+blaze-own.workspace = true
 
 [dev-dependencies]
+# A test's root allocator (`blaze_own::testing::heap()`), in place of the global heap.
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # The oracle of `wire`'s bytes: `cbor::check` holds them to RFC 8949 4.2.1.
 blaze-protocol.workspace = true
 blaze-sim.workspace = true

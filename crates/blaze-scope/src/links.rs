@@ -195,10 +195,15 @@ pub enum Unfollowed {
     TextualCut,
     /// A definition's written `pub(in path)` with no decided row in `Imports`.
     VisUndecided,
+    /// The ORACLE's reading of a [`Unfollowed::TextualCut`] whose child is a block's module
+    /// (cells/agree.rs, never [`lookup_textual`]): a block has no `mod` line, so no mark row, and
+    /// the old scope's walk passes it as outside. Neither side decides the textual scope seen
+    /// from inside a body's block (D189: the body's own solve does), so it is core-only.
+    BlockTextualCut,
 }
 
 impl Unfollowed {
-    pub const ALL: [Unfollowed; 8] = [
+    pub const ALL: [Unfollowed; 9] = [
         Unfollowed::Prelude,
         Unfollowed::DollarCrate,
         Unfollowed::ExternCrateUse,
@@ -207,6 +212,7 @@ impl Unfollowed {
         Unfollowed::EmptyPath,
         Unfollowed::TextualCut,
         Unfollowed::VisUndecided,
+        Unfollowed::BlockTextualCut,
     ];
 
     /// Its place in [`Unfollowed::ALL`].
@@ -220,6 +226,7 @@ impl Unfollowed {
             Unfollowed::EmptyPath => 5,
             Unfollowed::TextualCut => 6,
             Unfollowed::VisUndecided => 7,
+            Unfollowed::BlockTextualCut => 8,
         }
     }
 
@@ -229,7 +236,7 @@ impl Unfollowed {
     pub const fn core_only(self) -> bool {
         matches!(
             self,
-            Unfollowed::Prelude | Unfollowed::DollarCrate | Unfollowed::ExternCrateUse | Unfollowed::NotAModule | Unfollowed::Unheld
+            Unfollowed::Prelude | Unfollowed::DollarCrate | Unfollowed::ExternCrateUse | Unfollowed::NotAModule | Unfollowed::Unheld | Unfollowed::BlockTextualCut
         )
     }
 
@@ -243,6 +250,7 @@ impl Unfollowed {
             Unfollowed::EmptyPath => "empty path",
             Unfollowed::TextualCut => "textual cut",
             Unfollowed::VisUndecided => "pub(in path) undecided",
+            Unfollowed::BlockTextualCut => "textual cut at a block (no mod line)",
         }
     }
 }
@@ -465,7 +473,21 @@ fn follow<'b>(
 ) -> Result<Hop, LookupError> {
     let n = segments.len();
     if n == 0 {
-        return Ok(Hop::Unfollowed(from, Unfollowed::EmptyPath));
+        return Ok(match kind {
+            // `use crate as name;`: the crate root, a module, in the type namespace alone (rustc
+            // refuses the unnamed `use crate;`: "crate root imports need to be explicitly named:
+            // `use crate as name;`"). icu's baked data writes `pub mod icu { pub use crate as
+            // normalizer; }` in a `const _: () = { .. }` block (icu_normalizer, icu_properties;
+            // tempo, 21 Nov 05:33): the row was left to the core (`EmptyPath`), the core found it.
+            // The caller narrows by the `use`'s own visibility; the root itself is public.
+            PathKind::Crate if ns == Namespace::Types => {
+                let chain = tables.chain(from).ok_or(LookupError::NoTable { module: from })?;
+                let root = *chain.last().ok_or(LookupError::NoTable { module: from })?;
+                Hop::Found(Passed { def: Def::module(root), vis: Visibility::Public, state: BindingState::Determined })
+            }
+            PathKind::Crate => Hop::NotInTables,
+            _ => Hop::Unfollowed(from, Unfollowed::EmptyPath),
+        });
     }
     let m = match walk(tables, from, kind, segments, n - 1, log, stack)? {
         Walk::At(m) => m,

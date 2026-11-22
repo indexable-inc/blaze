@@ -30,6 +30,83 @@ use crate::CliError;
 use crate::home::{self, Older};
 use crate::work::Unread;
 
+/// Files in the runner's fact mount use absolute logical names. Checkout file observations
+/// can only create relative names (engine_script_reads.rs `observed`). No part of a saved
+/// question is ever opened as a host path.
+pub(crate) const FACT_MOUNT: &str = "/blaze/facts/";
+pub(crate) const REPLY_FILES: &str = "/blaze/facts/reply/";
+pub(crate) const SHIM_FILE: &str = "/blaze/facts/bin/blaze-fact-shim";
+pub(crate) const PINS_FILE: &str = "/blaze/facts/pins";
+pub(crate) const EXECUTOR_FILE: &str = "/blaze/facts/executor";
+
+/// The command reads the pins once, however many question files share them. These are the
+/// same pins used by ScriptSetup::open before a script can receive a successful reply.
+#[derive(Default)]
+struct FactFiles {
+    setting: Option<blaze_proc_macro::spawn_route::SpawnSetting>,
+}
+
+impl FactFiles {
+    fn read(&mut self, path: &str, alloc: blaze_own::Alloc<'_>) -> Result<ContentId, CliError> {
+        if path == SHIM_FILE {
+            let installed = || {
+                let exe = std::env::current_exe().map_err(|_| CliError::Text { what: "cannot locate blaze to follow the native fact shim image" })?;
+                let dir = exe.parent().ok_or(CliError::Text { what: "blaze has no parent folder for its native fact shim" })?;
+                Ok::<_, CliError>(dir.join(blaze_build_script::fact_shim::SHIM_NAME))
+            };
+            #[cfg(test)]
+            let shim = TEST_FACT_INPUTS.with_borrow(|inputs| inputs.as_ref().and_then(|(_, path)| path.clone())).map_or_else(installed, Ok)?;
+            #[cfg(not(test))]
+            let shim = installed()?;
+            return match blaze_proc_macro::native_facts::image_digest(&shim) {
+                Ok(digest) => Ok(digest),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(crate::engine_script_reads::NONE),
+                Err(_) => Err(CliError::Text { what: "cannot read blaze-fact-shim beside blaze while following a native build-script probe" }),
+            };
+        }
+        use blaze_proc_macro::fact_pins::{FactNow, command_spawn_setting, fact_now};
+        if self.setting.is_none() {
+            let from_host = || command_spawn_setting(crate::graph::TRIPLE, alloc)
+                .map_err(|_| CliError::Text { what: "cannot obtain the command's pinned userland and clang setting to replay a build-script fact" });
+            #[cfg(test)]
+            let read = TEST_FACT_INPUTS.with_borrow(|inputs| inputs.as_ref().map(|(pins, _)| blaze_proc_macro::spawn_route::SpawnSetting::facts_only(pins.clone())))
+                .map_or_else(from_host, Ok)?;
+            #[cfg(not(test))]
+            let read = from_host()?;
+            self.setting = Some(read);
+        }
+        let setting = self.setting.as_ref().expect("opened the command's fact pins above");
+        if path == PINS_FILE {
+            return Ok(blaze_proc_macro::native_facts::pins_digest(setting.pins.as_ref(), alloc));
+        }
+        if path == EXECUTOR_FILE {
+            return Ok(setting.executor_id(alloc).unwrap_or(crate::engine_script_reads::NONE));
+        }
+        let subject = path.strip_prefix(REPLY_FILES).ok_or(CliError::Text { what: "unknown file in the saved build-script fact mount" })?;
+        match fact_now(subject, setting.pins.as_ref(), alloc) {
+            FactNow::Answer(Some(answer)) => Ok(answer),
+            FactNow::Answer(None) | FactNow::NoPins => Ok(crate::engine_script_reads::NONE),
+            FactNow::NotAFact => Err(CliError::Text { what: "saved build-script reply names no question in the pinned fact table" }),
+        }
+    }
+}
+
+#[cfg(test)]
+type TestFactInputs = (blaze_proc_macro::spawn_route::FactPins, Option<std::path::PathBuf>);
+#[cfg(test)]
+std::thread_local! {
+    static TEST_FACT_INPUTS: core::cell::RefCell<Option<TestFactInputs>> = const { core::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_fact_inputs<R>(pins: &blaze_proc_macro::spawn_route::FactPins, image: Option<&std::path::Path>, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<TestFactInputs>);
+    impl Drop for Restore {
+        fn drop(&mut self) { TEST_FACT_INPUTS.set(self.0.take()); }
+    }
+    let _restore = Restore(TEST_FACT_INPUTS.replace(Some((pins.clone(), image.map(std::path::Path::to_owned)))));
+    run()
+}
+
 /// What a stat says of a file, enough to prove it unchanged when every part is equal: git's
 /// index fields less the mode and owner, which a content id does not depend on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,7 +226,7 @@ pub enum LeafKind {
     /// the files digest walks (`macro_files::walked`); followed as a listing is, so a file made
     /// or removed beneath the crate moves a row.
     MacroFolder = 6,
-    /// A checkout file a member's build script read (`file:`): its id the answer the run saw,
+    /// A checkout file or a file of the runner's [`FACT_MOUNT`]: its id the answer the run saw,
     /// the file's bytes as the sandbox digests them (engine_script_reads.rs). The script reads
     /// its `Given` cell; nothing of the layout does, so it moves no layout.
     ScriptFile = 7,
@@ -429,6 +506,12 @@ pub fn read_manifest(
 /// socket, a device or an entry gone since the listing is no name the layout reads.
 /// blaze's home in the checkout's root (`.blaze/v2/...`): not listed.
 pub const HOME: &str = ".blaze";
+/// The ignore file of blaze's folder in the checkout's root, made by the first command (print.rs
+/// `ensure_checkout_ignore`) so its state stays out of the checkout's git status.
+pub const HOME_IGNORE: &str = ".blaze/.gitignore";
+/// Its bytes: every name beneath blaze's folder ignored (journal_sweep.rs
+/// `CheckoutChanges::ignored_whole` stands on exactly these).
+pub const HOME_IGNORE_TEXT: &[u8] = b"*\n";
 /// git's entry in the checkout's root: a directory in a clone, a file (`gitdir: ...`) in a
 /// worktree or a submodule. Not listed, whichever it is.
 const GIT: &str = ".git";
@@ -624,12 +707,32 @@ impl<S: Stamps> Follow<S> {
     /// its read). A [`LeafKind::MacroFiles`] row is decided by its files' and folders' rows
     /// either way, and not counted.
     pub fn follow_marked<'f>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, marked: Option<&[bool]>, frame: &'f Frame) -> Result<(Followed<'f>, u32), CliError> {
+        self.follow_served(cx, root, home, last, marked, None, frame)
+    }
+
+    /// A served script observation can depend on paths beyond its recorded name, including
+    /// symlink targets and, for a git fact, every tracked file: whether the journal reaches it
+    /// is journal_sweep.rs `ServedReach`'s, folded into `marked`, so an unmarked row is kept
+    /// here as any other. Each served row's ask is bracketed by two events in a span naming its
+    /// kind, so the profile says what the served reads cost.
+    pub(crate) fn follow_served<'f>(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        home: Option<&Dir<ReadWrite>>,
+        last: &Leaves<'_>,
+        marked: Option<&[bool]>,
+        mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
+        frame: &'f Frame,
+    ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
         let mut statted = 0u32;
         let mut now = Rows::new_in(frame);
         let mut was = Vec::with_capacity_in(last.len(), frame);
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
         let mut layout_moved = false;
+        let erased = blaze_own::Erased::new(frame);
+        let mut fact_files = FactFiles::default();
         // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
         // after them in the table's (kind, path) order.
         let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);
@@ -638,7 +741,8 @@ impl<S: Stamps> Follow<S> {
             let path = last.path(i);
             let old_state = old.state();
             let unmarked = marked.is_some_and(|marked| !marked.get(i).copied().unwrap_or(true));
-            if unmarked && old.kind != LeafKind::MacroFiles {
+            let fact_file = old.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT);
+            if unmarked && !fact_file && old.kind != LeafKind::MacroFiles {
                 now.push(old.kind, old.flags, path, old.stamp, old.id);
                 was.push(old_state);
                 continue;
@@ -673,9 +777,26 @@ impl<S: Stamps> Follow<S> {
                     (old.flags, None, old.id)
                 }
                 LeafKind::MacroFolder => crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, Some(&old), frame)?,
+                LeafKind::ScriptFile if fact_file => (0, None, fact_files.read(path, erased.handle())?),
                 LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => {
-                    let kind = crate::engine_script_reads::ReadKind::of_leaf(old.kind).ok_or(CliError::Text { what: "a script read's leaf row has no read kind (sweep.rs `follow_marked`)" })?;
-                    crate::engine_script_reads::now(&cx, root, &self.stamps, self.plant, kind, path, Some((old.stamp, old.id)), frame)?
+                    let kind = crate::engine_script_reads::ReadKind::of_leaf(old.kind).ok_or(CliError::Text { what: "a script read's leaf row has no read kind (sweep.rs `follow_served`)" })?;
+                    match served.as_deref_mut() {
+                        Some(checkout) => {
+                            // The served tree's reads go around the effect layer (std paths,
+                            // a git status's walk): timed by the two events, not by a wait.
+                            let asked = cx.span(match old.kind {
+                                LeafKind::ScriptGit => "sweep: a build script's git fact asked again of its served tree",
+                                LeafKind::ScriptListing => "sweep: a build script's listing asked again of its served tree",
+                                LeafKind::ScriptStat => "sweep: a build script's stat asked again of its served tree",
+                                _ => "sweep: a build script's file asked again of its served tree",
+                            });
+                            asked.event("asked");
+                            let row = checkout.row(kind, path)?;
+                            asked.event("answered");
+                            row
+                        }
+                        None => crate::engine_script_reads::now(&cx, root, &self.stamps, self.plant, kind, path, Some((old.stamp, old.id)), frame)?,
+                    }
                 }
             };
             now.push(old.kind, flags, path, stamp, id);

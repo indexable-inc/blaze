@@ -22,7 +22,6 @@ blaze-radix.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
 blaze-rng.workspace = true
-blaze-serde.workspace = true
 blaze-spin.workspace = true
 blaze-queue.workspace = true
 crossbeam-deque.workspace = true
@@ -31,14 +30,12 @@ serde_json.workspace = true
 stdx.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
 # The fibers' stacks on native targets; on wasm the host switches them (`sched::stack`).
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 corosensei.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

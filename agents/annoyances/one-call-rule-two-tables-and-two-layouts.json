@@ -1,0 +1,15 @@
+{
+ "id": "one-call-rule-two-tables-and-two-layouts",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer lane D156 (flow-lower one call rule seam)",
+ "where": "crates/blaze-flow-lower/src/one_call.rs, oracle.rs, builder.rs; crates/blaze-borrow/src/relate.rs, inst.rs",
+ "what": "Switching flow-lower's nine call paths onto blaze_borrow::call met two facts no doc states together: (1) a body's values are types of the checked record's table while a head's columns are laid in `Facts::region_tys()`, a different table in production (the fixtures' WithRegions does not forward it, so fixtures hide the split); the contract's Cx read both from one `types`. (2) The flow's origins are laid by `npos` (an opaque, an alias, a trait object ONE position each, a fn item none) and the contract's by `Columns` slots (an opaque: its captures plus its arguments'; an alias: its trait's and GAT's lifetimes then its arguments'; a dyn: 1 plus its predicates'): the same value has different origin counts under the two models. Also clause columns are laid subject-first `ExTrait(Tr, [T, A..])` while impl headers lay `ExTrait(Tr, [A..])`, without Self.",
+ "cost": "most of the lane's reading time went to establishing these three from code (no build allowed in a writer lane)",
+ "cause": "two layouts and two tables grew in separate pieces (D148 heads, D156 contract) with no type separating a record PTy from a head PTy and no shared layout",
+ "whys": "PTy is one type for every table; npos was the flow's model before slots existed; ExTrait carries no flag saying whether Self is in its list",
+ "class": "an index valid in one table or one layout read in another: silent on fixtures that use one table, a Shape refusal or a wrong pairing in production",
+ "prevention": "done here: Cx carries `sig_types` and each side reads its own table (test each_side_is_read_in_its_own_table); the adapter refuses by name (OneRuleWhy::PositionsNotSlots) wherever npos and slots part. Wanted: a typed PTy per table (RecordTy, HeadTy) and the flow laying slots (D156 C3), after which npos is deleted",
+ "annoyance": "a writer lane cannot grep with a tool other than Bash, and git diff here is difftastic",
+ "workaround": "read with Read and grep through Bash; never sed over .rs",
+ "state": "open"
+}

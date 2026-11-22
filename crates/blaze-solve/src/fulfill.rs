@@ -116,7 +116,7 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
     /// The unresolved variables of `g`, into `self.vars`.
     fn stalled_on<T: Tys>(&mut self, tys: &T, g: Goal) -> Result<(), SolveError> {
         self.vars.clear();
-        let mut each = |t: Ty, vars: &mut Vec<u32, Alloc<'a>>, work: &mut Vec<(Ty, u32), Alloc<'a>>| {
+        let each = |t: Ty, vars: &mut Vec<u32, Alloc<'a>>, work: &mut Vec<(Ty, u32), Alloc<'a>>| {
             fold_vars(tys, work, t, vars)
         };
         match g.pred {

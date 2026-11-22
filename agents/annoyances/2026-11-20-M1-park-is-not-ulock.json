@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "M1",
+  "area": "blaze-sys macOS waits: macos.rs SYMBOLS and blaze-core/src/wait/macos.rs",
+  "annoyance": "macos.rs's SYMBOLS lists `__ulock_wait2` with the reason \"parking: ...\" and the lane brief said the park already uses it, but blaze-core's park (crates/blaze-core/src/wait/macos.rs) calls the public `os_sync_wait_on_address_with_deadline` / `os_sync_wake_by_address_any` through the cold table, and nothing in the tree calls `macos::ffi::__ulock_wait2` or `__ulock_wake`. Calling the ffi declaration would also add a libSystem import the ratchet tools/ratchets/blaze-sys-libsystem.txt does not list.",
+  "workaround": "The macos_kernel experiment's Public wait is the park's os_sync call; its Kernel wait finds `__ulock_wait2`/`__ulock_wake` by dlsym into the strategy value (MacFacts, D185), so no import is added. The SYMBOLS reason for `__ulock_wait2` should say it is declared for the Kernel experiment, not the park."
+}

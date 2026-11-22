@@ -281,6 +281,7 @@ fn main() {
         solve_time += t.elapsed();
         match pass {
             Pass::Done(graph) => break graph,
+            Pass::Partial(partial) => panic!("no unit graph: the manifests of {:?} are missing", partial.missing()),
             Pass::Need(needs) => {
                 let t = Instant::now();
                 for id in needs.iter() {
@@ -320,7 +321,6 @@ fn main() {
     println!("units         {} ({host} for the host)", units.len());
     println!("proc macros   {procs} units");
     println!("build scripts {builds} units");
-    println!("unavailable   {} packages", graph.unavailable.len());
     // `files`: each store package's directory in its record holds its manifest.
     let t_files = Instant::now();
     let mut located = 0usize;

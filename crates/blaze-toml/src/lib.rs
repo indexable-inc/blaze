@@ -21,12 +21,18 @@
 //! `Origin` and header-versus-dotted navigation, libs/toml_parser/src/toml.rs); the code here is
 //! written for this document's columns.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 use core::fmt;
 
@@ -36,47 +42,55 @@ mod doc;
 mod edit;
 mod lower;
 mod parse;
+mod plant;
 mod write;
 
 #[cfg(test)]
-mod plant;
-#[cfg(test)]
 mod tests;
 
-/// The planted bug the edit control asks for, compiled away outside tests.
-#[cfg(not(test))]
-mod plant {
-    #[inline(always)]
-    pub(crate) fn body_end(end: usize) -> usize {
-        end
-    }
-}
-
 pub use doc::{Children, Date, Datetime, Document, Item, Kind, Offset, Origin, Time};
+pub use plant::TomlPlant;
 pub use edit::{Edit, EditError, EditWhat};
 pub use write::{
     DocumentOptions, StringForm, Unwritable, WriteError, write_document, write_dotted_key, write_inline, write_key,
     write_string, write_string_in_form,
 };
 
-/// The bounds a read holds untrusted text to.
+/// The bounds a read holds untrusted text to: every cap the reader enforces is a field here
+/// (D165), [`Limits::SHIPPED`] the values it ships with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
-    /// The most bytes of text; at most `u32::MAX`.
+    /// The most bytes of text; at most `u32::MAX` (a node's range is two `u32`s).
     pub most_bytes: usize,
     /// The most arrays and inline tables open at once.
     pub most_depth: usize,
     /// The most nodes (tables, arrays and values).
     pub most_nodes: usize,
+    /// The most parts of one dotted key (`a.b.c` has three); at most [`MOST_KEY_PARTS`], the
+    /// parts a key holds in place.
+    pub most_key_parts: usize,
+    /// The most characters of a float as written, underscores aside; at most
+    /// [`MOST_FLOAT_LEN`], the characters a float is read from in place.
+    pub most_float_len: usize,
 }
 
 impl Limits {
-    /// For manifests, configs and lockfiles: 64 MiB, 64 deep, 4 million nodes.
-    pub const CARGO: Limits = Limits { most_bytes: 64 << 20, most_depth: 64, most_nodes: 4 << 20 };
+    /// For manifests, configs and lockfiles: 64 MiB, 64 deep, 4 million nodes, keys of 64
+    /// parts, floats of 256 characters.
+    pub const SHIPPED: Limits =
+        Limits { most_bytes: 64 << 20, most_depth: 64, most_nodes: 4 << 20, most_key_parts: 64, most_float_len: 256 };
+
+    /// [`Limits::SHIPPED`], by the name manifests' readers use.
+    pub const CARGO: Limits = Limits::SHIPPED;
 }
 
-/// The most parts of one dotted key (`a.b.c` has three).
-pub const MOST_KEY_PARTS: usize = 64;
+/// The most parts of one dotted key (`a.b.c` has three) the shipped limits allow, and the most
+/// any limits can: a key's parts are held in place.
+pub const MOST_KEY_PARTS: usize = Limits::SHIPPED.most_key_parts;
+
+/// The most characters of a float as written the shipped limits allow, and the most any limits
+/// can: a float is read from a buffer in place.
+pub const MOST_FLOAT_LEN: usize = Limits::SHIPPED.most_float_len;
 
 /// What a reader wanted where it found something else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

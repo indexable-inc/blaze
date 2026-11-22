@@ -19,7 +19,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -667,7 +667,7 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
             alloc,
         );
 
-        let mut out = Writer::new_in(<ModuleScopeRoot as Record>::SCHEMA, alloc);
+        let mut out = Writer::new(WriterOpts { schema: <ModuleScopeRoot as Record>::SCHEMA, alloc: alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let bindings = Column::push(&mut out, &rows);
         let globs = Column::push(&mut out, &globs);
@@ -869,12 +869,26 @@ impl<'a> ScopeView<'a> {
         }
     }
 
-    /// The binding of `name` in `ns`, by one binary search.
+    /// The binding of `name` in `ns`, by one binary search. A probe compares the namespace and
+    /// the first eight bytes of the names as one word each (blaze-format's `rows::prefix_in`,
+    /// one load from the string table), and the names' bytes only where those tie
+    /// (`rows::order_by_prefix`: the same order as `str`'s, so the same probes and the same
+    /// answer as comparing `(ns, &str)`): most names differ in their first eight bytes, so
+    /// `memcmp` runs about once a lookup, where it ran once a probe, and no probe re-checks a
+    /// name's character boundaries, which `read` checked once (rule 74).
     pub fn get(&self, ns: Namespace, name: &str) -> Option<Binding> {
-        let strings = self.strings;
+        let strings = self.strings.as_bytes();
+        let (want, name) = (blaze_format::rows::prefix(name.as_bytes()), name.as_bytes());
         let at = self
             .rows
-            .binary_search_by(|row| (row.ns, text_of(strings, row.name)).cmp(&(ns, name)))
+            .binary_search_by(|row| {
+                row.ns.cmp(&ns).then_with(|| {
+                    // Inside `strings`: `read` checked every binding's name (`check_text`).
+                    let range = row.name.range();
+                    let probe_prefix = blaze_format::rows::prefix_in(strings, range.start, range.len());
+                    blaze_format::rows::order_by_prefix(probe_prefix, &strings[range], want, name)
+                })
+            })
             .ok()?;
         Some(self.decode(&self.rows[at]).binding)
     }
@@ -958,4 +972,70 @@ impl<'a> ScopeView<'a> {
 
 fn textual_of<'a>(strings: &'a str, rows: &'a [TextualRow]) -> impl ExactSizeIterator<Item = TextualDef<&'a str>> + use<'a> {
     rows.iter().map(move |row| TextualDef { name: text_of(strings, row.name), def: ItemKey(row.def), expansion: row.expansion, shapes: row.shapes })
+}
+
+/// `ScopeView::get`'s prefix-first probe against its scalar twin, the probe it replaced.
+#[cfg(test)]
+mod prefix_probe {
+    use blaze_format::AlignedIn;
+    use blaze_id::{ContentId, ItemKey};
+    use blaze_sim::{Broke, Config, Tape};
+
+    use super::{ScopeBuilder, ScopeView};
+    use crate::kind::{Binding, BindingState, Def, DefKind, Namespace, Origin, ScopeEntry, Visibility};
+
+    impl ScopeView<'_> {
+        /// The twin: the probe `get` made before, `(ns, &str)` compared whole at every step.
+        fn get_whole(&self, ns: Namespace, name: &str) -> Option<Binding> {
+            let strings = self.strings;
+            let at = self.rows.binary_search_by(|row| (row.ns, super::text_of(strings, row.name)).cmp(&(ns, name))).ok()?;
+            Some(self.decode(&self.rows[at]).binding)
+        }
+    }
+
+    /// A name of up to twelve characters from a small alphabet with a two-byte one in it: names
+    /// share their first eight bytes often, end inside another's prefix, and some are empty.
+    fn drawn_name(tape: &Tape) -> String {
+        tape.vec(0..=12, "name", |tape| ['a', 'b', '_', 'é'][tape.index(4, "char")]).into_iter().collect()
+    }
+
+    /// Every drawn binding is found by both probes, and every drawn query (bound or not, in each
+    /// namespace) gets one answer from both. Prints nothing.
+    #[test]
+    fn get_answers_what_the_whole_name_probe_does() {
+        let heap = blaze_own::testing::heap().alloc();
+        blaze_sim::check(Config::cases(400), |tape| {
+            let names: Vec<String> = tape.vec(0..=40, "names", drawn_name);
+            let spaces = [Namespace::Types, Namespace::Values, Namespace::Macros];
+            let mut builder = ScopeBuilder::<&str>::new_in(ItemKey(ContentId([9; 32])), heap);
+            let mut bound: Vec<(Namespace, &str)> = Vec::new();
+            for (n, name) in names.iter().enumerate() {
+                let ns = spaces[tape.index(3, "ns")];
+                if bound.contains(&(ns, name.as_str())) {
+                    continue;
+                }
+                bound.push((ns, name.as_str()));
+                let key = ItemKey(ContentId([u8::try_from(n).expect("at most 40 names"); 32]));
+                let binding = Binding { def: Def { key, kind: DefKind::Other }, vis: Visibility::Public, origin: Origin::Declared, expansion: 0, state: BindingState::Determined };
+                builder.bindings.push(ScopeEntry { ns, name: name.as_str(), binding });
+            }
+            let bytes = builder.write_sorted(true, heap).map_err(|why| Broke::Oracle(format!("{why:?}")))?;
+            let buffer = AlignedIn::copy_from(&bytes, heap);
+            let view = ScopeView::read(&buffer).map_err(|why| Broke::Oracle(format!("{why}")))?;
+            let mut queries: Vec<String> = tape.vec(0..=12, "queries", drawn_name);
+            queries.extend(names.iter().cloned());
+            for ns in spaces {
+                for query in &queries {
+                    let (fast, whole) = (view.get(ns, query), view.get_whole(ns, query));
+                    if fast != whole {
+                        return Err(Broke::Oracle(format!("{ns:?} {query:?}: prefix-first {fast:?}, whole {whole:?}")));
+                    }
+                    if bound.contains(&(ns, query.as_str())) != fast.is_some() {
+                        return Err(Broke::Oracle(format!("{ns:?} {query:?}: bound is not found, or unbound is")));
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
 }

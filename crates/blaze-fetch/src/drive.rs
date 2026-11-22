@@ -27,9 +27,9 @@ pub enum Reserved {
 /// What woke a [`FetchIo::wait`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Woke<'b> {
-    /// An answer to `ask`, come at `at` on [`FetchIo::now`]'s clock, its body the IO's until its
-    /// next wait.
-    Answer { ask: Ask, at: u64, reply: Reply<'b> },
+    /// An answer to `ask`, its body the IO's until its next wait. No time with it: the machine
+    /// tries once (D172), so nothing it does waits on when an answer came.
+    Answer { ask: Ask, reply: Reply<'b> },
     /// The time given passed with no answer.
     Due,
     /// Something of the caller's (a unit wanted): no answer.
@@ -132,8 +132,8 @@ pub fn step<I: FetchIo + ?Sized>(machine: &mut Machine<'_, '_, '_>, io: &mut I, 
         return;
     }
     let until = Some(machine.next_deadline().unwrap_or_else(|| io.now().saturating_add(wait_most_ns)));
-    if let Woke::Answer { ask, at, reply } = io.wait(until) {
-        machine.answered(ask, at, reply);
+    if let Woke::Answer { ask, reply } = io.wait(until) {
+        machine.answered(ask, reply);
         if machine.reserving(ask.unit) {
             io.keep(ask.unit);
         }

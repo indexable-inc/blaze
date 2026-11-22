@@ -29,6 +29,9 @@ blaze-hash.workspace = true
 blaze-surface.workspace = true
 # `Vec`: every list of the machine, in the allocator it is made in.
 blaze-own.workspace = true
+# lib_features.rs: `Vector`, the walk's search across comments and strings. No cycle:
+# blaze-own already depends on it.
+blaze-memchr.workspace = true
 # task/lower.rs: `Outline`, a file's items, which the source lowering reads.
 blaze-file-items.workspace = true
 # task/lower.rs: `Hasher`, the keys of the lowered items and the cfg's digest.

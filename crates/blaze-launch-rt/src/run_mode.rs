@@ -40,14 +40,25 @@
 //! thread-local, or a writable static (run.md, "Statics in the run", steps 3 and 4); a record naming a
 //! static the parent did not send before it ([`RunModeError::StaticNotTold`]); a record whose pads land placed
 //! before the parent's `Down::Personality` named the program's personality routine
-//! ([`EhError::NoPersonality`]; run_mode/personality.rs); an outside name the process
-//! does not have; an entry form none of `unit`, `c-main` and `hosted` ([`Start::parse`]); run
+//! ([`EhError::NoPersonality`]; run_mode/personality.rs); an outside name the run's binder
+//! does not bind, naming the record, the symbol and the name ([`RunModeError::Outside`]); an
+//! entry form none of `unit`, `c-main`, `hosted` and `comptime` ([`Start::parse`]); run
 //! mode on x86-64 (code records are AArch64). A parent's `Failed` stops the program with
 //! [`STOPPED`] (D86) naming the function.
+//!
+//! **C names** (THE BINDER SEAM, run_mode/bind.rs): a record's `Space::Outside` target, from a
+//! call, a load of its word or a datum's word, resolves first to what the program defines (a
+//! declared slot or a told static of the name's own symbol), then through the run's strategy,
+//! a type parameter: [`Dlsym`] for an ordinary run, [`Table`] (blaze-comptime-sys) for a
+//! compile-time one.
 //!
 //! **A hosted entry** (`hosted:<symbol>`, bstd's `bstd_hosted_start`; run.md, "Every program
 //! runs in the child") is called with bstd's host table, which the launcher makes in this
 //! process over its own world before [`run`] ([`Handed::Hosted`]); this crate never names bstd.
+//!
+//! **A compile-time entry** (`comptime:<symbol>`, D175) is called as C `main` with the
+//! compile-time host's arguments ([`Handed::Comptime`]), its C names bound through the table,
+//! and [`run`] returns its status ([`End::Return`]): the launcher owns the process (G5).
 //!
 //! **TO VERIFY BY A TEST** (listed in the piece's report): (1) the two-view code area
 //! (`sys::Code`) runs placed code under the launcher's current signature (run.md, "Executable
@@ -77,7 +88,7 @@ use blaze_run::first_call::{self, Do, FirstCall, Woken};
 use blaze_run::{CodeRef, FindingsRef, Nanos, SlotId, ThreadId, Why};
 
 use crate::code_unwind::{self, Step};
-use crate::native_lib::{DlNatives, NativeError, Natives as _, PATH_MOST, RecordFiles};
+use crate::native_lib::{NativeError, PATH_MOST, RecordFiles};
 
 /// The exit status of a program blaze stopped: it could not build or start it, or stopped it
 /// at a function it cannot build (decision D86: what `env` and `timeout` use for the tool's
@@ -243,8 +254,10 @@ pub trait Memory {
     fn address_word(&self, slot: SlotId) -> u64;
     /// The address of `slot`'s entry thunk: the function's address.
     fn thunk(&self, slot: SlotId) -> u64;
-    /// Binds the C name `name` (once a run; again gives the same).
-    fn outside(&mut self, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError>;
+    /// Binds the C name `name` of symbol `symbol`, which record `record` names, through the
+    /// run's strategy (run_mode/bind.rs; once a run; again gives the same). A C name the program
+    /// defines never comes here: the binder resolves it to its slot or static first.
+    fn outside(&mut self, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError>;
     /// `len` bytes of the code area on `align`: their run-view address.
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
     /// `len` bytes of the hot region on `align`, where promoted code is laid out in the order the
@@ -332,10 +345,16 @@ pub enum RunModeError {
     Eh { record: RecordId, why: EhError },
     /// The record could not be placed.
     Place { record: RecordId, why: PlaceError },
-    /// A C name the record calls or reads: unnamed in the record, too long, or not in this
-    /// process. `name` is the C name as far as the record gave it ([`CName`]): the words name
-    /// it, so a stop at `_tlv_atexit` says `_tlv_atexit`, not a hash.
-    Outside { symbol: CodeSymbol, name: CName, why: &'static str },
+    /// A C name record `record` calls or reads: unnamed in the record, too long, not in this
+    /// process, or (a compile-time run) not in blaze-comptime-sys's table, refused at bind time
+    /// (run_mode/bind.rs). `name` is the C name as far as the record gave it ([`CName`]): the
+    /// words name it, so a stop at `_tlv_atexit` says `_tlv_atexit`, not a hash.
+    Outside { record: RecordId, symbol: CodeSymbol, name: CName, why: &'static str },
+    /// The parent declared or told `symbol` (a C name the program defines) after a record's
+    /// C name of that symbol was already bound by the run's strategy: two answers for one name
+    /// in one run. Refused: the parent declares every program-defined C name before its first
+    /// record (blaze-cli run_parent.rs `Needs::declare_c_defined`).
+    DefinedAfterBound { symbol: CodeSymbol },
     /// More C names than [`MOST_OUTSIDE`].
     OutsideFull,
     /// The code area has no room for `want` more bytes.
@@ -450,8 +469,14 @@ impl fmt::Display for RunModeError {
             RunModeError::Unwind { record, why } => write!(f, "record {}: {why}", Short(&record.0)),
             RunModeError::Eh { record, why } => write!(f, "record {}: {why}", Short(&record.0)),
             RunModeError::Place { record, why } => write!(f, "record {}: {why}", Short(&record.0)),
-            RunModeError::Outside { symbol, name, why } => write!(f, "the C name {name} (symbol {symbol}): {why}"),
+            RunModeError::Outside { record, symbol, name, why } => {
+                write!(f, "record {} names the C name {name} (symbol {symbol}): {why}", Short(&record.0))
+            }
             RunModeError::OutsideFull => write!(f, "the program binds more than {MOST_OUTSIDE} C names"),
+            RunModeError::DefinedAfterBound { symbol } => write!(
+                f,
+                "the parent declared the program's own C name of symbol {symbol} after a record's use of that name was bound outside the program: every program-defined C name is declared before the first record"
+            ),
             RunModeError::AreaFull { want, left } => {
                 write!(f, "the code area has {left} bytes left and a record needs {want} (the run's reservation, run.md \"Slot table\")")
             }
@@ -511,6 +536,12 @@ struct Numbering<'a> {
     to_wire: AVec<'a, u32>,
     /// By the parent's slot: the local slot, or [`NONE`].
     to_local: AVec<'a, u32>,
+    /// Every symbol the parent declared, sorted, with its local slot: how a C name the program
+    /// defines (its symbol `Symbol::of_name`, run_mode/bind.rs) is found without numbering it.
+    declared: AVec<'a, (CodeSymbol, SlotId)>,
+    /// Every C name symbol the run's strategy bound, sorted: a later declaration or static of
+    /// one is [`RunModeError::DefinedAfterBound`], so no name has two answers in one run.
+    bound_outside: AVec<'a, CodeSymbol>,
     alloc: Alloc<'a>,
 }
 
@@ -530,6 +561,11 @@ impl<'a> Numbering<'a> {
 
     fn symbol(&self, slot: SlotId) -> CodeSymbol {
         self.symbols[slot.index()]
+    }
+
+    /// The local slot of `symbol` when the parent declared it; `None` numbers nothing.
+    fn declared(&self, symbol: CodeSymbol) -> Option<SlotId> {
+        self.declared.binary_search_by_key(&symbol, |&(it, _)| it).ok().map(|at| self.declared[at].1)
     }
 
     fn wire(&self, slot: SlotId) -> Option<Slot> {
@@ -598,6 +634,8 @@ impl<'a> RunMode<'a> {
                 symbols: Vec::new_in(alloc),
                 to_wire: Vec::new_in(alloc),
                 to_local: Vec::new_in(alloc),
+                declared: Vec::new_in(alloc),
+                bound_outside: Vec::new_in(alloc),
                 alloc,
             },
             inbox: Vec::new_in(alloc),
@@ -711,6 +749,9 @@ impl<'a> RunMode<'a> {
             Down::Data { data } => {
                 for told in data.iter() {
                     let symbol = CodeSymbol(told.symbol.0);
+                    if self.slots.bound_outside.binary_search(&symbol).is_ok() {
+                        return Err(RunModeError::DefinedAfterBound { symbol });
+                    }
                     let placed = self.statics.binary_search_by_key(&symbol, |&(it, _)| it).is_ok();
                     if placed || self.told.iter().any(|&(it, _)| it == symbol) {
                         return Err(RunModeError::StaticTwice { symbol: told.symbol });
@@ -802,8 +843,16 @@ impl<'a> RunMode<'a> {
         let had_wire = self.slots.to_wire[local.index()];
         match (had_local, had_wire) {
             (NONE, NONE) => {
+                let symbol = CodeSymbol(symbol.0);
+                if self.slots.bound_outside.binary_search(&symbol).is_ok() {
+                    return Err(RunModeError::DefinedAfterBound { symbol });
+                }
                 self.slots.to_local[at] = local.0;
                 self.slots.to_wire[local.index()] = wire.0;
+                // Not found: `to_wire` was NONE, so this symbol was never declared before.
+                if let Err(pos) = self.slots.declared.binary_search_by_key(&symbol, |&(it, _)| it) {
+                    self.slots.declared.insert_shift(pos, (symbol, local));
+                }
             }
             (l, w) if l == local.0 && w == wire.0 => {}
             _ => return Err(RunModeError::Redeclared { slot: wire, symbol }),
@@ -920,7 +969,7 @@ impl<'a> RunMode<'a> {
                     statics: &self.statics,
                     thread_locals: &mut self.thread_locals,
                     memory: &mut *memory,
-                    names: None,
+                    names: Names::Datum(view),
                     record,
                     refused: None,
                 };
@@ -978,7 +1027,7 @@ impl<'a> RunMode<'a> {
                 statics: &self.statics,
                 thread_locals: &mut self.thread_locals,
                 memory: &mut *memory,
-                names: Some(view),
+                names: Names::Code(view),
                 record,
                 refused: None,
             };
@@ -1038,10 +1087,38 @@ struct Binder<'s, 'a, M: Memory> {
     /// The run's thread-local indexes: a load of a thread-local's index numbers it.
     thread_locals: &'s mut thread_locals::ThreadLocals<'a>,
     memory: &'s mut M,
-    /// The code record's C names; `None` for a datum, which names none.
-    names: Option<CodeView<'s>>,
+    /// The record whose C names' texts this placement reads: a code record's, or a datum's.
+    names: Names<'s>,
     record: RecordId,
     refused: Option<RunModeError>,
+}
+
+/// Where a placement finds a C name's text: the record being placed keeps it.
+#[derive(Clone, Copy)]
+enum Names<'s> {
+    Code(CodeView<'s>),
+    Datum(DatumView<'s>),
+}
+
+impl<'s> Names<'s> {
+    fn name(self, symbol: CodeSymbol) -> Option<&'s str> {
+        match self {
+            Names::Code(view) => view.name(symbol),
+            Names::Datum(view) => view.name(symbol),
+        }
+    }
+}
+
+/// What a C name target is bound to: THE BINDER SEAM's three answers (run_mode/bind.rs), one
+/// for every space that asks (a call, a load of its word, a datum's word).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bound {
+    /// A C name the program defines as a function, through the slot the parent declared.
+    Slot(SlotId),
+    /// A C name the program defines as data, the static the parent told.
+    Static(StaticAt),
+    /// A C name bound by the run's strategy ([`Bind`]): its word and the address in it.
+    Outside(Outside),
 }
 
 impl<M: Memory> Binder<'_, '_, M> {
@@ -1053,11 +1130,48 @@ impl<M: Memory> Binder<'_, '_, M> {
         Ok(slot)
     }
 
-    fn outside(&mut self, symbol: CodeSymbol) -> Result<Outside, RunModeError> {
-        let Some(name) = self.names.and_then(|view| view.name(symbol)) else {
-            return Err(RunModeError::Outside { symbol, name: CName::NONE, why: "the record keeps no name for it" });
+    /// THE BINDER SEAM (run_mode/bind.rs): C name target `symbol` of the record being placed,
+    /// first as what the program defines (a declared slot, a told static: its symbol is the
+    /// name's own), then through the memory's strategy, which needs the name's text.
+    fn outside(&mut self, symbol: CodeSymbol) -> Result<Bound, RunModeError> {
+        if let Some(slot) = self.slots.declared(symbol) {
+            return Ok(Bound::Slot(slot));
+        }
+        if let Ok(at) = self.statics.binary_search_by_key(&symbol, |&(it, _)| it) {
+            return Ok(Bound::Static(self.statics[at].1));
+        }
+        let Some(name) = self.names.name(symbol) else {
+            return Err(RunModeError::Outside { record: self.record, symbol, name: CName::NONE, why: "the record keeps no name for it" });
         };
-        self.memory.outside(symbol, name)
+        let bound = self.memory.outside(self.record, symbol, name)?;
+        if let Err(at) = self.slots.bound_outside.binary_search(&symbol) {
+            self.slots.bound_outside.insert_shift(at, symbol);
+        }
+        Ok(Bound::Outside(bound))
+    }
+
+    /// The word a C name target's site loads: for a call the word holding the code to run, for
+    /// a load the word holding its address.
+    fn outside_word(&mut self, symbol: CodeSymbol, call: bool) -> Result<u64, RunModeError> {
+        match self.outside(symbol)? {
+            Bound::Slot(slot) => Ok(match call {
+                true => self.memory.word(slot),
+                false => self.memory.address_word(slot),
+            }),
+            Bound::Static(at) if !call => Ok(self.memory.static_word(at.index)),
+            // A call of data the program defines: no code is there.
+            Bound::Static(_) => Err(RunModeError::Target { record: self.record, space: Space::Outside, symbol }),
+            Bound::Outside(it) => Ok(it.word),
+        }
+    }
+
+    /// A C name target's address, as a datum's word holds it.
+    fn outside_value(&mut self, symbol: CodeSymbol) -> Result<u64, RunModeError> {
+        Ok(match self.outside(symbol)? {
+            Bound::Slot(slot) => self.memory.thunk(slot),
+            Bound::Static(at) => at.at,
+            Bound::Outside(it) => it.value,
+        })
     }
 
     /// Static `symbol`, which the parent sent before the record naming it.
@@ -1084,7 +1198,7 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
                 true => self.memory.word(slot),
                 false => self.memory.address_word(slot),
             }),
-            Space::Outside => self.outside(target.symbol).map(|it| it.word),
+            Space::Outside => self.outside_word(target.symbol, call),
             // A load of the static's address reads its word; nothing calls a static. A vtable is
             // a datum the parent sent as a static's (code_records.rs `VtableDatum`), bound alike.
             Space::Static | Space::Vtable if !call => self.static_at(target.symbol).map(|it| self.memory.static_word(it.index)),
@@ -1104,7 +1218,7 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
     fn value(&mut self, target: Target) -> Result<u64, ImageError> {
         let found = match target.space {
             Space::Func => self.func(target.symbol).map(|slot| self.memory.thunk(slot)),
-            Space::Outside => self.outside(target.symbol).map(|it| it.value),
+            Space::Outside => self.outside_value(target.symbol),
             // A vtable's first word (a supertrait's table, in a vtable's datum) is its datum's.
             Space::Static | Space::Vtable => self.static_at(target.symbol).map(|it| it.at),
             Space::Tls => {
@@ -1148,6 +1262,44 @@ pub enum EntryForm {
     /// crates/blaze-std entry.rs; the table is bstd's `wire::HostTable`, which the launcher makes
     /// in this process over its own world: run.md, "Every program runs in the child").
     Hosted,
+    /// A compile-time program's entry (D175, `comptime:<symbol>`): C `main`'s form,
+    /// `extern "C" fn(c_int, *const *const c_char) -> c_int`, called with the arguments the
+    /// compile-time host sent (blaze-comptime-sys `child::argv`), never the process's own; for a
+    /// proc macro the symbol is `comptime:blaze_proc_macro_expand`'s. Its C names are bound
+    /// through blaze-comptime-sys's table ([`Table`]) and the run RETURNS its status
+    /// ([`End::Return`]): the launcher owns the process (G5).
+    Comptime,
+}
+
+/// How [`run`] ends once the entry returns (G5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum End {
+    /// An ordinary program: the process ends through `exit` with the entry's status, on the
+    /// entry's thread with the control thread alive, so the program's `atexit` functions (its
+    /// code) can still reach code not yet placed.
+    Exit,
+    /// A compile-time program: the control thread is stopped and joined and [`run`] returns the
+    /// status to its caller, which owns the process (blaze-launcher's `comptime:` branch, which
+    /// ends it through the compile-time transport's `end`). The program's `atexit` functions
+    /// do not run here: a compile-time program's `exit` is the layer's, which never returns.
+    Return,
+}
+
+/// A compile-time entry's `argc` and `argv`: the arguments the compile-time host sent. Made
+/// only by [`ComptimeArgs::new`], whose contract is the words' life.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ComptimeArgs {
+    argc: core::ffi::c_int,
+    argv: *const *const core::ffi::c_char,
+}
+
+impl ComptimeArgs {
+    /// # Safety
+    /// `argv` points at `argc` NUL-terminated strings and a null after them (blaze-comptime-sys
+    /// `child::argv`, the layer's words), all live and unchanged until the process ends.
+    pub unsafe fn new(argc: core::ffi::c_int, argv: *const *const core::ffi::c_char) -> ComptimeArgs {
+        ComptimeArgs { argc, argv }
+    }
 }
 
 /// What the program starts at.
@@ -1182,6 +1334,8 @@ pub enum Handed {
     CMain,
     /// [`EntryForm::Hosted`]: the host's table.
     Hosted(HostTableAt),
+    /// [`EntryForm::Comptime`]: the compile-time host's arguments.
+    Comptime(ComptimeArgs),
 }
 
 /// Why `BLAZE_LAUNCH_ENTRY`'s text names no entry.
@@ -1194,22 +1348,24 @@ impl fmt::Display for EntryRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "BLAZE_LAUNCH_ENTRY is `<form>:<64 hex digits of the entry's symbol>` with the form `unit`, `c-main` or `hosted`: {}",
+            "BLAZE_LAUNCH_ENTRY is `<form>:<64 hex digits of the entry's symbol>` with the form `unit`, `c-main`, `hosted` or `comptime`: {}",
             self.why
         )
     }
 }
 
 impl Start {
-    /// Reads the parent's `BLAZE_LAUNCH_ENTRY`: `unit:<symbol>`, `c-main:<symbol>` or
-    /// `hosted:<symbol>` (bstd's hosted entry, `bstd_hosted_start`), the symbol in 64 lowercase
-    /// or uppercase hex digits. Any other form is refused by name.
+    /// Reads the parent's `BLAZE_LAUNCH_ENTRY`: `unit:<symbol>`, `c-main:<symbol>`,
+    /// `hosted:<symbol>` (bstd's hosted entry, `bstd_hosted_start`) or `comptime:<symbol>` (a
+    /// compile-time program, D175), the symbol in 64 lowercase or uppercase hex digits. Any
+    /// other form is refused by name.
     pub fn parse(text: &[u8]) -> Result<Start, EntryRefused> {
         let (form, hex) = match text {
             [b'u', b'n', b'i', b't', b':', hex @ ..] => (EntryForm::Unit, hex),
             [b'c', b'-', b'm', b'a', b'i', b'n', b':', hex @ ..] => (EntryForm::CMain, hex),
             [b'h', b'o', b's', b't', b'e', b'd', b':', hex @ ..] => (EntryForm::Hosted, hex),
-            _ => return Err(EntryRefused { why: "the form is none of `unit`, `c-main` and `hosted`" }),
+            [b'c', b'o', b'm', b'p', b't', b'i', b'm', b'e', b':', hex @ ..] => (EntryForm::Comptime, hex),
+            _ => return Err(EntryRefused { why: "the form is none of `unit`, `c-main`, `hosted` and `comptime`" }),
         };
         if hex.len() != 64 {
             return Err(EntryRefused { why: "the symbol is not 64 hex digits" });
@@ -1333,8 +1489,11 @@ impl Layout {
     }
 }
 
-/// The process's run memory: one `sys::Code` mapping laid out as [`Layout`] says.
-struct NativeMemory<'a> {
+/// The process's run memory: one `sys::Code` mapping laid out as [`Layout`] says, its C names
+/// bound by strategy `B` (run_mode/bind.rs).
+struct NativeMemory<'a, B: Bind> {
+    /// How a C name the program does not define is bound: [`Dlsym`] or [`Table`].
+    bind: B,
     code: crate::sys::Code,
     layout: Layout,
     base: u64,
@@ -1352,6 +1511,11 @@ struct NativeMemory<'a> {
     data_base: u64,
     /// The next free byte of the data area, from its base.
     data_next: usize,
+    /// The program's native library once loaded (`Act::Native`): from then on every C name is
+    /// bound through its handle (the image, then the libraries it loaded: native_lib.rs
+    /// [`crate::native_lib::bind`]), never `bind`. `None` for a run whose start named no
+    /// library (BLAZE_LAUNCH_NATIVE unset): its C names bind through `bind` as before.
+    natives: Option<crate::native_lib::DlNatives>,
 }
 
 /// The writable data area's length: address space only, each page backed by the kernel on its
@@ -1370,8 +1534,8 @@ fn map_data() -> Result<u64, RunModeError> {
     }
 }
 
-impl<'a> NativeMemory<'a> {
-    fn new(alloc: Alloc<'a>, unwind: crate::unwind_reg::Writer<'static>) -> Result<NativeMemory<'a>, RunModeError> {
+impl<'a, B: Bind> NativeMemory<'a, B> {
+    fn new(bind: B, alloc: Alloc<'a>, unwind: crate::unwind_reg::Writer<'static>) -> Result<NativeMemory<'a, B>, RunModeError> {
         let page = crate::sys::page().map_err(RunModeError::Sys)?;
         let layout = Layout::of(page)?;
         let mut code = crate::sys::Code::map(layout.whole).map_err(RunModeError::Sys)?;
@@ -1409,7 +1573,7 @@ impl<'a> NativeMemory<'a> {
         // written and so before any program code runs.
         unsafe { fault_report::install(regions) }?;
         let data_base = map_data()?;
-        Ok(NativeMemory { code, layout, base: base as u64, next, hot_next, outside: Vec::new_in(alloc), shared, unwind, data_base, data_next: 0 })
+        Ok(NativeMemory { bind, code, layout, base: base as u64, next, hot_next, outside: Vec::new_in(alloc), shared, unwind, data_base, data_next: 0, natives: None })
     }
 
     fn at(&self, offset: usize) -> u64 {
@@ -1422,7 +1586,7 @@ impl<'a> NativeMemory<'a> {
     }
 }
 
-impl Memory for NativeMemory<'_> {
+impl<B: Bind> Memory for NativeMemory<'_, B> {
     fn stub(&mut self, slot: SlotId) -> Result<(), RunModeError> {
         if slot.0 >= MOST_SLOTS {
             return Err(RunModeError::SlotPast { slot: Slot(slot.0), most: MOST_SLOTS });
@@ -1451,7 +1615,7 @@ impl Memory for NativeMemory<'_> {
         self.at(self.layout.thunks + slot.index() * crate::arch::THUNK)
     }
 
-    fn outside(&mut self, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError> {
+    fn outside(&mut self, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError> {
         let found = self.outside.binary_search_by_key(&symbol, |&(it, _)| it);
         let index = match found {
             Ok(at) => self.outside[at].1,
@@ -1460,17 +1624,24 @@ impl Memory for NativeMemory<'_> {
                 if count >= MOST_OUTSIDE {
                     return Err(RunModeError::OutsideFull);
                 }
+                let refused = |why| RunModeError::Outside { record, symbol, name: CName::new(name), why };
                 let mut cname = [0u8; 512];
                 if name.len() >= cname.len() || name.as_bytes().contains(&0) {
-                    return Err(RunModeError::Outside { symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
+                    return Err(refused("its name is longer than 511 bytes or holds a NUL"));
                 }
                 cname[..name.len()].copy_from_slice(name.as_bytes());
-                // SAFETY: a lookup, by a NUL-terminated name, among the images this process loaded.
-                let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr().cast()) };
-                if address.is_null() {
-                    return Err(RunModeError::Outside { symbol, name: CName::new(name), why: "no image of this process defines it (`dlsym`)" });
-                }
-                self.code.store(self.layout.outside + count as usize * 8, address as u64).map_err(RunModeError::Sys)?;
+                let Ok(cname) = core::ffi::CStr::from_bytes_until_nul(&cname) else {
+                    return Err(refused("its name is longer than 511 bytes or holds a NUL"));
+                };
+                // A run with its native library: through the library's handle (NATIVE.md 3.7: a
+                // name resolves against the program's declared libraries, not against what the
+                // launcher happened to load). Without one, the run's strategy
+                // (run_mode/bind.rs): the process's images, or the table.
+                let address = match self.natives.as_mut() {
+                    Some(natives) => crate::native_lib::bind(Some(natives), record, symbol, name)?,
+                    None => self.bind.address(name, cname).map_err(refused)?,
+                };
+                self.code.store(self.layout.outside + count as usize * 8, address).map_err(RunModeError::Sys)?;
                 self.outside.insert_shift(at, (symbol, count));
                 count
             }
@@ -1702,51 +1873,86 @@ fn format_errno(call: &str, errno: i32) -> String {
 
 /// Runs the program under its parent, the socket at `fd`: maps the run's memory, starts the
 /// control thread and the socket's reader, numbers the entry `entry`, and calls it on this
-/// thread (the process's first) with what `handed` holds. Returns only when the program could not
-/// be started; else the process ends through `exit` with the program's status, or with
-/// [`STOPPED`] when blaze stops it.
+/// thread (the process's first) with what `handed` holds, its C names bound by `bind`
+/// (run_mode/bind.rs). How it ends is `end` (G5): [`End::Exit`] ends the process through
+/// `exit` with the program's status and never returns `Ok`; [`End::Return`] stops the control
+/// thread and returns `Ok(status)` to the caller, which owns the process. `Err` when the program
+/// could not be started. A stop mid-run (code that could not come, a fault) still ends the
+/// process with [`STOPPED`] under either end.
 ///
 /// `alloc` crosses to the control thread, so it is a [`blaze_own::SharedAlloc`]; it lives for
 /// the process, because the run's unwind registry is made in it and the system's unwinder keeps
 /// the registry's finder until the process ends (run_mode/personality.rs `run_registry`).
-pub fn run<S: RecordSource + Sync>(
+///
+/// `native` is the program's native library record when its start names one
+/// (BLAZE_LAUNCH_NATIVE, [`parse_record`]; the parent's rule is wire/run.rs `Down::Native`'s):
+/// the control thread then reads the parent's frames until its `Native`, at most
+/// [`NATIVE_WAIT_MS`], loads the library from `source`'s folder (`dlopen`, its words and
+/// pointer cells filled) BEFORE the entry's thunk is handed here, and this thread runs the
+/// library's initializers ([`crate::native_lib::run_inits`]) before the entry is called. `None`:
+/// nothing waits and nothing is opened, the start as before.
+#[expect(clippy::too_many_arguments, reason = "the run's edge: each argument one handle or fact of it")]
+pub fn run<S: RecordSource + RecordFiles + Sync, B: Bind + Send>(
     fd: std::os::fd::OwnedFd,
     source: &S,
     entry: CodeSymbol,
+    native: Option<RecordId>,
     handed: Handed,
+    bind: B,
+    end: End,
     alloc: blaze_own::SharedAlloc<'static>,
-) -> RunModeError {
+) -> Result<i32, RunModeError> {
     use std::os::fd::AsRawFd;
 
     if cfg!(not(target_arch = "aarch64")) {
-        return RunModeError::NotBuilt { what: "run mode on x86-64: code records are AArch64 (blaze-code a64)" };
+        return Err(RunModeError::NotBuilt { what: "run mode on x86-64: code records are AArch64 (blaze-code a64)" });
     }
     let raw = fd.as_raw_fd();
     let ready: crate::sys::Handoff<Ready> = crate::sys::Handoff::new();
     std::thread::scope(|scope| {
         let control = std::thread::Builder::new()
             .name("blaze-run-control".to_owned())
-            .spawn_scoped(scope, || control(raw, source, entry, alloc, &ready));
-        if control.is_err() {
-            return RunModeError::Thread { what: "control" };
-        }
+            .spawn_scoped(scope, || control(raw, source, entry, native, bind, alloc, &ready));
+        let Ok(control) = control else {
+            return Err(RunModeError::Thread { what: "control" });
+        };
         // The wait "run mode: the entry's stub written": the control thread answers at once,
         // with the thunk or with why it has none (and then returns, so the scope's join ends).
-        let (thunk, shared) = match ready.take() {
-            Ok(made) => made,
-            Err(why) => return why,
-        };
+        let (thunk, shared, loaded) = ready.take()?;
         let me = match crate::threads::adopt(&shared) {
             Ok(me) => me,
             Err(_) => stop_with(format_args!("blaze: the program could not start: pthread_key_create failed")),
         };
+        // The native library's initializers, on this first thread, after the entry is numbered
+        // and before it is called (native_lib.rs step 5): an executable's order. They may call
+        // Rust words: each is a slot's thunk, served by the control thread, already in its loop.
+        if let Some(loaded) = loaded {
+            crate::native_lib::run_inits(loaded)?;
+        }
         let status = call_entry(thunk, handed);
-        // The main thread stays a mutator to the end: `exit` runs the program's `atexit`
-        // functions, which are its code.
-        core::mem::forget(me);
-        // SAFETY: ends the process as a C program's return from `main` does; `fd` and every
-        // mapping end with it.
-        unsafe { libc::exit(status) }
+        match end {
+            End::Exit => {
+                // The main thread stays a mutator to the end: `exit` runs the program's
+                // `atexit` functions, which are its code.
+                core::mem::forget(me);
+                // SAFETY: ends the process as a C program's return from `main` does; `fd` and
+                // every mapping end with it.
+                unsafe { libc::exit(status) }
+            }
+            End::Return => {
+                // The control thread's loop ends at `Stop` (no code is placed after it: the
+                // program's one thread has returned). The wait "run mode: the control thread
+                // stops" is the join; it is bounded by the loop's next event, at most the
+                // reader's tick away. The mappings stay: the process's owner ends it.
+                // The thread's end is told first, so the loop sees it before `Stop`.
+                drop(me);
+                shared.stop();
+                if control.join().is_err() {
+                    return Err(RunModeError::Thread { what: "control (it panicked while stopping)" });
+                }
+                Ok(status)
+            }
+        }
     })
 }
 
@@ -1795,6 +2001,13 @@ fn call_entry(thunk: u64, handed: Handed) -> i32 {
                 unsafe { core::mem::transmute(thunk as usize) };
             entry(argc, argv)
         }
+        Handed::Comptime(args) => {
+            // SAFETY: as for `CMain` (the form the parent named, `comptime:`); `args` holds the
+            // host's arguments, live for the process (`ComptimeArgs::new`'s contract).
+            let entry: extern "C" fn(c_int, *const *const c_char) -> c_int =
+                unsafe { core::mem::transmute(thunk as usize) };
+            entry(args.argc, args.argv)
+        }
     }
 }
 
@@ -1802,17 +2015,41 @@ fn call_entry(thunk: u64, handed: Handed) -> i32 {
 /// nothing before tiers, piece 14), so a hang's report can say how many there were.
 static THREAD_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/// What the control thread hands the first thread: the entry's thunk and the words' owner, or
-/// why the program cannot start.
-type Ready = Result<(u64, std::sync::Arc<crate::table::Shared>), RunModeError>;
+/// What the control thread hands the first thread: the entry's thunk, the words' owner and the
+/// native library loaded (its initializers are the first thread's to run), or why the program
+/// cannot start.
+type Ready = Result<(u64, std::sync::Arc<crate::table::Shared>, Option<crate::native_lib::Loaded>), RunModeError>;
+
+/// How long the control thread waits for the parent's `Native` when the start names a library
+/// (rule 18): the parent writes it first, before anything is built, so it is on the socket
+/// within the spawn's own time; past this the start is refused ([`NativeError::NotSent`]).
+pub const NATIVE_WAIT_MS: u64 = 10_000;
+
+/// A record's id from its 64 lowercase or uppercase hex digits (BLAZE_LAUNCH_NATIVE's value).
+pub fn parse_record(hex: &[u8]) -> Result<RecordId, EntryRefused> {
+    if hex.len() != 64 {
+        return Err(EntryRefused { why: "the record is not 64 hex digits" });
+    }
+    let digit = |it: u8| (it as char).to_digit(16).map(|it| it as u8);
+    let mut id = [0u8; 32];
+    for (byte, pair) in id.iter_mut().zip(hex.chunks(2)) {
+        match (digit(pair[0]), digit(pair[1])) {
+            (Some(high), Some(low)) => *byte = high << 4 | low,
+            _ => return Err(EntryRefused { why: "the record holds a character that is no hex digit" }),
+        }
+    }
+    Ok(RecordId(id))
+}
 
 /// The control thread: maps the run's memory (its tables are in the run's allocator, which
 /// stays on this thread), starts the socket's reader, writes the entry's stub, then is the one
 /// writer of code and words for the life of the process.
-fn control<S: RecordSource>(
+fn control<S: RecordSource + RecordFiles, B: Bind>(
     fd: i32,
     source: &S,
     entry: CodeSymbol,
+    native: Option<RecordId>,
+    bind: B,
     alloc: blaze_own::SharedAlloc<'static>,
     ready: &crate::sys::Handoff<Ready>,
 ) {
@@ -1826,7 +2063,7 @@ fn control<S: RecordSource>(
         Err(why) => return ready.put(Err(why)),
     };
     let alloc = alloc.local();
-    let mut memory = match NativeMemory::new(alloc, unwind) {
+    let mut memory = match NativeMemory::new(bind, alloc, unwind) {
         Ok(memory) => memory,
         Err(why) => return ready.put(Err(why)),
     };
@@ -1852,7 +2089,19 @@ fn control<S: RecordSource>(
         }
     }
     acts.clear();
-    ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared))));
+    // The entry's thunk goes to the first thread now, or, when the start names a native
+    // library, once that library is loaded (`Act::Native` below): `owed` is the library and
+    // when the wait for its `Native` began (rule 18: at most NATIVE_WAIT_MS).
+    let mut owed: Option<(RecordId, Nanos)> = None;
+    match native {
+        None => ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), None))),
+        // Linux: the load is not built (NATIVE.md W5: the ELF image's initializers and its
+        // loader's checks); refused by name, never skipped.
+        Some(_) if cfg!(not(target_os = "macos")) => {
+            return ready.put(Err(RunModeError::NotBuilt { what: "a program's native library on Linux (NATIVE.md W5)" }));
+        }
+        Some(record) => owed = Some((record, now())),
+    }
     // Threads waiting in a stub: the slot, the thread, and the stub waiters' row its answer
     // goes to (`Waiters::answer`).
     let mut waiting: AVec<'_, (SlotId, Thread, u32)> = Vec::new_in(alloc);
@@ -1917,15 +2166,33 @@ fn control<S: RecordSource>(
                 Act::Stop(Stop::ParentGone { waiting }) => stop_with(format_args!(
                     "blaze: the program's parent (`blaze run`) is gone while {waiting} threads wait for code"
                 )),
-                // Until native-W8-1's GROUP D (the driver's load) goes in with the parent's send of
-                // `Down::Native`, no parent sends one: a native library here is refused by name.
-                Act::Native { record } => stop_with(format_args!(
-                    "blaze: the parent sent native library {record:?}, which this launcher does not load yet (native-W8-1 GROUP D)"
-                )),
+                // The library the start named (BLAZE_LAUNCH_NATIVE), loaded before the entry's
+                // thunk is handed over: its words and pointer cells hold their slots' thunks
+                // (stubs until placed) before any C runs. A `Native` the start did not name, or
+                // another record than it named, is the parent out of step: stopped by name.
+                Act::Native { record } => match owed.take() {
+                    Some((named, _)) if named == record => match load_library(&mut mode, source, &mut memory) {
+                        Ok(loaded) => {
+                            ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared), Some(loaded))));
+                            Ok(())
+                        }
+                        Err(why) => return ready.put(Err(why)),
+                    },
+                    _ => stop_with(format_args!(
+                        "blaze: the parent sent native library {record:?}, which this program's start did not name (BLAZE_LAUNCH_NATIVE; NATIVE.md 3.7)"
+                    )),
+                },
             };
             if let Err(why) = carried {
                 stop_with(format_args!("blaze: the program stopped: its code could not come: {why}"));
             }
+        }
+        // The start's wait for the parent's `Native`, bounded (rule 18): the reader's tick
+        // brings an event at least every TICK_MS, so this is checked while nothing comes.
+        if let Some((_, since)) = &owed
+            && now.0.saturating_sub(since.0) > NATIVE_WAIT_MS * 1_000_000
+        {
+            return ready.put(Err(RunModeError::Native(NativeError::NotSent { bound_ms: NATIVE_WAIT_MS })));
         }
         acts.clear();
         if !mode.outbox().is_empty() {
@@ -1954,13 +2221,50 @@ impl fmt::Display for WhyText {
     }
 }
 
+pub mod bind;
 pub mod fault_report;
 mod native;
 mod personality;
 mod thread_locals;
 
+/// Carries `Act::Native`: the library `mode` was told opened from `source`'s folder and its words
+/// and pointer cells filled ([`RunMode::load_native`] through [`crate::native_lib::DlNatives`]),
+/// then kept in `memory` so every C name after it binds through the library's handle. A `dlopen`
+/// refusal is typed from its `dlerror` text ([`crate::native_lib::open_refused`]): the first
+/// name dyld could not bind, or its words.
+///
+/// What the load rests on (the review rule's "unsafe resting on an assumption", stated here for
+/// the whole load; the calls' own SAFETY comments are in native_lib.rs `DlNatives::open`):
+/// - the file is `<the command's home>/.blaze/v2/run/records/<64 hex>` (BLAZE_LAUNCH_STORE, set by
+///   the parent from the command's own `HOME`, a folder only its user writes), named by the
+///   image record's key, which covers every input of its bytes (rule 21); the parent filed the
+///   payload of the store's record there once, the store having checked the record's bytes when
+///   it was put (blaze-cli engine_native.rs `send_of`: written once, never rewritten in place);
+/// - `dlopen` runs the initializers of the libraries the image loads (libSystem's, already
+///   run in this process) and none of the image's own (`__blaze_inits`, run by the first thread
+///   before the entry: `run`); all of it runs in THIS process, inside whatever sandbox the
+///   parent started it under (for `blaze test`, the test's sandbox), never in the parent;
+/// - each word and pointer cell gets the entry thunk of the slot the parent paired with it: a
+///   Rust function C calls is assumed to have the ABI the Rust side declared (`extern "C"`
+///   with the C prototype's types). Nothing here can check that: neither the image nor the
+///   code record carries a type, so a mismatch is the program's own undefined behaviour, as
+///   it is under a native link.
+fn load_library<S: RecordFiles, B: Bind>(mode: &mut RunMode<'_>, source: &S, memory: &mut NativeMemory<'_, B>) -> Result<crate::native_lib::Loaded, RunModeError> {
+    let mut natives = crate::native_lib::DlNatives::new(source.folder())?;
+    let loaded = match mode.load_native(&mut natives, memory) {
+        Ok(loaded) => loaded,
+        Err(RunModeError::Native(NativeError::Open { record })) => return Err(RunModeError::Native(crate::native_lib::open_refused(record, natives.said()))),
+        Err(why) => return Err(why),
+    };
+    memory.natives = Some(natives);
+    Ok(loaded)
+}
+
+pub use bind::{Bind, Dlsym, Table, TableError};
 pub use thread_locals::ThreadKey;
 
+#[cfg(test)]
+mod bind_tests;
 #[cfg(test)]
 mod entry_tests;
 #[cfg(test)]
@@ -2006,7 +2310,7 @@ mod position_tests {
         fn word(&self, _: SlotId) -> u64 { unreachable!("no calls") }
         fn address_word(&self, _: SlotId) -> u64 { unreachable!("no function address loads") }
         fn thunk(&self, _: SlotId) -> u64 { unreachable!("no function addresses") }
-        fn outside(&mut self, _: CodeSymbol, _: &str) -> Result<Outside, RunModeError> { unreachable!("no C names") }
+        fn outside(&mut self, _: RecordId, _: CodeSymbol, _: &str) -> Result<Outside, RunModeError> { unreachable!("no C names") }
         fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
             let at = self.next.next_multiple_of(align as u64);
             self.next = at + len as u64;

@@ -7,10 +7,11 @@
 
 #![blaze::sans_io]
 
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, planted::Planted};
 
-use crate::bdd::{Bdd, Cond};
+use crate::bdd::{Cond, PlantedBdd};
 use crate::error::{CondError, ParseError};
+use crate::plant::CondPlant;
 use crate::space::{Atom, NameParts, Space, VarKey};
 
 /// One step of a predicate in postfix.
@@ -230,7 +231,7 @@ pub fn lower(
     expr: &Expr<'_, '_>,
     space: &Space<'_>,
     package: &str,
-    bdd: &mut Bdd<'_>,
+    bdd: &mut PlantedBdd<'_, impl Planted<CondPlant>>,
     absent: &mut AVec<'_, VarKey>,
 ) -> Result<Cond, CondError> {
     let mut stack: AVec<'_, Cond> = AVec::new_in(bdd.alloc());

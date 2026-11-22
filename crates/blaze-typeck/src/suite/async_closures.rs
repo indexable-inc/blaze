@@ -209,3 +209,47 @@ fn an_async_closure_that_moves_a_capture_is_only_async_fn_once() {
         assert_eq!(has, want_e0277, "{callee}(c): {:?}", checked.diags);
     }
 }
+
+/// RFC 3668 ("Async closures"; rustc `CoroutineClosureSignature::tupled_upvars_by_closure_kind`):
+/// an `FnMut` async closure's call futures are two, `async_call_once(self)`'s storing the
+/// closure's captures and `async_call_mut(&mut self)`'s storing `&mut P` for each place it
+/// uses mutably. `let mut n = 0u8; let c = async || { n = 1u8; }; c().await; n` captures `n`
+/// BY REFERENCE (`&mut u8`, no `move`): both futures store `&mut u8`, so the checker's one
+/// future term is exact and, the body not suspending, its witness is `Complete`
+/// (rules/closure.rs `borrows_alike`; before it, `NeedsCapturePlaces`: a named gap at every
+/// auto-trait question on the call future). CONTROL (rule 23), the cause removed: the same
+/// closure `move`: `n` is held BY VALUE, the two futures store `u8` and `&mut u8`, one term
+/// cannot be both, and the witness stays `NeedsCapturePlaces` (never decided from one layout).
+/// Expected line: `test suite::async_closures::a_borrowing_async_closure_call_future_is_decided ... ok`.
+#[test]
+fn a_borrowing_async_closure_call_future_is_decided() {
+    for (is_move, want) in [(false, crate::CoroutineWitness::Complete), (true, crate::CoroutineWitness::NeedsCapturePlaces)] {
+        let (fx, it) = world();
+        let mut b = Bb::new();
+        let out = b.ty(PNode::Uint(UintTy::U8));
+        b.async_fn(out);
+        let n = b.bind("n");
+        let e0 = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+        let s0 = b.let_(n, None, e0);
+        let e1 = b.local(n);
+        let e2 = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+        let e3 = b.e(Expr::Assign { lhs: e1, rhs: e2 });
+        let s1 = b.semi(e3);
+        let e4 = b.block(&[s1], None);
+        let closure = b.async_closure(&[], e4);
+        if let Some(Expr::Closure { is_move: m, .. }) = b.exprs.get_mut(closure.0 as usize) {
+            *m = is_move;
+        }
+        let c = b.bind("c");
+        let s2 = b.let_(c, None, closure);
+        let callee = b.local(c);
+        let call = b.call(callee, &[]);
+        let aw = b.await_(call);
+        let s3 = b.semi(aw);
+        let tail = b.local(n);
+        let root = b.block(&[s0, s2, s3], Some(tail));
+        let checked = check_body(&fx, &b, it.c_async, root, Plant::None, InferPlant::None);
+        assert!(checked.diags.is_empty(), "move: {is_move}: {:?}", checked.diags);
+        assert_eq!(checked.coroutine_witness(closure), Some(want), "move: {is_move}: the call future's witness");
+    }
+}

@@ -1,0 +1,15 @@
+{
+ "id": "2026-11-20-N1-signal-two-kernel-sigactions",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane N1 (no C library on Linux, signals)",
+ "where": "crates/blaze-sys/src/posix/signal.rs (old module doc); crates/blaze-sys/src/linux/process.rs and linux/sample.rs (KernelSigaction)",
+ "what": "posix/signal.rs's doc said an action read by raw rt_sigaction 'holds the kernel's restorer and flag, which no C caller expects', as the reason to call glibc's sigaction. glibc's sigaction returns the kernel's flags and restorer verbatim (SA_RESTORER and __restore_rt included), so the two reads agree; the claim sent the file down the C-library path. Separately the kernel's struct sigaction was declared twice (process.rs and sample.rs, both private) and sample.rs carried its own x86-64 restorer as a global asm symbol and its own copies of four syscall numbers.",
+ "cost": "about twenty minutes to check against glibc's sigaction and the kernel's setup_return",
+ "cause": "the reason was written from expectation, not from glibc's code; each file that needed the kernel struct declared its own",
+ "whys": "no one home for the kernel's signal types existed under linux/",
+ "class": "a concept declared privately in each file that needs it (rule 30)",
+ "prevention": "linux/signal.rs is now the one home (SigAction, Stack, restore_rt, set_action); the edits that move process.rs and sample.rs onto it are listed in lane N1's final message",
+ "annoyance": "none beyond the above",
+ "workaround": "none needed",
+ "state": "open until process.rs and sample.rs take linux::signal"
+}

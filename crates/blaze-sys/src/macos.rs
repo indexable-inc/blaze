@@ -100,6 +100,18 @@ pub const SYMBOLS: &[Symbol] = &[
     public(c"dlsym", "the symbol test itself, and optional symbols by name"),
 ];
 
+/// The private symbols of the [`cold`] table, each with why it and not a public call (rule
+/// macos-private-apis). They are not in [`SYMBOLS`]: `every_declared_symbol_exists` looks up
+/// with `RTLD_DEFAULT`, which finds the cold table's own definition first; `every_cold_symbol_exists`
+/// looks each up past it (`RTLD_NEXT`), and `every_private_symbol_says_why` reads this list too.
+pub const COLD_PRIVATE: &[Symbol] = &[private(
+    c"thread_selfcounts",
+    "the meter (blaze-meter, D169): this thread's instructions, cycles and user and system time \
+     in one call (`THSC_TIME_CPI`, 3), read without a lock at every stretch's two ends; the \
+     public `thread_info(THREAD_BASIC_INFO)` gives the times alone, microsecond-grained and \
+     through a Mach port, and no public call gives a thread's instructions",
+)];
+
 /// The declarations. Nothing calls them in slice 1 but the symbol test's `dlsym`.
 #[allow(dead_code, reason = "declared for the slices that build on them; each is looked up by the symbol test")]
 #[expect(blaze::unwired, reason = "unwired until the slices that build on these declarations call them")]
@@ -348,6 +360,13 @@ pub mod cold {
         fn isatty(fd: c_int) -> c_int;
         /// sys/resource.h; `limit` is a `struct rlimit`.
         fn getrlimit(resource: c_int, limit: *mut c_void) -> c_int;
+        /// sys/resource.h; `usage` is a `struct rusage`. The meter's process totals
+        /// ([`super::process_usage`]).
+        fn getrusage(who: c_int, usage: *mut c_void) -> c_int;
+        /// Private (Kernel.framework's sys/resource_private.h; no SDK header declares it):
+        /// `kind` a `thread_selfcounts_kind_t`, `into` the struct of that kind
+        /// ([`super::COLD_PRIVATE`] says why).
+        fn thread_selfcounts(kind: c_int, into: *mut c_void, len: usize) -> c_int;
         /// sys/event.h; `changes` and `events` are `struct kevent`s, `timeout` a `timespec`.
         fn kevent(kq: c_int, changes: *const c_void, nchanges: c_int, events: *mut c_void, nevents: c_int, timeout: *const c_void) -> c_int;
         /// sys/event.h.
@@ -487,6 +506,168 @@ pub fn window_size(fd: crate::Fd) -> Result<crate::WindowSize, crate::Errno> {
     Ok(crate::WindowSize { cols: size.cols, rows: size.rows })
 }
 
+/// `struct thsc_time_cpi` (sys/resource_private.h): what [`thread_counts`] reads. The kernel
+/// may leave the instructions and cycles 0 "on certain hardware" (the header's words), and
+/// the system time 0 where it is counted as user time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct ThreadCounts {
+    pub instructions: u64,
+    pub cycles: u64,
+    /// In Mach absolute time units ([`timebase`]).
+    pub user_mach: u64,
+    pub system_mach: u64,
+}
+
+/// `thread_selfcounts(THSC_TIME_CPI)`: the calling thread's instructions, cycles and user and
+/// system time since it began, one system call (186), no lock. A private call
+/// ([`COLD_PRIVATE`]); `ENOTSUP` where the hardware has no counters. Used by blaze-meter's
+/// `Meter::now`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn thread_counts() -> Result<ThreadCounts, crate::Errno> {
+    /// `THSC_TIME_CPI`.
+    const TIME_CPI: c_int = 3;
+    let mut counts = ThreadCounts::default();
+    // SAFETY: `THSC_TIME_CPI` writes one `struct thsc_time_cpi` (four `uint64_t`s, the layout
+    // above) into the buffer of the size given and keeps nothing.
+    let said = unsafe { cold::thread_selfcounts(TIME_CPI, (&raw mut counts).cast(), size_of::<ThreadCounts>()) };
+    if said != 0 {
+        // SAFETY: `__error` returns the calling thread's `errno`, valid while it runs.
+        let code = unsafe { *ffi::__error() };
+        return Err(crate::Errno::from_raw(code as u16));
+    }
+    Ok(counts)
+}
+
+/// `mach_timebase_info`: Mach absolute time is `numer / denom` nanoseconds a unit (125 / 3 on
+/// Apple silicon, 1 / 1 on Intel). Read once by a caller and kept: it never changes.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn timebase() -> (u32, u32) {
+    let mut info = [0u32; 2];
+    // SAFETY: `mach_timebase_info` writes one `mach_timebase_info_data_t` (two `uint32_t`s).
+    unsafe { cold::mach_timebase_info(info.as_mut_ptr().cast()) };
+    (info[0], info[1])
+}
+
+/// `struct timeval` on 64-bit macOS: a `time_t` and an `int` of microseconds, padded to 16.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Timeval {
+    pub sec: i64,
+    pub usec: i32,
+    pad: i32,
+}
+
+/// `struct rusage` on 64-bit macOS: two [`Timeval`]s and fourteen `long`s (`ru_maxrss` in
+/// bytes, not Linux's kilobytes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Rusage {
+    pub user: Timeval,
+    pub system: Timeval,
+    pub max_rss_bytes: i64,
+    pub ixrss: i64,
+    pub idrss: i64,
+    pub isrss: i64,
+    /// Page reclaims: faults served without I/O.
+    pub minflt: i64,
+    /// Page faults that read.
+    pub majflt: i64,
+    pub rest: [i64; 8],
+}
+
+/// `struct rusage_info_v4` (sys/resource.h): its UUID, then 35 `uint64_t`s; the meter reads
+/// the ones named by the constants below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct RusageInfoV4 {
+    pub uuid: [u8; 16],
+    pub words: [u64; 35],
+}
+
+impl RusageInfoV4 {
+    /// `ri_user_time` and `ri_system_time`, in Mach absolute time units.
+    pub const USER: usize = 0;
+    pub const SYSTEM: usize = 1;
+    /// `ri_pageins`.
+    pub const PAGEINS: usize = 4;
+    /// `ri_phys_footprint`, bytes.
+    pub const FOOTPRINT: usize = 7;
+    /// `ri_lifetime_max_phys_footprint`, bytes.
+    pub const MOST_FOOTPRINT: usize = 28;
+    /// `ri_instructions` and `ri_cycles`: the whole process's, every thread that ran.
+    pub const INSTRUCTIONS: usize = 29;
+    pub const CYCLES: usize = 30;
+}
+
+/// `getrusage(RUSAGE_SELF)` and `proc_pid_rusage(getpid(), RUSAGE_INFO_V4)`: what the whole
+/// process used since it began, every thread's, the meter's totals to reconcile its stretches
+/// against (blaze-meter `Process::now`).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn process_usage() -> Result<(Rusage, RusageInfoV4), crate::Errno> {
+    /// `RUSAGE_SELF` and `RUSAGE_INFO_V4`.
+    const SELF: c_int = 0;
+    const INFO_V4: c_int = 4;
+    let mut usage = Rusage::default();
+    let mut info = RusageInfoV4 { uuid: [0; 16], words: [0; 35] };
+    // SAFETY: `getrusage` writes one `struct rusage` (the layout above) into the one given.
+    let said = unsafe { cold::getrusage(SELF, (&raw mut usage).cast()) };
+    if said != 0 {
+        // SAFETY: as in `thread_counts`.
+        return Err(crate::Errno::from_raw(unsafe { *ffi::__error() } as u16));
+    }
+    // SAFETY: `RUSAGE_INFO_V4` writes one `struct rusage_info_v4` (the layout above) for the
+    // pid given, this process's own.
+    let said = unsafe { cold::proc_pid_rusage(cold::getpid(), INFO_V4, (&raw mut info).cast()) };
+    if said != 0 {
+        // SAFETY: as above.
+        return Err(crate::Errno::from_raw(unsafe { *ffi::__error() } as u16));
+    }
+    Ok((usage, info))
+}
+
+/// `sched_yield`: the CPU given to another runnable thread, if one waits; back at once
+/// otherwise. A spin's back-off before it parks (blaze-core's locks, blaze-spin).
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn sched_yield() -> Result<(), crate::Errno> {
+    // SAFETY: `int sched_yield(void)`: no arguments, no memory.
+    let said = unsafe { cold::sched_yield() };
+    if said != 0 {
+        // SAFETY: as in `thread_counts`.
+        return Err(crate::Errno::from_raw(unsafe { *ffi::__error() } as u16));
+    }
+    Ok(())
+}
+
+/// `sysctlbyname` of a 32-bit integer: its value, or `None` where this macOS has no such name
+/// (`ENOENT`: the `hw.optional.arm.FEAT_*` a chip predates are absent, not 0). Any other
+/// refusal, and a value of another size, are errors: [`crate::Errno::Inval`] for the size.
+/// Used by [`crate::cpu::CpuFeatures::detect`].
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn sysctl_u32(name: &CStr) -> Result<Option<u32>, crate::Errno> {
+    let mut value = 0u32;
+    let mut len = size_of::<u32>();
+    // SAFETY: `name` is a live NUL-terminated string; `value` is live memory of `len` bytes the
+    // call writes at most `len` of, and `len` is written back; nothing new is set (null, 0).
+    let said = unsafe {
+        cold::sysctlbyname(name.as_ptr(), (&raw mut value).cast(), &raw mut len, core::ptr::null_mut(), 0)
+    };
+    if said != 0 {
+        // SAFETY: as in `thread_counts`.
+        let errno = crate::Errno::from_raw(unsafe { *ffi::__error() } as u16);
+        return if errno == crate::Errno::NoEnt { Ok(None) } else { Err(errno) };
+    }
+    if len != size_of::<u32>() {
+        return Err(crate::Errno::Inval);
+    }
+    Ok(Some(value))
+}
+
 crate::unbuilt! {
     "macOS":
     open_beneath, openat, close, read, pread, write, pwrite, sync_barrier, sync_full, ftruncate,
@@ -606,9 +787,40 @@ mod tests {
     /// Every private symbol says why it and not the public call.
     #[test]
     fn every_private_symbol_says_why() {
-        for symbol in SYMBOLS.iter().filter(|it| it.api == Api::Private) {
+        for symbol in SYMBOLS.iter().chain(COLD_PRIVATE).filter(|it| it.api == Api::Private) {
             assert!(symbol.why.len() > 40, "{:?} gives no reason", symbol.name);
         }
+        assert!(COLD_PRIVATE.iter().all(|it| cold::SYMBOLS.contains(&it.name)), "a cold private symbol is in the cold table");
+    }
+
+    /// The meter's calls (rule macos-private-apis: the private one's symbol exists, and it
+    /// answers): `thread_selfcounts` past this file's definition, and the layouts are libc's.
+    #[test]
+    fn the_meters_calls_exist_and_answer() {
+        // SAFETY: as above.
+        let found = unsafe { ffi::dlsym(RTLD_NEXT, c"thread_selfcounts".as_ptr()) };
+        assert!(!found.is_null(), "libSystem has no `thread_selfcounts` on this macOS");
+        let before = thread_counts().expect("THSC_TIME_CPI answers on this Mac");
+        let mut spin = 0u64;
+        for at in 0..1_000_000u64 {
+            spin = core::hint::black_box(spin.wrapping_add(at));
+        }
+        let after = thread_counts().expect("THSC_TIME_CPI answers on this Mac");
+        assert!(after.instructions > before.instructions + 1_000_000, "a million adds retire a million instructions: {before:?} {after:?}");
+        assert!(after.user_mach + after.system_mach > before.user_mach + before.system_mach);
+        let (numer, denom) = timebase();
+        assert!(numer > 0 && denom > 0);
+        let (usage, info) = process_usage().expect("the process's own usage");
+        assert!(usage.minflt > 0 && info.words[RusageInfoV4::INSTRUCTIONS] >= after.instructions);
+        assert_eq!(size_of::<Rusage>(), size_of::<libc::rusage>());
+        assert_eq!(core::mem::offset_of!(Rusage, minflt), core::mem::offset_of!(libc::rusage, ru_minflt));
+        assert_eq!(size_of::<RusageInfoV4>(), size_of::<libc::rusage_info_v4>());
+        let word = |at: usize| 16 + 8 * at;
+        assert_eq!(word(RusageInfoV4::INSTRUCTIONS), core::mem::offset_of!(libc::rusage_info_v4, ri_instructions));
+        assert_eq!(word(RusageInfoV4::CYCLES), core::mem::offset_of!(libc::rusage_info_v4, ri_cycles));
+        assert_eq!(word(RusageInfoV4::FOOTPRINT), core::mem::offset_of!(libc::rusage_info_v4, ri_phys_footprint));
+        assert_eq!(word(RusageInfoV4::MOST_FOOTPRINT), core::mem::offset_of!(libc::rusage_info_v4, ri_lifetime_max_phys_footprint));
+        assert_eq!(word(RusageInfoV4::PAGEINS), core::mem::offset_of!(libc::rusage_info_v4, ri_pageins));
     }
 
     #[test]
@@ -667,5 +879,23 @@ mod tests {
             assert_eq!(c_int::from(errno.raw()), libcs, "{}", errno.name());
             assert_eq!(Errno::from_raw(errno.raw()), errno);
         }
+    }
+
+    /// `sched_yield` answers; `sysctl_u32` reads what libc's `sysctlbyname` reads, says `None`
+    /// for a name this macOS lacks, and refuses a value wider than 32 bits.
+    #[test]
+    fn sched_yield_and_sysctl_answer_as_libc() {
+        assert_eq!(sched_yield(), Ok(()));
+        let mut libcs = 0u32;
+        let mut len = size_of::<u32>();
+        // SAFETY: as in `sysctl_u32`.
+        let said = unsafe {
+            libc::sysctlbyname(c"hw.ncpu".as_ptr(), (&raw mut libcs).cast(), &raw mut len, core::ptr::null_mut(), 0)
+        };
+        assert_eq!(said, 0);
+        assert_eq!(sysctl_u32(c"hw.ncpu"), Ok(Some(libcs)));
+        assert_eq!(sysctl_u32(c"hw.optional.arm.FEAT_NO_SUCH_FEATURE"), Ok(None));
+        // 64 bits into 32: the kernel's `ENOMEM` for the short buffer, or `Inval` for the size.
+        assert!(sysctl_u32(c"hw.memsize").is_err(), "hw.memsize is 64 bits");
     }
 }

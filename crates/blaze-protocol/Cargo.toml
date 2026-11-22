@@ -21,7 +21,6 @@ reference = []
 [dependencies]
 blaze-hash.workspace = true
 blaze-kit.workspace = true
-blaze-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]

@@ -63,6 +63,25 @@ impl TextMark {
         TextMark { site: mark.site, transparency: mark.transparency, edition: mark.edition }
     }
 
+    /// The stream mark a token of a text keeps when the text is lexed again
+    /// ([`crate::tokens::lex_marked`]): this mark's site, transparency and edition, of an
+    /// earlier expansion ([`crate::MarkOf::Outer`], never `This`: a call's input holds no mark of
+    /// the call's own, `ExpandError::Unsealed`). The column does not keep which expansion wrote
+    /// the token, only these three, so the expansion is named by them: a key hashed from the
+    /// mark's bytes. Two tokens of one text with equal marks are one expansion's to
+    /// [`crate::local_hygiene`] then, as they already are to the text's own lowering, which
+    /// reads the same column.
+    pub fn as_outer_mark(self) -> crate::tokens::Mark {
+        let mut hasher = blaze_ids::Hasher::new("blaze v2 text mark expansion 1");
+        hasher.part(&self.to_bytes());
+        crate::tokens::Mark {
+            of: crate::tokens::MarkOf::Outer(hasher.finish()),
+            transparency: self.transparency,
+            edition: self.edition,
+            site: self.site,
+        }
+    }
+
     /// The mark's [`MARK`] bytes, little-endian: the crate key (32), the module flag u32 (0 none,
     /// 1 some), the module key (32, zero for none), the transparency byte as u32, the edition
     /// byte as u32. One mark has one form: the column's table and the lowered body's marks

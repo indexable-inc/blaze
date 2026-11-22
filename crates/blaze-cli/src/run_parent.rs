@@ -18,7 +18,8 @@
 //!   `make_special`), or else unknown. Nothing of the front end is built until a need requires
 //!   it ([`Front`]): the roots on the first call the start list does not answer, the body ids
 //!   and the maker on the first row that must be keyed. A workspace body is stepped only when
-//!   the gate before the start left its check `Clean` ([`Gate`]); anything else stops the parent
+//!   its check today runs (D151, `Checked::runs`: types whole and no error, asked at the call);
+//!   anything else stops the parent
 //!   by name ([`ParentError::NotChecked`]), never a second check.
 //! - [`Needs`]: the slot bookkeeping, one need answered. A symbol's first need asks the
 //!   [`Resolve`] seam ONCE (however many needs name it later); a record is told with the slots
@@ -60,7 +61,7 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, RowKind, Scratch, Unkeyed, Walk, WalkError};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, NotEmitting, Settings, StoreError, TierName, content_key};
 use blaze_launch::wire::data::Datum;
-use blaze_ladder::run::make_one::{LoweringCounts, MOST_WALKED, Maker, NamesRecords};
+use blaze_ladder::run::make_one::{LoweringCounts, MOST_WALKED, Maker, NamesRecords, SecondCheck};
 use blaze_ladder::run::special::{self, Roots, RootsError, SpecialMade, StartHead, make_special, special_of};
 use blaze_ladder::run::{OverflowChecks, RunError};
 use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol, Up};
@@ -72,10 +73,10 @@ use blaze_typeck::ItemKey;
 use bstd::Cx;
 use bstd::fs::{Content, Dir, Durable, FsError, ReadWrite};
 use bstd::path::{Path, PathError};
-use bstd::procs::Ended;
+use bstd::procs::Exit;
 
-use crate::run_ids::{Checked, Grain, RunIds};
-use crate::start_list::{self, Line, Row, TodayRows};
+use crate::run_ids::{NotRunnable, RunIds, Runnable};
+use crate::start_list::{self, Row, TodayGroup, TodayRows};
 
 /// How long the parent waits for the program's next message before it looks at the child
 /// again (the launcher's own tick is 250 ms: `blaze_launch_rt::run_mode::TICK_MS`).
@@ -142,10 +143,11 @@ pub enum ParentError {
     BodyIds { shown: Box<str> },
     /// The names records the maker and the roots read were not opened (the command's words).
     Names { shown: Box<str> },
-    /// The workspace fn `function` has no clean check today (`why`; `None`: the body ids hold
-    /// nothing for it): the gate before the start must have left it `Clean`, and the parent
-    /// never checks or builds it another way.
-    NotChecked { function: ItemKey, symbol: [u8; 32], why: Option<Checked> },
+    /// The fn `function` may not run (`why`, run_ids.rs `NotRunnable`: a workspace body's
+    /// verdict today, a workspace fn the body ids hold no row for and what they hold beside it,
+    /// or a fn of no crate of the list): the call is the gate, so the program stops here, and
+    /// the parent never checks or builds it another way.
+    NotChecked { function: ItemKey, symbol: [u8; 32], why: NotRunnable },
     /// The code record of `symbol` has a row that lands (a cleanup or a catch that unwinding
     /// must run: its unwind entry needs a personality routine) and no crate of the program
     /// declares `#[lang = "eh_personality"]` (blaze-ladder personality.rs: a program that never
@@ -165,6 +167,16 @@ pub enum ParentError {
     /// specials are made by run/special.rs over no program, so none may (run.md, "Statics in
     /// the run").
     SpecialStatic { symbol: [u8; 32] },
+    /// A C name the program defines (`symbol`, `Symbol::of_name`) was to be declared after a
+    /// record was published: the child may have bound that name outside the program already.
+    /// Refused ([`Needs::declare_c_defined`]): every program-defined C name is declared before
+    /// the first `Publish` (D175; the child refuses the converse, run_mode.rs
+    /// `DefinedAfterBound`).
+    CDefinedLate { symbol: [u8; 32] },
+    /// The program's native library was to be told after `slots` slots were numbered: the
+    /// child takes its `Native` first, before any `Declare` (blaze-launch wire/run.rs), or it
+    /// would hand the entry over before the library is loaded ([`Needs::tell_native`]).
+    NativeLate { slots: usize },
     /// A static row of the walk (`symbol`) was served once already and is not told: a bug of
     /// `Lazy::resolve`'s statics.
     StaticServed { symbol: [u8; 32] },
@@ -204,11 +216,8 @@ pub enum ParentError {
     NotEmitting(NotEmitting),
     /// The start list's rows past its cap (never while `Needs` keeps the window: a bug).
     StartList(start_list::CapError),
-    /// A row placed ahead has no record answer after it was settled (a bug of `place_ahead`).
-    UndeclaredSymbol { symbol: [u8; 32] },
-    /// Start-list rows of data or names placed with no code row after them (static `symbol`
-    /// the first): `read` and [`ahead_of`] leave no group open, so a bug.
-    StartGroupOpen { symbol: [u8; 32] },
+    /// The record id `record` is not a file name of the records folder.
+    RecordName { record: [u8; 32] },
     /// The walk forward from the roots stepped `most` functions the program has not called and
     /// did not reach `symbol` (rule 18).
     TooFar { symbol: [u8; 32], most: usize },
@@ -225,12 +234,13 @@ impl fmt::Display for ParentError {
             ParentError::BodyIds { shown } => write!(f, "{rule}: the body ids: {shown}"),
             ParentError::Names { shown } => write!(f, "{rule}: the names records: {shown}"),
             ParentError::NotChecked { function, symbol, why } => {
-                write!(f, "{rule}: the program called fn {:#x} (symbol {}), a workspace body ", function.0, Hex(symbol))?;
+                write!(f, "{rule}: the program called fn {:#x} (symbol {}), which may not run: ", function.0, Hex(symbol))?;
                 match why {
-                    Some(why) => write!(f, "whose check today is {why:?}")?,
-                    None => write!(f, "the body ids hold nothing for")?,
+                    NotRunnable::Checked(verdict) => write!(f, "a workspace body whose check today is {verdict:?}")?,
+                    NotRunnable::NoRow(held) => write!(f, "a workspace body the body ids hold nothing for ({held})")?,
+                    NotRunnable::NoGrain { .. } | NotRunnable::Unread(_) => write!(f, "{why}")?,
                 }
-                write!(f, "; the gate before the start leaves every body the program reaches `Clean`, and the parent never checks or builds one another way")
+                write!(f, "; the call is the gate (D151): a workspace body is run only when its types were checked whole and it has no error (`Clean`, or `Typed`: its borrow check refused or not run), and the parent never checks or builds one another way")
             }
             ParentError::NoPersonality { function, path, symbol } => {
                 match (path, function) {
@@ -248,6 +258,8 @@ impl fmt::Display for ParentError {
             ParentError::Unwind { symbol, why } => write!(f, "{rule}: the unwind rows of the code record of symbol {}: {why}", Hex(symbol)),
             ParentError::ResolvedTwice { symbol } => write!(f, "{rule}: the symbol {} was resolved twice (run_parent.rs `Needs` asks once a symbol)", Hex(symbol)),
             ParentError::SpecialStatic { symbol } => write!(f, "{rule}: the run's special record {} names a static, and the specials are made over no program (run.md, \"Statics in the run\")", Hex(symbol)),
+            ParentError::NativeLate { slots } => write!(f, "{rule}: the program's native library was to be told after {slots} slots were numbered: it is the run's first frame, before any `Declare` (run_parent.rs `Needs::tell_native`, blaze-launch wire/run.rs `Down::Native`)"),
+            ParentError::CDefinedLate { symbol } => write!(f, "{rule}: the program's own C name of symbol {} was declared after a record was published: every program-defined C name is declared before the first record (run_parent.rs `Needs::declare_c_defined`)", Hex(symbol)),
             ParentError::StaticServed { symbol } => write!(f, "{rule}: the static {} was served once and is not among the statics told (run_parent.rs `Lazy::resolve`)", Hex(symbol)),
             ParentError::StaticUnsent { record, symbol, instance, touches_tls } => {
                 write!(f, "{rule}: record {}", Hex(record))?;
@@ -274,8 +286,7 @@ impl fmt::Display for ParentError {
             ParentError::Full => write!(f, "{rule}: the program asked for more than {MOST_SLOTS} functions"),
             ParentError::NotEmitting(why) => write!(f, "{rule}: {why}"),
             ParentError::StartList(why) => write!(f, "{rule}: {why}"),
-            ParentError::UndeclaredSymbol { symbol } => write!(f, "{rule}: the start list's row of symbol {} was placed ahead without a slot", Hex(symbol)),
-            ParentError::StartGroupOpen { symbol } => write!(f, "{rule}: the start list's rows naming static {} were placed with no code row after them (run_parent.rs `Needs::place_ahead`)", Hex(symbol)),
+            ParentError::RecordName { record } => write!(f, "{rule}: the record id {} is not a file name of `{RECORDS}`", Hex(record)),
             ParentError::TooFar { symbol, most } => write!(f, "{rule}: the walk forward from the roots stepped {most} functions the program has not called and did not reach symbol {}", Hex(symbol)),
         }
     }
@@ -327,7 +338,9 @@ pub(crate) fn launch_env<'e, A: Allocator>(
     grants: Option<&'e str>,
     out: &mut Vec<(&'e str, &'e str), A>,
 ) {
-    const OURS: [&str; 4] = ["BLAZE_LAUNCH_FD", "BLAZE_LAUNCH_STORE", "BLAZE_LAUNCH_ENTRY", blaze_launch::grants::VAR];
+    // BLAZE_LAUNCH_NATIVE is the parent's word alone (own_process.rs sets it when the image
+    // holds native code): one of the command's own is never passed on.
+    const OURS: [&str; 5] = ["BLAZE_LAUNCH_FD", "BLAZE_LAUNCH_STORE", "BLAZE_LAUNCH_ENTRY", "BLAZE_LAUNCH_NATIVE", blaze_launch::grants::VAR];
     for (name, value) in env {
         if !OURS.contains(&name) {
             out.push((name, value));
@@ -341,14 +354,13 @@ pub(crate) fn launch_env<'e, A: Allocator>(
     }
 }
 
-/// How the child ended, as `blaze run`'s status; `None` while it runs.
-pub(crate) fn status_of(ended: Ended) -> Option<u8> {
-    match ended {
+/// How the child ended, as `blaze run`'s status.
+pub(crate) fn status_of(exit: Exit) -> u8 {
+    match exit {
         // A process's exit status is its low 8 bits (`_exit`): what the kernel reports.
-        Ended::Exited(status) => Some((status & 0xff) as u8),
+        Exit::Exited(status) => (status & 0xff) as u8,
         // The shell's form for an end by signal: 128 + its number.
-        Ended::Signaled(signal) => Some(128u8.saturating_add((signal & 0x7f) as u8)),
-        Ended::Deadline => None,
+        Exit::Signaled(signal) => 128u8.saturating_add((signal & 0x7f) as u8),
     }
 }
 
@@ -393,20 +405,16 @@ pub(crate) trait Resolve {
     }
 }
 
-/// THE GATE'S PROOF, read before a row is stepped: which grain a fn's body is keyed at and,
-/// for a workspace body, what its check left today (run_ids.rs).
+/// THE GATE, asked before a row is stepped: the proof that the fn may run (run_ids.rs
+/// `Runnable`), or why not. The step takes the proof ([`Cleared`]), so no row is stepped that
+/// the gate did not let.
 pub(crate) trait Gate: BodyIds {
-    fn grain(&self, item: ItemKey) -> Option<Grain>;
-    fn checked(&self, item: ItemKey) -> Option<Checked>;
+    fn runnable(&self, item: ItemKey) -> Result<Runnable, NotRunnable>;
 }
 
 impl Gate for RunIds<'_> {
-    fn grain(&self, item: ItemKey) -> Option<Grain> {
-        RunIds::grain(self, item)
-    }
-
-    fn checked(&self, item: ItemKey) -> Option<Checked> {
-        RunIds::checked(self, item)
+    fn runnable(&self, item: ItemKey) -> Result<Runnable, NotRunnable> {
+        RunIds::runnable(self, item)
     }
 }
 
@@ -462,7 +470,9 @@ pub(crate) trait Publication {
 pub(crate) trait Front: Publication {
     type Start: Start;
     type Ids: Gate;
-    type Maker: Make<Error = RunError>;
+    /// The maker takes the run gate's proof and nothing else (D163: `Runnable` is the only
+    /// thing the make path accepts).
+    type Maker: Make<Error = RunError, Grant = Runnable>;
     fn start(&mut self) -> Result<Self::Start, ParentError>;
     fn ids(&mut self) -> Result<Self::Ids, ParentError>;
     fn maker(&mut self, start: &Self::Start) -> Result<Self::Maker, ParentError>;
@@ -565,10 +575,16 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
     }
 }
 
+/// THE RUN'S MAKER: handed the run gate's proof ([`Runnable`]), each body's checked columns
+/// from the typing seam (blaze-ladder make_one.rs `Typing`). THE FLIP of D163 part 2 is this
+/// line's [`SecondCheck`] (and the value each `Maker::of_roots` below is handed) becoming
+/// `FromRecord<the check's typed records>`; then `SecondCheck` has no production caller.
+pub(crate) type RunMaker<'h> = Maker<'h, Runnable, SecondCheck>;
+
 impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     type Start = Roots<'r>;
     type Ids = RunIds<'h>;
-    type Maker = Maker<'h>;
+    type Maker = RunMaker<'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         let names = self.names()?;
@@ -580,10 +596,10 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
         (self.ids)()
     }
 
-    fn maker(&mut self, start: &Roots<'r>) -> Result<Maker<'h>, ParentError> {
+    fn maker(&mut self, start: &Roots<'r>) -> Result<RunMaker<'h>, ParentError> {
         let names = self.names()?;
         // `run_roots` start by the rule (`MakerStart::ByRule`): what `Maker::new` did.
-        Ok(Maker::of_roots(names, start.maker_entry(), start, &self.builder, self.tables))
+        Ok(Maker::of_roots(names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables))
     }
 
     /// From the names records: the checker key's library item (its first 16 bytes,
@@ -594,7 +610,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
 
     /// By the lazy program's printer when the maker made it (its key map files every member,
     /// so a fn of an impl is named by the impl's header), else from the records alone.
-    fn named(&mut self, maker: Option<&Maker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+    fn named(&mut self, maker: Option<&RunMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
         use crate::run_fault::Named;
         if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
             return Named::Shown { item: shown.item, args: shown.args };
@@ -606,7 +622,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     }
 
     /// By the lazy program the maker made (its key map places members too); none without it.
-    fn site_shown(&mut self, maker: Option<&Maker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+    fn site_shown(&mut self, maker: Option<&RunMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
         let (file, line, column) = maker?.site_shown(item, site)?;
         Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
     }
@@ -702,7 +718,7 @@ pub(crate) struct RecordsDir<'r> {
 fn file_name(id: &[u8; 32], out: &mut [u8; 64]) -> Result<Path, ParentError> {
     *out = hex(id);
     // The digits are ASCII: always UTF-8.
-    let name = core::str::from_utf8(out).map_err(|_| ParentError::UndeclaredSymbol { symbol: *id })?;
+    let name = core::str::from_utf8(out).map_err(|_| ParentError::RecordName { record: *id })?;
     Path::new(name).map_err(ParentError::Path)
 }
 
@@ -777,7 +793,8 @@ pub(crate) enum ListHeld {
 }
 
 /// The start list's half of the closing count: `start list: placed P of F first answers (D
-/// data); resolved after the list R; front end built: no` (or `yes (..)`, naming why).
+/// data, Q positioned); resolved after the list R; front end built: no` (or `yes (..)`,
+/// naming why).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct StartTally {
     /// Code rows placed from today's list.
@@ -786,6 +803,9 @@ pub(crate) struct StartTally {
     pub answered: usize,
     /// Datum rows placed from today's list.
     pub data: usize,
+    /// Positioned groups placed from today's list (start_list.rs version 5), counted among
+    /// `placed`.
+    pub positioned: usize,
     /// Symbols asked of the resolver (each once; an unknown one too).
     pub resolved: usize,
     pub built: Built,
@@ -796,8 +816,8 @@ impl fmt::Display for StartTally {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "start list: placed {} of {} first answers ({} data); resolved after the list {}; front end built: ",
-            self.placed, self.answered, self.data, self.resolved
+            "start list: placed {} of {} first answers ({} data, {} positioned); resolved after the list {}; front end built: ",
+            self.placed, self.answered, self.data, self.positioned, self.resolved
         )?;
         match self.built {
             Built::No => f.write_str("no")?,
@@ -827,6 +847,9 @@ pub(crate) struct RunTally {
     pub codes: Tally,
     pub start: StartTally,
     pub lowerings: LoweringCounts,
+    /// The record walk's own counts (body_ids.rs `Counts`): its names' longest, most items and
+    /// arena bytes among them; `None` when the run never started the walk.
+    pub walk: Option<body_ids::Counts>,
 }
 
 /// The body ids and the maker: made on the first row stepped.
@@ -854,9 +877,11 @@ pub(crate) struct Lazy<'r, 'a, F: Front, D: Folder> {
     builder: Builder,
     alloc: Alloc<'a>,
     started: Option<Started<'a, F::Start, F::Ids, F::Maker>>,
-    /// The symbols placed from today's start list, sorted: their records are published, and the
-    /// walk steps such a row (found in the store) only to reach a callee the program asks for.
-    placed: AVec<'a, [u8; 32]>,
+    /// The symbols placed from today's start list, sorted, each with the list's proof that it
+    /// may run (run_ids.rs `Runnable::listed`): their records are published, and the walk steps
+    /// such a row (found in the store) only to reach a callee the program asks for, under that
+    /// proof, never the gate again (rule 74).
+    placed: AVec<'a, ([u8; 32], Runnable)>,
     /// The last record's declared symbols, handed out in [`Resolved::Record`].
     declares: AVec<'a, Symbol>,
     /// The rows stepped walking forward from the roots to reach a callee no placed row led to
@@ -878,13 +903,88 @@ pub(crate) struct Lazy<'r, 'a, F: Front, D: Folder> {
     built: Built,
 }
 
-/// A row stepped ahead of its first call, as `step` answered it: its entry kept when it is not
-/// in the store under its key (made or unkeyed: the scratch's bytes are the next step's).
-struct Ahead<'a> {
-    row: usize,
-    how: How,
-    key: Option<CodeKey>,
-    bytes: Option<AVec<'a, u8>>,
+/// A row of the walk, by its index: the one id [`Ahead`] and [`Cleared`] name a row by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WalkRow(usize);
+
+use cleared::Cleared;
+
+/// The one home of [`Cleared`]: its fields are private here, so a row and a proof are paired
+/// only by its two makers, each of which derives the proof FROM the row (its fn asked of the
+/// gate, or its symbol found in today's list). A proof of another body cannot be handed to
+/// [`step`]: there is no way to write the pair (rule 76).
+mod cleared {
+    use super::{Gate, ParentError, WalkRow};
+    use crate::run_ids::Runnable;
+    use blaze_ladder::body_ids::Walk;
+
+    /// A row the gate let run, with its proof (run_ids.rs `Runnable`): what [`super::step`]
+    /// takes, so no row is stepped that the gate did not let.
+    pub(super) struct Cleared {
+        row: WalkRow,
+        proof: Runnable,
+    }
+
+    impl Cleared {
+        /// THE GATE for `row`, asked of `ids` now (run_ids.rs `RunIds::runnable`) for the row's
+        /// own fn: its proof, or the parent's stop naming the fn and why (rule 19).
+        pub(super) fn gated<G: Gate + ?Sized>(walk: &Walk<'_>, ids: &G, row: usize) -> Result<Cleared, ParentError> {
+            let function = walk.tabled(row);
+            let proof = ids.runnable(function).map_err(|why| ParentError::NotChecked { function, symbol: walk.symbol(row).0, why })?;
+            Ok(Cleared { row: WalkRow(row), proof })
+        }
+
+        /// `row`'s proof from today's start list, when the row's own symbol was placed from it
+        /// (run_ids.rs `Runnable::listed`); `None`: it was not.
+        pub(super) fn placed(walk: &Walk<'_>, placed: &[([u8; 32], Runnable)], row: usize) -> Option<Cleared> {
+            let symbol = walk.symbol(row).0;
+            let at = placed.binary_search_by_key(&symbol, |placed| placed.0).ok()?;
+            Some(Cleared { row: WalkRow(row), proof: placed[at].1 })
+        }
+
+        /// The row, and the proof it was let run by, taken apart by the one step.
+        pub(super) fn into_parts(self) -> (WalkRow, Runnable) {
+            (self.row, self.proof)
+        }
+    }
+}
+
+/// What a made row's entry is (finding 16): put under its key, or made with none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Made {
+    Put(CodeKey),
+    Unkeyed(Unkeyed),
+}
+
+/// What one step answered: its entry found in the store under its key, or made (the scratch's
+/// bytes are the made entry until the next step).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stepped {
+    Found(CodeKey),
+    Made(Made),
+}
+
+/// A row stepped ahead of its first call, as [`step`] answered it (finding 16): found, by its
+/// key; or made, with its entry kept (the scratch's bytes are the next step's).
+enum Ahead<'a> {
+    Found { row: WalkRow, key: CodeKey },
+    Made { row: WalkRow, made: Made, entry: AVec<'a, u8> },
+}
+
+impl Ahead<'_> {
+    fn row(&self) -> WalkRow {
+        match self {
+            Ahead::Found { row, .. } | Ahead::Made { row, .. } => *row,
+        }
+    }
+}
+
+/// A row served at its first call ([`serve`]): found by its key, made now (its entry the
+/// scratch's), or made ahead (its entry kept).
+enum Served<'a> {
+    Found(CodeKey),
+    MadeNow(Made),
+    MadeAhead(Made, AVec<'a, u8>),
 }
 
 impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
@@ -937,9 +1037,14 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         self.tally
     }
 
+    /// The record walk's counts (its names' sizes among them), once it started.
+    pub(crate) fn walk_counts(&self) -> Option<body_ids::Counts> {
+        self.started.as_ref().map(|started| started.walk.counts())
+    }
+
     pub(crate) fn lowering_counts<'h>(&self) -> LoweringCounts
     where
-        F: Front<Maker = Maker<'h>>,
+        F: Front<Maker = RunMaker<'h>>,
     {
         self.started.as_ref().and_then(|s| s.heavy.as_ref()).map_or_else(LoweringCounts::default, |heavy| heavy.maker.lowering_counts())
     }
@@ -967,28 +1072,24 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         self.front.site_shown(maker, item, site)
     }
 
-    /// `lines` placed ahead from today's start list: each code row's symbol among the placed
-    /// (the walk steps such a row only to reach a callee), each datum's among the statics told
-    /// (a later record reaching it sends it again never), each row reached and found.
-    fn placed(&mut self, lines: &[Line]) {
+    /// `groups` placed ahead from today's start list: each code row's symbol among the placed
+    /// with the list's proof (the walk steps such a row only to reach a callee), each datum's
+    /// among the statics told (a later record reaching it sends it again never), each row
+    /// reached and found.
+    fn placed(&mut self, groups: &[TodayGroup<'_>]) {
         let mut rows = 0usize;
-        for line in lines {
-            match line {
-                Line::Code(row) => {
-                    self.placed.push(row.symbol.0);
-                    rows += 1;
+        for group in groups {
+            self.placed.push((group.code().symbol.0, Runnable::listed(group)));
+            rows += 1;
+            for datum in group.view().data() {
+                if let Err(at) = self.told.binary_search(&datum.symbol.0) {
+                    self.told.insert(at, datum.symbol.0);
                 }
-                Line::Datum(datum) => {
-                    if let Err(at) = self.told.binary_search(&datum.symbol.0) {
-                        self.told.insert(at, datum.symbol.0);
-                    }
-                    rows += 1;
-                }
-                Line::Named(_) => {}
+                rows += 1;
             }
         }
-        self.placed.sort_unstable();
-        self.placed.dedup();
+        self.placed.sort_unstable_by_key(|placed| placed.0);
+        self.placed.dedup_by_key(|placed| placed.0);
         self.tally.reached += rows;
         self.tally.found += rows;
         self.front.watch().see(Step::Placed { rows: u32::try_from(rows).unwrap_or(u32::MAX) });
@@ -1030,53 +1131,67 @@ fn ensure<'s, 'a, F: Front>(slot: &'s mut Option<Started<'a, F::Start, F::Ids, F
     Ok(slot.insert(started))
 }
 
-/// ONE step of the walk for `row`: the body ids and the maker made if they are not yet, THE
-/// GATE'S PROOF read (a workspace body must be `Clean` today), then `Walk::one` in its span,
-/// whose event says how it was answered.
-fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F::Ids, F::Maker>, store: &mut dyn CodeStore, builder: &Builder, row: usize) -> Result<(How, Option<CodeKey>), ParentError> {
-    let symbol = started.walk.symbol(row).0;
-    let heavy = match started.heavy.take() {
+/// The body ids and the maker, made on the first row stepped.
+fn heavy<'h, F: Front>(front: &mut F, slot: &'h mut Option<Heavy<F::Ids, F::Maker>>, start: &F::Start) -> Result<&'h mut Heavy<F::Ids, F::Maker>, ParentError> {
+    let heavy = match slot.take() {
         Some(heavy) => heavy,
         None => {
             let ids = front.ids()?;
-            let maker = front.maker(&started.start)?;
+            let maker = front.maker(start)?;
             Heavy { ids, maker }
         }
     };
-    let heavy = started.heavy.insert(heavy);
+    Ok(slot.insert(heavy))
+}
+
+/// THE GATE for `row`, asked now (run_ids.rs `RunIds::runnable`): its fn's proof that it may
+/// run, or the parent's stop naming the fn and why (rule 19).
+fn clear<F: Front>(front: &mut F, started: &mut Started<'_, F::Start, F::Ids, F::Maker>, row: usize) -> Result<Cleared, ParentError> {
+    let heavy = heavy(front, &mut started.heavy, &started.start)?;
+    Cleared::gated(&started.walk, &heavy.ids, row)
+}
+
+/// ONE step of the walk for the row `cleared` names, under its proof: the body ids and the
+/// maker made if they are not yet, then `Walk::one` in its span, whose event says how it was
+/// answered. The only caller of `Walk::one`.
+fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F::Ids, F::Maker>, store: &mut dyn CodeStore, builder: &Builder, cleared: Cleared) -> Result<Stepped, ParentError> {
+    // The proof was derived from this row by its maker (`Cleared::gated`, `Cleared::placed`):
+    // it is this row's body's, by construction, and nothing here compares it again (rule 74).
+    // The make takes it (D163): no instance is made without the gate's proof in hand.
+    let (WalkRow(row), proof) = cleared.into_parts();
+    let symbol = started.walk.symbol(row).0;
     let tabled = started.walk.tabled(row);
-    if heavy.ids.grain(tabled) == Some(Grain::Workspace) {
-        match heavy.ids.checked(tabled) {
-            Some(Checked::Clean) => {}
-            why => return Err(ParentError::NotChecked { function: tabled, symbol, why }),
-        }
-    }
+    let heavy = heavy(front, &mut started.heavy, &started.start)?;
     let path = if front.watch().paths() { front.path_of(tabled) } else { None };
     front.watch().see(Step::Resolving { path: path.as_deref() });
     let cx = cx.span(FIRST_CALL_SPAN);
     let one = started
         .walk
-        .one(row, &heavy.ids, store, builder, &builder.producer, &mut heavy.maker, front.form(), MOST_WALKED, &mut started.scratch)
+        .one(row, &heavy.ids, store, builder, &builder.producer, &mut heavy.maker, &proof, front.form(), MOST_WALKED, &mut started.scratch)
         .map_err(|why| ParentError::Walk { symbol, why })?;
-    let (how, key) = (one.how, one.key);
-    cx.event(match how {
-        How::Found => HOW_FOUND,
-        How::Made => HOW_MADE,
-        How::Unkeyed(Unkeyed::NoRecord) => HOW_NO_RECORD,
-        How::Unkeyed(Unkeyed::Stale { .. }) => HOW_STALE,
-        // `one` never answers `Waiting`.
-        How::Waiting => FIRST_CALL_SPAN,
+    // Total: a step's answer carries its key in the variant (body_ids.rs `Stepped`), and is
+    // never waiting.
+    let stepped = match one.stepped {
+        body_ids::Stepped::Found(key) => Stepped::Found(key),
+        body_ids::Stepped::Made(key) => Stepped::Made(Made::Put(key)),
+        body_ids::Stepped::Unkeyed(unkeyed) => Stepped::Made(Made::Unkeyed(unkeyed)),
+    };
+    cx.event(match stepped {
+        Stepped::Found(_) => HOW_FOUND,
+        Stepped::Made(Made::Put(_)) => HOW_MADE,
+        Stepped::Made(Made::Unkeyed(Unkeyed::NoRecord)) => HOW_NO_RECORD,
+        Stepped::Made(Made::Unkeyed(Unkeyed::Stale { .. })) => HOW_STALE,
     });
-    front.watch().see(Step::Answered(match how {
-        How::Found => Answered::Found,
-        How::Made => Answered::Made,
-        How::Unkeyed(_) | How::Waiting => Answered::Unkeyed,
+    front.watch().see(Step::Answered(match stepped {
+        Stepped::Found(_) => Answered::Found,
+        Stepped::Made(Made::Put(_)) => Answered::Made,
+        Stepped::Made(Made::Unkeyed(_)) => Answered::Unkeyed,
     }));
-    Ok((how, key))
+    Ok(stepped)
 }
 
-/// Row `row` served once: stepped now if it is waiting, else taken from what its step ahead
-/// answered (`twice`: the refusal when it is neither, a row served already).
+/// Row `row` served once: gated and stepped now if it is waiting, else taken from what its step
+/// ahead answered (`twice`: the refusal when it is neither, a row served already).
 #[expect(clippy::too_many_arguments, reason = "the resolver's parts, borrowed apart")]
 fn serve<'a, F: Front>(
     cx: &Cx,
@@ -1087,14 +1202,30 @@ fn serve<'a, F: Front>(
     ahead: &mut AVec<'a, Ahead<'a>>,
     row: usize,
     twice: ParentError,
-) -> Result<(How, Option<CodeKey>, Option<AVec<'a, u8>>), ParentError> {
+) -> Result<Served<'a>, ParentError> {
     if started.walk.how(row) == How::Waiting {
-        let (how, key) = step(cx, front, started, store, builder, row)?;
-        return Ok((how, key, None));
+        let cleared = clear(front, started, row)?;
+        return Ok(match step(cx, front, started, store, builder, cleared)? {
+            Stepped::Found(key) => Served::Found(key),
+            Stepped::Made(made) => Served::MadeNow(made),
+        });
     }
-    let Some(i) = ahead.iter().position(|one| one.row == row) else { return Err(twice) };
-    let one = ahead.swap_remove(i);
-    Ok((one.how, one.key, one.bytes))
+    let Some(i) = ahead.iter().position(|one| one.row() == WalkRow(row)) else { return Err(twice) };
+    Ok(match ahead.swap_remove(i) {
+        Ahead::Found { key, .. } => Served::Found(key),
+        Ahead::Made { made, entry, .. } => Served::MadeAhead(made, entry),
+    })
+}
+
+/// The entry `served` answered: the store's under its key, the scratch's (made now), or the one
+/// kept (made ahead). `symbol` names a refusal.
+fn entry_of<'e>(served: &'e Served<'_>, store: &'e dyn CodeStore, scratch: &'e Scratch<'_>, symbol: [u8; 32]) -> Result<&'e [u8], ParentError> {
+    match served {
+        Served::Found(key) => store.get(*key).map_err(|why| ParentError::Store { symbol, why })?.ok_or(ParentError::NotStored { symbol }),
+        // The made entry; an unkeyed one is not put, so these bytes are its only copy.
+        Served::MadeNow(_) => Ok(scratch.made()),
+        Served::MadeAhead(_, entry) => Ok(entry.as_slice()),
+    }
 }
 
 /// The rows `row`'s entry declares, split by kind: an instance's symbol onto `declares` (its
@@ -1117,12 +1248,21 @@ fn callees(walk: &Walk<'_>, row: usize, declares: &mut AVec<'_, Symbol>, told: &
     }
 }
 
-fn count(tally: &mut Tally, how: How) {
+fn count(tally: &mut Tally, served: &Served<'_>) {
     tally.reached += 1;
-    match how {
-        How::Found => tally.found += 1,
-        How::Made => tally.made += 1,
-        How::Unkeyed(_) | How::Waiting => tally.unkeyed += 1,
+    match served {
+        Served::Found(_) => tally.found += 1,
+        Served::MadeNow(Made::Put(_)) | Served::MadeAhead(Made::Put(_), _) => tally.made += 1,
+        Served::MadeNow(Made::Unkeyed(_)) | Served::MadeAhead(Made::Unkeyed(_), _) => tally.unkeyed += 1,
+    }
+}
+
+/// The key of `served`'s row in the next start list: its key, or, for an unkeyed instance, its
+/// entry's content key.
+fn listed_key(served: &Served<'_>, entry: &[u8]) -> CodeKey {
+    match served {
+        Served::Found(key) | Served::MadeNow(Made::Put(key)) | Served::MadeAhead(Made::Put(key), _) => *key,
+        Served::MadeNow(Made::Unkeyed(_)) | Served::MadeAhead(Made::Unkeyed(_), _) => content_key(entry),
     }
 }
 
@@ -1154,8 +1294,10 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         // program has not run is stepped.
         let mut at = 0;
         while row.is_none() && at < started.walk.len() {
-            if started.walk.how(at) == How::Waiting && placed.binary_search(&started.walk.symbol(at).0).is_ok() {
-                step(cx, front, started, &mut **store, &builder, at)?;
+            if started.walk.how(at) == How::Waiting
+                && let Some(cleared) = Cleared::placed(&started.walk, placed.as_slice(), at)
+            {
+                step(cx, front, started, &mut **store, &builder, cleared)?;
                 row = started.walk.row_of(&code);
             }
             at += 1;
@@ -1202,16 +1344,16 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
                     return Err(ParentError::TooFar { symbol: symbol.0, most: MOST_WALKED });
                 }
                 stepped += 1;
-                let (how, key) = step(cx, front, started, &mut **store, &builder, at)?;
-                let bytes = match how {
-                    How::Found => None,
-                    How::Made | How::Unkeyed(_) | How::Waiting => {
-                        let mut bytes: AVec<'_, u8> = Vec::new_in(*alloc);
-                        bytes.extend_from_slice(started.scratch.made());
-                        Some(bytes)
+                let cleared = clear(front, started, at)?;
+                let one = match step(cx, front, started, &mut **store, &builder, cleared)? {
+                    Stepped::Found(key) => Ahead::Found { row: WalkRow(at), key },
+                    Stepped::Made(made) => {
+                        let mut entry: AVec<'_, u8> = Vec::new_in(*alloc);
+                        entry.extend_from_slice(started.scratch.made());
+                        Ahead::Made { row: WalkRow(at), made, entry }
                     }
                 };
-                ahead.push(Ahead { row: at, how, key, bytes });
+                ahead.push(one);
                 row = started.walk.row_of(&code);
             }
             at += 1;
@@ -1224,21 +1366,13 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         }
         // A row stepped ahead is served once, from what its step answered; any other row that is
         // not waiting was served already.
-        let (how, key, held) = serve(cx, front, started, &mut **store, &builder, ahead, row, ParentError::ResolvedTwice { symbol: symbol.0 })?;
-        let entry: &[u8] = match (&held, how) {
-            (Some(bytes), _) => bytes.as_slice(),
-            (None, How::Found) => {
-                let key = key.ok_or(ParentError::NotStored { symbol: symbol.0 })?;
-                store.get(key).map_err(|why| ParentError::Store { symbol: symbol.0, why })?.ok_or(ParentError::NotStored { symbol: symbol.0 })?
-            }
-            // The made entry; an unkeyed one is not put, so these bytes are its only copy.
-            (None, How::Made | How::Unkeyed(_) | How::Waiting) => started.scratch.made(),
-        };
+        let served = serve(cx, front, started, &mut **store, &builder, ahead, row, ParentError::ResolvedTwice { symbol: symbol.0 })?;
+        let entry = entry_of(&served, &**store, &started.scratch, symbol.0)?;
         let record = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
         prepare_publication(&mut *front, started.start.head().personality, Some(started.walk.tabled(row)), symbol.0, record, values)?;
         let id = folder.file(record)?;
         // An unkeyed instance's row in the next list: its entry's content key.
-        let key = key.unwrap_or_else(|| content_key(entry));
+        let key = listed_key(&served, entry);
         front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
         callees(&started.walk, row, declares, told, statics);
         // The vtables the record names: each a datum the entry carries, filed and sent in this
@@ -1251,7 +1385,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             }
             Ok(())
         })?;
-        count(tally, how);
+        count(tally, &served);
         // The statics the record reaches and this run has not told, each served once and its
         // datum filed; their own callees after them (a static's value names statics, and fns
         // from step 2 on: those are declared like the record's own).
@@ -1260,20 +1394,13 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             let at = statics[next];
             next += 1;
             let static_ = started.walk.symbol(at).0;
-            let (how, key, held) = serve(cx, front, started, &mut **store, &builder, ahead, at, ParentError::StaticServed { symbol: static_ })?;
-            let entry: &[u8] = match (&held, how) {
-                (Some(bytes), _) => bytes.as_slice(),
-                (None, How::Found) => {
-                    let key = key.ok_or(ParentError::NotStored { symbol: static_ })?;
-                    store.get(key).map_err(|why| ParentError::Store { symbol: static_, why })?.ok_or(ParentError::NotStored { symbol: static_ })?
-                }
-                (None, How::Made | How::Unkeyed(_) | How::Waiting) => started.scratch.made(),
-            };
+            let served = serve(cx, front, started, &mut **store, &builder, ahead, at, ParentError::StaticServed { symbol: static_ })?;
+            let entry = entry_of(&served, &**store, &started.scratch, static_)?;
             let datum = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: static_, why })?;
             data.push(Datum { symbol: Symbol(static_), record: folder.file(datum)? });
             front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: static_, why })?;
             callees(&started.walk, at, declares, told, statics);
-            count(tally, how);
+            count(tally, &served);
         }
         named.sort_unstable();
         named.dedup();
@@ -1295,15 +1422,17 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
 /// writer tells it before the first record naming it. Whatever is left out is resolved at its
 /// first call like any other (rule 3: nothing is published that is not there). The start's
 /// head: the list's when there is one (nothing of the front end is made), else the roots'.
-/// `Needs::first_answer` omits groups requiring source positions when it writes the list.
-/// This replay therefore needs no source lookup. A later group can still name a static
-/// from an omitted group, which is why its dependencies are checked here.
-/// `kept` holds the rows placed.
-pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
-    today: Option<TodayRows<'_>>,
+/// A positioned group (start_list.rs version 5) is kept with its values rows, which
+/// `Needs::place_ahead` sends in its `Positioned`: the list is today's, so they are today's
+/// positions and this replay needs no source lookup. A group left out for a file the folder
+/// does not hold still takes its data with it, which is why a later group's names are checked
+/// here. `kept` holds the groups placed (each a [`TodayGroup`]: the list is today's, so each
+/// group's row runs under the list's proof, run_ids.rs `Runnable::listed`).
+pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
+    today: Option<TodayRows<'b>>,
     lazy: &mut Lazy<'_, '_, F, D>,
     needs: &mut Needs<'_>,
-    kept: &mut AVec<'_, Line>,
+    kept: &mut AVec<'_, TodayGroup<'b>>,
     out: &mut std::vec::Vec<u8, A>,
 ) -> Result<StartHead, ParentError> {
     let Some(today) = today else {
@@ -1316,64 +1445,58 @@ pub(crate) fn ahead_of<F: Front, D: Folder, A: Allocator>(
     let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
     // The statics the groups kept so far send, sorted.
     let mut on: AVec<'_, [u8; 32]> = Vec::new_in(lazy.alloc);
-    let mut group = kept.len();
-    let mut whole = true;
-    for line in today.lines() {
-        match line {
-            Line::Datum(datum) => whole &= lazy.folder().holds(&datum.record)?,
-            Line::Named(_) => {}
-            Line::Code(row) => whole &= lazy.folder().holds(&row.record)?,
+    for group in today.groups() {
+        let view = group.view();
+        // A positioned group's values are today's (the certificate is): nothing to hold.
+        let mut whole = true;
+        for datum in view.data() {
+            whole &= lazy.folder().holds(&datum.record)?;
         }
-        kept.push(line);
-        let Line::Code(_) = line else { continue };
-        let lines = &kept[group..];
-        let stands = |symbol: &Symbol| {
-            symbol.0 == descriptor || on.binary_search(&symbol.0).is_ok() || lines.iter().any(|it| matches!(it, Line::Datum(datum) if datum.symbol == *symbol))
-        };
-        if whole && !lines.iter().any(|it| matches!(it, Line::Named(symbol) if !stands(symbol))) {
-            for it in lines {
-                if let Line::Datum(datum) = it
-                    && let Err(at) = on.binary_search(&datum.symbol.0)
-                {
-                    on.insert(at, datum.symbol.0);
-                }
+        whole &= lazy.folder().holds(&group.code().record)?;
+        let stands = |symbol: &Symbol| symbol.0 == descriptor || on.binary_search(&symbol.0).is_ok() || view.data().any(|datum| datum.symbol == *symbol);
+        if !whole || !view.named().all(|symbol| stands(&symbol)) {
+            continue;
+        }
+        for datum in view.data() {
+            if let Err(at) = on.binary_search(&datum.symbol.0) {
+                on.insert(at, datum.symbol.0);
             }
-        } else {
-            kept.truncate(group);
         }
-        group = kept.len();
-        whole = true;
+        kept.push(group);
     }
-    // `read` refused a list ending in data or names with no code row; nothing is left open.
-    kept.truncate(group);
     needs.place_ahead(kept.as_slice(), out)?;
     lazy.placed(kept.as_slice());
     Ok(head)
 }
 
-/// What a symbol is to this run, once met.
+/// What a symbol is to this run once met (finding 9); a symbol not in [`Needs::met`] is met
+/// by no need and no record: neither declared nor asked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Answer {
-    /// Declared (a record's target) and not needed yet: not resolved.
-    NotAsked,
+enum Met {
+    /// Declared through `Slot` (a record's target, or the personality routine) and not
+    /// answered yet: a need of it resolves it.
+    Declared(Slot),
     /// Resolved, or placed from today's start list: published through `slot`.
-    Record { record: RecordId, slot: Slot },
-    /// Resolved to nothing: every need of it is `Failed`.
-    Unknown,
+    Published { slot: Slot, record: RecordId },
+    /// Resolved to nothing: every need of it is `Failed`. `slot`: its slot when one was
+    /// declared (a record's target that no record answers), none when only a need named it.
+    Unknown { slot: Option<Slot> },
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Seen {
-    /// Its slot, once declared.
-    slot: Option<Slot>,
-    answer: Answer,
+impl Met {
+    fn slot(self) -> Option<Slot> {
+        match self {
+            Met::Declared(slot) | Met::Published { slot, .. } => Some(slot),
+            Met::Unknown { slot } => slot,
+        }
+    }
 }
 
 /// The parent's slot bookkeeping (the module's doc): every symbol met, the slots numbered, the
 /// pairs not yet told, and the first-answer order the next start list is.
 pub(crate) struct Needs<'a> {
-    /// Each symbol met, by its bytes; at most [`MOST_SLOTS`] (rule 18).
-    met: ByHash<[u8; 32], Seen, Alloc<'a>>,
+    /// Each symbol met, by its bytes; at most [`MOST_SLOTS`] (rule 18, checked at each insert).
+    met: ByHash<[u8; 32], Met, Alloc<'a>>,
     /// Each declared slot's symbol, by slot: slots are dense, in the order they were numbered.
     slots: AVec<'a, Symbol>,
     /// Pairs numbered and not yet told: one `Declare` before the next `Publish`.
@@ -1392,17 +1515,24 @@ pub(crate) struct Needs<'a> {
     batch: AVec<'a, Datum>,
     /// The next message's id.
     next_id: u64,
+    /// A `Publish` (or `Positioned`) was written: no program-defined C name may be declared
+    /// after it ([`Needs::declare_c_defined`]).
+    published: bool,
     /// The start list's window closed: a first answer's group did not fit under its cap, so no
     /// later answer (which may stand on that group's statics) is kept.
     closed: bool,
     /// A placed group's data and names, gathered from its rows ([`Needs::place_ahead`]), reused.
     group_data: AVec<'a, Datum>,
     group_named: AVec<'a, Symbol>,
+    /// The placed groups' slots, in the list's order ([`Needs::place_ahead`]), reused.
+    group_slots: AVec<'a, Slot>,
     alloc: Alloc<'a>,
     /// The start list's count ([`StartTally`]): code rows and datum rows placed, first answers,
     /// symbols asked of the resolver.
     placed: usize,
     placed_data: usize,
+    /// Positioned groups placed from today's list, their values the list's.
+    placed_positioned: usize,
     answered: usize,
     resolved: usize,
     /// Where the program struck, as its crash handler told it (`Up::Fault`): the first one
@@ -1435,12 +1565,15 @@ impl<'a> Needs<'a> {
             positioned: ByHash::new_in(alloc),
             batch: Vec::new_in(alloc),
             next_id: 0,
+            published: false,
             closed: false,
             group_data: Vec::new_in(alloc),
             group_named: Vec::new_in(alloc),
+            group_slots: Vec::new_in(alloc),
             alloc,
             placed: 0,
             placed_data: 0,
+            placed_positioned: 0,
             answered: 0,
             resolved: 0,
             fault: None,
@@ -1456,7 +1589,7 @@ impl<'a> Needs<'a> {
     /// `built` (the resolver's: whether the front end was built, and for what) and `held` (what
     /// the list was at the start).
     pub(crate) fn start_tally(&self, built: Built, held: ListHeld) -> StartTally {
-        StartTally { placed: self.placed, answered: self.answered, data: self.placed_data, resolved: self.resolved, built, held }
+        StartTally { placed: self.placed, answered: self.answered, data: self.placed_data, positioned: self.placed_positioned, resolved: self.resolved, built, held }
     }
 
     /// THE ONE WRITER OF `Publish` (rule 76; run.md, "Statics in the run"): the pairs not yet
@@ -1511,11 +1644,34 @@ impl<'a> Needs<'a> {
             }
         }
         let id = self.id();
+        self.published = true;
         match self.positioned.get(&record.0) {
             Some(values) => Down::Positioned { slot, tier: Tier::Zero, record, values: values.as_slice() },
             None => Down::Publish { slot, tier: Tier::Zero, record },
         }.encode(id, out)?;
         Ok(())
+    }
+
+    /// THE ORDER OF C NAMES (D175): every C name the program itself defines (a C unit's global
+    /// function, a Rust item exported under its C name), each by its `Symbol::of_name`, given
+    /// its slot and told in one `Declare` BEFORE the first `Publish`. The child resolves a
+    /// record's C name to a declared slot before its strategy (run_mode/bind.rs), so a name the
+    /// program defines is never bound to the process's or the table's definition. After a
+    /// `Publish` it is refused ([`ParentError::CDefinedLate`]); the child refuses the converse
+    /// (a declaration of a name it already bound: run_mode.rs `DefinedAfterBound`). A C name
+    /// the program defines as DATA has no slot: it goes in the first record's `Data` as any
+    /// static does, under the same symbol.
+    #[expect(dead_code, reason = "D175: called once the front end registers the program's own C names (the checker's writer's item), before `ahead_of`")]
+    pub(crate) fn declare_c_defined<A: Allocator>(&mut self, functions: &[Symbol], out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        if let Some(first) = functions.first()
+            && self.published
+        {
+            return Err(ParentError::CDefinedLate { symbol: first.0 });
+        }
+        for &symbol in functions {
+            self.slot_of(symbol)?;
+        }
+        self.declare(out)
     }
 
     fn id(&mut self) -> u64 {
@@ -1527,26 +1683,23 @@ impl<'a> Needs<'a> {
     /// This run's first answers with a record, in order, each as its group (its data sent, the
     /// statics it names, its code row; at most the start list's cap): the rows of the list
     /// written at exit.
-    pub(crate) fn first(&self) -> &[Line] {
-        self.first.as_slice()
+    pub(crate) fn first(&self) -> &start_list::Rows<'a> {
+        &self.first
     }
 
-    /// `symbol`'s entry; a symbol not met yet is entered with no slot, not asked.
-    fn meet(&mut self, symbol: Symbol) -> Result<Seen, ParentError> {
-        if let Some(seen) = self.met.get(&symbol.0) {
-            return Ok(*seen);
-        }
-        if self.met.len() >= MOST_SLOTS as usize {
+    /// `symbol` entered as `met`: a symbol not met before counts against [`MOST_SLOTS`].
+    fn enter(&mut self, symbol: Symbol, met: Met) -> Result<(), ParentError> {
+        if !self.met.contains_key(&symbol.0) && self.met.len() >= MOST_SLOTS as usize {
             return Err(ParentError::Full);
         }
-        let seen = Seen { slot: None, answer: Answer::NotAsked };
-        self.met.insert(symbol.0, seen);
-        Ok(seen)
+        self.met.insert(symbol.0, met);
+        Ok(())
     }
 
     /// `symbol`'s slot: its own, or the next one numbered, its pair kept for the next `Declare`.
     fn slot_of(&mut self, symbol: Symbol) -> Result<Slot, ParentError> {
-        if let Some(slot) = self.meet(symbol)?.slot {
+        let met = self.met.get(&symbol.0).copied();
+        if let Some(slot) = met.and_then(Met::slot) {
             return Ok(slot);
         }
         let number = u32::try_from(self.slots.len()).map_err(|_| ParentError::Full)?;
@@ -1554,18 +1707,21 @@ impl<'a> Needs<'a> {
             return Err(ParentError::Full);
         }
         let slot = Slot(number);
+        // Unknown before it was declared stays unknown, now through its slot.
+        let entered = match met {
+            Some(Met::Unknown { .. }) => Met::Unknown { slot: Some(slot) },
+            Some(Met::Declared(_) | Met::Published { .. }) | None => Met::Declared(slot),
+        };
+        self.enter(symbol, entered)?;
         self.slots.push(symbol);
         self.pairs.push(Declared { symbol, slot });
-        if let Some(seen) = self.met.get_mut(&symbol.0) {
-            seen.slot = Some(slot);
-        }
         Ok(slot)
     }
 
-    fn settle(&mut self, symbol: Symbol, answer: Answer) {
-        if let Some(seen) = self.met.get_mut(&symbol.0) {
-            seen.answer = answer;
-        }
+    /// `symbol` resolved to nothing: its slot kept, when it has one.
+    fn settle_unknown(&mut self, symbol: Symbol) -> Result<(), ParentError> {
+        let slot = self.met.get(&symbol.0).copied().and_then(Met::slot);
+        self.enter(symbol, Met::Unknown { slot })
     }
 
     /// A record answered for the first time, just published: a group of the next start list
@@ -1575,17 +1731,19 @@ impl<'a> Needs<'a> {
     /// may stand on that group's statics), and nothing fails.
     fn first_answer(&mut self, row: Row, named: &[Symbol]) -> Result<(), ParentError> {
         self.answered += 1;
-        // The list has no column for a source file's identity or the values resolved from
-        // it. Keep the whole group off the list, including data first sent with this record.
-        // On replay ahead_of also omits any later group relying on those missing data.
-        if self.closed || self.positioned.contains_key(&row.record.0) {
+        if self.closed {
             return Ok(());
         }
-        if !self.first.fits(self.batch.len() + named.len() + 1) {
+        // A positioned record's group keeps the values its `Positioned` sent (start_list.rs
+        // version 5): the list is written under today's certificate, under which every file's
+        // text is the same, so they are what a replay under it must send. Under another
+        // certificate the list's values are not used (start_list.rs `Held::Other`).
+        let values: &[u8] = self.positioned.get(&row.record.0).map_or(&[], |values| values.as_slice());
+        if !self.first.fits(start_list::Rows::group_rows(self.batch.len(), named.len(), values.len())) {
             self.closed = true;
             return Ok(());
         }
-        self.first.push_answer(self.batch.as_slice(), named, row).map_err(ParentError::StartList)
+        self.first.push_answer(self.batch.as_slice(), named, values, row).map_err(ParentError::StartList)
     }
 
     /// The pairs numbered since the last `Declare`, told in one.
@@ -1595,6 +1753,27 @@ impl<'a> Needs<'a> {
         }
         let id = self.id();
         Down::Declare { pairs: List::of(self.pairs.as_slice()) }.encode(id, out)?;
+        self.pairs.clear();
+        Ok(())
+    }
+
+    /// The program's native library `library` told as the run's FIRST frame (blaze-launch
+    /// wire/run.rs `Down::Native`, its one rule): each Rust word's symbol, in word order, given
+    /// its slot (pair i fills word i), in one `Native` instead of a `Declare`. Each symbol is met
+    /// as declared, so the C's first call of a word is a need of it like any. Before any slot
+    /// is numbered (the personality's and today's list's come after), else
+    /// [`ParentError::NativeLate`]. A run whose image holds no native code never calls it.
+    pub(crate) fn tell_native<A: Allocator>(&mut self, library: RecordId, words: &[Symbol], out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        if !self.slots.is_empty() {
+            return Err(ParentError::NativeLate { slots: self.slots.len() });
+        }
+        // Each numbered here is a pair not yet told (`slot_of`), in word order: none was before.
+        for &symbol in words {
+            self.slot_of(symbol)?;
+        }
+        let id = self.id();
+        Down::Native { library, words: List::of(self.pairs.as_slice()) }.encode(id, out)?;
+        // Told in the `Native`: not again in the next `Declare`.
         self.pairs.clear();
         Ok(())
     }
@@ -1619,33 +1798,36 @@ impl<'a> Needs<'a> {
     /// writer ([`Needs::publish`] with the group's data and names: its data not on the child
     /// yet in one `Data`, the descriptor told if it names it, each static it names checked on
     /// the child, then its `Publish`); each group is this run's first answer of its symbol, so a
-    /// need of it later resolves nothing. `lines` are the groups kept whole ([`ahead_of`]); a
-    /// row of data or names after the last code row is refused by name.
-    pub(crate) fn place_ahead<A: Allocator>(&mut self, lines: &[Line], out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
-        for line in lines {
-            if let Line::Code(row) = line {
-                let slot = self.slot_of(row.symbol)?;
-                self.settle(row.symbol, Answer::Record { record: row.record, slot });
-            }
+    /// need of it later resolves nothing. `groups` are the groups kept whole ([`ahead_of`]),
+    /// each whole by its type (a group always ends in its code row).
+    pub(crate) fn place_ahead<A: Allocator>(&mut self, groups: &[TodayGroup<'_>], out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+        self.group_slots.clear();
+        for group in groups {
+            let row = group.code();
+            let slot = self.slot_of(row.symbol)?;
+            self.enter(row.symbol, Met::Published { slot, record: row.record })?;
+            self.group_slots.push(slot);
         }
         self.declare(out)?;
-        self.group_data.clear();
-        self.group_named.clear();
-        for line in lines {
-            let row = match *line {
-                Line::Datum(datum) => {
-                    self.group_data.push(datum);
-                    continue;
+        let slots = core::mem::replace(&mut self.group_slots, Vec::new_in(self.alloc));
+        for (group, slot) in groups.iter().zip(slots.iter().copied()) {
+            let (view, row) = (group.view(), group.code());
+            let record = row.record;
+            self.group_data.clear();
+            self.group_data.extend(view.data());
+            self.group_named.clear();
+            self.group_named.extend(view.named());
+            // A positioned group: its values as the list holds them (today's certificate, so
+            // today's lines), sent in its `Positioned` by the one writer and kept for its group
+            // in this run's list, as a resolved record's are (`answer`).
+            if view.values().next().is_some() {
+                let mut values: AVec<'a, u8> = Vec::new_in(self.alloc);
+                for chunk in view.values() {
+                    values.extend_from_slice(chunk);
                 }
-                Line::Named(symbol) => {
-                    self.group_named.push(symbol);
-                    continue;
-                }
-                Line::Code(row) => row,
-            };
-            let Some(Seen { answer: Answer::Record { record, slot }, .. }) = self.met.get(&row.symbol.0).copied() else {
-                return Err(ParentError::UndeclaredSymbol { symbol: row.symbol.0 });
-            };
+                self.positioned.insert(record.0, values);
+                self.placed_positioned += 1;
+            }
             // The group's two lists out of `self` while the one writer borrows it, then back.
             let data = core::mem::replace(&mut self.group_data, Vec::new_in(self.alloc));
             let named = core::mem::replace(&mut self.group_named, Vec::new_in(self.alloc));
@@ -1654,13 +1836,12 @@ impl<'a> Needs<'a> {
             self.placed_data += data.len();
             self.group_data = data;
             self.group_named = named;
-            self.group_data.clear();
-            self.group_named.clear();
-            placed?;
+            if let Err(why) = placed {
+                self.group_slots = slots;
+                return Err(why);
+            }
         }
-        if let Some(open) = self.group_data.first().map(|datum| datum.symbol).or(self.group_named.first().copied()) {
-            return Err(ParentError::StartGroupOpen { symbol: open.0 });
-        }
+        self.group_slots = slots;
         Ok(())
     }
 
@@ -1691,15 +1872,15 @@ impl<'a> Needs<'a> {
             Needed::Symbol(symbol) => symbol,
             Needed::Slot(slot) => *self.slots.get(slot.0 as usize).ok_or(ParentError::UndeclaredSlot { slot: slot.0 })?,
         };
-        match self.meet(symbol)?.answer {
-            Answer::Record { record, slot } => self.publish(slot, record, Stands::Again, out),
-            Answer::Unknown => self.failed(need, out),
-            Answer::NotAsked => {
+        match self.met.get(&symbol.0).copied() {
+            Some(Met::Published { slot, record }) => self.publish(slot, record, Stands::Again, out),
+            Some(Met::Unknown { .. }) => self.failed(need, out),
+            Some(Met::Declared(_)) | None => {
                 self.resolved += 1;
                 let mut values = Vec::new_in(self.alloc);
                 match resolve.publication(&symbol, &mut values)? {
                     Resolved::Unknown => {
-                        self.settle(symbol, Answer::Unknown);
+                        self.settle_unknown(symbol)?;
                         self.failed(need, out)
                     }
                     Resolved::Record { key, record, declares, data, named } => {
@@ -1710,7 +1891,7 @@ impl<'a> Needs<'a> {
                         for each in declares {
                             self.slot_of(*each)?;
                         }
-                        self.settle(symbol, Answer::Record { record, slot });
+                        self.enter(symbol, Met::Published { slot, record })?;
                         // Published first, so the batch is what this `Publish` stood on; then
                         // the next list's group: those data, every static named, the row
                         // (start_list.rs version 4; run.md, "Statics in the run").
@@ -1740,9 +1921,15 @@ mod tests;
 #[path = "run_replay_tests.rs"]
 mod replay_tests;
 
+/// Asserts: a positioned record's `Positioned` carries the values one source lookup gave, at
+/// every need of it; its group (its data, its name, its values, its row) is in the list written
+/// under today's certificate (start_list.rs version 5), and a replay under that certificate
+/// sends `Positioned` with the list's values and looks nothing up. CONTROL: under another
+/// certificate the list's values are not used (`Held::Other` hands out symbols alone), and the
+/// record resolves again with today's positions. A missing source is refused by row.
 #[cfg(test)]
 #[test]
-fn positioned_publications_send_current_values_and_leave_the_whole_group_off_the_list() {
+fn positioned_groups_are_listed_with_their_values_and_replayed_under_todays_certificate() {
     use blaze_code::record::{CodeRecord, CodeView, PositionField, PositionPart, PositionRow};
     use blaze_ladder::seam::PositionGap;
 
@@ -1789,6 +1976,23 @@ fn positioned_publications_send_current_values_and_leave_the_whole_group_off_the
         }
     }
 
+    // Each `Positioned` in `out`: its record, slot and values.
+    let positioned_in = |out: &[u8]| {
+        let mut found = std::vec::Vec::new();
+        let mut rest = out;
+        while let Some((item, len)) = split(rest).expect("whole frame") {
+            if let (_, Down::Positioned { record, slot, values, .. }) = Down::decode(item).expect("valid publication") {
+                found.push((record, slot, std::vec::Vec::from(values)));
+            }
+            rest = &rest[len..];
+        }
+        found
+    };
+    let positioned_record = RecordId(blaze_blake3::hash(&bytes));
+    let other_row = Row { symbol: OTHER, key: CodeKey(blaze_ids::ContentId(OTHER.0)), record: RecordId(OTHER.0) };
+    let function_row = Row { symbol: FUNCTION, key: CodeKey(blaze_ids::ContentId(FUNCTION.0)), record: positioned_record };
+    use start_list::Line;
+    let mut written: std::vec::Vec<Line> = std::vec::Vec::new();
     for source_line in [11u32, 14] {
         let mut front = FromSource { view, at: Ok((source_line, 7)), reads: 0 };
         let mut needs = Needs::new(alloc);
@@ -1797,20 +2001,60 @@ fn positioned_publications_send_current_values_and_leave_the_whole_group_off_the
             needs.answer(need, &mut front, &mut out).expect("served");
         }
         assert_eq!(front.reads, 1, "one lookup gives both fields and every repeat need");
-        let want = Row { symbol: OTHER, key: CodeKey(blaze_ids::ContentId(OTHER.0)), record: RecordId(OTHER.0) };
-        assert_eq!(needs.first(), &[Line::Code(want)], "the positioned record's data, name and code share its eligibility");
-        let mut position_count = 0;
-        let mut rest = out.as_slice();
-        while let Some((item, len)) = split(rest).expect("whole frame") {
-            if let (_, Down::Positioned { record, slot, values, .. }) = Down::decode(item).expect("valid publication") {
-                assert_eq!((record, slot), (RecordId(blaze_blake3::hash(&bytes)), Slot(0)));
-                assert_eq!(values, [source_line.to_le_bytes(), 7u32.to_le_bytes()].concat().as_slice());
-                position_count += 1;
-            }
-            rest = &rest[len..];
+        let values = [source_line.to_le_bytes(), 7u32.to_le_bytes()].concat();
+        let chunks: std::vec::Vec<Line> = start_list::Values::rows(&values).map(Line::Values).collect();
+        assert_eq!(chunks.len(), 1, "eight bytes of values are one values row");
+        let mut want = std::vec![Line::Datum(DATUM), Line::Named(STATIC)];
+        want.extend_from_slice(&chunks);
+        want.extend_from_slice(&[Line::Code(function_row), Line::Code(other_row)]);
+        assert_eq!(needs.first().lines().collect::<std::vec::Vec<_>>(), want, "the positioned record's group, its values with it, is in the list");
+        let sent = positioned_in(&out);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(record, slot, sent)| (*record, *slot, sent.as_slice()) == (positioned_record, Slot(0), values.as_slice())), "{sent:?}");
+        if source_line == 11 {
+            written = needs.first().lines().collect();
         }
-        assert_eq!(position_count, 2);
     }
+
+    // The list run 1 wrote, through its bytes, under its certificate.
+    const TODAY: start_list::Certificate = start_list::Certificate::for_tests([0xa1; 32]);
+    const MOVED: start_list::Certificate = start_list::Certificate::for_tests([0xb2; 32]);
+    let head = StartHead { line: blaze_ladder::run::special::EntryLine { form: blaze_ladder::run::special::EntryForm::Unit, symbol: CodeSymbol([9; 32]) }, personality: None };
+    let mut list = Vec::new_in(alloc);
+    start_list::encode_lines(&TODAY, head, written.as_slice(), &mut list).expect("a small list");
+    let view_of = start_list::read(&list, alloc).expect("the list reads back");
+
+    // Under today's certificate: placed as written, `Positioned` with the list's values (line
+    // 11), and nothing looked up: the source answers nothing.
+    let start_list::Held::Today(rows) = view_of.under(&TODAY) else { panic!("the list under its own certificate is not today's") };
+    let lines: std::vec::Vec<Line> = rows.lines().collect();
+    assert_eq!(lines, written, "the bytes round-trip the positioned group");
+    let groups: std::vec::Vec<TodayGroup<'_>> = rows.groups().collect();
+    let mut front = FromSource { view, at: Err(PositionGap::Unanswered), reads: 0 };
+    let mut needs = Needs::new(alloc);
+    let mut out = std::vec::Vec::new();
+    needs.place_ahead(&groups, &mut out).expect("today's list placed");
+    needs.answer(Needed::Slot(Slot(0)), &mut front, &mut out).expect("a repeat need of the placed record");
+    assert_eq!(front.reads, 0, "a replay under today's certificate looked a position up");
+    let listed = [11u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
+    let sent = positioned_in(&out);
+    assert_eq!(sent.len(), 2, "the placed publish and the repeat need");
+    assert!(sent.iter().all(|(record, slot, sent)| (*record, *slot, sent.as_slice()) == (positioned_record, Slot(0), listed.as_slice())), "{sent:?}");
+    assert_eq!(needs.first().lines().collect::<std::vec::Vec<_>>(), written, "the replay writes the same list again");
+    let tally = needs.start_tally(Built::No, ListHeld::Today);
+    assert_eq!((tally.placed, tally.positioned, tally.resolved), (2, 1, 0));
+
+    // CONTROL: under another certificate the list's values are not used (they may have moved):
+    // symbols alone, and the record resolves again with today's positions (line 14).
+    let start_list::Held::Other(symbols) = view_of.under(&MOVED) else { panic!("the list under another certificate was today's") };
+    assert_eq!(symbols.iter().collect::<std::vec::Vec<_>>(), [FUNCTION, OTHER], "another certificate's list hands out its code symbols alone");
+    let mut front = FromSource { view, at: Ok((14, 7)), reads: 0 };
+    let mut needs = Needs::new(alloc);
+    let mut out = std::vec::Vec::new();
+    needs.answer(Needed::Symbol(FUNCTION), &mut front, &mut out).expect("resolved");
+    assert_eq!(front.reads, 1, "under another certificate the position is looked up today");
+    let today = [14u32.to_le_bytes(), 7u32.to_le_bytes()].concat();
+    assert_eq!(positioned_in(&out).iter().map(|(_, _, values)| values.clone()).collect::<std::vec::Vec<_>>(), [today], "the old list's line 11 was sent");
 
     // Remove the source entirely. The parent refuses the exact row before any frame is sent.
     let mut front = FromSource { view, at: Err(PositionGap::Unanswered), reads: 0 };
@@ -1819,5 +2063,5 @@ fn positioned_publications_send_current_values_and_leave_the_whole_group_off_the
     let error = needs.answer(Needed::Symbol(FUNCTION), &mut front, &mut out).expect_err("no resolver");
     assert!(matches!(error, ParentError::Position { symbol, row, why: PositionGap::Unanswered } if symbol == FUNCTION.0 && row == line));
     assert!(out.is_empty() && needs.first().is_empty());
-    std::println!("positions: (11, 7) then (14, 7), no positioned group replayed, missing source refused");
+    std::println!("positions: (11, 7) then (14, 7); today's list replays (11, 7) with no lookup; another certificate's resolves (14, 7); missing source refused");
 }

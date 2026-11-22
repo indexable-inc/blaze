@@ -7,12 +7,12 @@
         from, with the backtrace submodule, std's third-party crates in vendor/ and the
         .cargo/config.toml that reads them from there), checked against the sha256 the
         nightly's channel manifest gives; library/UPSTREAM says which. For the first import, or
-        to start over; the daily bump merges instead. An empty date is harness/toolchain's.
+        to start over; the daily bump merges instead. An empty date is pins/toolchain's.
     library.py merge '{"date": "2026-11-02"}'
         library/ moves to that nightly's standard library as a merge: upstream's changes from
         UPSTREAM's snapshot to the new nightly's are applied three-way to library/, so blaze's
         own changes are kept. A conflict stops with the files, which have conflict markers then,
-        and nothing else changed is undone. An empty date is harness/toolchain's. The new
+        and nothing else changed is undone. An empty date is pins/toolchain's. The new
         snapshot is the branch upstream/library then, which the bump pushes.
     library.py snapshot '{}'
         prints the snapshot of UPSTREAM's nightly and makes the branch upstream/library hold
@@ -100,8 +100,9 @@ def typed(cls, text):
 
 
 def pinned_date():
-    name = open(os.path.join(HERE, "toolchain")).read().strip()
-    return name.removeprefix("nightly-")
+    import toolchain_pins
+
+    return toolchain_pins.toolchain().removeprefix("nightly-")
 
 
 def get(url):

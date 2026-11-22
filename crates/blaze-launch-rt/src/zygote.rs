@@ -346,9 +346,17 @@ pub fn run<'s, S: Suite>(
                     unsafe { libc::kill(child.0 as libc::pid_t, libc::SIGQUIT) };
                 }
                 Effect::Kill { child } => {
-                    // SAFETY: a signal to our child's process group (its pid, set by both
-                    // sides before any test code ran); a group already gone gives ESRCH.
-                    unsafe { libc::kill(-(child.0 as libc::pid_t), libc::SIGKILL) };
+                    // Our child's process group (its pid, set by both sides before any test code
+                    // ran), through blaze-sys's one group kill (D177). A group already gone
+                    // (ESRCH) is the end the kill asks for; any other answer is named.
+                    #[cfg(target_os = "linux")]
+                    let killed = blaze_sys::linux::kill_group(child.0 as i32, 9);
+                    #[cfg(target_os = "macos")]
+                    let killed = blaze_sys::seatbelt::kill_group(child.0 as i32, 9);
+                    match killed {
+                        Ok(()) | Err(blaze_sys::Errno::Srch) => {}
+                        Err(errno) => return Err(DriverError::Call { call: "kill_group", errno: i32::from(errno.raw()), row: None }),
+                    }
                 }
             }
             at += 1;

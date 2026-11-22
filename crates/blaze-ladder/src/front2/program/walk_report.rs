@@ -33,6 +33,8 @@
 
 use super::*;
 
+use crate::front2::body::lower_fn;
+
 use core::fmt::{self, Write as _};
 
 use blaze_own::{AString, AVec};

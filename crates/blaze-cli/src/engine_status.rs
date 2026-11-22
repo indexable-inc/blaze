@@ -553,6 +553,7 @@ impl core::error::Error for StatusError {}
 
 /// `text` to stderr and to the profile, replaced whole by a rename (bstd `Dir::publish`).
 pub(crate) fn put(cx: &Cx, root: &Dir<ReadWrite>, err: &Out, text: &[u8]) -> Result<(), crate::CliError> {
+    crate::print::ensure_checkout_ignore(cx, root)?;
     err.write_all(cx, text)?;
     err.flush(cx)?;
     root.publish(cx, &Path::new(crate::print::PROFILE)?, bstd::fs::Content::bytes(text), bstd::fs::Durable::No)?;

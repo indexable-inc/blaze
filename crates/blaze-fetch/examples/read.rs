@@ -11,7 +11,7 @@ use std::time::Instant;
 use blaze_fetch::PackView;
 use blaze_fetch::plan;
 use blaze_manifest::lock::Lock;
-use blaze_own::{Alloc, String as OwnString};
+use blaze_own::String as OwnString;
 use blaze_text::Writes as _;
 
 /// A file mapped read-only and private, unmapped when dropped.

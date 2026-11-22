@@ -47,6 +47,70 @@ const MAX_ELABORATED: usize = 4096;
 const INSTANCE_TAB: u32 = u32::MAX;
 
 impl<'a> FactCache<'a> {
+    /// The item bounds at `self.preds[start..]` of the synthetic associated type `assoc` whose
+    /// item is the trait fn's opaque `opaque` (front2 rpitit.rs: an `impl Trait` of a trait fn,
+    /// `<Self as Tr<..>>::{o}`), each with its `Self` made the projection: the opaque's
+    /// predicates are written with `Self` the opaque `Opaque(o, X)`, which is by definition
+    /// `<X0 as Tr<..>>::{o}` at the same arguments (its hidden type, rpitit.rs `Synthetic::alias`).
+    /// RFC 3425 ("Return position `impl Trait` in traits"): the associated type's bounds are the
+    /// `impl Trait`'s, so a rigid `<S as Tr>::{o}` (a `where S: Tr` in the env selects it, as
+    /// tempo's `BasicEngineValidatorBuilder<..>: EngineValidatorBuilder<Node>`) is a `Future`
+    /// with the written `Output` and `Send`. Kept with `Self` the opaque, the solver read them
+    /// as no self bound of the projection (blaze-solve alias.rs `push_alias_bounds`) and
+    /// answered "not a future" (a false E0277). A bound whose `Self` is anything else is kept.
+    pub(super) fn opaque_self_as_projection(&mut self, start: usize, opaque: ItemKey, assoc: SDef) -> Result<(), Stop> {
+        for i in start..self.preds.len() {
+            match self.preds[i] {
+                Pred::Trait { trait_, args, polarity } => {
+                    if let Some(args) = self.self_swapped(args, opaque, assoc)? {
+                        self.preds[i] = Pred::Trait { trait_, args, polarity };
+                    }
+                }
+                Pred::HostEffect { trait_, args, constness } => {
+                    if let Some(args) = self.self_swapped(args, opaque, assoc)? {
+                        self.preds[i] = Pred::HostEffect { trait_, args, constness };
+                    }
+                }
+                Pred::Projection { alias, term } => {
+                    let node = *self.nodes.get(alias.0 as usize).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: alias.0, child: alias.0 }))?;
+                    let K::Alias(rigid, SAlias::Projection, def, l) = node else { continue };
+                    if let Some(l) = self.self_swapped(l, opaque, assoc)? {
+                        let alias = STy(self.nodes.len() as u32);
+                        self.nodes.push(K::Alias(rigid, SAlias::Projection, def, l));
+                        self.preds[i] = Pred::Projection { alias, term };
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// `l` with its first term, the opaque `opaque` at arguments `X`, made the projection
+    /// `assoc` at `X` (a new node and list; `l` is left as it is, other answers may hold it).
+    /// `None` when `l` is empty or its first term is not that opaque.
+    fn self_swapped(&mut self, l: SList, opaque: ItemKey, assoc: SDef) -> Result<Option<SList>, Stop> {
+        if l.len == 0 {
+            return Ok(None);
+        }
+        let malformed = || -> Stop { CheckError::Malformed(Malformed::TypeOrder { node: l.start, child: l.start }).into() };
+        let first = *self.lists.get(l.start as usize).ok_or_else(malformed)?;
+        let node = *self.nodes.get(first.0 as usize).ok_or_else(malformed)?;
+        let K::Alias(rigid, SAlias::Opaque, def, args) = node else { return Ok(None) };
+        if def != SDef(opaque.0) {
+            return Ok(None);
+        }
+        let projection = STy(self.nodes.len() as u32);
+        self.nodes.push(K::Alias(rigid, SAlias::Projection, assoc, args));
+        let start = self.lists.len() as u32;
+        self.lists.push(projection);
+        for j in 1..l.len {
+            let t = *self.lists.get((l.start + j) as usize).ok_or_else(malformed)?;
+            self.lists.push(t);
+        }
+        Ok(Some(SList { start, len: l.len }))
+    }
+
     /// Elaborates the item bounds at `self.preds[start..]` in place: for each trait bound
     /// `X: Tr<args>` there (those appended here too, so transitively), `Tr`'s supertrait
     /// clauses with `Tr`'s parameters replaced by `X, args`, each trait bound once. Returns a
@@ -142,6 +206,8 @@ impl<'a> FactCache<'a> {
                 let site = crate::error::ParamSite::Supertrait { of, super_: cond };
                 Pred::ConstHolds { cond: SDef(cond.0), args: self.instance_list(c, args, with, put, site)? }
             }
+            // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
+            PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => return Ok(None),
         };
         Ok(Some(p))
     }

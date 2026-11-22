@@ -130,7 +130,7 @@ impl RowPath {
                 at = super::keys::checker_of(enum_);
                 continue;
             }
-            match names.text_of(lib).and_then(|t| t.impl_header) {
+            match names.signature_text_of(lib).and_then(|t| t.impl_header) {
                 // An impl: its header as written.
                 Some(header) => segments.push(impl_shown(header)),
                 // A nameless item that is no impl (`const _: () = { .. }`, an extern block):

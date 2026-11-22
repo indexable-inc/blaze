@@ -43,7 +43,7 @@ use blaze_lir::{Scalar, Ty, Value};
 
 use super::{EmitError, FloatWidth, Pass};
 use crate::Os;
-use crate::enc::{self, FP, Reg, SP, Size, X9, X11, X16};
+use crate::enc::{self, FP, Reg, SP, Size, X9, X16};
 
 /// One stacked argument's place: its offset in the area and the bytes it takes there (1, 2, 4,
 /// 8 or 16).
@@ -160,14 +160,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
     }
 
     /// `rt` to the `size` bytes at `sp + off` (any `off` below 16 MiB): `str` with its scaled
-    /// immediate where it reaches, else through `x11`.
+    /// immediate where it reaches, else through [`super::FAR`].
     pub(super) fn st_sp_sized(&mut self, size: Size, rt: Reg, off: u32) {
+        debug_assert_ne!(rt, super::FAR, "a value stored from the far-address register (pass.rs `FAR`)");
         let scale = size as u32;
         match off % (1 << scale) == 0 && (off >> scale) < 4096 {
             true => self.put(enc::str(size, rt, SP, off >> scale)),
             false => {
-                self.sp_addr(X11, off);
-                self.put(enc::str(size, rt, X11, 0));
+                self.sp_addr(super::FAR, off);
+                self.put(enc::str(size, rt, super::FAR, 0));
             }
         }
     }
@@ -193,7 +194,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
     }
 
     /// Stores the named stacked arguments into the open area of `area` bytes, through `x9`
-    /// (and `x11`, `x12` for far offsets): no argument register is written.
+    /// (and `FAR` for far offsets): no argument register is written.
     pub(super) fn store_stacked(&mut self, named: &[StackedArg], area: u32) {
         for arg in named {
             let (at, bytes) = (arg.slot.at, arg.slot.bytes);

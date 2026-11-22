@@ -59,9 +59,15 @@
 //! the base point, whose 64 odd multiples the compiler computes from its encoding (`point.rs`).
 //! Measured and set against its floor in `examples/cost.rs`.
 //!
-//! `no_std`, no allocation, no recursion, no unsafe code, one dependency (blaze-int).
+//! `no_std`, no allocation, no recursion, no unsafe code, two dependencies (blaze-int, and
+//! blaze-own for the plant seam: each check a control can weaken takes `plant: impl
+//! Planted<Plant>`, and the public functions pass `NoPlant`).
 
 #![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
@@ -76,6 +82,8 @@ pub mod sha512;
 mod tests;
 
 use core::fmt;
+
+use blaze_own::planted::{NoPlant, Planted, Plants};
 
 pub use point::Encoding;
 use point::Point;
@@ -135,11 +143,16 @@ pub struct VerifyingKey {
 impl VerifyingKey {
     /// Steps 1 to 3 of the crate's doc.
     pub fn decode(bytes: &[u8; 32]) -> Result<VerifyingKey, Refused> {
+        VerifyingKey::decode_planted(bytes, NoPlant)
+    }
+
+    /// [`VerifyingKey::decode`] with its plant seam: [`NoPlant`] where it ships.
+    pub(crate) fn decode_planted(bytes: &[u8; 32], plant: impl Planted<Plant>) -> Result<VerifyingKey, Refused> {
         let a = Point::decode(bytes).map_err(Refused::KeyEncoding)?;
-        if a.is_small_order() {
+        if a.is_small_order_planted(plant) {
             return Err(Refused::KeySmallOrder);
         }
-        if !a.is_torsion_free() {
+        if !a.is_torsion_free_planted(plant) {
             return Err(Refused::KeyMixedOrder);
         }
         Ok(VerifyingKey { bytes: *bytes, minus_a: a.neg() })
@@ -157,14 +170,24 @@ impl VerifyingKey {
     /// Steps 4 to 7 for the message that is `parts` joined, hashed in place: a caller that signs
     /// `domain || 0 || body` passes the three pieces and copies nothing.
     pub fn verify_parts(&self, parts: &[&[u8]], signature: &[u8; 64]) -> Result<(), Refused> {
+        self.verify_parts_planted(parts, signature, NoPlant)
+    }
+
+    /// [`VerifyingKey::verify_parts`] with its plant seam: [`NoPlant`] where it ships.
+    pub(crate) fn verify_parts_planted(
+        &self,
+        parts: &[&[u8]],
+        signature: &[u8; 64],
+        plant: impl Planted<Plant>,
+    ) -> Result<(), Refused> {
         let (r_bytes, s_bytes) = signature.split_at(32);
         let r_bytes: &[u8; 32] = r_bytes.try_into().expect("a signature's first half is 32 bytes");
         let s_bytes: &[u8; 32] = s_bytes.try_into().expect("a signature's second half is 32 bytes");
-        if !scalar::is_canonical(s_bytes) && !planted(Plant::SRangeUnchecked) {
+        if !scalar::is_canonical_planted(s_bytes, plant) && !plant.has(Plant::SRangeUnchecked) {
             return Err(Refused::SNotBelowOrder);
         }
-        let r = decode_r(r_bytes).map_err(Refused::REncoding)?;
-        if r.is_small_order() {
+        let r = decode_r(r_bytes, plant).map_err(Refused::REncoding)?;
+        if r.is_small_order_planted(plant) {
             return Err(Refused::RSmallOrder);
         }
         let mut hasher = sha512::Sha512::new();
@@ -176,7 +199,7 @@ impl VerifyingKey {
         let k = scalar::reduce_wide(&hasher.finalize());
         let s = scalar::from_bytes(s_bytes);
         let r_check = point::double_scalar_mul_basepoint(&k, &self.minus_a, &s);
-        if same_point(&r_check, &r) { Ok(()) } else { Err(Refused::Mismatch) }
+        if same_point(&r_check, &r, plant) { Ok(()) } else { Err(Refused::Mismatch) }
     }
 }
 
@@ -191,8 +214,8 @@ pub fn verify_parts(public_key: &[u8; 32], parts: &[&[u8]], signature: &[u8; 64]
 }
 
 /// R's point: canonical decoding (step 5).
-fn decode_r(bytes: &[u8; 32]) -> Result<Point, Encoding> {
-    if planted(Plant::RNonCanonical) {
+fn decode_r(bytes: &[u8; 32], plant: impl Planted<Plant>) -> Result<Point, Encoding> {
+    if plant.has(Plant::RNonCanonical) {
         return Point::decode_y(field::Fe::from_bytes(bytes), bytes[31] >> 7 == 1);
     }
     Point::decode(bytes)
@@ -203,25 +226,25 @@ fn decode_r(bytes: &[u8; 32]) -> Result<Point, Encoding> {
 /// encoding of [S]B - [k]A. A computed Z of zero is no point at all ((0 : 0 : 0) would equal
 /// every point by the cross-multiplication): no correct arithmetic makes one, so one is a bug,
 /// and it is refused rather than let it accept everything.
-pub(crate) fn same_point(computed: &Point, r: &Point) -> bool {
-    #[cfg(test)]
-    if planted(Plant::CompareUnnormalised) {
+pub(crate) fn same_point(computed: &Point, r: &Point, plant: impl Planted<Plant>) -> bool {
+    if plant.has(Plant::CompareUnnormalised) {
         return computed.unnormalised() == r.unnormalised();
     }
-    !computed.z_is_zero() && computed.equals(r)
+    !computed.z_is_zero() && computed.equals_planted(r, plant)
 }
 
-/// A bug planted by a test, to show the tests catch it: only ever in this crate's tests.
+/// A bug a control plants, to show the tests catch it (D165, rule 78): taken through the
+/// `Planted<Plant>` seam, which shipped code fills with [`NoPlant`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), expect(dead_code, reason = "shipped code passes NoPlant; only the controls make a plant"))]
 pub(crate) enum Plant {
-    #[cfg(test)]
+    /// The code as it is.
     None,
     /// Step 4 skipped: S at or above L taken.
     SRangeUnchecked,
     /// Step 5 lenient: R's y read modulo p, so a second encoding of a point is taken.
     RNonCanonical,
     /// Step 7 compares the computed point's X and Y as held, not divided by Z.
-    #[cfg(test)]
     CompareUnnormalised,
     /// The identity test reads X = 0 alone, so (0, -1) counts as the identity and a key of
     /// order 2L passes [L]A = O.
@@ -236,23 +259,7 @@ pub(crate) enum Plant {
     STopLimbOnly,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    pub(crate) static PLANT: core::cell::Cell<Plant> = const { core::cell::Cell::new(Plant::None) };
-}
-
-/// Whether `plant` is planted: only ever in this crate's tests.
-#[cfg(test)]
-pub(crate) fn planted(plant: Plant) -> bool {
-    PLANT.get() == plant
-}
-
-/// Whether `plant` is planted: never, outside tests.
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) const fn planted(_plant: Plant) -> bool {
-    false
-}
+impl Plants for Plant {}
 
 /// Not an interface: the few internals `examples/cost.rs` times and counts, each wrapped so it
 /// is total (no precondition a caller could break). Nothing but that example uses it.

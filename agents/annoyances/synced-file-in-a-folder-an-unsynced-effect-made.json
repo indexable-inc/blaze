@@ -1,0 +1,14 @@
+{
+ "id": "synced-file-in-a-folder-an-unsynced-effect-made",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5, writer lane on the 24 tests the stricter folder model failed",
+ "where": "crates/blaze-std/src/fs.rs `Dir::place` (truncate of the temporary file, 1388) and `publish_synced` (1553), `Dir::create` (1366) and `File::close_synced` (2096); crates/blaze-core/src/reserve.rs (MapWrite, 138); crates/blaze-core/src/sim/pages.rs (Truncate, 172); crates/blaze-cas/src/plain/core.rs (the head's Truncate)",
+ "what": "Every durable call ended with the file synced and its name synced into its folder, which reads as durable. The folder itself had been made earlier by an unsynced effect of the same call (a truncate, an append, a map), so the durable rename or SyncDir at the end found it there and synced nothing above it: after a crash the folder, and the synced file in it, were gone. The first fix (2026-11-20, earlier the same day) made only Effect::Write and Effect::Rename sync the folders they made, which covers none of these: by the time they ran, the folder was there.",
+ "cost": "24 tests in blaze-core and blaze-std and 21 in blaze-cas red after the model turned strict; a fix per protocol would have needed each sans-IO core to know which folders its effects made, which it cannot",
+ "cause": "durability of a folder was tied to the durability of the effect that happened to make it, and which effect makes a folder is the driver's choice, not the caller's",
+ "class": "a durability promise resting on a step the caller cannot see (the driver's implicit folder making)",
+ "prevention": "the folders rule on blaze-core's `Effect` doc: every effect that makes a folder makes it durably before it completes (fs.rs `make_parent`, the ring's `sync_made`, the simulation's `make_parents`); only Effect::MakeDir waits for its parent's sync. Scenario (5) in sim/host/dir_names/tests.rs, with the control Plant::MadeParentsNotSynced, holds it",
+ "workaround": "none needed",
+ "fix": "the rule above, in one place per driver and in the model",
+ "state": "fixed in the tree, not compiled"
+}

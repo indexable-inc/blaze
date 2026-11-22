@@ -651,25 +651,25 @@ fn freeze<N: crate::Name>(core: &mut Cells<'_, N>) {
 
 /// One cell the walk decided otherwise than the whole solve (`decided: None`: it waited).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Difference<N> {
-    pub(crate) module: ItemKey,
-    pub(crate) ns: Namespace,
-    pub(crate) name: N,
-    pub(crate) layer: Layer,
-    pub(crate) whole: Value,
-    pub(crate) decided: Option<Value>,
+pub struct Difference<N> {
+    pub module: ItemKey,
+    pub ns: Namespace,
+    pub name: N,
+    pub layer: Layer,
+    pub whole: Value,
+    pub decided: Option<Value>,
 }
 
 /// [`check`]'s report.
 #[derive(Debug)]
 pub struct DecideCheck<'a, N> {
     /// The cells the whole solve decided (of this crate's modules).
-    pub(crate) cells: u64,
+    pub cells: u64,
     /// Summed over the forward, backward and text passes.
-    pub(crate) differences: u64,
-    pub(crate) waits: u64,
+    pub differences: u64,
+    pub waits: u64,
     /// Hops logged by the forward pass.
-    pub(crate) hops: u64,
+    pub hops: u64,
     /// The text pass: `Full` cells whose module has an explicit entry of the name.
     pub(crate) text_answered: u64,
     pub(crate) text_ns: u64,
@@ -677,7 +677,8 @@ pub struct DecideCheck<'a, N> {
     pub(crate) probe_centi_ns: u64,
     /// The forward pass, every cell.
     pub(crate) all_ns: u64,
-    pub(crate) examples: AVec<'a, Difference<N>>,
+    /// The first 8 differences, of any pass.
+    pub examples: AVec<'a, Difference<N>>,
     /// The text pass taken apart: the bare rule alone, the hop's cell key alone.
     pub(crate) text_rule_ns: u64,
     pub(crate) text_key_ns: u64,

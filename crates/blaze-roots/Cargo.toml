@@ -1,0 +1,29 @@
+[package]
+name = "blaze-roots"
+description = "What a run may see and what it saw: a small set of read-only roots (a digest-keyed tree, a package directory with its declared globs) and one output directory, a RelPath that cannot name anything outside its root, the read list (each file with its digest, each failed lookup, each listing), and the one check that proves a read list lies under its roots; the base of the compile-time runs (blaze-comptime), the C compiler's hermetic driver and sandboxed tests; no_std, sans-IO, the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` in the caller's allocator: the read list's entries and its path text.
+blaze-own.workspace = true
+# The checked read list's digest and a listing's digest, in BLAKE3's key-derivation mode.
+blaze-blake3.workspace = true
+
+[dev-dependencies]
+# The simulation: drawn roots, drawn reads, planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), never `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -388,8 +388,8 @@ impl FutexCalls for FutexSim<'_> {
             // Woken, a word that changed (the kernel's `EAGAIN`, which the driver reads the
             // same), or a return with nothing.
             Once::Ready(()) | Once::Spurious => Ok(()),
-            Once::Interrupted => Err(io::Error::from_raw_os_error(libc::EINTR)),
-            Once::TimedOut => Err(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+            Once::Interrupted => Err(io::Error::from_raw_os_error(i32::from(blaze_sys::Errno::Intr.raw()))),
+            Once::TimedOut => Err(io::Error::from_raw_os_error(i32::from(blaze_sys::Errno::TimedOut.raw()))),
         }
     }
 

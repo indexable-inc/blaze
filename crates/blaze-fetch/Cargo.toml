@@ -24,9 +24,9 @@ blaze-manifest = { workspace = true, default-features = false }
 blaze-sha256.workspace = true
 blaze-ed25519.workspace = true
 # Record keys (`Hasher`, `ContentId`) and BLAKE3 of files and listings.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # Hex for pins.
-blaze-format = { path = "../blaze-format" }
+blaze-format.workspace = true
 # A path's caseless form, so no two files of a record are one on a case-insensitive disk.
 blaze-unicode.workspace = true
 # gzip and tar: a `.crate`, inflated and read under the limits given, every path checked.

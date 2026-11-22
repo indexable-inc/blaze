@@ -20,45 +20,102 @@ use std::format;
 use std::string::String;
 use std::vec;
 
-use blaze_flow::record::check;
-use blaze_own::Alloc;
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{ExprId, InferCtx, ItemKey, Mutbl, Name, Needs, Outcome, PTy};
+use blaze_typeck::{ExprId, ItemKey, Mutbl, Name, PTy};
 
-use crate::{AdtFacts, CalleeFacts, Facts, Plant, Refusal, SigBuf, SigLife, lower_planted, read_signature};
+use crate::region_fixture::{Decls, FnHead};
+use crate::{AdtFacts, CalleeFacts, Facts, Plant, Refusal, Region};
 
-fn alloc() -> Alloc<'static> {
-    blaze_own::testing::heap().alloc()
-}
+/// The head records of the world's fns (D148), declared with the shared fixture and laid in
+/// the checked record's own table (region_fixture.rs `run`): the toy's one ADT, `S`, declares
+/// no lifetime.
+struct Heads(Decls);
 
-/// `S` has no drop glue; `copy`: it is `Copy` too. Heads read from their text; `keep` writes
-/// `'static`.
-struct World {
-    copy: bool,
-    keep: ItemKey,
-    sigs: vec::Vec<(ItemKey, SigBuf<Alloc<'static>>)>,
-}
-
-impl World {
-    fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
-        let adt = |_: ItemKey| Some(0);
-        let mut buf = SigBuf::new_in(alloc());
-        if let Err(why) = read_signature(text, fx.t.view(), inputs, output, &adt, &mut buf, alloc()) {
-            panic!("`{text}` was not read: {why:?}");
-        }
-        self.sigs.push((item, buf));
+impl Heads {
+    /// `item`'s head: `count` lifetimes, all late-bound (none is in a bound), its column over
+    /// `fn(io[..last]) -> io[last]` `slots`.
+    fn add(&mut self, _fx: &mut Fx, item: ItemKey, count: u32, io: &[PTy], slots: &[Region]) {
+        let Some((&output, inputs)) = io.split_last() else { panic!("{item:?}: a head has an output") };
+        let late: vec::Vec<u32> = (0..count).collect();
+        self.0.func(item, FnHead { lifetimes: count, late: &late, outlives: &[], inputs, output, slots });
     }
 }
 
+/// `S` has no drop glue; `copy`: it is `Copy` too. Heads from their region records; `keep`
+/// writes `'static`.
+struct World {
+    copy: bool,
+    keep: ItemKey,
+    heads: Heads,
+}
+
 impl Facts for World {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: self.copy, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: k == self.keep, self_ref: false })
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.sigs.iter().find(|(k, _)| *k == item).map(|(_, s)| s.life())
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None
@@ -71,28 +128,9 @@ impl Facts for World {
     }
 }
 
+/// The findings of one body, the heads laid into the checked record's own table.
 fn run(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &World, plant: Plant) -> Result<vec::Vec<String>, Refusal> {
-    let a = alloc();
-    let view = b.view(owner, root);
-    let mut cx = InferCtx::new_in(a);
-    let c = match blaze_typeck::check(&view, fx, &mut cx, &Needs::new_in(a), a) {
-        Ok(Outcome::Done(c)) => {
-            assert!(c.diags.is_empty(), "the fixture type-checks clean: {:?}", c.diags);
-            c
-        }
-        Ok(Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
-        Err(e) => panic!("{e:?}"),
-    };
-    let lowered = lower_planted(&view, &c, facts, plant, a)?;
-    let rec = check(&lowered.flow, a).expect("bounded");
-    let mut out = vec::Vec::new();
-    for m in rec.moves.iter() {
-        out.push(format!("move {:?} at {:?}", m.kind, m.at));
-    }
-    for f in rec.borrows.iter() {
-        out.push(format!("borrow {f:?}"));
-    }
-    Ok(out)
+    crate::region_fixture::run(fx, &b.view(owner, root), facts, &facts.heads.0, plant).map(|r| r.lines)
 }
 
 /// The three bodies, each of owner `f(t: S)` or `f(s: S)`:
@@ -118,15 +156,13 @@ fn findings(body: Body, copy: bool, plant: Plant) -> Result<vec::Vec<String>, Re
     let look = fx.func("look", 0, &[rs], unit, vec![]);
     let f = fx.func("f", 0, &[st], unit, vec![]);
     fx.finish();
-    let mut w = World { copy, keep, sigs: vec::Vec::new() };
-    w.add(&fx, keep, "fn keep(x: &'static S) {}", &[rs], unit);
-    w.add(&fx, look, "fn look(x: &S) {}", &[rs], unit);
-    let own = match body {
-        Body::Param => "fn f(s: S) { keep(&s); }",
-        Body::Let => "fn f(t: S) { let s = t; keep(&s); }",
-        Body::Fine => "fn f(s: S) { look(&s); }",
-    };
-    w.add(&fx, f, own, &[st], unit);
+    // `fn keep(x: &'static S)`: `['static]`; `fn look(x: &S)`: one elided input lifetime,
+    // `Param(0)`; `fn f(s: S)` (or `t: S`): no lifetime.
+    let mut heads = Heads(Decls::new());
+    heads.add(&mut fx, keep, 0, &[rs, unit], &[Region::Static]);
+    heads.add(&mut fx, look, 1, &[rs, unit], &[Region::Param(0)]);
+    heads.add(&mut fx, f, 0, &[st, unit], &[]);
+    let w = World { copy, keep, heads };
     let mut b = Bb::new();
     let callee = b.path(&[if body == Body::Fine { "look" } else { "keep" }]);
     let root = match body {

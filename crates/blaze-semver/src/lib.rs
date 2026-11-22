@@ -20,51 +20,54 @@
 //! comparators, each a typed refusal. Every [`Error`] names the byte offset in the text and
 //! the part of the version it was reading.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 use core::fmt;
 
 mod data;
 mod ident;
+mod plant;
 mod req;
 mod version;
 
 #[cfg(test)]
-mod plant;
-#[cfg(test)]
 mod tests;
 
-/// The planted bug the control asks for, compiled away outside tests.
-#[cfg(not(test))]
-mod plant {
-    #[inline(always)]
-    pub(crate) fn identifier(_a: &str, _b: &str, order: core::cmp::Ordering) -> core::cmp::Ordering {
-        order
-    }
-}
-
 pub use ident::{BuildMetadata, INLINE, Ident, Prerelease};
+pub use plant::SemverPlant;
 pub use req::{Comparator, Op, VersionReq};
 pub use version::Version;
 
-/// The bounds a parse holds untrusted text to.
+/// The bounds a parse holds untrusted text to (D165: every cap a parse enforces is a field
+/// here, taken as a value, and drawn by the simulation down to its least legal value).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
-    /// The most bytes of a version's or a requirement's text.
+    /// The most bytes of a version's or a requirement's text ([`What::TooLong`] past it); at
+    /// least 1.
     pub most_len: usize,
-    /// The most comparators of a requirement.
+    /// The most comparators of a requirement ([`What::TooManyComparators`] past it); at least 1.
     pub most_comparators: usize,
 }
 
 impl Limits {
-    /// For registry indexes and manifests: 1 KiB of text, 32 comparators (the `semver` crate's
-    /// bound on comparators).
-    pub const CARGO: Limits = Limits { most_len: 1024, most_comparators: 32 };
+    /// What the crate ships with, for registry indexes and manifests: 1 KiB of text, 32
+    /// comparators (the `semver` crate's bound on comparators).
+    pub const SHIPPED: Limits = Limits { most_len: 1024, most_comparators: 32 };
+    /// The least legal value of each cap: what a simulation draws them down to.
+    pub const SMALLEST: Limits = Limits { most_len: 1, most_comparators: 1 };
+    /// [`Limits::SHIPPED`] under the name callers outside the crate use.
+    pub const CARGO: Limits = Limits::SHIPPED;
 }
 
 /// Which part of a version a parse was reading.

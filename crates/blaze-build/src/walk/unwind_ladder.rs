@@ -185,6 +185,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn held_pending(&self, h: Held) -> bool {
         match h {
             Held::Rest { .. } | Held::Moved { .. } | Held::Temp { .. } => true,
+            Held::EnvPlace(j) => self.env_place_pending(j),
             Held::Pat(p) => match self.owned[p.ix()] {
                 Some(Owned { flag: Some(_), .. }) => true,
                 Some(Owned { flag: None, .. }) => self.init[p.ix()],

@@ -17,7 +17,7 @@ doctest = false
 # the crates below turn on adapter features this crate does not want in its graph.
 [dependencies]
 # `ItemKey`: what an item is in a portable type and in a canonical key.
-blaze-id = { path = "../blaze-id" }
+blaze-id.workspace = true
 # Integer conversions that say what they do, in place of `as`.
 blaze-int.workspace = true
 # `Vec` and `Alloc<'a>`: every column, in the allocator the task names.

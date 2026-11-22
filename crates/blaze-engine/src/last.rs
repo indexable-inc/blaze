@@ -119,12 +119,20 @@ pub struct Touched {
 /// (rule 19); the caller reports it and answers in full (a stated path, rule 3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LastError {
+    /// A page named by the authenticated root could not be read or verified.
+    Pages(crate::pages::PagesError),
+    /// The findings index names a task whose answer has no findings count.
+    FindingRow { task: Name },
     /// The rows form refused (blaze-answer).
     Answer(AnswerError),
     /// A row's stage byte names no stage.
     Stage { found: u8 },
     /// A dense id the answer's dictionary does not name (`what`: a task, a file, a cell).
     NoName { what: &'static str, id: u32 },
+    /// A changed row reached publication without a payload decision or with a reserved key.
+    RowPayload { task: Name },
+    /// A changed row contradicts a count carried in the previous certificate.
+    CertificateCount { task: Name, column: &'static str, previous: u32 },
 }
 
 impl From<AnswerError> for LastError {
@@ -136,9 +144,13 @@ impl From<AnswerError> for LastError {
 impl fmt::Display for LastError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LastError::Pages(error) => write!(f, "{error}"),
+            LastError::FindingRow { task } => write!(f, "answer's findings index names {task} without a row count"),
             LastError::Answer(error) => write!(f, "the stored answer: {error}"),
             LastError::Stage { found } => write!(f, "the stored answer: a row's stage is {found}, which names no stage (last.rs)"),
             LastError::NoName { what, id } => write!(f, "the stored answer: {what} {id} is not in its dictionary (last.rs)"),
+            LastError::RowPayload { task } => write!(f, "cannot publish {task}: its changed row needs a nonzero record key or an explicit recordless result"),
+            LastError::CertificateCount { task, column, previous } => write!(f, "cannot publish {task}: applying its change to the certificate's {column} count {previous} is out of range"),
         }
     }
 }
@@ -148,6 +160,11 @@ impl fmt::Display for LastError {
 /// [`LastAnswer::with_findings`]) are each read from the set's own column in the rows form
 /// (blaze-answer kinds 5 to 8), and a row each reads is counted in [`Touched::rows`].
 pub trait LastAnswer {
+    /// A failure observed by an infallible worker query. It stops the request before
+    /// a merge accepts results or a fold can publish its answer.
+    fn refusal(&self) -> Option<LastError> {
+        None
+    }
     /// A task inside this answer.
     type Task: Copy + Eq + Ord + fmt::Debug;
     /// A cell inside this answer.
@@ -209,11 +226,8 @@ pub trait LastAnswer {
     }
     /// What `cell` holds today ([`CellDigest::ABSENT`]: nothing defines it).
     fn digest(&self, cell: Self::Cell) -> CellDigest;
-    /// What `cell` holds today, whole: what a task reading it through the engine's view is
-    /// handed (`ABSENT`: nothing defines it). The rows form keeps the first
-    /// [`blaze_answer::DIGEST_BYTES`] alone and answers them padded with zeros, which
-    /// [`CellDigest::of`] maps back to its digest; a task's read of such a cell is the switch's
-    /// question (lane RD8's report, NOT DONE).
+    /// The full content ID a task observes, identical across a restart. An undefined cell
+    /// yields `ABSENT`.
     fn content(&self, cell: Self::Cell) -> ContentId;
     /// The request `cell` last moved in ([`Serial`]`(0)`: never moved, or the form lost it when
     /// the cell went absent and every reader saw that).
@@ -231,6 +245,11 @@ pub trait LastAnswer {
     /// The tasks whose row names `file` as the file that lists them (`Answer::by_file`: an
     /// edited file's tasks gone from its plan).
     fn file_tasks<'m>(&self, file: Self::Task, alloc: Alloc<'m>) -> Result<AVec<'m, Self::Task>, LastError>;
+    /// The actual key of a made row, when the stored file plan certifies it.
+    /// A form without this column, a new member or an unmade task has no proof.
+    fn planned_key(&self, _file: Name, _name: Name) -> Result<Option<Key>, LastError> {
+        Ok(None)
+    }
     /// The owed tasks, as planned (`Answer::owed_tasks`).
     fn owed<'m>(&self, alloc: Alloc<'m>) -> Result<AVec<'m, Planned>, LastError>;
     /// The cells that moved while a reader of them was not run, and when (`Answer::owed_cells`).

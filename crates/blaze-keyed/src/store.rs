@@ -475,6 +475,44 @@ impl fmt::Display for TwoValues {
     }
 }
 
+/// Why a segment's row (or a segment about to be written) is not one a commit writes: one
+/// variant a condition, each carrying its values (blaze-cas plain format.rs `Row::new`, the
+/// one constructor that checks them, in this order).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowRefused {
+    /// `len` bytes, past the segment cap `most` ([`SEGMENT_MOST`] for the store).
+    TooLong { len: u64, most: u64 },
+    /// Its index starts at `index_at`, not a multiple of `align`.
+    Unaligned { index_at: u64, align: u64 },
+    /// `count` entries from `index_at` end at `end` (`None`: past `u64`), not at its footer
+    /// before `len`.
+    NotItsEnd { index_at: u64, count: u32, end: Option<u64>, len: u64 },
+    /// Made in generation `row`, after the manifest's own `manifest`.
+    NewerGeneration { row: u64, manifest: u64 },
+    /// Touched in generation `row`, after the manifest's own `manifest`.
+    NewerTouch { row: u64, manifest: u64 },
+    /// Flags `flags` set outside the three a row holds.
+    Flags { flags: u32 },
+}
+
+impl fmt::Display for RowRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RowRefused::TooLong { len, most } => write!(f, "its length {len} is past the segment cap of {most} bytes"),
+            RowRefused::Unaligned { index_at, align } => write!(f, "its index at byte {index_at} is not aligned to {align}"),
+            RowRefused::NotItsEnd { index_at, count, end: Some(end), len } => {
+                write!(f, "its {count} index entries from byte {index_at} end at byte {end}, not at its footer in its {len} bytes")
+            }
+            RowRefused::NotItsEnd { index_at, count, end: None, len } => {
+                write!(f, "its {count} index entries from byte {index_at} end past any length, not at its footer in its {len} bytes")
+            }
+            RowRefused::NewerGeneration { row, manifest } => write!(f, "it was made in generation {row}, after the manifest's generation {manifest}"),
+            RowRefused::NewerTouch { row, manifest } => write!(f, "it was touched in generation {row}, after the manifest's generation {manifest}"),
+            RowRefused::Flags { flags } => write!(f, "its flags {flags:#x} are not ones a row holds"),
+        }
+    }
+}
+
 /// A failure of the store, by name and class: never a formatted string.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StoreError {
@@ -497,6 +535,13 @@ pub enum StoreError {
     Format { what: &'static str, found: u32, wanted: u32 },
     /// Generation `generation`'s manifest: `what` is wrong at byte `at`.
     Manifest { generation: u64, what: &'static str, at: u64 },
+    /// Generation `generation`'s manifest names `segment` (its row at byte `at`) in a shape no
+    /// commit writes (blaze-cas plain format.rs `Row`): on encode the commit is refused and the
+    /// store stops; on open the store does not open.
+    Row { generation: u64, segment: u64, at: u64, why: RowRefused },
+    /// A segment of `namespace` refused before it is written: its shape is not one a row holds
+    /// (blaze-cas plain core.rs `copy_live`, `lay_out`).
+    Shape { namespace: Namespace, why: RowRefused },
     /// Two values under one key (rule 21: the key misses an input), each side as the raise
     /// site knows it (rule 19).
     TwoValues(TwoValues),
@@ -589,6 +634,12 @@ impl fmt::Display for StoreError {
             }
             StoreError::Manifest { generation, what, at } => {
                 write!(f, "generation {generation}'s manifest: {what} at byte {at}")
+            }
+            StoreError::Row { generation, segment, at, why } => {
+                write!(f, "generation {generation}'s manifest: segment {segment:016x} (its row at byte {at}) is not one a commit writes: {why}")
+            }
+            StoreError::Shape { namespace, why } => {
+                write!(f, "a segment of namespace {:016x} is refused before it is written: {why}", namespace.0)
             }
             StoreError::TwoValues(two) => write!(f, "{two}"),
             StoreError::Namespace { found, wanted } => write!(

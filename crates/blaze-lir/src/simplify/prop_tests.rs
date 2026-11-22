@@ -279,7 +279,7 @@ impl Bodies for One<'_> {
 }
 
 fn arguments(t: &Tape, width: u32) -> [Val; 2] {
-    let mut draw = || {
+    let draw = || {
         let high = u128::from(t.int::<u64>("an argument's high word"));
         let low = u128::from(t.int::<u64>("an argument's low word"));
         Val::Int(((high << 64) | low) & mask(width))

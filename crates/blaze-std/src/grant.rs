@@ -725,6 +725,36 @@ whole! {
     crate::gpu::Gpu => "gpu", need_gpu;
 }
 
+/// `hermetic: Hermetic` (D177): the one way a program runs another hermetically, a whole
+/// capability by machine ([`BY_MACHINE`]), made from the host's spawner and the run's clock and
+/// handed on as the narrower authority: it starts a child only under a plan's confinement. A
+/// `main` that may start children only this way names `Hermetic` and never `Host`.
+#[cfg(unix)]
+impl Grant for crate::procs::hermetic::Hermetic {
+    const KIND: Kind = Kind::Whole("hermetic");
+
+    fn grant(from: &Granting<'_>) -> Result<crate::procs::hermetic::Hermetic, Want> {
+        // As every whole capability (the `whole!` rows): an ordinary start's is the process's;
+        // a spec start's is its grant's provider's, and only when granted whole.
+        let io = match from.started() {
+            Started::Ordinary => from.process(),
+            Started::WithSpec => {
+                let (scope, io) = from.scope("whole")?;
+                match scope {
+                    Scope::Whole { capability, device: None } if capability.as_str() == "hermetic" => io,
+                    Scope::Whole { capability, device: Some(_) } if capability.as_str() == "hermetic" => {
+                        return Err(Want::WrongKind { given: "device" });
+                    }
+                    _ => return Err(Want::WrongKind { given: scope.kind_name() }),
+                }
+            }
+        };
+        let spawner = io.need_host().and_then(|host| host.spawner()).map_err(Want::NotOffered)?;
+        let clock = io.need_clock().map_err(Want::NotOffered)?;
+        Ok(crate::procs::hermetic::Hermetic::new(crate::procs::hermetic::HermeticCapOpts { spawner, clock }))
+    }
+}
+
 // Requests, behind bstd's `net` feature.
 #[cfg(feature = "requests")]
 whole! {

@@ -31,7 +31,9 @@ blaze-surface.workspace = true
 blaze-impls.workspace = true
 # The engine's task and result (engine.md, D131): the body task (front2/tables/task.rs) is
 # entered as a `Task` and answers a `Done`.
-blaze-engine = { path = "../blaze-engine" }
+blaze-engine.workspace = true
+# The checker's one ask (D161): the census a body task's meter keeps (front2 tables/cost.rs).
+blaze-ask.workspace = true
 # The engine's names, kinds, keys and cells (blaze-drive key.rs, cells.rs): the impl tables
 # task's result in the engine's form (front2/buckets/records.rs `impl_tables_task`), and the
 # body task's reads as `Name`/`Cell` ids.
@@ -44,8 +46,8 @@ blaze-typeck = { workspace = true }
 blaze-solve = { workspace = true }
 blaze-own = { workspace = true, features = ["std"] }
 # Signatures and bodies lowered from text, and bodies converted to the checker's form.
-blaze-lower = { path = "../blaze-lower" }
-blaze-hash = { path = "../blaze-hash" }
+blaze-lower.workspace = true
+blaze-hash.workspace = true
 # The command's frame: a body's local items are kept in it for the command (front2/locals.rs).
 blaze-mem.workspace = true
 # A checked body to LIR, and LIR to AArch64 code (the baseline tier).
@@ -53,6 +55,10 @@ blaze-build.workspace = true
 # front2/borrows.rs: a checked body lowered to its flow, then the move and borrow checks.
 blaze-flow.workspace = true
 blaze-flow-lower.workspace = true
+# R4 (run.md): the checked body lowered once to blaze-body's form and kept with its table
+# (front2 tables/task.rs `keep_checked`).
+blaze-body.workspace = true
+blaze-body-lower.workspace = true
 blaze-emit.workspace = true
 # The code record's form (`bzcode03`) and its declared section (D106): `declare`, `Declares`.
 blaze-tier.workspace = true
@@ -62,20 +68,21 @@ blaze-consteval.workspace = true
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
 # `ContentId`: a placed body's record id, by its bytes.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # The program's native library record (src/natives.rs, NATIVE.md W7): blaze-native's readers, resolve
 # and layout, blaze-export's Mach-O dylib writer, and the build script's outputs record it reads.
-blaze-native = { path = "../blaze-native" }
-blaze-export = { path = "../blaze-export" }
+blaze-native.workspace = true
+blaze-export.workspace = true
 blaze-build-script.workspace = true
 # Code records (src/code_records.rs): `Symbol`, the sealed record and its reader. By path, as
 # blaze-emit names it: it has no workspace entry.
-blaze-code = { path = "../blaze-code" }
+blaze-code.workspace = true
 # `Tier`: the tier a code record's key names (src/code_records.rs).
 blaze-run.workspace = true
 # `Func`: the LIR a code record is emitted from, an instance's or the thread-local getter's
 # (src/code_records.rs `make_entry`).
 blaze-lir.workspace = true
+blaze-sys.workspace = true
 # `dlsym`: an outside symbol's address in this process.
 libc.workspace = true
 # The program's crates: the toolchain's verified packs, their units and edition rule, and
@@ -102,6 +109,15 @@ blaze-sim.workspace = true
 blaze-std.workspace = true
 # tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# tests/toolchain_store/mod.rs: the `names` producer's digest in the prepared std world's key.
+blaze-producers.workspace = true
+
+[features]
+# D161 step 3's oracle over every body any test checks (front2 tables/task.rs `compare_asks`):
+# each body run under `AsksMet::Again` and `AsksMet::Once` first, a difference a panic naming
+# the body, what the one ask made and both results. `cargo test -p blaze-ladder --features
+# asks-oracle` is the ONE entry: no fixture is skipped, none is listed.
+asks-oracle = []
 
 [lints]
 workspace = true

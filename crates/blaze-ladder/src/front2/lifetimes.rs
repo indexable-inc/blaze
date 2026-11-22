@@ -352,7 +352,7 @@ fn item_text<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, lib: LibKey)
         Some(Ok((_, text, module))) => Ok((text, module)),
         Some(Err(_)) => Err(LifeRefusal::Text),
         None => {
-            let text = names.text_of(lib).ok_or(LifeRefusal::Text)?.text;
+            let text = names.signature_text_of(lib).ok_or(LifeRefusal::Text)?.text;
             Ok((text, names.home_of(lib).ok_or(LifeRefusal::Text)?))
         }
     }

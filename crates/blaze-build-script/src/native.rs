@@ -8,8 +8,9 @@
 //! (rule 3).
 //!
 //! The policy is text and lists made here, sans-IO: the macOS Seatbelt profile
-//! ([`seatbelt`]) and the paths Linux's Landlock is given come from one [`Grant`]. The process
-//! is started by blaze-proc-macro's `native_sandbox`.
+//! ([`seatbelt`]) and the paths Linux's Landlock is given come from one [`Grant`]. Since D177
+//! the process is started by bstd's hermetic run (blaze-proc-macro native_script.rs), whose
+//! plan renders its own profile and ruleset; here [`seatbelt_with`] is only the grant's check.
 #![blaze::sans_io]
 
 use blaze_own::{AString, AVec, Alloc, String, Vec};

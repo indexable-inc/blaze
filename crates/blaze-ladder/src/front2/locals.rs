@@ -245,6 +245,63 @@ pub struct BodyLocals<'n> {
     /// Each block scope's module, by `ScopeId` (super::scope_table): the one answer to "which
     /// module is this block" for every reader.
     pub scopes: &'n [super::scope_table::ScopeAt],
+    /// Where a block's own names are read (D189 S3): the crate's block modules under
+    /// `BlockScopes::Modules`, the body's `BodyScope` record under `Bodies` ([`BodyScopes`]).
+    /// The one seam every reader of a block's direct names takes (scope_table `direct_name_in`).
+    pub names_of_blocks: super::scope_table::BlockNames<'n, 'n>,
+}
+
+/// Each body's `BodyScope` record under `BlockScopes::Bodies` (D189 S3), by the body's checker
+/// key: a surface body's as the store holds it (the engine's `BodyScope` task), every other
+/// body's made in its own lowering by the same `blaze_scope::body_scope::body_scope`. `None`
+/// for a body is refused by [`Locals::keep`] (rule 3: never read as the crate's modules).
+/// No lifetime parameter: a trait object `dyn BodyScopes<'n>` is invariant in `'n`, which made
+/// `Locals<'n>` invariant and with it every `Env<'e>` holding `&'e Locals<'e>` (types.rs
+/// `Env::body`): a shorter `Env` could no longer be made from a longer one (heads.rs
+/// `own_env`, preds.rs `param_bound`), and a body's `Env` borrowed the store for `'n` (body.rs
+/// `lower_at`). Held as `&'n (dyn BodyScopes + 'n)`, its answers live for `'n`. The one
+/// supplier: super::body_scopes `Supplied`.
+pub trait BodyScopes {
+    /// The record of the body whose names-library key is `body` ([`Locals::library_body`]: the
+    /// key its blocks' modules and its `BodyScope` record are keyed under), or why none is held.
+    fn of(&self, body: LibKey) -> Result<&blaze_scope::body_scope::BodyScopeView<'_>, NoBodyScope>;
+}
+
+/// Why a body has no `BodyScope` record under `BlockScopes::Bodies`: the body is refused by
+/// name with it (rule 3), never read as the crate's block modules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoBodyScope {
+    /// The names library holds no item whose body is this text ([`Locals::library_body`]).
+    NoLibraryBody,
+    /// No crate of the request is the body's, or its crate's solve held no such body.
+    NotHeld,
+    /// A surface body whose record the store does not hold (the engine's `BodyScope` task
+    /// wrote none for it): never made here instead (rule 3, no fallback).
+    NotStored,
+    /// The crate's tree record did not read, so no body of it can be solved.
+    NoTreeRecord,
+    /// `blaze_scope::body_scope::body_scope` refused the body; its words are the supplier's
+    /// (`Supplied::refusals`).
+    Refused,
+    /// The record made here could not be written.
+    Unwritable,
+    /// The record's bytes did not read back.
+    Unreadable,
+}
+
+impl NoBodyScope {
+    /// The refusal's words, naming the cause (the body is named by the refusal's item).
+    pub fn form(self) -> &'static str {
+        match self {
+            NoBodyScope::NoLibraryBody => "a body the names library holds no item for, under --block-scopes=bodies (D189 S3)",
+            NoBodyScope::NotHeld => "a body its crate's solve did not hold, under --block-scopes=bodies (D189 S3)",
+            NoBodyScope::NotStored => "a surface body whose BodyScope record the store does not hold, under --block-scopes=bodies (D189 S3)",
+            NoBodyScope::NoTreeRecord => "a body whose crate's tree record did not read, under --block-scopes=bodies (D189 S3)",
+            NoBodyScope::Refused => "a body whose BodyScope solve was refused, under --block-scopes=bodies (D189 S3)",
+            NoBodyScope::Unwritable => "a body whose BodyScope record could not be written, under --block-scopes=bodies (D189 S3)",
+            NoBodyScope::Unreadable => "a body whose BodyScope record did not read back, under --block-scopes=bodies (D189 S3)",
+        }
+    }
 }
 
 /// What a local item's head is made from: its text, its module (its enclosing body's), the
@@ -326,11 +383,27 @@ pub struct Locals<'n> {
     anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
     /// The scope table's planted bug, for the test that must catch it; `Planted::None` else.
     planted: super::scope_table::Planted,
+    /// Under `BlockScopes::Bodies`, each body's record ([`BodyScopes`]); `None` under `Modules`.
+    body_scopes: Option<&'n (dyn BodyScopes + 'n)>,
+}
+
+/// `Locals` is covariant in `'n` (body.rs, heads.rs, preds.rs make a shorter `Env<'e>` from a
+/// longer one): a field invariant in `'n` (a trait object with a lifetime parameter, a `Cell`,
+/// a `&mut`) fails to compile here, not at those sites. Keep [`BodyScopes`] lifetime-free.
+#[expect(dead_code, reason = "a compile-time proof of covariance, never called")]
+fn covariant<'s, 'l: 's>(locals: &'s Locals<'l>) -> &'s Locals<'s> {
+    locals
 }
 
 impl<'n> Locals<'n> {
     pub fn new(frame: &'n Frame) -> Locals<'n> {
-        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame), anons: HashMap::new_in(frame), planted: super::scope_table::Planted::None }
+        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame), anons: HashMap::new_in(frame), planted: super::scope_table::Planted::None, body_scopes: None }
+    }
+
+    /// Reads every body kept after this under `BlockScopes::Bodies`: its block names from its
+    /// `BodyScope` record (D189 S3). Never called under `Modules`.
+    pub fn read_body_scopes(&mut self, scopes: &'n (dyn BodyScopes + 'n)) {
+        self.body_scopes = Some(scopes);
     }
 
     /// Files the anonymous constant `key` as written in block `scope` of the body `owner`
@@ -427,7 +500,8 @@ impl<'n> Locals<'n> {
         // or static's own body is the library's item of its block's module when its blocks
         // are written (`Self::library_twin`). None when the library has no such body.
         let nested = blaze_file_items::nested::scan(at.text, alloc);
-        let modules = match self.library_body(names, at.item, at.text) {
+        let library_body = self.library_body(names, at.item, at.text);
+        let modules = match library_body {
             Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
             _ => None,
         };
@@ -540,8 +614,21 @@ impl<'n> Locals<'n> {
                     let edition = names.edition_of(at.krate).ok_or(HeadError::NoText(at.item))?;
                     // Which declarations exist is the crate's cfg's to say (`cfg`, `cfg_attr`).
                     let atoms = names.cfg_atoms(at.krate).ok_or(HeadError::NoText(at.item))?;
-                    let (abi, decls) = super::foreign_locals::declared(text, edition, &mut super::heads::CrateCfg(atoms), alloc)
-                        .map_err(|r| bad(Why::Unsupported(r.form(), range)))?;
+                    let (abi, decls) = match super::foreign_locals::declared(text, edition, &mut super::heads::CrateCfg(atoms), alloc) {
+                        Ok(read) => read,
+                        // A macro call inside the block (ring 0.17.14's `prefixed_extern!` in a
+                        // body writes `extern "C" { prefixed_item! { .. } }`): what it declares
+                        // is its expansion's. The names library made this block a module (a
+                        // statement call writes its block: blaze-scope blocks.rs) and expanded
+                        // the call there once, so the fns are the block module's items under
+                        // the library's keys, each `link_name` value expanded at its place and
+                        // its symbol in the crate's link table (front2 links.rs `values_key`).
+                        // The body's paths reach them through that module (scope_table.rs
+                        // `direct_name_in`): nothing is kept here, nothing is expanded again
+                        // (rule 77). A block the library made no module for stays refused.
+                        Err(super::foreign_locals::Refused::MacroCall) if table.at(s as u32).and_then(|a| a.own()).is_some() => continue,
+                        Err(r) => return Err(bad(Why::Unsupported(r.form(), range))),
+                    };
                     let from = view.item_relative(it.range).map(|r| r.start);
                     for d in decls.iter() {
                         let kind = match d.kind {
@@ -621,7 +708,14 @@ impl<'n> Locals<'n> {
         }
         let blocks: &'n [BlockModule] = frame.alloc_slice_copy(&blocks);
         let scopes: &'n [super::scope_table::ScopeAt] = frame.alloc_slice_copy(&table.scopes);
-        self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks, scopes });
+        let names_of_blocks = match self.body_scopes {
+            None => super::scope_table::BlockNames::Modules,
+            Some(s) => match library_body.ok_or(NoBodyScope::NoLibraryBody).and_then(|body| s.of(body)) {
+                Ok(view) => super::scope_table::BlockNames::Bodies(view),
+                Err(why) => return Err(bad(Why::Unsupported(why.form(), whole))),
+            },
+        };
+        self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks, scopes, names_of_blocks });
         Ok(())
     }
 
@@ -634,7 +728,7 @@ impl<'n> Locals<'n> {
     /// (`Locals::keep`, glob_uses.rs `PatternBlocks::of`).
     pub(super) fn library_body<S: NamesSource<'n>>(&self, names: S, item: LibKey, text: &str) -> Option<LibKey> {
         let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
-        if names.text_of(item).is_some_and(|it| same(it.text)) {
+        if names.seeded_text_of(item).is_some_and(|it| same(it.text)) {
             return Some(item);
         }
         if let Some(h) = self.heads.get(&checker_of(item)) {

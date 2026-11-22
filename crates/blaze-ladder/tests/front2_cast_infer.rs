@@ -64,7 +64,7 @@ use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
 use blaze_ladder::code_records::{Builder, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::{Maker, NamesRecords, walk_records};
 use blaze_mem::Frame;
@@ -627,24 +627,20 @@ impl Load<'static> for Kept {
         (krate == 0 && path.as_str() == self.path).then_some(self.text)
     }
 
-    fn expansion(&self, krate: usize, call: LibKey) -> Option<&'static str> {
+    fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'static>> {
         if krate != 0 {
             return None;
         }
-        self.expansions.iter().find(|m| m.0 == call).map(|m| m.1)
-    }
-
-    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
-        if krate != 0 {
-            return None;
-        }
-        let bytes = self.expansions.iter().find(|m| m.0 == call).map(|m| m.2)?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+        let row = self.expansions.iter().find(|m| m.0 == call)?;
+        let bytes = row.2;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none).
+        let origins = if bytes.is_empty() {
+            (&[][..], &[][..])
+        } else {
+            blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+        };
+        Some(LoadedExpansion { text: row.1, origins: Some(origins) })
     }
 }
 

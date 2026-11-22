@@ -76,8 +76,17 @@
 //!   change is made, and for a name change its directory's sync (`Effect::SyncDir`), and
 //!   waits for neither: their ends are dropped as they arrive. A write-back makes no file, so
 //!   one still in flight brings nothing back of a file removed or renamed away meanwhile.
-//! - A directory is there once a file under it is, or once [`Dir::make_dir`] made it empty
-//!   (`Effect::MakeDir`); [`Dir::remove_dir`] removes one only when it is empty.
+//! - A directory is there once made, by [`Dir::make_dir`] (`Effect::MakeDir`) or by a file's
+//!   making under it. One made by a file's making is durable as it is made, whichever effect
+//!   made it (blaze-core's folders rule, on `Effect`): so a `_synced` call, whose last steps
+//!   sync its file and its name into its directory, is durable from the root down, in a
+//!   directory an earlier `_unsynced` call or `create` made too. Before 2026-11-20 it was not:
+//!   `publish_synced` placed its temporary file with a truncate that made the directory and
+//!   synced only the names in it, so a crash lost the published file with the directory. One
+//!   made by `make_dir` is durable once its parent is synced (`make_dir_synced`). A directory
+//!   stays until [`Dir::remove_dir`] removes it, which it does only when
+//!   it is empty: the last file under it going leaves it there, as on a real disk (the
+//!   conformance suite, blaze-core's `conform/fs.rs`, holds the simulated disk to that).
 //! - A read's bytes come back in a buffer the driver made (`Done::Read`), so
 //!   [`File::read_all`] and `copy_to` pass through one global allocation each read; the page
 //!   pool (std.md, S1f) replaces it with a view.
@@ -130,7 +139,11 @@ mod dirs;
 // What changed beneath a folder since a saved place in the system's journal of changes, asked
 // with no process having been alive in between (`Dir::changes_since`).
 mod journal;
-pub use journal::{CHANGES_MOST, Changes, JournalError};
+pub use journal::{CHANGES_MOST, Changes, HeldChanges, JournalError, ReplayTimes};
+
+// A folder made the user's alone (`Dir::make_private`): the journal helper's socket folder.
+mod private;
+pub use private::PrivateError;
 pub use blaze_core::{Cursor, Lost};
 #[cfg(test)]
 pub(crate) use dirs::DirsPlant;
@@ -563,6 +576,8 @@ pub enum FsOp {
     /// What changed beneath a folder since a saved place in the system's journal
     /// ([`Dir::changes_since`]).
     Journal,
+    /// A folder made the user's alone ([`Dir::make_private`]).
+    Private,
 }
 
 impl FsOp {
@@ -589,6 +604,7 @@ impl FsOp {
             FsOp::MakeDir => "make_dir",
             FsOp::RemoveDir => "remove_dir",
             FsOp::Journal => "changes_since",
+            FsOp::Private => "make_private",
         }
     }
 }
@@ -612,6 +628,10 @@ pub enum FsKind {
     /// for (by effect `changed_at` of this world; the flush saw `flushed_at`): the clone
     /// would make the kernel write the new bytes out first. Nothing was cloned.
     Stale { flushed_at: u64, changed_at: u64 },
+    /// A whole-file read ([`File::read_all`]) found the file's length moved while it read: the
+    /// open file's `fstat` said `stated` bytes and the read found `read` (one more: it grew).
+    /// Nothing was added.
+    Moved { stated: u64, read: u64 },
     /// The driver failed it, saying this.
     Driver(String),
     /// The driver answered with a completion of another kind: a driver's bug.
@@ -666,6 +686,11 @@ impl fmt::Display for FsError {
                  change {flushed_at}, and change {changed_at} came after), so a clone would wait for \
                  its writeback: nothing was cloned (flush it again, `Written::from(flushed).flush(cx)`, \
                  or copy it)"
+            ),
+            FsKind::Moved { stated, read } => write!(
+                f,
+                "bstd::fs {op} of {path}: the file's length moved while it was read ({stated} bytes at its open, \
+                 {read} read): it is being written; nothing was read"
             ),
             FsKind::Driver(said) => write!(f, "bstd::fs {op} of {path}: {said}"),
             FsKind::Answered(done) => {
@@ -726,7 +751,7 @@ impl FsError {
     pub fn stopped(&self) -> Option<&Stopped> {
         match &self.kind {
             FsKind::Stopped(stopped) => Some(stopped),
-            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
+            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Moved { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
         }
     }
 }
@@ -1909,7 +1934,25 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 
     /// The whole file added to `into`; how many bytes.
+    ///
+    /// On a native world with inline calls the bytes are read straight into `into`: it grows
+    /// once by the file's length (from the open file's `fstat`) and one byte, one `pread`
+    /// fills it, and nothing is copied after the kernel's copy (`Io::read_all_lent`; the growing
+    /// copy of a driver's `Vec` was 3.35% of a one-function edit on tempo, 2026-11-20). A file
+    /// whose length moved between that `fstat` and the read is refused by name
+    /// ([`FsKind::Moved`]), `into` as it was: no second read (a writer still writing races a
+    /// retry the same way; rule no-fallback). Elsewhere (the simulation, a guest's escape) one
+    /// `Effect::ReadAll`, whose bytes are added as before.
     pub fn read_all(&self, cx: &Cx, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        if let Some(lent) = self.io.read_all_lent(cx, &self.name, into) {
+            return match lent {
+                Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
+                Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Moved { stated, read })),
+                // alloc: an error's message.
+                Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped))),
+            };
+        }
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         let done = call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::ReadAll { file, tag })?;

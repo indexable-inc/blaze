@@ -235,10 +235,6 @@
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
     {
-      "path": "crates/blaze-gc",
-      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
-    },
-    {
       "path": "crates/blaze-graph",
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
@@ -323,10 +319,6 @@
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
     {
-      "path": "crates/blaze-storemodel",
-      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
-    },
-    {
       "path": "crates/blaze-usercode",
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
@@ -397,14 +389,6 @@
     {
       "path": "crates/tt",
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
-    },
-    {
-      "path": "crates/blaze-cas/src/pool.rs",
-      "why": "the pool's drop asks std::thread::panicking: moves with bstd::rt's unwinding (slice 5)"
-    },
-    {
-      "path": "crates/blaze-cas/src/pool/drive.rs",
-      "why": "the pool's driver thread by std::thread: moves with bstd::rt (slice 5)"
     },
     {
       "path": "crates/blaze-client",

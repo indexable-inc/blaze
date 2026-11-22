@@ -4,7 +4,7 @@ use blaze_id::ContentId;
 
 use super::{by_cause, Cause, NotRunError};
 use crate::key::{Kind, Name};
-use crate::request::{TaskFailure, Why};
+use crate::task::{TaskFailure, Why};
 
 fn name(kind: Kind, n: u8) -> Name {
     Name::new(kind, ContentId([n; 32]))

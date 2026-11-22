@@ -63,7 +63,7 @@ use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, Read};
 use blaze_ladder::code_records::{Builder, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::{Maker, NamesRecords, walk_records};
 use blaze_own::Alloc;
@@ -318,18 +318,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: LibKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 

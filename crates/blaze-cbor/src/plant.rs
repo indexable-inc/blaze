@@ -1,24 +1,19 @@
-//! The planted bug for the round trip's control (rule 53).
+//! The bugs a control can plant in the writer (D165, rule 78: a strategy is a type parameter at
+//! one seam). [`write_into_planted`](crate::write_into_planted) takes one as
+//! `plant: impl Planted<CborPlant>`; shipped code passes `NoPlant`, whose every `has` is
+//! `false`, so the check compiles away. The round trip's control (tests.rs) passes a value.
 
-use std::cell::Cell;
+#![blaze::sans_io]
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    Clean,
+use blaze_own::planted::Plants;
+
+/// A bug a control plants in the writer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CborPlant {
+    /// The code as it is.
+    None,
     /// Map keys sorted by their bytes alone, not their encodings' (length first).
     KeysBytewise,
 }
 
-std::thread_local! {
-    static PLANTED: Cell<Plant> = const { Cell::new(Plant::Clean) };
-}
-
-pub(crate) fn length_first() -> bool {
-    PLANTED.with(Cell::get) == Plant::Clean
-}
-
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for CborPlant {}

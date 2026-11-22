@@ -47,6 +47,57 @@ pub fn heap() -> &'static crate::Heap {
     crate::Heap::for_tests()
 }
 
+/// The test heap as an allocator TYPE that is `Default`: for a test that must name an
+/// allocator through a bound that defaults it (blaze-hash's `Default` and `FromIterator` for its
+/// maps and sets, `A: Allocator + Default`; a `mem::take` of a struct holding one). Zero bytes;
+/// every call goes to [`heap`]'s shared handle, so a block made through it may be freed through
+/// any handle of the process heap and the other way round. In this module only (the `testing`
+/// feature): shipped code never names an allocator it was not handed, so it never defaults one
+/// (D170 C1); it takes `A` and calls `new_in(alloc)`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct TestHeap;
+
+// SAFETY: every method forwards, unchanged, to the process heap's shared handle, whose own
+// contract (`SharedAlloc`'s `Allocator`) it is; every `TestHeap` is that one allocator.
+unsafe impl Allocator for TestHeap {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        heap().shared().allocate(layout)
+    }
+
+    #[inline]
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        heap().shared().allocate_zeroed(layout)
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller's contract for `deallocate`, passed on; the block is the heap's.
+        unsafe { heap().shared().deallocate(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's contract for `grow`, passed on.
+        unsafe { heap().shared().grow(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's contract for `grow_zeroed`, passed on.
+        unsafe { heap().shared().grow_zeroed(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's contract for `shrink`, passed on.
+        unsafe { heap().shared().shrink(ptr, old, new) }
+    }
+}
+
+// SAFETY: every `TestHeap` is the one process heap (above), so a copy frees what another made.
+unsafe impl core::alloc::AllocatorClone for TestHeap {}
+
 /// The byte a fresh block is filled with.
 pub const POISON: u8 = 0xA5;
 

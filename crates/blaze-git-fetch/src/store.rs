@@ -224,7 +224,7 @@ pub fn inflate_entry<B: Allocator>(window: &[u8], head: &EntryHead, most: u64, o
 /// `delta` applied to `base` into `out`, the result refused past `most` bytes.
 pub fn apply_delta<B: Allocator>(base: &[u8], delta: &[u8], most: u64, out: &mut Vec<u8, B>) -> Result<(), StoreWhy> {
     out.clear();
-    pack::apply(base, delta, most, out).map_err(StoreWhy::Entry)
+    pack::apply(base, delta, most, out, blaze_own::planted::NoPlant).map_err(StoreWhy::Entry)
 }
 
 /// A loose object's file inflated into `out` (header and body), refused past `most` bytes:

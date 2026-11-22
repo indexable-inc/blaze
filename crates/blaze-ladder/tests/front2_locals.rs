@@ -30,6 +30,14 @@
 //! `block_use_by_macro: clean`, `block_use_absent: clean (refused with NoMethod)`,
 //! `block_use_out_of_block: clean (refused with NoMethod)`.
 //!
+//! A block's `use` of a name whose type-namespace binding is private (the Reference, "Use
+//! declarations", "Visibility and privacy": an import takes in each namespace only a binding it
+//! may name; core's `mod poll_fn;` beside `pub use poll_fn::{PollFn, poll_fn};`, imported by
+//! tokio's `Receiver::recv` as `use std::future::poll_fn;`). Expected lines:
+//! `block_use_private_namesake: clean`, `block_use_private_unexported: clean (stopped with the
+//! gap ..)`. Before the change the first stopped with that gap too (21 tempo bodies waited on
+//! `recv`'s hidden type for it, c0410wave90).
+//!
 //! Traits declared in a block (front2 block_traits.rs `Reader::declared`; the block is a module
 //! of the names library, blaze-scope blocks.rs). The Reference, "Statements"
 //! [statement.item.scope] above, and "Method call expressions": "Then all remaining methods in
@@ -121,6 +129,15 @@ mod quad {
         pub fn block_glob_super(x: u8) -> u8 { { use super::*; x.quad() } }
     }
 }
+mod fut {
+    mod poll_fn { pub fn poll_fn(x: u8) -> u8 { x } }
+    pub use self::poll_fn::poll_fn;
+}
+mod fut_unexported {
+    mod poll_fn { pub fn poll_fn(x: u8) -> u8 { x } }
+}
+fn block_use_private_namesake(x: u8) -> u8 { use crate::fut::poll_fn; use crate::tr::Twice as _; poll_fn(x).twice() }
+fn block_use_private_unexported(x: u8) -> u8 { use crate::fut_unexported::poll_fn; use crate::tr::Twice as _; x.twice() }
 ";
 
 /// The bodies that must check clean, each with the rule it proves.
@@ -139,7 +156,17 @@ const CLEAN: &[(&str, &str)] = &[
     ("block_trait_write_fmt", "core's `Write::write_fmt` shape: a block declares a trait and its impl for `&mut W` and calls the method"),
     ("block_trait_inner_call", "a block's trait is in scope in the blocks inside it"),
     ("block_trait_provided", "a block's trait with a provided method, called through the block's impl"),
+    (
+        "block_use_private_namesake",
+        "tokio's `Receiver::recv` shape (`use std::future::poll_fn;` over core's private `mod poll_fn` beside `pub use poll_fn::poll_fn`): a block's `use` takes the visible fn, the private module of the name brings no trait",
+    ),
 ];
+
+/// The bodies whose check must stop with a gap naming the text (front2 block_traits.rs).
+/// `block_use_private_unexported` is `block_use_private_namesake` without the `pub use` (the
+/// cause removed): the `use` names only a private module (rustc: E0603), no namespace resolves
+/// it, and the block's traits are refused by name, never read as "none".
+const REFUSED_GAP: &[(&str, &str)] = &[("block_use_private_unexported", blaze_ladder::front2::block_traits::UNRESOLVED)];
 
 /// The bodies that must be refused, with the finding each must have. `block_use_absent` is
 /// `block_use_underscore` without its `use` (the cause removed: `Not` is in no prelude);
@@ -203,6 +230,9 @@ fn items_inside_bodies_through_front2() {
     for &(n, w) in REFUSED {
         cases.push((n.to_string(), find(0, &[n]), "must be refused", Some(w)));
     }
+    for &(n, w) in REFUSED_GAP {
+        cases.push((n.to_string(), find(0, &[n]), "must stop with a gap", Some(w)));
+    }
     for &(n, path, p) in CLEAN_AT {
         cases.push((n.to_string(), find(0, path), p, None));
     }
@@ -232,6 +262,9 @@ fn items_inside_bodies_through_front2() {
             (Ok(_), None) => report.push(format!("{name}: clean")),
             (Err(CheckFail::Diags { diags, .. }), Some(w)) if format!("{diags:?}").contains(&format!("({w},")) => {
                 report.push(format!("{name}: clean (refused with {w})"));
+            }
+            (Err(gap @ CheckFail::Gap { .. }), Some(w)) if format!("{gap:?}").contains(w) => {
+                report.push(format!("{name}: clean (stopped with the gap `{w}`)"));
             }
             (Ok(_), Some(w)) => {
                 report.push(format!("{name}: checked clean, but must be refused with {w}"));

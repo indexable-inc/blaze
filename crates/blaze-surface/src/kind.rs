@@ -193,6 +193,10 @@ byte_enum! {
         /// Lowering takes the item's attributes in written order (`AttrOrder::Written`), so only
         /// the planted old order (`AttrOrder::DerivesAtOnce`) reaches this refusal, kept as that control's oracle.
         AfterDeriveBeforeDerive = 3 => "after derive, before a derive",
+        /// A proc-macro crate's harness (blaze-scope task/lower.rs `Lower::proc_macro_harness`,
+        /// D175): no macro and no item; its input is the `_DECLS` static the lowering wrote,
+        /// lowered as its expansion, declaring no name (rustc's def-site `_DECLS`).
+        ProcMacroHarness = 4 => "proc-macro harness",
     }
 }
 

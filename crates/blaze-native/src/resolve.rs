@@ -24,8 +24,9 @@
 //!   it at run through the image handle.
 //! - ELF COMDAT groups: the first group of a signature, in pull order, wins; the sections of the
 //!   rest are [`Plan::dropped`], and their symbols neither define nor reference anything.
-//! - Every library goes through [`install_name`] before any input is read, so an unknown one
-//!   fails before layout.
+//! - Every library comes resolved ([`Linked`]: its install name read from the SDK's stub on
+//!   macOS, glibc's soname on Linux); one resolved for another platform fails before any input
+//!   is read.
 //!
 //! Iteration only: the worklist is a vector read from a cursor.
 
@@ -34,7 +35,7 @@ use blaze_own::{AVec, Alloc};
 
 use crate::Platform;
 use crate::ar::{self, ArError};
-use crate::libraries::{Library, LibraryError, install_name};
+use crate::libraries::Linked;
 use crate::object::{self, Bind, Def, Object, ReadError};
 
 /// Where an input came from: the package (`name@version`) whose build script made it, and the
@@ -61,11 +62,11 @@ pub struct Input<'a> {
 
 /// What the program asks of its native image: the names its crates' foreign items declare
 /// (`roots`), the names Rust exports (`rust`), both platform-mangled, and the libraries its
-/// crates declare, in link order.
+/// crates declare, resolved, in link order.
 pub struct Wanted<'a> {
     pub roots: &'a [&'a [u8]],
     pub rust: &'a [&'a [u8]],
-    pub libraries: &'a [Library<'a>],
+    pub libraries: &'a [Linked<'a>],
 }
 
 /// One object the image holds: input `input`'s member `member` (`u32::MAX` for a plain object).
@@ -98,7 +99,7 @@ pub struct Plan<'a> {
     /// (object, section) of the losing COMDAT groups, in pull order.
     pub dropped: AVec<'a, (u32, u32)>,
     /// The libraries, in the order declared.
-    pub libraries: AVec<'a, Library<'a>>,
+    pub libraries: AVec<'a, Linked<'a>>,
 }
 
 /// Why the link was refused, naming the input, the member or the name, and the rule.
@@ -113,21 +114,32 @@ pub enum ResolveError<'a> {
     Duplicate { name: &'a [u8], first: Origin<'a>, second: Origin<'a> },
     /// A Rust export also defined by a pulled member.
     RustAndNative { name: &'a [u8], from: Origin<'a> },
-    /// A library with no install name (NATIVE.md 3.5).
-    Library(LibraryError<'a>),
+    /// A library resolved for another platform than the plan's (NATIVE.md 3.5).
+    Library { name: &'a str, resolved_for: Platform },
     /// An allocation was refused.
     Alloc,
 }
 
-/// `name` as the platform's symbol tables write it: a leading `_` on Mach-O, as is on ELF.
+/// A name that begins with this byte is the exact symbol that follows it, written with no
+/// platform prefix. LLVM's rule (its `Mangler`: a global whose name starts with `\1` is emitted
+/// as the rest, as is), which rustc passes through for a `#[link_name]` or `#[export_name]`
+/// beginning with `\u{1}`: bindgen writes `#[link_name = "\u{1}_proc_listpids"]` for every name
+/// it read from a header already mangled (on Mach-O the `_` is in the rest).
+pub const VERBATIM: u8 = 0x01;
+
+/// `name` as the platform's symbol tables write it: a leading `_` on Mach-O, as is on ELF; a
+/// name that begins with [`VERBATIM`] is the rest, as is, on both.
 pub fn mangle<'a>(platform: Platform, name: &str, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ResolveError<'a>> {
-    let prefix: &[u8] = match platform {
-        Platform::MacosArm64 => b"_",
-        Platform::LinuxArm64 => b"",
+    let (prefix, rest): (&[u8], &[u8]) = match name.as_bytes().split_first() {
+        Some((&VERBATIM, rest)) => (b"", rest),
+        _ => match platform {
+            Platform::MacosArm64 => (b"_", name.as_bytes()),
+            Platform::LinuxArm64 => (b"", name.as_bytes()),
+        },
     };
-    let mut out = AVec::try_with_capacity_in(prefix.len() + name.len(), alloc).map_err(|_| ResolveError::Alloc)?;
+    let mut out = AVec::try_with_capacity_in(prefix.len() + rest.len(), alloc).map_err(|_| ResolveError::Alloc)?;
     out.try_extend_from_slice(prefix).map_err(|_| ResolveError::Alloc)?;
-    out.try_extend_from_slice(name.as_bytes()).map_err(|_| ResolveError::Alloc)?;
+    out.try_extend_from_slice(rest).map_err(|_| ResolveError::Alloc)?;
     Ok(out)
 }
 
@@ -143,7 +155,9 @@ pub fn plan<'a>(
 ) -> Result<Plan<'a>, ResolveError<'a>> {
     let mut libraries = AVec::new_in(alloc);
     for &library in wanted.libraries {
-        install_name(platform, library).map_err(ResolveError::Library)?;
+        if library.platform() != platform {
+            return Err(ResolveError::Library { name: library.library().name, resolved_for: library.platform() });
+        }
         libraries.try_push(library).map_err(|_| ResolveError::Alloc)?;
     }
 
@@ -415,7 +429,7 @@ impl<'i, 'a> Resolver<'i, 'a> {
 
     /// The plan: names sorted, words and imports sorted, each name's index into them assigned by
     /// walking the sorted lists together (both are subsequences of the sorted names).
-    fn finish(self, libraries: AVec<'a, Library<'a>>, alloc: Alloc<'a>) -> Result<Plan<'a>, ResolveError<'a>> {
+    fn finish(self, libraries: AVec<'a, Linked<'a>>, alloc: Alloc<'a>) -> Result<Plan<'a>, ResolveError<'a>> {
         let mut names = AVec::new_in(alloc);
         let mut words = AVec::new_in(alloc);
         let mut imports = AVec::new_in(alloc);

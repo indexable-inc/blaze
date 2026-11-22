@@ -231,7 +231,7 @@ impl core::error::Error for EditError {}
 /// Dropping a `Driver` frees its tables and unmaps nothing (`sys::Code` is never unmapped):
 /// code a thread is in, and the words it loads, outlive it.
 pub struct Driver {
-    core: Launch,
+    core: Launch<Kept>,
     /// The one mapping: words, stubs, area.
     code: Code,
     /// The offset in the mapping of the stub region's head.

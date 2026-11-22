@@ -95,10 +95,78 @@ fn optional(field: u32, rows: usize) -> bool {
     field as usize <= rows
 }
 
-/// Checks `view` all the way: [`structure`], then what it means.
-pub fn verify(view: View<'_>) -> Result {
+/// THE PROOF THAT A VIEW IS LIR (D163, rule 74): a [`View`] that [`verify`] checked all the
+/// way. Its field is private, so the one way to hold a `Verified` is to have verified the view
+/// (or to own a [`VerifiedFunc`], whose one constructor verifies): an emitter that takes it
+/// (blaze-emit `emit`, `emit_record`, blaze-tier `Tier::emit`) cannot be handed unchecked LIR,
+/// and checks nothing again.
+///
+/// ```compile_fail
+/// // Outside this module no proof is made by hand: its field is private.
+/// fn forge(view: blaze_lir::View<'_>) -> blaze_lir::Verified<'_> { blaze_lir::Verified { view } }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Verified<'v> {
+    view: View<'v>,
+}
+
+impl<'v> Verified<'v> {
+    /// The view the proof is of.
+    pub fn view(self) -> View<'v> {
+        self.view
+    }
+
+    /// An owned copy, in `alloc`, carrying the proof: the copy's columns are the proven view's
+    /// bytes, so it is the same function and is not checked again.
+    pub fn to_verified_in<A: core::alloc::Allocator + Clone>(self, alloc: A) -> VerifiedFunc<A> {
+        VerifiedFunc { func: self.view.to_func_in(alloc) }
+    }
+}
+
+/// An owned function that [`verify`] checked all the way: what a builder hands an emitter
+/// (blaze-build `Built::func`), so the proof travels with the function and the emitter takes
+/// [`VerifiedFunc::verified`] without checking again (rule 74). Read only: a change to the
+/// function needs [`VerifiedFunc::into_func`] and a new [`VerifiedFunc::new`], which verifies
+/// again; nothing mutates a verified function in place.
+#[derive(Debug)]
+pub struct VerifiedFunc<A: core::alloc::Allocator> {
+    func: crate::Func<A>,
+}
+
+impl<A: core::alloc::Allocator> VerifiedFunc<A> {
+    /// `func` verified all the way ([`verify`]), or the rule it breaks.
+    pub fn new(func: crate::Func<A>) -> core::result::Result<VerifiedFunc<A>, VerifyError> {
+        verify(func.view())?;
+        Ok(VerifiedFunc { func })
+    }
+
+    /// The proof, borrowed: what an emitter takes.
+    pub fn verified(&self) -> Verified<'_> {
+        Verified { view: self.func.view() }
+    }
+
+    /// The function's view (verified; [`VerifiedFunc::verified`] when a proof is wanted).
+    pub fn view(&self) -> View<'_> {
+        self.func.view()
+    }
+
+    /// The function, read only.
+    pub fn func(&self) -> &crate::Func<A> {
+        &self.func
+    }
+
+    /// The function, its proof given up: changing it needs a new [`VerifiedFunc::new`].
+    pub fn into_func(self) -> crate::Func<A> {
+        self.func
+    }
+}
+
+/// Checks `view` all the way: [`structure`], then what it means. The answer is the proof
+/// ([`Verified`]) every emitter takes.
+pub fn verify(view: View<'_>) -> core::result::Result<Verified<'_>, VerifyError> {
     structure(view)?;
-    semantics(&view)
+    semantics(&view)?;
+    Ok(Verified { view })
 }
 
 /// Checks what every reader of `view` relies on: lengths, tags, ranges and indices.

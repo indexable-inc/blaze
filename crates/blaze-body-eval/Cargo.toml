@@ -29,7 +29,7 @@ blaze-typeck.workspace = true
 # `Vec` in the allocator the caller passes; `Alloc`.
 blaze-own.workspace = true
 # `ContentId`: a record's reads. By path: the workspace entry turns on serde adapters.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std", "testing"] }

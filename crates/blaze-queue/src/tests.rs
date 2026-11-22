@@ -1,11 +1,17 @@
 //! The queues' tests. Between real threads: that every value pushed is popped once, in each
 //! producer's order. Under `RUSTFLAGS="--cfg blaze_check" cargo test -p blaze-queue --release
 //! model_`: every interleaving to the model's preemption bound and every value C11 lets a load
-//! read, each slot's value a tracked place, and each queue's planted bug ([`Plant`]) caught.
+//! read, each slot's value a tracked place, and each queue's planted bug ([`QueuePlant`], through
+//! the `Planted` seam) caught. Every queue is in `blaze_own::testing::heap()`'s shared handle,
+//! never the global heap.
+//!
+//! [`QueuePlant`]: crate::QueuePlant
 
 #[cfg(not(blaze_check))]
 mod threads {
     use std::{sync::Arc, thread, vec::Vec};
+
+    use blaze_own::testing::heap;
 
     use crate::{ArrayQueue, SegQueue};
 
@@ -67,7 +73,7 @@ mod threads {
 
     #[test]
     fn array_queue_hands_every_value_over_once() {
-        let queue = Arc::new(ArrayQueue::new(64));
+        let queue = Arc::new(ArrayQueue::new_in(64, heap().shared()));
         let theirs = Arc::clone(&queue);
         hands_over_once(
             move |value| {
@@ -82,7 +88,7 @@ mod threads {
 
     #[test]
     fn seg_queue_hands_every_value_over_once() {
-        let queue = Arc::new(SegQueue::<usize>::new());
+        let queue = Arc::new(SegQueue::<usize, _>::new_in(heap().shared()));
         let theirs = Arc::clone(&queue);
         hands_over_once(move |value| queue.push(value), move || theirs.pop());
     }
@@ -91,7 +97,7 @@ mod threads {
     /// what is left.
     #[test]
     fn array_queue_refuses_when_full_and_drops_what_is_left() {
-        let queue = ArrayQueue::new(3);
+        let queue = ArrayQueue::new_in(3, heap().shared());
         for at in 0..3 {
             assert_eq!(queue.push(Arc::new(at)), Ok(()));
         }
@@ -110,7 +116,7 @@ mod threads {
     /// Its length across blocks, and a drop drops what is left in every block.
     #[test]
     fn seg_queue_counts_across_blocks_and_drops_what_is_left() {
-        let queue = SegQueue::<Arc<u32>, 3>::new();
+        let queue = SegQueue::<Arc<u32>, _, 3>::new_in(heap().shared());
         let kept = Arc::new(0);
         for _ in 0..10 {
             queue.push(Arc::clone(&kept));
@@ -130,14 +136,16 @@ mod checked {
     use blaze_check::{model, sync::Arc, thread};
     use std::vec::Vec;
 
-    use crate::{ArrayQueue, Plant, SegQueue};
+    use blaze_own::testing::heap;
+
+    use crate::{ArrayQueue, QueuePlant, SegQueue};
 
     /// Two producers push one value each into a ring of one slot while a consumer pops both:
-    /// both arrive, once each. With [`Plant::RelaxedPublish`] the consumer's read of a value
-    /// races with its write.
-    fn ring_hands_over(plant: Plant) {
+    /// both arrive, once each. With [`QueuePlant::RelaxedPublish`] the consumer's read of a
+    /// value races with its write.
+    fn ring_hands_over(plant: QueuePlant) {
         model(move || {
-            let queue = Arc::new(ArrayQueue::new(1));
+            let queue = Arc::new(ArrayQueue::new_in(1, heap().shared()));
             let producers: Vec<_> = (1..3u32)
                 .map(|value| {
                     let queue = queue.clone();
@@ -171,22 +179,22 @@ mod checked {
 
     #[test]
     fn model_array_queue_hands_each_value_over_once() {
-        ring_hands_over(Plant::None);
+        ring_hands_over(QueuePlant::None);
     }
 
     /// The control: a relaxed publish of the slot lets the pop read the value unordered.
     #[test]
     #[should_panic(expected = "data race")]
     fn model_array_queue_relaxed_publish_races() {
-        ring_hands_over(Plant::RelaxedPublish);
+        ring_hands_over(QueuePlant::RelaxedPublish);
     }
 
     /// One producer fills a block of two and starts the next while two consumers pop: each
     /// value arrives once, and the full block is freed by its last reader only. With
-    /// [`Plant::FreeUnasked`] the pop of its last slot frees it under the other reader.
-    fn segments_free_after_the_last_read(plant: Plant) {
+    /// [`QueuePlant::FreeUnasked`] the pop of its last slot frees it under the other reader.
+    fn segments_free_after_the_last_read(plant: QueuePlant) {
         model(move || {
-            let queue = Arc::new(SegQueue::<u32, 2>::new());
+            let queue = Arc::new(SegQueue::<u32, _, 2>::new_in(heap().shared()));
             for value in 0..3 {
                 queue.push(value);
             }
@@ -205,14 +213,14 @@ mod checked {
 
     #[test]
     fn model_seg_queue_frees_a_block_after_its_last_read() {
-        segments_free_after_the_last_read(Plant::None);
+        segments_free_after_the_last_read(QueuePlant::None);
     }
 
     /// The control: a block freed without asking its other readers is read after its free.
     #[test]
     #[should_panic(expected = "free")]
     fn model_seg_queue_free_unasked_reads_freed_memory() {
-        segments_free_after_the_last_read(Plant::FreeUnasked);
+        segments_free_after_the_last_read(QueuePlant::FreeUnasked);
     }
 
     /// Two producers push across a block's end while one consumer pops: the block switch
@@ -220,7 +228,7 @@ mod checked {
     #[test]
     fn model_seg_queue_pushes_across_a_block_end() {
         model(|| {
-            let queue = Arc::new(SegQueue::<u32, 2>::new());
+            let queue = Arc::new(SegQueue::<u32, _, 2>::new_in(heap().shared()));
             queue.push(0);
             let producers: Vec<_> = (1..3u32)
                 .map(|value| {

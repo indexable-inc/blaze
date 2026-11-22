@@ -32,11 +32,13 @@ use blaze_typeck::ItemKey;
 use super::ProjectWorld;
 use crate::front2::by_origin;
 use crate::front2::fill::FillError;
-use crate::front2::head_record::{self, HeadAt, HeadRecordError};
-use crate::front2::heads::{HeadError, Want};
-use crate::front2::keys::{Origin, checker_of};
+use crate::front2::head_record::{self, Head, HeadAt, HeadRecordError, OpaqueOrigin};
+use crate::front2::heads::{HeadError, Store, Want};
+use crate::front2::keys::{Keys, MemberKind, Origin, checker_of, member_key_of};
 use crate::front2::project_records::BodySource;
 use crate::front2::reads::{Fact, FactKind};
+use crate::front2::source::NamesSource;
+use crate::front2::tables::head::{FreezeError, FrozenHead};
 
 /// The domain of a want's digest: the count of its heads, then each head record's digest.
 const WANT_DOMAIN: &str = "blaze-ladder front2 signature digest 1";
@@ -97,6 +99,7 @@ pub const fn reads_a_head(kind: FactKind) -> bool {
             | FactKind::ConstParams
             | FactKind::AssocGenerics
             | FactKind::TypeAlias
+            | FactKind::MemberVisible
     )
 }
 
@@ -104,14 +107,28 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// The want a fact of a body's read list reads; `None` for a fact about no head
     /// ([`reads_a_head`]).
     pub fn want_of_fact(&self, fact: Fact) -> Result<Option<Want>, HeadDigestError> {
-        if !reads_a_head(fact.kind) {
+        let opaque_owner = self.opaque_fn(ItemKey(fact.key));
+        if !reads_a_head(fact.kind) && fact.kind != FactKind::Coroutine && !(fact.kind == FactKind::Opaque && opaque_owner.is_some()) {
             return Ok(None);
         }
-        let key = ItemKey(fact.key);
+        let key = opaque_owner.unwrap_or(ItemKey(fact.key));
         let names = self.front.names;
         let keys = &self.front.keys;
         let kind = by_origin::kind_of_key(names, keys, key).map_err(|error| HeadDigestError::Fill { fact, error })?;
-        by_origin::key_want(names, keys, key, kind).map(Some).map_err(|error| HeadDigestError::Fill { fact, error })
+        let want = by_origin::key_want(names, keys, key, kind).map_err(|error| HeadDigestError::Fill { fact, error })?;
+        // A trait's member signatures share one head, but a provided method's
+        // hidden type and coroutines belong to that particular method's body.
+        if matches!(fact.kind, FactKind::Opaque | FactKind::Coroutine)
+            && let Want::Members(container) = want
+        {
+            return Ok(Some(Want::MemberFn(container, key)));
+        }
+        Ok(Some(want))
+    }
+
+    /// The parts of this checked body's hidden types that another body can read.
+    pub fn hidden_facts(&self, owner: ItemKey, scratch: Alloc<'_>, put: impl FnMut(Fact, u64)) -> Result<(), blaze_typeck::CheckError> {
+        self.store.hidden.published(owner, scratch, put)
     }
 
     /// The want whose item is the outline entry `item` of file `file` of the program's own
@@ -177,7 +194,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// The written types of `want`'s fn signature that name nothing (E0412, front2
     /// type_miss.rs), each made the error type in its head: empty for a want that is no fn's,
     /// or whose head is not made ([`Self::want_digest`] makes it).
-    pub fn want_type_misses(&self, want: Want) -> &[crate::front2::type_miss::TypeMiss] {
+    pub fn want_type_misses(&self, want: Want) -> &[crate::front2::type_miss::HeadMiss] {
         let key = match want {
             Want::Fn(lib) => checker_of(lib),
             Want::MemberFn(_, f) => f,
@@ -209,7 +226,9 @@ pub fn want_digest_in<'n, N: crate::front2::source::NamesSource<'n>>(names: N, k
     for at in heads.iter().copied() {
         let head = head_record::from_store(store, at).map_err(|error| HeadDigestError::Record { want, at, error })?;
         // What the head means, not how it is spelled: a reformat moves no reader.
-        digests.push(head_record::reader_digest(head, store.tys.view(), alloc).map_err(|error| HeadDigestError::Record { want, at, error })?);
+        let origin = |key| opaque_origin(names, keys, store, key);
+        digests.push(head_record::reader_digest_with_origins(head, store.tys.view(), alloc, &origin)
+            .map_err(|error| HeadDigestError::Record { want, at, error })?);
     }
     Ok(digest_of_heads(digests.len(), digests.iter().copied()))
 }
@@ -225,10 +244,145 @@ pub fn digest_of_heads(count: usize, digests: impl IntoIterator<Item = ContentId
     h.finish()
 }
 
+/// The owner of a term is independent of the head currently being written. In
+/// particular a field's substituted alias and a trait method's return type can
+/// belong to cells other than the field's ADT or the method's checker key.
+pub fn opaque_origin<'n, N: NamesSource<'n>>(names: N, keys: &Keys, store: &Store<'n>, key: ItemKey) -> Result<OpaqueOrigin, HeadRecordError> {
+    let &(owner, index) = store.opaques.get(&key).ok_or(HeadRecordError::MissingOpaqueOrigin { key })?;
+    let want = crate::front2::fill::want_of_key(names, keys, owner)
+        .map_err(|error| HeadRecordError::OpaqueOwner { key, owner, error })?;
+    Ok(OpaqueOrigin { want, owner, index })
+}
+
+/// Bind the serialized checker owner to the named cell in this names snapshot.
+/// A trait member is keyed by its container, kind and name. Its library item
+/// key is a different identity and cannot be substituted for the checker key.
+fn register_owner<'n, N: NamesSource<'n>>(names: N, keys: &Keys, key: ItemKey, origin: OpaqueOrigin) -> Result<(), FreezeError> {
+    let want = origin.want;
+    let lib = want.key();
+    let invalid = || FreezeError::Record { want, at: HeadAt::Opaque(key), error: HeadRecordError::InvalidOpaqueOrigin { key, origin } };
+    let clash = |error| FreezeError::Head { want, error: HeadError::Key(error) };
+    let member = match (want, names.kind_of_item(lib)) {
+        (Want::Head(_), Some(ItemKind::TypeAlias)) | (Want::Fn(_), Some(ItemKind::Function | ItemKind::Const | ItemKind::Static)) => None,
+        (Want::Members(_), Some(ItemKind::Trait)) | (Want::MemberFn(..), Some(ItemKind::Impl)) => {
+            let mut found = None;
+            let mut ambiguous = false;
+            names.each_member(lib, &mut |m| {
+                let Some(name) = m.name else { return };
+                let kind = match m.kind {
+                    ItemKind::Function => MemberKind::Fn,
+                    ItemKind::Const if matches!(want, Want::Members(_)) => MemberKind::Const,
+                    _ => return,
+                };
+                if member_key_of(checker_of(lib), kind, name) == origin.owner {
+                    ambiguous |= found.replace((kind, name)).is_some();
+                }
+            });
+            if ambiguous {
+                return Err(invalid());
+            }
+            Some(found.ok_or_else(invalid)?)
+        }
+        _ => return Err(invalid()),
+    };
+    keys.item(lib).map_err(clash)?;
+    if let Some((kind, name)) = member {
+        keys.member(checker_of(lib), kind, name).map_err(clash)?;
+    }
+    Ok(())
+}
+
+/// Read all entries before publishing their opaque references to the consumer.
+/// References point at a definition. Only the defining cell supplies predicates.
+pub fn import_with_opaque_origins<'n, 'a, N: NamesSource<'n>>(
+    names: N, keys: &Keys, store: &Store<'n>, frozen: &FrozenHead<'_>,
+    text_of: &mut dyn FnMut(HeadAt) -> Option<&'n str>, alloc: Alloc<'static>, out: Alloc<'a>,
+) -> Result<AVec<'a, (HeadAt, Head<'n>)>, FreezeError> {
+    let want = frozen.want();
+    let mut heads = AVec::new_in(out);
+    let mut origins = AVec::new_in(alloc);
+    for entry in frozen.heads() {
+        let rec = |error| FreezeError::Record { want, at: entry.at, error };
+        let text = match entry.at { HeadAt::Fn(_) => text_of(entry.at), _ => None };
+        let head = head_record::decode_with_origins(entry.record, text, &store.tys, alloc, &mut |key, origin| {
+            origins.push((key, origin, false));
+            Ok(())
+        }).map_err(rec)?;
+        match (entry.at, &head) {
+            (HeadAt::Opaque(at), Head::Opaque { key, fn_, index, preds, .. }) if at == *key => {
+                let origin = OpaqueOrigin { want, owner: *fn_, index: *index };
+                origin.check(*key).map_err(rec)?;
+                if preds.is_none() {
+                    return Err(rec(HeadRecordError::MissingOpaqueRow { key: *key, origin }));
+                }
+                origins.push((*key, origin, true));
+            }
+            (HeadAt::Opaque(_), _) | (_, Head::Opaque { .. }) =>
+                return Err(rec(HeadRecordError::Shape { what: "the opaque row disagrees with its frozen directory entry" })),
+            _ => {}
+        }
+        heads.push((entry.at, head));
+    }
+    origins.sort_unstable_by_key(|&(key, _, _)| key);
+    // A damaged producer might omit both the row and every use in its own type.
+    // A promise already imported from another cell still binds that producer.
+    if !matches!(want, Want::Adt(_) | Want::Impl(_)) {
+        let container = checker_of(want.key());
+        let missing = store.opaques.iter().filter_map(|(&key, &(owner, index))| {
+            if store.preds.contains_key(&key) {
+                return None;
+            }
+            let ours = match want {
+                Want::Head(_) | Want::Fn(_) => owner == container,
+                Want::MemberFn(_, member) => owner == member,
+                Want::Members(_) => matches!(keys.origin(owner), Some(Origin::Member { container: k, .. }) if *k == container),
+                Want::Adt(_) | Want::Impl(_) => false,
+            };
+            (ours && origins.binary_search_by_key(&key, |r| r.0).is_err()).then_some((key, owner, index))
+        }).min_by_key(|r| r.0);
+        if let Some((key, owner, index)) = missing {
+            let origin = OpaqueOrigin { want, owner, index };
+            return Err(FreezeError::Record { want, at: HeadAt::Opaque(key), error: HeadRecordError::MissingOpaqueRow { key, origin } });
+        }
+    }
+    for group in origins.chunk_by(|a, b| a.0 == b.0) {
+        let (key, origin, _) = group[0];
+        let rec = |error| FreezeError::Record { want, at: HeadAt::Opaque(key), error };
+        let mut rows = 0;
+        for &(_, other, is_row) in group {
+            if origin != other {
+                return Err(rec(HeadRecordError::ConflictingOpaqueOrigin { key, first: origin, second: other }));
+            }
+            rows += usize::from(is_row);
+        }
+        if rows > 1 {
+            return Err(rec(HeadRecordError::Shape { what: "two opaque definition rows have the same key" }));
+        }
+        if (origin.want == want && rows == 0) || (store.made(origin.want) && !store.preds.contains_key(&key)) {
+            return Err(rec(HeadRecordError::MissingOpaqueRow { key, origin }));
+        }
+        if store.opaques.contains_key(&key) {
+            let first = opaque_origin(names, keys, store, key).map_err(rec)?;
+            if first != origin {
+                return Err(rec(HeadRecordError::ConflictingOpaqueOrigin { key, first, second: origin }));
+            }
+        } else {
+            register_owner(names, keys, key, origin)?;
+        }
+    }
+    origins.dedup_by_key(|row| row.0);
+    for (key, origin, _) in origins {
+        if !store.opaques.contains_key(&key) {
+            store.opaques.insert(key, (origin.owner, origin.index));
+        }
+    }
+    Ok(heads)
+}
+
 /// The heads `want` makes in `store` (the one list: a `Signature`'s digest above and a frozen
 /// head, front2/tables/head.rs), in a fixed order with no map order in it: the item's own first,
 /// then the heads made with it, each group sorted by key:
-/// - a fn (free or of an impl): its `impl Trait` return types' opaques;
+/// - a fn (free or of an impl) or type alias: its owned opaques;
 /// - an ADT: its constructors, then its field defaults' anonymous constants (RFC 3681);
 /// - a trait's members: its fns and associated constants that have a head or were refused alone
 ///   (`Store::fn_gaps`: head_record.rs `FnRefused`, its why), then those fns' opaques;
@@ -238,10 +392,10 @@ pub fn digest_of_heads(count: usize, digests: impl IntoIterator<Item = ContentId
 /// no head of their own kind yet (`HeadAt`), so not listed.
 pub fn want_heads<'a>(store: &crate::front2::heads::Store<'_>, want: Want, alloc: Alloc<'a>) -> AVec<'a, HeadAt> {
     let mut out: AVec<'a, HeadAt> = AVec::new_in(alloc);
-    // Each opaque made by one of `fns`, sorted.
-    let opaques_of = |fns: &[ItemKey], out: &mut AVec<'a, HeadAt>| {
+    // Each opaque made by one of these owners, sorted.
+    let opaques_of = |owners: &[ItemKey], out: &mut AVec<'a, HeadAt>| {
         let mut found: AVec<'a, ItemKey> = AVec::new_in(alloc);
-        found.extend(store.opaques.iter().filter(|(_, (f, _))| fns.contains(f)).map(|(k, _)| *k));
+        found.extend(store.opaques.iter().filter(|(_, (owner, _))| owners.contains(owner)).map(|(k, _)| *k));
         found.sort_unstable();
         out.extend(found.iter().map(|k| HeadAt::Opaque(*k)));
     };
@@ -303,6 +457,7 @@ pub fn want_heads<'a>(store: &crate::front2::heads::Store<'_>, want: Want, alloc
         Want::Head(lib) => {
             if store.maps.aliases.contains_key(&lib) {
                 out.push(HeadAt::Alias(lib));
+                opaques_of(&[checker_of(lib)], &mut out);
             } else if store.maps.trait_aliases.contains_key(&lib) {
                 out.push(HeadAt::TraitAlias(lib));
             } else if store.maps.traits.contains_key(&lib) {

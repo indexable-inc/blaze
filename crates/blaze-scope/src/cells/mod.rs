@@ -26,6 +26,8 @@ use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Names
 
 // D116: the old scopes against the records at module grain, name by name.
 mod agree;
+// D189 step 4: one body's blocks solved over the crate's finished names.
+mod body;
 mod decide;
 mod deps;
 mod early;
@@ -53,19 +55,20 @@ use early::EarlyAmbiguity;
 pub(crate) use world::{links_agree_world, solve_world};
 
 pub use agree::{Agreed, Answer, AnswersDiffer, Asked, Disagreement};
+pub(crate) use body::{BodyTree, FinishedScopes, LoggedEnums, solve_body_in};
 pub(crate) use made::Tables;
 pub use made::TablesError;
 pub(crate) use switch::solve_and_write;
-pub use decide::{DecideCheck, DecideError};
+pub use decide::{DecideCheck, DecideError, Difference};
 pub use groups::{ABSENT as GROUP_ABSENT, GroupRead, GroupSeen, GroupShape, GroupsError, NameGroup, NodeAt, OwnError as GroupOwnError, RecordError as GroupRecordError, write_groups};
 use groups::OwnError;
 pub use lazy_deps::{LazyDep, MOST_ROUNDS as MOST_WANT_ROUNDS, OnDemand, OnDemandError, Refused as OnDemandRefused, Want, names_on_demand};
 pub use lazy::{DemandError, Demanded, DemandedOpts, MOST_DEPTH as MOST_DEMAND_DEPTH, MOST_SOLVES as MOST_DEMAND_SOLVES, NoRecordOf, demand};
-pub use edit::{Edit, EditError, Edited, GroupRecords, GroupRef, GroupSolver, MOST_WIDENINGS, MemberRefusal, Members, OneGroup, OneGroupRefusal, Solved, most_entries, re_solve};
+pub use edit::{Edit, EditError, Edited, GroupRecords, GroupRef, GroupSolver, MemberRefusal, Members, OneGroup, OneGroupRefusal, Solved, most_entries, re_solve};
 #[cfg(test)]
 pub(crate) use edit::{EditPlant, re_solve_planted};
 pub use groups::{globs_cell, own_digest, textual_cell};
-pub use switch::{MOST_ROUNDS, Unwritten};
+pub use switch::Unwritten;
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames, EnumNames};
 
@@ -86,7 +89,7 @@ fn ns_at(ns: Namespace) -> usize {
 
 /// Which bindings of a name a cell holds.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum Layer {
+pub enum Layer {
     /// What a path reads: the explicit entry or named import, else the globs.
     Full,
     /// Through the module's globs alone: what a named import of this very name reads.
@@ -95,7 +98,7 @@ pub(crate) enum Layer {
 
 /// A decided cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Value {
+pub enum Value {
     NotFound,
     Found(Def, Visibility),
     /// Two different items through globs (R2); the smaller def, the first visibility.
@@ -160,9 +163,6 @@ pub enum Unfollowed {
     /// `use name;` beside a `macro_rules! name` of the module's text.
     TextualImport,
 }
-
-/// The number of [`Unfollowed`] classes.
-pub const UNFOLLOWED: usize = 8;
 
 impl Unfollowed {
     pub fn at(self) -> usize {
@@ -327,6 +327,10 @@ pub(crate) enum CellPlant {
     NoWatch,
     /// R7 broken: a glob candidate wins over a different outer one.
     GlobBeatsOuter,
+    /// A block's lexical `use super::*;` is read as a glob import at a first segment: a name
+    /// the module around the block binds by a named import is ambiguous with a different
+    /// outer one (the `#[macro_use]` prelude's `format` beside `use dep::x as format;`).
+    LexicalGlobIsAGlob,
     /// A stalled item whose guess is `Outside` is failed by the stall, not marked first.
     StallFailsOutside,
     /// A path into a dependency's module is unknown (`Outside`), its record unread.
@@ -456,6 +460,17 @@ pub(crate) const KEEP_ITEM: Def = Def {
     kind: DefKind::Other,
 };
 
+/// What a proc-macro crate's harness call ([`CallRole::ProcMacroHarness`], D175) is called
+/// with: no macro; the driver lowers the call's input, the `_DECLS` static blaze-scope
+/// task/lower.rs `Lower::proc_macro_harness` wrote, as its expansion, declaring no name
+/// (resolve.rs `keep_item`, [`crate::resolve`]'s `KeepAs::Harness`). Never bound in a module,
+/// never written to a record; its bytes are no other sentinel's and, but by a 2^-64 chance, no
+/// item's.
+pub(crate) const PROC_MACRO_HARNESS: Def = Def {
+    key: ItemKey(blaze_id::ContentId(*b"proc-macro harness _DECLS\0\0\0\0\0\0\0")),
+    kind: DefKind::Other,
+};
+
 /// What the calls written after a derive on an item decided for one attribute call on it
 /// ([`Cells::item_fate`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -575,6 +590,15 @@ enum Answered {
     NoRecord,
 }
 
+/// Where a walk of a recorded textual sequence ([`Cells::textual_recorded`]) stops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cut {
+    /// The whole sequence (a `#[macro_use]` child walked into).
+    Whole,
+    /// Before this child's `mod` line (its mark).
+    Child(ItemKey),
+}
+
 /// A module outside a one-group solve's members as its group's record holds it ([`Outside`]).
 pub(crate) struct Filled<'f, N> {
     pub(crate) bindings: AVec<'f, blaze_surface::ScopeEntry<N>>,
@@ -593,6 +617,16 @@ pub(crate) trait Outside<N> {
     /// `key`'s scope from its group's record into `into`, and the digest of its globs cell
     /// there; `None` when no record holds it.
     fn fill(&self, key: ItemKey, into: &mut Filled<'_, N>) -> Result<Option<blaze_id::ContentId>, edit::MemberRefusal>;
+
+    /// The chain of `key`, a module of this crate the outside holds (itself first, the root
+    /// last): how a module that no text read here names, and that no record filled yet
+    /// declares, is reached ([`Cells::reach_outside`]: each ancestor filled from the root
+    /// down, whose record declares the next). `None` (the default, a one-group solve's group
+    /// records): such a module is reached only through its parent's record, as before.
+    fn chain(&self, key: ItemKey) -> Option<&[ItemKey]> {
+        let _ = key;
+        None
+    }
 }
 
 struct Cell<'a, N> {
@@ -659,6 +693,16 @@ enum Skip {
     /// All of it, and the module's glob imports not resolved yet: the weak view
     /// ([`Cells::weak_view`]), read at a stall under a guess of its own.
     Weak,
+}
+
+/// How far [`Cells::make_modules_in`] makes modules from the ones it is given.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Extent {
+    /// Their subtrees by their `mod` lines: a crate solve's whole tree.
+    Subtrees,
+    /// The given modules alone, each with its `mod` lines: a body solve's chain
+    /// ([`Cells::load_body`]).
+    Listed,
 }
 
 /// What holds the lookup of a plain first segment in its module ([`Cells::first_segment`]).
@@ -749,6 +793,9 @@ pub(crate) struct Cells<'a, N> {
     /// The item each call is written on (`MacroCallDecl::item`), by call: a derive's helper
     /// scope is its item's ([`Cells::derive_helper`]).
     call_on: ABTreeMap<'a, ItemId, u32>,
+    /// The proc-macro harness calls ([`CallRole::ProcMacroHarness`]): each answered
+    /// [`PROC_MACRO_HARNESS`] at once, its path never read.
+    harness_calls: ABTreeSet<'a, ItemId>,
     /// The derive calls on each item of each fragment, in text order.
     derives_on: ABTreeMap<'a, (FragId, u32), AVec<'a, ItemId>>,
     /// The calls written after a derive on each item of each fragment ([`CallRole`]): what
@@ -837,6 +884,10 @@ pub(crate) struct Cells<'a, N> {
     /// A one-group solve met what it cannot answer from the members' texts and the records
     /// (the first met): the caller solves the crate whole (edit.rs).
     pub(crate) member_refusal: Option<edit::MemberRefusal>,
+    /// A body solve's (body.rs) outermost block modules, each with the length of its body's
+    /// module's textual sequence at the body's place: a `macro_rules!` walk out of the block
+    /// reads that module's finished sequence cut there ([`Cells::textual`]). Empty otherwise.
+    body_cuts: ABTreeMap<'a, ItemKey, u32>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -904,6 +955,67 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         read: &dyn Fn(ItemKey) -> bool,
         alloc: Alloc<'a>,
     ) -> Result<Cells<'a, N>, CellError> {
+        let mut cells = Cells::empty(facts, root, deps, plant, alloc)?;
+        let made = cells.make_modules(facts, &[root])?;
+        cells.walked = cells.modules.len() as ModId;
+        cells.root = cells.by_key[&root];
+        for &m in made.iter() {
+            if read(cells.modules[m as usize].key) {
+                cells.read_text(facts, m)?;
+            } else if m == cells.root {
+                cells.read_outer(facts, m)?;
+            }
+        }
+        Ok(cells)
+    }
+
+    /// A body solve's load (cells/body.rs `solve_body_in`): the crate's root, the chain of
+    /// modules `prelude` names (the crate's own standard prelude and its ancestors, empty when
+    /// the prelude is a dependency's: [`Cells::read_outer`] reads a prelude of this crate as one
+    /// of its modules), the root's outer scopes, and the modules `chain` names (the body's
+    /// module's ancestors from the root, `BodyTree::chain`), each with its `mod` lines and no
+    /// text, and the `#[macro_use]`
+    /// children of each module of `chain`, to the end of that closure (a `macro_rules!` walk
+    /// out of the body enters them, [`Cells::textual_recorded`]). No subtree is walked: every
+    /// other module of the crate is made when a lookup first reaches it
+    /// ([`Cells::reach_outside`] through the finished scopes' chains, or
+    /// [`Cells::fill_pending`] as a child its parent's scope declares), so a body's load is its
+    /// chain and what it reads, never its crate's whole tree (rule 77: the tree is the crate's
+    /// records, made once by the crate's solve).
+    pub(crate) fn load_body<F: ScopeFacts<Name = N>>(
+        facts: &F,
+        root: ItemKey,
+        chain: &[ItemKey],
+        prelude: &[ItemKey],
+        deps: Option<&'a dyn DepNames<N>>,
+        alloc: Alloc<'a>,
+    ) -> Result<Cells<'a, N>, CellError> {
+        let mut cells = Cells::empty(facts, root, deps, CellPlant::None, alloc)?;
+        cells.make_modules_in(facts, &[root], Extent::Listed)?;
+        let r = cells.by_key[&root];
+        cells.root = r;
+        cells.make_modules_in(facts, prelude, Extent::Listed)?;
+        cells.read_outer(facts, r)?;
+        let mut made = cells.make_modules_in(facts, chain, Extent::Listed)?;
+        made.push(r);
+        // The `#[macro_use]` closure from the chain (the root's own children included): each
+        // round makes the children not made yet of the last round's modules; a module is made
+        // once, so it ends within the crate's tree.
+        while !made.is_empty() {
+            let mut kids: AVec<'a, ItemKey> = AVec::new_in(alloc);
+            for &m in made.iter() {
+                let lines = cells.modules[m as usize].lines.iter().flatten();
+                kids.extend(lines.filter(|l| l.1 && !cells.by_key.contains_key(&l.0)).map(|l| l.0));
+            }
+            made = cells.make_modules_in(facts, &kids, Extent::Listed)?;
+        }
+        cells.walked = cells.modules.len() as ModId;
+        Ok(cells)
+    }
+
+    /// The cells of the crate under `root` with no module made yet: the crate's dependencies by
+    /// name, its tools and built-in attributes read from its root record.
+    fn empty<F: ScopeFacts<Name = N>>(facts: &F, root: ItemKey, deps: Option<&'a dyn DepNames<N>>, plant: CellPlant, alloc: Alloc<'a>) -> Result<Cells<'a, N>, CellError> {
         let info = facts.module(root).map_err(|error| CellError::Facts { module: root, error })?;
         let mut cells = Cells {
             alloc,
@@ -931,6 +1043,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             builtin_attrs: AVec::new_in(alloc),
             arbitrary_ints: false,
             call_on: ABTreeMap::new_in(alloc),
+            harness_calls: ABTreeSet::new_in(alloc),
             derives_on: ABTreeMap::new_in(alloc),
             after_derive_on: ABTreeMap::new_in(alloc),
             attr_after: ABTreeMap::new_in(alloc),
@@ -966,6 +1079,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             recorded_textual: ABTreeMap::new_in(alloc),
             outside: None,
             member_refusal: None,
+            body_cuts: ABTreeMap::new_in(alloc),
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
@@ -976,16 +1090,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
             cells.arbitrary_ints = r.head.arbitrary_ints;
         }
-        let made = cells.make_modules(facts, &[root])?;
-        cells.walked = cells.modules.len() as ModId;
-        cells.root = cells.by_key[&root];
-        for &m in made.iter() {
-            if read(cells.modules[m as usize].key) {
-                cells.read_text(facts, m)?;
-            } else if m == cells.root {
-                cells.read_outer(facts, m)?;
-            }
-        }
         Ok(cells)
     }
 
@@ -993,6 +1097,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// their texts; those an expansion writes come with it), numbered in key order after the
     /// modules already made, with parents and chains. Their texts are read by the caller.
     fn make_modules<F: ScopeFacts<Name = N>>(&mut self, facts: &F, tops: &[ItemKey]) -> Result<AVec<'a, ModId>, CellError> {
+        self.make_modules_in(facts, tops, Extent::Subtrees)
+    }
+
+    /// [`Cells::make_modules`] to the extent `extent`: the subtrees under `tops`, or the modules
+    /// `tops` alone (each with its `mod` lines, its children not made).
+    fn make_modules_in<F: ScopeFacts<Name = N>>(&mut self, facts: &F, tops: &[ItemKey], extent: Extent) -> Result<AVec<'a, ModId>, CellError> {
         let alloc = self.alloc;
         let mut keys: ABTreeSet<'a, ItemKey> = ABTreeSet::new_in(alloc);
         let mut todo: AVec<'a, ItemKey> = AVec::from_slice_in(tops, alloc);
@@ -1005,7 +1115,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // The module tree record's lines: no text of it is lowered for them.
             let mut own: AVec<'a, (ItemKey, bool)> = AVec::new_in(alloc);
             if facts.mod_lines(m, &mut own) {
-                todo.extend(own.iter().map(|l| l.0));
+                if extent == Extent::Subtrees {
+                    todo.extend(own.iter().map(|l| l.0));
+                }
                 lines.insert(m, own);
                 continue;
             }
@@ -1023,7 +1135,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             };
             own.reserve(d.mods.len());
             for c in d.mods.iter() {
-                todo.push(c.module);
+                if extent == Extent::Subtrees {
+                    todo.push(c.module);
+                }
                 own.push((c.module, c.macro_use));
             }
             lines.insert(m, own);
@@ -1226,7 +1340,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             for e in f.bindings.iter() {
                 let d = e.binding.def;
-                if e.binding.origin == crate::Origin::Declared && d.kind == crate::DefKind::Module && !self.by_key.contains_key(&d.key) {
+                // A child the outside places ([`Outside::chain`]: a body solve's finished
+                // scopes) is made when a lookup reaches it ([`Cells::reach_outside`]): a body
+                // that reads the root makes none of the root's other children.
+                if e.binding.origin == crate::Origin::Declared
+                    && d.kind == crate::DefKind::Module
+                    && !self.by_key.contains_key(&d.key)
+                    && outside.chain(d.key).is_none()
+                {
                     self.make_recorded_child(m, d.key, e.name);
                 }
             }
@@ -1453,6 +1574,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 deep,
             });
             self.call_ids.insert(c.call, id);
+            if c.role == CallRole::ProcMacroHarness {
+                self.harness_calls.insert(id);
+            }
             if let Some(on) = c.item {
                 self.call_on.insert(id, on);
                 if c.role != CallRole::Call {
@@ -1467,7 +1591,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             calls.before_derive.push(id);
                         }
                         CallRole::Keep => calls.keep = Some(id),
-                        CallRole::Call => {}
+                        // Never on an item (its `item` is `None`): registered below.
+                        CallRole::Call | CallRole::ProcMacroHarness => {}
                     }
                 }
                 match c.kind {
@@ -1772,11 +1897,52 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if let Some(&m) = self.by_key.get(&key) {
             return Some(m);
         }
+        if let Some(m) = self.reach_outside(key) {
+            return Some(m);
+        }
         let found = self.foreign(key);
         if found.is_none() {
             self.stats.dep_absent += 1;
         }
         found
+    }
+
+    /// Module `key` of this crate when the outside places it ([`Outside::chain`]) and it is
+    /// not made yet: a body solve's glob of a module an expansion wrote outside the body
+    /// (serde_core's every `use crate::lib::*;`, `lib` written by `crate_root!()`; libc's
+    /// `use crate::prelude::*;` and the root's `pub use unix::*;` under `cfg_if!`), whose
+    /// source no `mod` line of a text read here names. Each ancestor below the deepest one
+    /// made here is filled from its finished scope, root side first ([`Cells::fill_pending`]),
+    /// which makes the next one as the child its scope declares; the ancestors' scopes are
+    /// then reads of the solve, as for any path through them. `None`: no outside places it,
+    /// or a filled ancestor does not declare the next (the caller then refuses the module by
+    /// name, rule 3). Bounded by the chain's length; each module leaves `Pending` once.
+    fn reach_outside(&mut self, key: ItemKey) -> Option<ModId> {
+        if key.crate_prefix() != self.krate.prefix() {
+            return None;
+        }
+        let outside = self.outside?;
+        let chain = outside.chain(key)?;
+        // The deepest ancestor made here (the root is always made: `load_reading`'s first).
+        let made = chain.iter().position(|k| self.by_key.contains_key(k))?;
+        for i in (1..=made).rev() {
+            let parent = self.by_key[&chain[i]];
+            let child = chain[i - 1];
+            self.fill_pending(parent);
+            if self.by_key.contains_key(&child) {
+                continue;
+            }
+            // A parent filled already, or being filled now (its bindings read, its globs being
+            // followed: libc's root reaching `unix` from its own `pub use unix::*;`), makes the
+            // children its record declares only after its globs: the one this reach needs is
+            // made here, by the name the parent's record declares it under.
+            if !matches!(self.modules[parent as usize].answered, Answered::Record(_)) {
+                return None;
+            }
+            let name = self.modules[parent as usize].explicit.iter().find(|(_, e)| e.0.key == child && e.0.kind == DefKind::Module && e.2 == Origin::Declared).map(|(&(_, n), _)| n)?;
+            self.make_recorded_child(parent, child, name);
+        }
+        self.by_key.get(&key).copied()
     }
 
     fn foreign(&mut self, key: ItemKey) -> Option<ModId> {
@@ -2205,6 +2371,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// Item `i`'s answer from its reads; `hold`: what holds a plain first segment's lookup.
     fn try_item(&mut self, i: ItemId, guess: Option<&Guess<'a>>, hold: Hold) -> Step<Outcome> {
+        // A proc-macro crate's harness: no path to read, its expansion its own input.
+        if self.harness_calls.contains(&i) {
+            return Step::Done(Outcome::Called(PROC_MACRO_HARNESS));
+        }
         let (m, kind, glob, binds, ivis) = {
             let it = &self.items[i as usize];
             (it.module, it.kind, it.glob, it.binds, it.vis)
@@ -2880,6 +3050,25 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             Step::Done(x) => x,
             Step::Wait(n) => return Step::Wait(n),
         };
+        // A block's module whose only glob is its lexical one ([`Cells::lexical_glob`]) and that
+        // binds `name` itself nowhere: its candidate is the scope around the block's, not a
+        // glob's. The Reference, `names.scopes.block` / "Statements", "Item declarations": a
+        // block's names are its own item declarations, and a name it lacks is looked up in the
+        // scope around it, lexically; that walk is no glob import, so the glob-vs-outer rule
+        // (`names.resolution.expansion.imports.ambiguity.glob-vs-outer`) is the enclosing
+        // module's to apply, against its own kind of binding. (`use dep::emits_impl as format;
+        // fn g() { format!(); }`: the module's named import shadows the `#[macro_use]`
+        // prelude's `format`; taken as a glob's candidate it was GlobVsOuter, the call failed
+        // and its impl was never written.) A block with a glob of its own keeps the glob
+        // reading: its candidates and the outer ones are then really a glob's and the outer's.
+        if from == From::Glob
+            && self.anonymous(m)
+            && self.plant != CellPlant::LexicalGlobIsAGlob
+            && self.modules[m as usize].glob_items.iter().all(|&g| self.lexical_glob(g))
+            && let Some(p) = self.modules[m as usize].parent
+        {
+            return self.first_segment(p, ns, name, me, guess, hold, amb_kind);
+        }
         if inner == Value::Outside {
             return Step::Done(Value::Outside);
         }
@@ -3253,7 +3442,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         if t == FragId::MAX {
                             // A `#[macro_use]` child outside the group: its textual sequence
                             // from its record; one not held is refused (rule 3: never skipped).
-                            match self.textual_recorded(child, None, name, sub) {
+                            match self.textual_recorded(child, Cut::Whole, name, sub) {
                                 Ok(Some(def)) => return Step::Done(Some(def)),
                                 Ok(None) => {}
                                 Err(module) => {
@@ -3294,12 +3483,28 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     for _ in 0..self.modules[module as usize].chain.len() {
                         let Some(p) = self.modules[at as usize].parent else { break };
                         self.fill_pending(p);
+                        // A body solve's outermost block (body.rs): out of the body, the scope is
+                        // the crate's FINISHED textual scope at the body's place, an input fixed
+                        // outside (D189): its module's flattened sequence before the place, then
+                        // each ancestor's before its child's mark ([`Cells::textual_finished`]).
+                        if let Some(&len) = self.body_cuts.get(&self.modules[at as usize].key)
+                            && matches!(self.modules[p as usize].answered, Answered::Record(_))
+                        {
+                            match self.textual_finished(p, len, name, sub) {
+                                Ok(found) => return Step::Done(found),
+                                Err(module) => {
+                                    let refusal = self.textual_refusal(module);
+                                    self.member_refusal.get_or_insert(refusal);
+                                    return Step::Done(None);
+                                }
+                            }
+                        }
                         let md = &self.modules[at as usize];
                         if md.mod_line.is_some() || md.block_at.is_some() || !matches!(self.modules[p as usize].answered, Answered::Record(_)) {
                             break;
                         }
                         let child = md.key;
-                        match self.textual_recorded(p, Some(child), name, sub) {
+                        match self.textual_recorded(p, Cut::Child(child), name, sub) {
                             Ok(Some(def)) => return Step::Done(Some(def)),
                             Ok(None) => at = p,
                             Err(module) => {
@@ -3326,21 +3531,22 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 
     /// `name!` by the textual sequence of module `p` as its record holds it (a module outside a
-    /// one-group solve's members): before `cut`'s `mod` line, or in the whole of it (`None`, a
+    /// one-group solve's members): before a child's `mod` line ([`Cut::Child`]) or in the whole
+    /// of it ([`Cut::Whole`], a
     /// `#[macro_use]` child walked into), the latest definition first. The walk over text
     /// ([`Cells::textual`]) would read `p`'s fragments and each `#[macro_use]` child's met on
     /// the way back to the definition found, or all of them: those are logged
     /// (`textual_rec_log`), each from its own record, so the group's reads are the whole
     /// solve's. `Err(module)`: a module the walk reads whose sequence is not held here.
-    fn textual_recorded(&mut self, p: ModId, cut: Option<ItemKey>, name: N, sub: Option<CallShape>) -> Result<Option<Def>, ItemKey> {
+    fn textual_recorded(&mut self, p: ModId, cut: Cut, name: N, sub: Option<CallShape>) -> Result<Option<Def>, ItemKey> {
         let alloc = self.alloc;
         let key = self.modules[p as usize].key;
         self.fill_pending(p);
         let Some(r) = self.recorded_textual.get(&p) else { return Err(key) };
         let mut found: Option<(usize, Def)> = None;
         let end = match cut {
-            None => r.defs.len(),
-            Some(c) => match r.marks.iter().find(|k| k.child == c) {
+            Cut::Whole => r.defs.len(),
+            Cut::Child(c) => match r.marks.iter().find(|k| k.child == c) {
                 Some(k) => k.len as usize,
                 None => return Err(key),
             },
@@ -3354,7 +3560,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         // The modules the walk reads: `p` (before `cut`), then each `#[macro_use]` child it
         // meets going back to the definition, with where that definition is inside it. Each
         // module once (the tree), so the list ends within the crate's modules (rule 18).
-        let mut todo: AVec<'a, (ModId, Option<ItemKey>, Option<usize>)> = AVec::new_in(alloc);
+        let mut todo: AVec<'a, (ModId, Cut, Option<usize>)> = AVec::new_in(alloc);
         todo.push((p, cut, found.map(|(i, _)| i)));
         let mut steps = 0usize;
         while let Some((t, cut, at)) = todo.pop() {
@@ -3372,7 +3578,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let Some(r) = self.recorded_textual.get(&t) else { return Err(tkey) };
             let Some(macro_use) = r.macro_use.as_ref() else { return Err(tkey) };
             let mut met: AVec<'a, (ModId, Option<usize>)> = AVec::new_in(alloc);
-            for k in r.marks.iter().take_while(|k| Some(k.child) != cut) {
+            for k in r.marks.iter() {
+                match cut {
+                    Cut::Child(c) if k.child == c => break,
+                    Cut::Whole | Cut::Child(_) => {}
+                }
                 if !macro_use.contains(&k.child) {
                     continue;
                 }
@@ -3390,9 +3600,60 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             if let Some(log) = self.textual_rec_log.as_mut() {
                 log.push(t);
             }
-            todo.extend(met.iter().map(|&(c, at)| (c, None, at)));
+            todo.extend(met.iter().map(|&(c, at)| (c, Cut::Whole, at)));
         }
         Ok(found.map(|(_, def)| def))
+    }
+
+    /// `name!` out of a body (a body solve, D189): the crate's finished textual scope at the
+    /// body's place, which the crate solve fixed before the body is solved. Module `p` (the
+    /// body's module) is read in its finished sequence before `len` definitions (the body's
+    /// cut, `HeldBody::cut`); then each module up the tree in its finished sequence before its
+    /// child's mark, to the root (Reference `macro.decl.scope.textual`: a `macro_rules!` is in
+    /// scope after its definition, into child modules, and out of a `#[macro_use]` module).
+    /// Each sequence is the scope's own `textual` as write.rs flattened it (its `#[macro_use]`
+    /// children's and its expansions' definitions in place, every `mod` line's mark, a
+    /// macro-written `mod` too), so the walk never needs a module's `mod` lines: the case
+    /// [`Cells::textual_recorded`] refuses for a parent whose `mod` an expansion wrote
+    /// (`cfg_if! { mod soft; }`), which refused every body of such a crate that calls a name no
+    /// nearer sequence defines (`vec!`, `format!`: a one-segment call asks the textual scope
+    /// first). Every module read is filled through the solve's [`Outside`], so the body's read
+    /// list holds its scope (crate::body_scope `reads_digest`). `Err(module)`: a module the walk
+    /// needs whose finished sequence is not held, or that marks no place for the child it came
+    /// up from (rule 3: refused, never taken as the end of the scope).
+    fn textual_finished(&mut self, p: ModId, len: u32, name: N, sub: Option<CallShape>) -> Result<Option<Def>, ItemKey> {
+        let plant = self.plant;
+        let mut at = p;
+        let mut child: Option<ItemKey> = None;
+        // The tree bounds the walk (rule 18): one step per module of `p`'s chain.
+        for _ in 0..=self.modules[p as usize].chain.len() {
+            self.fill_pending(at);
+            let key = self.modules[at as usize].key;
+            let Some(r) = self.recorded_textual.get(&at) else { return Err(key) };
+            let end = match child {
+                None => len as usize,
+                Some(c) => match r.marks.iter().find(|k| k.child == c) {
+                    Some(k) => k.len as usize,
+                    // A module with no `macro_rules!` at all shows nothing before any line.
+                    None if r.defs.is_empty() => 0,
+                    None => return Err(key),
+                },
+            };
+            if end > r.defs.len() {
+                return Err(key);
+            }
+            let hit = r.defs[..end].iter().rev().find(|d| {
+                let def = Def { key: d.def, kind: DefKind::Macro(d.shapes) };
+                d.name == name && (plant == CellPlant::SubNamespaceIgnored || sub.is_none_or(|s| same_sub(def, s)))
+            });
+            if let Some(d) = hit {
+                return Ok(Some(Def { key: d.def, kind: DefKind::Macro(d.shapes) }));
+            }
+            let Some(parent) = self.modules[at as usize].parent else { return Ok(None) };
+            child = Some(key);
+            at = parent;
+        }
+        Err(self.modules[p as usize].key)
     }
 
     /// The refusal of a textual walk that needs the sequence of `module`, outside a one-group

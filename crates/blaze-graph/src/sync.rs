@@ -13,7 +13,7 @@ pub(crate) use blaze_core::lock::{Lock, LockGuard};
 )]
 pub(crate) use std::sync::OnceLock;
 #[cfg(not(blaze_check))]
-pub(crate) use std::{hint, sync::atomic, thread, thread_local};
+pub(crate) use std::{sync::atomic, thread, thread_local};
 
 #[cfg(blaze_check)]
 pub(crate) use blaze_check::{

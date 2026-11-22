@@ -28,11 +28,11 @@ use blaze_own::FixedString;
 
 use crate::{
     cx::Cx,
-    io::{Io, Missing},
+    io::Io,
     mem::TASK_FRAME,
 };
 
-pub use crate::rt::{Exit, run, run_with, run_with_heap};
+pub use crate::rt::{Exit, run, run_with, run_with_heap, run_with_heap_at};
 
 /// The process's heap, as the grant a `main` or a test is handed ([`crate::mem::Heap`]): the
 /// ONE call of `blaze_own::Heap::process()` in the tree (D120). Every entry of bstd takes its

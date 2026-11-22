@@ -318,7 +318,12 @@ impl Live {
 /// scope cancelled, [`crate::io::Limits::abandon_wait`] more on the pool's. Past that, what it
 /// waits for is a task still running that may borrow the frame the waiter is about to leave:
 /// a hang, and the process stops naming `task` (rule 18; the module's doc).
-fn outlast(cx: &Cx, pool: &Pool, tally: &Tally, task: &'static str, until: Deadline, mut ready: impl FnMut() -> bool) {
+fn outlast(cx: &Cx, pool: &Pool, tally: &Tally, task: &'static str, until: Deadline, ready: impl FnMut() -> bool) {
+    // The join's time is charged to the joiner's worker under the task it waited on (D171).
+    cx.charged(cx.io(), task, None, || outlast_now(cx, pool, tally, task, until, ready));
+}
+
+fn outlast_now(cx: &Cx, pool: &Pool, tally: &Tally, task: &'static str, until: Deadline, mut ready: impl FnMut() -> bool) {
     let io = cx.io();
     let waited = pool.wait(cx.here(), tally, "bstd.task.join", &mut ready, || until.passed(io.now()));
     match waited {
@@ -509,9 +514,18 @@ impl<'p> Scope<'p> {
         let scope = live.cx.name();
         let failures = Arc::clone(tally);
         let body = move |here: Here| -> Ran<T> {
+            // The task's name on its thread while it runs: what a lock it holds leaves for a
+            // waiter at a release someone waited for (blaze-core's lock record, D179). Two stores
+            // a task; a child run inline keeps its parent's name.
+            let was = blaze_meter::set_doing(name);
             let cx = seed.grow(here);
+            // The telemetry's task hooks (decision 2): the worker's cell names this task as its
+            // current one until it ends, so its waits' records carry its id.
+            let begun = cx.task_began(name);
             let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
+            cx.task_ended(begun, !matches!(ran, Ok(Ok(_))));
             drop(cx);
+            blaze_meter::set_doing(was);
             match ended(ran) {
                 Ok(made) => Ran::Made(made),
                 Err(Ending::Exit(exit)) => Ran::Exit(exit),
@@ -580,7 +594,9 @@ impl<'p> Scope<'p> {
         // A new task may go to any worker; once started it stays there (the module's doc).
         let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(index)).with_class(live.class.get());
         live.running.set(live.running.get() + 1);
+        let begun = cx.task_began(name);
         let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
+        cx.task_ended(begun, !matches!(ran, Ok(Ok(_))));
         live.running.set(live.running.get() - 1);
         drop(cx);
         let outcome = match ended(ran) {

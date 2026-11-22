@@ -86,6 +86,11 @@ pub trait BodySources {
     /// (`blaze_scope::left_reads::file_left_reads`), the item host's own; returns how many.
     /// Required, never defaulted: no body source can leave the finding out (super::body_left).
     fn file_left_reads(&self, krate: usize, call: blaze_scope::left_reads::CallAt<'_>, reads: &blaze_expand::Reads<'_>, span: core::ops::Range<usize>, alloc: Alloc<'_>) -> u32;
+    /// Decision D111: an include a body's call made whose file lies outside its member's own
+    /// package and inside the workspace, told as `left` to the item host's one sink
+    /// (`SourceTexts::left_package`: a warning at the call). Required, never defaulted: no body
+    /// source can leave the finding out (super::body_left `file_body_left_includes`).
+    fn left_package(&self, krate: usize, left: blaze_scope::include_place::LeftPackage<'_>);
 }
 
 /// A [`SourceTexts`] as a body's [`BodySources`]: the same texts, environment and runner
@@ -133,14 +138,35 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
     fn file_left_reads(&self, krate: usize, call: blaze_scope::left_reads::CallAt<'_>, reads: &blaze_expand::Reads<'_>, span: core::ops::Range<usize>, alloc: Alloc<'_>) -> u32 {
         blaze_scope::left_reads::file_left_reads(self.0, krate, call, reads, span, alloc)
     }
+
+    fn left_package(&self, krate: usize, left: blaze_scope::include_place::LeftPackage<'_>) {
+        self.0.left_package(krate, left)
+    }
 }
 
-fn body_file<'h, S: NamesSource<'h>>(names: S, krate: usize, item: LibKey) -> Option<FilePaths<'h>> {
+/// The file the body of `item` is written in (the outermost call's file for a body a macro
+/// wrote): where its includes are placed from (here, and super::body_left's D111 filing).
+pub(super) fn body_file<'h, S: NamesSource<'h>>(names: S, krate: usize, item: LibKey) -> Option<FilePaths<'h>> {
     let place = names.place_of(item)?;
-    match place.at {
-        At::File(file) if place.krate == krate => names.file_paths(krate, file),
-        _ => None,
+    if place.krate != krate {
+        return None;
     }
+    let At::Expansion(mut call) = place.at else {
+        let At::File(file) = place.at else { return None };
+        return names.file_paths(krate, file);
+    };
+
+    // The text each call is written in, outward to the outermost call's file (the Reference,
+    // `include!`: relative to the file of the outermost call site): the call part of the
+    // expansion's origins (`NamesSource::call_text`), which solved names and records both
+    // serve. An expansion's call is no item row, so its `place_of` answers nothing over records.
+    for _ in 0..super::expansion_origin::MOST_LEVELS {
+        match names.call_text(krate, call)? {
+            At::File(file) => return names.file_paths(krate, file),
+            At::Expansion(parent) => call = parent,
+        }
+    }
+    None
 }
 
 /// The expansion host of one body: see the module's doc.
@@ -162,6 +188,15 @@ impl<'h> BodyHost<'h> {
     /// refuses every env read, include and proc macro by name.
     pub fn of<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
         Self::from_file_lookup(names, sources, krate, module, alloc, move || body_file(names, krate, item))
+    }
+
+    /// The host of a body whose item was written by a macro. The body stage supplies the
+    /// physical file of the invocation because records do not retain the expansion-origin
+    /// column needed to recover it from the item key alone.
+    pub fn of_with_file<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, file: FilePaths<'h>, alloc: Alloc<'h>) -> impl ExpandCx {
+        Self::from_file_lookup(names, sources, krate, module, alloc, move || {
+            body_file(names, krate, item).or_else(|| names.place_of(item).and_then(|place| matches!(place.at, At::Expansion(_)).then_some(file)))
+        })
     }
 
     fn from_file_lookup<S: NamesSource<'h>, F: FnOnce() -> Option<FilePaths<'h>>>(
@@ -186,7 +221,7 @@ impl<'h, F: FnOnce() -> Option<FilePaths<'h>>> ExpandCx for BodyHost<'h, F> {
         blaze_lower::cfg_outcome(predicate, &mut CrateCfg(self.atoms), self.alloc)
     }
 
-    fn include(&self, written: &str, how: IncludeAs) -> Result<Included<'_>, HostError> {
+    fn include(&self, written: &str, _how: IncludeAs) -> Result<Included<'_>, HostError> {
         let sources = self.sources.ok_or(refused(HostAsk::Include))?;
         if let Some(file) = sources.script_file(self.krate, written) {
             return Ok(file?.map_or(Included::Missing, Included::Bytes));
@@ -199,10 +234,13 @@ impl<'h, F: FnOnce() -> Option<FilePaths<'h>>> ExpandCx for BodyHost<'h, F> {
         let Some(path) = blaze_scope::included::included_file(package, sources.seen(self.krate), &from, written, self.alloc) else {
             return Ok(Included::Outside);
         };
-        let bytes = match how {
-            IncludeAs::Tokens => sources.read(self.krate, &path).map(str::as_bytes),
-            IncludeAs::Str | IncludeAs::Bytes => sources.read_data(self.krate, &from, &path),
-        };
+        // Every kind is a read of the file's bytes, listed with the calling file (the body's
+        // WHOLE read of it, rule 21): `include!` in a body is parsed as one expression (the
+        // Reference, "Macros", core `include!`), so its block's meaning is the file's whole
+        // text, as blaze-scope's item host reads a body's `include!` (resolve.rs
+        // `Host::include`). Read as a module text it was in no read list, and an edit of the
+        // file left the body's check standing.
+        let bytes = sources.read_data(self.krate, &from, &path);
         Ok(bytes.map_or(Included::Missing, Included::Bytes))
     }
 
@@ -272,6 +310,8 @@ mod tests {
         fn file_left_reads(&self, _: usize, _: blaze_scope::left_reads::CallAt<'_>, _: &blaze_expand::Reads<'_>, _: core::ops::Range<usize>, _: Alloc<'_>) -> u32 {
             0
         }
+        // Its one data file is in its package: nothing to tell.
+        fn left_package(&self, _: usize, _: blaze_scope::include_place::LeftPackage<'_>) {}
     }
 
     fn host(sources: Option<&'static dyn BodySources>) -> BodyHost<'static> {

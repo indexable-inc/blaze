@@ -14,7 +14,7 @@ mod fn_text_tests;
 pub mod goals;
 pub mod head;
 #[cfg(test)]
-mod head_tests;
+pub(crate) mod head_tests;
 #[cfg(test)]
 mod local_fns_tests;
 pub mod owned_reads;

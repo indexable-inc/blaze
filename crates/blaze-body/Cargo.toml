@@ -22,10 +22,10 @@ blaze-own.workspace = true
 blaze-typeck.workspace = true
 # `record!`, `Writer`, `Slice`, `open_as`: the record, on `core` alone. By path, as blaze-lower
 # names it.
-blaze-format-core = { path = "../blaze-format-core" }
+blaze-format-core.workspace = true
 # `HashMap`, `FixedState`: the builder's interning indexes (places, constants, the type overlay),
 # in the builder's allocator. By path, as blaze-typeck names it (no serde, no shared tables).
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 
 [lints]
 workspace = true

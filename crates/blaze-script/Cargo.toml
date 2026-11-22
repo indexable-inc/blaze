@@ -22,6 +22,8 @@ blaze-core.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 # `\d` of a pattern (`regex`) is Unicode Nd.
 blaze-unicode.workspace = true
+# The pinned nightly's name (`RUSTUP_TOOLCHAIN` of a run).
+blaze-pins.workspace = true
 
 [dev-dependencies]
 # The property test of `regex` against a backtracking reference.

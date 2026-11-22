@@ -1186,6 +1186,366 @@
    "recommended": "After the check's stages are at their floors: `run`/`test` start from the engine's answer with code as engine tasks (plan row F2). Judge: hello world's first run (12.84 s for 630 code records made one at a time on 2026-11-18; the second run 0.07 s must not move) and unused code records made.",
    "why": "Both reviews named it the one design limit of the cold run; the hello-world first run builds 630 fns serially on one thread.",
    "state": "decided by the coordinator 2026-11-18 05:15; NOT started."
+  },
+  {
+   "id": "D147",
+   "date": "2026-11-19",
+   "decision": "`run` and `test` read the engine's answer: one check (`check_for_start`), then the start walks the answer's records for the body ids and the native image; the old drive request is deleted.",
+   "recommended": "design/run.md, \"Run and test read the engine's answer\" and \"THE CONTRACT OF E3\".",
+   "why": "Two paths checked a program two ways; the first real `blaze test` on tempo took 193 s and ran 0 tests on the old one.",
+   "state": "decided by the coordinator 2026-11-19; written in the wave; hello-world fixtures run through it on 2026-11-19 20:20 (rounds/wave-1119/t5); not admitted."
+  },
+  {
+   "id": "D148",
+   "date": "2026-11-19",
+   "decision": "Lifetimes are produced once by the head producer and carried in region columns beside the erased types; no consumer reads signature text.",
+   "recommended": "design/flow.md, \"Lifetimes are produced once and carried beside the types\"; `region_facts.rs` is the contract. Variance stays (`lifetimes.rs`).",
+   "why": "Three text readers of signatures disagreed and each was a second fix to one mechanism.",
+   "state": "decided by the coordinator 2026-11-19; written in the wave; typeck 352, flow-lower 94 and ladder lib 169 tests pass on 2026-11-19 20:15; not admitted."
+  },
+  {
+   "id": "D149",
+   "date": "2026-11-19",
+   "decision": "An edit costs what it moved: a member listing row per file keyed by the file's text, a per-file head listing record, and per-file rendered lines.",
+   "recommended": "design/engine.md, \"An edit costs what it moved\".",
+   "why": "A stack sample of a tempo body edit: about 60% in the Bodies listing and 30% in printing; the body itself about 1%.",
+   "state": "decided by the coordinator 2026-11-19; written in the wave; tempo not yet measured on it."
+  },
+  {
+   "id": "D150",
+   "date": "2026-11-19",
+   "decision": "A command's fixed costs do not grow with the project: the FSEvents replay is checkpointed, the plan is read back through an index.",
+   "recommended": "design/engine.md, \"A command's fixed costs do not grow with the project\" (as corrected: the \"journal replayed\" phase is the FSEvents replay in journal_sweep.rs).",
+   "why": "A tempo no-op was 221 ms: journal replayed 152 ms, sweep 55 ms; an edit added 196 ms of plan read-back.",
+   "state": "decided by the coordinator 2026-11-19; written in the wave; tempo not yet measured on it."
+  },
+  {
+   "id": "D151",
+   "date": "2026-11-19",
+   "decision": "The run's gate: a workspace body is run when its types were checked whole and it has no error finding. A body whose borrow check was refused or not run is run too, and `run` prints the check's own incomplete line. A body with an error, or whose types were not checked whole, is not run and is named.",
+   "recommended": "Revisit when `BORROWS_ARE_ERRORS` is turned on: a borrow finding is then an error and stops the body as any error does; a refused borrow check stays a note.",
+   "why": "The borrow check never changes what a body does when run, and `check` answers 0 errors for such a body. The real hello world's `main` was refused by `blaze run` on 2026-11-19 20:25 because its borrow check was refused (rounds/wave-1119/real5); under \"Clean only\" every body tempo's borrow check refuses (1,895 on green) could not be run.",
+   "state": "decided by the coordinator 2026-11-19 20:27; being written (engine_body_facts.rs `Class`, run_ids.rs `verdict`)."
+  },
+  {
+   "id": "D152",
+   "date": "2026-11-19",
+   "decision": "A package's test build is a VIEW of its crate, not a second crate: one crate key and one ItemKey per item, cfg recorded as a read, the test view computed as the base view plus an edit and stored as an overlay; `blaze test` reads the overlay then the base. A package that reaches itself through a dev-dependency keeps a crate key of its own for its test build.",
+   "recommended": "design/test.md, \"A test build is a view of its crate\". Its own wave, after the 2026-11-19 wave is admitted. Rejected: checking every shared body a second time (doubles the check for every package with tests); two crate keys shared by code-identity keys with key mapping (front2 shared_keys.rs: relative keys in every record and answer digest).",
+   "why": "Seen 2026-11-19 (rounds/wave-1119/t5): a test that calls a library fn is NOT RUN, because the body is checked under the library unit's key alone and the test program asks for the test unit's. bottom.md already states the end state (\"an item's key holds no cfg, and every record's read list names the cfg outcomes it read\"). A second reader (advise, 2026-11-19 20:52) confirmed the design and added: keys must count every written sibling, the extern prelude needs a cell per name, lookups must check reads, and dev-dependency cycles (2 tempo packages, 16 of reth's) need their own key.",
+   "state": "decided by the coordinator 2026-11-19 20:55; design written; NOT started."
+  },
+  {
+   "id": "D153",
+   "date": "2026-11-20",
+   "decision": "Utilization is designed from the measured runs: Names is scheduled by readiness and not by wave; a worker writes its own record; the answer is stored as each stage merges; the poles (a 50.8 s build script, proc-macro calls of 20 to 28 s) are profiled, then cut; the edit's and the no-op's fixed costs are brought to stated floors (edit under 300 ms, no-op under 30 ms, cold peak under 8 GB on tempo).",
+   "recommended": "design/utilization.md (U1 to U11, each with its measured cost and its judge). Data: the notes' reports/util-1120/ (37 scoreboards mined).",
+   "why": "Cold check on tempo (wave11): 270 s at 4.1 of 16 cores; Names at 1.8 cores for 118 s because a wave waits for its slowest task (53.7 s of wall for 54 ms of work); 19.8 s of record puts on the coordinator; 31 s and +22 GB to store a 2.8 GB answer. One-body edit: 1.63 s, of which the body is 36 ms.",
+   "state": "decided by the coordinator 2026-11-20 12:50 on the owner's request (\"measure and redesign for optimal IO, Mem and CPU utilization based on all our historical data\"); design written; NOT started."
+  },
+  {
+   "id": "D154",
+   "date": "2026-11-20",
+   "decision": "The implicit state machines of the live path are encoded in types, by eight forms (state enum, typestate, proof, linear value, typed id, recording host, whole-value constructor, no sentinel), starting with the 36 that can give a wrong answer, lose data or hang. A count that depends on what was made first is carried in the type's node (the third fix to that mechanism is the redesign, rule 66).",
+   "recommended": "design/states.md (the forms, the 36, the order). The six audit reports: the notes' rounds/wave-1121-sm/. Three lints that exist and are set to Allow are turned on first.",
+   "why": "The owner's request of 2026-11-20 (\"find all implicit state machines in my code, encode all correct states in the typesystem, and eliminate bug categories at compile time\"). Six read-only audits found 165 machines; one was a live bug (the root manifest read before the journal's place is taken, fixed by hand the same day); several of the week's bugs are of these classes (a head filed without its regions, positions compared with slots, a separator inside a string).",
+   "state": "decided by the coordinator 2026-11-20 12:55; design written; item 9 fixed by hand; the rest NOT started (after the 2026-11-19 wave is admitted)."
+  },
+  {
+   "id": "D155",
+   "date": "2026-11-20",
+   "decision": "A declared lifetime count is a fact of the item's own text and has one home: its crate's items record (one count per ADT, trait, type alias and associated type, written by the names lowering from the item's generics). The region walk's `Arity` reads it through the names source, for any item the names world holds, in any store; it never reads the heads' maps. `Count::NotKnown` stays only for an opaque type's captures (derived by its fn's head) and a key the names world does not hold. Deleted with it: `Maps.{adt,trait,assoc}_lifetimes` as the walk's source, `CountsNoting`, `Store::unmade_counts`, the counts carried in trait head records.",
+   "recommended": "design/states.md item 30 (amended: the home is the items record; a node need not carry it once the lookup is total). One writer for both sides (blaze-scope items_record.rs and lower.rs; front2 types.rs `HeadsArity`, heads.rs).",
+   "why": "The fourth failure of one mechanism in two days: a count known only if another head was made first (a restored trait's lifetimes; an associated type's; a default or alias body of a recorded ADT, 9,115 tempo bodies; and on 2026-11-20 13:06 the derive's own `fn clone(&self) -> Self`, refused `Counts` on the two-crate fixture). Rule 66: a second fix to one mechanism stops it.",
+   "state": "decided by the coordinator 2026-11-20 13:08; being written."
+  },
+  {
+   "id": "D156",
+   "date": "2026-11-20",
+   "decision": "Regions are arguments inside types (erased only in keys and in the trait solver); one walk makes them; the borrow check works over one grain (a type's region slots) and one call rule (instantiate the callee's signature, relate, add its clauses). D148's column beside erased types is superseded.",
+   "recommended": "design/end-state.md D156; the audit: the notes' rounds/wave-1122-arch/A1-borrow-check.md. Contract crate: crates/blaze-borrow.",
+   "why": "Tempo 2026-11-20: 8,449 bodies refused against 1,895 before the wave; 4,715 by a count known only if another head was made first (four fixes), 2,940 where the flow's positions meet the column's slots; nine call paths, 54 refusal forms. The cause is the erasure, which D148 (the coordinator's, 2026-11-19) kept.",
+   "state": "decided by the coordinator 2026-11-20 13:40 on the owner's words (\"do u agree with the end sstate? if so do the end state immediately\", \"u shoudl delte dead weight oto\"); started the same hour."
+  },
+  {
+   "id": "D157",
+   "date": "2026-11-20",
+   "decision": "One driver in blaze-engine; a stage is a kind of task (plan, run -> Done | Need | Failed); a task is entered when the producers of what it read have merged; a worker puts its own record; the answer is written as tasks merge and asked by key. No side record, index or memo is added: a derived fact that is kept is a task.",
+   "recommended": "design/end-state.md D157; the audit: rounds/wave-1122-arch/A2-command-engine.md.",
+   "why": "bottom.md states pull (`Need`); the command plans everything ahead, runs seven stages with eight schedulers of its own and refuses `Need` as a bug; the engine's generic driver is called by its simulation alone. The side records of D149 and D150 (member rows, listing records, the plan index, the journal checkpoint) hide repetition with hand-written keys; the checkpoint is not taken on tempo.",
+   "state": "decided by the coordinator 2026-11-20 13:40 on the owner's words (\"do u agree with the end sstate? if so do the end state immediately\", \"u shoudl delte dead weight oto\"); started the same hour."
+  },
+  {
+   "id": "D158",
+   "date": "2026-11-20",
+   "decision": "Names at module grain: a module's links are a record keyed by its text, a lookup decides cells on demand with every hop a logged read, a cycle is a group; one crate key (D152); cfg is read; an expansion is found by its call key before the work; script outputs are read as cells. One of the two built designs is completed and the other three are deleted.",
+   "recommended": "design/end-state.md D158; the audit: rounds/wave-1122-arch/A3-names-macros-units.md.",
+   "why": "Names is 118 s of a 270 s cold check at 1.8 cores; the live path solves each crate whole under about 9,000 lines of overlay; four finer-grain designs (about 14,000 lines) are built and unswitched; 115,426 of 221,933 expansions are made twice.",
+   "state": "decided by the coordinator 2026-11-20 13:40 on the owner's words (\"do u agree with the end sstate? if so do the end state immediately\", \"u shoudl delte dead weight oto\"); started the same hour."
+  },
+  {
+   "id": "D159",
+   "date": "2026-11-20",
+   "decision": "One body record read by the borrow check, constant evaluation and the builder (D119 finished); code made ahead by one run parent on the worker pool; one store handle with a writer per worker; a size-tiered merge with a stated bound in the commit; one stored answer form; the pack store and the dead crates deleted.",
+   "recommended": "design/end-state.md D159; the audit: rounds/wave-1122-arch/A4-store-builder.md.",
+   "why": "A checked body is lowered three times with 115 not-built refusals in the builder; D119's crates are written and unwired; the old pack store (about 49,700 lines) is used by nothing live; the compaction planner discards every merge past 64 MiB, so segments only grow.",
+   "state": "decided by the coordinator 2026-11-20 13:40 on the owner's words (\"do u agree with the end sstate? if so do the end state immediately\", \"u shoudl delte dead weight oto\"); started the same hour."
+  },
+  {
+   "id": "D160",
+   "date": "2026-11-20",
+   "decision": "A store's format is part of its place: the one store is `<home>/.blaze/v2/store/f<FORMAT>/`. A blaze with a new format starts a new store beside the old one, says so once (the old folder by name and size), and goes on; nothing is migrated, and no command stops because an older or newer blaze wrote a store. Old-format folders are cleanup's: removed by the sweep after their expiry, and by `blaze clean`. A store of the SAME format that does not read is still a typed refusal (corruption is never read as empty).",
+   "recommended": "Scope in AGENTS.md: 'An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.' Keys cover every input (rule 21): the format is an input of the place. The real-run script gains an upgrade case: the previous binary makes a store, the new one runs on the same home.",
+   "why": "Installing today's build (store head format 5) on a home whose store was format 4 stopped every command: 'a plain store's head slot is of format 4, and this blaze reads format 5'. The store only detected and reported; nothing rebuilt it, and two binaries (blaze and blaze-prev) could not share a home. Found by the owner's first run after the install; the real-run script always used a fresh home, so it could not see it.",
+   "state": "decided by the coordinator 2026-11-20 16:26 on the owner's question (\"hwo to fix this? sohudl it auto clean or what\"); with the store writer; not built."
+  },
+  {
+   "id": "D161",
+   "date": "2026-11-20",
+   "decision": "A task that lacks a fact waits on it and resumes; nothing starts over: Need in the engine (D157), the gate and inline claims in the checker. Deletes nine restart loops, waves and their caps.",
+   "recommended": "design/end-state.md D161; audit B2 F1 (rounds/wave-1123-audit2/B2-checker-flow-builder-run.md); the outside review of the ready driver.",
+   "why": "Nine layers restart from the top on a missing fact (caps 65,536 / 256 / 256); typeck.md measures 74% of solver calls as restarted goals; a 145-frame stack overflow and three failed fixes to the engine's batch bookkeeping were the same shape.",
+   "state": "decided by the coordinator 2026-11-20 16:45 on the owner's words (\"ok rewrite to be proper long term design that u recommend here\"); not built."
+  },
+  {
+   "id": "D162",
+   "date": "2026-11-20",
+   "decision": "A key is Key::of(schema, producer, inputs) with the schema derived by reflection; an old form is a miss; one Home value names every place; one pins/ folder holds every toolchain fact.",
+   "recommended": "design/end-state.md D162; audits B1 and B4.",
+   "why": "About 85 form numbers and 46 numbered hash domains sit inside keys that already hold the binary's id, so none can catch anything, while the numbers that matter (the store's place, the profile history, fixed paths) are outside any key; toolchain facts are in nine places; 18 path constants in 14 files; three home-root rules.",
+   "state": "decided by the coordinator 2026-11-20 16:45 on the owner's words (\"ok rewrite to be proper long term design that u recommend here\"); not built."
+  },
+  {
+   "id": "D163",
+   "date": "2026-11-20",
+   "decision": "A proof is a type in a signature: emit takes Verified, run builds from the check's body record and never checks again.",
+   "recommended": "design/end-state.md D163; audit B2 F3, F4.",
+   "why": "blaze run type-checks every body a second time in another front end; the borrow proof is read by nothing; verify returns ().",
+   "state": "decided by the coordinator 2026-11-20 16:45 on the owner's words (\"ok rewrite to be proper long term design that u recommend here\"); not built."
+  },
+  {
+   "id": "D164",
+   "date": "2026-11-20",
+   "decision": "A finding is one record with a subject and a typed cause key; every view is a query over findings; tests assert on records through World.",
+   "recommended": "design/end-state.md D164; audit B3.",
+   "why": "Notes are sentences built at the site and grouped by sentence equality in five printers; exit status comes from the printed tally; about 1,288 text matches in tests broke on wording changes.",
+   "state": "decided by the coordinator 2026-11-20 16:45 on the owner's words (\"ok rewrite to be proper long term design that u recommend here\"); not built."
+  },
+  {
+   "id": "D165",
+   "date": "2026-11-20",
+   "decision": "Limits are a value a simulation draws down to the boundary; a blaze-sim control names its invariant as a typed value; plants are parameters; a test's declared kind decides its tier.",
+   "recommended": "design/end-state.md D165; audit B3.",
+   "why": "All 89 store simulations passed and the first real tempo run committed a manifest its reader refuses; controls matched substrings and all failed with the clean run's message for a day; 166 plant enums in production files.",
+   "state": "decided by the coordinator 2026-11-20 16:45 on the owner's words (\"ok rewrite to be proper long term design that u recommend here\"); not built."
+  },
+  {
+   "id": "D166",
+   "date": "2026-11-20",
+   "decision": "Five crate layers pointing down, one store with namespaces, heads read in place, crates no binary reaches out of the workspace, documents current or end-state only.",
+   "recommended": "design/end-state.md D166; audit B4, B2 F2.",
+   "why": "55 of 168 workspace members (348k lines) are reached by no binary; the live front end sits in blaze-ladder beside the driver and emitter; blaze-cli holds the engine; heads are copied three times per reader; 135 of 145 design docs say plan and 40 name deleted crates.",
+   "state": "decided by the coordinator 2026-11-20 16:45 on the owner's words (\"ok rewrite to be proper long term design that u recommend here\"); not built."
+  },
+  {
+   "id": "D167",
+   "date": "2026-11-20",
+   "decision": "Each error of 2026-11-20 is closed by a design: seven by D160 to D166, five new: body grain for macro-written bodies; a phase's wall accounted as work plus named waits; a model held against the real service by one conformance suite; one walk per syntax; real runs that meet an upgraded home and a large store and keep a failed home.",
+   "recommended": "design/end-state.md D167 (the table).",
+   "why": "A 28.6 s single task for one macro call's bodies bounds the Bodies stage at 16 cores; Names rounds with 0.1 s of work take 42 s and 26 s unexplained; the file-event simulation passed while the real service failed; one syntax was walked by two functions with the same bug; the install check could not see an older store and the scoreboard deleted the failed home.",
+   "state": "decided by the coordinator 2026-11-20 16:55 on the owner's words (\"based on errors you are having redesig narchitecture to by design fix these thigns\"); (a) and (b) with a writer."
+  },
+  {
+   "id": "D168",
+   "date": "2026-11-20",
+   "decision": "The edit path's floor: a one-body edit on tempo costs the body (about 30 ms with a live helper holding the file-event stream, about 130 ms with none), a no-op under 10 ms. Six mechanisms: a request starts from what moved on the one driver; a world is opened by need with the last read list as the gate set; a script reads cells of a Given, never the whole; an expiring helper holds the journal's stream; the answer is a delta; start reads one pointer.",
+   "recommended": "design/end-state.md D168 (the measured table).",
+   "why": "Measured on tempo (c1725wave42): edit 1.21 s of which the body is 31 ms: Bodies stage 587 ms beside the body (1,204 names records, 96,285 asks, 29,771 heads listed to read 4), plan 187 ms (1,797 of 1,797 rows read, 920 sources statted), scripts 123 ms (two build scripts rerun on a Given read whole), journal 99 ms (141 ms on a no-op), sweep 45 ms (191 files statted for 1 event), print 23 ms, open checkout 22 ms.",
+   "state": "decided by the coordinator 2026-11-20 17:40 on the owner's words (\"look at architecture and see how we can imporve incremental times ... insanely fast ... otherwordly\"); lanes out."
+  },
+  {
+   "id": "D169",
+   "date": "2026-11-20",
+   "decision": "Every row of the profile that has a time also says what the stretch used: allocations and bytes by allocator, page faults, instructions and cycles, system calls by kind, store gets and bytes, bytes hashed, waits; one thread-local meter read where time is already taken.",
+   "recommended": "design/end-state.md D169.",
+   "why": "A one-body edit of tempo (1.21 s, the body 31 ms) retires 17.9 billion instructions, allocates 1.06 GB on the global heap, takes 154,194 page faults (2.5 GB resident) and 0.35 s of system time, and the profile cannot say which stretch does it.",
+   "state": "decided by the coordinator 2026-11-20 17:46 on the owner's words (\"the data should incldue allocations too ideally or other itngs statics\"); a writer is out."
+  },
+  {
+   "id": "D170",
+   "date": "2026-11-20",
+   "decision": "Everything the binary reaches becomes a sans-IO state machine on bstd with nothing ambient, as a gated requirement: conventions C1 to C7 (one allocator form, Opts constructors, nothing ambient, typed errors, one machine shape, planted tests, a gate of lints and ratchets), waves T0, W1, the four seams, the middle, the core and bstd, the top. Wasmtime stays behind a driver; the Windows driver and Alloc::global() go; code the end state deletes is not converted first.",
+   "recommended": "design/end-state.md D170; the analysis: notes rounds/wave-1124-sansio (inventory.csv, A, B, C).",
+   "why": "108 reached crates (665k lines): 42 no_std, 28 marked sans-IO, 2,775 Global, 293 Alloc::global(), 7,431 ambient allocating calls, 85 thread-locals, 22 crates with third-party packages, none clean, and no lint or ratchet for it runs (the sans_io lints are set to allow and unimplemented).",
+   "state": "decided by the coordinator 2026-11-20 18:15 on the owner's words (\"this should be a reuiqremnet and u should rewrite evyerhign to be this and explicit state machien\"; \"first analyze evyerhing and then do a mass rewrite in aprallel\"); open with the owner: whether collections take the Opts form, objc2 in bstd, vendored crypto and QUIC, the unreached middle code's deletion; wave 1 out."
+  },
+  {
+   "id": "D171",
+   "date": "2026-11-20",
+   "decision": "A worker's state is a value the pool owns: `Workers`, built once in main, with bstd's own fields (id, scratch, trace sink, meter, random stream) and typed slots: a `Slot<T>` token made only by registering a column before the pool is built, read by two indexes inside `cx.on_worker(|w| ..)`, which cannot wait. ECS storage (a column a component, a worker the entity), none of its machinery.",
+   "recommended": "design/end-state.md D171.",
+   "why": "85 thread-locals in the reached tree hold per-worker state (frames, tag counts, trace, the meter, plants); a fiber resumed on another thread reads the wrong one; simulations cannot give each worker its own; nothing in a signature shows the state.",
+   "state": "decided by the coordinator 2026-11-20 18:50 on the owner's words (\"YES add that that would be great... should it kinda be like an ECS too or no? (so people can add arbitrary things)\"); a writer is out."
+  },
+  {
+   "id": "D172",
+   "date": "2026-11-20",
+   "decision": "The open questions decided: collections keep new_in; third-party packages leave the reached tree except Wasmtime and the unedited vendored crypto and QUIC behind thin drivers; plainly dead middle code is deleted and the lock-file capability (manifest cargo layer, blaze-resolve, blaze-source) is parked; one HTTP client, bstd's; the journal helper is built; a body run needs with no typed record is a Need for the engine's one check (SecondCheck deleted at that switch); fetch's bounded retry goes; no cross-crate seam is stacked on unbuilt work.",
+   "recommended": "design/end-state.md D172.",
+   "why": "Each was open with the owner after the analyses of D170 and the edit-path work of D168; he asked for the best long-term option in each.",
+   "state": "decided by the coordinator 2026-11-20 18:52 on the owner's words (\"just do the best long term option yea / whatever makes u happiest etc\"); vendored code is still not edited without his word."
+  },
+  {
+   "id": "D173",
+   "date": "2026-11-20",
+   "decision": "No global allocator can be reached from blaze's code: `Global`, `Alloc::global()`, `SharedAlloc::global()` and `Heap::process()` go; the process heap is a grant `main` names and passes; blaze's crates are no_std without `alloc`, so the compiler refuses ambient allocation; the one `#[global_allocator]` static lives in the binary crate as the counted, capped foreign heap for Wasmtime and the vendored cryptography only.",
+   "recommended": "design/end-state.md D173.",
+   "why": "`Heap::process()` is a const fn any code can call (5 shipped uses), 2,775 `Global` and 293 `Alloc::global()` remain, and the gate tool and the lint disagreed on whether the allocator's static is allowed.",
+   "state": "decided by the coordinator 2026-11-20 19:00 on the owner's words (\"ideally no global allocator and need expicit\"; \"just do the best long term option\"); a seam: waits for the unbuilt pile to compile."
+  },
+  {
+   "id": "D174",
+   "date": "2026-11-20",
+   "decision": "C in blaze without a build script: one pinned C toolchain (toolchain-c.md) run natively in its own process as blaze's own hermetic tool (only the roots blaze gives it; its reads reported and checked); no WebAssembly build of it; `blaze::c::import!`, a built-in macro whose expansion is a record of Rust declarations keyed by the call, target, toolchain and every header read, behind a `CFrontEnd` seam (clang first, blaze's own declaration front end later, held equal); C sources as per-file unit tasks declared in `[package.metadata.blaze.c]`, compiled only when a reached symbol needs them, to code records with no link step; existing crates' `cc` and `bindgen` calls answered by the same machinery.",
+   "recommended": "design/c.md.",
+   "why": "Six of tempo's dependencies run bindgen and a C compiler from build scripts (one is 24 s of a first check); a build script is opaque to keys, read lists and the sandbox. Zig removed `@cImport` in 0.17 because a compile-time C import tied the compiler to a C compiler: so this is a library over records, not a language builtin.",
+   "state": "decided by the coordinator 2026-11-20 19:05 on the owner's words (\"I think blaze shoudl also sship a c compiler and do something similar to the cImport ... what is the most idioamtic way pls do this\"); step 1 (crates/blaze-c) out; the toolchain's wasm build needs CI (network), not run here. Amended 19:05: the wasm build of clang is dropped on the owner's words (\"web assembly clang? huh and why we need that\")."
+  },
+  {
+   "id": "D175",
+   "date": "2026-11-20",
+   "decision": "WebAssembly is a bridge, not the end state: compile-time code (proc macros, build scripts) will be compiled by blaze's own back end and run by its launcher in its own process, against a standard library whose system layer holds only the grants given, with the OS process sandbox, fuel and a deadline; Wasmtime, the wasm target, blaze-wasi and the WASI view are deleted at that switch after a byte-equality oracle on tempo's expansions. Nothing new is built on wasm; the C compiler never goes through it.",
+   "recommended": "design/end-state.md D175; rule 10 is rewritten at the switch.",
+   "why": "Wasmtime is the one third-party runtime left; a second target, standard-library build and WASI layer exist only for compile-time code; blaze already owns a back end, a launcher and its standard library.",
+   "state": "decided by the coordinator 2026-11-20 19:06 on the owner's words (\"do we even want/need web assembly etc??? ... long term that stuff should be comptime stuff and it is kinda just a for now thing\"); not started: it needs run from code records (D159, D163) and the unbuilt pile compiled first."
+  },
+  {
+   "id": "D176",
+   "date": "2026-11-20",
+   "decision": "C++ is imported by the same seam as C (`blaze::cpp::import!`), in three steps on one declaration record: plain shapes (namespaces, overloads with clang's mangled names, enum class, references, trivially copyable classes); classes with constructors and destructors (trivially relocatable ones as owned values with Drop and clone, the rest address-only through blaze's own extension type); and what needs the compiler (templates instantiated on demand, inline functions compiled into code records, exceptions caught by generated thunks and returned as Result). No bridge file, build script or generated source.",
+   "recommended": "design/c.md, section C++.",
+   "why": "blaze ships the C++ compiler, has no link step and owns the language: the three things a binding generator lacks for C++.",
+   "state": "decided by the coordinator 2026-11-20 19:10 on the owner's words (\"could we build the same thing as c import but for cpp ? that would be really awesome too\"); the C declaration model is being written to hold it; C++ step 1 starts after C imports work on tempo's six crates."
+  },
+  {
+   "id": "D177",
+   "date": "2026-11-20",
+   "decision": "bstd gets one capability to run a program hermetically, over the existing `start_served`: `cx.hermetic(HermeticSpec { .. })` with nothing inherited (env, roots, clock, seed given), returning exit, outputs and a checked read list; the promise is a type: `Level::Inputs` (OS-held roots, reads reported: for blaze's own pinned tools) or `Level::Execution` (the run itself determined: blaze-built programs on its launcher, or the hypervisor sandbox where allowed); a level with no backend is a typed refusal.",
+   "recommended": "design/end-state.md D177.",
+   "why": "Three partial mechanisms exist (bstd's served child with no confinement or read list; the wasm sandbox; the hypervisor sandbox the owner has parked) and four users need one (the C compiler, compile-time code, build scripts' native tools, sandboxed tests).",
+   "state": "decided by the coordinator 2026-11-20 19:15 on the owner's question (\"shouold bstd have api for spawning command in sandboxed detemrinistic way?\") and his earlier \"just do the best long term option\"; a writer is out. The hypervisor backend is not run without his word."
+  },
+  {
+   "id": "D178",
+   "date": "2026-11-20",
+   "decision": "Telemetry is a property of bstd: every bstd program gets, per span and per run, what it used, what it waited on (with distributions and lock holders), IO by effect kind, the pool's utilization and queue depth, the critical chain computed from named waits, and a reconciliation against process totals, in one typed Report handed to a sink main was granted, at a level that is a value; never in a key or record. Crates add only domain counters through a worker slot.",
+   "recommended": "design/end-state.md D178.",
+   "why": "Every measurement added today (phase marks, stage tables, the Names timeline, body counters, the meter's per-task lines) was hand-placed in the command crate for one program, and each needed remembering; all of it passes through choke points bstd already owns.",
+   "state": "decided by the coordinator 2026-11-20 19:25 on the owner's words (\"it would be great if everything that uses B standard could have this option by default rather than us adding ad hoc per grade where we have to remember\"); a writer is out on the core as new files."
+  },
+  {
+   "id": "D179",
+   "date": "2026-11-20",
+   "decision": "State shared between workers is one of three bstd primitives: Published (written once, read with one atomic load; reading before publication is a Need), Gathered (a column of worker cells, merged by one owner at a boundary in worker-independent order), Claimed (the claim table: first to ask makes it, others read or park; ends in Published). A named Lock is the exception: it states at construction which shape it could not be, the count of locks only falls, and the profile's locks section finds the ones to remove.",
+   "recommended": "design/end-state.md D179; docs/v2/plan/design/lock-policy.md.",
+   "why": "About 86 locks are constructed in shipped code with no report on any; bstd's World lock sits on every IO submit and poll; per-worker cells (D171), the claim table and write-once records already exist as three separate mechanisms with no rule tying shared state to them.",
+   "state": "decided by the coordinator 2026-11-20 19:30 on the owner's words (\"ok the ndesign for this\"); the writer on lock reporting is extending it with the list of every lock and what it becomes."
+  },
+  {
+   "id": "D180",
+   "date": "2026-11-20",
+   "decision": "No package from a registry in blaze's build: the 15 third-party packages named directly by 21 of our crates (closure: 205 registry packages reached by the binary, 274 with test edges) go to zero in a stated order, each count a ratchet in the gate that only falls; what is truly left at the end (the TLS and QUIC closure) is pinned in vendor/ with the registry replaced, until blaze's own TLS.",
+   "recommended": "design/end-state.md D180.",
+   "why": "cargo metadata on the verification tree 2026-11-20: 205 registry packages reached, 115 through wasmtime alone; most direct names already have a decided deletion (D172, D175).",
+   "state": "decided by the coordinator 2026-11-20 19:50 on the owner's words (\"can we try to vendor all of our crates (no crates from crates.io) or control all of our own\"); the gate's ratchet is with the gate's writer; removals follow admission of the waiting pile. Open for the owner: own TLS or vendored."
+  },
+  {
+   "id": "D181",
+   "date": "2026-11-20",
+   "decision": "A command's live output is a pure view of the answer's own state in the user's words: progress as the share of expected work from the last run's costs (no invented percentage on a first run), the longest-running tasks by person-readable subject, the live critical chain of named waits, the cause of the work on an edit, findings as found, one closing line; built as one typed CBOR event stream with a sans-IO view machine sampling worker cells at most 20 times a second, nothing drawn under 200 ms, plain lines when not a terminal.",
+   "recommended": "design/end-state.md D181.",
+   "why": "Today's status line prints an internal stage name, a task count whose total grows as work is found (2/4, 23/24, 31/37) and a debug-printed key with a hash.",
+   "state": "decided by the coordinator 2026-11-20 19:58 on the owner's words (\"show exactly what is it building at that certain time ... just think what the most sota design would look like\"); to be written as a new crate when a lane frees."
+  },
+  {
+   "id": "D182",
+   "date": "2026-11-20",
+   "decision": "bstd gains a `Block` grant: a range of durable blocks with aligned-by-type reads and writes, durable writes, flush, discard and the device's facts (block sizes, atomic write unit, queue depth, volatile cache); behind it a preallocated file, the simulated disk, a raw Linux block device through the ring (buffered by default), native NVMe only when measured. The store's bottom becomes a type-parameter seam (OverDir, OverBlock) proven equal in the crash simulation.",
+   "recommended": "design/end-state.md D182.",
+   "why": "About a tenth of a one-function edit's CPU is `open` (sample 2026-11-20), the day's durability bug class needs a folder to occur in, and a stated atomic write unit removes the torn-page case.",
+   "state": "decided by the coordinator 2026-11-20 19:58 on the owner's words (\"should bstd have a raw nvme thing ... capabilities can depend upon\"; \"ok do this\"); the store's writer is on it."
+  },
+  {
+   "id": "D183",
+   "date": "2026-11-20",
+   "decision": "blaze gains a CAD library as importable crates on bstd (blaze-math, blaze-cad-field, blaze-cad-mesh, blaze-cad-out, blaze-cad): models are typed programs over an implicit signed-distance kernel (one tape; point, interval and derivative interpreters), parts meet at named frames, quantities are typed, meshing is adaptive with sharp features and proven manifold, mesh optimization and colliders follow, and every result is a record keyed by expression digest so runs are incremental and deterministic.",
+   "recommended": "design/end-state.md D183.",
+   "why": "The owner's ship models are 2,188 lines of Python over a C++ boundary kernel; booleans, shells and blends cannot fail on an implicit kernel, which is what makes a from-scratch kernel honest; the tree has no floating-point functions of its own and determinism needs them.",
+   "state": "decided by the coordinator 2026-11-20 20:05 on the owner's words (\"make your own CAD software ... a general builder ... a crate in blaze we can import\"); the first writer is on blaze-math and blaze-cad-field."
+  },
+  {
+   "id": "D184",
+   "date": "2026-11-20",
+   "decision": "bstd gains typed quantities (crate blaze-units): a quantity's type holds its dimension and, where one dimension has meanings that must not mix (CPU versus wall time, allocated versus resident bytes), its kind; one base unit inside, units only at the edges; a closed table of named quantities now, the const-generic general form when blaze builds blaze.",
+   "recommended": "design/end-state.md D184.",
+   "why": "The coordinator misread profile numbers three times on 2026-11-20 by mixing CPU and wall time and units; the CAD library (D183) needs lengths, angles and masses that cannot be confused.",
+   "state": "decided by the coordinator 2026-11-20 20:08 on the owner's words (\"bstd maybe should have units in there too\"); the CAD kernel's writer writes the crate; the meter adopts it next."
+  },
+  {
+   "id": "D185",
+   "date": "2026-11-20",
+   "decision": "No minimum kernel version; each operation uses the best interface the running kernel has, chosen once at start from probed KernelFacts (never a version string), as a strategy at one seam with every form held equal by conformance tests; the choice is printed; an operation with no form on this kernel is a typed refusal. Not a fallback: nothing is tried twice.",
+   "recommended": "design/end-state.md D185.",
+   "why": "A clean way to read startup facts needed Linux 6.4, which excludes Ubuntu 22.04, Debian 12 and RHEL 9; the owner wants no floor and the best interface per kernel.",
+   "state": "decided 2026-11-20 20:30 on the owner's words (\"no minimum kernel version i agree but should be the most optimized api for each kernel version\"); with the blaze-sys writer."
+  },
+  {
+   "id": "D186",
+   "date": "2026-11-20",
+   "decision": "PROPOSED: one way to make, key, store and read a result: a sans-IO Task whose key the engine derives from its typed input, whose only access is recorded asks, whose outcome is a type (Made, Stood, Refused, Owed), read by need with no iteration offered, bytes proved once per boot in the type, one row layout read in place with a persistent hash index, one group commit per command, a format as a place, nothing large by value.",
+   "recommended": "design/end-state.md D186.",
+   "why": "On 2026-11-20 nine bugs each came from a hand-made choice in the command crate's 33 engine files (44 puts, 33 gets, 15 key domains, 34 format constants): a key missing an input, failed work stored as done, verification on every read, whole-workspace loops, per-site syncs, large frames.",
+   "state": "proposed 2026-11-20 20:50; corrected by the outside review the same hour: see D187"
+  },
+  {
+   "id": "D187",
+   "date": "2026-11-20",
+   "decision": "Rebuild the command crate's stage code on the engine seam that already exists (TaskKind, Recorded, Ready: D157 finished), replace the whole-workspace planner with the forward wake, delete pages/headers.rs and the per-phase commits, key derived records by schema plus producer, keep the answer pages and the checker; no new task crate, no in-place hash index; nothing on the store until its crash simulation is green. First step: a one-day edit-path dry run on tempo that must show one body woken, about 50 pages, 0 header shards, 10 ms.",
+   "recommended": "design/end-state.md D187.",
+   "why": "The outside review found the proposed Task seam already in blaze-engine with no user outside its simulations, the four loops in the planner and not the layout, and the 108 MB read in a second index kept for the planner's sweep.",
+   "state": "accepted by the coordinator 2026-11-20 20:55 on the outsider's verdict (rule 66); the dry run is with the engine's writer."
+  },
+  {
+   "id": "D188",
+   "date": "2026-11-20",
+   "decision": "A utilization budget for tempo from 44 scoreboards (first check 190 s to 60 then 35; 6 to 14 of 16 cores busy; peak footprint 34 GB to 8; heap churn 668 GB to under 20; edit to 100 ms and under 3 MB read) and the changes the data asks for: undo the 18 Nov Names regression (macro modules with debug-assertion std; compiled modules as records), one ready driver for every stage, memory by worker frame returned at stage end, records built in their stored bytes, undo the 19 Nov borrow-check regression, and every scoreboard read against the best on record.",
+   "recommended": "design/end-state.md D188.",
+   "why": "The series shows Names at 2 of 16 cores with 95.5% of its wall waiting for admission, a nine-line change that tripled it, peak memory flat at 27 to 34 GB regardless of work, zero block IO, and two regressions unseen for two days.",
+   "state": "decided by the coordinator 2026-11-20 21:15 on the owner's words (\"redesign for optimal IO, Mem and CPU utilization based on all our historical data\"); items 1 and 5 are with writers, 6 is done, 2 follows the dry run (D187), 3 and 4 are next."
+  },
+  {
+   "id": "D189",
+   "date": "2026-11-21",
+   "decision": "Block scopes belong to the body's own task. Crate-level name resolution takes from a body only what can leave it (impls, link and lang items, exported macros), decided after module names are solved through a per-definition MacroEffect record and a per-file surface pass; a surface body gets one BodyScope task, every other body builds its block scopes in its own lowering; synthetic block modules are deleted.",
+   "recommended": "design/end-state.md D189.",
+   "why": "Rule 66: three fixes in one day to block modules; the second made nearly every body's blocks modules (tempo Names 54.7 s CPU to 81.4 s) to serve about a hundred bodies. An outside reviewer ruled rebuild: 18 of 13,833 workspace bodies are surface by text; the fault was the order (blocks rendered before macro names are solved) and two homes for one concept.",
+   "state": "decided: the names writer builds it; the old path is deleted only after the three proofs"
+  },
+  {
+   "id": "D190",
+   "date": "2026-11-21",
+   "decision": "The borrow lowering's old call-relating paths are frozen (honesty fixes only). D156's one call rule is finished behind the existing seam (one_call.rs CallRule), proven by a census of every tempo body under both rules, then switched and the old paths deleted in one piece. The type checker records only the callee, adjustments, one selection table per body and closure signatures; the borrow lowering instantiates from the head.",
+   "recommended": "design/end-state.md D190 (and D156).",
+   "why": "Rule 66: paths were still being added to the old relation after D156 was decided. An outside reviewer counted eleven relating paths, each pairing two different structures by counting; about 1,000 of tempo's 1,513 refused bodies and the largest false-finding group sit there. The contract crate, the seam and the oracle already exist.",
+   "state": "decided: order in end-state.md D190; step 2 (the census) first"
+  },
+  {
+   "id": "D191",
+   "date": "2026-11-21",
+   "decision": "D152's order is changed: the FULL view is built first, for every package, on today's keys. Every unit that holds a body checks it; the first holder in rank keeps the body's plain name (the base), each other holder's row is the name at its view (one name function, one home). `blaze test` and `blaze run` build their body-id table for a unit by asking the name at that unit's view. Equal findings of one body in two views print once. The choice of plan is a strategy at one seam (ViewPlan: Full, Lifted); Lifted (rows only where they differ, D152 point 5) cannot be instantiated until the keys are one (D152 points 2 and 1) and replaces Full for those packages then; Full stays for a package that reaches itself through a dev-dependency (point 8) and for a file two different crates hold. `Holders::decide`'s 'the first holder checks' is deleted with this piece.",
+   "recommended": "design/test.md, 'The order as built (D191)'.",
+   "why": "`blaze test` on tempo (2026-11-21 05:52) reaches the engine; every test that calls a library fn of its own package finds no row under the test unit's key and is NOT RUN (engine_start.rs ignored test). The design's own first slice put point 8 last, behind the every-ItemKey port, cfg-as-read across 19 front2 files and the engine's lift: none of which a running test needs. 'The first holder checks' is also unsound today: a body that reads cfg(test), or resolves a name differently under test, is checked under the non-test unit alone and reported checked (engine_body_plan.rs:33; tempo has 4 cfg(not(test)) and 87 cfg(any(test..))/cfg_attr(test..) forms). Cost, stated: at most +9,221 body tasks on tempo's 16,586 (the bodies two or more units hold), no more heads or names; an edit of a shared body checks it once a view.",
+   "state": "decided: writers briefed 2026-11-21 06:25; nothing compiled"
   }
  ]
 }

@@ -48,6 +48,30 @@ pub trait MacroNames<'d> {
     fn local_site(&self) -> Option<DefSite> {
         None
     }
+
+    /// The module of the innermost block an EXPANSION wrote that holds the body call at `call`
+    /// (a range of `expansions.text`). A path of the call read at the call site is read there
+    /// ([`PathAt::block`]). `Ok(None)`: no block an expansion wrote holds the call and binds
+    /// names, so the path is read at the written call's block ([`PathAt::written`]). `Err`
+    /// names why that block cannot be read. The default knows no blocks: `Ok(None)`.
+    fn expansion_block(&self, expansions: crate::driver::Expansions<'_>, call: blaze_surface::Range) -> Result<Option<blaze_surface::ItemKey>, &'static str> {
+        let _ = (expansions, call);
+        Ok(None)
+    }
+}
+
+/// Whether a call's `path` (as written, or an expansion's words with spaces) is read at the
+/// call site by the Reference's rules ("Macros By Example", "Hygiene": `macro_rules!` "have
+/// mixed-site hygiene ... other symbols are looked up at the macro invocation site"). It is
+/// read there unless it starts at a root (`::`, `crate`, `$crate`, `self`, `super`, `Self`) or
+/// its first word has an opaque (def-site) mark.
+pub fn call_site_path(path: &str, mark: Option<crate::mark_site::TextMark>) -> bool {
+    let absolute = path.trim_start().starts_with(':');
+    let first = path.split(|c: char| c == ':' || c.is_whitespace()).find(|s| !s.is_empty()).unwrap_or("");
+    !absolute
+        && !first.is_empty()
+        && !matches!(first, "$crate" | "crate" | "self" | "super" | "Self" | "{{root}}" | "<qualified>")
+        && !mark.is_some_and(|m| m.transparency == blaze_expand::Transparency::Opaque)
 }
 
 /// Why a call's path names no macro.
@@ -65,6 +89,10 @@ pub enum NoMacro<'a> {
     /// The names library's answer: the path names nothing usable, a procedural macro the
     /// caller has no runner for, or a source that makes no definition of this shape.
     Names(blaze_scope::resolve::MacroDefError<'a>),
+    /// The call stands in a block an expansion wrote, and the resolver cannot read that block's
+    /// names ([`MacroNames::expansion_block`]): the words name why. The path is not read at
+    /// an outer block in its place, because the block may bind its first segment.
+    Block(&'static str),
 }
 
 impl core::fmt::Display for NoMacro<'_> {
@@ -79,6 +107,7 @@ impl core::fmt::Display for NoMacro<'_> {
                 write!(f, "a macro of crate {krate} with no source (procedural, or not read)")
             }
             NoMacro::Names(blaze_scope::resolve::MacroDefError::Refused(note)) => write!(f, "its source makes no definition: {note:?}"),
+            NoMacro::Block(why) => write!(f, "the call stands in a block a macro expansion wrote, whose names cannot be read: {why} (statement.item.scope)"),
         }
     }
 }
@@ -134,7 +163,19 @@ pub enum Failure<'a> {
 
 impl core::fmt::Display for Failure<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use blaze_expand::{Diagnostic as D, IncludeFailure as I};
         match self {
+            // The expander's own words for a file the call reads (blaze-expand failed.rs
+            // `Failed`'s display: "including `gen.in`: no such file"), as rustc names it at the
+            // call ("couldn't read `src/gen.in`"): one wording for a body's call and a module's.
+            Failure::Diagnostic { diagnostic: D::Include { why: why @ (I::Missing | I::NotUtf8 | I::DoesNotLex), .. }, text } => {
+                let why = match why {
+                    I::Missing => "no such file",
+                    I::NotUtf8 => "not UTF-8",
+                    I::DoesNotLex | I::Outside => "does not lex",
+                };
+                write!(f, "its expansion's error Include: including `{text}`: {why}")
+            }
             Failure::Diagnostic { diagnostic, text } => write!(f, "its expansion's error {}: `{text}`", diagnostic_name(diagnostic)),
             Failure::Expand(e) => write!(f, "the expander stopped: {e:?}"),
             Failure::Lex(e) => write!(f, "its input does not lex: {e:?}"),
@@ -226,36 +267,72 @@ impl core::fmt::Display for NotExpanded<'_> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PathAt {
     pub mark: Option<crate::mark_site::TextMark>,
-    /// The whole call's range in the body's own text (item-relative, rule 71) when the call is
-    /// written there; `None` for a call an expansion lowered in the body wrote. A resolver
+    /// The range in the body's own text (item-relative, rule 71) of the call written there that
+    /// this call is, or that it came from through expansions ([`BodyCall::written`]); `None`
+    /// for a call outside a body's text (an item's, an eager call's input). A resolver
     /// that knows the body's blocks reads a call-site path in the innermost block holding the
     /// range (the Reference, "Statements": an item a block declares is in scope in that block
     /// only; an `extern crate .. as` in a derive's `const _: () = { .. };` is one).
     pub written: Option<blaze_surface::Range>,
+    /// The module of the innermost block an expansion wrote that holds the call
+    /// ([`MacroNames::expansion_block`]). When set, a call-site path is read there, before
+    /// `written`'s block: proptest's `prop_assert!` writes `extern crate alloc;` and
+    /// `alloc::format!(..)` in one `if` block of its expansion. `None` for a call that no such
+    /// block holds.
+    pub block: Option<blaze_surface::ItemKey>,
 }
 
 impl PathAt {
-    /// The mark on the first token of the path that ends just before `open` (the call's `!`
-    /// is at `open - 1`) in `stream`.
+    /// The mark on the first word of the path that ends just before `open` (the call's `!`
+    /// is at `open - 1`) in `stream`: walked back by the path's grammar (the Reference,
+    /// "Paths": words joined by `::`), a word, then `::` and a word again while the path goes
+    /// on; a keyword before the path (`return m!()`) is no segment of it.
+    ///
+    /// An invisible group's delimiters are no tokens of the path: a `$p:path` fragment is
+    /// passed on in one (blaze-expand rules/transcribe.rs `var`), and the Reference, "Macros
+    /// By Example", lets a `path` fragment name the macro of a call (`$p!(..)`). Its words keep
+    /// the marks of the text that wrote them, so a `$crate` handed in as `$crate::m` names the
+    /// crate of the macro that WROTE it (antithesis_sdk 0.3.0's `assert_sometimes_greater_than!`
+    /// writes `$crate::numeric_guidance_helper!($crate::assert_sometimes, ..)`, whose
+    /// transcriber calls `$assert!(..)`). Stopping at the group's `)` left the call with no
+    /// mark, and its `$crate` was refused as written outside an expansion.
     fn before(stream: &TokenStream<'_>, open: u32) -> PathAt {
         let tokens = stream.tokens();
-        let mut at = (open as usize).saturating_sub(1);
+        let invisible = |i: usize| matches!(tokens[i].kind, TokenKind::Open(blaze_expand::Delim::Invisible) | TokenKind::Close(blaze_expand::Delim::Invisible));
+        // The token before `i` that is no invisible delimiter.
+        let prev = |mut i: usize| -> Option<usize> {
+            while i > 0 {
+                i -= 1;
+                if !invisible(i) {
+                    return Some(i);
+                }
+            }
+            None
+        };
+        let colon = |i: usize| matches!(tokens[i].kind, TokenKind::Punct { char: ':', .. });
+        // From the `!`; each step moves to an earlier token, so the walk ends.
+        let mut at = (open as usize).saturating_sub(1).min(tokens.len());
         let mut first = None;
-        while at > 0 {
-            at -= 1;
-            match tokens[at].kind {
-                TokenKind::Ident { .. } => first = Some(at),
-                TokenKind::Punct { char: ':', .. } => {}
+        while let Some(word) = prev(at) {
+            if !matches!(tokens[word].kind, TokenKind::Ident { .. }) {
+                break;
+            }
+            first = Some(word);
+            match prev(word).and_then(|second| Some((second, prev(second)?))) {
+                Some((second, colon_one)) if colon(second) && colon(colon_one) => at = colon_one,
                 _ => break,
             }
         }
-        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark).map(crate::mark_site::TextMark::of), written: None }
+        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark).map(crate::mark_site::TextMark::of), written: None, block: None }
     }
 
-    /// The first token of `start..end` (a nested call's path) in `stream`.
+    /// The first word of the path at `start` (a nested call's path) in `stream`: an invisible
+    /// group's `(` there is no word of it (a `$p:path` fragment's: [`PathAt::before`]).
     fn of(stream: &TokenStream<'_>, start: u32) -> PathAt {
-        let mark = stream.tokens().get(start as usize).and_then(|t| stream.hygiene(t.ctx).mark);
-        PathAt { mark: mark.map(crate::mark_site::TextMark::of), written: None }
+        let tokens = stream.tokens();
+        let first = tokens.iter().skip(start as usize).find(|t| !matches!(t.kind, TokenKind::Open(blaze_expand::Delim::Invisible)));
+        let mark = first.and_then(|t| stream.hygiene(t.ctx).mark);
+        PathAt { mark: mark.map(crate::mark_site::TextMark::of), written: None, block: None }
     }
 }
 
@@ -436,9 +513,12 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
     /// wrote is the word `crate` there, its crate only in the mark).
     fn path_at(&self, call: &BodyCall<'_>) -> PathAt {
         match call.input {
-            CallInput::Text(_) => PathAt { mark: call.path_mark, written: Some(call.range) },
+            CallInput::Text(_) => PathAt { mark: call.path_mark, written: Some(call.range), block: None },
+            // A call an expansion wrote: its path's mark from its first word, and the written
+            // call it came from (`BodyCall::written`), where a call-site path is read.
             CallInput::Expanded { expansion, start, .. } => {
-                self.expansions.get(expansion as usize).map_or(PathAt::default(), |(_, tokens)| PathAt::before(tokens, start))
+                let at = self.expansions.get(expansion as usize).map_or(PathAt::default(), |(_, tokens)| PathAt::before(tokens, start));
+                PathAt { written: Some(call.written), ..at }
             }
         }
     }
@@ -655,7 +735,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         cfg: &mut dyn crate::Cfg,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let at = PathAt { mark: path_mark, written: None };
+        let at = PathAt { mark: path_mark, written: None, block: None };
         let result = self
             .input(CallInput::Text(input), edition)
             .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg)));
@@ -672,7 +752,27 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
     }
 
     fn expand_body(&mut self, call: BodyCall<'_>, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion {
-        let at = self.path_at(&call);
+        let mut at = self.path_at(&call);
+        // A call an expansion wrote, with a path read at the call site: read in the innermost
+        // block around it, which may be a block that expansion wrote (`PathAt::block`).
+        // A body's own `macro_rules!` of a one-word path is in textual scope first (`call`'s
+        // `local`), and no block is read for it.
+        let local = call.locals.iter().any(|l| l.name == call.path.trim());
+        if !local && call.range.start >= call.expansions.item_len && call_site_path(call.path, at.mark) {
+            let block = match &self.names {
+                Names::Lists(_) => Ok(None),
+                Names::Caller(names) => names.expansion_block(call.expansions, call.range),
+            };
+            match block {
+                Ok(block) => at.block = block,
+                Err(why) => {
+                    let mut path = AString::new_in(self.alloc);
+                    path.push_str(call.path);
+                    self.findings.push(MacroFinding { at: call.range, path, why: NotExpanded::NoMacro(NoMacro::Block(why)) });
+                    return Expansion::Unsupported;
+                }
+            }
+        }
         let before = self.reads.list().len();
         let result = self
             .input(call.input, call.edition)
@@ -726,7 +826,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         edition: Edition,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let Ok(resolved) = self.resolve(path, PathAt { mark: path_mark, written: None }, ProcKind::Attr) else { return Expansion::Unsupported };
+        let Ok(resolved) = self.resolve(path, PathAt { mark: path_mark, written: None, block: None }, ProcKind::Attr) else { return Expansion::Unsupported };
         let def;
         let own;
         let prepared = match resolved {
@@ -771,7 +871,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         edition: Edition,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let def = match self.resolve(path, PathAt { mark: path_mark, written: None }, ProcKind::Derive) {
+        let def = match self.resolve(path, PathAt { mark: path_mark, written: None, block: None }, ProcKind::Derive) {
             Ok(Resolved::Def(def)) => def,
             // A `macro_rules!` is no derive.
             Ok(Resolved::Prepared(_)) => return Expansion::Failed,

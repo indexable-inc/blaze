@@ -13,6 +13,7 @@
 use std::{io, sync::Once, time::Duration};
 
 use blaze_mem::{Slab, Tag as MemTag};
+use blaze_sys::{Errno, posix::types::pid_t};
 use crate::lock::{Lock, LockGuard, Signal};
 
 /// How often the footprint is read: a process faulting pages in as fast as it can gets tens of
@@ -23,7 +24,7 @@ const MOST: u32 = 1 << 16;
 
 /// One watched process.
 struct Entry {
-    pid: libc::pid_t,
+    pid: pid_t,
     limit: u64,
     /// The most footprint read so far.
     seen: u64,
@@ -49,7 +50,7 @@ fn entries() -> LockGuard<'static, Option<Slab<Entry>>> {
 
 pub(crate) struct Watch {
     id: blaze_mem::Handle<Entry>,
-    pid: libc::pid_t,
+    pid: pid_t,
 }
 
 impl Watch {
@@ -59,7 +60,7 @@ impl Watch {
     /// Stops when the slab's room cannot be reserved, or the most processes are watched,
     /// naming the subsystem.
     #[track_caller]
-    pub(crate) fn start(pid: libc::pid_t, limit: u64) -> Watch {
+    pub(crate) fn start(pid: pid_t, limit: u64) -> Watch {
         STARTED.call_once(|| {
             std::thread::Builder::new()
                 .name("blaze-footprint".into()) // alloc: setup, once per process.
@@ -126,7 +127,7 @@ fn check(entry: &mut Entry) {
             }
         }
         // Gone: there is nothing left to hold.
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => entry.done = true,
+        Err(error) if error.raw_os_error() == Some(i32::from(Errno::Srch.raw())) => entry.done = true,
         // Its footprint cannot be read, so its limit cannot be held: it does not run on.
         Err(_) => {
             crate::raw::kill(entry.pid);
@@ -140,13 +141,14 @@ struct Usage {
     most: u64,
 }
 
-fn footprint(pid: libc::pid_t) -> io::Result<Usage> {
+fn footprint(pid: pid_t) -> io::Result<Usage> {
     let (now, most) = crate::raw::footprint(pid)?;
     Ok(Usage { now, most })
 }
 
 #[cfg(test)]
 mod tests {
+    use blaze_sys::posix::{proc, signal::SIGKILL};
     use super::*;
 
     /// A shell running `script`, by its pid: a driver holds a process by its pid and reaps it
@@ -155,14 +157,14 @@ mod tests {
         blaze::untied_child,
         reason = "reaped by pid through `crate::process::reap`, as a driver reaps; a guard's kill on drop would signal a pid already reaped"
     )]
-    fn spawn(script: &str) -> libc::pid_t {
+    fn spawn(script: &str) -> pid_t {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", script]).env_clear().stdout(std::process::Stdio::piped());
-        command.spawn().unwrap().id() as libc::pid_t
+        command.spawn().unwrap().id() as pid_t
     }
 
     /// Waits for it to exit, stops the watch, then reaps it, as a driver does.
-    fn end(pid: libc::pid_t, watch: Watch) -> (libc::c_int, u64) {
+    fn end(pid: pid_t, watch: Watch) -> (core::ffi::c_int, u64) {
         crate::process::wait_exited(pid).unwrap();
         let peak = watch.stop();
         let (status, _) = crate::process::reap(pid).unwrap();
@@ -177,8 +179,8 @@ mod tests {
             spawn(r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#);
         let watch = Watch::start(child, limit);
         let (status, peak) = end(child, watch);
-        assert!(libc::WIFSIGNALED(status), "it ran to its end: {status:#x}");
-        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        assert!(proc::WIFSIGNALED(status), "it ran to its end: {status:#x}");
+        assert_eq!(proc::WTERMSIG(status), SIGKILL);
         assert!(peak > limit, "{peak}");
     }
 
@@ -187,8 +189,8 @@ mod tests {
         let child = spawn("exit 3");
         let watch = Watch::start(child, 1 << 30);
         let (status, peak) = end(child, watch);
-        assert!(!libc::WIFSIGNALED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 3);
+        assert!(!proc::WIFSIGNALED(status));
+        assert_eq!(proc::WEXITSTATUS(status), 3);
         assert!(peak > 0 && peak < 1 << 30, "{peak}");
     }
 
@@ -200,14 +202,14 @@ mod tests {
         let watch = Watch::start(first, 1 << 30);
         let late = Watch { id: watch.id, pid: watch.pid };
         let (status, _) = end(first, watch);
-        assert!(!libc::WIFSIGNALED(status));
+        assert!(!proc::WIFSIGNALED(status));
         let second = spawn("sleep 0.2; exit 0");
         let live = Watch::start(second, 1 << 30);
         assert_eq!(late.remove(), 0, "a stale handle");
         drop(late);
         assert!(entries().as_ref().unwrap().contains(live.id), "the live watch is left as it is");
         let (status, peak) = end(second, live);
-        assert!(!libc::WIFSIGNALED(status) && peak > 0);
+        assert!(!proc::WIFSIGNALED(status) && peak > 0);
     }
 
     /// The one thread holds each process to its own limit.
@@ -220,7 +222,7 @@ mod tests {
         let grows_watch = Watch::start(grows, 32 << 20);
         let (grew, _) = end(grows, grows_watch);
         let (stayed, _) = end(small, small_watch);
-        assert!(libc::WIFSIGNALED(grew) && libc::WTERMSIG(grew) == libc::SIGKILL, "{grew:#x}");
-        assert!(!libc::WIFSIGNALED(stayed) && libc::WEXITSTATUS(stayed) == 0, "{stayed:#x}");
+        assert!(proc::WIFSIGNALED(grew) && proc::WTERMSIG(grew) == SIGKILL, "{grew:#x}");
+        assert!(!proc::WIFSIGNALED(stayed) && proc::WEXITSTATUS(stayed) == 0, "{stayed:#x}");
     }
 }

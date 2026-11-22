@@ -15,14 +15,14 @@ use blaze_own::{SharedAlloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::engine::{
-    Answer, Buffer, Cause, CellId, Done, Edit, Engine, EngineError, Everything, Finished, Gen, Made, Phase, Plant, Planned, Pool, SMap, SVec, Scope, Stage,
+    Answer, Buffer, Cause, CellDigests, CellId, Done, Edit, Engine, EngineError, Everything, Finished, Gen, Made, Phase, Plant, Planned, Pool, SMap, SVec, Scope, Stage,
     Task, View, drive, drive_growing,
 };
 use crate::last::LastAnswer;
 use crate::overlay::Fold;
 use crate::pages::{Kept, PagesPlant, Root};
 
-const TOOL: Tool = Tool(ContentId([7; 32]));
+pub(crate) const TOOL: Tool = Tool(ContentId([7; 32]));
 
 pub(crate) fn alloc() -> SharedAlloc<'static> {
     blaze_own::testing::heap().shared()
@@ -80,7 +80,7 @@ fn outline(f: usize) -> Name {
 fn manifest(c: usize) -> Name {
     Name::new(Kind::Units, d("sim engine manifest", &[c as u64]))
 }
-fn names(c: usize) -> Name {
+pub(crate) fn names(c: usize) -> Name {
     Name::new(Kind::CrateScope, d("sim engine names", &[c as u64]))
 }
 fn head(id: u32) -> Name {
@@ -115,7 +115,7 @@ fn konst_read() -> CellId {
 }
 
 /// The record of the constant `v` made over the view: its value is a function of what it read.
-fn make_konst<L: LastAnswer>(v: u32, view: View<'_, 'static, L>) -> Done<'static> {
+fn make_konst<V: CellDigests + Copy>(v: u32, view: V) -> Done<'static> {
     let a = alloc();
     let read = konst_read();
     let seen = view.cell(&read);
@@ -130,7 +130,7 @@ fn make_konst<L: LastAnswer>(v: u32, view: View<'_, 'static, L>) -> Done<'static
 
 /// What a names task grows: for each item of crate `c` that derives, the head and the body of
 /// the item its expansion makes, keyed from that expansion's text (invariant 11).
-fn growth_of(world: &World, c: usize) -> StdVec<Planned> {
+pub(crate) fn growth_of(world: &World, c: usize) -> StdVec<Planned> {
     let by = names(c);
     let mut grown = StdVec::new();
     for (f, item) in world.items() {
@@ -271,7 +271,7 @@ impl<'a> Pool<'a> for Pools {
 
 /// The model's tasks, over the world's text and the view's cells. `plant` is
 /// [`Plant::HitWithoutReads`] alone when a body drops its read of the constant it hit or made.
-pub(crate) fn work<L: LastAnswer>(world: &World, plant: Plant, view: View<'_, 'static, L>, task: &Task, buffer: &mut Buffer<'static>) {
+pub(crate) fn work<V: CellDigests + Copy>(world: &World, plant: Plant, view: V, task: &Task, buffer: &mut Buffer<'static>) {
     let name = task.planned.name;
     let a = alloc();
     let mut defines: SVec<'static, (Cell, ContentId)> = Vec::new_in(a);
@@ -433,7 +433,7 @@ pub(crate) fn request<L: Fold<'static> + Sync>(
 
 pub(crate) fn first_world(tape: &Tape) -> World {
     let crates: StdVec<StdVec<usize>> = (0..1 + tape.index(3, "crates"))
-        .map(|c| (0..c).filter(|dep| tape.one_in(2, "a dependency")).collect())
+        .map(|c| (0..c).filter(|_dep| tape.one_in(2, "a dependency")).collect())
         .collect();
     let mut world = World { crates, files: StdVec::new(), next_id: 0 };
     for c in 0..world.crates.len() {
@@ -608,7 +608,7 @@ impl History {
             self.store.insert(*key, bytes.iter().copied().collect());
         }
         let store = &self.store;
-        let restored = crate::pages::decode(encoded.root, |key| store.get(&key).map(|bytes| bytes.as_slice()), alloc())
+        let restored = crate::pages::decode(encoded.root, |key| store.get(&key).map(|bytes| crate::pages::Sealed::hashed(key, bytes)), alloc())
             .map_err(|error| Broke::Oracle(format!("request {serial}: its stored answer does not read back: {error}")))?;
         let again = crate::pages::encode_planted(&restored, self.root.as_ref(), self.pages, alloc());
         oracle(again.root == encoded.root, || format!("request {serial}: the stored answer read back encodes to another root"))?;
@@ -625,7 +625,7 @@ impl History {
         }
         oracle(restored.answer.readers == kept.answer.readers, || format!("request {serial}: the reverse index made again differs from the engine's"))?;
         oracle(restored.answer.with_findings == kept.answer.with_findings, || format!("request {serial}: the rows with findings made again differ"))?;
-        self.root = Some(crate::pages::decode_root(encoded.root, &self.store[&encoded.root], alloc()).map_err(|error| Broke::Harness(format!("{error}")))?);
+        self.root = Some(crate::pages::decode_root_hashed(encoded.root, &self.store[&encoded.root], alloc()).map_err(|error| Broke::Harness(format!("{error}")))?);
         Ok(restored)
     }
 

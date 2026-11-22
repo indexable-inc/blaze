@@ -1,6 +1,6 @@
 //! A heads store's tables are in the allocator they are handed, and map nothing of their own
 //! (front2 rows.rs, "Whose memory"): making, filling and dropping 1,000 of each of
-//! [`Rows`], the type table's columns ([`stable_tys`]), [`Lives`] and [`Store`] reserves no
+//! [`Rows`], the type table's columns ([`stable_tys`]), [`RegionTable`] and [`Store`] reserves no
 //! `blaze_mem` region and unmaps none; in a frame, they leave it at its mark after a reset.
 //!
 //! The ONLY test of this binary: blaze-mem's system-call counters are the process's, so a
@@ -12,8 +12,8 @@
 
 #![feature(allocator_api)]
 
+use blaze_ladder::front2::head_record::RegionTable;
 use blaze_ladder::front2::heads::Store;
-use blaze_ladder::front2::lifetimes::{LifeRefusal, Lives};
 use blaze_ladder::front2::rows::{Rows, stable_tys};
 use blaze_mem::syscalls::{Kind, snapshot};
 use blaze_own::Alloc;
@@ -75,12 +75,13 @@ fn heads_stores_map_nothing_and_leave_the_frame_at_its_mark() {
     frame.reset_to(mark);
     assert_eq!(frame.used(), used, "the frame is at its mark after the reset");
 
-    // (2) Lives and whole stores, in the allocator a store is handed.
+    // (2) Region tables and whole stores, in the allocator a store is handed.
     for i in 0..EACH {
-        drop(Lives::new_in(kept_alloc));
+        drop(RegionTable::new_in(kept_alloc));
         let store = Store::new(None, kept, kept_alloc);
-        // A row in the store's `Lives` (its tables are private; the store files them).
-        store.file_fn_life(blaze_typeck::ItemKey(u128::from(i)), Err(LifeRefusal::NoHead));
+        // A row in the store's region table (D148: the head records' regions; a refused head
+        // is a row as a made one is).
+        store.regions.file_refused(blaze_typeck::ItemKey(u128::from(i)));
         let unit = store.tys.intern_shared(PNode::Tuple(List::EMPTY)).expect("interned");
         store.maps.fieldless_enums.insert(blaze_typeck::ItemKey(u128::from(i)), 3);
         let list = store.tys.intern_list_shared(&[unit, unit]).expect("a list");

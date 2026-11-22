@@ -41,7 +41,10 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                     return Err(NotPrinted::Untyped);
                 }
                 let facts = gather_facts(r, lowered.owner, done, BorrowLangs::of(r.index), alloc);
-                if let Some(&(adt, fact)) = facts.unknown().first() {
+                // Every fn's signature regions are its head record's, read in place (D148).
+                let reader = r.store.regions.reader(r.store.tys.alloc());
+                let facts = facts.read_by(&reader, r.store.tys.view());
+                if let Some(&(adt, fact)) = facts.facts.unknown().first() {
                     return Err(NotPrinted::FactUnknown { adt, fact });
                 }
                 let tys = lowered.tys.view(&r.store.tys).map_err(|_| NotPrinted::TypeTable)?;

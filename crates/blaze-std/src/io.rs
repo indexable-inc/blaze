@@ -48,7 +48,6 @@ use blaze_core::{
     sim::{Faults, Sim},
     wait::Deadline,
 };
-use blaze_mem::Frame;
 use blaze_rng::SplitMix64;
 
 use crate::{
@@ -96,6 +95,7 @@ pub use lend::LentDriver;
 mod tests;
 
 pub(crate) use blaze_core::threads::inline::Lent;
+pub(crate) use fast::ReadAllLent;
 
 /// The bounds bstd would otherwise pick for its caller, said once where the [`Io`] is made
 /// (docs/v2/plan/design/std.md, "The second rule": a bound is an argument, never a default).
@@ -353,7 +353,10 @@ enum Reach {
     /// A native or simulated world: shared by the `Io`s cloned from it, on any thread, behind
     /// its lock; with what is read or done without the lock beside it ([`fast::Beside`]: the
     /// native clock and inline file calls).
-    Shared { world: Arc<Lock<World>>, env: Vars, args: ArgList, beside: fast::Beside },
+    ///
+    /// `workers` is the world's per-worker state (D171, [`crate::workers`]): the cells its
+    /// tasks' `on_worker` holds, made with the world or handed in ([`Io::on_workers`]).
+    Shared { world: Arc<Lock<World>>, env: Vars, args: ArgList, beside: fast::Beside, workers: crate::workers::Workers },
     /// A hosted run's ([`crate::guest::Run`]): found through the calling thread's run, never
     /// held, so cloning and dropping an `Io` of it touches nothing. Its hot calls (a write,
     /// the clock, a grant, the exit) go straight to the host's table with no lock; the rest
@@ -554,7 +557,20 @@ pub struct SimWorld {
     /// The bounds its waits, closes and trace end by.
     #[blaze::policy]
     pub limits: Limits,
+    /// How many simulated workers its tasks move between (D171, [`crate::workers`]): each has
+    /// its own cell. [`SIM_WORKERS`] unless a test says so; 0 seats its roots as a real
+    /// world's are, on leased caller cells.
+    #[blaze::policy]
+    pub models: u32,
 }
+
+/// The simulated workers of a [`SimWorld`] unless a test says otherwise: enough that a task
+/// that moves at each wait lands on a cell other than its last.
+pub const SIM_WORKERS: u32 = 4;
+
+/// What the simulation's workers' streams start from, besides the seed: so they draw apart
+/// from the world's own generator.
+const WORKERS_SALT: u64 = 0x5745_524B_4552_5331;
 
 impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
@@ -576,6 +592,7 @@ impl SimWorld {
             // alloc: none, no folders above.
             above: Vec::new(),
             top: u8::MAX,
+            models: SIM_WORKERS,
         }
     }
 }
@@ -654,6 +671,47 @@ impl Io {
 
     /// `world` with `plant` planted: [`Plant::None`] but for the tests' controls.
     pub(crate) fn planted(world: SimWorld, plant: Plant) -> Io {
+        // The world's workers (D171): its `models` simulated workers' cells and bstd's own
+        // fields, each worker's stream drawn from the world's seed.
+        let setup = crate::workers::WorkersSetup {
+            limits: crate::workers::Limits::BARE,
+            seed: Some(world.seed ^ WORKERS_SALT),
+            models: world.models,
+        };
+        let workers = match crate::workers::Workers::bare(setup) {
+            Ok(workers) => workers,
+            Err(error) => panic!("bstd::Io::simulated of seed {}: {error}", world.seed),
+        };
+        Io::planted_on(world, plant, workers)
+    }
+
+    /// [`Io::simulated`] over `workers`, made by a test's main with its slots registered
+    /// ([`crate::workers::WorkersOpts`]): its tasks' `on_worker` holds `workers`' cells.
+    pub fn simulated_on(world: SimWorld, workers: crate::workers::Workers) -> Io {
+        Io::planted_on(world, Plant::None, workers)
+    }
+
+    /// This world's handle, its tasks' per-worker state `workers` instead (D171): what main
+    /// does once after registering its slots, before it makes the root it runs on. Contexts
+    /// made from the old handle keep the old cells; nothing is shared between the two.
+    pub fn on_workers(&self, workers: crate::workers::Workers) -> Io {
+        let mut io = self.clone();
+        match &mut io.reach {
+            Reach::Shared { workers: held, .. } => *held = workers,
+            Reach::Hosted => crate::guest::Run::current().set_workers(workers),
+        }
+        io
+    }
+
+    /// The world's per-worker state: what `Cx::on_worker` holds a cell of.
+    pub(crate) fn workers(&self) -> &crate::workers::Workers {
+        match &self.reach {
+            Reach::Shared { workers, .. } => workers,
+            Reach::Hosted => crate::guest::Run::current().workers(),
+        }
+    }
+
+    fn planted_on(world: SimWorld, plant: Plant, workers: crate::workers::Workers) -> Io {
         Io::over(Start {
             // alloc: once per simulated world.
             driver: Backend::Sim(Box::new({
@@ -673,7 +731,7 @@ impl Io {
             // alloc: once per simulated world, its disk's ledger.
             disk: Some(Box::new(Disk::new())),
             plant,
-        })
+        }, workers)
     }
 
     /// The target's own driver over `world.root`.
@@ -726,7 +784,7 @@ impl Io {
         }
     }
 
-    fn over(start: Start) -> Io {
+    fn over(start: Start, workers: crate::workers::Workers) -> Io {
         let (offers, limits, plant) = (start.offers, start.limits, start.plant);
         // clone: the world's environment and command line, `Arc`s.
         let (env, args) = (start.env.clone(), start.args.clone());
@@ -734,7 +792,7 @@ impl Io {
         let beside = fast::Beside::of(&start.driver);
         Io {
             // alloc: once per world.
-            reach: Reach::Shared { world: Arc::new(Lock::new("bstd.io.world", World::new(start))), env, args, beside },
+            reach: Reach::Shared { world: Arc::new(Lock::new("bstd.io.world", World::new(start))), env, args, beside, workers },
             offers,
             limits,
             plant,
@@ -1618,12 +1676,37 @@ impl Io {
     /// instead, its `Done` the queue's ([`fast`]); every other effect, and every effect of a
     /// simulated world, is queued and waited for as before.
     pub(crate) fn call(&self, cx: &Cx, effect: impl FnOnce(Tag) -> Effect) -> Result<Done, Stopped> {
-        cx.stopped_by(self.now())?;
-        if let Some(files) = self.inline_files() {
-            return self.call_inline(cx, files, effect);
-        }
-        let tag = self.submit(effect);
-        cx.wait(self, tag, Ends::Once)
+        let began = self.now();
+        cx.stopped_by(began)?;
+        // The meter (D169): the call's time as its asker waited, by its kind (counted at the
+        // stamp, `fast::stamp`), on this world's clock.
+        let mut kind = blaze_meter::Call::Other;
+        let effect = |tag| {
+            let effect = effect(tag);
+            kind = effect.metered();
+            effect
+        };
+        let done = match self.inline_files() {
+            Some(files) => self.call_inline(cx, files, effect),
+            None => {
+                let tag = self.submit(effect);
+                cx.wait(self, tag, Ends::Once)
+            }
+        };
+        let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        // The call's time on the worker the asker is on (D171): its meter cell, not the
+        // thread's. Its count stays at the stamp (`fast::stamp`), which has no context: both
+        // are read together by `Meter::now_with` of the worker's tally.
+        // The telemetry's effect row of `kind` too (D178): its count and time; the bytes moved
+        // are not known at this seam (0: the report's bytes column counts only what a driver
+        // reports, which none does yet).
+        cx.on_worker(|w| {
+            w.meter().call_took(kind, ns);
+            if let Some((_, cell)) = w.telemetry() {
+                cell.effect(kind, 0, ns);
+            }
+        });
+        done
     }
 
     /// `effect` of a fresh tag, handed to the driver now.
@@ -1832,7 +1915,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         Effect::Watch { dir, .. } => named(dir, false),
         Effect::Private { dir, .. } | Effect::MakeDir { dir, .. } | Effect::RemoveDir { dir, .. } => named(dir, true),
         // The root has no name to record.
-        Effect::List { dir, .. } | Effect::Entries { dir, .. } => {
+        Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Journal { dir, .. } => {
             if let Some(dir) = dir.name() {
                 named(dir, false);
             }
@@ -1842,7 +1925,6 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
                 named(dir, true);
             }
         }
-        Effect::Journal { dir, .. } => named(dir, false),
         // A batch of reads names each part's file, and changes none.
         Effect::ReadMany { parts, .. } => {
             for part in parts {

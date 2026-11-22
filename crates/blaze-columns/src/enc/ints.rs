@@ -24,7 +24,6 @@
 //! over 8 KiB, cheaper than sampling would be; sampling is where a trial is dear (FSST's
 //! table, in [`super::strs`]).
 
-use blaze_int::Int;
 use blaze_kit::Dict;
 use blaze_own::{AVec, Alloc, Vec};
 

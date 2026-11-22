@@ -18,7 +18,7 @@
 use blaze_export::native_dylib::{FLAT_LOOKUP, write};
 use blaze_native::Platform;
 use blaze_native::image::{FixTo, Fixup, Image, Import, Placed, Region};
-use blaze_native::libraries::{Library, LibraryKind};
+use blaze_native::libraries::{Library, LibraryKind, Linked, Source, source};
 use blaze_own::{AVec, Alloc, Vec};
 
 const IDENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -27,6 +27,14 @@ const RET: u32 = 0xd65f_03c0;
 
 fn alloc() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
+}
+
+/// `-l<name>` linked as the SDK's stub states `install` (blaze-native libraries.rs: a macOS
+/// library's install name is its stub's, read).
+fn mac_dylib(name: &'static str, install: &'static str) -> Linked<'static> {
+    let Ok(Source::Stub(at)) = source(Platform::MacosArm64, Library { kind: LibraryKind::Dylib, name }) else { panic!("`{name}` is named by its stub") };
+    let stub = format!("--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\ninstall-name: '{install}'\n...\n");
+    at.linked(Box::leak(stub.into_bytes().into_boxed_slice())).unwrap_or_else(|e| panic!("the stub of `{name}`: {e}"))
 }
 
 fn put32(bytes: &mut [u8], at: u64, value: u32) {
@@ -87,10 +95,10 @@ fn image(word_pointer: bool) -> Image<'static> {
     exports.push((b"_c_entry2", 0x4004));
     let mut words: AVec<'static, &'static [u8]> = Vec::new_in(a);
     words.push(b"_rust_six");
-    let mut libraries: AVec<'static, Library<'static>> = Vec::new_in(a);
-    libraries.push(Library { kind: LibraryKind::Dylib, name: "c" });
-    libraries.push(Library { kind: LibraryKind::Dylib, name: "z" });
-    libraries.push(Library { kind: LibraryKind::Dylib, name: "m" });
+    let mut libraries: AVec<'static, Linked<'static>> = Vec::new_in(a);
+    libraries.push(mac_dylib("c", "/usr/lib/libSystem.B.dylib"));
+    libraries.push(mac_dylib("z", "/usr/lib/libz.1.dylib"));
+    libraries.push(mac_dylib("m", "/usr/lib/libSystem.B.dylib"));
     Image {
         platform: Platform::MacosArm64,
         regions,

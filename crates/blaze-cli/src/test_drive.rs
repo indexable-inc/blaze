@@ -13,7 +13,8 @@
 //! and never retried, rule 3); then a temporary folder of its own, the Seatbelt profile (blaze-run
 //! child.rs `seatbelt`, the one test profile) applied by `/usr/bin/sandbox-exec` to the launcher,
 //! its own process group, standard output and error piped and kept ([`Output`]: the last
-//! `2 * OUTPUT_CAP` bytes, all of it hashed and counted), and a deadline (rule 18: the plan's
+//! `2 * OUTPUT_CAP` bytes, all of it hashed and counted; [`StderrCapture`] also keeps fd 2
+//! in full for a signal report), and a deadline (rule 18: the plan's
 //! allowance, `--deadline`; past it the group is killed and the run is `TimedOut`). An exit with
 //! status 0 is a pass; any other end is a failure. A panic ends the process by the runtime's
 //! abort (it unwinds out of an entry no frame catches), which is that test's failure (rule 20)
@@ -47,9 +48,10 @@ use blaze_id::ItemKey as LibKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
 use blaze_ladder::code_records::{Builder, CodeClass};
-use blaze_ladder::run::make_one::{Maker, NamesRecords};
+use blaze_ladder::run::make_one::{Maker, NamesRecords, SecondCheck};
 use blaze_ladder::run::special::Roots;
 use blaze_ladder::run::special::test_roots::test_roots;
+use blaze_launch::wire::run::Symbol;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_run::head::ReadDigest;
 use blaze_run::plan::{Address, NotKept};
@@ -66,13 +68,13 @@ use bstd::fs::{Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::{Io, Missing};
 use bstd::mem::Frame;
 use bstd::path::{Path, PathError};
-use bstd::procs::{ChannelError, Ended, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, SignalError, Spawner, Streams};
+use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, SignalError, Spawner, Started, Streams, Waited};
 
 use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
-use crate::run_ids::{Checked, Grain, RunIds};
+use crate::run_ids::RunIds;
 use crate::run_loop::LoopError as RunLoopError;
-use crate::run_parent::{self, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Start as _, WRITE_BOUND};
+use crate::run_parent::{self, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, RunMaker, Start as _, WRITE_BOUND};
 use crate::store::CommandLent;
 use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, SuiteId, TestLoop};
 use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runner, Start, Zygotes};
@@ -174,10 +176,19 @@ pub(crate) enum OneError {
     Parent(ParentError),
     CannotBuild(InstanceRefusal),
     Launcher(crate::own_process::OwnError),
+    /// No file at `launcher`, the launcher's path beside this binary `exe`
+    /// (own_process.rs `launcher_beside`): no test can start.
+    NoLauncher { launcher: Box<str>, exe: Box<str> },
+    /// Whether the launcher is at `launcher` could not be looked at: the refusal's words.
+    LauncherNotLooked { launcher: Box<str>, why: Box<str> },
     /// The Seatbelt profile could not say a path, or words did not fit: in words.
     Profile { why: Box<str> },
     Start(ProcError),
     Pipe(ProcError),
+    MissingPipe { stream: &'static str },
+    Capture(FsError),
+    ShortCapture { read: u64, written: u64 },
+    Diagnostic(bstd::out::OutError),
     Loop(RunLoopError),
     Signals(SignalError),
 }
@@ -195,9 +206,19 @@ impl fmt::Display for OneError {
             OneError::Parent(error) => write!(f, "a test's run parent: {error}"),
             OneError::CannotBuild(refusal) => refusal.fmt(f),
             OneError::Launcher(error) => write!(f, "the launcher: {error}"),
+            OneError::NoLauncher { launcher, exe } => write!(
+                f,
+                "no `{}` beside `{exe}` (looked for at `{launcher}`): every test starts in it; it is built with blaze and installed next to it",
+                crate::own_process::LAUNCHER
+            ),
+            OneError::LauncherNotLooked { launcher, why } => write!(f, "whether the launcher is at `{launcher}` could not be looked at: {why}"),
             OneError::Profile { why } => write!(f, "a test's sandbox profile: {why}"),
             OneError::Start(error) => write!(f, "a test's launcher did not start under {SANDBOX_EXEC}: {error}"),
             OneError::Pipe(error) => write!(f, "a test's output: {error}"),
+            OneError::MissingPipe { stream } => write!(f, "the test launcher was started with piped {stream} but supplied no read end"),
+            OneError::Capture(error) => write!(f, "the test's stderr capture: {error}"),
+            OneError::ShortCapture { read, written } => write!(f, "the test's stderr capture ended after {read} of {written} recorded bytes"),
+            OneError::Diagnostic(error) => write!(f, "writing the test's signal report: {error}"),
             OneError::Loop(error) => write!(f, "a test's run: {error}"),
             OneError::Signals(error) => write!(f, "a test's run: the parent's signals: {error}"),
         }
@@ -211,7 +232,13 @@ pub(crate) struct InstanceRefusal {
     instance: crate::run_fault::Named,
     symbol: [u8; 32],
     site: Option<InstanceSite>,
-    cause: ParentError,
+    cause: RefusalCause,
+}
+
+#[derive(Debug)]
+enum RefusalCause {
+    Build(ParentError),
+    Unresolved,
 }
 
 #[derive(Debug)]
@@ -220,10 +247,12 @@ enum InstanceSite {
     Item { item: ItemKey, byte: u32 },
 }
 
-impl fmt::Display for InstanceRefusal {
+struct InstanceName<'n>(&'n crate::run_fault::Named, [u8; 32]);
+
+impl fmt::Display for InstanceName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use crate::run_fault::Named;
-        match &self.instance {
+        match self.0 {
             Named::Shown { item, args } => {
                 write!(f, "{item}")?;
                 if let Some(args) = args {
@@ -234,17 +263,27 @@ impl fmt::Display for InstanceRefusal {
             Named::Item(item) => write!(f, "fn {:#x}", item.0)?,
             Named::NoRow => {
                 f.write_str("symbol ")?;
-                for byte in self.symbol {
+                for byte in self.1 {
                     write!(f, "{byte:02x}")?;
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl fmt::Display for InstanceRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", InstanceName(&self.instance, self.symbol))?;
         match &self.site {
             Some(InstanceSite::Source(site)) => write!(f, " at {}:{}:{}", site.file, site.line, site.column)?,
             Some(InstanceSite::Item { item, byte }) => write!(f, " at byte {byte} of item {:#x}", item.0)?,
             None => {}
         }
-        match &self.cause {
+        let RefusalCause::Build(cause) = &self.cause else {
+            return f.write_str(": the first-call stub requested this symbol, but the program has no callable record for it");
+        };
+        match cause {
             ParentError::Walk {
                 why: blaze_ladder::body_ids::WalkError::Make { why: blaze_ladder::run::RunError::Build { error, .. }, .. }, ..
             } => write!(f, ": {error}"),
@@ -255,65 +294,135 @@ impl fmt::Display for InstanceRefusal {
     }
 }
 
-/// Only a refusal of the requested instance belongs to its test. A broken shared record,
-/// an unanswered names-record read, a wire error, or an invariant of the parent stops the
-/// command. Keep the walk alive until the instance and item-relative site have been named.
+/// Only a refusal of the requested instance belongs to its test. A broken shared record, a
+/// wire error, or an invariant of the parent stops the command; a names-record read that did
+/// not answer while one instance was made (`LazyRefusal::RecordsVoid`) is that test's. Keep the walk alive until the instance and item-relative site have been named.
 fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F, D>, cause: ParentError) -> OneError {
     let Some((symbol, location)) = refused_instance(&cause) else { return OneError::Parent(cause) };
     let site = location.map(|(item, byte)| match lazy.site_of(item, byte) {
         Some(shown) => InstanceSite::Source(shown),
         None => InstanceSite::Item { item, byte },
     });
-    OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(symbol), symbol, site, cause })
+    OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(symbol), symbol, site, cause: RefusalCause::Build(cause) })
 }
 
+/// The test whose instance could not be made, and where (`refused_at`), or `None` for a fault
+/// that is the suite's own. INVERTED (wave-1119, handoff c8): every failure of making ONE
+/// instance is that test's NOT RUN (rule 20), and only the classes named here and in
+/// [`stops_suite`] stop the suite (rule 19). Before, the test's classes were listed and every
+/// class not on the list stopped the suite: three new front-end classes stopped whole suites in
+/// one day that way (`LazyRefusal::RecordsVoid` at tempo a1425; `LazyRefusal::NotFound` at
+/// tempo-primitives 15:06, "the suite stopped" with 165 tests passing at 14:41).
 fn refused_instance(cause: &ParentError) -> Option<([u8; 32], Option<(ItemKey, u32)>)> {
     use blaze_ladder::body_ids::WalkError;
-    use blaze_ladder::code_records::CodeRecordError;
-    use blaze_ladder::run::RunError;
 
     Some(match cause {
-        ParentError::Walk { symbol, why: WalkError::Make { tabled, why } } => {
-            let byte = match why {
-                RunError::Build { range, .. } => range.map_or(0, |range| range.start),
-                RunError::ItemRefused { .. } | RunError::NoAdt { .. } | RunError::Emit { .. }
-                | RunError::Callee { .. } | RunError::Projection { .. } | RunError::LeftOut { .. }
-                | RunError::ConstAt { .. } | RunError::Resolve { .. } | RunError::NoBuiltinCall { .. }
-                | RunError::Vtable { .. } | RunError::StaticRecord { .. }
-                | RunError::Check { .. } | RunError::Types { .. } | RunError::Const { .. } | RunError::Need { .. }
-                | RunError::OneBody { .. }
-                | RunError::CodeRecord { error: CodeRecordError::Emit(_) | CodeRecordError::Routine(_), .. } => 0,
-                RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { range, .. }) => range.start,
-                RunError::Front2(why) if instance_front_refusal(why) => 0,
-                _ => return None,
-            };
-            (*symbol, Some((*tabled, byte)))
-        }
-        ParentError::Walk { symbol, why: WalkError::NoBody { tabled } } => (*symbol, Some((*tabled, 0))),
-        ParentError::Special {
-            symbol,
-            why: CodeRecordError::Emit(_) | CodeRecordError::Getter(_) | CodeRecordError::Ender(_) | CodeRecordError::Shim(_) | CodeRecordError::Routine(_),
-        } => (*symbol, None),
+        // Every variant, no `_`: a new step of the walk is sorted when it is added (rule 73).
+        ParentError::Walk { symbol, why } => match why {
+            // The suite's: the store refused a read or a write, a stored entry does not read,
+            // one symbol is tabled under two fns (an entry's declaration), or the walk's own
+            // bound on its instances (rule 18).
+            WalkError::Store(_) | WalkError::Entry { .. } | WalkError::TwoTabled { .. } | WalkError::Cap { .. } => return None,
+            WalkError::Make { tabled, why } => (*symbol, Some((*tabled, refused_at(why)?))),
+            // That instance's: a bound the test's code passes (an instance name past its cap,
+            // the walk's names past their arena, an item instantiating itself past
+            // `#![recursion_limit]`, rustc's "reached the recursion limit while
+            // instantiating"), a fn or crate fact the command lacks, a name that does not list.
+            // The error names the declarer, the depth or the size.
+            WalkError::NoBody { tabled }
+            | WalkError::NoCrateFact { tabled, .. }
+            | WalkError::Name { tabled, .. }
+            | WalkError::NameTooLarge { tabled, .. }
+            | WalkError::ArenaFull { tabled, .. }
+            | WalkError::RecursionLimit { tabled, .. } => (*symbol, Some((*tabled, 0))),
+        },
+        ParentError::Special { symbol, why } if !record_stops_suite(why) => (*symbol, None),
         ParentError::NotChecked { function, symbol, .. } => (*symbol, Some((*function, 0))),
         ParentError::NoPersonality { function, symbol, .. } => (*symbol, function.map(|item| (item, 0))),
+        // The wire and the protocol of the run, its roots, the names records it opened, a
+        // special record's store fault: the suite's. Never a failure inside one make.
         _ => return None,
     })
 }
 
-fn instance_front_refusal(why: &blaze_ladder::front2::program::Front2Refusal) -> bool {
+/// The byte of the body where making one instance refused (`Some(0)`: the body, no place), or
+/// `None` for one of the faults [`stops_suite`] names. A refusal a later instance carried
+/// (`NotBuilt`) is judged by the refusal it holds.
+fn refused_at(why: &blaze_ladder::run::RunError) -> Option<u32> {
+    use blaze_ladder::front2::program::Front2Refusal;
+    use blaze_ladder::run::RunError;
+    if stops_suite(why) {
+        return None;
+    }
+    Some(match why {
+        RunError::Build { range, .. } => range.map_or(0, |range| range.start),
+        RunError::NotBuilt { refusal, .. } => return refused_at(refusal),
+        RunError::Front2(Front2Refusal::Literal { range, .. }) => range.start,
+        _ => 0,
+    })
+}
+
+/// The few failures of making an instance that are the suite's own, never one test's: the
+/// store (a code record that would not be stored, sealed or entered), a bound of the run
+/// itself (its instance cap), and the run's setup and start (its crates, edition, manifest,
+/// names, roots, the start's shape and process; the program's start rule, queue cap and crate
+/// set, [`front_stops_suite`]). Anything else is that test's NOT RUN. A refusal `NotBuilt`
+/// carries is judged by what it carries.
+fn stops_suite(why: &blaze_ladder::run::RunError) -> bool {
+    use blaze_ladder::run::RunError;
+    match why {
+        RunError::NotBuilt { refusal, .. } => stops_suite(refusal),
+        RunError::CodeRecord { error, .. } => record_stops_suite(error),
+        RunError::Front2(front) => front_stops_suite(front),
+        RunError::TooManyInstances
+        | RunError::OverflowDisagrees { .. }
+        | RunError::Crates(_)
+        | RunError::Edition { .. }
+        | RunError::Names { .. }
+        | RunError::Manifest { .. }
+        | RunError::Roots(_)
+        | RunError::NoMain
+        | RunError::MainShape { .. }
+        | RunError::NoHost { .. }
+        | RunError::NoArgs { .. }
+        | RunError::Args(_)
+        | RunError::OwnProcess { .. } => true,
+        _ => false,
+    }
+}
+
+/// A code record's fault that is the store's: it would not be stored, sealed or entered. An
+/// emit, a symbol, a routine, a shim or a datum that did not make is the instance's.
+fn record_stops_suite(error: &blaze_ladder::code_records::CodeRecordError) -> bool {
+    use blaze_ladder::code_records::CodeRecordError;
+    matches!(error, CodeRecordError::Store(_) | CodeRecordError::Seal(_) | CodeRecordError::Entry(_))
+}
+
+/// The front end's refusals that are the suite's: the engine's own check state (the tables did
+/// not fork, a record's reads differ from the list it was checked against), the program's queue
+/// cap, its start (the start rule, the crate list) and its crate set (`Front2Refusal::Front`: a
+/// program file no `mod` reaches, two values under one key (rule 21), a lang item defined twice,
+/// roots that name no crate set; none is one instance's). A row's refusal is judged by what it
+/// carries. Every other refusal, `LazyRefusal::NotFound`, `Unanswered` and `RecordsVoid` among
+/// them, is the instance's.
+fn front_stops_suite(why: &blaze_ladder::front2::program::Front2Refusal) -> bool {
     use blaze_ladder::front2::check::CheckFail;
     use blaze_ladder::front2::program::{Front2Refusal as Front, lazy::LazyRefusal};
     match why {
-        Front::Lazy(LazyRefusal::Row { refusal, .. }) => instance_front_refusal(refusal),
+        Front::Lazy(LazyRefusal::Row { refusal, .. }) => front_stops_suite(refusal),
         Front::Lazy(LazyRefusal::Check { error, .. }) | Front::Asked { error, .. } | Front::Check(error) =>
-            !matches!(error, CheckFail::Tables { .. } | CheckFail::ReadsDiffer { .. }),
-        Front::Lazy(LazyRefusal::Lower { .. } | LazyRefusal::Spell { .. }
-            | LazyRefusal::LocalNotBuilt { .. } | LazyRefusal::Diagnostic { .. }
-            | LazyRefusal::Head { .. } | LazyRefusal::Adt { .. } | LazyRefusal::Const { .. }
-            | LazyRefusal::NotLazyYet { .. } | LazyRefusal::NeedsSolvedNames { .. } | LazyRefusal::FmtArgument { .. })
-        | Front::Unchecked { .. } | Front::NoBody { .. } | Front::Const { .. }
-        | Front::Static { .. } | Front::Abi { .. } | Front::Literal { .. } | Front::Intrinsic { .. }
-        | Front::TargetIntrinsic { .. } | Front::AdtRow { .. } | Front::ObjectTrait { .. } => true,
+            matches!(error, CheckFail::Tables { .. } | CheckFail::ReadsDiffer { .. }),
+        Front::Front(_)
+        | Front::Capped { .. }
+        | Front::Unlisted { .. }
+        | Front::NoMain
+        | Front::MainTakenBy { .. }
+        | Front::MainNotWritten { .. }
+        | Front::NoLangStart { .. }
+        | Front::Start { .. }
+        | Front::NoHostedStart
+        | Front::StartFact { .. }
+        | Front::TwoEntries { .. } => true,
         _ => false,
     }
 }
@@ -331,7 +440,7 @@ pub(crate) mod refusal_tests {
         InstanceRefusal {
             instance: crate::run_fault::Named::Path("lib::callee".into()),
             symbol, site: Some(InstanceSite::Item { item, byte: 15 }),
-            cause: ParentError::NotChecked { function: item, symbol, why: None },
+            cause: RefusalCause::Build(ParentError::NotChecked { function: item, symbol, why: crate::run_ids::NotRunnable::Checked(crate::run_ids::Checked::Absent(crate::run_ids::Missing::NoRecord)) }),
         }
     }
 
@@ -348,6 +457,92 @@ pub(crate) mod refusal_tests {
         let range = blaze_typeck::Range { start: 15, end: 22 };
         let why = RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { function: "lib::callee".into(), what: "an unsupported literal", range });
         assert_eq!(refused_instance(&make(why)), Some((symbol, Some((item, range.start)))));
+    }
+
+    /// A test's code blaze refuses (a static's data, a thread local, a lowering, an unwinding
+    /// raise) is that test's NOT RUN, and a refusal carried by `NotBuilt` is judged by what it
+    /// carries. PLANTED: `NotBuilt` carrying a store's fault stays the suite's stop (rule 19),
+    /// never one test's refusal.
+    #[test]
+    fn a_refusal_of_the_tests_code_is_its_own_and_a_carried_fault_is_not() {
+        let symbol = [17; 32];
+        let item = ItemKey(3);
+        let named = || Named { path: "lib::callee".into(), at: blaze_ladder::front::At { file: 0, place: 80 } };
+        let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
+        let range = blaze_typeck::Range { start: 15, end: 22 };
+        assert_eq!(refused_instance(&make(RunError::UnwindRaised { function: named() })), Some((symbol, Some((item, 0)))));
+        assert_eq!(refused_instance(&make(RunError::Lower { refusals: std::vec::Vec::new(), shown: "a lowering".into() })), Some((symbol, Some((item, 0)))));
+        let literal = RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Literal { function: "lib::callee".into(), what: "an unsupported literal", range });
+        let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(literal), not_built: 1, reached: 2 };
+        assert_eq!(refused_instance(&make(carried)), Some((symbol, Some((item, range.start)))), "a carried refusal is judged by what it carries");
+        let store = RunError::CodeRecord { function: named(), error: CodeRecordError::Store(StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) }) };
+        let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(store), not_built: 1, reached: 2 };
+        assert_eq!(refused_instance(&make(carried)), None, "planted: a carried store fault stops the suite");
+    }
+
+    /// Before (tempo a1425, 2026-11-21): a make the names records voided fell to `_` and stopped
+    /// the suite. Now it is that test's NOT RUN at the instance stepped. CONTROL: the same void
+    /// carried with a store's fault beside it in the walk (`WalkError::Store`) still stops the
+    /// suite; TWIN: the void carried by `NotBuilt` is judged by what it carries, the same.
+    #[test]
+    fn a_make_the_names_records_voided_is_that_tests_not_run() {
+        use blaze_ladder::front2::program::{Front2Refusal, lazy::LazyRefusal};
+        let symbol = [17; 32];
+        let item = ItemKey(3);
+        let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
+        let void = || RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled: item, first: "no record answers yet".into(), kept: 1, dropped: 0 }));
+        assert_eq!(refused_instance(&make(void())), Some((symbol, Some((item, 0)))));
+        let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(void()), not_built: 1, reached: 2 };
+        assert_eq!(refused_instance(&make(carried)), Some((symbol, Some((item, 0)))), "twin: a carried void is the test's too");
+        let store = StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) };
+        assert_eq!(refused_instance(&ParentError::Walk { symbol, why: WalkError::Store(store) }), None, "control: a store fault stops the suite");
+    }
+
+    /// A walk bound the test's code passes (a name past its cap, the names' arena full, an item
+    /// past `#![recursion_limit]`) is that test's NOT RUN, at the fn it reached. CONTROL: the
+    /// walk's instance cap (`Cap`, blaze's own bound on the whole walk) stays the suite's stop.
+    #[test]
+    fn a_walk_bound_the_tests_code_passes_is_its_own() {
+        let symbol = [17; 32];
+        let (item, declarer) = (ItemKey(3), ItemKey(4));
+        let walk = |why| ParentError::Walk { symbol, why };
+        let recursion = WalkError::RecursionLimit { tabled: item, item, declarer: Some(declarer), depth: 129, limit: 128 };
+        assert_eq!(refused_instance(&walk(recursion)), Some((symbol, Some((item, 0)))));
+        let large = WalkError::NameTooLarge { tabled: item, declarer: Some(declarer), bytes: 1 << 30, most: 1 << 29, heads: [Some(item), None, None] };
+        assert_eq!(refused_instance(&walk(large)), Some((symbol, Some((item, 0)))));
+        let arena = WalkError::ArenaFull { tabled: item, bytes: 1 << 32, adding: 20 };
+        assert_eq!(refused_instance(&walk(arena)), Some((symbol, Some((item, 0)))));
+        assert_eq!(refused_instance(&walk(WalkError::Cap { most: 4 })), None, "control: the walk's own cap stops the suite");
+    }
+
+    /// INVERTED (wave-1119, handoff c8): a failure of making an instance that no stopping class
+    /// names is that test's NOT RUN. tempo-primitives 15:06: `LazyRefusal::NotFound` (a fn the
+    /// cold search did not find) fell to `_` and stopped the suite. TWINS: `NotFound` carried by
+    /// `NotBuilt` and through a row's refusal, and `Unanswered`, which no list names, are the
+    /// test's too. PLANTED: a store fault carried by `NotBuilt` still stops the suite. CONTROLS:
+    /// the program's queue cap (`Front2Refusal::Capped`) and the run's instance bound
+    /// (`TooManyInstances`) stop it.
+    #[test]
+    fn every_failure_to_make_an_instance_is_its_tests_unless_named() {
+        use blaze_ladder::front2::program::{Front2Refusal, lazy::LazyRefusal};
+        let symbol = [17; 32];
+        let item = ItemKey(3);
+        let named = || Named { path: "lib::callee".into(), at: blaze_ladder::front::At { file: 0, place: 80 } };
+        let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
+        let not_found = || LazyRefusal::NotFound { key: item, krate: "crate 91".into(), searched: "its item, module and variant rows".into() };
+        assert_eq!(refused_instance(&make(RunError::Front2(Front2Refusal::Lazy(not_found())))), Some((symbol, Some((item, 0)))));
+        let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(RunError::Front2(Front2Refusal::Lazy(not_found()))), not_built: 1, reached: 2 };
+        assert_eq!(refused_instance(&make(carried)), Some((symbol, Some((item, 0)))), "twin: carried by `NotBuilt`");
+        let row = Front2Refusal::Lazy(LazyRefusal::Row { function: "lib::callee".into(), refusal: std::boxed::Box::new(Front2Refusal::Lazy(not_found())) });
+        assert_eq!(refused_instance(&make(RunError::Front2(row))), Some((symbol, Some((item, 0)))), "twin: through a row's refusal");
+        let unanswered = Front2Refusal::Lazy(LazyRefusal::Unanswered { question: "each_item", item: "crate 91".into() });
+        assert_eq!(refused_instance(&make(RunError::Front2(unanswered))), Some((symbol, Some((item, 0)))), "twin: a class no list names is the test's");
+        let store = RunError::CodeRecord { function: named(), error: CodeRecordError::Store(StoreError::TwoValues { key: CodeKey(ContentId([7; 32])) }) };
+        let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(store), not_built: 1, reached: 2 };
+        assert_eq!(refused_instance(&make(carried)), None, "planted: a carried store fault stops the suite");
+        let capped = Front2Refusal::Capped { entry: "lib::main".into(), queued: 9, cap: 8, items: 9, forced: false, report: "".into() };
+        assert_eq!(refused_instance(&make(RunError::Front2(capped))), None, "control: the program's queue cap stops the suite");
+        assert_eq!(refused_instance(&make(RunError::TooManyInstances)), None, "control: the run's instance bound stops the suite");
     }
 }
 
@@ -809,6 +1004,9 @@ impl Refuse for EntryCheck<'_, '_> {
 /// `run_own`), with the test's roots, its own folder and profile, piped output and a deadline.
 pub(crate) struct Launched<'c, 'h> {
     pub cx: &'c Cx,
+    pub err: &'c bstd::out::Out,
+    pub package: &'c str,
+    pub target: &'c str,
     pub spawner: &'c Spawner,
     /// `blaze-launcher` beside this binary (own_process.rs `launcher_beside`).
     pub launcher: &'c str,
@@ -821,6 +1019,9 @@ pub(crate) struct Launched<'c, 'h> {
     pub temp: &'c str,
     /// The command's environment.
     pub env: &'c [(&'c str, &'c str)],
+    /// The package's root (each test's working directory) and its run-time variables
+    /// ([`PackageRun`]).
+    pub place: PackageRun<'c>,
     /// Arguments of a harnessless target's main. A harnessed entry takes none.
     pub args: &'c [&'c str],
     pub tests: TestRows<'c>,
@@ -834,18 +1035,121 @@ pub(crate) struct Launched<'c, 'h> {
 
 impl RunOne for Launched<'_, '_> {
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<How, OneError> {
+        let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
+        let name = bstd::mem::format_in!(&frame, "stderr-{row}");
+        let path = Path::new(name.as_str()).map_err(OneError::Path)?;
+        // The parent owns this file beside the child's writable directory. A child cannot
+        // replace the evidence. Quiet tests create no file.
+        let mut stderr = StderrCapture { dir: self.temps, path, prefix: Vec::new_in(&frame), spilled: false, bytes: 0 };
+        let result = self.run_captured(row, budget, output, signals, &mut stderr, &frame).await;
+        if stderr.spilled {
+            stderr.dir.remove(self.cx, &stderr.path, Durable::No).map_err(OneError::Capture)?;
+        }
+        result
+    }
+}
+
+/// The result record has a bounded tail. A live signal diagnostic also needs the complete
+/// byte stream from descriptor 2, including non-UTF-8 output and anything before that tail.
+struct StderrCapture<'d> {
+    dir: &'d Dir<ReadWrite>,
+    path: Path,
+    prefix: Vec<u8, &'d Frame>,
+    spilled: bool,
+    bytes: u64,
+}
+
+impl StderrCapture<'_> {
+    fn push(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), OneError> {
+        if !self.spilled && self.prefix.len() + bytes.len() <= OUTPUT_CAP {
+            self.prefix.extend_from_slice(bytes);
+        } else {
+            let file = if self.spilled {
+                self.dir.open(cx, &self.path)
+            } else {
+                self.dir.create(cx, &self.path)
+            }.map_err(OneError::Capture)?;
+            self.spilled = true;
+            let at = self.bytes - self.prefix.len() as u64;
+            let wrote = file.write_at(cx, at, bytes, Durable::No);
+            file.close(cx, Durable::No).map_err(OneError::Capture)?;
+            wrote.map_err(OneError::Capture)?;
+        }
+        self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn print(&self, cx: &Cx, err: &bstd::out::Out) -> Result<(), OneError> {
+        err.write_all(cx, &self.prefix).map_err(OneError::Diagnostic)?;
+        if !self.spilled {
+            return Ok(());
+        }
+        let file = self.dir.open_read(cx, &self.path).map_err(OneError::Capture)?;
+        let mut chunk = [0; 16 * 1024];
+        let mut at = 0;
+        let spilled = self.bytes - self.prefix.len() as u64;
+        while at < spilled {
+            let n = file.read_into(&mut chunk, at).wait(cx).map_err(OneError::Capture)?;
+            if n == 0 {
+                return Err(OneError::ShortCapture { read: self.prefix.len() as u64 + at, written: self.bytes });
+            }
+            err.write_all(cx, &chunk[..n]).map_err(OneError::Diagnostic)?;
+            at += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// One fd 3 request is served per turn. The resolver sees the symbol even for a request
+/// by slot, after Needs has looked the slot up in its own declaration table.
+struct TestResolve<'r, R> {
+    parent: &'r mut R,
+    requested: Option<TestAnswer>,
+}
+
+enum TestAnswer {
+    Ready(Symbol),
+    Unresolved(Symbol),
+}
+
+impl<R: Resolve> Resolve for TestResolve<'_, R> {
+    #[cfg(test)]
+    fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+        self.parent.resolve(symbol)
+    }
+
+    fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+        let answer = self.parent.publication(symbol, values)?;
+        self.requested = Some(match answer {
+            Resolved::Record { .. } => TestAnswer::Ready(*symbol),
+            Resolved::Unknown => TestAnswer::Unresolved(*symbol),
+        });
+        Ok(answer)
+    }
+}
+
+struct FirstCall {
+    symbol: Symbol,
+    elapsed: Duration,
+    // Includes any static data this function needed before publication.
+    made: usize,
+    found: usize,
+    unkeyed: usize,
+}
+
+impl Launched<'_, '_> {
+    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<How, OneError> {
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
         // The test's own frame: everything of its run, dropped with it.
-        let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
-        let erased = blaze_own::Erased::new(&frame);
+        let erased = blaze_own::Erased::new(frame);
         let alloc = erased.handle();
         // 1. Its temporary folder, made empty: one already there is refused by name, so
         // nothing another run left is read as this one's.
-        let name = bstd::mem::format_in!(&frame, "{row}");
+        let name = bstd::mem::format_in!(frame, "{row}");
         let named = Path::new(name.as_str()).map_err(OneError::Path)?;
         self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
-        let temp = bstd::mem::format_in!(&frame, "{}/{row}", self.temp);
+        let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
         // 2. The lazy parent with the test's roots; nothing built yet.
         let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, harness: self.tests.harnessed(), watch: self.watch };
         let mut codes = HomeCodeStore::new(self.lent);
@@ -856,49 +1160,61 @@ impl RunOne for Launched<'_, '_> {
         let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
             .map_err(|cause| test_parent_error(&mut lazy, cause))?;
         let line = head.line;
-        let entry = bstd::mem::format_in!(&frame, "{line}");
-        // 3. Its environment: its own `TMPDIR`, then the command's, then the run mode's names.
-        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + 8, &frame);
+        let entry = bstd::mem::format_in!(frame, "{line}");
+        // 3. Its environment: its own `TMPDIR`, its package's variables (`PackageRun`), then the
+        // command's (less the names those set), then the run mode's names.
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 8, frame);
         vars.push(("TMPDIR", temp.as_str()));
-        run_parent::launch_env(self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR"), self.store, entry.as_str(), None, &mut vars);
+        vars.extend_from_slice(self.place.vars);
+        let package = self.place.vars;
+        let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
+        run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
         // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
-        let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(&frame, "{why}").as_str()) })?;
-        let mut args = Vec::with_capacity_in(self.args.len() + 3, &frame);
+        let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
+        let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
         args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
         args.extend_from_slice(self.args);
-        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: ".", streams: Streams::PIPED, channel: true, own_group: true, parent_death: ParentDeath::STRONGEST };
-        let mut run = self.spawner.start_run(cx, &spec).map_err(OneError::Start)?;
+        // Its working directory: its package's root, as `cargo test` runs it (`PackageRun`).
+        let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+        let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
         let until = Deadline::after(run.now(), Duration::from_nanos(budget.0));
-        let mut pipes = [run.take_stdout().map_err(OneError::Pipe)?, run.take_stderr().map_err(OneError::Pipe)?];
+        let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
+        let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
+        let mut pipes = [Some(stdout), Some(stderr_pipe)];
         let mut relay = Relay::new(GRACE);
         let mut inbox = std::vec::Vec::new_in(alloc);
         let mut reply = ahead;
         let mut open = true;
+        let mut calls = Vec::new_in(alloc);
+        let mut published = 0;
+        let mut service_time = Duration::ZERO;
+        let mut torn = None;
         let child_error = |error| OneError::Loop(RunLoopError::Child(error));
-        // Start the other ready children before building any first-call answer.
-        let ended = loop {
+        // Start the other ready children before building any first-call answer. The loop ends
+        // with the child's end and what it left (its channel, still read for what it wrote).
+        let (ended, mut over) = loop {
             next_turn().await;
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             let now = run.now();
             if until.passed(now) {
-                run.kill().map_err(child_error)?;
-                break How::TimedOut { after: budget };
+                let killed = run.kill().map_err(child_error)?;
+                break (How::TimedOut { after: budget }, killed.left);
             }
             match relay.turn(now, signals.terminate(now)?) {
                 RelayAct::Forward => run.terminate().map_err(child_error)?,
                 RelayAct::Kill => {
-                    if let Some(how) = child_outcome(run.kill().map_err(child_error)?) {
-                        break how;
-                    }
+                    // A kill reaps: its end is always known.
+                    let killed = run.kill().map_err(child_error)?;
+                    break (child_outcome(killed.exit), killed.left);
                 }
                 RelayAct::Nothing => {}
             }
             let bound = until.min(relay.bound());
-            drain_pipes(&mut pipes, output, Deadline::PASSED)?;
+            drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
             if open && !reply.is_empty() {
                 let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
                 match run.send(&reply, by) {
-                    Ok(()) => {}
+                    Ok(()) => published = calls.len(),
                     Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
                     Err(error) => return Err(child_error(error)),
                 }
@@ -907,9 +1223,12 @@ impl RunOne for Launched<'_, '_> {
             let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
             if open {
                 match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
-                    Ok(Message::Whole { .. }) => {
+                    Ok(Message::Whole { len }) => {
                         self.watch.see(blaze_screen::Step::Waits);
-                        let taken = match needs.serve(&mut lazy, &inbox, &mut reply) {
+                        let serving = run.now();
+                        let before = lazy.tally();
+                        let mut resolver = TestResolve { parent: &mut lazy, requested: None };
+                        let taken = match needs.serve(&mut resolver, &inbox[..len], &mut reply) {
                             Ok(taken) => taken,
                             Err(cause) => {
                                 // This group is waiting for code it will never receive.
@@ -918,6 +1237,26 @@ impl RunOne for Launched<'_, '_> {
                                 return Err(test_parent_error(&mut lazy, cause));
                             }
                         };
+                        let elapsed = run.now().saturating_sub(serving);
+                        service_time += elapsed;
+                        match resolver.requested {
+                            Some(TestAnswer::Unresolved(Symbol(symbol))) => {
+                                // Sending Failed would turn the unavailable instance into a launcher exit.
+                                run.kill().map_err(child_error)?;
+                                return Err(OneError::CannotBuild(InstanceRefusal {
+                                    instance: lazy.name_of(symbol), symbol, site: None, cause: RefusalCause::Unresolved,
+                                }));
+                            }
+                            Some(TestAnswer::Ready(symbol)) => {
+                                let after = lazy.tally();
+                                calls.push(FirstCall {
+                                    symbol, elapsed, made: after.made - before.made,
+                                    found: after.found - before.found, unkeyed: after.unkeyed - before.unkeyed,
+                                });
+                            }
+                            // Faults and requests for an already answered slot need no resolution.
+                            None => {}
+                        }
                         self.watch.see(blaze_screen::Step::Answers);
                         // The served prefix out, the rest kept in order, as run_loop.rs does
                         // (`drain` wants the nightly-only allocator trait of the vec's allocator).
@@ -927,46 +1266,165 @@ impl RunOne for Launched<'_, '_> {
                         continue;
                     }
                     Ok(Message::Closed) => open = false,
+                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
+                        torn = Some(error);
+                        open = false;
+                    }
                     Ok(Message::Deadline) => {}
                     Err(error) => return Err(child_error(error)),
                 }
             }
             let look = if open { Deadline::PASSED } else { poll };
-            if let Some(how) = child_outcome(run.wait(look).map_err(child_error)?) {
-                break how;
-            }
+            run = match run.wait(look).map_err(child_error)? {
+                Waited::Ended(reaped) => break (child_outcome(reaped.exit), reaped.left),
+                Waited::Running(running) => running,
+            };
         };
         // The reaped child's remaining output belongs to its own capture.
-        let drain_until = Deadline::after(run.now(), DRAIN_AFTER);
-        while pipes.iter().any(Option::is_some) && !drain_until.passed(run.now()) {
-            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
-            drain_pipes(&mut pipes, output, poll)?;
+        let drain_until = Deadline::after(over.now(), DRAIN_AFTER);
+        while pipes.iter().any(Option::is_some) && !drain_until.passed(over.now()) {
+            let poll = Deadline::after(over.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
+            drain_pipes(cx, &mut pipes, output, stderr, poll)?;
             if pipes.iter().any(Option::is_some) {
                 next_turn().await;
             }
+        }
+        if let How::Signal { number } = ended {
+            let path = self.tests.row(row as usize).map_err(OneError::Record)?.ok_or(OneError::NoRow { row })?.path;
+            let err = self.err;
+            let diagnostic = OneError::Diagnostic;
+            err.line(cx, format_args!("---- {}/{}/{path} signal {number}: stderr ({} bytes) ----", self.package, self.target, stderr.bytes)).map_err(diagnostic)?;
+            let mut first = [0u8; 4000];
+            let wanted = stderr.bytes.min(first.len() as u64) as usize;
+            let held = wanted.min(stderr.prefix.len());
+            first[..held].copy_from_slice(&stderr.prefix[..held]);
+            if held < wanted {
+                // The spill starts immediately after the in-memory prefix, even when
+                // the first pipe read was too large to keep any prefix.
+                let file = stderr.dir.open_read(cx, &stderr.path).map_err(OneError::Capture)?;
+                let mut read = held;
+                while read < wanted {
+                    let n = file.read_into(&mut first[read..wanted], (read - held) as u64).wait(cx).map_err(OneError::Capture)?;
+                    if n == 0 {
+                        return Err(OneError::ShortCapture { read: read as u64, written: stderr.bytes });
+                    }
+                    read += n;
+                }
+            }
+            let mut line = [0u8; 101];
+            let mut width = 0;
+            for &byte in &first[..wanted] {
+                let escaped = core::ascii::escape_default(byte);
+                if width + escaped.len() > 100 {
+                    line[width] = b'\n';
+                    err.write_all(cx, &line[..=width]).map_err(diagnostic)?;
+                    width = 0;
+                }
+                for ascii in escaped {
+                    line[width] = ascii;
+                    width += 1;
+                }
+            }
+            if width != 0 {
+                line[width] = b'\n';
+                err.write_all(cx, &line[..=width]).map_err(diagnostic)?;
+            }
+            err.line(cx, "---- end escaped stderr ----").map_err(diagnostic)?;
+            if pipes[1].is_some() {
+                err.line(cx, "\nstderr was still open at the post-exit drain deadline").map_err(diagnostic)?;
+            }
+            err.line(cx, format_args!("\nfirst calls: {}; parent serving requests: {service_time:?}; {}", calls.len(), lazy.tally())).map_err(diagnostic)?;
+            match calls[..published].last() {
+                Some(call) => err.line(cx, format_args!("last published: {}", InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0))),
+                None => err.line(cx, "last published: none"),
+            }.map_err(diagnostic)?;
+            for call in &calls[published..] {
+                err.line(cx, format_args!("pending need: {}", InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0))).map_err(diagnostic)?;
+            }
+            // A last request or fault may have reached fd 3 between the final poll and
+            // waitpid. Read already-queued messages without building anything for a dead child.
+            let mut fault = needs.fault();
+            let mut queued = false;
+            let wire_error = |why| OneError::Parent(ParentError::Wire(why));
+            let read_until = Deadline::after(over.now(), DRAIN_AFTER);
+            while torn.is_none() && !read_until.passed(over.now()) {
+                match over.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
+                    Ok(Message::Whole { len }) => {
+                        let (_, up) = blaze_launch::wire::run::Up::decode(&inbox[4..len]).map_err(wire_error)?;
+                        match up {
+                            blaze_launch::wire::run::Up::Need { need, .. } => {
+                                queued = true;
+                                err.line(cx, format_args!("pending need (received after exit): {need:?}")).map_err(diagnostic)?;
+                            }
+                            blaze_launch::wire::run::Up::Fault { fault: last } => {
+                                if fault.is_none() {
+                                    fault = Some(last);
+                                }
+                            }
+                        }
+                        let left = inbox.len() - len;
+                        inbox.copy_within(len.., 0);
+                        inbox.truncate(left);
+                    }
+                    Ok(Message::Closed | Message::Deadline) => break,
+                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => torn = Some(error),
+                    Err(error) => return Err(child_error(error)),
+                }
+            }
+            if !queued && calls.len() == published && inbox.is_empty() {
+                err.line(cx, "pending need: none").map_err(diagnostic)?;
+            }
+            if let Some(error) = torn {
+                err.line(cx, format_args!("incomplete first-call channel message: {error}")).map_err(diagnostic)?;
+            } else if !inbox.is_empty() {
+                err.line(cx, format_args!("unprocessed first-call channel bytes at exit: {}", inbox.len())).map_err(diagnostic)?;
+            }
+            err.line(cx, "refusal stub: no refused first call observed by the parent").map_err(diagnostic)?;
+            if let Some(fault) = fault {
+                let mut bytes = bstd::mem::Bytes::new_in(frame, "the code record a test struck in");
+                let record = match fault.at {
+                    Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.folder().read(&spot.record, &mut bytes).map(|()| bytes.as_slice())),
+                    _ => None,
+                };
+                err.line(cx, format_args!("{}", crate::run_fault::report(fault, &mut lazy, record))).map_err(diagnostic)?;
+            } else {
+                err.line(cx, format_args!("the launcher sent no fault location for signal {number}")).map_err(diagnostic)?;
+            }
+            for call in &calls[..published] {
+                err.line(cx, format_args!("published: {} in {:?} (records made {}, found {}, unkeyed {})",
+                    InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0), call.elapsed, call.made, call.found, call.unkeyed)).map_err(diagnostic)?;
+            }
+            err.line(cx, "---- end signal report ----").map_err(diagnostic)?;
+            err.flush(cx).map_err(diagnostic)?;
+        } else if let Some(error) = torn {
+            return Err(child_error(error));
         }
         Ok(ended)
     }
 }
 
-fn child_outcome(ended: Ended) -> Option<How> {
-    match ended {
-        Ended::Exited(0) => Some(How::Reported(Said::Returned)),
-        Ended::Exited(code) => Some(How::NoReport { code, torn: 0 }),
-        Ended::Signaled(number) => Some(How::Signal { number }),
-        Ended::Deadline => None,
+fn child_outcome(exit: Exit) -> How {
+    match exit {
+        Exit::Exited(0) => How::Reported(Said::Returned),
+        Exit::Exited(code) => How::NoReport { code, torn: 0 },
+        Exit::Signaled(number) => How::Signal { number },
     }
 }
 
 /// At most a pipeful from each stream per turn, so a writer that never stops cannot starve
 /// another child's first-call channel or deadline.
-fn drain_pipes(pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, by: Deadline) -> Result<(), OneError> {
+fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, stderr: &mut StderrCapture<'_>, by: Deadline) -> Result<(), OneError> {
     let mut chunk = [0u8; 16 * 1024];
-    for slot in pipes {
+    for (stream, slot) in pipes.iter_mut().enumerate() {
         for _ in 0..4 {
             let Some(pipe) = slot.as_ref() else { break };
             match pipe.read(&mut chunk, by).map_err(OneError::Pipe)? {
-                Piped::Bytes(n) => output.push(&chunk[..n]),
+                Piped::Bytes(n) => {
+                    output.push(&chunk[..n]);
+                    if stream == 1 {
+                        stderr.push(cx, &chunk[..n])?;
+                    }
+                }
                 Piped::Closed => *slot = None,
                 Piped::Deadline => break,
             }
@@ -991,7 +1449,7 @@ pub(crate) struct TestFront<'s, 'h, 'r> {
 impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
     type Start = Roots<'r>;
     type Ids = &'s RunIds<'h>;
-    type Maker = Maker<'h>;
+    type Maker = RunMaker<'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         entry_roots(self.harness, self.names, self.test, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
@@ -1001,9 +1459,10 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         Ok(self.ids)
     }
 
-    fn maker(&mut self, start: &Roots<'r>) -> Result<Maker<'h>, ParentError> {
+    fn maker(&mut self, start: &Roots<'r>) -> Result<RunMaker<'h>, ParentError> {
         // The test's roots start its program at the test fn (`MakerStart::Direct`), not at `main`.
-        Ok(Maker::of_roots(self.names, start.maker_entry(), start, &self.builder, self.tables))
+        // The typing is the run's (run_parent.rs `RunMaker`: the flip changes both).
+        Ok(Maker::of_roots(self.names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables))
     }
 
     /// As run_parent.rs `CommandFront::path_of`: the one printer over the names records.
@@ -1013,7 +1472,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         blaze_ladder::front2::item_shown::ItemShown::of_lib(self.names.records, lib).path().map(Box::from)
     }
 
-    fn named(&mut self, maker: Option<&Maker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+    fn named(&mut self, maker: Option<&RunMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
         use crate::run_fault::Named;
         if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
             return Named::Shown { item: shown.item, args: shown.args };
@@ -1024,7 +1483,7 @@ impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
         }
     }
 
-    fn site_shown(&mut self, maker: Option<&Maker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+    fn site_shown(&mut self, maker: Option<&RunMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
         let (file, line, column) = maker?.site_shown(item, site)?;
         Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
     }
@@ -1051,16 +1510,30 @@ impl BodyIds for &RunIds<'_> {
 }
 
 impl Gate for &RunIds<'_> {
-    fn grain(&self, item: ItemKey) -> Option<Grain> {
-        (**self).grain(item)
-    }
-    fn checked(&self, item: ItemKey) -> Option<Checked> {
-        (**self).checked(item)
+    fn runnable(&self, item: ItemKey) -> Result<crate::run_ids::Runnable, crate::run_ids::NotRunnable> {
+        RunIds::runnable(self, item)
     }
 }
 
 /// `name` beneath `dir`, made; one already there taken as it is (a folder is the state wanted);
 /// anything else fails naming it.
+/// Whether a file is at `launcher` (an absolute path, own_process.rs `launcher_beside`): its
+/// folder is opened as a tree of its own (bstd `Fs::home` over the folder's parent, the folder's
+/// name beneath it) and the file's name is stat'ed there; one stat per command.
+fn launcher_there(cx: &Cx, fs: &bstd::fs::Fs, launcher: &str, frame: &Frame) -> Result<bool, OneError> {
+    let not_looked = |why: &dyn fmt::Display| OneError::LauncherNotLooked { launcher: Box::from(launcher), why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) };
+    let Some((folder, file)) = launcher.rsplit_once('/') else { return Err(not_looked(&"the path has no folder")) };
+    let Some((parent, name)) = folder.rsplit_once('/') else { return Err(not_looked(&"the folder is not an absolute path")) };
+    let parent = if parent.is_empty() { "/" } else { parent };
+    let name = Path::new(name).map_err(OneError::Path)?;
+    let file = Path::new(file).map_err(OneError::Path)?;
+    let dir = fs.home(cx, parent, &name).map_err(|why| not_looked(&why))?;
+    match dir.stat(cx, &file) {
+        Ok(found) => Ok(found.is_some()),
+        Err(why) => Err(not_looked(&why)),
+    }
+}
+
 fn made_or_there(cx: &Cx, dir: &Dir<ReadWrite>, name: &str) -> Result<Dir<ReadWrite>, OneError> {
     let named = Path::new(name).map_err(OneError::Path)?;
     match dir.make_dir(cx, &named, Durable::No) {
@@ -1123,6 +1596,84 @@ pub(crate) struct Suite<'s, 'h> {
     pub unit: TestUnit<'s>,
     pub names: NamesRecords<'h>,
     pub builder: Builder,
+    /// Where its tests run and what of their package they are told ([`package_run`]).
+    pub place: PackageRun<'s>,
+}
+
+/// Where a package's tests run and what of the package they are told at run time, as
+/// `cargo test` starts one: its working directory is the package's root (the folder of its
+/// `Cargo.toml`), `CARGO_MANIFEST_DIR` names that folder and `CARGO_MANIFEST_PATH` its manifest,
+/// and every `CARGO_PKG_*` the package has is set, from the unit graph's package record (the
+/// crate list's row: blaze-scope crate_env.rs `CrateEnv::of`, the one construction `env!` is
+/// answered by, rule 30).
+///
+/// TWO VALUES OF ONE NAME, BY DESIGN: `env!("CARGO_MANIFEST_DIR")` compiled in is the root the
+/// crate SEES (D96: `/workspace/<member dir>`, never the machine's path, so keys hold nothing
+/// of it, rule 25); the run's `CARGO_MANIFEST_DIR` is the real folder, which only the run
+/// reads, so no key holds it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackageRun<'s> {
+    /// The package's root, absolute: the tests' working directory.
+    pub dir: &'s str,
+    /// Each variable, sorted by name, each name once.
+    pub vars: &'s [(&'s str, &'s str)],
+}
+
+/// Why a test unit's run place could not be made: each names the crate (rule 19).
+#[derive(Debug)]
+pub(crate) enum PackageRunError<'a> {
+    /// The crate is no workspace member's (`SeenRoot::Package`): only members' tests run.
+    NotMember { krate: &'a str },
+    /// The checkout's root has no absolute path as text (a simulated world, or a path that is
+    /// not UTF-8): no folder to run in.
+    NoRoot { krate: &'a str },
+    /// The package's environment could not be made.
+    Env(blaze_scope::crate_env::CrateEnvError<'a>),
+}
+
+impl fmt::Display for PackageRunError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackageRunError::NotMember { krate } => write!(f, "crate `{krate}` is no workspace member's: its tests have no package root in the checkout to run in (test_drive.rs `package_run`)"),
+            PackageRunError::NoRoot { krate } => write!(f, "crate `{krate}`: the checkout's root has no absolute path as text, so its tests have no folder to run in (test_drive.rs `package_run`)"),
+            PackageRunError::Env(why) => write!(f, "{why} (test_drive.rs `package_run`)"),
+        }
+    }
+}
+
+/// `text` copied into `alloc`, borrowed for its life.
+fn kept<'a>(text: &str, alloc: Alloc<'a>) -> &'a str {
+    let bytes: &'a [u8] = Vec::from_slice_in(text.as_bytes(), alloc).leak();
+    // A copy of a `str`'s bytes is UTF-8: the check cannot fail.
+    core::str::from_utf8(bytes).unwrap_or_default()
+}
+
+/// The run place of the crate whose environment's facts are `facts` (the crate list's
+/// `env_facts` of its row) in the checkout whose absolute root is `checkout`, in `alloc`
+/// ([`PackageRun`]). Sans-IO: the root is read at the edge (engine_check.rs `Served::root_text`).
+pub(crate) fn package_run<'a>(checkout: Option<&str>, facts: blaze_scope::crate_env::EnvFacts<'a>, alloc: Alloc<'a>) -> Result<PackageRun<'a>, PackageRunError<'a>> {
+    let krate = facts.crate_name;
+    let blaze_scope::crate_env::SeenRoot::Member { dir: member } = facts.seen else { return Err(PackageRunError::NotMember { krate }) };
+    let Some(root) = checkout else { return Err(PackageRunError::NoRoot { krate }) };
+    let mut dir: AString<'a> = AString::from_str_in(root.trim_end_matches('/'), alloc);
+    if !member.is_empty() {
+        dir.push_str("/");
+        dir.push_str(member);
+    }
+    let mut manifest: AString<'a> = AString::from_str_in(dir.as_str(), alloc);
+    manifest.push_str("/Cargo.toml");
+    let env = blaze_scope::crate_env::CrateEnv::of(facts, alloc).map_err(PackageRunError::Env)?;
+    let dir = kept(dir.as_str(), alloc);
+    let mut vars: AVec<'a, (&'a str, &'a str)> = Vec::new_in(alloc);
+    vars.push(("CARGO_MANIFEST_DIR", dir));
+    vars.push(("CARGO_MANIFEST_PATH", kept(manifest.as_str(), alloc)));
+    // The package's own facts; a build script's `rustc-env` pairs are the compile's alone.
+    for (name, value) in env.vars().filter(|(name, _)| name.starts_with("CARGO_PKG_")) {
+        vars.push((kept(name, alloc), kept(value, alloc)));
+    }
+    vars.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let vars: &'a [(&'a str, &'a str)] = vars.leak();
+    Ok(PackageRun { dir, vars })
 }
 
 /// The child pool addresses rows across the request. Each launch and precheck uses
@@ -1187,6 +1738,13 @@ pub(crate) fn run_suites<'h>(
     // 2. The launcher beside this binary, the spawner, the command's environment.
     let exe = host.exe().map_err(DriveError::Missing)?;
     let launcher = crate::own_process::launcher_beside(&exe, frame).map_err(|why| one(OneError::Launcher(why)))?;
+    // Looked at once, before any test starts: a missing launcher under `sandbox-exec` is the
+    // sandbox's own exit 71 for every test, which names no cause (rule 19; seen 2026-11-21 in a
+    // cargo target folder holding `blaze` and no `blaze-launcher`, rounds/wave-1119/t82). A host
+    // with no test sandbox starts no test (each is NOT RUN: test_run.rs `Host::has_sandbox`).
+    if crate::test_run::Host::THIS.has_sandbox() && !launcher_there(&cx, &fs, launcher.as_str(), frame).map_err(one)? {
+        return Err(one(OneError::NoLauncher { launcher: Box::from(launcher.as_str()), exe: Box::from(&*exe) }));
+    }
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
@@ -1211,8 +1769,9 @@ pub(crate) fn run_suites<'h>(
         let (dir, temp) = &dirs[index];
         let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
         launches.push(Launched {
+            err: &err, package: unit.package, target: unit.target,
             cx: &cx, spawner: &spawner, launcher: launcher.as_str(), records: &records, store: store.as_str(),
-            temps: dir, temp: temp.as_str(), env: vars.as_slice(), tests, names: suite.names, ids,
+            temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
             builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },
         });
@@ -1266,4 +1825,60 @@ pub(crate) fn run_suites<'h>(
         err.line(&cx, format_args!("{unkept}")).map_err(|_| DriveError::Print)?;
     }
     Ok(status)
+}
+
+#[cfg(test)]
+mod package_run_tests {
+    use super::*;
+    use blaze_scope::crate_env::{CrateEnv, EnvFacts, SeenRoot};
+
+    fn facts(seen: SeenRoot<'static>) -> EnvFacts<'static> {
+        EnvFacts {
+            crate_name: "tempo_hardfork",
+            package: Some(("tempo-hardfork", "1.16.0")),
+            bin: None,
+            seen,
+            read_folder: "/0/crates/hardfork/",
+            build_script: false,
+            script: None,
+            test_or_bench: false,
+            meta: None,
+        }
+    }
+
+    fn get<'a>(run: &PackageRun<'a>, name: &str) -> Option<&'a str> {
+        run.vars.iter().find(|(set, _)| *set == name).map(|(_, value)| *value)
+    }
+
+    /// A member's tests run in its package's root under the checkout, told its package's
+    /// variables: `CARGO_MANIFEST_DIR` is that real folder, `CARGO_MANIFEST_PATH` its manifest,
+    /// `CARGO_PKG_*` the package's, sorted, each once. The workspace's root package runs in the
+    /// checkout's root. PLANTED (the variable as compiled, D96): the compile-time
+    /// `CARGO_MANIFEST_DIR` of the same facts is the seen root, never the machine's folder, so the
+    /// run's value is not the compile's. A dependency's crate and a checkout with no root as text
+    /// are refused by name.
+    #[test]
+    fn a_members_tests_run_in_its_package_root_told_its_package() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let member = SeenRoot::Member { dir: "crates/hardfork" };
+        let run = package_run(Some("/w/tempo/"), facts(member), alloc).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(run.dir, "/w/tempo/crates/hardfork", "the package's root under the checkout");
+        assert_eq!(get(&run, "CARGO_MANIFEST_DIR"), Some("/w/tempo/crates/hardfork"));
+        assert_eq!(get(&run, "CARGO_MANIFEST_PATH"), Some("/w/tempo/crates/hardfork/Cargo.toml"));
+        assert_eq!(get(&run, "CARGO_PKG_NAME"), Some("tempo-hardfork"));
+        assert_eq!(get(&run, "CARGO_PKG_VERSION"), Some("1.16.0"));
+        assert_eq!((get(&run, "CARGO_PKG_VERSION_MAJOR"), get(&run, "CARGO_PKG_VERSION_MINOR"), get(&run, "CARGO_PKG_VERSION_PATCH")), (Some("1"), Some("16"), Some("0")));
+        assert_eq!(get(&run, "CARGO_CRATE_NAME"), None, "only the package's facts and its folder: the crate's name is the compile's");
+        assert!(run.vars.windows(2).all(|pair| pair[0].0 < pair[1].0), "sorted, each name once: {:?}", run.vars);
+
+        // PLANTED: the compiled value of the same name is the seen root (D96), not this folder.
+        let compiled = CrateEnv::of(facts(member), alloc).unwrap_or_else(|why| panic!("{why}"));
+        let seen = compiled.get("CARGO_MANIFEST_DIR").unwrap_or_else(|_| panic!("known")).unwrap_or_else(|| panic!("set"));
+        assert_ne!(Some(seen), get(&run, "CARGO_MANIFEST_DIR"), "planted: the compile's value would send a test's reads to {seen}");
+
+        let root = package_run(Some("/w/one"), facts(SeenRoot::Member { dir: "" }), alloc).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(root.dir, "/w/one", "the workspace's root package runs in the checkout's root");
+        assert!(matches!(package_run(Some("/w/one"), facts(SeenRoot::Package), alloc), Err(PackageRunError::NotMember { krate: "tempo_hardfork" })));
+        assert!(matches!(package_run(None, facts(member), alloc), Err(PackageRunError::NoRoot { krate: "tempo_hardfork" })));
+    }
 }

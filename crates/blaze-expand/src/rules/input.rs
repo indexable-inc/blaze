@@ -10,7 +10,7 @@ use super::{At, CallError, Def, DefTok, Engine, First, Msg, SITE, Style};
 use crate::{
     call::Call,
     expansion::TokenOrigin,
-    tokens::{Delim, Edition, LitKind, Raw, Spacing, TokenKind, TokenStream, parser_edition},
+    tokens::{Delim, Edition, LitKind, Raw, Spacing, TokenKind, TokenStream, WholeText, parser_edition},
 };
 
 /// Where a token of the view is from.
@@ -148,13 +148,21 @@ impl<'c, 'f> View<'c, 'f> {
         }
     }
 
-    /// [`View::text`] as bytes, read with no UTF-8 check: what a match compares and a copy
-    /// writes.
+    /// [`View::text`] as bytes: what a match compares (a copy writes [`View::whole`]).
     pub(crate) fn bytes(&self, at: u32) -> &'c [u8] {
         match self.toks[at as usize].src {
             Src::Input(i) => self.call.input().bytes_at(i as usize),
             Src::Args(i) => self.args().bytes_at(i as usize),
             Src::Made => b"",
+        }
+    }
+
+    /// [`View::text`] as a [`WholeText`]: what a copy writes, with no UTF-8 check.
+    pub(crate) fn whole(&self, at: u32) -> WholeText<'c> {
+        match self.toks[at as usize].src {
+            Src::Input(i) => self.call.input().whole_at(i as usize),
+            Src::Args(i) => self.args().whole_at(i as usize),
+            Src::Made => WholeText::of(""),
         }
     }
 

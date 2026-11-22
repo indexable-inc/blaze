@@ -1,6 +1,7 @@
 //! Lane B15 on the front end's own facts (front2 borrows.rs; NEVER COMPILED when written,
-//! 2026-11-18): a fn-pointer type knows which lifetimes its `for<..>` binds (blaze-flow-lower
-//! sig.rs `Region::Bound`, `MOST_BINDERS`), and the borrow check uses it. Each case prints
+//! 2026-11-18): a fn-pointer type knows which lifetimes its `for<..>` binds (the head's region
+//! record, D148: a bound lifetime is `Region::Late { binder, var }`), and the borrow check uses
+//! it. Each case prints
 //! `borrows <name> [<plant>]: [findings] refused ..`.
 //!
 //! - (a) BOUND, INSTANTIATED PER CALL. `call(f: for<'r> fn(&'r u8) -> &'r u8, x: &u8) -> &u8
@@ -17,7 +18,8 @@
 //!   - `store_static_bad<'a>(s: &mut S<'a>, g: fn(&'static u8)) { s.f = g; }`: a finding.
 //!   - `store_any_ok(t: &mut T, g: fn(&u8))` with `struct T { f: fn(&'static u8) }` (the other
 //!     direction: `fn(&'b u8)` where `fn(&'static u8)` is wanted, `'static: 'b` holds): clean.
-//!   - the ADT's own variance (lifetimes.rs `variances`: `S` is contravariant in `'a`):
+//!   - the ADT's own variance (computed from its fields by the variance table: `S` is
+//!     contravariant in `'a`):
 //!     `grow<'a>(s: S<'a>) -> S<'static> { s }` clean, `shrink<'a>(s: S<'static>) -> S<'a> { s }`
 //!     a finding (it needs `'a: 'static`).
 //! - (c) A FREE OUTPUT LIFETIME THROUGH A FN-POINTER VALUE. `get<'a>(f: fn() -> &'a u8) -> &'a
@@ -31,7 +33,7 @@
 //!   must outlive the pointer's one placeholder and back), while `get` (free only) stays clean.
 //!
 //! NEEDS (LINES ELSEWHERE in lane B15's report): front2/borrow_fields.rs walking a fn
-//! pointer's positions and mapping `Region::Bound`; without them (b)'s `s.f = g` and `t.f = g`
+//! pointer's positions and mapping its bound lifetimes (`Region::Late`); without them (b)'s `s.f = g` and `t.f = g`
 //! are refused (the field's place has no row for the pointer's position).
 //!
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`. The heap is one root of

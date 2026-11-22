@@ -17,7 +17,7 @@ use crate::facts::{
     Missing, OpaqueDef, Portable, Seal, TraitDef, TraitFlags,
 };
 use crate::prefilter::{self, Columns};
-use crate::term::{AliasKind, Def, Lang, List, Polarity, Pred, Rigid, Shape, Ty, TyKind, VarKind, shape_of_kind};
+use crate::term::{AliasKind, Def, Lang, List, Polarity, Pred, Rigid, Shape, Ty, TyKind, VarKind};
 use crate::tys::Tys;
 
 use super::tys::TestTys;
@@ -997,6 +997,16 @@ impl World {
 
     pub fn portable(&self) -> Portable<'_> {
         Portable { nodes: &self.table.nodes, lists: &self.table.lists }
+    }
+
+    /// Drops `item` from the members `trait_`'s facts hold, keeping its own `assoc` record:
+    /// the state of a dependency trait whose members were not filed while a name still
+    /// resolves to one of them (tests/member_not_filed.rs). Whether it was there.
+    pub fn forget_member(&mut self, trait_: Def, item: Def) -> bool {
+        let Some(t) = self.traits.get_mut(&trait_) else { return false };
+        let before = t.assoc.len();
+        t.assoc.retain(|a| a.def != item);
+        t.assoc.len() != before && self.assocs.contains_key(&item)
     }
 
     fn ask(&self) {

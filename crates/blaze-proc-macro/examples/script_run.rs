@@ -54,7 +54,7 @@ fn main() {
     let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
     let script = Arc::new(Script {
         package: format!("{name} {version}"),
-        tree: dir_tree(Path::new(folder)),
+        tree: dir_tree(&blaze_proc_macro::script_sandbox::RealRoot::resolve(&std::path::absolute(Path::new(folder)).expect("the folder's absolute path")).expect("the folder resolves")),
         root: blaze_proc_macro::script_sandbox::ScriptRoot::package(),
         env: owned_env(&env, alloc),
         target: TARGET.to_owned(),
@@ -94,7 +94,7 @@ fn main() {
                     println!("  file {} ({} bytes)", file.name.as_str(), file.bytes.len());
                 }
                 for request in o.c_requests.iter() {
-                    println!("  c request {:?}", request.as_str().replace('\0', " "));
+                    println!("  c request {:?} (OUT_DIR state {})", request.argv.as_str().replace('\0', " "), request.state);
                 }
                 for read in &ran.reads {
                     println!("  read {} {}", read.subject, if read.digest.is_some() { "found" } else { "absent" });

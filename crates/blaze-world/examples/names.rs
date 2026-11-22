@@ -1152,7 +1152,6 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
     // Each crate's macros see its own package's files and nothing else, at the sandbox's one
     // virtual root that `CARGO_MANIFEST_DIR` names: the rule's one home is
     // `blaze_world::procs::files` (shared with blaze-real's `names_load`).
-    use blaze_proc_macro::sandbox::PACKAGE;
     use blaze_world::procs::files::{PackageAt, sandbox_files};
     for (i, c) in world.crates.iter().enumerate() {
         let mut env = vec![
@@ -1549,7 +1548,7 @@ fn subset(graph: &UnitGraph<'static>, roots: &[String]) -> &'static UnitGraph<'s
         }
         u.build_script = u.build_script.map(|_| UnitId(u32::MAX));
     }
-    Box::leak(Box::new(UnitGraph { units: kept, unavailable: AVec::new_in(g()), resolver: graph.resolver, meta: AVec::new_in(g()) }))
+    Box::leak(Box::new(UnitGraph { units: kept, resolver: graph.resolver, meta: AVec::new_in(g()) }))
 }
 
 /// `--owners`: each owner's heap bytes now and at its own peak; the default zone's are the
@@ -1619,6 +1618,7 @@ fn main() {
     let whole: &'static UnitGraph<'static> = Box::leak(Box::new(loop {
         match res.pass().unwrap_or_else(|e| panic!("{e}")) {
             Pass::Done(graph) => break graph,
+            Pass::Partial(partial) => panic!("no unit graph: the manifests of {:?} are missing", partial.missing()),
             Pass::Need(needs) => {
                 for id in needs.iter() {
                     let facts = sources.package(*id).unwrap_or_else(|e| panic!("{e}"));

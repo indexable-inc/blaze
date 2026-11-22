@@ -31,7 +31,7 @@ pub(crate) use input::{consumed, words_of};
 mod transcribe;
 
 use blaze_mem::frame::Frame;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Vec};
 use core::fmt::{self, Write as _};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -42,7 +42,7 @@ use crate::{
     expand::Out,
     expansion::{Diagnostic, TokenOrigin},
     key::call_key,
-    tokens::{Ctx, Delim, Edition, LitKind, Raw, Spacing, Token, TokenKind, TokenStream, Transparency},
+    tokens::{Ctx, Delim, Edition, LitKind, Raw, Spacing, Token, TokenKind, TokenStream, Transparency, WholeText},
 };
 
 /// No index: the end of a list, an unbound binder, no separator.
@@ -109,10 +109,14 @@ impl<'d> Def<'d> {
         self.stream(tok).text_at(tok.at())
     }
 
-    /// [`Def::text`] as bytes, read with no UTF-8 check: what a match compares and a copy
-    /// writes.
+    /// [`Def::text`] as bytes: what a match compares (a copy writes [`Def::whole`]).
     pub(crate) fn bytes(self, tok: DefTok) -> &'d [u8] {
         self.stream(tok).bytes_at(tok.at())
+    }
+
+    /// [`Def::text`] as a [`WholeText`]: what a copy writes, with no UTF-8 check.
+    pub(crate) fn whole(self, tok: DefTok) -> WholeText<'d> {
+        self.stream(tok).whole_at(tok.at())
     }
 
     pub(crate) fn edition(self, tok: DefTok) -> Edition {

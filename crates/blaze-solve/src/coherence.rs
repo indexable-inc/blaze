@@ -213,7 +213,7 @@ fn orphan_walk_inner<T: Tys, F: Facts, L: Log + ?Sized>(
             // The reference panics: the orphan check expects only inference variables.
             TyKind::Param(index) => {
                 let at = core::panic::Location::caller();
-                return Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args: 0, at, goal: None })));
+                return Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args: 0, head: None, at, goal: None })));
             }
             TyKind::Placeholder(..) | TyKind::Bound(..) | TyKind::Infer(_) => return Ok(var_exit),
             // A rigid alias (and, here, a non-rigid one: see the module doc) may normalize to
@@ -387,8 +387,8 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
 /// another item's `ConstParam(i)` as this impl's, and made the impl's type parameter `i` a
 /// const as soon as such an item had been built: the result of checking a body depended on
 /// what was checked before it (tests/front2_order.rs in blaze-ladder).
-pub fn fresh_for<'a, T: Tys>(tys: &mut T, h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
-    let is_const = const_params(h, alloc)?;
+pub fn fresh_for<'a, T: Tys>(tys: &mut T, s: &mut Scratch<'_>, h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
+    let is_const = const_params(s, h, alloc)?;
     let mut v = Vec::with_capacity_in(h.generics as usize, alloc);
     for c in is_const {
         v.push(tys.fresh(if c { VarKind::Const } else { VarKind::Ty })?);
@@ -408,13 +408,13 @@ pub(crate) fn fresh_for_impl<'a, T: Tys>(
     alloc: Alloc<'a>,
 ) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
     if h.generics > 64 {
-        return fresh_for(tys, h, alloc);
+        return fresh_for(tys, s, h, alloc);
     }
     let mask = match s.const_mask(impl_, h.digest) {
         Some(m) => m,
         None => {
             let mut m = 0u64;
-            for (i, c) in const_params(h, alloc)?.into_iter().enumerate() {
+            for (i, c) in const_params(s, h, alloc)?.into_iter().enumerate() {
                 if c {
                     m |= 1 << i;
                 }
@@ -431,10 +431,11 @@ pub(crate) fn fresh_for_impl<'a, T: Tys>(
 }
 
 /// Which of the impl's generics its own terms name as `ConstParam(i)` ([`fresh_for`]).
-fn const_params<'a>(h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<bool, Alloc<'a>>, SolveError> {
+fn const_params<'a>(s: &mut Scratch<'_>, h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<bool, Alloc<'a>>, SolveError> {
     let p = h.portable;
-    let mut roots: Vec<Ty, Alloc<'_>> = Vec::new_in(alloc);
-    let mut list = |l: List, roots: &mut Vec<Ty, Alloc<'_>>| -> Result<(), SolveError> {
+    let (roots, work) = s.params_buffers();
+    roots.clear();
+    let list = |l: List, roots: &mut Vec<Ty, Alloc<'_>>| -> Result<(), SolveError> {
         for i in 0..l.len {
             let at = l.start + i;
             let Some(&x) = p.lists.get(at as usize) else {
@@ -444,10 +445,10 @@ fn const_params<'a>(h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<bool, Al
         }
         Ok(())
     };
-    list(h.args, &mut roots)?;
+    list(h.args, roots)?;
     for c in h.where_clauses {
         match *c {
-            Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, &mut roots)?,
+            Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, roots)?,
             Pred::Projection { alias: a, term: b }
             | Pred::NormalizesTo { alias: a, term: b }
             | Pred::TypeOutlives { ty: a, region: b }
@@ -466,7 +467,7 @@ fn const_params<'a>(h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<bool, Al
         TyKind::ConstParam(x) => Some(x),
         _ => None,
     };
-    crate::builtin::params_reached(p, &roots, konst, &mut is_const, alloc)?;
+    crate::builtin::params_reached(p, roots, konst, &mut is_const, work)?;
     Ok(is_const)
 }
 
@@ -521,7 +522,7 @@ fn fresh_header<'a, T: Tys>(
     h: &ImplHeader<'_>,
     alloc: Alloc<'a>,
 ) -> Result<(Vec<Ty, Alloc<'a>>, List), SolveError> {
-    let vars = fresh_for(tys, h, alloc)?;
+    let vars = fresh_for(tys, s, h, alloc)?;
     let args = import_list(tys, s, h.portable, h.args, &vars, alloc)?;
     Ok((vars, args))
 }
@@ -580,6 +581,7 @@ fn orphan_check_inner<T: Tys, F: Facts>(
                 None => Err(Stop::Error(SolveError::Malformed(Malformed::Param {
                     index: u32::MAX,
                     args: h.generics,
+                    head: None,
                     at: core::panic::Location::caller(),
                     goal: None,
                 }))),

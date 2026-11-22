@@ -131,6 +131,10 @@ impl Loaded {
         }
         let found = own(name).or_else(|| {
             let name = CString::new(name).ok()?;
+            #[cfg(target_os = "macos")]
+            // SAFETY: RTLD_DEFAULT searches loaded images and name is a live C string.
+            let at = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, name.as_ptr()) };
+            #[cfg(target_os = "linux")]
             // SAFETY: a C string that lives across the call; `RTLD_DEFAULT` searches the
             // images of the process in load order, as a linked program's lookup would.
             let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };

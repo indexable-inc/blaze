@@ -107,7 +107,7 @@ fn places(without: Option<SoftFloat>) -> RoutinePlaces {
 /// [`Via::Address`]), in the allocator of a code the shared helper made.
 fn emit_bound<A: core::alloc::Allocator + Clone>(func: blaze_lir::View<'_>, places: &RoutinePlaces, like: &Code<A>) -> (Result<(), EmitError>, Code<A>) {
     let mut out = Code::new_in(like.bytes.allocator().clone());
-    let got = emit_with_routines(func, &[Via::Address; COUNT], places, ISA, &mut out).map(|_| ());
+    let got = emit_with_routines(blaze_lir::verify(func).expect("the test's function is LIR"), &[Via::Address; COUNT], places, ISA, &mut out).map(|_| ());
     (got, out)
 }
 

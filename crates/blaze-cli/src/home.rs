@@ -1,6 +1,6 @@
 //! The home's forms (AGENTS.md scope: "An old home after an upgrade is detected, reported and
 //! rebuilt; nothing is migrated"). Everything under `.blaze/v2` is derived data. A record is
-//! found by a key that holds every form's magic ([`tool`]), so a record of another form is never
+//! found by a key that holds every form's magic (`tools`), so a record of another form is never
 //! fetched, only made again. A file at a fixed path (`last`, `leaves`) is checked by its magic:
 //! another form is reported in one line and rebuilt. Bytes that claim this build's form and are
 //! malformed are refused by name (rule 3): only those.
@@ -42,19 +42,11 @@ pub fn current<'b>(file: &'static str, bytes: &'b [u8], magic: &'static [u8; 4])
     }
 }
 
-/// The tool every key holds: every producer's id (decision D105: the table the entry makes once,
-/// today each row from the running binary's linker id) and every form it writes, so other code
-/// or a form's bump is a new key for every record (rule 21) and an old home's records are
-/// misses. Nothing in it is typed in by hand.
-pub fn tool(producers: &Producers) -> Tool {
-    with_forms(ContentId::of("blaze-cli tool 4", &producers.digest().0))
-}
-
 /// Each kind's tool, by `Kind::index` (decision D105): the row of the producer that makes the
 /// kind ([`row_of`]) and every form. Every row is the binary's id today (producers.rs), so any
 /// rebuilt blaze moves every kind's key; the split stays so a producer that moves into a crate
 /// whose closure is what it runs moves only its own kinds' keys. The certificate and the
-/// pointer keep [`tool`], which every producer moves. The rule set that runs (the step's and
+/// pointer keep the producers' digest's tool, which every producer moves. The rule set that runs (the step's and
 /// `lints-add`'s, lints.rs `lints_of`; `blaze_lint::RuleSet::id`) joins the `FileItems` tool
 /// (whether it lists lint units) and the `Lint` tool (which rules a unit's findings are of):
 /// another step or another added rule is another key for those two kinds alone (rule 65).

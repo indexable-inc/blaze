@@ -37,16 +37,18 @@
 //! Missing` whose self path names nothing, and an unread one `impl gone::Gone for A` whose
 //! trait path names nothing), `b` (`Bee: Tr + Marker`, an inherent `impl Bee`) and `app`.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_impls::{ImplRead, Probe};
-use blaze_ladder::front2::buckets::{Ask, BucketRead, BucketSource, Buckets, ItemsIndex, TableSet, cell_read, cells_of, inherent_home, trait_cell, trait_home, write_impl_tables};
-use blaze_ladder::front2::tables::recorder::TableRead;
+use blaze_ladder::front2::buckets::{Ask, BucketRead, BucketSource, Buckets, Home, Homes, ItemsIndex, TableSet, cell_read, cells_of, inherent_home, prepare_home, trait_cell, trait_home, write_impl_tables};
+use blaze_ladder::front2::tables::recorder::{ReadSink, TableRead};
+use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_surface::BucketKey;
 use blaze_ladder::front2::heads::Store;
 use blaze_ladder::front2::keys::{Keys, checker_of};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_own::Alloc;
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::names::Written;
@@ -188,11 +190,7 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<&'static str> {
-        None
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
+    fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<LoadedExpansion<'static>> {
         None
     }
 }
@@ -249,12 +247,13 @@ struct Answer {
 
 /// Asks `ask` of `b` as the check does (check.rs `make_once`: the home from the coherence
 /// rules, the impls filed from `source`, the candidates) and reads what it answered.
-fn ask_of<B: BucketSource>(source: &B, records: &'static Records<'static>, keys: &Keys, store: &Store<'_>, b: &mut Buckets, ask: Ask) -> Answer {
+fn ask_of<B: BucketSource>(source: &B, records: &'static Records<'static>, keys: &mut Keys, store: &mut Store<'static>, b: &mut Buckets, ask: Ask) -> Answer {
+    prepare_home(records, keys, store, ask).unwrap_or_else(|e| panic!("{ask:?}: prepare coherence: {e}"));
     let home = match ask {
-        Ask::Trait(t, shape) => trait_home(records, keys, store, t, shape),
-        Ask::Inherent(shape) => inherent_home(records, keys, shape),
+        Ask::Trait(t, shape) => trait_home(records, keys, store, t, shape).unwrap_or_else(|e| panic!("{ask:?}: trait home: {e}")),
+        Ask::Inherent(shape) => inherent_home(records, keys, store, shape).unwrap_or_else(|e| panic!("{ask:?}: inherent home: {e}")),
     };
-    source.admit(b, records, keys, home, ask).unwrap_or_else(|e| panic!("{ask:?}: {e}"));
+    source.admit(b, records, keys, home, ask, store.tys.alloc()).unwrap_or_else(|e| panic!("{ask:?}: {e}"));
     let (mut candidates, mut negatives, reads) = match ask {
         Ask::Trait(t, shape) => (b.trait_candidates(t, shape, home).to_vec(), b.negative_of(t, shape, home).to_vec(), b.trait_reads(t, shape).to_vec()),
         Ask::Inherent(shape) => (b.inherent_candidates(shape, home).to_vec(), Vec::new(), b.inherent_reads(shape).to_vec()),
@@ -266,7 +265,7 @@ fn ask_of<B: BucketSource>(source: &B, records: &'static Records<'static>, keys:
 }
 
 /// [`ask_of`] over today's index (the items records' bucket section).
-fn ask(records: &'static Records<'static>, keys: &Keys, store: &Store<'_>, b: &mut Buckets, q: Ask) -> Answer {
+fn ask(records: &'static Records<'static>, keys: &mut Keys, store: &mut Store<'static>, b: &mut Buckets, q: Ask) -> Answer {
     ask_of(&ItemsIndex, records, keys, store, b, q)
 }
 
@@ -295,12 +294,127 @@ fn row_fits(shape: blaze_surface::SelfShape, asked: Shape) -> bool {
     }
 }
 
+fn fixture_tables(records: &'static Records<'static>, crates: &[usize]) -> &'static TableSet<'static> {
+    let mut tables = TableSet::new(a());
+    for &krate in crates {
+        let mut rows = Vec::new();
+        assert!(NamesSource::each_impl_row(records, krate, &mut |r| rows.push(r)), "crate {krate} has impl rows");
+        tables.put(write_impl_tables(records, krate, &rows, a()).expect("fixture impl tables"));
+    }
+    Box::leak(Box::new(tables))
+}
+
+/// Keep every offer to the recorder so a duplicate cannot be hidden by its own deduplication.
+#[derive(Default)]
+struct ImplOffers(RefCell<Vec<TableRead>>);
+
+impl ReadSink for ImplOffers {
+    fn read(&self, read: TableRead) {
+        if matches!(read, TableRead::Impls { .. }) {
+            self.0.borrow_mut().push(read);
+        }
+    }
+}
+
+#[test]
+fn ten_thousand_negative_goals_offer_each_dependency_once_and_derive_one_probe_id() {
+    let records = records();
+    let tables = fixture_tables(records, &[CORE_AT]);
+    let root = NamesSource::root_module(records, CORE_AT).expect("core's root");
+    let lib = walk(records, root, "Tr");
+    let tr = checker_of(lib);
+    let keys = Keys::new();
+    let in_core = Home::In(CORE_AT, None);
+    let home = Homes { all: in_core, bare: in_core, blanket: in_core, ..Homes::ANY };
+    let core = NamesSource::crate_key(records, CORE_AT).expect("core's key");
+    let absent = cells_of(&ImplRead::Filter { krate: core, probe: Probe::Trait(lib), may_hold: false }).expect("the absent trait has a cell");
+    let unread = cells_of(&ImplRead::Filter { krate: core, probe: Probe::UnreadTrait, may_hold: false }).expect("the crate's unread-impl flag has a cell");
+    assert_eq!(tables.probe_ids_derived(), 0);
+    for _body in 0..2 {
+        let sink = ImplOffers::default();
+        let view = Tables::new(TablesOpts { records, impls: Some(tables), lang_crates: &[CORE_AT], reads: &sink });
+        let buckets = Buckets::lazy(view);
+        for _ in 0..10_000 {
+            assert_eq!(buckets.admit_shared(view, &keys, home, Ask::Trait(tr, Shape::Bool), a()), Ok(0));
+        }
+        // These distinct questions pass the per-question cache and consult the same
+        // negative trait probe and unread-impl flag. Neither needs a second offer.
+        for shape in [Shape::Char, Shape::Uint(UintTy::U8), Shape::Tuple(2), Shape::AnyInt] {
+            assert_eq!(buckets.admit_shared(view, &keys, home, Ask::Trait(tr, shape), a()), Ok(0));
+        }
+        assert_ne!(absent, unread);
+        assert_eq!(sink.0.borrow().as_slice(), &[absent, unread]);
+        assert_eq!(tables.probe_ids_derived(), 1);
+    }
+    println!("10,000 repeated goals per body: one named trait read and one unread-impl flag per body, one probe ID derived across two bodies");
+}
+
+#[test]
+fn a_bodys_distinct_impl_reads_equal_the_physical_lookup_read_set() {
+    use blaze_surface::{SelfShape, Shape as SurfaceShape};
+
+    let records = records();
+    let crates = [APP_AT, CORE_AT, A_AT, B_AT];
+    let crate_keys = crates.map(|krate| NamesSource::crate_key(records, krate).expect("fixture crate"));
+    let tables = fixture_tables(records, &crates);
+    let root = NamesSource::root_module(records, CORE_AT).expect("core's root");
+    let tr = walk(records, root, "Tr");
+    let show = walk(records, root, "Show");
+    let root_a = NamesSource::root_module(records, A_AT).expect("a's root");
+    let root_b = NamesSource::root_module(records, B_AT).expect("b's root");
+    let type_a = walk(records, root_a, "A");
+    let bee = walk(records, root_b, "Bee");
+    let goals = [(Some(tr), type_a), (Some(tr), bee), (Some(show), bee), (None, bee), (Some(tr), type_a)];
+
+    // The old recorder took every physical note with a cell. Distinctness here is
+    // by the complete writer-visible cell, independent of any dense ID or stamp.
+    for (trait_, ty) in goals {
+        let shape = SelfShape::new(SurfaceShape::Def(ty)).expect("fixture shape");
+        let found = match trait_ {
+            Some(t) => blaze_impls::candidates_in(&crate_keys, t, shape, tables),
+            None => blaze_impls::inherent_candidates_in(&crate_keys, shape, tables),
+        };
+        for row in found {
+            row.expect("the physical lookup reads a fixture impl row");
+        }
+    }
+    // The ungrouped oracle reads blanket and blind buckets separately for every width.
+    // Show has a blanket impl, while several of these crates can reject Show outright.
+    for width in [blaze_surface::FloatWidth::F16, blaze_surface::FloatWidth::F32, blaze_surface::FloatWidth::F64, blaze_surface::FloatWidth::F128] {
+        let shape = SelfShape::new(SurfaceShape::Float(width)).expect("a concrete float width");
+        for row in blaze_impls::candidates_in(&crate_keys, show, shape, tables) {
+            row.expect("float lookup");
+        }
+    }
+    let notes = tables.take_notes();
+    assert!(notes.iter().any(|r| matches!(r, ImplRead::Bucket { .. })), "exercise a present bucket");
+    assert!(notes.iter().any(|r| matches!(r, ImplRead::Filter { may_hold: false, .. })), "exercise an absent bucket");
+    let expected: BTreeSet<_> = notes.iter().filter_map(cells_of).collect();
+    assert!(expected.len() > 1 && notes.iter().filter_map(cells_of).count() > expected.len(), "fixture has distinct and repeated cells");
+
+    let keys = Keys::new();
+    let sink = ImplOffers::default();
+    let view = Tables::new(TablesOpts { records, impls: Some(tables), lang_crates: &[CORE_AT], reads: &sink });
+    let buckets = Buckets::lazy(view);
+    for (trait_, ty) in goals {
+        let shape = Shape::Adt(checker_of(ty));
+        let ask = trait_.map_or(Ask::Inherent(shape), |t| Ask::Trait(checker_of(t), shape));
+        buckets.admit_shared(view, &keys, Homes::ANY, ask, a()).expect("the body's fixture lookup");
+    }
+    buckets.admit_shared(view, &keys, Homes::ANY, Ask::Trait(checker_of(show), Shape::AnyFloat), a()).expect("the numeric survey");
+    let offers = sink.0.borrow();
+    assert_eq!(offers.iter().copied().collect::<BTreeSet<_>>(), expected);
+    assert_eq!(offers.len(), expected.len(), "each distinct bucket reaches the sink once per body");
+    println!("mixed trait and inherent goals: each physical lookup dependency recorded once");
+}
+
 #[test]
 fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
     let records = records();
+    // Keep the synthetic store frame alive for the `'static` records used by this test.
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the store's frame")));
-    let store = Store::new(None, frame, a());
-    let keys = Keys::new();
+    let mut store: Store<'static> = Store::new(None, frame, a());
+    let mut keys = Keys::new();
 
     // The impls, by their rows; the traits and types, walked in the impl's module.
     let (a_tr, a_mod) = impl_key(records, A_AT, "A", Some("Tr"));
@@ -345,14 +459,14 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
         .iter()
         .map(|q| {
             let mut b = Buckets::lazy(records);
-            ask(records, &keys, &store, &mut b, *q)
+            ask(records, &mut keys, &mut store, &mut b, *q)
         })
         .collect();
     // FORWARD and REVERSED: all in one index each.
     let mut forward_index = Buckets::lazy(records);
-    let forward: Vec<Answer> = asks.iter().map(|q| ask(records, &keys, &store, &mut forward_index, *q)).collect();
+    let forward: Vec<Answer> = asks.iter().map(|q| ask(records, &mut keys, &mut store, &mut forward_index, *q)).collect();
     let mut reversed_index = Buckets::lazy(records);
-    let mut reversed: Vec<Answer> = asks.iter().rev().map(|q| ask(records, &keys, &store, &mut reversed_index, *q)).collect();
+    let mut reversed: Vec<Answer> = asks.iter().rev().map(|q| ask(records, &mut keys, &mut store, &mut reversed_index, *q)).collect();
     reversed.reverse();
     for (i, q) in asks.iter().enumerate() {
         println!("ASK {q:?}: {} candidates, {} negatives, {} unread, {} reads", alone[i].candidates.len(), alone[i].negatives.len(), alone[i].unread.len(), alone[i].reads.len());
@@ -401,7 +515,7 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
     assert_eq!(reversed_index.bucket_lookups(), forward_index.bucket_lookups(), "the lookups do not depend on the order asked");
     let before = forward_index.bucket_lookups();
     for q in asks.iter() {
-        ask(records, &keys, &store, &mut forward_index, *q);
+        ask(records, &mut keys, &mut store, &mut forward_index, *q);
     }
     assert_eq!(forward_index.bucket_lookups(), before, "a question asked again looks a bucket up again");
 
@@ -453,6 +567,7 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
                 ImplRead::Directory { found, .. } => assert_eq!(saw, *found, "`{what}: Tr`: a directory read of {krate:x} is not its cell"),
                 ImplRead::Filter { probe: Probe::Trait(_), may_hold: false, .. } => assert_eq!(saw, None, "`{what}: Tr`: {krate:x} said none of `Tr` but defines its cell"),
                 ImplRead::Filter { probe: Probe::Trait(_), may_hold: true, .. } => {}
+                ImplRead::Filter { probe: Probe::UnreadTrait, may_hold, .. } => assert_eq!(saw.is_some(), *may_hold, "the crate's unread-impl cell must agree with its filter"),
                 ImplRead::Filter { probe: Probe::Bucket(_), may_hold, .. } => assert!(*may_hold || saw.is_none(), "`{what}: Tr`: {krate:x} said no bucket but defines its cell"),
                 ImplRead::Bucket { .. } => {}
             }
@@ -466,14 +581,14 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
         .iter()
         .map(|q| {
             let mut b = Buckets::lazy(records);
-            let answer = ask_of(&tables, records, &keys, &store, &mut b, *q);
+            let answer = ask_of(&tables, records, &mut keys, &mut store, &mut b, *q);
             (answer, b.bucket_lookups())
         })
         .collect();
     let mut tables_forward_index = Buckets::lazy(records);
-    let tables_forward: Vec<Answer> = asks.iter().map(|q| ask_of(&tables, records, &keys, &store, &mut tables_forward_index, *q)).collect();
+    let tables_forward: Vec<Answer> = asks.iter().map(|q| ask_of(&tables, records, &mut keys, &mut store, &mut tables_forward_index, *q)).collect();
     let mut tables_reversed_index = Buckets::lazy(records);
-    let mut tables_reversed: Vec<Answer> = asks.iter().rev().map(|q| ask_of(&tables, records, &keys, &store, &mut tables_reversed_index, *q)).collect();
+    let mut tables_reversed: Vec<Answer> = asks.iter().rev().map(|q| ask_of(&tables, records, &mut keys, &mut store, &mut tables_reversed_index, *q)).collect();
     tables_reversed.reverse();
     for (i, q) in asks.iter().enumerate() {
         let (t, lookups) = &tables_alone[i];
@@ -505,7 +620,7 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
     assert!(!tables_alone[0].0.negatives.contains(&not_tr), "the tables give `impl !Tr for NotTr` at `A`");
     let before = tables_forward_index.bucket_lookups();
     for q in asks.iter() {
-        ask_of(&tables, records, &keys, &store, &mut tables_forward_index, *q);
+        ask_of(&tables, records, &mut keys, &mut store, &mut tables_forward_index, *q);
     }
     assert_eq!(tables_forward_index.bucket_lookups(), before, "over the tables, a question asked again reads a bucket again");
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();

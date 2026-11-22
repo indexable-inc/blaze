@@ -88,7 +88,69 @@ fn no_journal_is_refused_before_any_effect() {
     }
     let asked = io.asked();
     assert!(!asked.iter().any(|it| matches!(it, Effect::Journal { .. } | Effect::Unwatch { .. })), "no journal effect was made: {asked:?}");
-    // The root has no name a journal can watch.
+}
+
+/// A held stream (the journal helper's): a flush names every write made before it, and its
+/// cursor is one moment with it, so a replay from one flush's cursor names nothing the next
+/// flush does not (blaze-watch's oracle 5, on the driver). A flush that returned before taking
+/// the batches its barrier ordered, or a cursor not of the last batch taken, fails one. A held
+/// stream dropped is unwatched.
+#[test]
+fn a_held_stream_names_each_write_at_its_flush_as_a_replay_from_its_cursor_does() {
+    let io = Io::sim(47);
     io.with_sim(|sim| sim.set_journal(Journal::FsEvents)).expect("a simulated world");
-    assert!(matches!(fs.root().changes_since(&cx, Cursor::None), Err(JournalError::Root)));
+    let cx = root(&io);
+    let fs = io.need_fs().expect("a file tree");
+    let ws = fs.open_dir(&cx, &path("ws")).expect("the folder ws");
+    write_synced(&cx, &ws, &path("src/lib.rs"), b"mod a;").expect("ws/src/lib.rs is written");
+    let mut held = ws.hold_changes(&cx).expect("a held stream");
+    let first = held.flush(&cx).expect("the first flush");
+    assert_ne!(first.cursor, Cursor::None, "a flushed stream has a place");
+    assert_eq!(held.cursor(), first.cursor, "the stream's place is its last flush's");
+
+    write_synced(&cx, &ws, &path("src/a.rs"), b"pub fn a() {}").expect("ws/src/a.rs is written");
+    let second = held.flush(&cx).expect("the second flush");
+    let flushed: std::vec::Vec<&str> = second.files().collect();
+    assert!(flushed.contains(&"src/a.rs"), "a write before the flush is named by it: {flushed:?}");
+    let replay = ws.changes_since(&cx, first.cursor).expect("a replay from the first flush's cursor");
+    for name in replay.files() {
+        assert!(flushed.contains(&name), "{name} is named by the replay from the first flush's cursor but not by the held stream's next flush: {flushed:?}");
+    }
+
+    let third = held.flush(&cx).expect("a flush with nothing written");
+    assert!(third.is_empty(), "nothing written since the last flush: {third:?}");
+
+    io.record();
+    io.asked();
+    drop(held);
+    let asked = io.asked();
+    assert!(asked.iter().any(|it| matches!(it, Effect::Unwatch { .. })), "a held stream dropped is unwatched: {asked:?}");
+}
+
+/// The driver's root is journaled as any folder (a checkout run from its own folder): a file
+/// made directly in it, one renamed into it from beneath, and one written beneath it are each
+/// named; the root's own level is not left to a sweep. A fix that journals the root's folders
+/// one by one fails the first two.
+#[test]
+fn the_root_is_journaled_with_its_own_level() {
+    let io = Io::sim(46);
+    io.with_sim(|sim| sim.set_journal(Journal::FsEvents)).expect("a simulated world");
+    let cx = root(&io);
+    let fs = io.need_fs().expect("a file tree");
+    let top = fs.root();
+    write_synced(&cx, &top, &path("crates/a/src/lib.rs"), b"").expect("crates/a/src/lib.rs is written");
+    let at = top.changes_since(&cx, Cursor::None).expect("the root's journal place").cursor;
+    write_synced(&cx, &top, &path("Cargo.toml"), b"[workspace]").expect("Cargo.toml is written");
+    write_synced(&cx, &top, &path("crates/a/src/lib.rs"), b"pub fn a() {}").expect("crates/a/src/lib.rs is written");
+    io.with_sim(|sim| {
+        let (from, to) = (blaze_core::FileName::new("crates/a/src/lib.rs"), blaze_core::FileName::new("moved.rs"));
+        sim.rename(&from.expect("a name"), &to.expect("a name"));
+    })
+    .expect("a simulated world");
+    let heard = top.changes_since(&cx, at).expect("a replay of the root");
+    let files: std::vec::Vec<&str> = heard.files().collect();
+    for told in ["Cargo.toml", "crates/a/src/lib.rs", "moved.rs"] {
+        assert!(files.contains(&told), "{told} is named by the root's journal: {files:?}");
+    }
+    assert_eq!(heard.lost().count(), 0, "nothing lost: {heard:?}");
 }

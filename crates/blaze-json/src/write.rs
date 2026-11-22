@@ -8,9 +8,12 @@
 use core::{alloc::Allocator, fmt};
 
 use blaze_data::{Order, Value, Visit, Walk};
-use blaze_own::String;
+use blaze_own::{
+    String,
+    planted::{NoPlant, Planted},
+};
 
-use crate::{Event, Str, stack::Stack};
+use crate::{Event, JsonPlant, Str, stack::Stack};
 
 /// Blanks between tokens.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +116,21 @@ pub fn write_into<A: Allocator, B: Allocator + Clone>(
     out: &mut String<B>,
     options: WriteOptions,
 ) -> Result<(), WriteError<B>> {
+    write_into_planted(value, out, options, NoPlant)
+}
+
+/// [`write_into`] with a planted bug from `plant`: the seam the round trip's control drives.
+/// Shipped callers pass `NoPlant` (through [`write_into`]), and the writer is the code as it is.
+pub fn write_into_planted<A: Allocator, B: Allocator + Clone>(
+    value: &Value<A>,
+    out: &mut String<B>,
+    options: WriteOptions,
+    plant: impl Planted<JsonPlant>,
+) -> Result<(), WriteError<B>> {
+    let quote = match plant.has(JsonPlant::QuoteUnescaped) {
+        true => Quote::Bare,
+        false => Quote::Escaped,
+    };
     let order = match options.keys {
         KeyOrder::Sorted => Order::Sorted,
         KeyOrder::Insertion => Order::Insertion,
@@ -121,7 +139,7 @@ pub fn write_into<A: Allocator, B: Allocator + Clone>(
     let mut walk = Walk::new_in(value, order, out.allocator().clone());
     while let Some(visit) = walk.next() {
         match visit {
-            Visit::Leaf(leaf) => leaf_into(leaf, out, options.bytes).map_err(|what| fail(out, &walk, what))?,
+            Visit::Leaf(leaf) => leaf_into(leaf, out, options.bytes, quote).map_err(|what| fail(out, &walk, what))?,
             Visit::StartList(_) => out.push('['),
             Visit::StartMap(_) => out.push('{'),
             Visit::Item(i) => {
@@ -135,7 +153,7 @@ pub fn write_into<A: Allocator, B: Allocator + Clone>(
                     out.push(',');
                 }
                 newline(out, options.style, walk.depth());
-                escape(key, out);
+                escape(key, out, quote);
                 out.push(':');
                 if pretty {
                     out.push(' ');
@@ -170,14 +188,19 @@ fn newline<B: Allocator>(out: &mut String<B>, style: Style, depth: usize) {
 }
 
 /// A value that is no list or map, as JSON.
-fn leaf_into<A: Allocator, B: Allocator>(value: &Value<A>, out: &mut String<B>, bytes_as: BytesAs) -> Result<(), Unwritable> {
+fn leaf_into<A: Allocator, B: Allocator>(
+    value: &Value<A>,
+    out: &mut String<B>,
+    bytes_as: BytesAs,
+    quote: Quote,
+) -> Result<(), Unwritable> {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::Int(n) => blaze_own::format_into!(out, "{n}"),
         Value::Float(x) => float(*x, out)?,
-        Value::Text(text) => escape(text.as_str(), out),
+        Value::Text(text) => escape(text.as_str(), out, quote),
         Value::Bytes(bytes) => match bytes_as {
             BytesAs::Refuse => return Err(Unwritable::Bytes),
             BytesAs::Base64(engine) => {
@@ -200,14 +223,21 @@ fn float<B: Allocator>(x: f64, out: &mut String<B>) -> Result<(), Unwritable> {
     Ok(())
 }
 
+/// How a `"` inside a string is written: escaped, or bare under [`JsonPlant::QuoteUnescaped`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Quote {
+    Escaped,
+    Bare,
+}
+
 /// `text` as a JSON string.
-fn escape<B: Allocator>(text: &str, out: &mut String<B>) {
+fn escape<B: Allocator>(text: &str, out: &mut String<B>, quote: Quote) {
     out.push('"');
     let bytes = text.as_bytes();
     let mut run = 0;
     for (i, &b) in bytes.iter().enumerate() {
         let short = match b {
-            b'"' if crate::plant::escape_quote() => "\\\"",
+            b'"' if quote == Quote::Escaped => "\\\"",
             b'\\' => "\\\\",
             b'\n' => "\\n",
             b'\r' => "\\r",
@@ -258,17 +288,26 @@ pub enum StreamWhat {
 pub struct Writer<'o, B: Allocator, S: Allocator> {
     out: &'o mut String<B>,
     stack: Stack<S>,
-    /// The next event is a map's first key or a list's first element.
-    first: bool,
-    /// A key was written and its value is wanted.
-    after_key: bool,
-    done: bool,
+    due: Due,
     events: usize,
+}
+
+/// What the writer's place wants next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Due {
+    /// The top value, a list's first element or a map's first key: no `,` before it.
+    First,
+    /// A key was written and its value is wanted.
+    AfterKey,
+    /// Another element or key, after a `,`, or the open container's end.
+    Next,
+    /// The top value is whole: nothing more may come.
+    Whole,
 }
 
 impl<'o, B: Allocator, S: Allocator> Writer<'o, B, S> {
     pub fn new_in(out: &'o mut String<B>, scratch: S) -> Writer<'o, B, S> {
-        Writer { out, stack: Stack::new_in(scratch), first: true, after_key: false, done: false, events: 0 }
+        Writer { out, stack: Stack::new_in(scratch), due: Due::First, events: 0 }
     }
 
     fn refuse(&self, what: StreamWhat) -> StreamError {
@@ -277,28 +316,28 @@ impl<'o, B: Allocator, S: Allocator> Writer<'o, B, S> {
 
     /// The separator before a value or key at this place, after checking it may stand here.
     fn before(&mut self, key: bool) -> Result<(), StreamError> {
-        if self.done {
+        if self.due == Due::Whole {
             return Err(self.refuse(StreamWhat::AfterEnd));
         }
         let in_map = self.stack.top() == Some(true);
-        match (key, in_map, self.after_key) {
+        let after_key = self.due == Due::AfterKey;
+        match (key, in_map, after_key) {
             (true, true, false) => {}
             (true, _, _) => return Err(self.refuse(StreamWhat::KeyHere)),
             (false, true, false) => return Err(self.refuse(StreamWhat::ValueWithoutKey)),
             (false, _, _) => {}
         }
-        if !self.first && !self.after_key {
+        if self.due == Due::Next {
             self.out.push(',');
         }
-        self.first = false;
-        self.after_key = false;
+        self.due = Due::Next;
         Ok(())
     }
 
     /// After a whole value: the top one ends the text.
     fn after_value(&mut self) {
         if self.stack.depth() == 0 {
-            self.done = true;
+            self.due = Due::Whole;
         }
     }
 
@@ -308,16 +347,16 @@ impl<'o, B: Allocator, S: Allocator> Writer<'o, B, S> {
                 self.before(true)?;
                 string(key, self.out);
                 self.out.push(':');
-                self.after_key = true;
+                self.due = Due::AfterKey;
             }
             Event::EndList | Event::EndMap => {
                 let map = matches!(event, Event::EndMap);
-                if self.done || self.stack.top() != Some(map) || self.after_key {
+                if matches!(self.due, Due::Whole | Due::AfterKey) || self.stack.top() != Some(map) {
                     return Err(self.refuse(StreamWhat::Unbalanced));
                 }
                 self.stack.pop();
                 self.out.push(if map { '}' } else { ']' });
-                self.first = false;
+                self.due = Due::Next;
                 self.after_value();
             }
             Event::StartList | Event::StartMap => {
@@ -325,7 +364,7 @@ impl<'o, B: Allocator, S: Allocator> Writer<'o, B, S> {
                 let map = matches!(event, Event::StartMap);
                 self.stack.push(map);
                 self.out.push(if map { '{' } else { '[' });
-                self.first = true;
+                self.due = Due::First;
             }
             Event::Float(x) if !x.is_finite() => return Err(self.refuse(StreamWhat::NonFinite(x))),
             scalar => {
@@ -348,9 +387,9 @@ impl<'o, B: Allocator, S: Allocator> Writer<'o, B, S> {
 
     /// Checks that one whole value was written.
     pub fn finish(self) -> Result<(), StreamError> {
-        match self.done {
-            true => Ok(()),
-            false => Err(self.refuse(StreamWhat::Unfinished)),
+        match self.due {
+            Due::Whole => Ok(()),
+            Due::First | Due::AfterKey | Due::Next => Err(self.refuse(StreamWhat::Unfinished)),
         }
     }
 }
@@ -362,6 +401,6 @@ fn string<B: Allocator>(text: Str<'_>, out: &mut String<B>) {
             out.push_str(text.raw());
             out.push('"');
         }
-        false => escape(text.raw(), out),
+        false => escape(text.raw(), out, Quote::Escaped),
     }
 }

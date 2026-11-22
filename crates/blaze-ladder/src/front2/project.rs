@@ -70,6 +70,28 @@ pub struct BodyDiagnostic<'a> {
     pub text: AString<'a>,
     pub start: u32,
     pub end: u32,
+    /// The other places the text names, as data (item-relative ranges, like `start..end`):
+    /// for a future that is not `Send`, where the value it holds is declared and the await it
+    /// is held across. The printer turns each into `file:line:col`.
+    pub notes: AVec<'a, DiagNote>,
+}
+
+/// A place a finding's text names besides its own range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiagNote {
+    pub what: NoteKind,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// What a [`DiagNote`]'s place is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteKind {
+    /// Where a value an async block holds across an await is declared (a binding, a capture,
+    /// a temporary's expression).
+    HeldValue,
+    /// The await a value is held across.
+    HeldAcross,
 }
 
 /// A finding of a typed lint in a body (blaze-typeck `TypedFinding`, `args-inline` the first):
@@ -132,6 +154,7 @@ impl Refused {
             Refused::Container(_) => "container head refused",
             Refused::MemberNotFiled => "member not filed",
             Refused::MemberHead(_) => "member head refused",
+            Refused::Length(ConstFail::RequiredBody { .. }) => "a constant required by this body was refused",
             Refused::Length(_) => "array length constant refused",
             Refused::Lengths => "too many array length constants",
             Refused::Check(_) => "check stopped",
@@ -162,6 +185,13 @@ pub struct BodyVerdict<'a> {
     /// with the digest of the answer it got, sorted by fact. Every body has one, whatever its
     /// verdict; `reach` says how far the check got. `Err`: a read that names no fact, by name.
     pub facts: Result<BodyReads<'a>, ReadsError>,
+    /// The body's checked record (blaze-typeck checked_record.rs, D163 R1): the columns a run
+    /// reads in place of checking it again, encoded once where the check left them (borrows.rs
+    /// `check_borrows_in`). `None` for a check that did not finish or whose columns are not
+    /// clean (a diagnostic, a stalled goal, an undecided place: the record keeps none); `Err`
+    /// for a clean check the record refused, by name. Whether it is kept is the caller's (after
+    /// a clean verdict, borrows included).
+    pub typed: Option<Result<AVec<'a, u8>, blaze_typeck::checked_record::CheckedRecordError>>,
 }
 
 impl BodyVerdict<'_> {
@@ -253,9 +283,36 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         self.store.needs = needs;
     }
 
+    /// How the store's world meets a head it lacks (front2 asks.rs, D161 step 3's seam): under
+    /// `Once` the store's board is made now, from the store's own allocator.
+    pub fn set_asks(&mut self, met: super::asks::AsksMet) -> Result<(), blaze_core::claim_table::ClaimError> {
+        self.store.asks = super::asks::Asks::of(met, self.store.tys.alloc())?;
+        Ok(())
+    }
+
     /// The frozen heads the store files every head from (front2 tables/seeds.rs): it lowers none.
     pub fn set_seeds(&mut self, seeds: Option<&'n dyn super::tables::seeds::HeadSeed<'n>>) {
         self.store.seeds = seeds;
+    }
+
+    /// Capture the definitions the task evaluates, including its local bodies and callees.
+    pub fn record_const_texts(&mut self) {
+        use super::tables::recorder::{Recorder, RecorderOpts};
+        self.store.maps.const_text_reads = Some(Recorder::new(RecorderOpts { alloc: self.store.tys.alloc() }));
+    }
+
+    /// A pooled file job shares this world. Each subsequent body must receive
+    /// the defining-text reads even for values the job has already computed.
+    pub fn record_shared_const_texts(&mut self) {
+        let alloc = self.store.tys.alloc();
+        self.store.maps.const_proofs.get_or_insert_with(|| super::heads::ConstProofs::new(alloc));
+        self.record_const_texts();
+    }
+
+    /// The text reads for this body task. The engine places these on the defining files.
+    pub fn take_const_texts(&mut self) -> Result<AVec<'static, super::tables::recorder::TableRead>, super::tables::recorder::ReadsFull> {
+        let reads = self.store.maps.const_text_reads.take().expect("the body task enabled constant definition reads");
+        reads.distinct().map(|(keys, _)| keys)
     }
 
     /// Each head the store holds (a fn's, an ADT's, an impl's, a trait's, a constructor's), by
@@ -278,7 +335,8 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// The fn whose head filed opaque type `key` (heads.rs `Store::opaques`), if it is one: an
     /// opaque's key is in no row of the key map, and its head is its fn's.
     pub fn opaque_fn(&self, key: blaze_typeck::ItemKey) -> Option<blaze_typeck::ItemKey> {
-        self.store.opaques.get(&key).map(|&(fn_, _)| fn_)
+        // The default of a provided trait fn's `impl Trait` is that fn's (rpitit.rs `filed_as`).
+        self.store.opaques.get(&super::rpitit::filed_as(&self.store, key)).map(|&(fn_, _)| fn_)
     }
 
     /// Every body of the program's own crate, in key order (free fns, then each container's
@@ -321,6 +379,13 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         Ok(self.chains()?.get(file, chain))
     }
 
+    /// The body that declared a local item, when `key` is a body-local checker key. The
+    /// enclosing key is kept with the local head while its body is lowered, so callers can
+    /// attach facts of a body-local impl to the `BodyCheck` that publishes them.
+    pub fn local_body(&self, key: blaze_typeck::ItemKey) -> Option<blaze_typeck::ItemKey> {
+        self.store.locals.head(key).map(|head| head.enclosing)
+    }
+
     /// The body index made with `chain` as the chain function, not kept: the seam
     /// [`ProjectWorld::chains`] fills with `blaze_file_items::item_chain`, and a test with a
     /// planted bug.
@@ -331,8 +396,25 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
 
     /// Checks one body: lowered, its heads made (an array length's constant evaluated as met),
     /// then checked over the command's records.
+    ///
+    /// It takes the production path for an auto-trait goal of an async block's future that
+    /// fails only on the check's superset interior (`Stalls::Decide`, as `check_borrows`, which
+    /// `blaze check` runs: tables/task.rs): the goal is stalled, each block's witness lowered and
+    /// the goal decided on the exact interior (borrows.rs `witness_and_decide`). A harness on
+    /// another path than the command's is how "works in a harness" and "the command does it"
+    /// came apart before.
     pub fn check<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> BodyVerdict<'a> {
-        self.check_then(body, super::stalled_goals::Stalls::Gap, alloc, |_, _, _| {})
+        let mut reads: AVec<'a, super::reads::Read> = AVec::new_in(alloc);
+        let mut decision: Option<super::stalled_goals::Decision<'a>> = None;
+        let mut verdict = self.check_then(body, super::stalled_goals::Stalls::Decide, alloc, |r, lowered, done| {
+            decision = Some(super::borrows::witness_and_decide(r, lowered, done, &mut reads, alloc));
+        });
+        // What the witness lowering and the decision read, in the body's read list (rule 21).
+        super::borrow_reads::file_borrow_reads(&mut verdict, &reads, alloc);
+        if let Some(decision) = decision {
+            decision.file(&mut verdict);
+        }
+        verdict
     }
 
     /// [`ProjectWorld::check`], then `then` over the records, the lowered body and its
@@ -351,7 +433,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // leave the body before's to be counted again.
         self.store.goal_hits.clear();
         let mut verdict =
-            BodyVerdict { diagnostics: AVec::new_in(alloc), findings: AVec::new_in(alloc), undecided: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
+            BodyVerdict { diagnostics: AVec::new_in(alloc), findings: AVec::new_in(alloc), undecided: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)), typed: None };
         let prepared = self.prepared;
         let mut r = Records {
             names: self.front.names,
@@ -364,8 +446,46 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         };
         let cost = r.store.cost;
         let lowering = Cost::enter(cost, Part::Lower);
-        let lowered = match lower(&mut r, prepared, body) {
+        // Boxed, lowered in a frame of its own: this frame stays on the stack under the whole
+        // check (blaze-int notes t29 overflow-bt4.txt: 27,728 bytes).
+        let lowered = match lower_boxed(&mut r, prepared, body, alloc) {
             Ok(b) => b,
+            // A required anonymous body's check can stop on a world gap. That is an
+            // unanswered input to this body, not a refusal of the constant itself. Keep the
+            // typed gap at the outer body's boundary so the caller can make the same progress
+            // decision it would have made if the gap had been reached directly.
+            Err(Refused::Length(super::consts::ConstFail::RequiredBody {
+                cause: super::consts::RequiredBodyCause::Check(CheckFail::Gap { gaps, .. }),
+                ..
+            })) => {
+                verdict.gaps.extend(gaps);
+                return verdict;
+            }
+            // A macro's own error at a call (`include_str!` of a missing file, `compile_error!`,
+            // an unset `env!`: body.rs `call_error`): the program's error there, as rustc
+            // reports it, never a refusal. rustc gives these errors no code. `reads` stays
+            // `None`: the check did not run, so no certificate stands on it.
+            Err(Refused::Lower(BodyError::Calls { errors, .. })) => {
+                for e in errors.iter() {
+                    let mut text = AString::new_in(alloc);
+                    text.push_str("the call of `");
+                    text.push_str(&e.path);
+                    text.push_str("!`: ");
+                    text.push_str(&e.why);
+                    verdict.diagnostics.push(BodyDiagnostic { code: "", text, start: e.at.start, end: e.at.end, notes: AVec::new_in(alloc) });
+                }
+                verdict.diagnostics.sort_by_key(|d| (d.start, d.end, d.code));
+                return verdict;
+            }
+            // A body whose lowering found only errors of the program's TEXT (blaze-lower
+            // `DiagKind`: a syntax error, `break` outside a loop, ..): the program's errors
+            // there, never a refusal ([`lowering_errors`]). A lowering with any other finding
+            // (a construct not lowered yet, a macro call not taken, the fn cfg'd out) stays a
+            // refusal. As above, `reads` stays `None`.
+            Err(Refused::Lower(BodyError::Lowered { findings, .. })) if findings.iter().all(|f| matches!(f, super::body::BodyFinding::Diag { .. })) => {
+                lowering_errors(&findings, &mut verdict, alloc);
+                return verdict;
+            }
             Err(why) => {
                 verdict.refused = Some(why);
                 return verdict;
@@ -389,7 +509,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         let written = lowered.typeck.view(blaze_typeck::PTys::EMPTY);
         let mut asked = Asked::new_in(alloc);
         let rounds = Cost::enter(cost, Part::Rounds);
-        let checked = super::body_reads::check_body_filed_as(&mut r, &lowered, &scope, None, Some(&mut asked), stalls);
+        let checked = super::body_reads::check_body_filed_as(&mut r, &*lowered, &scope, None, Some(&mut asked), stalls);
         drop(rounds);
         let _reads = Cost::enter(cost, Part::Reads);
         // The buckets as the check left them: what each impl question read, per crate, kept to
@@ -422,7 +542,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         match checked {
             Ok((done, _)) => {
                 for d in done.diags.iter() {
-                    verdict.diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::new_in(alloc), start: d.at.start, end: d.at.end });
+                    verdict.diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::new_in(alloc), start: d.at.start, end: d.at.end, notes: AVec::new_in(alloc) });
                 }
                 for f in done.findings.iter() {
                     verdict.findings.push(lint_finding(&r, f, alloc));
@@ -436,11 +556,11 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                     };
                     verdict.undecided.push(BodyUndecided { cause: u.says(), text: AString::from_str_in(&text, alloc), start: at.start, end: at.end });
                 }
-                then(&mut r, &lowered, &done);
+                then(&mut r, &*lowered, &done);
             }
             Err(CheckFail::Diags { diags, .. }) => {
                 for (code, at, about) in diags.iter() {
-                    verdict.diagnostics.push(BodyDiagnostic { code: code.code(), text: AString::from_str_in(about, alloc), start: at.start, end: at.end });
+                    verdict.diagnostics.push(BodyDiagnostic { code: code.code(), text: AString::from_str_in(about, alloc), start: at.start, end: at.end, notes: AVec::new_in(alloc) });
                 }
             }
             Err(CheckFail::Gap { gaps, .. }) => {
@@ -482,6 +602,15 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
 /// Lowers `body` by [`lower_made`] (each head and constant its lowering needs made first); a
 /// member's container head is made first, each constant an array length in it names
 /// evaluated, at most [`MOST_LENS`] of them.
+/// [`lower`], boxed in `alloc` in a frame of its own ([`ProjectWorld::check_then`]'s frame
+/// holds the box's two words, not the body).
+#[inline(never)]
+fn lower_boxed<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, body: BodyRef<'n>, alloc: Alloc<'a>) -> Result<blaze_own::Box<Body<'n>, Alloc<'a>>, Refused> {
+    Ok(blaze_own::Box::new_in(lower(r, prepared, body)?, alloc))
+}
+
+const _: () = assert!(core::mem::size_of::<blaze_own::Box<Body<'static>, Alloc<'static>>>() == 2 * core::mem::size_of::<usize>());
+
 fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, body: BodyRef<'n>) -> Result<Body<'n>, Refused> {
     let target = match body {
         BodyRef::Free(lib) => LowerTarget::Free(lib),
@@ -526,5 +655,83 @@ fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares
         Err(BodyError::Const { error, .. }) => Err(Refused::Length(*error)),
         Err(e) => Err(Refused::Lower(e)),
     }
+}
+
+/// The code a body's text-does-not-parse error is filed under: blaze's code of a syntax error.
+/// blaze-cli engine_bodies.rs `found_of` files a diagnostic of this code as its `SYNTAX` error
+/// with the PARSER's own words ("expected expression"), found where the lowering's diagnostic
+/// is, in the entry's text parsed once more for that body alone: the lowering's `Diag` keeps
+/// the kind and place, not the parser's message.
+pub const SYNTAX_CODE: &str = "syntax";
+
+/// The program's errors of a body whose lowering found only errors of its text (each finding a
+/// `BodyFinding::Diag`), filed in `verdict` sorted by place. A syntax error first: ONE error,
+/// the first in the text, as the parser's recovery makes whatever follows it (a second
+/// diagnostic after a parse error is the recovery's, not the program's). Without one, each
+/// diagnostic is its own error, with rustc's code where rustc has one and its words. Every
+/// kind is named here (no `_`), so a new kind of the lowering is decided, never swept in.
+fn lowering_errors<'a>(findings: &[super::body::BodyFinding], verdict: &mut BodyVerdict<'a>, alloc: Alloc<'a>) {
+    use blaze_lower::form::DiagKind as K;
+    use super::body::BodyFinding;
+    let diags = || findings.iter().filter_map(|f| match f {
+        BodyFinding::Diag { kind, range } => Some((*kind, *range)),
+        BodyFinding::Macro { .. } | BodyFinding::Unhandled { .. } | BodyFinding::CfgOut => None,
+    });
+    let push = |verdict: &mut BodyVerdict<'a>, code: &'static str, text: AString<'a>, range: blaze_surface::Range| {
+        verdict.diagnostics.push(BodyDiagnostic { code, text, start: range.start, end: range.end, notes: AVec::new_in(alloc) });
+    };
+    if let Some((_, range)) = diags().filter(|(kind, _)| *kind == K::Syntax).min_by_key(|(_, range)| (range.start, range.end)) {
+        push(verdict, SYNTAX_CODE, AString::from_str_in("this body's text does not parse here", alloc), range);
+        return;
+    }
+    for (kind, range) in diags() {
+        let mut text = AString::new_in(alloc);
+        // rustc's code and words for each (the Reference's rule where rustc has no code).
+        let code = match kind {
+            K::Syntax => SYNTAX_CODE,
+            K::BreakOutsideLoop => {
+                text.push_str("`break` or `continue` outside of a loop");
+                "E0268"
+            }
+            K::UndeclaredLabel => {
+                text.push_str("use of undeclared label");
+                "E0426"
+            }
+            K::ContinueToBlock => {
+                text.push_str("`continue` pointing to a labeled block");
+                "E0696"
+            }
+            K::AwaitOutsideAsync => {
+                text.push_str("`await` is only allowed inside `async` functions and blocks");
+                "E0728"
+            }
+            K::YieldOutsideCoroutine => {
+                text.push_str("yield expression outside of coroutine literal");
+                "E0627"
+            }
+            K::InclusiveRangeNoEnd => {
+                text.push_str("inclusive range with no end");
+                "E0586"
+            }
+            K::FormatArgMissing => {
+                text.push_str("invalid reference to positional argument in format string");
+                ""
+            }
+            K::FruInDestructuringAssignment => {
+                text.push_str("functional record updates are not allowed in destructuring assignments");
+                ""
+            }
+            K::PatternShadows => {
+                text.push_str("this identifier pattern may not bind its name: it names a static, a tuple struct or a tuple variant (or is a `ref`, `mut` or `@` binding of a constant, a unit struct or a unit variant)");
+                "E0530"
+            }
+            K::Asm(rule) => {
+                text = blaze_own::format_in!(alloc, "this `asm!` breaks the Reference's inline-assembly rule {rule:?}");
+                ""
+            }
+        };
+        push(verdict, code, text, range);
+    }
+    verdict.diagnostics.sort_by_key(|d| (d.start, d.end, d.code));
 }
 

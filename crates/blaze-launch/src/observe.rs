@@ -41,12 +41,19 @@
 //! word from the stub never reads a body word that names code the slot word's stub was put in
 //! to reach. Because publish touches the body word and observe/plain touch the slot word, a
 //! publish that lands between a thread's two loads changes only the body it ends at, never
-//! whether the thread is counted or marked. [`Plant`] takes that ordering out, and the
+//! whether the thread is counted or marked. [`ObservePlant`] takes that ordering out, and the
 //! simulation's oracle (`tests::observe`) catches each.
 
-use alloc::vec::Vec;
+use core::alloc::Allocator;
 
-use crate::{Kept, Slot};
+use blaze_own::Vec;
+use blaze_own::planted::{NoPlant, Planted, Plants};
+
+use crate::Slot;
+
+/// The driver's list of stores: `alloc`'s vector in the allocator the driver names (the
+/// drivers' type until the vector seam moves them to blaze-own's; D170).
+type Out<B> = alloc::vec::Vec<ObserveWrite, B>;
 
 /// A kind of stub a slot's word can point at. The bytes of each are the driver's
 /// (`blaze-launch-rt`'s `observe`); the core knows only that a slot shows one.
@@ -91,11 +98,10 @@ pub enum ObserveWrite {
 }
 
 /// A safeguard taken out, for the simulation's controls (`tests`): each must make the oracle
-/// fail. `None` outside the controls.
+/// fail. Taken through blaze-own's seam (D165): [`Observe::new`] holds [`NoPlant`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
-#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
-pub enum Plant {
+pub enum ObservePlant {
+    /// The overlay as it is.
     None,
     /// `publish` moves an observed slot's word off its stub to the new body, so a function
     /// under observation stops being counted or marked without `plain`.
@@ -103,6 +109,8 @@ pub enum Plant {
     /// `publish` leaves the body word stale, so a slot's stub reaches the body it replaced.
     PublishSkipsBody,
 }
+
+impl Plants for ObservePlant {}
 
 /// One function the overlay keeps the two words of.
 #[derive(Clone, Copy)]
@@ -113,26 +121,27 @@ struct Func {
     body: Option<Addr>,
 }
 
-/// The per-function observe overlay of one process. See the module documentation.
-pub struct Observe {
-    funcs: Vec<Func, Kept>,
-    plant: Plant,
+/// The per-function observe overlay of one process, its table in `A`, the allocator its maker
+/// names; `P` its plant seam. See the module documentation.
+pub struct Observe<A: Allocator, P: Planted<ObservePlant> = NoPlant> {
+    funcs: Vec<Func, A>,
+    plant: P,
 }
 
-impl Observe {
-    /// An overlay of `slots` functions, each on its lazy stub with no body yet.
-    pub fn new(slots: u32, alloc: Kept) -> Observe {
+impl<A: Allocator> Observe<A, NoPlant> {
+    /// An overlay of `slots` functions, each on its lazy stub with no body yet, in `alloc`.
+    pub fn new(slots: u32, alloc: A) -> Observe<A, NoPlant> {
+        Observe::planted(slots, alloc, NoPlant)
+    }
+}
+
+impl<A: Allocator, P: Planted<ObservePlant>> Observe<A, P> {
+    /// [`Observe::new`] with its plant seam: [`NoPlant`] where it ships, an [`ObservePlant`]
+    /// under the simulation's controls.
+    pub fn planted(slots: u32, alloc: A, plant: P) -> Observe<A, P> {
         let mut funcs = Vec::new_in(alloc);
         funcs.resize(slots as usize, Func { word: Slotword::Lazy, body: None });
-        Observe { funcs, plant: Plant::None }
-    }
-
-    /// For the simulation's controls only.
-    #[cfg(test)]
-    pub(crate) fn planted(slots: u32, alloc: Kept, plant: Plant) -> Observe {
-        let mut it = Observe::new(slots, alloc);
-        it.plant = plant;
-        it
+        Observe { funcs, plant }
     }
 
     /// What `slot`'s word names now.
@@ -156,15 +165,16 @@ impl Observe {
     /// A new plain body for `slot`, at `body`. Stores the body word first, so every stub of
     /// the slot reaches the new body; moves the slot word to it only when the slot is plain,
     /// so a slot under observation keeps its stub (which reads the new body word).
-    pub fn publish(&mut self, slot: Slot, body: Addr, out: &mut Vec<ObserveWrite, Kept>) {
+    pub fn publish<B: Allocator>(&mut self, slot: Slot, body: Addr, out: &mut Out<B>) {
+        let plant = self.plant;
         let func = &mut self.funcs[slot.0 as usize];
         func.body = Some(body);
-        if self.plant != Plant::PublishSkipsBody {
+        if !plant.has(ObservePlant::PublishSkipsBody) {
             out.push(ObserveWrite::Body { slot, body });
         }
         match func.word {
             // A stub stays in the slot: it reads the body word just written.
-            Slotword::Stub { .. } if self.plant != Plant::PublishDropsStub => {}
+            Slotword::Stub { .. } if !plant.has(ObservePlant::PublishDropsStub) => {}
             // A plain or lazy slot now names the new body outright.
             _ => {
                 func.word = Slotword::Body(body);
@@ -177,12 +187,12 @@ impl Observe {
     /// its stub. A slot with no body yet is left alone (nothing to observe until its first
     /// call resolves): the stub would read an unset body word. Stores each slot's body word
     /// before its slot word.
-    pub fn observe(
+    pub fn observe<B: Allocator>(
         &mut self,
         slots: &[Slot],
         kind: Kind,
         mut at: impl FnMut(Slot) -> Addr,
-        out: &mut Vec<ObserveWrite, Kept>,
+        out: &mut Out<B>,
     ) {
         for &slot in slots {
             let func = &mut self.funcs[slot.0 as usize];
@@ -200,7 +210,7 @@ impl Observe {
 
     /// Takes the stub out of each of `slots`: stores the plain body address back in the slot
     /// word. A slot with no body, or already plain, is left alone.
-    pub fn plain(&mut self, slots: &[Slot], out: &mut Vec<ObserveWrite, Kept>) {
+    pub fn plain<B: Allocator>(&mut self, slots: &[Slot], out: &mut Out<B>) {
         for &slot in slots {
             let func = &mut self.funcs[slot.0 as usize];
             if let (Slotword::Stub { .. }, Some(body)) = (func.word, func.body) {

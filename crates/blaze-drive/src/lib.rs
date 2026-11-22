@@ -1,23 +1,29 @@
-//! The driver of one command on the new item layer (docs/v2/plan/design/drive.md), as a sans-IO
-//! machine: [`Request`] takes [`Event`]s and pushes [`Effect`]s; the caller (crates/blaze-cli)
-//! performs them in any order. Nothing here touches the system, keeps a clock or picks an
-//! allocator: each is passed in (rule 75).
+//! The drive's names, keys, records and task types on the new item layer
+//! (docs/v2/plan/design/drive.md), which the engine (crates/blaze-engine, blaze-cli engine_*.rs)
+//! builds on. The request machine that once stepped them (request.rs and its simulation) is
+//! gone: `check`, `run` and `test` start from the engine. Nothing here touches the system, keeps
+//! a clock or picks an allocator: each is passed in (rule 75).
 //!
 //! | module | what |
 //! |---|---|
-//! | [`key`] | names, sources, keys, the certificate key |
+//! | [`key`] | names, sources, keys |
 //! | [`record`] | the drive's record envelope: whole, shape, findings, parts |
 //! | [`answers`] | the answer table's rows, pages and root: the forward index and the reverse one |
-//! | [`request`] | the request machine |
-//! | [`lines`] | a file's line table: `file:line:col` when printed |
+//! | [`task`] | a task, its inputs, its wants, its failure and its printed finding |
+//! | [`cells`] | part reads: one cell of a record, and its digest |
+//! | [`condition`] | cfg conditions and the space a check covers |
 //! | [`profile`] | counts per task kind, on every command |
-//! | [`items`] | the production `Items` and `Source` over the records a task holds |
+//! | [`not_run`] | what did not run, grouped by the failure that stopped it |
+//! | [`verified`] | bytes read by path, proven to be the swept ones |
+//! | [`view`] | a unit's view of a body it shares: the name at a view and the plan (D191) |
+//! | [`pointers`] | the checkout's last-answer pointers |
+//! | [`table`] | the open-addressing map keyed by content ids |
 //! | [`fetch_task`] | the `Fetch` task: one lock entry's sources, its name, record and finding |
-//! | [`run`] | blaze-run's compiles and records as drive names |
+//! | [`unit_graph_task`] | the `UnitGraph` task |
 //!
-//! What a command gives the machine (a file's content read by path, a fact such as an
-//! environment variable) is a [`Kind::Given`] name like any other ([`key::content_of`],
-//! [`key::fact_of`], [`Ask::facts`]), found by its name, never an ambient input.
+//! What a command gives a task (a file's content read by path, a fact such as an environment
+//! variable) is a [`Kind::Given`] name like any other ([`key::content_of`], [`key::fact_of`]),
+//! found by its name, never an ambient input.
 //!
 //! # Collections
 //!
@@ -38,153 +44,31 @@ pub mod answers;
 pub mod cells;
 pub mod condition;
 pub mod fetch_task;
-pub mod items;
 pub mod key;
-pub mod lines;
 pub mod not_run;
-pub mod owners;
 pub mod pointers;
 pub mod profile;
 pub mod record;
-pub mod request;
-pub mod run;
-mod run_scope;
-pub mod settled;
 pub mod table;
+pub mod task;
 pub mod unit_graph_task;
 pub mod verified;
-pub mod worker;
+pub mod view;
 mod wire;
-
-#[cfg(test)]
-mod sim;
-#[cfg(test)]
-mod sim_cells;
-#[cfg(test)]
-mod sim_given;
-#[cfg(test)]
-mod sim_scope_cells;
-#[cfg(test)]
-mod sim_lints;
-#[cfg(test)]
-mod sim_owners;
-#[cfg(test)]
-mod sim_scripts;
-#[cfg(test)]
-mod sim_natives;
 
 pub use crate::cells::{Cell, CellOf, CellRead, CellRefused, Cells, Seen};
 pub use crate::condition::{Condition, ConditionError, Space, Var};
 pub use crate::key::{Key, Kind, Name, Tool};
 pub use crate::record::{Finding, Locate, Part, PathOf};
-pub use crate::request::{
-    Answer, Ask, Batch, BatchId, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Input,
-    Outcome, Output, Print, Ran, Request, Task, TaskFailure, Ticket, Verdict, Want, Why,
-};
-pub use crate::settled::{Settled, TableFull};
+pub use crate::task::{Class, Command, Input, Print, Task, TaskFailure, Want, Why};
 pub use crate::wire::{WireError, WireWhy};
 
 /// Every byte form the drive writes, by name: what a tool's key holds (a bump changes every key,
 /// so a record of another form is never fetched, only made again) and what drive.md's formats
 /// table lists. A file at a fixed path (`last`) is checked by its magic instead.
-pub const FORMATS: [(&str, &[u8; 4]); 6] = [
-    ("owners payload", owners::MAGIC),
+pub const FORMATS: [(&str, &[u8; 4]); 4] = [
     ("record", record::MAGIC),
     ("answer page", answers::PAGE_MAGIC),
     ("answer root", answers::ROOT_MAGIC),
     ("last answer", answers::LAST_MAGIC),
-    ("certificate", request::CERT_MAGIC),
 ];
-
-/// A bug the simulation plants to show its oracle catches it (`blaze_sim::control`). Always
-/// `None` outside the tests; public so a caller's simulation can plant it too.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Plant {
-    None,
-    /// A job waiting on answer-table pages is woken by each page as it comes, not by the last
-    /// of them (request.rs `Job::pages_due`): it walks its whole shape again per page.
-    WakePerPage,
-    /// A reader the walk dirtied and did not run again keeps its row as it was (request.rs
-    /// `finish`, `STALE_READ`): its recorded answer for a moved read is taken for today's later.
-    StaleReaderKept,
-    /// A row's recorded answer is taken for a read the walk DID enter this request.
-    RecordedForEntered,
-    /// A settled record whose out digest changed does not dirty its readers: the validity check
-    /// skips a changed read.
-    SkipChangedRead,
-    /// A name with no record (never made, or dropped) keeps no watch row: the readers that read
-    /// it absent are forgotten, so its appearing reruns none of them.
-    ForgetAbsentReaders,
-    /// A read that found nothing is handed to the task's next run as a hint: the name, still
-    /// not there, fails, and its reader fails `Waited` on it every run.
-    HintAbsentReads,
-    /// A want of a name whose task is running starts a second run of the same key.
-    DoubleFlight,
-    /// A batch's records are applied a second time, past the ticket check.
-    BatchTwice,
-    /// A settled row is published to the workers' table ahead of its record's `Put`: a worker
-    /// can answer a need before the record is written.
-    PublishBeforePut,
-    /// A program's success is reported at its exit, before the gate's check is done.
-    EarlySuccess,
-    /// Under `Gate::Before` the program starts over a check that left an item unchecked (a
-    /// `types-not-checked` finding): only an error or a failed task holds the start.
-    StartOverIncomplete,
-    /// `run`'s member closure ([`Request::with_member_closure`]) does not follow the first
-    /// dependency it meets: a member the program reaches is left out, and its bodies are not
-    /// checked before the start.
-    ReachedSkipped,
-    /// A record is stored under the condition its job began at, not the one it read: an asker
-    /// that does not imply what it read is served it.
-    RanUnderCondition,
-    /// A file's row keeps its part's place in its home, not its edition: a repeat whose home
-    /// stood reads the file in the edition its place spells.
-    EditionAsPlace,
-    /// A run's answer is given while the program it started is still running (stopped or
-    /// not): the caller then steps the answered machine with the program's exit.
-    AnswerWhileRunning,
-    /// `test` starts the package's program as `run` does: `main` is no test, and until tests
-    /// run on this path `test` is its check alone (decision D61 item 5).
-    TestStartsProgram,
-    /// `test` starts its tests (`Effect::StartTests`) over a check that found an error or a
-    /// failed task: the suite runs over code its check refused.
-    TestsOverErrors,
-    /// One finding held by two names' records (a library's and its test unit's names) prints
-    /// and counts once a name.
-    PrintEachName,
-    /// A settled job keeps the needs its runs were handed, at the capacity they grew to (the
-    /// clone's 5.2 GB of `Name` lists, 2026-11-16).
-    KeepSettledNeeds,
-    /// Puts are dropped once the request holds a failure: a request with findings would leave
-    /// nothing it computed for the next one (the coordinator's rule, 2026-11-16 20:10).
-    DropPutsOnFailure,
-    /// A task that read a file by path parses its bytes without comparing them with the
-    /// content id its key was made from (`verified::verify`).
-    SkipContentCompare,
-    /// A file part keeps only the last parent that listed it: a module of two crates is owned by
-    /// one (owners.rs).
-    OwnersLastParentWins,
-    /// A part a home lists anew does not dirty the part's `Owners`: a new `mod x;` leaves x's
-    /// owners and its bodies as they were.
-    OwnersAddedNotDirtied,
-    /// A part one home stops listing is dropped though another home still lists it.
-    OwnersDropListedElsewhere,
-    /// Every part of a record is made a job: a dependency's bodies run under `check` unasked.
-    EveryPartAJob,
-    /// A changed record's cell readers are never checked: a reader whose cell moved stands on
-    /// what it saw (cells.rs).
-    CellMovedNotDirtied,
-    /// Every cell reader of a changed record is dirtied, its cell moved or not: part reads
-    /// worth nothing over whole reads.
-    CellsAsWhole,
-    /// A changed or gone file seeds no `Given` job (key.rs `Kind::Given`): a reader of the file
-    /// by content only (`key::content_of`) stands on the bytes it read before the edit.
-    GivenNotSeeded,
-    /// A name its home dropped this run is entered again when a read of it moves: its job,
-    /// settled with no record, is decided and run as a part no home lists (request.rs `dirty`).
-    DirtyDropped,
-    /// A made record's shape is put at its task key, never in the hole its walk found
-    /// (request.rs `Walk`): a task whose read NAMES moved with an answer (a callee removed) puts a
-    /// second shape under one key, refused as two values.
-    ShapeAtTaskKey,
-}

@@ -533,7 +533,7 @@ fn token_at(view: &View<'_, '_>, src: Level) -> At {
 #[expect(clippy::too_many_arguments, reason = "the matcher's state, passed as its parts")]
 fn match_loop_inner<'f>(
     engine: &mut Engine<'_, '_, 'f>,
-    arm: &Arm,
+    _arm: &Arm,
     view: &mut View<'_, 'f>,
     src: Level,
     res: &mut Match<'f>,

@@ -1,10 +1,9 @@
-//! `blaze engine-check` against `blaze check` on one checkout (engine.md E6): what the engine
-//! path prints is what the old machine prints for the stages the engine runs. A child of
-//! main.rs's tests: its helpers are theirs.
+//! The engine's check on one checkout (engine.md E6), stage by stage. A child of main.rs's
+//! tests: its helpers are theirs.
 //!
-//! Today the engine runs the outlines alone, so the oracle is: every finding `engine-check`
-//! lists is one `check` lists (by code and id), the engine path lists at least one (the planted
-//! file-level syntax error), and the engine entered each planned task once.
+//! Until 2026-11-19 these tests compared what the engine printed with what the old machine
+//! printed; the old machine is gone, so each test's oracle is now the finding's own code, place
+//! and status, and the engine entering each planned task once.
 
 use super::*;
 
@@ -22,7 +21,7 @@ pub(super) fn engine(io: &Io, workers: u32) -> (std::vec::Vec<(std::string::Stri
     engine_from(io, workers, true)
 }
 
-/// The command's options as the tests' `check` runs (main.rs `ask_framed`), on the checkout `ws`.
+/// The command's options as the tests' `check` runs (main.rs tests `check_opts`), on the checkout `ws`.
 /// Its request frame is leaked: a cap whose blocks are taken as used (engine_check.rs
 /// `REQUEST_FRAME`), one a call, as `engine_check::serve` makes one a request.
 pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'static> {
@@ -35,6 +34,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         heap: blaze_own::testing::heap(),
         place: engine_check::Place {
             checkout: "ws",
+            served: crate::engine_script_reads::Served::Simulated,
             cert_file: None,
             cert_dir: None,
             home: Some("/h"),
@@ -54,6 +54,9 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
         status: crate::engine_status::Asking::NONE,
         origin: None,
+        names_oracle: crate::engine_names::NamesOracle::Off,
+        driver: crate::engine_ready_edit::Driver::Phases,
+        ready_plant: crate::engine_ready_edit::CommitPlant::None,
     }
 }
 
@@ -63,7 +66,7 @@ pub(super) fn why(io: &Io, target: &str) -> std::string::String {
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let out = io.need_out().expect("out");
     let err = io.need_err().expect("err");
-    let mut phases = Phases::new(io.need_clock().expect("a clock"));
+    let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let before = stdout(io).len();
     if let Err(error) = crate::engine_why::explain(&cx, io, &root, &opts(io, 2, false), target, &mut phases, &out, &err) {
         panic!("why {target} answers: {error:?}");
@@ -78,15 +81,32 @@ pub(super) fn engine_from(io: &Io, workers: u32, fresh: bool) -> (std::vec::Vec<
 
 /// [`engine_from`] with the command's options as given (`opts`, one field changed by a test).
 pub(super) fn engine_opts(io: &Io, opts: engine_check::Opts<'static>) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
-    let fresh = opts.fresh;
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    engine_view(&cx, io, opts, View::Person)
+}
+
+/// `make()` on the heap, made in this call's own frame: a large value (a [`Phases`], 24 meter
+/// arrays) is a temporary here, gone when it returns, never a slot in the caller's frame for
+/// the whole check under it (the 2 MiB test stack, wave-1119 t29).
+#[inline(never)]
+/// `make`'s value boxed, made in this call's frame: `Box::new(Phases::new(..))` written in a test
+/// keeps the 143 KiB value as a temporary in the TEST's frame for its whole call (debug builds
+/// reserve every temporary at entry), under the check it then runs (wave-1119 t59 frames:
+/// `standing_control` 166 KiB, `moduled_on` 164 KiB).
+#[inline(never)]
+pub(super) fn boxed<T>(make: impl FnOnce() -> T) -> std::boxed::Box<T> {
+    std::boxed::Box::new(make())
+}
+
+pub(super) fn engine_view(cx: &bstd::Cx, io: &Io, opts: engine_check::Opts<'static>, view: View) -> (std::vec::Vec<(std::string::String, std::string::String)>, engine_check::Checked) {
+    let fresh = opts.fresh;
     let frame = cx.frame();
-    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    let root = io.need_fs().expect("files").open_dir(cx, &Path::new("ws").expect("a path")).expect("open");
     let out = io.need_out().expect("out");
-    let mut phases = Phases::new(io.need_clock().expect("a clock"));
-    let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
+    let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
+    let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, view, "/ws", frame);
     let err = io.need_err().expect("err");
-    let checked = match engine_check::check(&cx, io, &root, opts, &mut shown, &mut phases, &out, &err) {
+    let checked = match engine_check::check(cx, io, &root, opts, &mut shown, &mut phases, &out, &err) {
         Ok(checked) => checked,
         Err(error) => panic!("engine-check (fresh {fresh}) answers: {error:?}"),
     };
@@ -124,22 +144,17 @@ fn two_crates(io: &Io) {
 fn engine_check_resolves_the_names_check_resolves() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     two_crates(&io);
-    let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
     let unresolved = |ids: &[(std::string::String, std::string::String)]| -> std::vec::Vec<(std::string::String, std::string::String)> {
         let mut found: std::vec::Vec<_> = ids.iter().filter(|(code, _)| code == "unresolved").cloned().collect();
         found.sort();
         found
     };
-    let expected = unresolved(&old.ids);
-    assert_eq!(expected.len(), 1, "check lists the one unresolved import: {:?}", old.ids);
     let mut answers = std::vec::Vec::new();
     for workers in [1, 4] {
         let (ids, checked) = engine(&io, workers);
-        assert_eq!(unresolved(&ids), expected, "engine-check with {workers} worker(s) lists check's names findings; it listed {ids:?}");
-        for id in &ids {
-            assert!(old.ids.contains(id), "engine-check listed {id:?}, which check did not: check listed {:?}", old.ids);
-        }
-        entered_once(&checked, workers);
+        // The one import `a` does not declare (`use a::g;`), and nothing for the glob: the old
+        // checker was this test's oracle until it went (2026-11-19); the rule is the oracle now.
+        assert_eq!(unresolved(&ids).len(), 1, "engine-check with {workers} worker(s) lists the one unresolved import; it listed {ids:?}");        entered_once(&checked, workers);
         let names: std::vec::Vec<_> = checked.phases.iter().filter(|(phase, ..)| phase.stage == blaze_engine::Stage::Names).map(|(phase, planned, _)| (phase.wave, *planned)).collect();
         assert!(names.len() >= 2, "the crates' names run in more than one wave (b after a): {names:?}");
         assert!(checked.puts > 0, "the phases' records were put to the store");
@@ -171,7 +186,11 @@ fn typed_crates(io: &Io, typed: Typed) {
     write(io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
     write(io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     let a = match typed {
-        Typed::Generic => "pub fn pick<T: Copy>(x: T) -> T {\n    x\n}\n",
+        // A bound the fixture's own world proves: a trait of this crate and its impl for `u8`.
+        // (`T: Copy` was an unresolved trait in a world with no std, which is E0405; and the lang
+        // shelf's core declares `marker::Copy` with no impl for `u8`, so `pick(1u8)` is then an
+        // unmet bound, as round 5 showed: "error[types]: `u8: Copy`".)
+        Typed::Generic => "pub trait Mark {}\n\nimpl Mark for u8 {}\n\npub fn pick<T: Mark>(x: T) -> T {\n    x\n}\n",
         Typed::Plain | Typed::Wrong => "pub fn one() -> u8 {\n    1\n}\n",
     };
     write(io, "a/src/lib.rs", a);
@@ -195,20 +214,26 @@ fn engine_check_checks_each_body_as_its_own_task() {
     for typed in [Typed::Plain, Typed::Generic, Typed::Wrong] {
         let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
         typed_crates(&io, typed);
-        let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
-        let old_said = stdout(&io);
         let types_not_checked = |said: &str| said.contains("NOT checked: types");
-        assert_eq!(old.errors > 0, typed == Typed::Wrong, "check's errors on {typed:?}: {:?}\n{old_said}", old.words);
         let mut answers = std::vec::Vec::new();
         for workers in [1, 4] {
             let before = stdout(&io).len();
-            let (ids, checked) = engine(&io, workers);
+            // Generic needs a world where `Copy` exists: the lang shelf (main.rs tests `lang_shelf`).
+            let (ids, checked) = if typed == Typed::Generic {
+                let mut o = opts(&io, workers, true);
+                o.toolchain = lang_shelf(&io);
+                engine_opts(&io, o)
+            } else {
+                engine(&io, workers)
+            };
             let said = stdout(&io).split_off(before);
             entered_once(&checked, workers);
             let bodies: std::vec::Vec<_> = checked.phases.iter().filter(|(phase, ..)| phase.stage == blaze_engine::Stage::Bodies).map(|(_, planned, entered)| (*planned, *entered)).collect();
-            // A task a body, each entered once: `h` and `one` or `pick`, and `wrong` when written.
-            let want = if typed == Typed::Wrong { 3 } else { 2 };
-            assert_eq!(bodies, [(want, want)], "Bodies planned and entered with {workers} worker(s) on {typed:?}");
+            // A task a body's row, each entered once: `h` and `one` or `pick`, and `wrong` when
+            // written, each under its library and its library's test build (D191: every unit that
+            // holds a body checks it, a row each, so 2 rows a body).
+            let want = 2 * if typed == Typed::Wrong { 3 } else { 2 };
+            assert_eq!(bodies, [(want, want)], "Bodies planned and entered with {workers} worker(s) on {typed:?}: two rows a body (D191: the library's and its test build's)");
             assert_eq!(checked.stages[blaze_engine::Stage::Bodies.index()].entered, want);
             // A time row a phase, in the phases' order; every Outlines and Bodies task timed.
             let timed: std::vec::Vec<_> = checked.times.iter().map(|one| one.phase).collect();
@@ -223,8 +248,11 @@ fn engine_check_checks_each_body_as_its_own_task() {
             let status = checked.status.0;
             let (notes, clean) = &checked.bodies;
             println!("engine-check bodies with {workers} worker(s) on {typed:?}: {clean} clean, notes {notes:?}, ids {ids:?}");
-            assert_eq!(Some(status), old.status, "engine-check's status is check's with {workers} worker(s) on {typed:?}; check said:\n{old_said}\nengine-check said:\n{said}");
-            assert_eq!(types_not_checked(&said), types_not_checked(&old_said), "the word on types is check's with {workers} worker(s) on {typed:?}; check said:\n{old_said}\nengine-check said:\n{said}");
+            // The status by the rule (the old checker was the oracle until 2026-11-19): a type
+            // error fails the command (1); otherwise it is incomplete while borrows are notes (3)
+            // or clean (0), never 4 (no item left unchecked).
+            assert_eq!(status == Status::FAILED.0, typed == Typed::Wrong, "engine-check's status with {workers} worker(s) on {typed:?}:\n{said}");
+            assert_ne!(status, crate::UNCHECKED_ITEMS.0, "no item left unchecked with {workers} worker(s) on {typed:?}:\n{said}");
             match typed {
                 Typed::Plain => {
                     assert!(notes.is_empty(), "the plain pair's bodies have no note with {workers} worker(s): {notes:?}");
@@ -235,8 +263,8 @@ fn engine_check_checks_each_body_as_its_own_task() {
                 Typed::Wrong => {
                     // The wrong body's type error is printed as `check` prints it, not a note.
                     assert!(notes.is_empty(), "the wrong body's finding is no note with {workers} worker(s): {notes:?}");
-                    assert_eq!(error_lines(&said), error_lines(&old_said), "the type error's lines are check's with {workers} worker(s); check said:\n{old_said}\nengine-check said:\n{said}");
                     assert_eq!(error_lines(&said).len(), 1, "one type error printed:\n{said}");
+                    assert!(!types_not_checked(&said), "types checked whole on the wrong pair:\n{said}");
                     assert_eq!(*clean, 2, "`one` and `h` checked clean with {workers} worker(s)");
                 }
             }
@@ -278,6 +306,130 @@ fn engine_check_finds_every_body_s_crate() {
     }
 }
 
+/// The stack a whole check is stated to fit: a cold check and an edit of one body, one worker
+/// (the bodies run inline on the caller's stack, `bstd::task::Scope::may_overlap`), measured on
+/// a larger thread (`MEASURED_STACK`). Half the 2 MiB test stack the archive test overflowed at 2,109,888
+/// bytes in 109 frames (wave-1119 t29, `checking` 523 KB and its drive closure 172 KB): the
+/// command's stages are their own frames now (engine_check.rs `drive`, `lines_of`,
+/// `print_answer`), so the depth is the stages', never their sum.
+#[cfg(target_os = "macos")]
+const CHECK_STACK: usize = 1 << 20;
+
+/// The stack the guard's thread is given: far above [`CHECK_STACK`], so a check past its bound
+/// is measured and refused by the assert, never an overflow that aborts the test binary.
+#[cfg(target_os = "macos")]
+const MEASURED_STACK: usize = 64 << 20;
+
+/// What one check left on the guard's thread: the thread's stack high water after it, and how
+/// deep each of the command's stages began (engine_check.rs `stack_probe`), deepest first.
+#[cfg(target_os = "macos")]
+struct StackUse {
+    high_water: usize,
+    stages: std::vec::Vec<(&'static str, usize)>,
+}
+
+#[cfg(target_os = "macos")]
+impl StackUse {
+    /// After a check on this thread: its high water so far and the stages' entry depths.
+    fn now() -> StackUse {
+        let high_water = blaze_sys::posix::thread::stack_high_water().expect("this thread's stack");
+        let top = blaze_sys::posix::thread::this_thread_stack().expect("this thread's stack").high;
+        let mut stages: std::vec::Vec<(&'static str, usize)> = crate::engine_check::stack_probe::take().into_iter().map(|(stage, sp)| (stage, top.saturating_sub(sp))).collect();
+        stages.sort_unstable_by_key(|one| core::cmp::Reverse(one.1));
+        StackUse { high_water, stages }
+    }
+
+    fn said(&self) -> std::string::String {
+        let stages: std::vec::Vec<std::string::String> = self.stages.iter().map(|(stage, depth)| format!("{stage} at {} KiB", depth >> 10)).collect();
+        format!("{} KiB (stages began: {})", self.high_water >> 10, stages.join(", "))
+    }
+
+    /// The oracle: the first bound this check broke, if any. The bodies must begin within
+    /// [`BODIES_ENTRY`] (what the command's own frames above them may take: wave-1119 t39 measured
+    /// 783 KiB, `checking` one 560 KiB frame), and the whole check within [`CHECK_STACK`].
+    fn past_bound(&self) -> Option<PastBound> {
+        let bodies = self.stages.iter().find(|one| one.0 == "bodies_phase").map(|one| one.1);
+        match bodies {
+            None => Some(PastBound::NoBodies),
+            Some(depth) if depth > BODIES_ENTRY => Some(PastBound::BodiesBegan(depth)),
+            Some(_) if self.high_water > CHECK_STACK => Some(PastBound::Whole(self.high_water)),
+            Some(_) => None,
+        }
+    }
+}
+
+/// How deep the bodies may begin: the command's frames above them (`check`, `checking`, the
+/// drive, the stages' own) together. The tree of wave-1119 t39 began them at 783 KiB.
+#[cfg(target_os = "macos")]
+const BODIES_ENTRY: usize = 512 << 10;
+
+/// Which bound a check broke ([`StackUse::past_bound`]), with the depth it was broken at.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum PastBound {
+    /// No body was checked: the bound is about nothing.
+    NoBodies,
+    /// The bodies began deeper than [`BODIES_ENTRY`].
+    BodiesBegan(usize),
+    /// The whole check went deeper than [`CHECK_STACK`].
+    Whole(usize),
+}
+
+/// The planted control's large local: a frame of [`PAD`] bytes held across `check`, as a large
+/// value kept on the stack above the bodies would be.
+#[cfg(target_os = "macos")]
+const PAD: usize = 600 << 10;
+
+#[cfg(target_os = "macos")]
+#[inline(never)]
+fn under_a_large_local<R>(check: impl FnOnce() -> R) -> R {
+    let pad = [7u8; PAD];
+    core::hint::black_box(&pad);
+    let ran = check();
+    core::hint::black_box(&pad);
+    ran
+}
+
+/// A WHOLE CHECK FITS ITS STATED STACK ([`CHECK_STACK`]), MEASURED: the smallest checkout checked
+/// cold, then one body edited and checked from the stored answer, one worker (the bodies inline
+/// on this stack), on a thread of [`MEASURED_STACK`]; after each, the thread's high water
+/// (blaze-sys `stack_high_water`: its fresh stack's lowest written word) and the depth each
+/// stage began at. The mark only rises, so the edit's is the larger of the two checks'. Printed
+/// on every run, asserted under the bound naming the stages. CONTROL: the tree before the stage
+/// split (`checking` one 523 KB frame) needed more than 2 MiB for the archive test's check.
+/// macOS: Linux has no call for a thread's stack range in blaze-sys yet.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_whole_check_fits_its_stated_stack() {
+    let ran = std::thread::Builder::new()
+        .name("a check on a measured stack".into())
+        .stack_size(MEASURED_STACK)
+        .spawn(|| {
+            let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+            write(&io, "Cargo.toml", MANIFEST);
+            write(&io, "src/lib.rs", "pub fn one() -> u8 {\n    1\n}\n\npub fn two() -> u8 {\n    one() + 1\n}\n");
+            let _ = crate::engine_check::stack_probe::take();
+            let (_, cold) = engine_from(&io, 1, true);
+            let cold_use = StackUse::now();
+            write(&io, "src/lib.rs", "pub fn one() -> u8 {\n    2\n}\n\npub fn two() -> u8 {\n    one() + 1\n}\n");
+            let (_, edited) = engine_from(&io, 1, false);
+            let edit_use = StackUse::now();
+            // PLANTED: the same cold check under a large local on its path: the oracle must
+            // name the bodies' entry as past its bound.
+            let (_, planted) = under_a_large_local(|| engine_from(&io, 1, true));
+            let planted_use = StackUse::now();
+            (cold.tasks, edited.entered, planted.tasks, cold_use, edit_use, planted_use)
+        })
+        .expect("a thread of the measured stack")
+        .join();
+    let (tasks, entered, planted_tasks, cold, edit, planted) = ran.expect("the check on the measured stack returned");
+    println!("STACK: a cold check used {}; with the edit after it {}; under the planted {} KiB local {}; bounds: bodies began within {} KiB, the whole within {} KiB", cold.said(), edit.said(), PAD >> 10, planted.said(), BODIES_ENTRY >> 10, CHECK_STACK >> 10);
+    assert!(tasks > 0 && entered > 0 && planted_tasks > 0, "every check ran tasks: cold {tasks} planned, edited {entered} entered, planted {planted_tasks} planned");
+    assert!(matches!(planted.past_bound(), Some(PastBound::BodiesBegan(_))), "CONTROL: a {} KiB local above the bodies is caught: {}", PAD >> 10, planted.said());
+    assert_eq!(cold.past_bound(), None, "a cold check within its bounds: {}", cold.said());
+    assert_eq!(edit.past_bound(), None, "a check with an edit within its bounds: {}", edit.said());
+}
+
 /// A SIGNATURE EDIT RE-CHECKS ITS CALLERS: from the plain pair's stored answer, `a::one`'s
 /// signature is edited so `b::h`'s unchanged body no longer type-checks (its return type, then
 /// its parameters). The incremental request must list `h`'s note and answer as a fresh run
@@ -304,7 +456,7 @@ fn engine_check_rechecks_the_callers_of_an_edited_signature() {
         assert_eq!((now_ids, error_lines(&now_lines.join("\n"))), (fresh_ids, fresh_errors), "the incremental request prints a fresh run's errors after {edited:?}\n{}", entries(&now));
         assert_eq!(now.bodies.0, fresh.bodies.0, "the incremental request's body notes are a fresh run's after {edited:?}\n{}", entries(&now));
         assert_eq!(now.status.0, fresh.status.0, "the incremental status is a fresh run's after {edited:?}");
-        assert_eq!(now.stages[blaze_engine::Stage::Bodies.index()].entered, 3, "`one`, `two` and `h` entered after {edited:?}\n{}", entries(&now));
+        assert_eq!(now.stages[blaze_engine::Stage::Bodies.index()].entered, 6, "`one`, `two` and `h` entered after {edited:?}, each under its library and its test build (D191: a row each unit that holds the body)\n{}", entries(&now));
     }
 }
 
@@ -315,7 +467,7 @@ pub(super) fn head_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::Strin
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
-    let mut phases = Phases::new(io.need_clock().expect("a clock"));
+    let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
         let rows = &kept.answer.rows;
         let (mut bad, mut good) = (std::vec::Vec::new(), 0u32);
@@ -350,16 +502,18 @@ fn every_head_read_of_a_body_is_a_head_task_cell() {
     let _ = engine_from(&io, 2, false);
     let (bad, good) = head_reads_of_bodies(&io);
     assert!(bad.is_empty(), "head reads no head task answers:\n{}", bad.join("\n"));
-    assert_eq!(good, 5, "the five head reads of the three bodies");
+    assert_eq!(good, 10, "the five head reads of the three bodies, each read by the body's two rows (D191: the library's and its test build's)");
 }
 
 /// A HEAD TASK PER ITEM (lane EY): a body is entered only when a head it read moved. One crate:
 /// `P`, read by `make` and `get`; `area`, called by `top` and `helper`; `other`, called by
-/// `top`. Each edit enters, exactly:
+/// `top`. The six bodies are `make`, `get`, `area`, `other`, `top` and `helper`. `make`
+/// constructs `P`, while `get` takes `&P` and reads `p.x`; both depend on `P`'s field list.
+/// The other four bodies do not mention `P`. Each edit enters, exactly:
 /// - a fn's parameter type changed: that fn's body (its key moved) and its two callers (their
 ///   read of its head moved); one head task: `area`'s, whose heads moved (see the edits below);
-/// - a struct gains a field: the two bodies that read its head (and three more by a names cell,
-///   OPEN, below); `P`'s head task, moving, and its readers', identical;
+/// - a struct gains a field: the two bodies that read its head; `P`'s head task, moving, and its
+///   readers', identical;
 /// - a body edit: that body by its key, and the floor of the head tasks: one, its item's (keyed
 ///   by the item's tokens, engine_heads.rs `plan_items`), which makes the heads it made
 ///   (identical), so nothing reads a moved head;
@@ -379,7 +533,8 @@ fn a_moved_head_enters_exactly_its_readers() {
     write(&io, "src/lib.rs", &lib(p, area, other));
     let (_, first) = engine_from(&io, 2, false);
     println!("the first request: {}", entries(&first));
-    assert_eq!(first.stages[blaze_engine::Stage::Bodies.index()].entered, 6, "six bodies: {}", entries(&first));
+    // D191: every unit that holds a body checks it, a row each: the library's and its test build's.
+    assert_eq!(first.stages[blaze_engine::Stage::Bodies.index()].entered, 12, "six bodies, two rows each (D191): {}", entries(&first));
     let (bad, _) = head_reads_of_bodies(&io);
     assert!(bad.is_empty(), "head reads no head task answers:\n{}", bad.join("\n"));
     let bodies = |checked: &engine_check::Checked| -> std::vec::Vec<(&'static str, Option<blaze_drive::Kind>, u32)> {
@@ -409,19 +564,21 @@ fn a_moved_head_enters_exactly_its_readers() {
     // `HEADS` cell, which any signature edit of the file moves (`make`'s and `get`'s read `P`,
     // entered and identical); a head task now reads a head of its own file by that head's
     // `Signature` cell (engine_heads.rs `heads_of`), and `area`'s is no head they read.
-    edit("a parameter's type changed", lib(p, area_u64, other), &[("key moved", None, 1), ("read moved", sig, 2)], Some((1, 0)));
+    // Body counts are rows (D191): each body's library row and its test build's row.
+    edit("a parameter's type changed", lib(p, area_u64, other), &[("key moved", None, 2), ("read moved", sig, 4)], Some((1, 0)));
     let p2 = "    pub x: u32,\n    pub y: u32,\n";
-    // `P`'s head moves (its key: its fields are its head), and `make`'s and `get`'s, which read
-    // it, come out identical. It was (7, 6) when every head's key held the file's surface. The
-    // names move too: OPEN (lane EY, for the names lanes): three bodies that name no `P` are
-    // entered by a names cell that moved, all identical; which cell is not yet found, so it is
-    // asserted as seen, not as wanted, and the head tasks such a cell enters are bounded, not
-    // counted: at least `P`'s and its two readers', at most the file's seven, and only `P`'s
-    // makes new heads.
-    let field = edit("a struct gains a field", lib(p2, area_u64, other), &[("read moved", sig, 2), ("read moved", Some(blaze_drive::Kind::CrateScope), 3)], None);
+    // `P`'s ADT head moves (its fields are its head), and `make`'s and `get`'s reads of that
+    // head's `Signature` cell enter them again, both with identical body results. The old
+    // `CrateScope` expectation came from a coarse whole-items read whose file text length and
+    // spans moved for an unrelated edit. The names task now defines its cell table, so that
+    // unrelated movement does not enter `area`, `other`, `top` or `helper`.
+    let field = edit("a struct gains a field", lib(p2, area_u64, other), &[("read moved", sig, 4)], None);
+    assert_eq!(field.stages[blaze_engine::Stage::Bodies.index()].entered, 4, "only the two bodies that use `P` are re-checked, two rows each (D191): {}", entries(&field));
+    assert_eq!(bodies(&field), &[("read moved", sig, 4)], "only `make` and `get` re-check on `P`'s ADT head, two rows each (D191): {}", entries(&field));
+    assert!(!field.because.iter().any(|(group, _)| group.stage == blaze_engine::Stage::Bodies && group.definer.is_some_and(|name| name.kind == blaze_drive::Kind::CrateScope)), "no body re-check is caused by an unrelated `CrateScope` cell: {}", entries(&field));
     let (entered, identical) = heads(&field);
     assert!((3..=7).contains(&entered) && identical + 1 == entered, "a struct gains a field: the head tasks (entered, identical) are `P`'s, moved, and readers that come out identical: {}", entries(&field));
-    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 1)], Some((0, 0)));
+    edit("a body edit", lib(p2, area_u64, "    4\n"), &[("key moved", None, 2)], Some((0, 0)));
     edit("a comment inside a body", lib(p2, area_u64, "    // four\n    4\n"), &[], Some((0, 0)));
 }
 
@@ -452,8 +609,14 @@ fn engine_check_keys_an_outline_and_its_bodies_by_their_edition() {
 
 /// The profile the last request wrote (`.blaze/v2/profile.txt` in the checkout).
 pub(super) fn profile(io: &Io) -> std::string::String {
+    profile_in(io, "ws")
+}
+
+/// The profile the last request in the checkout at `dir` wrote (its own `.blaze/v2/profile.txt`:
+/// a second worktree's request writes in its checkout, never in `ws`).
+pub(super) fn profile_in(io: &Io, dir: &str) -> std::string::String {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
-    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new(dir).expect("a path")).expect("open");
     let mut bytes = bstd::mem::Bytes::new_in(cx.frame(), "the profile");
     root.read_all(&cx, &Path::new(print::PROFILE).expect("a path"), &mut bytes).expect("the profile is there");
     std::string::String::from_utf8_lossy(bytes.as_slice()).into_owned()
@@ -487,7 +650,7 @@ fn engine_check_outlines_only_the_changed_file() {
     let (body_ids, body) = engine_from(&io, 2, false);
     println!("a statement: files {:?}, pages {}, entered {}\n{}", body.files, body.pages_written, entries(&body), profile_lines(&io));
     assert_eq!(body.files, engine_check::Files { read_back: 2, outlined: 1, probed: 0 }, "the statement's file alone outlined");
-    assert_eq!(body.stages[blaze_engine::Stage::Bodies.index()].entered, 1, "one body entered\n{}", entries(&body));
+    assert_eq!(body.stages[blaze_engine::Stage::Bodies.index()].entered, 2, "one body entered, its library's and its test build's rows (D191: a row each unit that holds it)\n{}", entries(&body));
     let (fresh_ids, fresh) = engine_from(&io, 2, true);
     assert_eq!(fresh.files.outlined, 3, "a fresh run outlines every file");
     assert_eq!((body_ids, body.status.0, body.bodies.0.clone()), (fresh_ids, fresh.status.0, fresh.bodies.0.clone()), "the incremental answer is a fresh run's");
@@ -516,7 +679,7 @@ fn engine_check_plans_a_project_sized_file() {
     println!("engine-check of {BODIES} one-line fns: {:?}, phases {:?}", began.elapsed(), checked.phases);
     entered_once(&checked, 4);
     let bodies: std::vec::Vec<_> = checked.phases.iter().filter(|(phase, ..)| phase.stage == blaze_engine::Stage::Bodies).map(|(_, planned, entered)| (*planned, *entered)).collect();
-    assert_eq!(bodies, [(BODIES as u32, BODIES as u32)], "a task a body, each entered once");
+    assert_eq!(bodies, [(2 * BODIES as u32, 2 * BODIES as u32)], "a task a body's row, each entered once: the library's and its test build's (D191)");
     let (notes, clean) = &checked.bodies;
     assert_eq!(*clean as usize, BODIES, "every body checked clean; notes: {:?}", &notes[..notes.len().min(3)]);
 }
@@ -555,7 +718,7 @@ fn engine_check_plans_a_project_sized_workspace() {
     let names: u32 = checked.phases.iter().filter(|(phase, ..)| phase.stage == blaze_engine::Stage::Names).map(|(_, _, entered)| *entered).sum();
     assert!(names as usize >= CRATES, "a names task a crate: {names}");
     let bodies: std::vec::Vec<_> = checked.phases.iter().filter(|(phase, ..)| phase.stage == blaze_engine::Stage::Bodies).map(|(_, planned, entered)| (*planned, *entered)).collect();
-    assert_eq!(bodies, [(2 * CRATES as u32, 2 * CRATES as u32)], "a task a body, each entered once");
+    assert_eq!(bodies, [(4 * CRATES as u32, 4 * CRATES as u32)], "a task a body's row, each entered once: two bodies a crate, each under its library and its test build (D191)");
     let (notes, clean) = &checked.bodies;
     assert_eq!(*clean as usize, 2 * CRATES, "every body checked clean; notes: {:?}", &notes[..notes.len().min(3)]);
     // The Heads stage: one impl tables task a crate of the world, none refused.
@@ -573,7 +736,12 @@ fn engine_check_plans_a_project_sized_workspace() {
     println!("one statement in {CRATES} crates: {:?}, files {:?}, pages written {}, entered:\n{}\n{}", began.elapsed(), edit.files, edit.pages_written, entries(&edit), profile_lines(&io));
     assert_eq!(edit.files, engine_check::Files { read_back: CRATES as u32 - 1, outlined: 1, probed: 0 }, "one file outlined and read");
     assert_eq!(edit.stages[blaze_engine::Stage::Outlines.index()].entered, 1, "one outline entered\n{}", entries(&edit));
-    assert_eq!(edit.stages[blaze_engine::Stage::Bodies.index()].entered, 1, "one body entered\n{}", entries(&edit));
+    assert_eq!(
+        edit.stages[blaze_engine::Stage::Bodies.index()].entered,
+        2,
+        "one body entered, in its 2 units' rows (D191: \"Every unit that holds a body checks it; the first holder in rank keeps the body's plain name (the base), each other holder's row is the name at its view\": c7's library and its test build)\n{}",
+        entries(&edit)
+    );
     // THE UNIT GRAPH IS READ BACK (plan row D2): no manifest moved, so the graph of 400 crates
     // is its stored record, no fetch run, no lock walked.
     assert_eq!(edit.units, crate::engine_units::Units { read_back: 1, discovered: 0, fetches_run: 0 }, "the graph read back\n{}", profile_lines(&io));
@@ -592,21 +760,21 @@ fn engine_check_checks_the_bodies_a_macro_wrote() {
         let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", text);
-        let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
-        let old_said = stdout(&io);
-        let before = old_said.len();
+        let before = stdout(&io).len();
         let (_, checked) = engine(&io, 1);
         let said = stdout(&io).split_off(before);
         entered_once(&checked, 1);
         let (notes, clean) = &checked.bodies;
         println!("engine-check of a macro-written fn (wrong {wrong}): {clean} clean, notes {notes:?}\n{said}");
-        assert_eq!(Some(checked.status.0), old.status, "engine-check's status is check's (wrong {wrong}); check said:\n{old_said}\nengine-check said:\n{said}");
+        // The wrong form fails the command, the good one does not (the old checker was the
+        // oracle until 2026-11-19).
+        assert_eq!(checked.status.0 == Status::FAILED.0, wrong, "engine-check's status (wrong {wrong}):\n{said}");
         assert!(notes.iter().all(|note| !note.contains("not checked")), "no body left unchecked: {notes:?}");
-        // The wrong written body's error is printed as `check` prints it (covered.rs
-        // `WRITTEN_UNPLACED`: at the call's item, said so), not a note.
+        // The wrong written body's error is printed (covered.rs `WRITTEN_UNPLACED`: at the
+        // call's item, said so), not a note.
         assert!(notes.is_empty(), "no body's finding is a note: {notes:?}");
-        assert_eq!(error_lines(&said), error_lines(&old_said), "the written body's error lines are check's (wrong {wrong}); check said:\n{old_said}\nengine-check said:\n{said}");
         assert_eq!(error_lines(&said).len(), usize::from(wrong), "the wrong written body's one error:\n{said}");
+        assert!(error_lines(&said).iter().all(|line| line.contains("src/lib.rs:")), "the error is placed in the file:\n{said}");
         assert!(!said.contains("NOT checked: types"), "types checked whole:\n{said}");
     }
 }
@@ -615,13 +783,13 @@ fn engine_check_checks_the_bodies_a_macro_wrote() {
 fn engine_check_lists_what_check_lists_for_the_outlines() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     workspace(&io);
-    let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
+    let mut listed = std::vec::Vec::new();
     for workers in [1, 4] {
         let (ids, checked) = engine(&io, workers);
-        assert!(!ids.is_empty(), "engine-check with {workers} worker(s) listed nothing; check listed {:?}", old.ids);
-        for id in &ids {
-            assert!(old.ids.contains(id), "engine-check listed {id:?}, which check did not: check listed {:?}", old.ids);
-        }
+        // The stray `}` of `src/a/b.rs`, a syntax error (the old checker was the oracle until
+        // 2026-11-19); 1 and 4 workers list the same.
+        assert!(ids.iter().any(|(code, _)| code == "syntax"), "engine-check with {workers} worker(s) listed no syntax error: {ids:?}");
+        listed.push(ids);
         // One `Outlines` task a file (lib.rs, a.rs, a/b.rs), each entered once; every phase
         // entered what it planned.
         let outlines: std::vec::Vec<_> = checked.phases.iter().filter(|(phase, ..)| phase.stage == blaze_engine::Stage::Outlines).map(|(_, planned, entered)| (*planned, *entered)).collect();
@@ -629,6 +797,7 @@ fn engine_check_lists_what_check_lists_for_the_outlines() {
         entered_once(&checked, workers);
         assert_eq!(checked.status.0, Status::FAILED.0, "a syntax error fails the command");
     }
+    assert_eq!(listed[0], listed[1], "1 and 4 workers list the same findings");
 }
 
 /// Each stage's entries and the "entered because" table of one request, for a message.
@@ -676,13 +845,15 @@ fn engine_check_starts_from_its_stored_answer() {
         groups.sort();
         groups
     };
-    // A comment at the end of one file: its file's outline alone, named by its path (it stands
-    // while its text moves), entered because its key moved; its surface cell stands, so no
-    // crate's names and no body is entered.
+    // A comment at the end of one file: its file's outline, named by its path (it stands while
+    // its text moves), entered because its key moved; and the file's own lint unit (unit 0, the
+    // file with its top-level items as holes, engine_lints.rs THE PLAN), whose bytes hold the
+    // comment, so a token rule over comments sees it. Its surface cell stands, so no crate's
+    // names, no body and no item's lint unit is entered.
     write(&io, "a/src/m.rs", "pub fn k() -> u8 {\n    2\n}\n// a comment\n");
     let (_, comment) = engine_from(&io, 2, false);
-    assert_eq!(because(&comment), [(blaze_engine::Stage::Outlines, "key moved", None, 1)], "a comment enters its file's outline alone: {}", entries(&comment));
-    assert_eq!(comment.entered, 1, "a comment: {}", entries(&comment));
+    assert_eq!(because(&comment), [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Lints, "key moved", None, 1)], "a comment enters its file's outline and its file's lint unit alone: {}", entries(&comment));
+    assert_eq!(comment.entered, 2, "a comment: {}", entries(&comment));
     nothing("a comment");
 
     // A statement added to one body: that file's outline, that one body, and the floor of the
@@ -692,8 +863,11 @@ fn engine_check_starts_from_its_stored_answer() {
     let (_, statement) = engine_from(&io, 2, false);
     assert_eq!(
         because(&statement),
-        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 1)],
-        "a statement enters its outline and body alone: {}",
+        // The body's two rows (D191: its library's and its test build's), and two lint units
+        // whose bytes hold the statement (engine_lints.rs `plan`: the item's own unit, and the
+        // file's unit 0, whose hole for the item moved with its length).
+        [(blaze_engine::Stage::Outlines, "key moved", None, 1), (blaze_engine::Stage::Bodies, "key moved", None, 2), (blaze_engine::Stage::Lints, "key moved", None, 2)],
+        "a statement enters its outline, its body's two rows (D191) and its lint units alone: {}",
         entries(&statement)
     );
     assert_eq!(statement.stages[blaze_engine::Stage::Heads.index()].identical, 0, "a statement enters no heads: {}", entries(&statement));
@@ -794,18 +968,18 @@ pub(super) fn placed_ids(ids: &[(std::string::String, std::string::String)]) -> 
 fn engine_check_prints_a_body_error_as_check_does() {
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
     typed_crates(&io, Typed::Wrong);
-    let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
-    let old_said = stdout(&io);
     let (ids, first, checked) = said(&io, false);
     let first_said = first.join("\n");
     let first_closing = closing(&io);
-    println!("check printed:\n{old_said}\nengine-check printed:\n{first_said}\n{first_closing}");
-    assert_eq!(error_lines(&first_said), error_lines(&old_said), "the error's lines are check's; check said:\n{old_said}\nengine-check said:\n{first_said}");
-    assert_eq!(error_lines(&first_said).len(), 1, "one error printed:\n{first_said}");
+    println!("engine-check printed:\n{first_said}\n{first_closing}");
+    // `wrong`'s `true` where a `u8` is returned, at its line in `b` (the old checker was this
+    // test's oracle until 2026-11-19; the place is the oracle now).
+    let errors = error_lines(&first_said);
+    assert_eq!(errors.len(), 1, "one error printed:\n{first_said}");
+    assert!(errors[0].contains("b/src/lib.rs:6:"), "the error at `true`'s line in `wrong`:\n{first_said}");
     assert!(first_closing.contains("1 error"), "the closing line counts it: {first_closing}");
-    assert_eq!(Some(checked.status.0), old.status, "the status is check's");
     assert_eq!(checked.status.0, Status::FAILED.0, "a type error fails the command");
-    assert_eq!(placed_ids(&ids), placed_ids(&old.ids), "the listed findings are check's (code and id)");
+    assert_eq!(placed_ids(&ids).len(), 1, "one placed finding: {ids:?}");
 
     // (2) Nothing changed: the certificate, the same lines from the stored answer.
     let (again_ids, again, certificate) = said(&io, false);
@@ -854,7 +1028,7 @@ fn engine_check_keeps_a_refused_body_until_what_it_read_moves() {
     let (notes, _) = &first.bodies;
     println!("a broken dependency: {}, notes {notes:?}\n{}", entries(&first), first_lines.join("\n"));
     assert!(first_lines.iter().any(|line| line.contains("crate `a`")), "control: `a`'s names failed, naming it (else the fixture fails nothing):\n{}", first_lines.join("\n"));
-    let refused: std::vec::Vec<&std::string::String> = notes.iter().filter(|note| note.starts_with("`b/src/lib.rs`") && note.contains("was not checked")).collect();
+    let refused: std::vec::Vec<&std::string::String> = notes.iter().filter(|note| note.starts_with("`b/src/lib.rs`") && note.contains("not checked because")).collect();
     assert_eq!(refused.len(), 1, "`b`'s one body is refused with a note: {notes:?}\n{}", entries(&first));
     assert!(
         refused[0].contains("no names record") || refused[0].contains("no `Names` task") || refused[0].contains("check scope could not be read"),
@@ -875,7 +1049,7 @@ fn engine_check_keeps_a_refused_body_until_what_it_read_moves() {
     write(&io, "a/Cargo.toml", plain);
     let (_, fixed_lines, fixed) = said(&io, false);
     println!("fixed: {}\n{}", entries(&fixed), fixed_lines.join("\n"));
-    assert_eq!(fixed.stages[blaze_engine::Stage::Bodies.index()].entered, 2, "`one` and `h` entered after the fix: {}", entries(&fixed));
+    assert_eq!(fixed.stages[blaze_engine::Stage::Bodies.index()].entered, 4, "`one` and `h` entered after the fix, each under its library and its test build (D191: a row each unit that holds the body): {}", entries(&fixed));
     let (fixed_notes, clean) = &fixed.bodies;
     assert!(fixed_notes.is_empty(), "fixed: no body is refused: {fixed_notes:?}");
     assert_eq!(*clean, 2, "`one` and `h` checked clean after the fix");
@@ -897,23 +1071,17 @@ fn engine_check_prints_a_lint_and_a_borrow_finding_as_check_does() {
         "src/lib.rs",
         "pub struct S;\n\npub fn moved() -> u8 {\n    let s = S;\n    let _t = s;\n    let _u = s;\n    1\n}\n\npub unsafe fn read(p: *const u8) -> u8 {\n    *p\n}\n",
     );
-    let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
-    let old_said = stdout(&io);
     let (ids, lines, _) = said(&io, false);
     let engine_said = lines.join("\n");
-    println!("check listed {:?}\ncheck printed:\n{old_said}\nengine-check listed {ids:?}\nengine-check printed:\n{engine_said}\n{}", old.ids, closing(&io));
-    // `check` lists and draws the lint twice: the file has two owners (the lib and its test
-    // unit), each a record of the body; the engine checks the body once. One each compared.
-    let once = |mut lines: std::vec::Vec<std::string::String>| {
-        lines.dedup();
-        lines
-    };
-    let mut check_ids = placed_ids(&old.ids);
-    check_ids.dedup();
-    assert_eq!(placed_ids(&ids), check_ids, "the listed findings are check's (code and id)");
+    println!("engine-check listed {ids:?}\nengine-check printed:\n{engine_said}\n{}", closing(&io));
+    // The old checker was this test's oracle until 2026-11-19 (it listed the lint once an
+    // owner); the lint's place is the oracle now: one finding, once, at `*p`'s line.
     assert!(ids.iter().any(|(code, _)| code == "unsafe-op-in-unsafe-fn"), "the lint is listed: {ids:?}");
-    assert_eq!(warning_lines(&engine_said), once(warning_lines(&old_said)), "the warning lines are check's");
-    assert_eq!(error_lines(&engine_said), error_lines(&old_said), "the error lines are check's");
+    assert_eq!(ids.iter().filter(|(code, _)| code == "unsafe-op-in-unsafe-fn").count(), 1, "the body checked once, its lint listed once: {ids:?}");
+    let warnings = warning_lines(&engine_said);
+    assert_eq!(warnings.len(), 1, "one warning line:\n{engine_said}");
+    assert!(warnings[0].contains("src/lib.rs:11:") && warnings[0].contains("unsafe-op-in-unsafe-fn"), "the warning at `*p`:\n{engine_said}");
+    assert!(error_lines(&engine_said).is_empty(), "no error line (no borrow finding on this shelf):\n{engine_said}");
     let (again_ids, again, certificate) = said(&io, false);
     assert!(certificate.certified, "nothing changed: the certificate; {}", entries(&certificate));
     // The closing line holds the time and the rebuilt count, which a certificate changes.
@@ -951,17 +1119,13 @@ fn lint_counts(checked: &engine_check::Checked) -> (u32, u32) {
 fn engine_check_lints_each_item_by_its_text() {
     let io = Io::simulated(SimWorld::new(14, Limits::USUAL));
     linted(&io, "aa", "n");
-    // (a) As `check` prints it.
-    let _ = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
-    let old_said = stdout(&io);
+    // (a) The one warning, at its place (the old checker's line was this step's second oracle
+    // until 2026-11-19; the exact line below is the oracle now).
     let (_, first, checked) = said(&io, false);
     let first_said = first.join("\n");
-    let mut check_warnings = warning_lines(&old_said);
-    check_warnings.dedup();
     let warnings = warning_lines(&first_said);
-    assert_eq!(warnings.len(), 1, "one warning, `f`'s recursion:\ncheck said:\n{old_said}\nengine-check said:\n{first_said}\n{}", entries(&checked));
+    assert_eq!(warnings.len(), 1, "one warning, `f`'s recursion:\nengine-check said:\n{first_said}\n{}", entries(&checked));
     assert!(warnings[0].contains("app/src/a.rs:1:8: warning[recursion]: `f` calls itself (at `f`)"), "placed at `f`'s name, naming the call: {warnings:?}");
-    assert_eq!(warnings, check_warnings, "the warning line is check's:\ncheck said:\n{old_said}\nengine-check said:\n{first_said}");
     assert!(checked.lints.entered.contains(&std::string::String::from("app/src/a.rs::f")) && checked.lints.entered.contains(&std::string::String::from("app/src/a.rs::g")), "every unit linted first: {:?}", checked.lints);
     assert_eq!(checked.lints.findings, 1, "one finding made: {:?}", checked.lints);
     // (e) The by-rule line: `recursion`, a nonzero cost, one finding.
@@ -1038,7 +1202,7 @@ fn names_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::String>, [u32; 
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
-    let mut phases = Phases::new(io.need_clock().expect("a clock"));
+    let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
         let rows = &kept.answer.rows;
         let (mut bad, mut counts) = (std::vec::Vec::new(), [0u32; 4]);
@@ -1141,10 +1305,11 @@ fn adding_a_private_fn_rechecks_one_body() {
     // their head tasks' cells, engine_heads.rs, lane EY; before, every body that read a head of
     // the file was entered by the file's `HEADS` cell: "Bodies read moved FileItems 8").
     let geom = "use crate::stats::*;\n\npub fn area(w: u32, h: u32) -> u32 {\n    scale(w) * h\n}\n\nfn scale(x: u32) -> u32 {\n    x + crate::stats::total(0, 0)\n}\n\npub fn side() -> u32 {\n    total(1, 1)\n}\n";
-    let new_alone: &[(&'static str, Option<blaze_drive::Kind>, u32)] = &[("new", None, 1)];
-    edit("a private fn added", "src/geom.rs", &format!("{geom}\nfn extra() -> u32 {{\n    7\n}}\n"), Some(0), 1, Some(new_alone), true);
+    // The new body's two rows (D191: its library's and its test build's), both new.
+    let new_alone: &[(&'static str, Option<blaze_drive::Kind>, u32)] = &[("new", None, 2)];
+    edit("a private fn added", "src/geom.rs", &format!("{geom}\nfn extra() -> u32 {{\n    7\n}}\n"), Some(0), 2, Some(new_alone), true);
     let stats = "pub fn total(a: u32, b: u32) -> u32 {\n    a + b\n}\n\npub fn mean(a: u32, b: u32) -> u32 {\n    total(a, b) / 2\n}\n\npub fn spread() -> u32 {\n    crate::geom::side() + 1\n}\n";
-    edit("a pub fn added nobody calls", "src/stats.rs", &format!("{stats}\npub fn unused() -> u32 {{\n    9\n}}\n"), Some(0), 1, Some(new_alone), true);
+    edit("a pub fn added nobody calls", "src/stats.rs", &format!("{stats}\npub fn unused() -> u32 {{\n    9\n}}\n"), Some(0), 2, Some(new_alone), true);
     // A `use` no body reads: the names move and no body is entered.
     let lib = "mod geom;\nmod stats;\n\npub fn top() -> u32 {\n    geom::area(2, 3) + stats::mean(4, 6)\n}\n\npub fn helper() -> u32 {\n    stats::total(1, 2)\n}\n";
     edit("a `use` no body reads", "src/lib.rs", &format!("use stats::spread;\n{lib}"), Some(0), 0, Some(&[]), true);
@@ -1157,7 +1322,7 @@ fn adding_a_private_fn_rechecks_one_body() {
     // entered, by a names cell or by the file's `HEADS` (the first read that moved names the
     // cause), and they then fail.
     let renamed = stats.replace("pub fn total(", "pub fn sum(");
-    let checked = edit("a pub fn renamed", "src/stats.rs", &format!("{renamed}\npub fn unused() -> u32 {{\n    9\n}}\n"), None, 1, None, false);
+    let checked = edit("a pub fn renamed", "src/stats.rs", &format!("{renamed}\npub fn unused() -> u32 {{\n    9\n}}\n"), None, 2, None, false);
     let entered: u32 = bodies(&checked).iter().filter(|(cause, _, _)| *cause != "new").map(|(_, _, n)| *n).sum();
     assert!(entered >= 3, "a pub fn renamed: its three callers entered: {}", entries(&checked));
 }
@@ -1426,7 +1591,7 @@ fn a_repeat_with_nothing_changed_stats_no_path() {
     assert_eq!(again.sweep.journal, journal_sweep::JournalUse::Used, "{}", sweep_line(&io));
     assert_eq!((again.sweep.events, again.sweep.statted), (0, 0), "no event, no path statted: {}", sweep_line(&io));
     assert!(again.sweep.leaves > 0, "the leaf table holds the answer's reads");
-    assert!(sweep_line(&io).starts_with("sweep: journal used; events 0; paths statted 0 of "), "{}", sweep_line(&io));
+    assert!(sweep_line(&io).starts_with("sweep: statted 0 of ") && sweep_line(&io).contains("(by events since id "), "{}", sweep_line(&io));
 }
 
 /// (b) ONE FILE WRITTEN: the journal names it (and the publish's temporary name beside it, which
@@ -1510,15 +1675,15 @@ fn a_write_after_the_replay_is_seen_by_the_next() {
         taken.encode(&mut bytes);
         bytes
     };
-    let first = journal_sweep::take(&cx, &root, &home, &clock, journal_sweep::Stored::NONE, None, frame).expect("the replay");
+    let first = journal_sweep::take(&cx, &root, &home, &clock, journal_sweep::Stored::NONE, frame).expect("the replay");
     let first_bytes = saved(&first);
     // CONTROL: nothing written since the place.
     let stored = journal_sweep::Stored::of(&first_bytes).expect("the places read back whole");
-    let quiet = journal_sweep::take(&cx, &root, &home, &clock, stored, None, frame).expect("the replay");
+    let quiet = journal_sweep::take(&cx, &root, &home, &clock, stored, frame).expect("the replay");
     assert_eq!((quiet.journal.clone(), quiet.events), (journal_sweep::JournalUse::Used, 0), "nothing written: nothing named");
     // The write a request's reads would race: after the place, before the read.
     write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    1\n}\n// late\n");
-    let next = journal_sweep::take(&cx, &root, &home, &clock, stored, None, frame).expect("the replay");
+    let next = journal_sweep::take(&cx, &root, &home, &clock, stored, frame).expect("the replay");
     println!("a write after the place: {} event(s)", next.events);
     assert_eq!(next.journal, journal_sweep::JournalUse::Used);
     assert!(next.events >= 1, "the late write is named by the next replay");
@@ -1547,7 +1712,7 @@ fn stored_graph_out(io: &Io) -> blaze_ids::ContentId {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
-    let mut phases = Phases::new(io.need_clock().expect("a clock"));
+    let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let got = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| kept.answer.rows.get(&blaze_drive::Name::unit_graph()).map(|row| row.out));
     got.expect("the stored answer opens").expect("an answer opens").expect("the answer has a unit graph row")
 }
@@ -1581,6 +1746,27 @@ fn engine_check_reads_the_unit_graph_back() {
     let (_, again) = engine_from(&io, 2, false);
     assert!(again.certified, "nothing moved: the certificate");
     assert_eq!(again.units, crate::engine_units::Units::default(), "the certificate opens no units stage");
+}
+
+/// A REACHABLE MODULE IS WITHDRAWN FROM THE STANDING PLAN (plan row D2): deleting `a`'s module
+/// and removing its `mod` edge changes the file plan while the manifests, lock and graph inputs
+/// remain fixed. The graph is read back without a fetch or graph walk, and the resulting answer
+/// equals a fresh request with the old module's body absent.
+#[test]
+fn engine_check_withdraws_a_deleted_reachable_module_from_the_plan() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    three_crates(&io);
+    let _ = engine_from(&io, 2, false);
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    root.remove(&cx, &Path::new("a/src/m.rs").expect("a path"), Durable::No).expect("remove the module");
+    write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
+    write(&io, "b/src/lib.rs", "pub fn g() -> u8 {\n    a::f()\n}\n");
+    let (ids, now) = engine_from(&io, 2, false);
+    let (fresh_ids, fresh) = engine_from(&io, 2, true);
+    println!("deleted reachable module: units {:?}, files {:?}, entries {}\n{}", now.units, now.files, now.bodies.1, profile_lines(&io));
+    assert_eq!(now.units, crate::engine_units::Units { read_back: 1, discovered: 0, fetches_run: 0 }, "the unchanged graph is read back after a source deletion\n{}", profile_lines(&io));
+    assert_eq!((ids, now.status.0, now.bodies.0.clone()), (fresh_ids, fresh.status.0, fresh.bodies.0.clone()), "withdrawing the deleted module matches a fresh request");
 }
 
 /// EARLY CUTOFF OF THE GRAPH (plan row D2): a comment in a member's `Cargo.toml` moves the

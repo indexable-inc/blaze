@@ -148,6 +148,7 @@ pub(crate) fn refused(effect: crate::Effect) -> Done {
 
 #[cfg(unix)]
 mod unix {
+    use blaze_sys::posix::io::PollEvents;
     use std::{
         alloc::Global,
         io,
@@ -212,7 +213,7 @@ mod unix {
         /// Fired as it is unbound.
         stop: Stop,
         /// The receives asked of it, in order, for its one receiving thread.
-        receives: SegQueue<Receive>,
+        receives: SegQueue<Receive, std::alloc::Global>,
         /// What its receiving thread parks on while `receives` is empty.
         parker: Parker,
         /// Whether its receiving thread was started.
@@ -684,17 +685,17 @@ mod unix {
     fn wait_for(
         what: &'static str,
         fd: BorrowedFd<'_>,
-        events: libc::c_short,
+        events: core::ffi::c_short,
         stop: Option<&Stop>,
         shared: &Shared,
     ) -> Woke {
         let mut fds = [
             libc::pollfd { fd: fd.as_raw_fd(), events, revents: 0 },
-            libc::pollfd { fd: shared.stop.read.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: shared.stop.read.as_raw_fd(), events: PollEvents::IN.bits(), revents: 0 },
             // A second look at the host's stop where there is no socket's: the same either way.
             libc::pollfd {
                 fd: stop.unwrap_or(&shared.stop).read.as_raw_fd(),
-                events: libc::POLLIN,
+                events: PollEvents::IN.bits(),
                 revents: 0,
             },
         ];
@@ -715,7 +716,7 @@ mod unix {
         loop {
             let what = "room in a UDP socket's buffer for an Effect::SendTo";
             let peer = batch.heads.get(at.run).map(|it| it.peer);
-            match wait_for(what, bound.socket.as_fd(), libc::POLLOUT, Some(&bound.stop), shared) {
+            match wait_for(what, bound.socket.as_fd(), PollEvents::OUT.bits(), Some(&bound.stop), shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     return bound.failed(batch, false, peer, None, "unbound with the send in flight");
@@ -779,7 +780,7 @@ mod unix {
                 }
             }
             let what = "a datagram for an Effect::RecvFrom";
-            match wait_for(what, bound.socket.as_fd(), libc::POLLIN, Some(&bound.stop), shared) {
+            match wait_for(what, bound.socket.as_fd(), PollEvents::IN.bits(), Some(&bound.stop), shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     return bound.failed(into, true, None, None, "unbound with the receive in flight");
@@ -867,7 +868,7 @@ mod unix {
         let mut at = 0;
         while at < bytes.len() {
             let what = "room in a standard stream for an Effect::WriteOut";
-            match wait_for(what, fd, libc::POLLOUT, None, shared) {
+            match wait_for(what, fd, PollEvents::OUT.bits(), None, shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     return Done::unsent(bytes, format_args!("writing {stream}: the driver ended"));
@@ -903,7 +904,7 @@ mod unix {
         let fd = input.as_fd();
         loop {
             let what = "the standard input for an Effect::ReadStdin";
-            match wait_for(what, fd, libc::POLLIN, None, shared) {
+            match wait_for(what, fd, PollEvents::IN.bits(), None, shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     let why = "reading the standard input: the driver ended";

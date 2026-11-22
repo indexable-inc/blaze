@@ -1,22 +1,28 @@
 //! RFC 4648 section 10's vectors, both alphabets, every refusal by its offset, and the round
 //! trip as a property with its planted-bug control.
 
-use std::{alloc::Global, format, string::String as StdString};
+use core::fmt;
+use std::{format, string::String as StdString, vec::Vec as StdVec};
 
-use blaze_sim::{Broke, Config, Tape};
+use blaze_own::Alloc;
+use blaze_sim::{Broken, Config, NoPlant, Planted, Tape, check, controls};
 
 use crate::{
-    DecodeError, Engine, OutputTooSmall, Padding, STANDARD, STANDARD_NO_PAD, URL_SAFE,
-    URL_SAFE_NO_PAD,
-    plant::{self, Plant},
+    Base64Plant, DecodeError, Engine, OutputTooSmall, Padding, STANDARD, STANDARD_NO_PAD,
+    URL_SAFE, URL_SAFE_NO_PAD,
 };
 
-fn enc(engine: Engine, input: &[u8]) -> StdString {
-    StdString::from(engine.encode_in(input, Global).as_str())
+/// The test's allocator (D102): the process heap's handle, never `Global`.
+fn heap() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
 }
 
-fn dec(engine: Engine, input: &str) -> Result<std::vec::Vec<u8>, DecodeError> {
-    engine.decode_in(input.as_bytes(), Global).map(|v| v.as_slice().to_vec())
+fn enc(engine: Engine, input: &[u8]) -> StdString {
+    StdString::from(engine.encode_in(input, heap()).as_str())
+}
+
+fn dec(engine: Engine, input: &str) -> Result<StdVec<u8>, DecodeError> {
+    engine.decode_in(input.as_bytes(), heap()).map(|v| v.as_slice().to_vec())
 }
 
 #[test]
@@ -97,56 +103,113 @@ fn encode_append_pads_only_the_last_piece() {
 
 const ENGINES: [Engine; 4] = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD];
 
-/// decode(encode(x)) == x, the length is `encoded_len`, and every symbol is the alphabet's.
-fn round_trip(tape: &Tape) -> Result<(), Broke> {
-    let bytes = tape.bytes(0..=80, "bytes");
-    let engine = *tape.one_of(&ENGINES, "engine");
-    let text = engine.encode_in(&bytes, Global);
-    if Some(text.len()) != engine.encoded_len(bytes.len()) {
-        return Err(Broke::Oracle(format!("encoded_len is not the length of {:?}", text.as_str())));
+/// The invariants of the round trip and of canonical decoding.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum TripBroken {
+    /// `encoded_len` is not the length of the encoding.
+    Length { text: StdVec<u8>, said: Option<usize> },
+    /// The encoding decoded to other bytes.
+    Differs { bytes: StdVec<u8>, text: StdVec<u8>, back: StdVec<u8> },
+    /// The encoding was refused by the decoder of the same engine.
+    Refused { bytes: StdVec<u8>, text: StdVec<u8>, error: DecodeError },
+    /// A text that decoded encodes back as another text: two texts mean the same bytes.
+    NotCanonical { text: StdString, again: StdString },
+}
+
+impl fmt::Display for TripBroken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TripBroken::Length { text, said } => {
+                write!(f, "encoded_len says {said:?}, not the length of {text:?}")
+            }
+            TripBroken::Differs { bytes, text, back } => {
+                write!(f, "the round trip of {bytes:?} through {text:?} gave {back:?}")
+            }
+            TripBroken::Refused { bytes, text, error } => {
+                write!(f, "the round trip of {bytes:?} through {text:?} was refused: {error}")
+            }
+            TripBroken::NotCanonical { text, again } => {
+                write!(f, "{text:?} decoded, but encodes back as {again:?}")
+            }
+        }
     }
-    match engine.decode_in(text.as_bytes(), Global) {
+}
+
+blaze_sim::plants! {
+    /// The bugs planted in the round trip, each with the invariant that must catch it.
+    enum TripPlant breaks TripBroken {
+        /// The encoder as it is.
+        None,
+        /// A two-byte tail's third symbol carries a stray bit: its decoder refuses it.
+        TailSetsBit => TripBroken::Refused { error: DecodeError::TrailingBits { .. }, .. },
+    }
+}
+
+impl TripPlant {
+    /// The encoder's plant this control plants.
+    fn planted(self) -> Base64Plant {
+        match self {
+            TripPlant::None => Base64Plant::None,
+            TripPlant::TailSetsBit => Base64Plant::TailSetsBit,
+        }
+    }
+}
+
+/// The most bytes the round trip draws, and the room their encoding needs.
+const MOST_BYTES: usize = 80;
+const ENCODED_ROOM: usize = (MOST_BYTES + 2) / 3 * 4;
+
+/// decode(encode(x)) == x, the length is `encoded_len`, and every symbol is the alphabet's.
+fn round_trip(tape: &Tape, plant: impl Planted<Base64Plant>) -> Result<(), Broken<TripBroken>> {
+    let bytes = tape.bytes(0..=MOST_BYTES, "bytes");
+    let engine = *tape.one_of(&ENGINES, "engine");
+    let mut room = [0u8; ENCODED_ROOM];
+    let n = engine
+        .encode_into_planted(&bytes, &mut room, plant)
+        .map_err(|small| Broken::Harness(format!("the room for {} bytes is too small: {small}", bytes.len())))?;
+    let text = &room[..n];
+    if Some(n) != engine.encoded_len(bytes.len()) {
+        let said = engine.encoded_len(bytes.len());
+        return Err(Broken::Oracle(TripBroken::Length { text: text.to_vec(), said }));
+    }
+    match engine.decode_in(text, heap()) {
         Ok(back) if back.as_slice() == bytes.as_slice() => Ok(()),
-        Ok(back) => Err(Broke::Oracle(format!(
-            "the round trip of {bytes:?} through {:?} gave {:?}",
-            text.as_str(),
-            back.as_slice()
-        ))),
-        Err(error) => Err(Broke::Oracle(format!(
-            "the round trip of {bytes:?} through {:?} was refused: {error}",
-            text.as_str()
-        ))),
+        Ok(back) => Err(Broken::Oracle(TripBroken::Differs {
+            bytes,
+            text: text.to_vec(),
+            back: back.as_slice().to_vec(),
+        })),
+        Err(error) => Err(Broken::Oracle(TripBroken::Refused { bytes, text: text.to_vec(), error })),
     }
 }
 
 #[test]
 fn decode_inverts_encode() {
-    blaze_sim::check(Config::cases(500), round_trip);
+    check(Config::cases(500), |tape| round_trip(tape, NoPlant));
 }
 
 #[test]
-fn the_oracle_catches_a_tail_with_a_stray_bit() {
-    let run = |tape: &Tape, p: Plant| plant::with(p, || round_trip(tape));
-    blaze_sim::control(Config::cases(500), Plant::Clean, Plant::TailSetsBit, "round trip", run);
+fn every_round_trip_plant_is_caught_by_its_invariant() {
+    controls(Config::cases(500), |tape, plant: TripPlant| round_trip(tape, plant.planted()));
 }
 
 /// Any text of the alphabet's bytes and `=` either decodes and encodes back to itself (one
 /// text per meaning) or is refused.
 #[test]
 fn a_text_that_decodes_is_the_canonical_one() {
-    blaze_sim::check(Config::cases(500), |tape| {
+    check(Config::cases(500), |tape| -> Result<(), Broken<TripBroken>> {
         let engine = *tape.one_of(&ENGINES, "engine");
         let text = tape.text_from("AQgw+/-_=", 0..=12, "text");
-        match engine.decode_in(text.as_bytes(), Global) {
+        match engine.decode_in(text.as_bytes(), heap()) {
             Err(_) => Ok(()),
             Ok(bytes) => {
-                let again = engine.encode_in(&bytes, Global);
+                let again = engine.encode_in(&bytes, heap());
                 match again.as_str() == text.as_str() {
                     true => Ok(()),
-                    false => Err(Broke::Oracle(format!(
-                        "{text:?} decoded, but encodes back as {:?}",
-                        again.as_str()
-                    ))),
+                    false => Err(Broken::Oracle(TripBroken::NotCanonical {
+                        text: StdString::from(text.as_str()),
+                        again: StdString::from(again.as_str()),
+                    })),
                 }
             }
         }

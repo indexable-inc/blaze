@@ -31,12 +31,16 @@
 //!   `blaze_expand::call_key` (one kept expansion), but Rust makes two blocks, two modules and
 //!   two `Out` enums. A table keyed by the call key has two candidate modules for one key; the
 //!   test also asks that the two expansions' blocks are two different modules.
+//! - `dispatch::written_alias`: the expansion's `Calls = u8` is visible before its declaration
+//!   and as the receiver in `<Calls as Read>::byte()`. In the same tuple, `super::Parent`
+//!   refers to the crate root's `bool`.
 //!
 //! Expected lines (in any order): `macro_block_mod: clean`, `select_shaped: clean`,
 //! `nested_calls: clean`, `twice_called: clean`, then `twice_called: 2 expansion block
-//! modules`. The planted bug (the table answers the calling block's module for every block an
+//! modules`, and `dispatch::written_alias: clean`. The planted bug (the table answers the
+//! calling block's module for every block an
 //! expansion wrote, `scope_table::Planted::CallingModuleForExpansions`) must make each of the
-//! four NOT clean; that test prints `planted: caught in 4 of 4`.
+//! five NOT clean; that test prints `planted: caught in 5 of 5`.
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
@@ -93,6 +97,23 @@ fn macro_block_mod() -> u8 { let mut out = 0; set_k!(out); out }
 fn select_shaped() -> u8 { let mut out = 0; select_like!(out); out }
 fn nested_calls() -> u8 { let mut out = 0; outer_like!(out); out }
 fn twice_called() -> u8 { let mut out = 0; select_like!(out); select_like!(out); out }
+type Parent = bool;
+mod dispatch {
+    type Parent = u32;
+    type Calls = bool;
+    trait Read { fn byte() -> u8; }
+    impl Read for u8 { fn byte() -> u8 { 7 } }
+    macro_rules! decode {
+        () => {{
+            let pair: (Calls, super::Parent) = (7u8, true);
+            type Calls = u8;
+            <Calls as Read>::byte() + pair.0
+        }};
+    }
+    pub fn written_alias() -> u8 { decode!() }
+}
+macro_rules! missing { () => {{ let _: Absent = (); }}; }
+fn missing_written_type() { missing!() }
 ";
 
 /// The bodies that must check clean, each with the rule it proves.
@@ -101,6 +122,7 @@ const CLEAN: &[(&str, &str)] = &[
     ("select_shaped", "a select!-shaped expansion: its mod, a use of an enum from it and a match on the enum"),
     ("nested_calls", "a call inside an expansion: its expansion's block is a module under the INNER call, keyed under the outer expansion's block"),
     ("twice_called", "two equal calls in one block: two blocks, two modules, two enums, by where each call stands"),
+    ("dispatch::written_alias", "the block alias shadows the module alias throughout the block, including in a qualified path; super names the enclosing Rust module's parent"),
 ];
 
 /// One body's verdict: its line, whether it checked clean, and (for `twice_called`) how many
@@ -110,10 +132,11 @@ struct Verdict {
     clean: bool,
     line: String,
     expansion_modules: usize,
+    type_misses: Vec<(u32, u32, String)>,
 }
 
-/// Checks every body of [`CLEAN`] through front2, with the scope table's planted bug `planted`.
-fn run(planted: Planted) -> Vec<Verdict> {
+/// Checks the selected bodies through front2, with the scope table's planted bug `planted`.
+fn run(planted: Planted, cases: &[(&'static str, &str)]) -> Vec<Verdict> {
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
@@ -139,9 +162,10 @@ fn run(planted: Planted) -> Vec<Verdict> {
     let prepared = Prepares::new_in(heap.alloc());
     let mut buckets = None;
     let mut out = Vec::new();
-    for &(name, proves) in CLEAN {
-        let key = find(0, &[name]);
-        let refused = |line: String| Verdict { name, clean: false, line, expansion_modules: 0 };
+    for &(name, proves) in cases {
+        let path: Vec<_> = name.split("::").collect();
+        let key = find(0, &path);
+        let refused = |line: String| Verdict { name, clean: false, line, expansion_modules: 0, type_misses: Vec::new() };
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(key)) {
             out.push(refused(format!("{name}: no head: {e:?}")));
             continue;
@@ -174,14 +198,15 @@ fn run(planted: Planted) -> Vec<Verdict> {
             Err(CheckFail::Diags { diags, .. }) => (false, format!("{name}: diagnostics {diags:?} ({proves})")),
             Err(other) => (false, format!("{name}: {other:?} ({proves})")),
         };
-        out.push(Verdict { name, clean, line, expansion_modules: modules.len() });
+        let type_misses = body.type_misses.iter().map(|m| (m.at.start, m.at.end, m.name.to_string())).collect();
+        out.push(Verdict { name, clean, line, expansion_modules: modules.len(), type_misses });
     }
     out
 }
 
 #[test]
 fn mods_written_by_expansions_in_blocks_through_front2() {
-    let verdicts = run(Planted::None);
+    let verdicts = run(Planted::None, CLEAN);
     let mut report: Vec<String> = verdicts.iter().map(|v| v.line.clone()).collect();
     let mut failed: Vec<&str> = verdicts.iter().filter(|v| !v.clean).map(|v| v.name).collect();
     // Two equal calls in one block: each expansion's block is its own module.
@@ -206,9 +231,25 @@ fn mods_written_by_expansions_in_blocks_through_front2() {
 /// prove nothing about the table.
 #[test]
 fn the_calling_block_for_an_expansion_block_is_caught() {
-    let verdicts = run(Planted::CallingModuleForExpansions);
+    let verdicts = run(Planted::CallingModuleForExpansions, CLEAN);
     let caught = verdicts.iter().filter(|v| !v.clean).count();
     println!("planted: caught in {caught} of {}", verdicts.len());
     let missed: Vec<&str> = verdicts.iter().filter(|v| v.clean).map(|v| v.name).collect();
     assert!(missed.is_empty(), "the planted calling-block answer checked clean in: {missed:?}");
+}
+
+/// The printed invocation cannot supply the missing spelling. The path supplies the name
+/// and the invocation supplies the item-relative range.
+#[test]
+fn a_missing_expanded_type_names_its_segment_at_the_call() {
+    let verdicts = run(Planted::None, &[("missing_written_type", "an undeclared type in an expansion")]);
+    let result = &verdicts[0];
+    let item = "fn missing_written_type() { missing!() }";
+    let start = item.find("missing!()").unwrap() as u32;
+    let [(from, to, name)] = result.type_misses.as_slice() else { panic!("one type miss: {}", result.line) };
+    assert_eq!(name, "Absent");
+    assert_eq!(*from, start);
+    assert_eq!(&item[*from as usize..*to as usize], "missing!()");
+    assert!(result.line.contains("cannot find type `Absent`"), "{}", result.line);
+    println!("missing_written_type: cannot find type `Absent` at missing!()");
 }

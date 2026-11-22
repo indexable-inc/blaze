@@ -16,7 +16,7 @@ doctest = false
 [dependencies]
 # `Record`, `Slice`, `Writer`, `open_as`: every record here is a blaze-format buffer, read in place.
 # By path: the workspace entry turns on its `serde`, which would bring serde.
-blaze-format = { path = "../blaze-format" }
+blaze-format.workspace = true
 # `ItemKey`, `CrateItemKey`, `ContentId`, `Portable`: what every record names an item and a crate by.
 blaze-id.workspace = true
 # Integer conversions that say what they do: a bit's place widened to an index.

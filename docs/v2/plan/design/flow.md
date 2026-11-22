@@ -386,6 +386,98 @@ OrPatternBinding 4. Findings: 309 UnprovenOutlives, 224 Invalidated, 3 moves. Th
   `Box` deref lowered as `Deref`, not `DerefBox`), `Pool::run_now` (UseOfMoved at
   `(head.release)(job.0)`).
 
+## Lifetimes are produced once and carried beside the types (D148, the coordinator's design, 2026-11-19)
+
+MEASURED (tempo, 16,556 bodies): 1,895 bodies are not borrow-checked; about 1,400 of them because
+the flow REBUILDS lifetimes from source text in its own readers (crates/blaze-flow-lower sig.rs and
+sig/*, front2 lifetimes.rs, borrows.rs's per-body loop: about 6,000 lines) and lines them up with
+the erased types by position. Two counters differed by design (`SigPositionsUnaligned`, 382
+bodies); each lifetime-carrying feature had its own reader and its own refusal class. Rule 66's
+outside review (2026-11-19) and three failed rounds on one conversion say: rebuild.
+
+THE RULE: a declared type's lifetimes are produced ONCE, by the head lowering, in the same walk
+that interns the erased type, as a REGION COLUMN: one slot per region position of the type, in the
+type's own pre-order. Types stay erased (interning, keys and the trait solver do not change). The
+definer stores the columns in its head record; every reader takes them from there. Nothing reads a
+signature's text for lifetimes again. Body types carry no column: a body's regions are inferred by
+the flow, which gives every position a fresh origin, as now.
+
+One home (rule 30), built: crates/blaze-typeck/src/regions.rs (`Region { Static, Param(u32),
+Late { binder, var } }`, `region_arity`, `slots`, `each_slot_node`, `RegionCol::lay`, `Numbering`,
+`LifetimeParams`). `Param(i)` numbers the container's lifetimes, then the item's own in DECLARATION
+order, then one per elided input lifetime; never by first appearance. Elision (the Reference's three
+rules), the trait-object default and early/late-bound are decided once, by the definer; E0106 is a
+head error.
+
+THE CONTRACT every piece writes against (crates/blaze-typeck/src/region_facts.rs, piece L2 makes
+the file exactly so; pieces written before it exists use these names):
+
+```rust
+/// What one head's lowering produced (pieces L1a, L1b fill it; L2 stores it).
+pub struct HeadRegions<A: Allocator> {
+    pub params: LifetimeParams<A>,
+    /// A fn: laid over `FnPtr(inputs.., output)`; `child(k)` is input k, the last child the output.
+    pub sig: Option<RegionCol<A>>,
+    /// An async fn's WRITTEN return type (the future's output).
+    pub written_output: Option<RegionCol<A>>,
+    /// One per where-clause or bound, in the head's clause order (`nth`).
+    pub clauses: Vec<ClauseRegions<A>, A>,
+    pub outlives: Vec<Outlives, A>,
+    /// An ADT: (variant, field, the field type's column).
+    pub fields: Vec<(u32, u32, RegionCol<A>), A>,
+    /// An impl: its self type's column and its trait reference's.
+    pub impl_header: Option<(RegionCol<A>, Option<RegionCol<A>>)>,
+    /// An opaque type: how many lifetimes it captures (edition rules and `use<..>` applied).
+    pub opaque_captures: Option<u32>,
+}
+pub struct ClauseRegions<A: Allocator> { pub nth: u32, pub binders: u32, pub col: RegionCol<A> }
+pub enum Outlives { Type { clause: u32, region: Region }, Region { long: Region, short: Region } }
+
+/// What a reader asks (the flow lowering's `Facts` supplies it from head records).
+pub trait RegionFacts {
+    fn sig(&self, item: ItemKey) -> Result<SigRegions<'_>, RegionsUnread>;
+    fn clauses(&self, item: ItemKey) -> Result<&[ClauseView<'_>], RegionsUnread>;
+    fn outlives(&self, item: ItemKey) -> Result<&[Outlives], RegionsUnread>;
+    fn field(&self, adt: ItemKey, variant: u32, field: u32) -> Result<ColView<'_>, RegionsUnread>;
+    fn impl_header(&self, impl_: ItemKey) -> Result<(ColView<'_>, Option<ColView<'_>>), RegionsUnread>;
+    fn opaque_captures(&self, opaque: ItemKey) -> Result<u32, RegionsUnread>;
+    fn lifetime_params(&self, item: ItemKey) -> Result<ParamsView<'_>, RegionsUnread>;
+}
+pub struct SigRegions<'a> { pub params: ParamsView<'a>, pub col: ColView<'a>, pub written_output: Option<ColView<'a>> }
+/// Why a head's regions were not read: the item named, the cause typed (rule 19); never a guess.
+pub struct RegionsUnread { pub item: ItemKey, pub why: UnreadWhy }
+pub enum UnreadWhy { NoHead, HeadRefused, RecordForm { found: u32 } }
+```
+
+`ColView` and `ParamsView` are borrowed reads of a stored `RegionCol` and `LifetimeParams` (slots by
+index, `own()`, `child(k)`; count, `is_late(i)`, outlives pairs): the same reads the owned types give.
+
+At a call the flow maps each callee `Param(i)` to one fresh origin a call and each `Late` to one a
+call a variable; type-parameter positions come from the call's erased argument types counted by
+`region_arity` (the one counter; `npos` is it). A closure's signature regions come from the clause
+that expected it: the checker records WHERE the expectation came from (`SigFrom::Clause { expr, nth }`,
+`Written`, `Inferred`; `Object` and `FnPtr` refused by name at first), never a copy; `Late` slots are
+universal origins of the closure body, the others are the OWNER's origins and their relations
+become owner constraints. A by-reference capture's loan lives as long as the closure value
+(`let read = || value; value = 1; read();` is E0506: unreported today, the first control of piece L5).
+
+Pieces, written at once against the contract (one writer each, files disjoint):
+- **L1a** the fn-signature producer: front2 types.rs (`RegionSink` beside each intern), heads.rs.
+- **L1b** clauses, ADT fields, impl headers, opaque captures: front2 preds.rs, typeck world.rs
+  (`PClause::TypeOutlives`, `RegionOutlives`), a new front2 heads_regions.rs.
+- **L2** region_facts.rs and the head record, VERSION 22: front2 head_record.rs; restore equals fresh.
+- **L3** the fn consumer: front2 borrows.rs, flow-lower lib.rs `signature()`, sig.rs reduced to views.
+- **L4** the clause consumer: front2 call_generics.rs, borrows_ties.rs; flow-lower trait_ties.rs,
+  generic_call.rs, param_outlives.rs.
+- **L5** closures: typeck rules/closure.rs, infer/mod.rs `closure_hint`, columns.rs; flow-lower
+  closure.rs; front2 borrows_nested.rs.
+- **L6** (after the build) deletions: sig/{alias,impl_life,outlives,value}.rs, lifetimes.rs,
+  borrow_sig_world.rs, sig_impl.rs, async_output.rs, and a ban on `read_signature`.
+First controls, each piece: `fn f<'a, 'b>(y: &'b u8, x: &'a u8) -> &'a u8` called so that confusing
+'a and 'b accepts a dangling borrow is E0597; `fn g<T: 'static>(t: T)` given `&local` is refused.
+NOT of this family (other work): a future's auto traits from another fn's witness, hidden-type
+questions, unnormalised projections (about 220 bodies), a mod in a macro-written block.
+
 ## For a successor
 
 - Read BUILD-STATUS.md for the last lines of blaze-flow, blaze-flow-lower and the census; the

@@ -31,17 +31,23 @@
 use core::{alloc::Allocator, fmt};
 
 use blaze_deflate::ZlibInto;
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::{
+    AllocFailure, Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
     oid::{Kind, Oid},
-    plant::{self, Plant},
+    plant::GitFetchPlant,
     sha1::sha1,
 };
 
-/// How much a pack may hold, and the cache that reads it: every field is the caller's choice.
+/// How much a pack may hold, and the cache that reads it: every field is the caller's choice,
+/// [`Limits::SHIPPED`] the values a real repository is read under (D165: a simulation draws
+/// each down to its smallest legal value).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
+    /// The most entries of one pack.
     pub most_objects: u32,
     /// The most bytes of one object or one delta, inflated.
     pub most_object: u64,
@@ -53,6 +59,19 @@ pub struct Limits {
     /// kept). The index's own memory is its rows, three buffers of the largest object read, and
     /// this.
     pub most_cache: u64,
+}
+
+impl Limits {
+    /// For real repositories: at most 2,000,000 objects, one of at most 512 MiB, 2 GiB of them
+    /// in all, delta chains at most 4096 deep, read through a base cache of at most 32 MiB
+    /// (blaze-fetch's `Limits::REAL` names the same values).
+    pub const SHIPPED: Limits = Limits {
+        most_objects: 2_000_000,
+        most_object: 512 << 20,
+        most_total: 2 << 30,
+        most_depth: 4096,
+        most_cache: 32 << 20,
+    };
 }
 
 /// Why a pack was refused.
@@ -203,8 +222,14 @@ struct Slot<A: Allocator> {
     bytes: Vec<u8, A>,
 }
 
-/// A pack indexed in place: see the module.
-pub struct Index<'p, A: Allocator + Clone> {
+/// A pack indexed in place, as shipped: no plant (see the module).
+pub type Index<'p, A> = PlantedIndex<'p, A, NoPlant>;
+
+/// A pack indexed in place, its plant seam the type parameter `P` (D165, rule 78): [`Index`]
+/// (`P = NoPlant`) where it ships, a [`GitFetchPlant`] under a control. See the module.
+pub struct PlantedIndex<'p, A: Allocator + Clone, P: Planted<GitFetchPlant>> {
+    /// The planted bug, if any: asked where each would be.
+    plant: P,
     /// The pack without its trailer.
     pack: &'p [u8],
     limits: Limits,
@@ -223,9 +248,17 @@ pub struct Index<'p, A: Allocator + Clone> {
     alloc: A,
 }
 
-impl<'p, A: Allocator + Clone> Index<'p, A> {
+impl<'p, A: Allocator + Clone> PlantedIndex<'p, A, NoPlant> {
     /// The index of the pack that is all of `pack`, under `limits`.
     pub fn new_in(pack: &'p [u8], limits: Limits, alloc: A) -> Result<Index<'p, A>, PackError> {
+        PlantedIndex::new_planted(pack, limits, alloc, NoPlant)
+    }
+}
+
+impl<'p, A: Allocator + Clone, P: Planted<GitFetchPlant>> PlantedIndex<'p, A, P> {
+    /// [`Index::new_in`] with its plant seam: `plant` is [`NoPlant`] where it ships and a
+    /// [`GitFetchPlant`] under a control (D165).
+    pub fn new_planted(pack: &'p [u8], limits: Limits, alloc: A, plant: P) -> Result<PlantedIndex<'p, A, P>, PackError> {
         let fail = |at: u64, entry: Option<u32>, why| PackError { entry, at, why };
         if pack.len() < 32 {
             return Err(fail(0, None, PackWhy::Short));
@@ -238,14 +271,15 @@ impl<'p, A: Allocator + Clone> Index<'p, A> {
             return Err(fail(4, None, PackWhy::Version { version }));
         }
         let end = pack.len() - 20;
-        if sha1(&pack[..end]) != pack[end..] && !plant::on(Plant::TrailerUnchecked) {
+        if sha1(&pack[..end]) != pack[end..] && !plant.has(GitFetchPlant::TrailerUnchecked) {
             return Err(fail(end as u64, None, PackWhy::Checksum));
         }
         let count = be32(&pack[8..12]);
         if count > limits.most_objects {
             return Err(fail(8, None, PackWhy::ObjectsOver { count, most: limits.most_objects }));
         }
-        let mut index = Index {
+        let mut index = PlantedIndex {
+            plant,
             pack: &pack[..end],
             limits,
             entries: Vec::new_in(alloc.clone()),
@@ -438,7 +472,7 @@ impl<'p, A: Allocator + Clone> Index<'p, A> {
             inflate(self.pack, entry.data as usize, entry.raw, &mut self.delta)?;
             self.stats.inflated += entry.raw;
             self.next.clear();
-            apply(&self.now, &self.delta, self.limits.most_object, &mut self.next)?;
+            apply(&self.now, &self.delta, self.limits.most_object, &mut self.next, self.plant)?;
             core::mem::swap(&mut self.now, &mut self.next);
             self.keep(delta_at)?;
         }
@@ -481,9 +515,14 @@ impl<'p, A: Allocator + Clone> Index<'p, A> {
             Ok(found) => Some(self.by_oid[found]),
             // A planted lookup that takes the entry where the id would be: an object accepted
             // without its id matching.
-            Err(near) if plant::on(Plant::NearestId) && near < self.by_oid.len() => Some(self.by_oid[near]),
+            Err(near) if self.plant.has(GitFetchPlant::NearestId) && near < self.by_oid.len() => Some(self.by_oid[near]),
             Err(_) => None,
         }
+    }
+
+    /// The plant this index was made with: the tree walk asks it too.
+    pub fn plant(&self) -> P {
+        self.plant
     }
 
     /// The object `oid`, if an object of the pack hashes to it.
@@ -634,8 +673,14 @@ fn delta_size(delta: &[u8], pos: &mut usize) -> Result<u64, PackWhy> {
     }
 }
 
-/// `delta` applied to `base`, into `out`.
-pub(crate) fn apply<B: Allocator>(base: &[u8], delta: &[u8], most: u64, out: &mut Vec<u8, B>) -> Result<(), PackWhy> {
+/// `delta` applied to `base`, into `out`; `plant` is the seam of the copy's plant.
+pub(crate) fn apply<B: Allocator>(
+    base: &[u8],
+    delta: &[u8],
+    most: u64,
+    out: &mut Vec<u8, B>,
+    plant: impl Planted<GitFetchPlant>,
+) -> Result<(), PackWhy> {
     let delta_why = PackWhy::Delta;
     let mut pos = 0;
     let declared = delta_size(delta, &mut pos)?;
@@ -671,7 +716,7 @@ pub(crate) fn apply<B: Allocator>(base: &[u8], delta: &[u8], most: u64, out: &mu
             if len == 0 {
                 len = 0x10000;
             }
-            if plant::on(Plant::CopyOffsetOffByOne) && offset > 0 && offset + len < base.len() as u64 {
+            if plant.has(GitFetchPlant::CopyOffsetOffByOne) && offset > 0 && offset + len < base.len() as u64 {
                 offset += 1;
             }
             let end = offset + len;

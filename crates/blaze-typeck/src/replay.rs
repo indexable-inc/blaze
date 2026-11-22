@@ -53,7 +53,9 @@ pub fn replay<'a, W: World>(world: &W, body: &BodyView<'_>, kept: &ReadList<'_>,
         if reads.hole_count() != holes {
             return Ok(Replay::Missing(q));
         }
-        if reads.digest(q)? != was {
+        // No answer recorded today where the kept list holds one (an opaque revealed to the
+        // check and seen as itself now: world.rs `Reads::opaque_record`): the answer moved.
+        if reads.recorded(q) != Some(was) {
             return Ok(Replay::Moved(q));
         }
     }
@@ -149,6 +151,9 @@ fn ask<'w, 'a, W: World>(reads: &mut Reads<'w, 'a, W>, body: &BodyView<'_>, q: Q
         Question::FieldDefaults(adt) => {
             reads.field_defaults(adt)?;
         }
+        Question::MemberVisible(container, name) => {
+            reads.member_visible(container, name)?;
+        }
     }
     Ok(Asked::Answered)
 }
@@ -231,6 +236,8 @@ mod tests {
             asm_text: "",
             call_arg_ints: &[],
             unsafe_blocks: &[],
+            expr_editions: &[],
+            pat_editions: &[],
         }
     }
 
@@ -276,5 +283,57 @@ mod tests {
         let mut gone = world();
         gone.missing.push(Question::Adt(struct_key(0)));
         assert_eq!(replayed(&gone, &kept), Replay::Missing(Question::Adt(struct_key(0))), "S0's record is not at hand");
+    }
+
+    /// The opaque's digest in a run over `w` that asks its hidden type twice (as a check asks
+    /// it in its last round and again in the stalled-goal decision after it: front2
+    /// stalled_goals.rs), with the read list the run leaves.
+    fn opaque_read(w: &ToyWorld, opaque: crate::ids::ItemKey) -> (Option<u64>, crate::world::ReadList<'static>) {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut reads = crate::world::Reads::new_in(w, alloc);
+        for _ in 0..2 {
+            if let Err(e) = reads.opaque_record(opaque) {
+                panic!("the opaque's hidden type was not answered: {e:?}");
+            }
+        }
+        let (list, _) = reads.finish(alloc);
+        (list.hash_of(&Question::Opaque(opaque)), list)
+    }
+
+    /// Rule 21 on an opaque seen as itself (tempo, 2026-11-21: 22 bodies refused "the fact
+    /// Opaque .. has two answers (09804c76d055e559, ..)", the first the digest of "not
+    /// revealed" in every row). A world that sees the opaque as itself reads nothing of the
+    /// program: no row; so the list a check made before a reveal and the decision's after it
+    /// never hold two answers to it. TWIN: a revealed opaque IS a read, one row, and its
+    /// digest moves with the hidden type (an edit of the defining body that changes it
+    /// rechecks the reader); a replay of that list over a world that no longer reveals it
+    /// names the opaque as moved (no answer recorded where one was kept), never `Holds`.
+    /// Planted: recording `None` as an answer (world.rs `Reads::opaque_record`) fails the
+    /// first assertion.
+    /// Expected: `test replay::tests::an_opaque_seen_as_itself_is_no_read_and_a_revealed_one_is ... ok`.
+    #[test]
+    fn an_opaque_seen_as_itself_is_no_read_and_a_revealed_one_is() {
+        let opaque = crate::ids::ItemKey(0x7_0000);
+        let unrevealed = world();
+        let (seen_as_itself, list) = opaque_read(&unrevealed, opaque);
+        assert_eq!(seen_as_itself, None, "an opaque seen as itself is no read: {list:?}");
+
+        let mut small = world();
+        let mut wide = world();
+        if let Err(e) = small.reveal(opaque, FieldTy::U8).and_then(|()| wide.reveal(opaque, FieldTy::I32)) {
+            panic!("the hidden types could not be made: {e}");
+        }
+        let (s, small_list) = opaque_read(&small, opaque);
+        let (w, _) = opaque_read(&wide, opaque);
+        assert!(s.is_some() && w.is_some(), "TWIN: a revealed opaque is a read: {small_list:?}");
+        assert_eq!(small_list.rows.len(), 1, "TWIN: asked twice, one row: {small_list:?}");
+        assert_ne!(s, w, "TWIN: the read's digest moves with the hidden type");
+
+        let replay_over = |w: &ToyWorld| match replay(w, &body(w), &small_list, blaze_own::testing::heap().alloc()) {
+            Ok(r) => r,
+            Err(e) => panic!("the replay failed: {e}"),
+        };
+        assert_eq!(replay_over(&small), Replay::Holds, "over the world it was read in");
+        assert_eq!(replay_over(&unrevealed), Replay::Moved(Question::Opaque(opaque)), "a revealed read replayed where the opaque is seen as itself");
     }
 }

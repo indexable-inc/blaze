@@ -7,12 +7,12 @@
 //! is seen to be caught; the unchecked reads run only once the reference has accepted the
 //! buffer, so a planted run never reads past what it may (the tests stay Miri-clean).
 
-use std::alloc::Global;
 use std::borrow::ToOwned;
 use std::format;
 use std::string::String;
 use std::vec::Vec;
 
+use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape};
 use core::mem::{align_of, offset_of, size_of};
 
@@ -20,7 +20,7 @@ use crate::declared::{ByteEnum, Declared, FromByte};
 use crate::planted::{self, Plant};
 use crate::{
     FormatError, HEADER_LEN, MAGIC, Offset, Own, Part, Record, Rel, SchemaHash, Slice, Text,
-    Unfit, Verified, Writer, bytes_of_slice, field, open, record, schema, schema_of,
+    Unfit, Verified, Writer, WriterOpts, bytes_of_slice, field, open, record, schema, schema_of,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,7 +149,12 @@ struct Aims {
     words: Vec<(u64, usize)>,
 }
 
-type Out = Writer<Own<Global>>;
+type Out = Writer<Own<Alloc<'static>>>;
+
+/// A writer of `schema` on the test's heap.
+fn out_of(schema: SchemaHash) -> Out {
+    Writer::new(WriterOpts { schema, alloc: Own(blaze_own::testing::heap().alloc()), capacity: None })
+}
 
 fn leaf_of(model: &LeafModel) -> Leaf {
     Leaf { value: model.value, flag: model.flag, kind: model.kind, pad: [0; 2] }
@@ -214,7 +219,7 @@ fn write_node(out: &mut Out, aims: &mut Aims, node: &NodeModel) -> u64 {
 
 /// `model` as a buffer, and where its references are.
 fn write(model: &RootModel) -> (Aligned, Aims) {
-    let mut out: Out = Writer::new_in(<Root as Record>::SCHEMA, Own(Global));
+    let mut out = out_of(<Root as Record>::SCHEMA);
     let mut aims = Aims::default();
     let nodes: Vec<Option<u64>> = model
         .nodes
@@ -648,7 +653,7 @@ fn a_narrow_reference_at_its_edge_opens_and_reads() {
             word: Rel<u32, i8>,
         }
     }
-    let mut out: Out = Writer::new_in(<Edge as Record>::SCHEMA, Own(Global));
+    let mut out = out_of(<Edge as Record>::SCHEMA);
     let word = out.push(&0xfeed_u32);
     out.push_slice(&[0u8; 124]);
     let at = out.next::<Edge>();

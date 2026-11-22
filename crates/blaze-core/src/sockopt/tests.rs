@@ -17,6 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blaze_sys::posix::net;
+
 use super::*;
 use crate::dgram::{Batch, Ecn, Head, Slots};
 
@@ -163,7 +165,7 @@ fn verify_tcp(fd: RawFd, v6: bool, options: &TcpOptions, side: Side) -> Result<(
 }
 
 fn tcp_socket() -> std::os::fd::OwnedFd {
-    crate::net::stream_socket(libc::AF_INET).expect("a TCP socket")
+    crate::net::stream_socket(net::AF_INET).expect("a TCP socket")
 }
 
 /// Every option the host has, set on a connect's socket and on a listen's, reads back as asked
@@ -247,7 +249,7 @@ fn an_option_the_host_lacks_is_refused_by_name() {
 /// planted bug.
 fn planted(call: Call, v6: bool) -> Option<Knob> {
     match call {
-        Call::NoDelay => Some(Knob { level: libc::SOL_SOCKET, name: libc::TCP_NODELAY, text: "TCP_NODELAY (planted)" }),
+        Call::NoDelay => Some(Knob { level: net::SOL_SOCKET, name: net::TCP_NODELAY, text: "TCP_NODELAY (planted)" }),
         call => knob(call, v6),
     }
 }

@@ -44,9 +44,16 @@
 //! Overflow in arithmetic is not this crate's: `wrapping_*`, `checked_*`, `saturating_*` and
 //! `overflowing_*` of `core` already name what is meant, and the profiles' `overflow-checks`
 //! decide what a plain `+` does.
+//!
+//! The crate also holds time as a number ([`time`]): [`Nanos`], [`Deadline`] and the [`Clock`]
+//! trait a core is handed, since this is the one crate every other may depend on.
 
 #![no_std]
-#![deny(unsafe_code)]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
+#![forbid(unsafe_code)]
 
 // The tests' `format!` and `catch_unwind`: `core` has neither.
 #[cfg(test)]
@@ -382,6 +389,11 @@ macro_rules! truncate {
 }
 
 table!(impls);
+
+// Time as a number: `Nanos`, `Deadline` and the handed-in `Clock` (the module's doc).
+pub mod time;
+
+pub use time::{Clock, Deadline, Nanos};
 
 #[cfg(test)]
 mod tests;

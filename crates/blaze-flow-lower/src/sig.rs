@@ -2,1342 +2,171 @@
 //! input and of the output, and the outlives relations the signature declares (flow.md, "What
 //! the signature must say (H1)").
 //!
-//! [`SigLife`] is the shape the lowering takes, whoever makes it. The front end's heads erase
-//! lifetimes today, so [`read_signature`] is a STAND-IN that reads them from the fn's own text
-//! and lines them up with the erased types' positions. It refuses by name whatever it cannot line
-//! up exactly (an alias to a type with references, an ADT written with some but not all of its
-//! lifetime arguments, a default object bound it cannot know); it never guesses a region. An
-//! ADT has one origin position per lifetime parameter its head declares (blaze-ladder front2
-//! lifetimes.rs `Grain::PerParam`). Its known limits are in flow.md.
-//!
-//! The rules it applies are the Reference's "Lifetime elision": "Each elided lifetime in the
-//! parameters becomes a distinct lifetime parameter"; "If there is exactly one lifetime used in
-//! the parameters (elided or not), that lifetime is assigned to all elided output lifetimes"; "If
-//! the receiver has type `&Self` or `&mut Self`, then the lifetime of that reference to `Self` is
-//! assigned to all elided output lifetime parameters"; and "Default trait object lifetimes": "If
-//! the trait object is used as `&'a dyn Trait`, the default is `'a`", else `'static` when the
-//! containing type gives no bound.
+//! THE LOWERING'S VIEW is [`life`] (D148, flow.md "Lifetimes are produced once and carried
+//! beside the types"): [`life::SigLife`] reads a head record's
+//! [`blaze_typeck::region_facts::SigRegions`] in place, and the lowering takes nothing else for
+//! a fn's lifetimes. No item's text is read for them: the text reader that stood here
+//! (`read_signature` and sig/{alias,impl_life,outlives,value}.rs) was deleted by piece L6, and
+//! its name is banned (text_reader_ban_tests.rs).
 
-use blaze_own::Vec;
-use core::alloc::Allocator;
+/// The lowering's view of a fn's signature regions (D148): a head record's
+/// [`blaze_typeck::region_facts::SigRegions`] read in
+/// place. Whether the flow lays a child of the column position for position as the column lays
+/// its slots is the lowering's question (lib.rs `Lower::laid_as_column`), since only it counts the
+/// flow's positions.
+pub mod life {
+    use blaze_typeck::{ItemKey, PTy};
+    use blaze_typeck::region_facts::{ClauseView, ColView, Outlives, ParamsView, RegionFacts, RegionsUnread, SigRegions, UnreadWhy};
+    use blaze_typeck::regions::Region;
 
-use blaze_typeck::{ItemKey, PNode, PTy, PTys};
-
-/// A written path read for what it resolves to: a type alias expanded (piece sig-paths).
-mod alias;
-/// A member of an impl: `Self::Name` and the impl's lifetimes (piece sig-assoc-projection).
-mod impl_life;
-mod outlives;
-mod value;
-
-pub use alias::{AliasScope, MOST_DEPTH, NoAliases, PathIs, PathWhy, SigWorld};
-pub use impl_life::{AssocWhy, ImplText, ImplTrait, ImplTraitWhy, MOST_IMPL_REGIONS, impl_header_end, read_impl_signature, read_impl_signature_with, read_impl_trait};
-pub use outlives::{assoc_declares_generics, container_declares_type_outlives, trait_declares_lifetime, trait_header};
-
-pub use value::{CallableRefusal, read_callable_param, read_callable_param_with, read_callable_value_with};
-
-/// What stands at one origin position of a signature.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Region {
-    /// `'static`.
-    Static,
-    /// A lifetime the signature names (its own or its impl's): numbered by first appearance.
-    Named(u32),
-    /// An elided input lifetime: each its own parameter.
-    Anon(u32),
-    /// Position `i` of `Self`: the impl's, the same in every `Self` of one signature.
-    SelfTy(u32),
-    /// A position whose lifetimes the text does not say (an opaque or associated type): related
-    /// to nothing in the fn's own body; a call through such a signature is not instantiated.
-    Hidden(u32),
-    /// A lifetime BOUND by the binder of a fn-pointer type written in the text (lane B15): one
-    /// its `for<..>` names, or one elided inside it, numbered per text in reading order (the
-    /// rules: the note on [`MOST_BINDERS`]). It is no lifetime of the fn: elision of the fn's
-    /// own output does not count it, and a use of the pointer instantiates it afresh.
-    Bound(u32),
-}
-
-/// FN-POINTER BINDERS (lane B15). The rules, from the Reference:
-///
-/// - "Function pointer types": `for<'a> fn(&'a u8)` is a fn pointer whose `'a` is bound by its
-///   own `for<..>` ("Higher-ranked trait bounds": the type holds "for all lifetimes").
-/// - "Lifetime elision": the elision rules hold "in function item, function pointer, and
-///   closure trait signatures", so `fn(&u8) -> &u8` is `for<'a> fn(&'a u8) -> &'a u8`: every
-///   lifetime elided in a fn-pointer type is BOUND by that pointer, and an elided output takes
-///   the pointer's one input lifetime (else it is E0106: refused, never guessed).
-/// - A lifetime the pointer names from outside its binder (`fn(&'a u8)` in `impl<'a>` or in a
-///   fn's generics, `'static`) is FREE: it is the enclosing item's region.
-/// - "Subtyping and Variance": `fn(A) -> R` is contravariant in `A` and covariant in `R`; for
-///   the free regions only, as a bound one is the same at every instance of the type.
-///
-/// WHERE THE BINDER LIVES. The type checker's table is region-erased (`PNode::Ref` holds no
-/// region), so `for<'r> fn(&'r u8)` and `fn(&'a u8)` are one `PTy` there, and its equality, by
-/// which the checker unifies, must stay region-blind. A binder in `PNode::FnPtr` would make the
-/// checker tell apart types it relates by subtyping (`let g: fn(&'a u8) = f` with `f` higher
-/// ranked is a coercion rustc accepts) and would be a second home of region facts. So a fn
-/// pointer's positions are laid structurally, as the type's (its inputs' positions in order,
-/// then its output's: the layout a function of the erased type, rule 21), and which of them its
-/// binder binds is a REGION of the signature's lifetime part, read from the text that wrote the
-/// type: `Region::Bound(v)`, beside `Named` and `Anon`. The records that hold a lifetime part
-/// (the head digests of front2 borrow_reads.rs) key it by the item's text already.
-///
-/// HOW THE LOWERING USES IT (lib.rs): a callee's bound region is fresh at each call, as every
-/// callee region is; the body's own bound region is an existential origin of its own, never a
-/// placeholder (a higher-ranked parameter may be used at any instance: `h = f` with
-/// `h: fn(&'a u8)` is accepted); a call through a fn-pointer parameter instantiates its bound
-/// regions fresh and takes its free ones from the parameter's own positions (sig/value.rs).
-///
-/// The constant itself: how many fn-pointer binders one written type may nest (`fn(fn(&u8))`
-/// is two); deeper is refused [`SigRefusal::Bound`].
-pub const MOST_BINDERS: u32 = 8;
-
-/// One signature's lifetime part, borrowed from whoever holds it.
-#[derive(Clone, Copy, Debug)]
-pub struct SigLife<'s> {
-    /// The regions of every input's positions, in order, then the output's.
-    pub regions: &'s [Region],
-    /// Per input, where its regions end in `regions`; the output's are the rest.
-    pub ends: &'s [u32],
-    /// `(a, b)`: the signature declares `a: b`, or its form implies it (an `async fn`'s inputs
-    /// outlive its future, `read_signature_in`).
-    pub bounds: &'s [(Region, Region)],
-    /// The regions of the fn's BODY's value, its own return place: the output's for a fn, the
-    /// written return type's for an `async fn` (whose output, what a caller gets, is the future).
-    pub body: BodyOut<'s>,
-}
-
-/// The regions of a body's value ([`SigLife::body`]). The Reference, "Async functions": `async
-/// fn f(x: &u8) -> T` is "roughly equivalent to" `fn f<'a>(x: &'a u8) -> impl Future<Output = T>
-/// + 'a`, the body an `async move` block whose value is the future's `Output`: so the body's value
-/// must be a `T` as written, its regions the signature's (RFC 2394), exactly as a fn's returned
-/// value is checked against its declared output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BodyOut<'s> {
-    /// A fn's body: its value is the output, `regions[ends.last()..]`.
-    Output,
-    /// An `async fn`'s body: its value is the written return type, one region per position.
-    Async(&'s [Region]),
-    /// An `async fn` whose written return type was not lined up, and why: its body is not
-    /// checked against it (the lowering refuses it by name), its callers still are.
-    AsyncUnread(SigRefusal),
-}
-
-/// The body part of a [`SigBuf`]: [`BodyOut`] owned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BodyState {
-    Output,
-    /// The regions are [`SigBuf::body_regions`].
-    Async,
-    AsyncUnread(SigRefusal),
-}
-
-/// The owned form [`read_signature`] fills.
-pub struct SigBuf<A: Allocator + Clone> {
-    pub regions: Vec<Region, A>,
-    pub ends: Vec<u32, A>,
-    pub bounds: Vec<(Region, Region), A>,
-    /// `(name, region)`: the fn declares `name: region` on a type parameter (`T: 'a`,
-    /// `where T: Tr + 'static`), the name as written (outlives.rs).
-    pub type_outlives: Vec<(blaze_typeck::Name, Region), A>,
-    /// A type-outlives bound whose left side is not one bare name (`Self: 'a`, `&'b T: 'a`).
-    pub type_outlives_unread: bool,
-    /// What the body's value's regions are ([`BodyOut`]).
-    pub body: BodyState,
-    /// With [`BodyState::Async`]: the written return type's regions.
-    pub body_regions: Vec<Region, A>,
-    /// Each trait bound the fn's own text writes with lifetime arguments (`V: Visitor<'de>`,
-    /// `where T: Conv<'a, 'b>`), in text order (outlives.rs `trait_bounds`): what ties a
-    /// callee's trait lifetimes to its caller's regions at a call (piece RB8, [`crate::Ties`]).
-    pub trait_bounds: Vec<TextBound, A>,
-    /// The lifetime arguments of every [`TextBound`], each row's `lo..hi`.
-    pub trait_bound_regions: Vec<Region, A>,
-    /// Each lifetime name the text writes (`'static` and `'_` aside), with the `Named` region
-    /// it reads as: a trait method's trait lifetimes by name (front2 borrows_ties.rs).
-    pub names: Vec<(blaze_typeck::Name, Region), A>,
-}
-
-/// One trait bound the fn's text writes with lifetime arguments (`T: Tr<'a, 'b>`): the bare
-/// name it bounds and the trait's last path segment, as written; its lifetime arguments are
-/// `SigBuf::trait_bound_regions[lo..hi]`, in order. `unread`: the left side is no bare name,
-/// or an argument is `'_`: the row says which trait, never which regions. `binder`: every
-/// lifetime argument is one the bound's `for<..>` quantifies (`T: for<'de> Deserialize<'de>`),
-/// so the bound fixes no region of the fn (no regions).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TextBound {
-    pub param: blaze_typeck::Name,
-    pub trait_: blaze_typeck::Name,
-    pub lo: u32,
-    pub hi: u32,
-    pub unread: bool,
-    pub binder: bool,
-}
-
-impl<A: Allocator + Clone> SigBuf<A> {
-    pub fn new_in(alloc: A) -> SigBuf<A> {
-        SigBuf {
-            regions: Vec::new_in(alloc.clone()),
-            ends: Vec::new_in(alloc.clone()),
-            bounds: Vec::new_in(alloc.clone()),
-            type_outlives: Vec::new_in(alloc.clone()),
-            type_outlives_unread: false,
-            body: BodyState::Output,
-            body_regions: Vec::new_in(alloc.clone()),
-            trait_bounds: Vec::new_in(alloc.clone()),
-            trait_bound_regions: Vec::new_in(alloc.clone()),
-            names: Vec::new_in(alloc),
-        }
+    /// One fn's signature regions as the lowering takes them: the column laid over
+    /// `FnPtr(inputs.., output)` (its root has no slot of its own; child `k` is input `k`, the
+    /// last child the output), the lifetime parameters and their declared outlives clauses, and
+    /// an async fn's written output.
+    #[derive(Clone, Copy, Debug)]
+    pub struct SigLife<'s> {
+        regions: SigRegions<'s>,
     }
 
-    pub fn life(&self) -> SigLife<'_> {
-        let body = match self.body {
-            BodyState::Output => BodyOut::Output,
-            BodyState::Async => BodyOut::Async(&self.body_regions),
-            BodyState::AsyncUnread(why) => BodyOut::AsyncUnread(why),
-        };
-        SigLife { regions: &self.regions, ends: &self.ends, bounds: &self.bounds, body }
-    }
-}
-
-/// Why a signature's text was not read: the rule, and the byte offset in the fn's text.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SigRefusal {
-    /// A literal or a bracket the reader cannot close.
-    Token { at: u32 },
-    /// No `fn name ( .. )` in the text.
-    NoFn,
-    /// The text's parameters are not as many as the head's inputs.
-    ParamCount { text: u32, head: u32 },
-    /// The written type and the erased type are not the same form (an alias, a qualified path,
-    /// a default argument): positions cannot be lined up.
-    Unaligned { at: u32 },
-    /// An elided output lifetime that neither rule of the Reference decides.
-    ElisionUndecided { at: u32 },
-    /// A trait object whose default lifetime depends on a type's declared bounds.
-    ObjectDefault { at: u32 },
-    /// The world did not say how many lifetimes an ADT has, or a type node is missing.
-    Unknown,
-    /// A closure or coroutine type in a signature.
-    TypeNode,
-    /// A walk passed its bound.
-    Bound,
-    /// `Self::Name` (or `<Self as Tr>::Name`), or the header of the impl a member is read with,
-    /// that was not read, and why (impl_life.rs); `at`: the path's offset in the fn's text, 0
-    /// for the header.
-    Assoc { at: u32, why: AssocWhy },
-    /// An `async fn` read without its written return type's erased form (the `Output` of its
-    /// future: [`read_async_signature`] takes it): its body's value cannot be lined up.
-    AsyncOutputNotGiven,
-    /// A written type path that was not read for what it resolves to, and why (alias.rs): the
-    /// path's offset in the fn's text.
-    Path { at: u32, why: PathWhy },
-}
-
-/// The reader's bound on any one walk (tokens, types): a signature past it is refused.
-const MOST: u32 = 1 << 16;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tk {
-    Ident,
-    Life,
-    Arrow,
-    Sep,
-    Lit,
-    P(u8),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Tok {
-    k: Tk,
-    lo: u32,
-    hi: u32,
-}
-
-fn ident_start(c: u8) -> bool {
-    c == b'_' || c.is_ascii_alphabetic() || c >= 0x80
-}
-
-fn ident_continue(c: u8) -> bool {
-    ident_start(c) || c.is_ascii_digit()
-}
-
-/// The end of the string literal whose opening quote is at `i`.
-fn string_end(b: &[u8], i: usize) -> Result<usize, SigRefusal> {
-    let mut j = i + 1;
-    while j < b.len() {
-        match b[j] {
-            b'\\' => j += 2,
-            b'"' => return Ok(j + 1),
-            _ => j += 1,
+    impl<'s> SigLife<'s> {
+        /// The view of `regions`.
+        pub fn new(regions: SigRegions<'s>) -> SigLife<'s> {
+            SigLife { regions }
         }
-    }
-    Err(SigRefusal::Token { at: i as u32 })
-}
 
-/// The end of the raw string whose first `#` or quote is at `i`, or `None` when it is not one
-/// (`r#name`, a raw identifier).
-fn raw_string_end(b: &[u8], i: usize) -> Result<Option<usize>, SigRefusal> {
-    let mut j = i;
-    let mut hashes = 0usize;
-    while j < b.len() && b[j] == b'#' {
-        hashes += 1;
-        j += 1;
-    }
-    if b.get(j) != Some(&b'"') {
-        return Ok(None);
-    }
-    j += 1;
-    while j < b.len() {
-        if b[j] == b'"' && j + hashes < b.len() && b[j + 1..j + 1 + hashes].iter().all(|c| *c == b'#') {
-            return Ok(Some(j + 1 + hashes));
+        /// The head record's regions this view reads.
+        pub fn regions(&self) -> SigRegions<'s> {
+            self.regions
         }
-        j += 1;
-    }
-    Err(SigRefusal::Token { at: i as u32 })
-}
 
-/// The tokens of `text` up to the signature's end: the first `{` or `;` outside `(` and `[`
-/// after the `fn` keyword. Comments are skipped; attributes stay (the parser steps over them).
-fn lex<A: Allocator + Clone>(text: &str, toks: &mut Vec<Tok, A>) -> Result<(), SigRefusal> {
-    let b = text.as_bytes();
-    let mut i = 0usize;
-    let mut seen_fn = false;
-    let mut depth = 0i32;
-    while i < b.len() {
-        if toks.len() as u32 > MOST {
-            return Err(SigRefusal::Bound);
+        /// Whether the column is laid as a signature's: a root with no slot of its own and at
+        /// least the output as a child. A column that is not is malformed, never read.
+        pub fn well_formed(&self) -> bool {
+            self.regions.col.own().is_empty() && self.regions.col.children() >= 1
         }
-        let c = b[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            let mut open = 1u32;
-            i += 2;
-            while i < b.len() && open > 0 {
-                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                    open += 1;
-                    i += 2;
-                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                    open -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        let lo = i;
-        if c == b'"' {
-            i = string_end(b, i)?;
-            toks.push(Tok { k: Tk::Lit, lo: lo as u32, hi: i as u32 });
-            continue;
-        }
-        if ident_start(c) {
-            while i < b.len() && ident_continue(b[i]) {
-                i += 1;
-            }
-            let word = &b[lo..i];
-            let prefix = matches!(word, b"r" | b"b" | b"br" | b"c" | b"cr");
-            if prefix && b.get(i) == Some(&b'"') && !matches!(word, b"r" | b"br" | b"cr") {
-                i = string_end(b, i)?;
-                toks.push(Tok { k: Tk::Lit, lo: lo as u32, hi: i as u32 });
-                continue;
-            }
-            if matches!(word, b"r" | b"br" | b"cr")
-                && matches!(b.get(i), Some(&b'"') | Some(&b'#'))
-                && let Some(end) = raw_string_end(b, i)?
-            {
-                i = end;
-                toks.push(Tok { k: Tk::Lit, lo: lo as u32, hi: i as u32 });
-                continue;
-            }
-            if word == b"fn" && depth == 0 {
-                seen_fn = true;
-            }
-            toks.push(Tok { k: Tk::Ident, lo: lo as u32, hi: i as u32 });
-            continue;
-        }
-        if c.is_ascii_digit() {
-            while i < b.len() && ident_continue(b[i]) {
-                i += 1;
-            }
-            toks.push(Tok { k: Tk::Lit, lo: lo as u32, hi: i as u32 });
-            continue;
-        }
-        if c == b'\'' {
-            if b.get(i + 1).is_some_and(|n| ident_start(*n)) {
-                let mut j = i + 1;
-                while j < b.len() && ident_continue(b[j]) {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'\'') {
-                    i = j + 1;
-                    toks.push(Tok { k: Tk::Lit, lo: lo as u32, hi: i as u32 });
-                } else {
-                    i = j;
-                    toks.push(Tok { k: Tk::Life, lo: lo as u32, hi: i as u32 });
-                }
-                continue;
-            }
-            let mut j = i + 1;
-            if b.get(j) == Some(&b'\\') {
-                j += 2;
-            }
-            while j < b.len() && b[j] != b'\'' {
-                j += 1;
-            }
-            if j >= b.len() {
-                return Err(SigRefusal::Token { at: lo as u32 });
-            }
-            i = j + 1;
-            toks.push(Tok { k: Tk::Lit, lo: lo as u32, hi: i as u32 });
-            continue;
-        }
-        if c == b'-' && b.get(i + 1) == Some(&b'>') {
-            i += 2;
-            toks.push(Tok { k: Tk::Arrow, lo: lo as u32, hi: i as u32 });
-            continue;
-        }
-        if c == b':' && b.get(i + 1) == Some(&b':') {
-            i += 2;
-            toks.push(Tok { k: Tk::Sep, lo: lo as u32, hi: i as u32 });
-            continue;
-        }
-        match c {
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
-            b'{' | b';' if seen_fn && depth == 0 => break,
-            _ => {}
-        }
-        i += 1;
-        toks.push(Tok { k: Tk::P(c), lo: lo as u32, hi: i as u32 });
-    }
-    Ok(())
-}
 
-/// Where an elided lifetime is being read.
-#[derive(Clone, Copy)]
-enum Mode {
-    Input,
-    Output(Option<Region>),
-    /// Inside a fn-pointer type's inputs: an elided lifetime is a fresh [`Region::Bound`]
-    /// ([`MOST_BINDERS`]: the binders' rules).
-    Binder,
-}
-
-/// What encloses a type: a trait object's default lifetime reads it.
-#[derive(Clone, Copy)]
-enum Ctx {
-    Ref(Region),
-    /// A type argument of an ADT, which has lifetimes or not.
-    Adt(bool),
-    Other,
-}
-
-/// One pair still to line up: an erased type, the tokens `lo..hi` of its written type, and the
-/// index in `regions` of its first position. `whole_self`: the written type is `Self`.
-#[derive(Clone, Copy)]
-struct Pair {
-    ty: PTy,
-    lo: u32,
-    hi: u32,
-    base: u32,
-    ctx: Ctx,
-    whole_self: bool,
-}
-
-/// A written fn-pointer type's parts ([`Reader::fn_pointer_text`]): the tokens of its
-/// `for<..>`'s names (empty when none), of its inputs inside the parentheses, and of its output.
-#[derive(Clone, Copy)]
-struct FnText {
-    binder: (u32, u32),
-    inputs: (u32, u32),
-    output: Option<(u32, u32)>,
-}
-
-struct Reader<'t, 'w, A: Allocator + Clone> {
-    text: &'t str,
-    tys: PTys<'w>,
-    /// The ADTs' lifetime counts and what a written path resolves to (alias.rs).
-    world: &'w dyn SigWorld,
-    toks: Vec<Tok, A>,
-    /// Per token, its closing or opening bracket's index (`u32::MAX` for the rest).
-    mate: Vec<u32, A>,
-    /// The lifetime names met, as token indices of their first appearance.
-    names: Vec<u32, A>,
-    anon: u32,
-    hidden: u32,
-    alloc: A,
-    /// The impl the fn is a member of, when its text was given (impl_life.rs): its lifetimes
-    /// by name and its associated type members.
-    imp: Option<impl_life::ImplLife<'t, A>>,
-    /// The positions whose regions the fn's own text did not write (a `Self`'s, a
-    /// `Self::Name`'s, an alias's own): elision counts only what is written.
-    unwritten: Vec<u32, A>,
-    /// Where this text resolves its paths: `None` for the item read, an alias's scope inside
-    /// its text (alias.rs).
-    from: Option<AliasScope>,
-    /// Reading an alias's text: its type parameters' names, whose uses are holes.
-    holes: Vec<&'t str, A>,
-    /// The holes met, for the use's reader to fill (alias.rs).
-    found: Vec<alias::Hole, A>,
-    /// How many alias texts deep this reader is.
-    depth: u32,
-    /// The fn-pointer binders in scope, innermost last: the tokens `lo..hi` of a `for<..>`'s
-    /// names (empty when none is written) and the [`Region::Bound`] number of its first name.
-    binders: Vec<(u32, u32, u32), A>,
-    /// The next [`Region::Bound`] number of this text (an alias's or an impl member's text
-    /// numbers on from its user's, so the two never meet).
-    bound: u32,
-}
-
-impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
-    fn word(&self, i: u32) -> &'t str {
-        let t = self.toks[i as usize];
-        self.text.get(t.lo as usize..t.hi as usize).unwrap_or("")
-    }
-
-    fn at(&self, i: u32) -> u32 {
-        match self.toks.get(i as usize) {
-            Some(t) => t.lo,
-            None => self.text.len() as u32,
+        /// How many inputs the column lays.
+        pub fn inputs(&self) -> u32 {
+            self.regions.col.children().saturating_sub(1)
         }
-    }
 
-    fn is(&self, i: u32, hi: u32, k: Tk) -> bool {
-        i < hi && self.toks[i as usize].k == k
-    }
+        /// Input `k`'s slots, in its type's pre-order; `None` past the inputs.
+        pub fn input(&self, k: u32) -> Option<&'s [Region]> {
+            if k < self.inputs() { self.regions.col.child(k) } else { None }
+        }
 
-    fn is_word(&self, i: u32, hi: u32, w: &str) -> bool {
-        self.is(i, hi, Tk::Ident) && self.word(i) == w
-    }
+        /// The output's slots, in its type's pre-order.
+        pub fn output(&self) -> Option<&'s [Region]> {
+            self.regions.col.child(self.regions.col.children().checked_sub(1)?)
+        }
 
-    /// The token after `i`, stepping over a bracketed group as one.
-    fn skip(&self, i: u32) -> u32 {
-        let m = self.mate[i as usize];
-        if m != u32::MAX && m > i { m + 1 } else { i + 1 }
-    }
+        /// Every slot of the column: the inputs' in order, then the output's.
+        pub fn slots(&self) -> &'s [Region] {
+            self.regions.col.as_slice()
+        }
 
-    fn pair_brackets(&mut self) -> Result<(), SigRefusal> {
-        let mut stack: Vec<u32, A> = Vec::new_in(self.alloc.clone());
-        self.mate.resize(self.toks.len(), u32::MAX);
-        for i in 0..self.toks.len() {
-            let Tk::P(c) = self.toks[i].k else { continue };
-            let open = match c {
-                b'(' | b'[' | b'<' | b'{' => {
-                    stack.push(i as u32);
-                    continue;
-                }
-                b')' => b'(',
-                b']' => b'[',
-                b'>' => b'<',
-                b'}' => b'{',
-                _ => continue,
-            };
-            match stack.pop() {
-                Some(o) if self.toks[o as usize].k == Tk::P(open) => {
-                    self.mate[o as usize] = i as u32;
-                    self.mate[i] = o;
-                }
-                _ => return Err(SigRefusal::Token { at: self.toks[i].lo }),
+        /// Whether lifetime parameter `i` is late-bound; an index the head does not declare is
+        /// not one, and the lowering refuses a slot naming it (a malformed column).
+        pub fn is_late(&self, i: u32) -> Option<bool> {
+            if i < self.regions.params.count() { self.regions.params.is_late(i).ok() } else { None }
+        }
+
+        /// The declared outlives clauses among the fn's lifetimes and `'static`, as `(longer,
+        /// shorter)`: `'a: 'b` is `(Param(a), Param(b))`.
+        pub fn bounds(&self) -> &'s [(Region, Region)] {
+            self.regions.params.outlives()
+        }
+
+        /// The fn's lifetime parameters (count, late-bound, outlives).
+        pub fn params(&self) -> ParamsView<'s> {
+            self.regions.params
+        }
+
+        /// The regions of the fn's BODY's value ([`BodyOut`]).
+        pub fn body(&self) -> BodyOut<'s> {
+            match self.regions.written_output {
+                Some(c) => BodyOut::Async(c.as_slice()),
+                None => BodyOut::Output,
             }
         }
-        match stack.pop() {
-            Some(o) => Err(SigRefusal::Token { at: self.toks[o as usize].lo }),
-            None => Ok(()),
-        }
-    }
 
-    /// The pieces of `lo..hi` between its top-level commas (an empty last piece is dropped).
-    fn pieces(&self, lo: u32, hi: u32, out: &mut Vec<(u32, u32), A>) {
-        out.clear();
-        let (mut i, mut from) = (lo, lo);
-        while i < hi {
-            if self.toks[i as usize].k == Tk::P(b',') {
-                out.push((from, i));
-                from = i + 1;
-                i += 1;
-            } else {
-                i = self.skip(i);
-            }
-        }
-        if from < hi {
-            out.push((from, hi));
-        }
-    }
-
-    /// The region a written lifetime token names; `None` for `'_`.
-    fn named(&mut self, i: u32) -> Option<Region> {
-        let w = self.word(i);
-        if w == "'_" {
-            return None;
-        }
-        // A name of a fn-pointer binder in scope, innermost first: bound by it, never the fn's
-        // (`for<'a> fn(&'a u8)` inside `fn f<'a>` shadows the fn's `'a`).
-        for b in (0..self.binders.len()).rev() {
-            let (lo, hi, first) = self.binders[b];
-            let mut var = first;
-            for t in lo..hi {
-                if self.toks[t as usize].k != Tk::Life {
-                    continue;
-                }
-                if self.word(t) == w {
-                    return Some(Region::Bound(var));
-                }
-                var += 1;
-            }
-        }
-        // A lifetime of the impl, held by its self type: that position of `Self` (impl_life.rs).
-        if let Some(r) = self.imp.as_ref().and_then(|m| m.region_of(w)) {
-            return Some(r);
-        }
-        if w == "'static" {
-            return Some(Region::Static);
-        }
-        for (n, &first) in self.names.iter().enumerate() {
-            if self.word(first) == w {
-                return Some(Region::Named(n as u32));
-            }
-        }
-        self.names.push(i);
-        Some(Region::Named(self.names.len() as u32 - 1))
-    }
-
-    fn elided(&mut self, mode: Mode, at: u32) -> Result<Region, SigRefusal> {
-        match mode {
-            Mode::Input => {
-                self.anon += 1;
-                Ok(Region::Anon(self.anon - 1))
-            }
-            Mode::Output(Some(r)) => Ok(r),
-            Mode::Output(None) => Err(SigRefusal::ElisionUndecided { at: self.at(at) }),
-            Mode::Binder => {
-                self.bound += 1;
-                Ok(Region::Bound(self.bound - 1))
+        /// The slots of the call's value `v` ([`CallValue`]), in its type's pre-order.
+        pub fn value(&self, v: CallValue<'s>) -> Option<&'s [Region]> {
+            match v {
+                CallValue::Returned => self.output(),
+                CallValue::Awaited { slots, .. } => Some(slots),
             }
         }
     }
 
-    /// Opens the binder of a fn-pointer type whose `for<..>` names are the tokens `lo..hi`
-    /// (`lo == hi`: none written): its names are numbered from the next [`Region::Bound`].
-    fn push_binder(&mut self, lo: u32, hi: u32) -> Result<(), SigRefusal> {
-        if self.binders.len() as u32 >= MOST_BINDERS {
-            return Err(SigRefusal::Bound);
-        }
-        let first = self.bound;
-        for t in lo..hi {
-            if self.toks[t as usize].k == Tk::Life {
-                self.bound += 1;
-            }
-        }
-        self.binders.push((lo, hi, first));
-        Ok(())
+    /// Which value of a call its destination holds. The Reference, "Await expressions": the
+    /// value of `f(x).await` is what the future's `poll` returns in `Ready`, its
+    /// `Future::Output`; "Async functions": for `async fn f(x: &u8) -> T` that is `T` as
+    /// written (RFC 2394), instantiated at the call. So the regions of an awaited `async fn`'s
+    /// value are the written return type's column (`SigRegions::written_output`) instantiated
+    /// as the call instantiates the inputs, never every region the future captured
+    /// (coroutine.rs `await_done`).
+    #[derive(Clone, Copy)]
+    pub enum CallValue<'s> {
+        /// The call's own value: the column's output.
+        Returned,
+        /// What an `.await` of the call yields, `Future::Output`: the type `ty` (in the head
+        /// records' table) and its slots in the fn's numbering. An `async fn`'s written return
+        /// type's column (`SigRegions::written_output`), or the `Output = T` binding of the
+        /// opaque a fn returns (`impl Future<Output = T>`, its clause column's term: await_call.rs
+        /// `opaque_output`).
+        Awaited { ty: PTy, slots: &'s [Region] },
     }
 
-    /// The written fn-pointer type at `lo..hi`: `[for<..>] [unsafe] [extern ["abi"]] fn ( .. )
-    /// [-> T]`, as the tokens of its binder's names, of its inputs and of its output (when one
-    /// is written). `None`: not that form.
-    fn fn_pointer_text(&self, lo: u32, hi: u32) -> Option<FnText> {
-        let mut i = lo;
-        let mut binder = (lo, lo);
-        if self.is_word(i, hi, "for") && self.is(i + 1, hi, Tk::P(b'<')) {
-            let close = self.mate[(i + 1) as usize];
-            if close == u32::MAX || close >= hi {
-                return None;
-            }
-            binder = (i + 2, close);
-            i = close + 1;
-        }
-        if self.is_word(i, hi, "unsafe") {
-            i += 1;
-        }
-        if self.is_word(i, hi, "extern") {
-            i += 1;
-            if self.is(i, hi, Tk::Lit) {
-                i += 1;
-            }
-        }
-        if !self.is_word(i, hi, "fn") || !self.is(i + 1, hi, Tk::P(b'(')) {
-            return None;
-        }
-        let open = i + 1;
-        let close = self.mate[open as usize];
-        if close == u32::MAX || close >= hi {
-            return None;
-        }
-        let output = if self.is(close + 1, hi, Tk::Arrow) {
-            if close + 2 >= hi {
-                return None;
-            }
-            Some((close + 2, hi))
-        } else if close + 1 == hi {
-            None
-        } else {
-            return None;
-        };
-        Some(FnText { binder, inputs: (open + 1, close), output })
+    /// The regions of a body's value ([`SigLife::body`]). The Reference, "Async functions":
+    /// `async fn f(x: &u8) -> T` is "roughly equivalent to" `fn f<'a>(x: &'a u8) -> impl
+    /// Future<Output = T> + 'a`, the body an `async move` block whose value is the future's
+    /// `Output`: so the body's value must be a `T` as written, its regions the written return
+    /// type's column (RFC 2394), exactly as a fn's returned value is checked against its output.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BodyOut<'s> {
+        /// A fn's body: its value is the output.
+        Output,
+        /// An `async fn`'s body: its value is the written return type, these its slots.
+        Async(&'s [Region]),
     }
 
-    /// Lines up a written fn-pointer type `fx` with the erased `FnPtr` list `list` (its inputs,
-    /// then its output last), filling `regions[base..]` (the rules: [`MOST_BINDERS`]). Its
-    /// binder is opened for the walk and closed after: a name it binds and every lifetime
-    /// elided in its inputs is a fresh [`Region::Bound`]; an elided output takes the one
-    /// lifetime its inputs use, else it is refused; a name from outside stays the fn's.
-    fn line_up_fn_pointer(&mut self, fx: FnText, list: &[PTy], base: u32, regions: &mut Vec<Region, A>) -> Result<(), SigRefusal> {
-        let unaligned = SigRefusal::Unaligned { at: self.at(fx.inputs.0) };
-        let Some((&out_ty, ins)) = list.split_last() else { return Err(unaligned) };
-        let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-        self.pieces(fx.inputs.0, fx.inputs.1, &mut parts);
-        // A C-variadic pointer's `...` is no input of the list.
-        if let Some(&(lo, hi)) = parts.last()
-            && hi == lo + 3
-            && (lo..hi).all(|t| self.toks[t as usize].k == Tk::P(b'.'))
-        {
-            parts.pop();
+    /// The [`RegionFacts`] of a lowering given none: every item's regions unread, `NoHead`. A
+    /// call of a head whose regions are unread is refused by name (`Form::RegionsUnread`), never
+    /// related by a guess; what `Facts::regions` answers when its implementer gives nothing.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct NoRegions;
+
+    impl NoRegions {
+        fn unread(item: ItemKey) -> RegionsUnread {
+            RegionsUnread { item, why: UnreadWhy::NoHead }
         }
-        if parts.len() != ins.len() {
-            return Err(unaligned);
-        }
-        self.push_binder(fx.binder.0, fx.binder.1)?;
-        let mut off = base;
-        for (j, &t) in ins.iter().enumerate() {
-            let (mut lo, hi) = parts[j];
-            // A fn pointer may name its parameters: `fn(x: &T)`, `fn(_: &T)`.
-            if (self.is(lo, hi, Tk::Ident) || self.is(lo, hi, Tk::P(b'_'))) && self.is(lo + 1, hi, Tk::P(b':')) && !self.is(lo + 2, hi, Tk::P(b':')) {
-                lo += 2;
-            }
-            let n = self.count(t)?;
-            self.line_up(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Other, whole_self: false }, Mode::Binder, regions)?;
-            off += n;
-        }
-        // The Reference, "Lifetime elision", in a fn-pointer type as in a fn: "If there is
-        // exactly one lifetime used in the parameters (elided or not), that lifetime is assigned
-        // to all elided output lifetimes."
-        let mut one: Option<Region> = None;
-        let mut many = false;
-        for k in base..off {
-            let x = regions[k as usize];
-            if matches!(x, Region::Hidden(_)) || self.unwritten.contains(&k) {
-                continue;
-            }
-            match one {
-                None => one = Some(x),
-                Some(y) if y != x => many = true,
-                Some(_) => {}
-            }
-        }
-        let decided = if many { None } else { one };
-        let n = self.count(out_ty)?;
-        match fx.output {
-            Some((lo, hi)) => self.line_up(Pair { ty: out_ty, lo, hi, base: off, ctx: Ctx::Other, whole_self: false }, Mode::Output(decided), regions)?,
-            None if n == 0 => {}
-            None => return Err(unaligned),
-        }
-        self.binders.pop();
-        Ok(())
     }
 
-    fn node(&self, t: PTy) -> Result<PNode, SigRefusal> {
-        self.tys.node(t).map_err(|_| SigRefusal::Unknown)
-    }
-
-    /// The number of origin positions of `t`, as the lowering counts them: one per reference,
-    /// one per lifetime parameter of an ADT, one per opaque, alias or trait object; a fn
-    /// pointer's are its inputs' then its output's, bound and free alike ([`MOST_BINDERS`]).
-    fn count(&self, t: PTy) -> Result<u32, SigRefusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t);
-        let (mut n, mut steps) = (0u32, 0u32);
-        while let Some(t) = stack.pop() {
-            steps += 1;
-            if steps > MOST {
-                return Err(SigRefusal::Bound);
-            }
-            match self.node(t)? {
-                PNode::Ref(_, i) => {
-                    n += 1;
-                    stack.push(i);
-                }
-                PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push(i),
-                PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?),
-                PNode::Adt(k, l) => {
-                    n += self.world.adt_lifetimes(k).ok_or(SigRefusal::Unknown)?;
-                    stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?);
-                }
-                PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
-                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(SigRefusal::TypeNode),
-                _ => {}
-            }
+    impl RegionFacts for NoRegions {
+        fn sig(&self, item: ItemKey) -> Result<SigRegions<'_>, RegionsUnread> {
+            Err(NoRegions::unread(item))
         }
-        Ok(n)
-    }
-
-    /// Lines up one input or the output: fills `regions[base..]`.
-    fn line_up(&mut self, first: Pair, mode: Mode, regions: &mut Vec<Region, A>) -> Result<(), SigRefusal> {
-        let mut work: Vec<Pair, A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-        work.push(first);
-        let mut steps = 0u32;
-        while let Some(mut p) = work.pop() {
-            steps += 1;
-            if steps > MOST {
-                return Err(SigRefusal::Bound);
-            }
-            let n = self.count(p.ty)?;
-            if n == 0 {
-                continue;
-            }
-            // `( T )` is `T`; `(T,)` is a tuple.
-            while self.is(p.lo, p.hi, Tk::P(b'(')) && self.mate[p.lo as usize] == p.hi - 1 {
-                self.pieces(p.lo + 1, p.hi - 1, &mut parts);
-                let trailing = p.hi >= 2 && self.toks[p.hi as usize - 2].k == Tk::P(b',');
-                if parts.len() != 1 || trailing {
-                    break;
-                }
-                p.lo += 1;
-                p.hi -= 1;
-            }
-            // In an alias's text, a use of one of its type parameters: the use's reader fills it.
-            if self.hole(p) {
-                continue;
-            }
-            if p.whole_self || (p.hi == p.lo + 1 && self.is_word(p.lo, p.hi, "Self")) {
-                for k in 0..n {
-                    regions[(p.base + k) as usize] = Region::SelfTy(k);
-                    self.unwritten.push(p.base + k);
-                }
-                continue;
-            }
-            // `Self::Name`: the impl's own `type Name = ..;` text (impl_life.rs), never the path
-            // read as an ADT's name.
-            if self.assoc_path(p, regions)? {
-                continue;
-            }
-            let unaligned = SigRefusal::Unaligned { at: self.at(p.lo) };
-            if p.lo >= p.hi {
-                return Err(unaligned);
-            }
-            // A fn-pointer type written as one: its binder's own reading. Written through an
-            // alias (`type Cb = fn(&u8);`), the path below expands it and meets this form there.
-            if let PNode::FnPtr(l, _) = self.node(p.ty)?
-                && let Some(fx) = self.fn_pointer_text(p.lo, p.hi)
-            {
-                let list = self.tys.list(l).map_err(|_| SigRefusal::Unknown)?;
-                self.line_up_fn_pointer(fx, list, p.base, regions)?;
-                continue;
-            }
-            // A plain path is read for what it resolves to: the erased ADT itself, or a type
-            // alias expanded (alias.rs); never lined up with its expansion as if it were it.
-            if self.path_or_alias(p, mode, regions)? {
-                continue;
-            }
-            match self.node(p.ty)? {
-                PNode::Ref(_, inner) => {
-                    if !self.is(p.lo, p.hi, Tk::P(b'&')) {
-                        return Err(unaligned);
-                    }
-                    let mut i = p.lo + 1;
-                    let written = if self.is(i, p.hi, Tk::Life) {
-                        i += 1;
-                        self.named(i - 1)
-                    } else {
-                        None
-                    };
-                    let r = match written {
-                        Some(r) => r,
-                        None => self.elided(mode, p.lo)?,
-                    };
-                    if self.is_word(i, p.hi, "mut") {
-                        i += 1;
-                    }
-                    regions[p.base as usize] = r;
-                    work.push(Pair { ty: inner, lo: i, hi: p.hi, base: p.base + 1, ctx: Ctx::Ref(r), whole_self: false });
-                }
-                PNode::Ptr(_, inner) => {
-                    if !self.is(p.lo, p.hi, Tk::P(b'*')) || p.lo + 2 > p.hi {
-                        return Err(unaligned);
-                    }
-                    work.push(Pair { ty: inner, lo: p.lo + 2, hi: p.hi, base: p.base, ctx: Ctx::Other, whole_self: false });
-                }
-                PNode::Slice(inner) | PNode::Array(inner, _) => {
-                    if !self.is(p.lo, p.hi, Tk::P(b'[')) || self.mate[p.lo as usize] != p.hi - 1 {
-                        return Err(unaligned);
-                    }
-                    let (mut i, mut end) = (p.lo + 1, p.hi - 1);
-                    while i < p.hi - 1 {
-                        if self.toks[i as usize].k == Tk::P(b';') {
-                            end = i;
-                            break;
-                        }
-                        i = self.skip(i);
-                    }
-                    work.push(Pair { ty: inner, lo: p.lo + 1, hi: end, base: p.base, ctx: Ctx::Other, whole_self: false });
-                }
-                PNode::Tuple(l) => {
-                    if !self.is(p.lo, p.hi, Tk::P(b'(')) || self.mate[p.lo as usize] != p.hi - 1 {
-                        return Err(unaligned);
-                    }
-                    let elems = self.tys.list(l).map_err(|_| SigRefusal::Unknown)?;
-                    self.pieces(p.lo + 1, p.hi - 1, &mut parts);
-                    if parts.len() != elems.len() {
-                        return Err(unaligned);
-                    }
-                    let mut off = p.base;
-                    for (j, &t) in elems.iter().enumerate() {
-                        let (lo, hi) = parts[j];
-                        work.push(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Other, whole_self: false });
-                        off += self.count(t)?;
-                    }
-                }
-                PNode::Adt(k, l) => {
-                    // A plain path: `a::b::Name` or `a::b::Name<..>`, arguments on the last segment only.
-                    let (name_end, args) = if self.is(p.hi - 1, p.hi, Tk::P(b'>')) {
-                        let open = self.mate[p.hi as usize - 1];
-                        (open, Some((open + 1, p.hi - 1)))
-                    } else {
-                        (p.hi, None)
-                    };
-                    if name_end <= p.lo || name_end > p.hi {
-                        return Err(unaligned);
-                    }
-                    for i in p.lo..name_end {
-                        if !matches!(self.toks[i as usize].k, Tk::Ident | Tk::Sep) {
-                            return Err(unaligned);
-                        }
-                    }
-                    let last = self.word(name_end - 1);
-                    if !self.is(name_end - 1, p.hi, Tk::Ident) || matches!(last, "dyn" | "impl" | "fn" | "Self") {
-                        return Err(unaligned);
-                    }
-                    match args {
-                        Some((lo, hi)) => self.pieces(lo, hi, &mut parts),
-                        None => parts.clear(),
-                    }
-                    // One position per lifetime parameter the ADT's head declares, in order.
-                    let has = self.world.adt_lifetimes(k).ok_or(SigRefusal::Unknown)?;
-                    // The written lifetime arguments' tokens: one per parameter, or none (each
-                    // elided: the Reference, "Lifetime elision", "Each elided lifetime in the
-                    // parameters becomes a distinct lifetime parameter").
-                    let mut lifes: Vec<u32, A> = Vec::new_in(self.alloc.clone());
-                    let mut types: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-                    for j in 0..parts.len() {
-                        let (lo, hi) = parts[j];
-                        if hi == lo + 1 && self.is(lo, hi, Tk::Life) {
-                            lifes.push(lo);
-                        } else {
-                            // `Name = Type` is a binding, not an argument: only in bounds.
-                            if self.is(lo + 1, hi, Tk::P(b'=')) {
-                                return Err(unaligned);
-                            }
-                            types.push((lo, hi));
-                        }
-                    }
-                    // Written lifetimes are all of the parameters, or none (E0107 otherwise).
-                    if !lifes.is_empty() && lifes.len() as u32 != has {
-                        return Err(unaligned);
-                    }
-                    for q in 0..has {
-                        let written = match lifes.get(q as usize) {
-                            Some(&t) => self.named(t),
-                            None => None,
-                        };
-                        let r = match written {
-                            Some(r) => r,
-                            None => self.elided(mode, p.lo)?,
-                        };
-                        regions[(p.base + q) as usize] = r;
-                    }
-                    let mut off = p.base + has;
-                    let elems = self.tys.list(l).map_err(|_| SigRefusal::Unknown)?;
-                    // Defaulted trailing parameters (`Vec<&T>` is `Vec<&T, Global>`): the written
-                    // arguments are the first ones, and what the defaults hold has no position
-                    // (a default with one is not read). The path is the ADT's own (resolved
-                    // above), so its arguments are its parameters in order.
-                    let mut defaults_bare = types.len() < elems.len();
-                    if defaults_bare {
-                        for &t in &elems[types.len()..] {
-                            defaults_bare &= self.count(t)? == 0;
-                        }
-                    }
-                    if types.len() != elems.len() && !defaults_bare {
-                        // Const arguments or defaults: fine only when no argument has a position.
-                        if n != has {
-                            return Err(unaligned);
-                        }
-                        continue;
-                    }
-                    for (j, &t) in elems.iter().take(types.len()).enumerate() {
-                        let (lo, hi) = types[j];
-                        work.push(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Adt(has > 0), whole_self: false });
-                        off += self.count(t)?;
-                    }
-                }
-                PNode::Dynamic(_) => {
-                    if !self.is_word(p.lo, p.hi, "dyn") {
-                        return Err(unaligned);
-                    }
-                    let mut written: Option<u32> = None;
-                    let mut i = p.lo + 1;
-                    while i < p.hi {
-                        if self.toks[i as usize].k == Tk::Life {
-                            written = Some(i);
-                        }
-                        i = self.skip(i);
-                    }
-                    let r = match written.map(|i| (i, self.named(i))) {
-                        Some((_, Some(r))) => r,
-                        Some((i, None)) => self.elided(mode, i)?,
-                        None => match p.ctx {
-                            Ctx::Ref(r) => r,
-                            Ctx::Adt(false) => Region::Static,
-                            _ => return Err(SigRefusal::ObjectDefault { at: self.at(p.lo) }),
-                        },
-                    };
-                    regions[p.base as usize] = r;
-                }
-                PNode::Opaque(_, _) | PNode::Alias { .. } => {
-                    self.hidden += 1;
-                    regions[p.base as usize] = Region::Hidden(self.hidden - 1);
-                }
-                _ => return Err(unaligned),
-            }
+        fn clauses(&self, item: ItemKey) -> Result<&[ClauseView<'_>], RegionsUnread> {
+            Err(NoRegions::unread(item))
         }
-        Ok(())
-    }
-
-    /// An `async fn`'s written return type `written` (its tokens `out_ty`, none for `()`) lined
-    /// up into `body` by the output's elision `decided`: the body's value's regions
-    /// ([`BodyOut::Async`]).
-    fn async_body(&mut self, written: PTy, out_ty: Option<(u32, u32)>, decided: Option<Region>, body: &mut Vec<Region, A>) -> Result<(), SigRefusal> {
-        body.clear();
-        let n = self.count(written)?;
-        body.resize(n as usize, Region::Hidden(u32::MAX));
-        match out_ty {
-            Some((lo, hi)) => self.line_up(Pair { ty: written, lo, hi, base: 0, ctx: Ctx::Other, whole_self: false }, Mode::Output(decided), body)?,
-            None if n == 0 => {}
-            None => return Err(SigRefusal::Unaligned { at: self.text.len() as u32 }),
+        fn outlives(&self, item: ItemKey) -> Result<&[Outlives], RegionsUnread> {
+            Err(NoRegions::unread(item))
         }
-        if body.iter().any(|x| *x == Region::Hidden(u32::MAX)) {
-            return Err(SigRefusal::Unaligned { at: out_ty.map_or(self.text.len() as u32, |(lo, _)| self.at(lo)) });
+        fn field(&self, adt: ItemKey, _: u32, _: u32) -> Result<ColView<'_>, RegionsUnread> {
+            Err(NoRegions::unread(adt))
         }
-        Ok(())
-    }
-
-    /// The declared bounds of one generics list or where clause: `'a: 'b + 'c`.
-    fn bounds(&mut self, lo: u32, hi: u32, out: &mut Vec<(Region, Region), A>) {
-        let mut parts: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
-        self.pieces(lo, hi, &mut parts);
-        for j in 0..parts.len() {
-            let (lo, hi) = parts[j];
-            if !(self.is(lo, hi, Tk::Life) && self.is(lo + 1, hi, Tk::P(b':'))) {
-                continue;
-            }
-            let Some(a) = self.named(lo) else { continue };
-            for i in lo + 2..hi {
-                if self.toks[i as usize].k == Tk::Life
-                    && let Some(b) = self.named(i)
-                {
-                    out.push((a, b));
-                }
-            }
+        fn impl_header(&self, impl_: ItemKey) -> Result<(ColView<'_>, Option<ColView<'_>>), RegionsUnread> {
+            Err(NoRegions::unread(impl_))
+        }
+        fn opaque_captures(&self, opaque: ItemKey) -> Result<u32, RegionsUnread> {
+            Err(NoRegions::unread(opaque))
+        }
+        fn lifetime_params(&self, item: ItemKey) -> Result<ParamsView<'_>, RegionsUnread> {
+            Err(NoRegions::unread(item))
+        }
+        fn impl_assoc(&self, impl_: ItemKey, _: blaze_typeck::Name) -> Result<ColView<'_>, RegionsUnread> {
+            Err(NoRegions::unread(impl_))
         }
     }
-}
-
-/// How the receiver is written.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Receiver {
-    None,
-    /// `&self`, `&mut self`, `self: &Self`, `self: &mut Self`: its lifetime decides elision.
-    Ref,
-    /// `self`, or `self: T` for another `T`.
-    Other,
-}
-
-/// Reads the lifetime part of the fn whose text is `text` and whose erased inputs and output are
-/// `inputs` and `output` in `tys`. `adt_lifetimes` says how many lifetime parameters an ADT's
-/// head declares. On `Ok`, `out` holds one region per origin position, in the lowering's order.
-/// For a text that names no type alias ([`NoAliases`]: fixtures); real code is read with
-/// [`read_signature_with`] and a world that resolves its paths.
-pub fn read_signature<A: Allocator + Clone>(
-    text: &str,
-    tys: PTys<'_>,
-    inputs: &[PTy],
-    output: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
-    out: &mut SigBuf<A>,
-    alloc: A,
-) -> Result<(), SigRefusal> {
-    read_signature_in(text, None, tys, inputs, output, None, &NoAliases(adt_lifetimes), out, alloc)
-}
-
-/// [`read_signature`] in `world`: each written type path is read for what it resolves to, a
-/// type alias expanded (alias.rs).
-pub fn read_signature_with<A: Allocator + Clone>(
-    text: &str,
-    tys: PTys<'_>,
-    inputs: &[PTy],
-    output: PTy,
-    world: &dyn SigWorld,
-    out: &mut SigBuf<A>,
-    alloc: A,
-) -> Result<(), SigRefusal> {
-    read_signature_in(text, None, tys, inputs, output, None, world, out, alloc)
-}
-
-/// [`read_signature`] (of a member of the impl `imp` when given: [`read_impl_signature`]) of an
-/// `async fn`: `future` is its output, the opaque future a caller gets, and `written` that
-/// future's `Output`, the return type as written, which the body's value is lined up with
-/// ([`SigLife::body`]). A text that is not an `async fn`'s reads as [`read_signature`] does.
-#[expect(clippy::too_many_arguments, reason = "read_signature's inputs, the impl, and the async fn's written output")]
-pub fn read_async_signature<'t, A: Allocator + Clone>(
-    text: &'t str,
-    imp: Option<ImplText<'t>>,
-    tys: PTys<'_>,
-    inputs: &[PTy],
-    future: PTy,
-    written: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
-    out: &mut SigBuf<A>,
-    alloc: A,
-) -> Result<(), SigRefusal> {
-    read_async_signature_with(text, imp, tys, inputs, future, written, &NoAliases(adt_lifetimes), out, alloc)
-}
-
-/// [`read_async_signature`] in `world` ([`read_signature_with`]).
-#[expect(clippy::too_many_arguments, reason = "read_signature's inputs, the impl, and the async fn's written output")]
-pub fn read_async_signature_with<'t, A: Allocator + Clone>(
-    text: &'t str,
-    imp: Option<ImplText<'t>>,
-    tys: PTys<'_>,
-    inputs: &[PTy],
-    future: PTy,
-    written: PTy,
-    world: &dyn SigWorld,
-    out: &mut SigBuf<A>,
-    alloc: A,
-) -> Result<(), SigRefusal> {
-    let life = match imp {
-        Some(it) => Some(impl_life::impl_life_or_unread(text, it, tys, world, alloc.clone())?),
-        None => None,
-    };
-    read_signature_in(text, life, tys, inputs, future, Some(written), world, out, alloc)
-}
-
-/// [`read_signature`], of a member of the impl `imp` when given (impl_life.rs
-/// [`read_impl_signature`]): its lifetimes by name, its `Self::Name`, its header's bounds; of an
-/// `async fn` with its written output when given ([`read_async_signature`]).
-#[expect(clippy::too_many_arguments, reason = "read_signature's inputs, the impl's reading and the async fn's written output")]
-fn read_signature_in<'t, A: Allocator + Clone>(
-    text: &'t str,
-    imp: Option<impl_life::ImplLife<'t, A>>,
-    tys: PTys<'_>,
-    inputs: &[PTy],
-    output: PTy,
-    async_written: Option<PTy>,
-    world: &dyn SigWorld,
-    out: &mut SigBuf<A>,
-    alloc: A,
-) -> Result<(), SigRefusal> {
-    out.regions.clear();
-    out.ends.clear();
-    out.bounds.clear();
-    out.type_outlives.clear();
-    out.type_outlives_unread = false;
-    out.body = BodyState::Output;
-    out.body_regions.clear();
-    out.trait_bounds.clear();
-    out.trait_bound_regions.clear();
-    out.names.clear();
-    let mut r = Reader {
-        text,
-        tys,
-        world,
-        toks: Vec::new_in(alloc.clone()),
-        mate: Vec::new_in(alloc.clone()),
-        names: Vec::new_in(alloc.clone()),
-        anon: 0,
-        hidden: 0,
-        alloc: alloc.clone(),
-        imp,
-        unwritten: Vec::new_in(alloc.clone()),
-        from: None,
-        holes: Vec::new_in(alloc.clone()),
-        found: Vec::new_in(alloc.clone()),
-        depth: 0,
-        binders: Vec::new_in(alloc.clone()),
-        bound: 0,
-    };
-    lex(text, &mut r.toks)?;
-    r.pair_brackets()?;
-    let end = r.toks.len() as u32;
-    // The `fn` keyword: the first outside every bracket (attributes are bracketed).
-    let mut i = 0u32;
-    let mut is_async = false;
-    while i < end && !r.is_word(i, end, "fn") {
-        is_async |= r.is_word(i, end, "async");
-        i = r.skip(i);
-    }
-    let mut i = i + 2;
-    if i > end {
-        return Err(SigRefusal::NoFn);
-    }
-    let generics = if r.is(i, end, Tk::P(b'<')) {
-        let close = r.mate[i as usize];
-        let g = (i + 1, close);
-        i = close + 1;
-        Some(g)
-    } else {
-        None
-    };
-    if !r.is(i, end, Tk::P(b'(')) {
-        return Err(SigRefusal::NoFn);
-    }
-    let params = (i + 1, r.mate[i as usize]);
-    i = params.1 + 1;
-    // The output's tokens run to `where` or the end.
-    let mut where_at = i;
-    while where_at < end && !r.is_word(where_at, end, "where") {
-        where_at = r.skip(where_at);
-    }
-    let out_ty = if r.is(i, end, Tk::Arrow) { Some((i + 1, where_at)) } else { None };
-    if let Some((lo, hi)) = generics {
-        r.bounds(lo, hi, &mut out.bounds);
-    }
-    if where_at < end {
-        r.bounds(where_at + 1, end, &mut out.bounds);
-    }
-    let mut parts: Vec<(u32, u32), A> = Vec::new_in(alloc.clone());
-    r.pieces(params.0, params.1, &mut parts);
-    if parts.len() != inputs.len() {
-        return Err(SigRefusal::ParamCount { text: parts.len() as u32, head: inputs.len() as u32 });
-    }
-    let mut receiver = Receiver::None;
-    for (j, &ty) in inputs.iter().enumerate() {
-        let (lo, hi) = parts[j];
-        let base = out.regions.len() as u32;
-        let n = r.count(ty)?;
-        out.regions.resize((base + n) as usize, Region::Hidden(u32::MAX));
-        // The receiver's short forms: `[&['a] [mut]] self`, `mut self`.
-        let self_at = if r.is_word(hi.saturating_sub(1), hi, "self") && hi > lo { Some(hi - 1) } else { None };
-        let short = self_at.is_some_and(|s| (lo..s).all(|i| matches!(r.toks[i as usize].k, Tk::P(b'&') | Tk::Life) || r.is_word(i, hi, "mut")));
-        if j == 0 && short {
-            if r.is(lo, hi, Tk::P(b'&')) {
-                receiver = Receiver::Ref;
-                let PNode::Ref(_, inner) = r.node(ty)? else { return Err(SigRefusal::Unaligned { at: r.at(lo) }) };
-                let written = if r.is(lo + 1, hi, Tk::Life) { r.named(lo + 1) } else { None };
-                let region = match written {
-                    Some(x) => x,
-                    None => r.elided(Mode::Input, lo)?,
-                };
-                out.regions[base as usize] = region;
-                r.line_up(Pair { ty: inner, lo, hi, base: base + 1, ctx: Ctx::Ref(region), whole_self: true }, Mode::Input, &mut out.regions)?;
-            } else {
-                receiver = Receiver::Other;
-                r.line_up(Pair { ty, lo, hi, base, ctx: Ctx::Other, whole_self: true }, Mode::Input, &mut out.regions)?;
-            }
-        } else {
-            // `pattern : Type`: the first top-level `:`.
-            let mut colon = lo;
-            while colon < hi && r.toks[colon as usize].k != Tk::P(b':') {
-                colon = r.skip(colon);
-            }
-            if colon >= hi {
-                return Err(SigRefusal::Unaligned { at: r.at(lo) });
-            }
-            if j == 0 && r.is_word(colon.saturating_sub(1), colon, "self") {
-                let t = colon + 1;
-                let by_ref = r.is(t, hi, Tk::P(b'&')) && r.is_word(hi - 1, hi, "Self") && (t + 1..hi - 1).all(|i| r.toks[i as usize].k == Tk::Life || r.is_word(i, hi, "mut"));
-                receiver = if by_ref { Receiver::Ref } else { Receiver::Other };
-            }
-            r.line_up(Pair { ty, lo: colon + 1, hi, base, ctx: Ctx::Other, whole_self: false }, Mode::Input, &mut out.regions)?;
-        }
-        out.ends.push(out.regions.len() as u32);
-    }
-    // The Reference, "Lifetime elision": the receiver's reference first, else the one lifetime
-    // used in the parameters. `Self`'s, a `Self::Name`'s and hidden positions are not lifetimes
-    // the text uses; an impl's lifetime written by name (`&'a u8`, a `SelfTy`) is.
-    let decided = if receiver == Receiver::Ref {
-        out.regions.first().copied()
-    } else {
-        let mut one: Option<Region> = None;
-        let mut many = false;
-        for (j, &x) in out.regions.iter().enumerate() {
-            // A fn pointer's bound lifetime is the pointer's, not one the fn's parameters use
-            // (`fn call(f: fn(&u8) -> &u8, x: &u8) -> &u8` takes `x`'s: MOST_BINDERS).
-            if matches!(x, Region::Hidden(_) | Region::Bound(_)) || r.unwritten.contains(&(j as u32)) {
-                continue;
-            }
-            match one {
-                None => one = Some(x),
-                Some(y) if y != x => many = true,
-                Some(_) => {}
-            }
-        }
-        if many { None } else { one }
-    };
-    let base = out.regions.len() as u32;
-    let n = r.count(output)?;
-    out.regions.resize((base + n) as usize, Region::Hidden(u32::MAX));
-    match out_ty {
-        Some((lo, hi)) => r.line_up(Pair { ty: output, lo, hi, base, ctx: Ctx::Other, whole_self: false }, Mode::Output(decided), &mut out.regions)?,
-        None if n == 0 => {}
-        None => return Err(SigRefusal::Unaligned { at: r.at(i) }),
-    }
-    if out.regions.iter().any(|x| *x == Region::Hidden(u32::MAX)) {
-        return Err(SigRefusal::Unaligned { at: r.at(params.0) });
-    }
-    // An `async fn`'s output is the future it returns, an opaque type that captures every
-    // lifetime of the fn (the Reference, "Async functions": `async fn f(x: &u8)` is
-    // `fn f<'a>(x: &'a u8) -> impl Future<Output = ..> + use<'a>`), and an opaque type outlives
-    // a lifetime when each of its captures does (RFC 1214, alias components). So each input
-    // region outlives the future's own position: the body may return a future holding any of
-    // its inputs' borrows (tempo zones/p2p runtime.rs:882, a false "outlives" in
-    // `async fn recv(&mut self)`). Only the inputs' regions are stated, a subset of the
-    // captures; an RPIT's captures (edition, `use<..>`, `+ 'x`) are not read and stay unrelated.
-    if is_async {
-        for k in base as usize..out.regions.len() {
-            let Region::Hidden(h) = out.regions[k] else { continue };
-            for j in 0..base as usize {
-                let x = out.regions[j];
-                if !matches!(x, Region::Hidden(_)) && !out.bounds.contains(&(x, Region::Hidden(h))) {
-                    out.bounds.push((x, Region::Hidden(h)));
-                }
-            }
-        }
-        // The body's value is the written return type (`BodyOut`): its regions by the same
-        // elision as a fn's output, the fn's names, and hidden regions after the future's.
-        out.body = match async_written {
-            None => BodyState::AsyncUnread(SigRefusal::AsyncOutputNotGiven),
-            Some(written) => match r.async_body(written, out_ty, decided, &mut out.body_regions) {
-                Ok(()) => BodyState::Async,
-                Err(why) => {
-                    out.body_regions.clear();
-                    BodyState::AsyncUnread(why)
-                }
-            },
-        };
-    }
-    let wheres = if where_at < end { Some((where_at + 1, end)) } else { None };
-    r.type_outlives(generics, wheres, &mut out.type_outlives, &mut out.type_outlives_unread)?;
-    // Last of all, so a lifetime written only in a trait bound is numbered after every other:
-    // the regions above are unchanged by it.
-    r.trait_bounds(generics, wheres, &mut out.trait_bounds, &mut out.trait_bound_regions)?;
-    for k in 0..r.names.len() {
-        let first = r.names[k];
-        out.names.push((blaze_typeck::Name::of(r.word(first)), Region::Named(k as u32)));
-    }
-    // The impl's: its self type's equal and `'static` positions, its declared `'a: 'b`.
-    if let Some(imp) = r.imp.as_ref() {
-        out.bounds.extend_from_slice(&imp.bounds);
-    }
-    Ok(())
 }

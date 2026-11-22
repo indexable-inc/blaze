@@ -16,6 +16,9 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-mem.workspace = true
+# D169's meter: an effect's kind (`Effect::metered`), opens (descriptors.rs), lock waits
+# (lock.rs) and parks (wait.rs) add to the thread's cells.
+blaze-meter.workspace = true
 # `SortedTexts`: a listing's names as one buffer and its ends (`listing`). Already under
 # blaze-mem, so no new crate in the graph.
 blaze-own.workspace = true
@@ -33,12 +36,10 @@ libc.workspace = true
 
 # The one home of system calls (docs/v2/plan/design/sys.md): the drivers move onto it call by
 # call, and `libc` above goes when the last has. On macOS its table of calls resolved at first
-# use (`blaze_sys::macos::cold`).
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# use (`blaze_sys::macos::cold`). On Windows its declarations of the system DLLs' exports
+# (`blaze_sys::windows`, D180).
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 blaze-sys.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

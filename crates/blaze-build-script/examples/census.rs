@@ -649,6 +649,7 @@ fn main() {
         assert!(passes <= 64, "no graph after 64 passes");
         match res.pass().unwrap_or_else(|e| panic!("{e}")) {
             Pass::Done(graph) => break graph,
+            Pass::Partial(partial) => panic!("no unit graph: the manifests of {:?} are missing", partial.missing()),
             Pass::Need(needs) => {
                 for id in needs.iter() {
                     // A source the store lacks stops the run, naming it: never guessed.
@@ -678,7 +679,7 @@ fn main() {
 
     let units = &graph.units;
     let scripts: Vec<usize> = (0..units.len()).filter(|i| units[*i].kind == UnitKind::BuildScript).collect();
-    let reached: BTreeSet<LockId> = units.iter().map(|u| u.package).chain(graph.unavailable.iter().copied()).collect();
+    let reached: BTreeSet<LockId> = units.iter().map(|u| u.package).collect();
     for at in &scripts {
         place(units[*at].package, &mut dirs);
     }
@@ -686,11 +687,10 @@ fn main() {
     println!("workspace      {}", root.display());
     println!("store          {}", store.display());
     println!(
-        "units          {} ({} build-script units, {} packages in the graph, {} unavailable)",
+        "units          {} ({} build-script units, {} packages in the graph)",
         units.len(),
         scripts.len(),
         units.iter().map(|u| u.package).collect::<BTreeSet<_>>().len(),
-        graph.unavailable.len()
     );
 
     // D65: where each script runs, decided from its dependency closure, and the units that

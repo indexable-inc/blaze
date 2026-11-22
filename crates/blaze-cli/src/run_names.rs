@@ -1,6 +1,6 @@
 //! The names records of a program's crates, made ONE way for `blaze check` and `blaze run`
 //! (rule 30): front2's `Records` over front_load's `StoreLoad`, its `Log`, and the texts a body's
-//! macro calls expand with ([`names_records`]). body_types.rs `checker` makes them for a file's
+//! macro calls expand with ([`names_records_with_snapshot`]). body_types.rs `checker` makes them for a file's
 //! owner; `blaze run` for the program's crate ([`open`]), which the lazy parent opens on its first
 //! need of them (run_parent.rs `CommandFront`, blaze-ladder make_one.rs `NamesRecords`).
 //!
@@ -10,16 +10,11 @@
 //! may see), each by its `CrateScope` record, the owner at 0: exactly what `blaze check` reads
 //! for that root.
 //!
-//! WHERE THE RECORDS ARE FOUND. A run that WALKED (run_ids.rs `walked`) settled every one of
-//! those names this request: each is `Request::settled_input`'s row ([`Walked`]). A run that
-//! STOOD on its certificate holds no row: the request read only the certificate, and the
-//! answer's root and pages are read by blaze-drive alone (`read_cert` and `read_root` are not
-//! public). So each walk writes the rows the names records read as ONE record at its certificate
-//! ([`put`], [`inputs_key`]: the certificate holds the whole tool, so a new blaze is a new key),
-//! and a run that stands reads it in place ([`Stood`]): one get when the program starts, the
-//! rest only when the parent first needs a name. A hit whose record the store does not hold
-//! (dropped) is answered in full: the command drops the request before the program starts and
-//! asks again cold (main.rs `AnswerInFull`), once; never a guess.
+//! WHERE THE RECORDS ARE FOUND. Every row is the engine's stored answer's ([`FromEngine`],
+//! engine_check.rs `Standing`): the `UnitGraph`'s row and each crate's `CrateScope` row. A
+//! test suite carries the rows it reads in [`Stood`]'s form, made in place from the answer
+//! ([`found_tests_answered`]); nothing is put at a certificate, since the next start reads the
+//! same answer.
 //!
 //! FORM (little-endian): [`MAGIC`] (16 bytes), the `UnitGraph` row's `at` and `out` (32 + 32),
 //! the count `n` (u32), then `n` rows of (the crate's index in the list u32, its `CrateScope`
@@ -33,6 +28,7 @@ use blaze_ladder::front2::body_host::Sourced;
 use blaze_ladder::front2::source::{Log, Records};
 use blaze_ladder::run::make_one::NamesRecords;
 use blaze_own::{AVec, Alloc, Vec};
+use blaze_core::SharedSet;
 use blaze_scope::items_record::ItemsRecordError;
 use blaze_scope::tests_record::{ShouldPanic, TestRow, TestsRecord, TestsRecordError};
 use blaze_world::crate_list::{CrateGraph, CrateList};
@@ -48,7 +44,7 @@ use crate::engine_records::{EngineRecords, ReadCounts, ReadError};
 use crate::front_load::{CrateRecords, StoreLoad};
 use crate::job_texts::{JobTexts, Packs};
 use crate::proc_runner::ProcRunner;
-use crate::store::Store;
+use crate::store::{SharedSnapshot, Store, StoreSnapshot};
 
 #[cfg(test)]
 #[path = "run_names_tests.rs"]
@@ -96,55 +92,188 @@ pub(crate) enum NamesError {
 /// Nothing is read of a crate here: `Records::new` opens each on the first question about it.
 /// COST: no items-record open here (each crate's edition is its load's); the records open each
 /// crate's items record once, at its first question.
+/// The worker borrows its phase's snapshot for expansion texts and its planner's outlines
+/// for current file ranges.
 #[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
-pub(crate) fn names_records<'n>(
+pub(crate) fn names_records_with_snapshot<'n>(
     cx: &'n Cx,
     root: &'n Dir<ReadWrite>,
     crates: &[Crate<'n>],
-    packs: impl Into<Packs<'n>>,
+    files: (impl Into<Packs<'n>>, Option<&'n [crate::engine_tasks::Outlined<'n>]>),
     corrected: &'n [(u32, &'n str, &'n str)],
     procs: Option<&'n ProcRunner<'static>>,
     read: std::vec::Vec<(&'n str, Option<&'n str>), Global>,
     env: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
+    snapshot: Option<&'n StoreSnapshot>,
+    expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
     frame: &'n Frame,
     g: Alloc<'static>,
 ) -> Result<Opened<'n>, NamesError> {
-    let mut records: Vec<CrateRecords<'n>, &'n Frame> = Vec::with_capacity_in(crates.len(), frame);
-    let mut crate_names: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(crates.len(), frame);
-    let mut packages: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(crates.len(), frame);
-    // Each crate as a proc-macro caller, by its place, which is its `krate` in the records made
-    // below from `records` in this order: its index in the names world and its edition.
-    let mut callers: Vec<(usize, usize, blaze_expand::Edition), &'n Frame> = Vec::with_capacity_in(crates.len(), frame);
-    for (at, one) in crates.iter().enumerate() {
-        records.push(one.records);
-        crate_names.push(one.name);
-        packages.push(one.package);
-        // The edition the load's one open read (front_load.rs `CrateRecords::edition`): the
-        // section is not opened again here; the records made below open it once, when asked.
-        callers.push((at, one.world_at, one.records.edition));
+    names_records_over(cx, root, ScopeCrates::Opened(crates), files, corrected, procs, read, env, snapshot, expansion_keys, frame, g)
+}
+
+/// The crates names records are read over, in reader order (the owner at 0): THE SEAM of piece C
+/// (a) (rule 78), as front_load.rs [`CratesFrom`] serves them. [`ScopeCrates::Opened`]: each
+/// crate's records opened before (the Heads stage, `blaze run`, the bodies' oracle arm);
+/// [`ScopeCrates::ByNeed`]: the owner's opened, every other crate's at its first question.
+#[derive(Clone, Copy)]
+pub(crate) enum ScopeCrates<'a, 'n> {
+    Opened(&'a [Crate<'n>]),
+    ByNeed(ByNeedScope<'n>),
+}
+
+/// A scope whose crates past the owner are opened by need ([`ScopeCrates::ByNeed`]).
+#[derive(Clone, Copy)]
+pub(crate) struct ByNeedScope<'n> {
+    pub(crate) own: Crate<'n>,
+    pub(crate) rest: &'n [crate::front_load::Unopened],
+    pub(crate) records: &'n dyn crate::front_load::OpenByNeed,
+}
+
+impl<'n> ScopeCrates<'_, 'n> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ScopeCrates::Opened(crates) => crates.len(),
+            ScopeCrates::ByNeed(scope) => scope.rest.len() + 1,
+        }
     }
-    let (records, crate_names, packages): (&'n [CrateRecords<'n>], &'n [&'n str], &'n [&'n str]) = (records.leak(), crate_names.leak(), packages.leak());
+
+    /// Reader crate `k`'s package directory (`CrateInput::shown_from`), known without its record.
+    pub(crate) fn package(&self, k: usize) -> Option<&'n str> {
+        match self {
+            ScopeCrates::Opened(crates) => crates.get(k).map(|one| one.package),
+            ScopeCrates::ByNeed(scope) => match k {
+                0 => Some(scope.own.package),
+                k => scope.rest.get(k - 1).map(|one| one.package),
+            },
+        }
+    }
+
+    /// Reader crate `k`'s records, opened by need; `None` when there is no crate `k` or its
+    /// record did not open (a job that asks it is refused by its load: front_load.rs
+    /// `StoreLoad::refused`).
+    pub(crate) fn records(&self, k: usize) -> Option<CrateRecords<'n>> {
+        match self {
+            ScopeCrates::Opened(crates) => crates.get(k).map(|one| one.records),
+            ScopeCrates::ByNeed(scope) => match k {
+                0 => Some(scope.own.records),
+                k => scope.rest.get(k - 1).and_then(|one| scope.records.open(one).ok()),
+            },
+        }
+    }
+}
+
+/// [`names_records_with_snapshot`] over either source of crates ([`ScopeCrates`]). On
+/// [`ScopeCrates::ByNeed`], only the owner is listed as a caller at setup. Every crate after it
+/// is a proc-macro caller too: its edition is read from its records, opened at its first call
+/// (job_texts.rs `JobTexts::caller`). A body job lowers another crate's body (front2
+/// opaque_auto.rs, the defining body of an `impl Trait`), and a call written there runs at
+/// that body's crate. The run is keyed by the call and by the caller's package and edition
+/// (rule 21), so it is the same whichever job asks for it. `env!` is still read for the owner
+/// only: a dependency's `env!` is refused by name (job_texts.rs `crate_env`); a run's names
+/// records ([`open`]) give every crate its own ([`RunEnvs`], through [`names_records_envs`]).
+#[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
+pub(crate) fn names_records_over<'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    crates: ScopeCrates<'_, 'n>,
+    files: (impl Into<Packs<'n>>, Option<&'n [crate::engine_tasks::Outlined<'n>]>),
+    corrected: &'n [(u32, &'n str, &'n str)],
+    procs: Option<&'n ProcRunner<'static>>,
+    read: std::vec::Vec<(&'n str, Option<&'n str>), Global>,
+    env: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
+    snapshot: Option<&'n StoreSnapshot>,
+    expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
+    frame: &'n Frame,
+    g: Alloc<'static>,
+) -> Result<Opened<'n>, NamesError> {
+    names_records_envs(cx, root, crates, files, corrected, crate::job_texts::Procs::of(procs), read, Envs { owner: env, rest: None }, snapshot, expansion_keys, frame, g)
+}
+
+/// The environments a names records' texts serve ([`JobTexts::env`], [`JobTexts::envs`]): the
+/// owner's (crate 0), and every other crate's made by need (`None`: refused by name).
+#[derive(Clone, Copy)]
+pub(crate) struct Envs<'n> {
+    pub(crate) owner: Option<&'n blaze_scope::crate_env::CrateEnv<'n>>,
+    pub(crate) rest: Option<&'n dyn crate::job_texts::EnvsByNeed<'n>>,
+}
+
+/// [`names_records_over`] with the environments of [`Envs`]: THE ONE BODY of the names records.
+#[expect(clippy::too_many_arguments, reason = "the names records' edge: each argument one input of them")]
+pub(crate) fn names_records_envs<'n>(
+    cx: &'n Cx,
+    root: &'n Dir<ReadWrite>,
+    crates: ScopeCrates<'_, 'n>,
+    files: (impl Into<Packs<'n>>, Option<&'n [crate::engine_tasks::Outlined<'n>]>),
+    corrected: &'n [(u32, &'n str, &'n str)],
+    procs: crate::job_texts::Procs<'n>,
+    read: std::vec::Vec<(&'n str, Option<&'n str>), Global>,
+    envs: Envs<'n>,
+    snapshot: Option<&'n StoreSnapshot>,
+    expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
+    frame: &'n Frame,
+    g: Alloc<'static>,
+) -> Result<Opened<'n>, NamesError> {
+    let count = crates.len();
+    let mut crate_names: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(count, frame);
+    let mut packages: Vec<&'n str, &'n Frame> = Vec::with_capacity_in(count, frame);
+    // Each crate as a proc-macro caller, by its place, which is its `krate` in the records made
+    // below in this order: its index in the names world and its edition.
+    let mut callers: Vec<(usize, usize, blaze_expand::Edition), &'n Frame> = Vec::with_capacity_in(count, frame);
+    // On a scope opened by need, every crate past the owner is a caller whose edition is read at
+    // its first call (job_texts.rs `JobTexts::caller`).
+    let mut by_need: Option<(&'n [crate::front_load::Unopened], &'n dyn crate::front_load::OpenByNeed)> = None;
+    let from = match crates {
+        ScopeCrates::Opened(crates) => {
+            let mut records: Vec<CrateRecords<'n>, &'n Frame> = Vec::with_capacity_in(count, frame);
+            for (at, one) in crates.iter().enumerate() {
+                records.push(one.records);
+                crate_names.push(one.name);
+                packages.push(one.package);
+                // The edition the load's one open read (front_load.rs `CrateRecords::edition`):
+                // the section is not opened again here; the records made below open it once.
+                callers.push((at, one.world_at, one.records.edition));
+            }
+            crate::front_load::CratesFrom::Opened(records.leak())
+        }
+        ScopeCrates::ByNeed(scope) => {
+            crate_names.push(scope.own.name);
+            packages.push(scope.own.package);
+            callers.push((0, scope.own.world_at, scope.own.records.edition));
+            by_need = Some((scope.rest, scope.records));
+            for one in scope.rest {
+                crate_names.push(one.name);
+                packages.push(one.package);
+            }
+            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, rest: scope.rest, records: scope.records }
+        }
+    };
+    let (crate_names, packages): (&'n [&'n str], &'n [&'n str]) = (crate_names.leak(), packages.leak());
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.leak();
     let texts: &'n JobTexts<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
         JobTexts {
             cx,
             root,
             frame,
-            packs: packs.into(),
+            packs: files.0.into(),
             corrected,
-            // The first crate's environment (a body job's owner): what its bodies' `env!` reads.
-            env: env.map(|env| (0, env)),
+            // The first crate's environment (a body job's owner): what its bodies' `env!` reads;
+            // every other crate's made at its first ask, when the caller gave a maker.
+            env: envs.owner.map(|env| (0, env)),
+            envs: envs.rest,
             read: RefCell::new(read),
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs,
             own: None,
             callers,
+            by_need,
             run_stopped: core::cell::Cell::new(None),
         },
         frame,
     ));
-    let load: &'n StoreLoad<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(StoreLoad::new(records, packages, texts, g), frame));
+    let storage = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+    let load: &'n StoreLoad<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(StoreLoad::from_crates(from, packages, texts, snapshot, expansion_keys, files.1, storage.handle()), frame));
     let log: &'n Log<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(Log::new(crate_names, g), frame));
     let keys = load.keys(g);
     let records: &'n Records<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(Records::new(keys, load, log, frame, g), frame));
@@ -164,32 +293,38 @@ const ROW: usize = 4 + 32 + 32;
 /// The most crates a record names (rule 18): far above any program's check scope.
 pub(crate) const MOST_ROWS: usize = 1 << 20;
 
-const KEY_DOMAIN: &str = "blaze-cli run names inputs 1";
-
-/// The key of the record of certificate `cert`: the certificate holds the tool and the request.
-pub(crate) fn inputs_key(cert: Key) -> Key {
-    let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&cert.0);
-    Key(h.finish())
-}
-
 /// Where a run finds the rows of the names it reads: the `UnitGraph`'s, and each crate's
 /// `CrateScope` row by its index in the list and its name.
 pub(crate) trait Answered {
     fn graph(&self) -> Option<Input>;
     fn crate_input(&self, at: usize, name: Name) -> Option<Input>;
+    /// The row of the build-script run `name` of the crate at list index `at` (body_types.rs
+    /// `owner_script`): what the crate's environment joins ([`RunEnvs`]). `None`: no row, or
+    /// a row that failed.
+    fn script_input(&self, at: usize, name: Name) -> Option<Input>;
 }
 
-/// The rows a request that walked settled.
-pub(crate) struct Walked<'q, 'r>(pub(crate) &'q blaze_drive::Request<'r>);
+/// The rows of the engine's stored answer (engine_check.rs `Standing`): the unit graph's row,
+/// and each crate's `CrateScope` row as the check's names stage gave it (`NamesStage::input_of`:
+/// its record key and out, `None` for a crate that failed). Every row is the answer's, so a
+/// start keeps no record of its own of them: the next start reads the same answer.
+#[derive(Clone, Copy)]
+pub(crate) struct FromEngine<'s> {
+    pub(crate) graph: Input,
+    pub(crate) names: &'s dyn Fn(Name) -> Option<Input>,
+}
 
-impl Answered for Walked<'_, '_> {
+impl Answered for FromEngine<'_> {
     fn graph(&self) -> Option<Input> {
-        self.0.settled_input(Name::unit_graph())
+        Some(self.graph)
     }
 
     fn crate_input(&self, _at: usize, name: Name) -> Option<Input> {
-        self.0.settled_input(name)
+        (self.names)(name)
+    }
+
+    fn script_input(&self, _at: usize, name: Name) -> Option<Input> {
+        (self.names)(name)
     }
 }
 
@@ -201,6 +336,9 @@ pub(crate) enum FormError {
     Rows { count: usize },
     Length { len: usize, want: usize },
     Unsorted { row: usize },
+    /// A crates' build-script rows over another graph row than the crates' rows
+    /// ([`Stood::with_scripts`]).
+    Graph,
 }
 
 impl fmt::Display for FormError {
@@ -211,16 +349,40 @@ impl fmt::Display for FormError {
             FormError::Rows { count } => write!(f, "it names {count} crates, more than the {MOST_ROWS} a record may"),
             FormError::Length { len, want } => write!(f, "{len} bytes where its count makes {want}"),
             FormError::Unsorted { row } => write!(f, "row {row}'s crate index is not above the row before it"),
+            FormError::Graph => f.write_str("its build-script rows are over another `UnitGraph` row than its crates' rows"),
         }
     }
 }
 
 /// The rows a request that stood reads: the record of its certificate, checked whole, read in
-/// place (each crate a binary search over its rows).
+/// place (each crate a binary search over its rows), and the crates' build-script rows in the
+/// same row form ([`Stood::with_scripts`]; none for a record opened alone).
 #[derive(Clone, Copy)]
 pub(crate) struct Stood<'b> {
     graph: Input,
     rows: &'b [u8],
+    scripts: &'b [u8],
+}
+
+/// The row of crate index `at` among `rows` (rows of [`ROW`] bytes, strictly increasing by
+/// index), named `name`: a binary search.
+fn row_at(rows: &[u8], at: usize, name: Name) -> Option<Input> {
+    let want = u32::try_from(at).ok()?;
+    let (mut low, mut high) = (0, rows.len() / ROW);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let here = u32_at(rows, mid * ROW);
+        if here == want {
+            let row = mid * ROW;
+            return Some(Input { name, at: Key(ContentId(word(rows, row + 4))), out: ContentId(word(rows, row + 36)) });
+        }
+        if here < want {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    None
 }
 
 fn word(b: &[u8], at: usize) -> [u8; 32] {
@@ -258,7 +420,17 @@ impl<'b> Stood<'b> {
             }
         }
         let graph = Input { name: Name::unit_graph(), at: Key(ContentId(word(bytes, 16))), out: ContentId(word(bytes, 48)) };
-        Ok(Stood { graph, rows })
+        Ok(Stood { graph, rows, scripts: &[] })
+    }
+
+    /// These rows with `scripts`' rows as the crates' build-script rows: a second record of
+    /// this form (its rows each a crate's `Script` row by the crate's index) over the same
+    /// graph row; another graph's is refused.
+    pub(crate) fn with_scripts(self, scripts: Stood<'b>) -> Result<Stood<'b>, FormError> {
+        if scripts.graph != self.graph {
+            return Err(FormError::Graph);
+        }
+        Ok(Stood { scripts: scripts.rows, ..self })
     }
 }
 
@@ -268,22 +440,11 @@ impl Answered for Stood<'_> {
     }
 
     fn crate_input(&self, at: usize, name: Name) -> Option<Input> {
-        let want = u32::try_from(at).ok()?;
-        let (mut low, mut high) = (0, self.rows.len() / ROW);
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let here = u32_at(self.rows, mid * ROW);
-            if here == want {
-                let row = mid * ROW;
-                return Some(Input { name, at: Key(ContentId(word(self.rows, row + 4))), out: ContentId(word(self.rows, row + 36)) });
-            }
-            if here < want {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        None
+        row_at(self.rows, at, name)
+    }
+
+    fn script_input(&self, at: usize, name: Name) -> Option<Input> {
+        row_at(self.scripts, at, name)
     }
 }
 
@@ -320,7 +481,32 @@ pub(crate) struct Program {
     graph: Input,
     list: CrateList<'static>,
     crates: AVec<'static, (usize, Input)>,
+    /// The build-script row of each crate of `crates` that has one, by its index in `list`,
+    /// sorted: what that crate's environment joins, made at its first `env!` ([`RunEnvs`]).
+    scripts: AVec<'static, (usize, Input)>,
     lang: AVec<'static, usize>,
+    /// The program's own crate, by its index in `list`.
+    owner: usize,
+}
+
+impl Program {
+    /// The program's crates for its native image (engine_native.rs `image_for`): its own crate
+    /// first, then every other crate of its check scope, each by its key and its names row.
+    /// Read from the one crate list this program already holds: the unit graph is not read
+    /// again for it. `closed` is not a fact the image reads, and is `false` for every crate.
+    pub(crate) fn closure_in<'a>(&self, alloc: Alloc<'a>) -> AVec<'a, crate::engine_seeds::CrateAt> {
+        let at_of = |at: usize, names_at: Option<Key>| {
+            let key = self.list.key(at);
+            let mut prefix = [0u8; 8];
+            prefix.copy_from_slice(&key.0.0[..8]);
+            crate::engine_seeds::CrateAt { prefix, key, names_at, member: self.list.member(at), closed: false }
+        };
+        let mut closure = AVec::with_capacity_in(self.crates.len() + 1, alloc);
+        let own = self.crates.iter().find(|(at, _)| *at == self.owner).map(|(_, input)| input.at);
+        closure.push(at_of(self.owner, own));
+        closure.extend(self.crates.iter().filter(|(at, _)| *at != self.owner).map(|(at, input)| at_of(*at, Some(input.at))));
+        closure
+    }
 }
 
 /// Why the names records of `blaze run` could not be had.
@@ -333,13 +519,10 @@ pub(crate) enum RunNamesError {
     Store(std::boxed::Box<CliError, Global>),
     /// The `UnitGraph` record holds no crate list: its world could not be made (its finding says why).
     WorldNotMade,
-    /// No member crate of the list has its root at `root`, the picked program's crate root
-    /// (run_package.rs `Program::root`).
+    /// No member crate of a `Bin` unit has its root at `root`, the picked program's crate root
+    /// (run_package.rs `Program::root`; [`program_row`]).
     NoProgramCrate { root: std::boxed::Box<str> },
-    /// The request started a program, but the command picked none: only `blaze run` picks one
-    /// (main.rs `request`, run_package.rs `pick`).
-    NonePicked,
-    /// Two crates of the list have their root at `root`.
+    /// Two `Bin` units' member crates have their root at `root` ([`program_row`]).
     TwoProgramCrates { root: std::boxed::Box<str>, first: &'static str, second: &'static str },
     /// No member crate is at place `at` of the list ([`Owner::At`]).
     NoMemberAt { at: usize },
@@ -371,12 +554,11 @@ impl fmt::Display for RunNamesError {
             RunNamesError::NoGraph => write!(f, "the answer holds no `UnitGraph` row (no lock file matched), so the program's crates are not known ({at})"),
             RunNamesError::Store(error) => write!(f, "the program's names records: {error}"),
             RunNamesError::WorldNotMade => write!(f, "the `UnitGraph` record holds no crate list: the crates' world could not be made (its finding says why; {at})"),
-            RunNamesError::NonePicked => write!(f, "the request started a program, but this command picked none: only `blaze run` picks one (run_package.rs `pick`; {at})"),
-            RunNamesError::NoProgramCrate { root } => write!(f, "no member crate of the crate list has its root at `{root}`, the program `blaze run` starts ({at})"),
-            RunNamesError::TwoProgramCrates { root, first, second } => write!(f, "two crates of the crate list, `{first}` and `{second}`, have their root at `{root}` ({at})"),
+            RunNamesError::NoProgramCrate { root } => write!(f, "no binary unit's member crate has its root at `{root}`, the program `blaze run` starts ({at})"),
+            RunNamesError::TwoProgramCrates { root, first, second } => write!(f, "two binary units' crates, `{first}` and `{second}`, have their root at `{root}` ({at})"),
             RunNamesError::NoMemberAt { at: place } => write!(f, "the crate list has no member crate at place {place} ({at})"),
-            RunNamesError::TestGraph(why) => write!(f, "the test command's unit graph: {why}"),
-            RunNamesError::TestMap { unit, why } => write!(f, "the test command's crate map at graph unit {unit}: {why} ({at})"),
+            RunNamesError::TestGraph(why) => write!(f, "the start's unit graph: {why}"),
+            RunNamesError::TestMap { unit, why } => write!(f, "the start's map of units to crates, at graph unit {unit}: {why} ({at})"),
             RunNamesError::TestTarget { package, crate_name, why } => write!(f, "package `{package}`, test target crate `{crate_name}`: {why} ({at})"),
             RunNamesError::TestRecord { package, crate_name, why } => write!(f, "package `{package}`, target crate `{crate_name}` tests record: {why} ({at})"),
             RunNamesError::NotAnswered { crate_name } => write!(f, "the answer holds no `CrateScope` row for crate `{crate_name}`, which the program's check reads ({at})"),
@@ -401,12 +583,10 @@ fn unread(crate_name: &'static str, error: ReadError) -> RunNamesError {
 
 /// Which member crate of the list is the program's.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Owner<'s> {
-    /// The one rooted at this checkout-relative path: `run`'s picked program (run_package.rs
-    /// `Program::root`).
-    Root(&'s str),
-    /// The one at this place in the list: `test`'s unit ([`TestUnit`]), which shares its root
-    /// with the library it is compiled from.
+pub(crate) enum Owner {
+    /// The one at this place in the list: `run`'s binary ([`program_row`], by its unit's kind)
+    /// or `test`'s unit ([`TestUnit`]), each of which shares its root with another crate (the
+    /// binary's test unit; the library a test unit is compiled from), so never found by root.
     At(usize),
 }
 
@@ -465,12 +645,103 @@ impl TestInventory<'_> {
 /// One row of the graph's unit-to-crate map per unit, including those with no crate.
 /// The world's indices and the crate-list indices have different orders: only their
 /// crate keys join them. Root paths are shared by libraries, binaries and their harnesses.
+/// Each unit's row of the crate list `list` ([`test_map`]: 4 bytes a unit, `u32::MAX` for a
+/// unit that is no crate), kept in the store under the sealed graph's out: the names world is
+/// made only on its miss. Copied into `frame` (a few bytes a unit).
+/// COST: one get; on a miss, the names world once a command and one put.
+#[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
+fn unit_map<'f, 'm>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    graph: &Input,
+    list: &CrateList<'_>,
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<&'f [u8], RunNamesError> {
+    let mut digest = Hasher::new("blaze test: unit rows of a sealed unit graph 1");
+    digest.id(&graph.out);
+    let map_key = Key(digest.finish());
+    if let Some(held) = store.get(cx, map_key).map_err(stored)? {
+        let mut copied = Vec::with_capacity_in(held.bytes.len(), frame);
+        copied.extend_from_slice(held.bytes);
+        return Ok(copied.leak());
+    }
+    let erased = blaze_own::Erased::new(frame);
+    crate::body_types::names_world(cx, root, store, facts, graph, frame, erased.handle())
+        .map_err(stored)?.map_err(|why| RunNamesError::Scope { rule: why })?;
+    let names = facts.names.as_ref().ok_or(RunNamesError::WorldNotMade)?;
+    let made = test_map(names, list, heap.alloc())?;
+    store.put(cx, map_key, &made).map_err(stored)?;
+    let mut copied = Vec::with_capacity_in(made.len(), frame);
+    copied.extend_from_slice(&made);
+    Ok(copied.leak())
+}
+
+/// `run`'s program crate: the crate list's row of the unit of kind `Bin` (never `for_host`)
+/// whose crate root is `program_root` (checkout-relative: run_package.rs `Program::root`).
+///
+/// Chosen by the UNIT's kind, through the unit map: the engine's unit graph is made with test
+/// units (engine_check.rs `checking`, `Graph::new(.., true, ..)`), so a binary's file is the
+/// root of two crates, its `Bin` unit's and its `Test { bin }` unit's. Their two rows of the
+/// crate list hold the same name, root, package, binary name and member; only their keys
+/// differ (the test unit's cfg holds `test`: blaze-world list.rs `unit_crate_key`), and the
+/// list holds no cfg, so the row alone cannot say which is the program.
+/// COST: [`unit_map`], the unit graph's decode on a map hit, O(units).
+#[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
+pub(crate) fn program_row<'f, 'm>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    answered: &dyn Answered,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    program_root: &str,
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<usize, RunNamesError> {
+    let _cx = cx.span("run names: the program's unit");
+    let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
+    let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
+    let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
+    let decoded;
+    let units = match facts.names.as_ref().and_then(|names| names.made()) {
+        Some(made) => &made.graph().units,
+        None => {
+            let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
+            decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
+            &decoded.graph.units
+        }
+    };
+    if mapping.len() != units.len() * 4 {
+        return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
+    }
+    let mut owner: Option<usize> = None;
+    for (index, unit) in units.iter().enumerate() {
+        if unit.for_host || !matches!(unit.kind, blaze_unit_graph::UnitKind::Bin(_)) {
+            continue;
+        }
+        let at = u32_at(mapping, index * 4) as usize;
+        // `u32::MAX`: a unit that is no crate of the list.
+        if at >= CrateGraph::len(&list) || !list.member(at) || list.root(at).strip_prefix("/0/") != Some(program_root) {
+            continue;
+        }
+        match owner {
+            Some(first) if first != at => {
+                return Err(RunNamesError::TwoProgramCrates { root: std::boxed::Box::from(program_root), first: CrateGraph::name(&list, first), second: CrateGraph::name(&list, at) });
+            }
+            _ => owner = Some(at),
+        }
+    }
+    owner.ok_or_else(|| RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })
+}
+
 fn test_map(
     names: &crate::names::Names<'_>,
     list: &CrateList<'_>,
     alloc: Alloc<'static>,
 ) -> Result<AVec<'static, u8>, RunNamesError> {
-    let world = names.world();
+    let world = names.made().ok_or(RunNamesError::WorldNotMade)?.world();
     let mut bytes = AVec::with_capacity_in(world.crate_of_unit.len() * 4, alloc);
     for (unit, krate) in world.crate_of_unit.iter().enumerate() {
         let row = match krate {
@@ -514,7 +785,7 @@ fn main_test(
     let items_error = |why| RunNamesError::Items { crate_name, why };
     let items = blaze_scope::items_record::ItemsRecord::open(records.items, alloc).map_err(items_error)?;
     for row in 0..items.items() {
-        let Some(item) = items.item_at(row).map_err(items_error)? else { continue };
+        let Some(item) = items.identity_at(row).map_err(items_error)? else { continue };
         if item.module == items.root_module() && item.name == Some("main") && item.kind == blaze_surface::ItemKind::Function
             && items.member_owner(item.key).map_err(items_error)?.is_none()
         {
@@ -524,60 +795,86 @@ fn main_test(
     Err(RunNamesError::TestTarget { package, crate_name, why: "the harnessless target has no main function in its crate root" })
 }
 
-/// Names rows for a test certificate cover all settled crates, independent of this invocation's
-/// package selection. A later command can use the same certificate with a different selection.
-/// The separate graph map binds each Cargo unit number to its row of this exact crate list.
-#[expect(clippy::too_many_arguments, reason = "the request supplies its capabilities and record readers")]
-pub(crate) fn found_tests<'s, 'f: 's, 'm: 's>(
+/// The test suites of `selected` over the engine's stored answer (engine_start.rs `run_tests`):
+/// every row is the answer's ([`FromEngine`]), so nothing is put at a certificate and nothing is
+/// asked again. The rows cover all the answer's crates, independent of the selection; the
+/// separate graph map binds each Cargo unit number to its row of this exact crate list.
+#[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
+pub(crate) fn found_tests_answered<'s, 'f: 's, 'm: 's>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
-    req: &blaze_drive::Request<'_>,
+    answered: &dyn Answered,
     store: &mut dyn Store<'m>,
     facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
     read: &mut EngineRecords<'m>,
     selected: &[&str],
+    bin: Option<&str>,
     heap: &'static blaze_own::Heap,
     frame: &'f Frame,
-) -> Result<Option<TestInventory<'s>>, RunNamesError> {
-    let walk = crate::run_ids::walked(req);
-    let (answer, list) = if walk {
-        let walked = Walked(req);
-        let graph = walked.graph().ok_or(RunNamesError::NoGraph)?;
-        let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
-        let mut rows = AVec::new_in(heap.alloc());
-        for at in 0..CrateGraph::len(&list) {
-            if let Some(input) = walked.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))) {
-                rows.push((at, input));
-            }
+) -> Result<TestInventory<'s>, RunNamesError> {
+    let (answer, list) = rows_of(cx, answered, store, facts, heap, frame)?;
+    tests_of(cx, root, answer, list, store, facts, read, selected, bin, heap, frame)
+}
+
+/// The graph's row and each listed crate's row of `answered`, in [`Stood`]'s form (in `frame`),
+/// with the graph's crate list. COST: the list's read (once a command) and O(crates).
+fn rows_of<'f, 'm>(
+    cx: &Cx,
+    answered: &dyn Answered,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<(Stood<'f>, CrateList<'static>), RunNamesError> {
+    let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
+    let list = facts.bodies.list(cx, store, &graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
+    let mut rows = AVec::new_in(heap.alloc());
+    // Each crate's build-script row too: what its environment joins when one of its bodies is
+    // lowered by need ([`RunEnvs`]). A row naming a script of no kind is skipped here and
+    // refused by name at that crate's first `env!` (body_types.rs `owner_script`).
+    let mut scripts = AVec::new_in(heap.alloc());
+    for at in 0..CrateGraph::len(&list) {
+        if let Some(input) = answered.crate_input(at, blaze_drive::key::crate_scope_name(&list.key(at))) {
+            rows.push((at, input));
         }
-        let mut encoded = Vec::with_capacity_in(HEAD + ROW * rows.len(), frame);
-        encode(graph, &rows, &mut encoded, heap.alloc())?;
-        store.put(cx, inputs_key(req.certificate()), &encoded).map_err(stored)?;
-        (Stood::open(encoded.leak()).map_err(RunNamesError::Form)?, list)
-    } else {
-        let Some(answer) = stood(cx, req.certificate(), store)? else { return Ok(None) };
-        let list = facts.bodies.list(cx, store, &answer.graph, frame).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
-        (answer, list)
-    };
+        if let Ok(Some(script)) = crate::body_types::owner_script(&list, at)
+            && let Some(input) = answered.script_input(at, script)
+        {
+            scripts.push((at, input));
+        }
+    }
+    let mut encoded = Vec::with_capacity_in(HEAD + ROW * rows.len(), frame);
+    encode(graph, &rows, &mut encoded, heap.alloc())?;
+    let encoded: &'f [u8] = encoded.leak();
+    let mut encoded_scripts = Vec::with_capacity_in(HEAD + ROW * scripts.len(), frame);
+    encode(graph, &scripts, &mut encoded_scripts, heap.alloc())?;
+    let encoded_scripts: &'f [u8] = encoded_scripts.leak();
+    let stood = Stood::open(encoded).map_err(RunNamesError::Form)?;
+    let stood = stood.with_scripts(Stood::open(encoded_scripts).map_err(RunNamesError::Form)?).map_err(RunNamesError::Form)?;
+    Ok((stood, list))
+}
+
+/// The suites of `selected` over `answer`'s rows and the graph's crate list `list`; with `bin`
+/// (`--bin <name>`), only that binary target's suite (R3).
+#[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
+fn tests_of<'s, 'f: 's, 'm: 's>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    answer: Stood<'s>,
+    list: CrateList<'static>,
+    store: &mut dyn Store<'m>,
+    facts: &mut crate::work::Facts<'f, impl crate::sweep::Stamps>,
+    read: &mut EngineRecords<'m>,
+    selected: &[&str],
+    bin: Option<&str>,
+    heap: &'static blaze_own::Heap,
+    frame: &'f Frame,
+) -> Result<TestInventory<'s>, RunNamesError> {
     let graph = answer.graph;
-    let mut digest = Hasher::new("blaze test: unit rows of a sealed unit graph 1");
-    digest.id(&graph.out);
-    let map_key = Key(digest.finish());
-    let made;
-    let mapping = if let Some(held) = store.get(cx, map_key).map_err(stored)? {
-        held.bytes
-    } else {
-        let erased = blaze_own::Erased::new(frame);
-        crate::body_types::names_world(cx, root, store, facts, &graph, frame, erased.handle())
-            .map_err(stored)?.map_err(|why| RunNamesError::Scope { rule: why })?;
-        let names = facts.names.as_ref().ok_or(RunNamesError::WorldNotMade)?;
-        made = test_map(names, &list, heap.alloc())?;
-        store.put(cx, map_key, &made).map_err(stored)?;
-        made.as_slice()
-    };
+    let mapping = unit_map(cx, root, store, facts, &graph, &list, heap, frame)?;
     let decoded;
-    let units = match facts.names.as_ref() {
-        Some(names) => &names.graph().units,
+    let units = match facts.names.as_ref().and_then(|names| names.made()) {
+        Some(made) => &made.graph().units,
         None => {
             let bytes = crate::work::payload(cx, store, &graph, frame).map_err(stored)?;
             decoded = blaze_unit_graph::record::decode(bytes.unit_graph(graph.name).map_err(stored)?.graph, heap.alloc()).map_err(RunNamesError::TestGraph)?;
@@ -587,9 +884,13 @@ pub(crate) fn found_tests<'s, 'f: 's, 'm: 's>(
     if mapping.len() != units.len() * 4 {
         return Err(RunNamesError::TestMap { unit: units.len(), why: "the number of indices differs from the unit graph" });
     }
+    let snapshot = run_snapshot(store)?;
     let mut suites = AVec::new_in(heap.alloc());
     for (index, unit) in units.iter().enumerate() {
         let Some((kind, target_name, harness)) = test_target(unit) else { continue };
+        if let Some(bin) = bin && (kind != "bin" || target_name != bin) {
+            continue;
+        }
         // run_package::test_packages orders the selection by package name.
         if selected.binary_search(&unit.name.as_str()).is_err() {
             continue;
@@ -626,16 +927,15 @@ pub(crate) fn found_tests<'s, 'f: 's, 'm: 's>(
         } else {
             crate::work::held_str(bstd::mem::format_in!(frame, "{kind}:{target_name}").as_str(), frame)
         };
-        suites.push((Found::Stood(answer), TestUnit { at, key, package, target, tests, edition: records.edition }));
+        suites.push((Found::Stood(answer, snapshot.clone()), TestUnit { at, key, package, target, tests, edition: records.edition }));
     }
     suites.sort_unstable_by(|(_, a), (_, b)| (a.package, a.target, a.key).cmp(&(b.package, b.target, b.key)));
-    Ok(Some(TestInventory { suites, walked: walk.then_some(list) }))
+    Ok(TestInventory { suites, walked: Some(list) })
 }
 
 /// The program's crates from `answered`: the crate list of its `UnitGraph` row (read once a
-/// command, `Kept::list`), the member crate `owner` names ([`Owner`]: `run`'s rooted at the
-/// picked program's crate root, checkout-relative: run_package.rs `Program::root`,
-/// `bin/tempo/src/main.rs` for a member binary; `test`'s by its place), its `CrateScope`
+/// command, `Kept::list`), the member crate `owner` names ([`Owner`]: `run`'s from its `Bin`
+/// unit, [`program_row`]; `test`'s by its unit's place), its `CrateScope`
 /// record's `no_core`, and its check scope's crates, each by its row.
 /// COST: the list's read and the program's records once a command (in place, through `read`:
 /// engine_records.rs); the scope, O(crates + edges).
@@ -643,7 +943,7 @@ pub(crate) fn found_tests<'s, 'f: 's, 'm: 's>(
 pub(crate) fn program_of<'m>(
     cx: &Cx,
     answered: &dyn Answered,
-    owner: Owner<'_>,
+    owner: Owner,
     store: &mut dyn Store<'m>,
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
@@ -654,18 +954,6 @@ pub(crate) fn program_of<'m>(
     let graph = answered.graph().ok_or(RunNamesError::NoGraph)?;
     let list = kept.list(cx, store, &graph, scratch).map_err(stored)?.ok_or(RunNamesError::WorldNotMade)?;
     let owner = match owner {
-        Owner::Root(program_root) => {
-            let mut owner: Option<usize> = None;
-            for at in 0..CrateGraph::len(&list) {
-                if list.member(at) && list.root(at).strip_prefix("/0/") == Some(program_root) {
-                    if let Some(first) = owner {
-                        return Err(RunNamesError::TwoProgramCrates { root: std::boxed::Box::from(program_root), first: CrateGraph::name(&list, first), second: CrateGraph::name(&list, at) });
-                    }
-                    owner = Some(at);
-                }
-            }
-            owner.ok_or_else(|| RunNamesError::NoProgramCrate { root: std::boxed::Box::from(program_root) })?
-        }
         Owner::At(at) if at < CrateGraph::len(&list) && list.member(at) => at,
         Owner::At(at) => return Err(RunNamesError::NoMemberAt { at }),
     };
@@ -676,92 +964,103 @@ pub(crate) fn program_of<'m>(
     let no_core = blaze_scope::names_record::NamesRecord::open(records.names_proof).crate_root().head().no_core;
     let scope = blaze_world::check_scope::check_scope_in(&list, owner, no_core, heap.alloc()).map_err(|refused| RunNamesError::Scope { rule: refused.rule() })?;
     let mut crates: AVec<'static, (usize, Input)> = AVec::new_in(heap.alloc());
+    let mut scripts: AVec<'static, (usize, Input)> = AVec::new_in(heap.alloc());
     for at in scope.crates() {
         crates.push((at, input_of(at)?));
+        // A row naming a script of no kind, or a script with no row in the answer, is refused
+        // by name at the crate's first `env!` ([`RunEnvs`]), never here: a crate whose bodies
+        // read no environment needs none.
+        if let Ok(Some(script)) = crate::body_types::owner_script(&list, at)
+            && let Some(input) = answered.script_input(at, script)
+        {
+            scripts.push((at, input));
+        }
     }
+    scripts.sort_unstable_by_key(|(at, _)| *at);
     let mut lang: AVec<'static, usize> = AVec::new_in(heap.alloc());
     lang.extend(scope.lang_places());
-    Ok(Program { graph, list, crates, lang })
+    Ok(Program { graph, list, crates, scripts, lang, owner })
 }
 
-/// On a walk: the record of the program's rows at `cert` ([`inputs_key`]), so a run that
-/// stands on the certificate finds the names records ([`Stood`]). One put.
-pub(crate) fn put(cx: &Cx, program: &Program, cert: Key, store: &mut dyn Store<'_>, heap: &'static blaze_own::Heap) -> Result<(), RunNamesError> {
-    let _cx = cx.span("run names: write the program's rows");
-    let mut bytes: AVec<'static, u8> = AVec::with_capacity_in(HEAD + program.crates.len() * ROW, heap.alloc());
-    encode(program.graph, &program.crates, &mut bytes, heap.alloc())?;
-    store.put(cx, inputs_key(cert), &bytes).map_err(stored)
-}
-
-/// On a hit: the record of `cert`'s rows, or `None` when the store holds none (the command then
-/// answers in full). One get; the bytes are checked whole.
-pub(crate) fn stood<'m>(cx: &Cx, cert: Key, store: &mut dyn Store<'m>) -> Result<Option<Stood<'m>>, RunNamesError> {
-    let Some(held) = store.get(cx, inputs_key(cert)).map_err(stored)? else { return Ok(None) };
-    let bytes: &'m [u8] = held.bytes;
-    Stood::open(bytes).map(Some).map_err(RunNamesError::Form)
-}
-
-/// Where the program's names rows are, found when the program starts: on a walk, the program's
-/// crates (made now, and written at the certificate, [`put`]); on a hit, the certificate's record.
+/// Where the program's names rows are, found when the program starts: the program's crates
+/// (`run`, [`found_answered`]), or a test suite's rows of the answer in [`Stood`]'s form
+/// ([`found_tests_answered`]), its crates found when the parent first needs them.
 pub(crate) enum Found<'b> {
-    Walked(Program),
-    Stood(Stood<'b>),
+    Walked(Program, SharedSnapshot),
+    Stood(Stood<'b>, SharedSnapshot),
+}
+
+fn run_snapshot(store: &dyn Store<'_>) -> Result<SharedSnapshot, RunNamesError> {
+    store.snapshot().map_err(stored)?.ok_or_else(|| stored(CliError::Text { what: "the run names reader needs a committed store snapshot for expansion text" }))
 }
 
 impl Found<'_> {
-    /// The crate list a walk read (what run_ids.rs `for_run` takes); `None` on a hit.
+    /// The crate list the program's crates were found in (what run_ids.rs `RunIds::new` takes);
+    /// `None` for a suite's rows.
     pub(crate) fn list(&self) -> Option<&CrateList<'static>> {
         match self {
-            Found::Walked(program) => Some(&program.list),
-            Found::Stood(_) => None,
+            Found::Walked(program, _) => Some(&program.list),
+            Found::Stood(..) => None,
+        }
+    }
+
+    /// The program [`found_answered`] found; `None` for a suite's rows.
+    pub(crate) fn program(&self) -> Option<&Program> {
+        match self {
+            Found::Walked(program, _) => Some(program),
+            Found::Stood(..) => None,
+        }
+    }
+
+    /// The committed store's snapshot the names records read in place: what a runner made by
+    /// need reads the unit graph's record from (engine_start.rs `RunProcs`).
+    pub(crate) fn snapshot(&self) -> &StoreSnapshot {
+        match self {
+            Found::Walked(_, snapshot) | Found::Stood(_, snapshot) => &**snapshot,
         }
     }
 }
 
-/// [`Found`] for the request `req` at its `Effect::StartProgram`, before the program starts;
-/// `None`: the request stood and the store holds no record of its rows, so the command answers in
-/// full (main.rs `CliError::AnswerInFull`). A walk: [`program_of`] and one put; a hit: one get.
-#[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
-pub(crate) fn found<'m>(
+/// [`Found`] over the engine's stored answer (engine_start.rs `run_program`): the program's
+/// crates found from `answered`'s rows ([`FromEngine`]), always; nothing put at a certificate,
+/// since the next start reads the same answer. COST: as [`program_of`].
+#[expect(clippy::too_many_arguments, reason = "the start's edge: each argument one thing it holds")]
+pub(crate) fn found_answered<'m>(
     cx: &Cx,
-    req: &blaze_drive::Request<'_>,
-    owner: Owner<'_>,
+    answered: &dyn Answered,
+    owner: Owner,
     store: &mut dyn Store<'m>,
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
     heap: &'static blaze_own::Heap,
     scratch: &Frame,
-) -> Result<Option<Found<'m>>, RunNamesError> {
-    if crate::run_ids::walked(req) {
-        let program = program_of(cx, &Walked(req), owner, store, kept, read, heap, scratch)?;
-        put(cx, &program, req.certificate(), store, heap)?;
-        return Ok(Some(Found::Walked(program)));
-    }
-    Ok(stood(cx, req.certificate(), store)?.map(Found::Stood))
+) -> Result<Found<'m>, RunNamesError> {
+    let program = program_of(cx, answered, owner, store, kept, read, heap, scratch)?;
+    Ok(Found::Walked(program, run_snapshot(store)?))
 }
 
-/// The names records of `found` (the lazy parent's `names` closure, called at most once): on a
-/// hit the program's crates are found from the record first ([`program_of`] over [`Stood`]).
+/// The names records of `found` (the lazy parent's `names` closure, called at most once): for a
+/// suite's rows the program's crates are found from them first ([`program_of`] over [`Stood`]).
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
 pub(crate) fn names_of<'n, 'm: 'n>(
     cx: &'n Cx,
     root: &'n Dir<ReadWrite>,
-    found: &Found<'_>,
-    owner: Owner<'_>,
+    found: &'n Found<'_>,
+    owner: Owner,
     store: &mut dyn Store<'m>,
     kept: &mut Kept,
     read: &mut EngineRecords<'m>,
     env: &'n crate::fetch::FetchEnv<'_>,
-    procs: Option<&'n ProcRunner<'static>>,
+    procs: crate::job_texts::Procs<'n>,
     seen: &'n TreesSeen,
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<NamesRecords<'n>, RunNamesError> {
     match found {
-        Found::Walked(program) => open(cx, root, program, store, read, env, procs, seen, frame, heap),
-        Found::Stood(rows) => {
+        Found::Walked(program, snapshot) => open(cx, root, program, snapshot, store, read, env, procs, seen, frame, heap),
+        Found::Stood(rows, snapshot) => {
             let program = program_of(cx, rows, owner, store, kept, read, heap, frame)?;
-            open(cx, root, &program, store, read, env, procs, seen, frame, heap)
+            open(cx, root, &program, snapshot, store, read, env, procs, seen, frame, heap)
         }
     }
 }
@@ -775,12 +1074,19 @@ pub(crate) struct NamesRead {
     pub(crate) reads: ReadCounts,
     pub(crate) trees_opened: u32,
     pub(crate) trees: u32,
+    /// The body ids' line beside it (run_ids.rs `IdsLine`), when the run made them.
+    pub(crate) ids: Option<crate::run_ids::IdsLine>,
 }
 
 impl NamesRead {
     pub(crate) fn of(reads: ReadCounts, seen: &TreesSeen) -> NamesRead {
         let (trees_opened, trees) = seen.opened();
-        NamesRead { reads, trees_opened, trees }
+        NamesRead { reads, trees_opened, trees, ids: None }
+    }
+
+    /// With the body ids' line, printed as a second `run` line of the profile.
+    pub(crate) fn with_ids(self, ids: crate::run_ids::IdsLine) -> NamesRead {
+        NamesRead { ids: Some(ids), ..self }
     }
 }
 
@@ -794,7 +1100,75 @@ impl fmt::Display for NamesRead {
             self.reads.copied,
             self.trees_opened,
             self.trees
-        )
+        )?;
+        // phases.rs prints this value after `run          `: the second line is indented alike.
+        match self.ids {
+            Some(ids) => write!(f, "\nrun          {ids}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The environment of each crate of a run's names records, made at the first ask for it
+/// (job_texts.rs `EnvsByNeed`): what a body of that crate lowered by need reads through
+/// `env!`/`option_env!`, its includes' package folder and `file!()`, made by the one
+/// construction `blaze check` makes its body owner's with (body_types.rs `row_env`, rule 30):
+/// the crate list's facts of its row and, when it has a build script, the payload of its
+/// `Script` row in the answer, read in place from the committed snapshot. The Reference: `env!`
+/// reads the environment "of the crate being compiled"; for a dependency that is ITS package's
+/// `CARGO_PKG_*` and `CARGO_MANIFEST_DIR` and its build script's `cargo:rustc-env`.
+///
+/// THE READ (rule 21): every answer a body's expansion takes from it is in that call's read
+/// list (blaze-expand cx.rs: `ReadKind::Env` with the value's digest; an include's bytes), and
+/// what it is made from is the answer's: the crate list is the `UnitGraph` row's and the script
+/// row the answer's, both under the answer's root, which certifies the run (start_list.rs
+/// `Certificate::of_answer`): an edited `version` or a changed `rustc-env` is another answer.
+/// COST: per crate asked, its list row and at most one record read in place; never at setup.
+pub(crate) struct RunEnvs<'n> {
+    list: &'n CrateList<'static>,
+    /// Reader crate `k`'s row of `list` (the names records' order, the owner at 0).
+    rows: &'n [usize],
+    /// [`Program::scripts`]: each crate's build-script row by its row of `list`, sorted.
+    scripts: &'n [(usize, Input)],
+    snapshot: &'n StoreSnapshot,
+    /// The home whose file area holds a native script's stored `OUT_DIR` files.
+    home: Option<&'n str>,
+    frame: &'n Frame,
+    /// Reader crate `k`'s environment, or the words of why it could not be made: made once.
+    made: Vec<core::cell::OnceCell<Result<&'n blaze_scope::crate_env::CrateEnv<'n>, &'static str>>, &'n Frame>,
+}
+
+impl<'n> RunEnvs<'n> {
+    pub(crate) fn new(list: &'n CrateList<'static>, rows: &'n [usize], scripts: &'n [(usize, Input)], snapshot: &'n StoreSnapshot, home: Option<&'n str>, frame: &'n Frame) -> RunEnvs<'n> {
+        let mut made = Vec::with_capacity_in(rows.len(), frame);
+        made.resize_with(rows.len(), core::cell::OnceCell::new);
+        RunEnvs { list, rows, scripts, snapshot, home, frame, made }
+    }
+
+    /// The one making of list row `at`'s environment.
+    fn make(&self, at: usize) -> Result<&'n blaze_scope::crate_env::CrateEnv<'n>, &'static str> {
+        let script = match crate::body_types::owner_script(self.list, at)? {
+            None => None,
+            Some(name) => {
+                let found = self.scripts.binary_search_by_key(&at, |(row, _)| *row).ok().and_then(|i| self.scripts.get(i)).filter(|(_, input)| input.name == name);
+                let (_, input) = found.ok_or("its build-script run has no row in the answer, or a row that failed (run_names.rs `Program::scripts`)")?;
+                let bytes = self.snapshot.get(input.at).map_err(|_| "its build-script record could not be read from the store's snapshot")?;
+                let bytes = bytes.ok_or("its build-script record is not in the store's snapshot")?;
+                match blaze_drive::record::open(bytes) {
+                    Ok(blaze_drive::record::Stored::Whole(view)) => Some(view.payload),
+                    Ok(blaze_drive::record::Stored::Shape(_)) => return Err("its build-script record is a shape, with no payload"),
+                    Err(_) => return Err("its build-script record is not one of this tool's records"),
+                }
+            }
+        };
+        crate::body_types::row_env(self.list, at, script, self.home, self.frame)
+    }
+}
+
+impl<'n> crate::job_texts::EnvsByNeed<'n> for RunEnvs<'n> {
+    fn env_of(&self, krate: usize) -> Option<&'n blaze_scope::crate_env::CrateEnv<'n>> {
+        let (&at, slot) = self.rows.get(krate).zip(self.made.get(krate))?;
+        slot.get_or_init(|| self.make(at)).ok()
     }
 }
 
@@ -802,17 +1176,19 @@ impl fmt::Display for NamesRead {
 /// read IN PLACE from the store's mapping through `read` (engine_records.rs, the one reader of
 /// `blaze check` too; for `'m`, the command's `Lent` borrow, which outlives `'n`), the list's
 /// trees each opened at the first read of a text from it ([`LazyTrees`], counted in `seen`), and
-/// the command's proc-macro runner when the names world was made this command (`None`: a body's
-/// proc-macro call is refused by name).
+/// the command's proc-macro runner: for `run` and `test`, made at a body's first proc-macro call
+/// (engine_start.rs `RunProcs`, job_texts.rs `Procs::ByNeed`); `Procs::None`: a body's
+/// proc-macro call is refused by name.
 #[expect(clippy::too_many_arguments, reason = "the StartProgram site's edge: each argument one thing it holds")]
 pub(crate) fn open<'n, 'm: 'n>(
     cx: &'n Cx,
     root: &'n Dir<ReadWrite>,
     program: &Program,
+    snapshot: &'n StoreSnapshot,
     store: &mut dyn Store<'m>,
     read: &mut EngineRecords<'m>,
     env: &'n crate::fetch::FetchEnv<'_>,
-    procs: Option<&'n ProcRunner<'static>>,
+    procs: crate::job_texts::Procs<'n>,
     seen: &'n TreesSeen,
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
@@ -833,9 +1209,16 @@ pub(crate) fn open<'n, 'm: 'n>(
     ));
     let trees: &'n LazyTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(LazyTrees::new(opener, list.trees(), seen, frame), frame));
     let corrected = crate::body_types::corrected_of(list, heap).map_err(|why| RunNamesError::Trees { why })?;
-    // No crate's environment yet: a run's bodies' `env!` is refused by name (the next piece:
-    // each crate's `CrateList::env_facts`, as body_types.rs `owner_env` makes the owner's).
-    let opened = names_records(cx, root, &crates, trees, corrected, procs, std::vec::Vec::new_in(Global), None, frame, heap.alloc()).map_err(|error| match error {
+    // Every crate's environment, each made at its first ask ([`RunEnvs`]): a body lowered by
+    // need reads its own crate's, as `blaze check` gives a body its owner's.
+    let mut rows: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
+    rows.extend(program.crates.iter().map(|(at, _)| *at));
+    let mut scripts: Vec<(usize, Input), &'n Frame> = Vec::with_capacity_in(program.scripts.len(), frame);
+    scripts.extend_from_slice(&program.scripts);
+    let envs: &'n RunEnvs<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(RunEnvs::new(list, rows.leak(), scripts.leak(), snapshot, env.home, frame), frame));
+    let envs = Envs { owner: None, rest: Some(envs) };
+    let trees = (trees, None);
+    let opened = names_records_envs(cx, root, ScopeCrates::Opened(&crates), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {
         NamesError::Items { at, why } => RunNamesError::Items { crate_name: program.crates.get(at).map_or("?", |(at, _)| CrateGraph::name(list, *at)), why },
     })?;
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);

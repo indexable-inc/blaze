@@ -400,9 +400,9 @@ number marked "estimate" is one; no run backs it.
    (parked) gen/ shows LLVM driven at build time with a pinned prebuilt output checked by BLAKE3 (pin.rs,
    stencils.json): the model for the table's digest (point 2, stage 2).
    How LLVM is pinned and linked: root Cargo.toml `[workspace.metadata.blaze.native.llvm] pin =
-   "crates/blaze-toolchain/pins/llvm.json", env = "LLVM_SYS_231_PREFIX", packages = ["llvm-sys",
+   "pins/llvm.json", env = "LLVM_SYS_231_PREFIX", packages = ["llvm-sys",
    "blaze-stencil/llvm-stencils"]`; llvm.json pins 23.1.4 with per-target tarballs and sha256; vendor/llvm-sys
-   pin.rs reads `PIN_JSON = "../../crates/blaze-toolchain/pins/llvm.json"`, wrappers/passes.cpp holds
+   pin.rs reads `PIN_JSON = "../../pins/llvm.json"`, wrappers/passes.cpp holds
    `LLVMBlazeRunPasses`. The pin lives in a parked crate and must move when blaze-llvm exists (coordinator's
    edit: vendor/ is no lane's).
 5. Export. blaze-export export.rs `export(program, platform, out, alloc)` already makes every in-reach call a
@@ -482,7 +482,7 @@ records shareable across a layout edit. Kept as decided.
 | 14 | Loop-entry variant, poll fault handler | none | F3 |
 | 15 | Export of optimized records | export takes today's records | G |
 | 16 | x86-64 | refused in run mode; parked stencils only | H |
-| 17 | The LLVM pin out of a parked crate (moved 2026-11-16: crates/hir-ty-codegen/llvm.json is crates/blaze-toolchain/pins/llvm.json) | crates/blaze-toolchain/pins/llvm.json, vendor/llvm-sys pin.rs | coordinator |
+| 17 | The LLVM pin out of a parked crate (moved 2026-11-16: crates/hir-ty-codegen/llvm.json is pins/llvm.json) | pins/llvm.json, vendor/llvm-sys pin.rs | coordinator |
 
 #### Pieces, in point 7's order
 

@@ -1,3 +1,8 @@
+use std::{
+    string::{String, ToString},
+    vec::Vec,
+};
+
 use super::*;
 
 const SETS: [(&str, &[(u32, u32)]); 8] = [
@@ -215,9 +220,68 @@ fn legacy_grapheme_clusters() {
 }
 
 fn nfd_of(s: &str) -> String {
-    let mut out = String::new();
-    nfd(s, &mut out);
-    out
+    nfd_chars(s).collect()
+}
+
+/// NFD as it was written before [`nfd_chars`]: each part pushed onto the text, a non-starter
+/// inserted after the last of the run at the text's end whose class is not above its own (a
+/// stable insertion sort). The reference the iterator is held to.
+fn nfd_by_insertion(s: &str, out: &mut String) {
+    fn put(out: &mut String, run: &mut usize, c: char) {
+        let class = combining_class(c);
+        if class == 0 {
+            out.push(c);
+            *run = out.len();
+            return;
+        }
+        let tail = &out[*run..];
+        let at = match tail.char_indices().rev().find(|&(_, it)| combining_class(it) <= class) {
+            Some((at, it)) => *run + at + it.len_utf8(),
+            None => *run,
+        };
+        out.insert(at, c);
+    }
+    const S_BASE: u32 = 0xac00;
+    const S_COUNT: u32 = 19 * 21 * 28;
+    let mut run = out.len();
+    for c in s.chars() {
+        let cp = u32::from(c);
+        if (S_BASE..S_BASE + S_COUNT).contains(&cp) {
+            let index = cp - S_BASE;
+            for part in [0x1100 + index / (21 * 28), 0x1161 + index % (21 * 28) / 28] {
+                out.push(char::from_u32(part).expect("a Hangul jamo"));
+            }
+            if index % 28 != 0 {
+                out.push(char::from_u32(0x11a7 + index % 28).expect("a Hangul jamo"));
+            }
+            run = out.len();
+            continue;
+        }
+        let at = tables::NFD.partition_point(|&(key, _, _)| key < cp);
+        match tables::NFD.get(at) {
+            Some(&(key, start, len)) if key == cp => {
+                let start = usize::from(start);
+                for &part in &tables::NFD_CHARS[start..start + usize::from(len)] {
+                    put(out, &mut run, char::from_u32(part).expect("a decomposition is characters"));
+                }
+            }
+            _ => put(out, &mut run, c),
+        }
+    }
+}
+
+/// The iterator gives what the insertion sort wrote, and the deprecated `nfd` appends it.
+#[test]
+fn nfd_chars_is_the_insertion_sort() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let s = text(tape);
+        let mut want = String::new();
+        nfd_by_insertion(&s, &mut want);
+        assert_eq!(nfd_of(&s), want, "{s:?}");
+        let mut out = String::from("a\u{301}");
+        nfd(&s, &mut out);
+        assert_eq!(out, std::format!("a\u{301}{want}"), "{s:?}");
+    });
 }
 
 #[test]

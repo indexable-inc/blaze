@@ -175,7 +175,7 @@ pub(super) fn copy_frags(
                 }
             };
             let kind = written(view.kind(at));
-            out.push_bytes_ctx(kind, view.bytes(at), origin, ctx)?;
+            out.push_whole_ctx(kind, view.whole(at), origin, ctx)?;
             prev = match kind {
                 TokenKind::Ident { .. } | TokenKind::Literal { .. } => Some(origin),
                 _ => None,

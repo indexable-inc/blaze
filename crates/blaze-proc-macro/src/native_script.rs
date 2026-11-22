@@ -1,6 +1,7 @@
 //! D65/D69: one native build script run end to end, confined: its environment (cargo's, with
 //! the real folders in place of the key's, and the pinned C toolchain's from
-//! [`blaze_build_script::toolchain::c_env`]), the run in [`crate::native_sandbox`], and what it
+//! [`blaze_build_script::toolchain::c_env`]), the run a hermetic one (bstd `procs::hermetic`,
+//! D177: the one way blaze runs a program confined), and what it
 //! left made into the same outputs record a wasm script's run gives ([`Outputs`]):
 //!
 //! - its standard output with the real `OUT_DIR` and package folder written as the key's
@@ -30,18 +31,31 @@ use blaze_build_script::{
     outputs::{FileLimits, FileMode, Outputs},
     toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
 };
+use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
-use bstd::{fs::Durable, mem::Bytes, mem::TASK_FRAME};
-
-use crate::{
-    native_sandbox::{NativeRefusal, NativeRun, run},
-    record::native_world,
+use blaze_roots::{Digest, Mount, RelPath, Root, RootId, RootKind, Roots, Seen};
+use bstd::{
+    fs::Durable,
+    mem::{Bytes, TASK_FRAME},
+    procs::{
+        Exit,
+        hermetic::{
+            Budget, Capture, ClockSpec, Fault, FilesError, FilesOp, Hermetic, HermeticCapOpts, HermeticOpts, HermeticSpec, HermeticStreams,
+            Level, Program, ReportSpec, RootFiles,
+        },
+    },
 };
+
+use crate::record::native_world;
 
 /// One script to run.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeScript<'s> {
+    /// The run's key (`native_unit`'s base key: the script, its package, its producers' views,
+    /// the pins). While it is the same, nothing beneath a folder the run reads changes, so it
+    /// names each read folder as a tree root and the program (D177: `RootKind::Tree`).
+    pub key: ContentId,
     /// The script's host binary, canonical.
     pub program: &'s str,
     /// The C toolchain and folders: `c.package` is the copied package folder, `c.out_dir` an
@@ -95,8 +109,27 @@ pub struct NativeScriptRun<'a> {
 /// Why a native run gave no record; each names the script.
 #[derive(Debug)]
 pub enum NativeScriptError {
-    Refused { program: std::string::String, refusal: NativeRefusal },
-    Failed { program: std::string::String, code: Option<i32>, stderr: std::string::String },
+    /// The hermetic run (bstd `procs::hermetic`, D177) refused it or failed: the fault names the
+    /// rule ([`Fault::rule`]).
+    Refused { program: std::string::String, fault: Fault },
+    /// The grant names a path no confinement can say (D65), refused before anything runs.
+    Grant { program: std::string::String, why: std::string::String },
+    /// The world the run is started from offers no `capability` (a host, its spawner, a clock).
+    NoHost { program: std::string::String, capability: &'static str },
+    /// The script ran to an end that was not exit 0. `exit` is how it ended (a status, or the
+    /// signal that killed it); `stderr` and `stdout` the ends of its streams (on macOS
+    /// `sandbox-exec`'s own refusals are on that standard error: an empty one means it said
+    /// nothing); `confinement` the BLAKE3 of what confined it ([`bstd::procs::hermetic::confinement`],
+    /// the SBPL profile on macOS) and `profile` that text, printed when the script gave no
+    /// reason of its own (killed by a signal, or nothing on either stream).
+    Failed {
+        program: std::string::String,
+        exit: Exit,
+        stderr: std::string::String,
+        stdout: std::string::String,
+        confinement: Digest,
+        profile: Option<std::string::String>,
+    },
     Output { program: std::string::String, why: std::string::String },
     Files { folder: std::string::String, why: std::string::String },
     /// The script's environment lacks a variable cargo always sets for a build script (D96 P5:
@@ -112,9 +145,39 @@ pub enum NativeScriptError {
 impl std::fmt::Display for NativeScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NativeScriptError::Refused { program, refusal } => write!(f, "{program}: the native build script was refused: {refusal}"),
-            NativeScriptError::Failed { program, code, stderr } => {
-                write!(f, "{program}: the native build script failed (exit {code:?}; not retried as wasm, rule 3); its standard error ends:\n{stderr}")
+            NativeScriptError::Refused { program, fault: Fault::Stopped(stop) } => write!(
+                f,
+                "{program}: the native build script was stopped by its hermetic run ({stop:?}; rule 18); nothing it wrote is kept"
+            ),
+            NativeScriptError::Refused { program, fault } => {
+                write!(f, "{program}: the native build script's hermetic run was refused by {:?}: {fault:?}", fault.rule())
+            }
+            NativeScriptError::Grant { program, why } => write!(f, "{program}: {why}"),
+            NativeScriptError::NoHost { program, capability } => {
+                write!(f, "{program}: the world a native build script is started from offers no `{capability}` (rule 9: nothing runs then)")
+            }
+            NativeScriptError::Failed { program, exit, stderr, stdout, confinement, profile } => {
+                write!(f, "{program}: the native build script ")?;
+                match *exit {
+                    Exit::Exited(code) => write!(f, "exited with status {code}")?,
+                    Exit::Signaled(signal) => write!(f, "was killed by signal {signal} ({})", signal_name(signal))?,
+                }
+                write!(f, " (not retried as wasm, rule 3); it ran confined by ")?;
+                for byte in &confinement.0[..8] {
+                    write!(f, "{byte:02x}")?;
+                }
+                if stderr.is_empty() {
+                    write!(f, "; its standard error is empty")?;
+                } else {
+                    write!(f, "; its standard error ends:\n{stderr}")?;
+                }
+                if !stdout.is_empty() {
+                    write!(f, "\nits standard output ends:\n{stdout}")?;
+                }
+                if let Some(profile) = profile {
+                    write!(f, "\nit gave no reason of its own; what confined it:\n{profile}")?;
+                }
+                Ok(())
             }
             NativeScriptError::Output { program, why } => write!(f, "{program}: its outputs: {why}"),
             NativeScriptError::Files { folder, why } => write!(f, "{folder}: {why}"),
@@ -131,6 +194,23 @@ impl std::fmt::Display for NativeScriptError {
 }
 
 impl std::error::Error for NativeScriptError {}
+
+/// The name of `signal` on this host, for a killed script's message.
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGABRT => "SIGABRT: it aborted, or the loader did",
+        libc::SIGKILL => "SIGKILL: the kernel or a sandbox killed it, or its group's kill",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGSYS => "SIGSYS: a system call the confinement refuses",
+        libc::SIGXCPU => "SIGXCPU: its CPU limit",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGPIPE => "SIGPIPE",
+        _ => "another signal",
+    }
+}
 
 /// The `OUT_DIR` and `CARGO_MANIFEST_DIR` the script is shown (what its outputs' real folders
 /// are mapped back to), each from its environment; a missing one is refused by name (rule 3).
@@ -494,6 +574,90 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     sha.finish()
 }
 
+/// How a native run ended.
+struct Ran {
+    exit: Exit,
+    stdout: std::vec::Vec<u8>,
+    stderr: std::vec::Vec<u8>,
+}
+
+/// A native build script's budget (D177 requires one; native_sandbox held none but the
+/// deadline). CPU: the deadline times [`NativeBudget::cpus`], since a script's group (make,
+/// clang) runs that many at once; on Linux `RLIMIT_CPU` holds each process of the group alone,
+/// on macOS the meter reads the script's own process. Memory: address space on Linux (each
+/// process alone), the script's footprint on macOS; 16 GiB is past every C compile met
+/// (librocksdb-sys's largest clang stays under 2 GiB) and under every supported machine.
+pub(crate) struct NativeBudget {
+    cpus: u32,
+    memory: u64,
+}
+
+pub(crate) const NATIVE_BUDGET: NativeBudget =NativeBudget { cpus: 16, memory: 16 << 30 };
+
+impl NativeBudget {
+    pub(crate) fn of(&self, deadline: Duration) -> Budget {
+        Budget { cpu: deadline.saturating_mul(self.cpus), memory: self.memory, steps: None }
+    }
+}
+
+/// `OUT_DIR` as the hermetic run's output root: listed with digests after the run, emptied
+/// after a stopped one. The run has no package root and no report of its own, so the other
+/// calls are a driver's bug, refused by name.
+pub(crate) struct OutDir<'d> {
+    pub(crate) root: RootId,
+    pub(crate) folder: &'d str,
+}
+
+impl OutDir<'_> {
+    fn refused(&self, op: FilesOp, error: Option<&std::io::Error>) -> Fault {
+        let code = error.and_then(std::io::Error::raw_os_error).and_then(|code| u16::try_from(code).ok()).unwrap_or(0);
+        Fault::Files(FilesError { op, root: self.root, code })
+    }
+}
+
+impl RootFiles for OutDir<'_> {
+    fn package_files(&self, root: RootId, _: &mut dyn FnMut(RelPath<'_>, Digest, u64) -> Result<(), Fault>) -> Result<(), Fault> {
+        Err(Fault::Files(FilesError { op: FilesOp::PackageFiles, root, code: 0 }))
+    }
+
+    fn seen(&self, root: RootId, _: RelPath<'_>) -> Result<Seen, Fault> {
+        Err(Fault::Files(FilesError { op: FilesOp::Seen, root, code: 0 }))
+    }
+
+    fn read_output(&self, _: RelPath<'_>, _: u32, _: &mut AVec<'_, u8>) -> Result<(), Fault> {
+        Err(self.refused(FilesOp::ReadOutput, None))
+    }
+
+    /// Every plain file, its BLAKE3 streamed through one buffer. A link or another kind is not
+    /// listed here: [`store_out_dir`] refuses it by name next ([`NativeScriptError::NotAFile`]).
+    fn list_output(&self, each: &mut dyn FnMut(RelPath<'_>, Digest, u64) -> Result<(), Fault>) -> Result<(), Fault> {
+        use std::io::Read as _;
+        let listed = listed_under(self.folder).map_err(|_| self.refused(FilesOp::ListOutput, None))?;
+        let mut buf = vec![0u8; CHUNK];
+        for file in listed.iter().filter(|file| file.kind == bstd::fs::EntryKind::File) {
+            let path = RelPath::new(&file.name, blaze_roots::Limits::SHIPPED.most_path).map_err(|_| self.refused(FilesOp::ListOutput, None))?;
+            let mut opened = std::fs::File::open(Path::new(self.folder).join(&file.name)).map_err(|e| self.refused(FilesOp::ListOutput, Some(&e)))?;
+            let mut hasher = bstd::digest::Blake3::new();
+            let mut len = 0u64;
+            loop {
+                let n = opened.read(&mut buf).map_err(|e| self.refused(FilesOp::ListOutput, Some(&e)))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                len += n as u64;
+            }
+            each(path, Digest(hasher.finalize()), len)?;
+        }
+        Ok(())
+    }
+
+    fn clear_output(&self) -> Result<(), Fault> {
+        std::fs::remove_dir_all(self.folder).map_err(|e| self.refused(FilesOp::ClearOutput, Some(&e)))?;
+        std::fs::create_dir(self.folder).map_err(|e| self.refused(FilesOp::ClearOutput, Some(&e)))
+    }
+}
+
 /// Runs `script` confined and makes its record's outputs.
 pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<NativeScriptRun<'a>, NativeScriptError> {
     let c = &script.c;
@@ -609,30 +773,118 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     }
     let out_only = [c.out_dir];
     let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
-    // Lent before the child starts, ended after it and its process group are gone (`run`
+    // The grant's paths are checked as the Seatbelt profile would say them (one check for both
+    // hosts: a grant refused on one is refused on both), before anything runs.
+    blaze_build_script::native::seatbelt_with(&Grant { program: script.program, exec: &exec, read: &reads, write: &writes }, exec_under, alloc)
+        .map_err(|why| NativeScriptError::Grant { program: program(), why: why.to_string() })?;
+
+    // D177: the run is a hermetic spec at `Level::Inputs`. Each read folder is a tree root
+    // named by the key; `OUT_DIR` the output root; the jobserver's fifo and the fact shim's
+    // folder channels (neither an input nor an output: tokens, and questions the record keeps
+    // by `native_facts::reads`); the granted programs helpers; `OUT_DIR` a helper folder when a
+    // tool runs what the script built there (D112).
+    let tree = RootKind::Tree { tree: Digest(script.key.0) };
+    let mut roots: AVec<'_, Root<'_>> = Vec::new_in(alloc);
+    let mut spellings: AVec<'_, &str> = Vec::new_in(alloc);
+    let facts_folder = script.facts.map(|facts| facts.folder.as_str());
+    for folder in reads.iter() {
+        // One mount a spelling: a folder named twice (a tool's and the shelf's) is one root.
+        // The fact shim's folder is a channel, not a root (below).
+        if !spellings.contains(folder) && Some(*folder) != facts_folder {
+            roots.push(Root { name: "a folder a native build script reads", kind: tree });
+            spellings.push(folder);
+        }
+    }
+    roots.push(Root { name: "OUT_DIR", kind: RootKind::Output });
+    spellings.push(c.out_dir);
+    let output = RootId(u8::try_from(roots.len() - 1).map_err(|_| NativeScriptError::Output { program: program(), why: "more than 255 folders read".to_owned() })?);
+    let mut mounts: AVec<'_, Mount<'_>> = Vec::new_in(alloc);
+    for (at, spelling) in spellings.iter().enumerate() {
+        mounts.push(Mount { spelling: spelling.as_bytes(), root: RootId(at as u8) });
+    }
+    let roots = Roots::new(&roots).map_err(|e| NativeScriptError::Output { program: program(), why: format!("its roots: {e:?}") })?;
+    let mut channels: AVec<'_, &str> = Vec::new_in(alloc);
+    if let Some(facts) = script.facts {
+        channels.push(facts.folder.as_str());
+    }
+    if let Some(server) = script.jobs {
+        channels.push(server.fifo());
+    }
+    // The environment in one spelling: sorted by name, a later pair of one name replacing an
+    // earlier (the toolchain's and the run's own variables are pushed after cargo's, and were
+    // the ones a started process saw: std's `Command::env` in native_sandbox.rs kept the last
+    // too). Variable for variable what native_sandbox.rs's start was given (the same `vars`,
+    // built above unchanged by the D177 move):
+    // - every pair of `script.env` (cargo's: `TARGET`, `HOST`, `PROFILE`, `OPT_LEVEL`, `DEBUG`,
+    //   `RUSTC`, `CARGO_PKG_*`, `CARGO_CFG_*`, `CARGO_FEATURE_*`, `DEP_*`, ...), with `OUT_DIR`,
+    //   `CARGO_MANIFEST_DIR` and `CARGO_MANIFEST_PATH` made the real folders;
+    // - the job variables (`Env::for_run`): `NUM_JOBS`, and `CARGO_MAKEFLAGS` with a jobserver;
+    // - the C toolchain's (`c_env`: `CC`, `CXX`, `AR`, `CFLAGS`, `CXXFLAGS`, `SDKROOT`,
+    //   `MACOSX_DEPLOYMENT_TARGET`, `LIBCLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS`,
+    //   `SOURCE_DATE_EPOCH`: the clock below is read from it);
+    // - each granted tool's variable (`host_tools::tool_env`, `NM`, ...);
+    // - `PATH` (the fact shim's links, then the granted tools' folders), `TMPDIR` (`OUT_DIR`),
+    //   and the fact shim's folder variable when it is used.
+    // The fact-shim test (tests/native_fact_shim.rs) asserts what the confined script saw.
+    vars.sort_by(|a, b| a.0.cmp(b.0));
+    let mut env: AVec<'_, (&str, &str)> = Vec::new_in(alloc);
+    for &pair in vars.iter() {
+        match env.last_mut() {
+            Some(last) if last.0 == pair.0 => *last = pair,
+            _ => env.push(pair),
+        }
+    }
+    let clock = match env.iter().find(|(name, _)| *name == "SOURCE_DATE_EPOCH") {
+        // A value that is no decimal leaves the spec's own check to refuse it by name.
+        Some((_, value)) => value.parse::<u64>().map_or(ClockSpec::NeverAsks, |unix_secs| ClockSpec::Fixed { unix_secs }),
+        None => ClockSpec::NeverAsks,
+    };
+    let (world, _) = native_world(Path::new(c.out_dir)).map_err(|e| NativeScriptError::Files { folder: c.out_dir.to_owned(), why: e.to_string() })?;
+    let no_host = |missing: bstd::io::Missing| NativeScriptError::NoHost { program: program(), capability: missing.capability };
+    let spawner = world.need_host().and_then(|host| host.spawner()).map_err(no_host)?;
+    let driver_clock = world.need_clock().map_err(no_host)?;
+    let deadline = Deadline::after(driver_clock.now().since_start(), script.deadline);
+    let cx = world
+        .cx(script.deadline.saturating_add(Duration::from_secs(60)), TASK_FRAME)
+        .map_err(|_| NativeScriptError::Files { folder: c.out_dir.to_owned(), why: "its world stopped".to_owned() })?;
+    let hermetic = Hermetic::new(HermeticCapOpts { spawner, clock: driver_clock });
+    let most_stream = u32::try_from(script.limits.output)
+        .map_err(|_| NativeScriptError::Output { program: program(), why: format!("an output limit of {} bytes is past what a stream keeps (4 GiB)", script.limits.output) })?;
+    let spec = HermeticSpec::new(HermeticOpts {
+        program: Program::Stored { name: script.program, digest: Digest(script.key.0), path: script.program },
+        args: &[],
+        env: &env,
+        roots,
+        mounts: &mounts,
+        cwd: c.package,
+        helpers: &exec,
+        helper_folders: exec_under,
+        channels: &channels,
+        clock,
+        seed: 0,
+        budget: NATIVE_BUDGET.of(script.deadline),
+        deadline,
+        streams: HermeticStreams { stdout: Capture::Keep { most: most_stream }, stderr: Capture::Keep { most: most_stream } },
+        level: Level::Inputs,
+        report: ReportSpec::WholeRoots,
+    })
+    .map_err(|error| NativeScriptError::Refused { program: program(), fault: error.fault })?;
+    let files = OutDir { root: output, folder: c.out_dir };
+    // Lent before the child starts, ended after it and its process group are gone (the run
     // kills the group): a token it kept comes back by count (jobserver.rs).
     let lent = match script.jobs {
         Some(server) => Some(server.lend().map_err(|error| NativeScriptError::Jobs { program: program(), error })?),
         None => None,
     };
     let started = Instant::now();
-    let ran = run(
-        &NativeRun {
-            grant: Grant { program: script.program, exec: &exec, read: &reads, write: &writes },
-            args: &[],
-            env: &vars,
-            dir: c.package,
-            deadline: script.deadline,
-            exec_under,
-        },
-        alloc,
-    );
+    let ran = hermetic.run(&cx, &spec, &files, alloc);
     if let Some(lent) = lent {
         lent.end().map_err(|error| NativeScriptError::Jobs { program: program(), error })?;
     }
-    let ran = ran.map_err(|refusal| NativeScriptError::Refused { program: program(), refusal })?;
+    let ran = ran.map_err(|error| NativeScriptError::Refused { program: program(), fault: error.fault })?;
+    let ran = Ran { exit: ran.exit, stdout: ran.stdout.to_vec(), stderr: ran.stderr.to_vec() };
     let wall = started.elapsed();
-    if ran.code != Some(0) {
+    if ran.exit != Exit::Exited(0) {
         // `cc` passes the compiler's own messages on as `cargo:warning=` lines on standard
         // output: they come first, then standard error's end.
         let out = std::string::String::from_utf8_lossy(&ran.stdout);
@@ -641,7 +893,20 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         let text: std::vec::Vec<&str> = warned.take(10).chain(err.lines()).collect();
         let tail: std::vec::Vec<&str> = text.iter().copied().rev().take(30).collect();
         let tail: std::vec::Vec<&str> = tail.into_iter().rev().collect();
-        return Err(NativeScriptError::Failed { program: program(), code: ran.code, stderr: tail.join("\n") });
+        let out_tail: std::vec::Vec<&str> = out.lines().rev().take(10).collect();
+        let out_tail: std::vec::Vec<&str> = out_tail.into_iter().rev().collect();
+        // What confined it, rendered again from the same spec (one plan, one rendering).
+        let confinement = bstd::procs::hermetic::confinement(&spec, &files, alloc)
+            .map_err(|fault| NativeScriptError::Refused { program: program(), fault })?;
+        let gave_no_reason = matches!(ran.exit, Exit::Signaled(_)) || (ran.stdout.is_empty() && ran.stderr.is_empty());
+        return Err(NativeScriptError::Failed {
+            program: program(),
+            exit: ran.exit,
+            stderr: tail.join("\n"),
+            stdout: out_tail.join("\n"),
+            confinement: bstd::procs::hermetic::confinement_digest(&confinement),
+            profile: gave_no_reason.then(|| std::string::String::from_utf8_lossy(&confinement).into_owned()),
+        });
     }
 
     // The laid trees first (brief N8): they are the most specific folders; then `OUT_DIR`, then

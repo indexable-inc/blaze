@@ -25,22 +25,25 @@
 //! one), and the same question with every auto trait dropped from the target's objects MAY
 //! hold. Then the only thing refused is an auto trait the source must meet, of a type holding a
 //! superset interior: the coercion is taken, the goal registered as it is, and its failure at
-//! the end of the check is the typed gap [`INTERIOR_GAP`] ([`Machine::unsize_interior_gap`]),
+//! the end of the check is the typed gap [`crate::INTERIOR_GAP`] ([`Machine::unsize_interior_gap`]),
 //! never E0277 and never E0308. A wrong `Output` (`dyn Future<Output = u16>` from a `u8`
 //! future) still fails without the auto traits: the mismatch stands.
 //!
-//! Owed (the gap's replacement, not here): the EXACT interior in the hidden future's record
-//! (blaze-flow-lower's `interior`, filed by the defining body's check in front2
-//! opaque_auto.rs), after which the solver's answer at the site is right and this rule never
-//! fires for a future that is `Send`.
+//! Flow lowering supplies a local block's saved types. The obligation recorded for a local
+//! replay includes the target and every object predicate. A foreign coroutine record can
+//! still contain a provisional witness when its defining body's flow lowering was refused.
 
 use blaze_own::{Alloc, Vec};
 
-use super::async_fn::INTERIOR_GAP;
+use super::async_fn::Witness;
+use crate::diag::{At, Because, DiagCode, PendingDiag, PendingGoal, UnmetGoal};
 use crate::error::{CheckError, Limit, Stop};
 use crate::ids::{ItemKey, LangItem};
+use crate::infer::InferCtx;
+use crate::instance::{ClosureSource, import, import_list};
 use crate::machine::Machine;
-use crate::ty::{Goal, Ty, TyList, TyView, TypeCtx};
+use crate::portable::PTys;
+use crate::ty::{FulfillError, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
 /// The most type nodes one walk here visits (rule 18). Interned types are acyclic, so only a
@@ -55,6 +58,35 @@ enum Step {
     Enter(Ty),
     /// Rebuild `t` from its children's rebuilt forms, the last ones on the results stack.
     Exit(Ty),
+}
+
+impl crate::stalled::Stalled {
+    /// Import the same predicate that failed before flow lowering. Writeback already
+    /// exports its complete argument list with the finding. A where-const reason on
+    /// a unary auto-trait obligation carries the reason instead of an unmet predicate.
+    pub(crate) fn import_witness_goal<S: ClosureSource>(
+        &self,
+        cx: &mut InferCtx<'_>,
+        src: &mut S,
+        types: PTys<'_>,
+    ) -> Result<Goal, S::Error> {
+        let args = match self.diag.because {
+            Some(Because::Unmet { goal: UnmetGoal::Trait { trait_, args }, .. })
+                if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
+            {
+                import_list(cx, src, types, args, &[], 0)?
+            }
+            Some(Because::False(_) | Because::Error(_) | Because::Generic(_)) => {
+                // Only unary auto goals keep a where-const reason in the stalled row.
+                let ty = import(cx, src, types, self.ty, &[], 0)?;
+                cx.mk_list(&[ty])?
+            }
+            _ => return Err(CheckError::Malformed(crate::error::Malformed::StalledGoal {
+                trait_: self.trait_, at: self.diag.at,
+            }).into()),
+        };
+        Ok(Goal::Trait { trait_: self.trait_, args })
+    }
 }
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -75,65 +107,35 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// For a goal that FAILED at the end of the check: the interior gap when it is an
     /// `Unsize` / `CoerceUnsized` goal whose failure may rest only on a superset interior
-    /// (the module doc); `None` when the failure stands as the ordinary finding.
-    pub(crate) fn unsize_interior_gap(&mut self, goal: Goal) -> Result<Option<CheckError>, Stop> {
-        let Goal::Trait { trait_, args } = goal else { return Ok(None) };
+    /// (the module doc).
+    pub(crate) fn unsize_interior_gap(&mut self, goal: Goal) -> Result<Witness, Stop> {
+        let Goal::Trait { trait_, args } = goal else { return Ok(Witness::Fixed) };
         let unsize = self.lang(LangItem::Unsize)?;
         let coerce = self.lang(LangItem::CoerceUnsized)?;
         if unsize != Some(trait_) && coerce != Some(trait_) {
-            return Ok(None);
+            return Ok(Witness::Fixed);
         }
         if self.unsize_no_may_rest_on_interior(trait_, args)? {
-            // Known on the exact interior too: an `async move` block of this body that `a`
-            // holds captures by value a variable missing one of the target's auto traits. A
-            // by-value capture is in the state whatever is live at an `.await` (rules/async_fn.rs,
-            // 2), so the failure stands as the ordinary E0277.
-            if self.held_capture_misses_an_auto_trait(args)? {
-                return Ok(None);
-            }
-            return Ok(Some(CheckError::Unported(INTERIOR_GAP)));
+            // A missing bound on an arbitrary source capture does not prove that the
+            // corresponding object in the target requires that bound of that capture.
+            // Keep the solver's No when the full goal already used fixed witnesses.
+            return self.witness_source(self.ty.list_get(args, 0));
         }
-        Ok(None)
+        Ok(Witness::Fixed)
     }
 
-    /// For `args = [a, b]`: whether some async block's future inside `a` has a by-value capture
-    /// that misses an auto trait some object inside `b` names (rules/async_fn.rs
-    /// `moved_capture_fails`).
-    fn held_capture_misses_an_auto_trait(&mut self, args: TyList) -> Result<bool, Stop> {
-        if self.ty.list_len(args) != 2 {
-            return Ok(false);
+    /// Keep the entire failed coercion at its site. Replaying just the auto trait would
+    /// lose the pointer impl's other bounds and the object's associated-type equalities.
+    /// Only the current body's futures get a new witness when its flow is lowered.
+    pub(crate) fn defer_local_unsizing(&mut self, err: FulfillError, at: At) -> bool {
+        if self.interior != crate::stalled::Interior::Defer || err.because.is_some() {
+            return false;
         }
-        let (a, b) = (self.ty.list_get(args, 0), self.ty.list_get(args, 1));
-        let mut autos: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut blocks: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut work: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut met = 0u32;
-        for (root, want_blocks) in [(b, false), (a, true)] {
-            work.clear();
-            work.push(root);
-            while let Some(x) = work.pop() {
-                met += 1;
-                if met > MOST_NODES {
-                    return Err(CheckError::Limit(Limit::Steps).into());
-                }
-                let x = self.ty.shallow_resolve(x);
-                let v = self.view(x);
-                match v {
-                    TyView::ExAuto(k) if !want_blocks && !autos.contains(&k) => autos.push(k),
-                    TyView::Future(block, _, _) if want_blocks && !blocks.contains(&block) => blocks.push(block),
-                    _ => {}
-                }
-                self.ty_children(v, &mut work);
-            }
-        }
-        for &block in blocks.iter() {
-            for &k in autos.iter() {
-                if self.moved_capture_fails(block, k)? {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        let Goal::Trait { trait_, args } = err.obligation.goal else { return false };
+        let source = self.ty.list_get(args, 0);
+        let diag = PendingDiag::unmet(DiagCode::Unsatisfied, at, Some(source), PendingGoal::Trait { trait_, args }, None);
+        self.stalled.push(crate::stalled::PendingStalled { trait_, ty: source, diag });
+        true
     }
 
     /// Whether `t` is, or holds anywhere inside, a future whose interior may be a superset: an

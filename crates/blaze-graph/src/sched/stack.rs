@@ -89,10 +89,9 @@ mod tests {
         let mut held = vec![0u8; (to - from) / page]; // alloc: a test's
         // SAFETY: `[from, to)` is whole pages of this thread's mapped stack; `held` has a byte
         // a page, which the call writes.
-        let rc = unsafe {
-            libc::mincore(std::ptr::without_provenance_mut(from), to - from, held.as_mut_ptr())
-        };
-        assert_eq!(rc, 0, "mincore of {from:#x}..{to:#x}: {}", std::io::Error::last_os_error());
+        let at = unsafe { std::ptr::NonNull::new_unchecked(std::ptr::without_provenance_mut(from)) };
+        let result = unsafe { blaze_sys::posix::io::mincore(at, to - from, &mut held) };
+        assert!(result.is_ok(), "mincore of {from:#x}..{to:#x}: {result:?}");
         held.iter().filter(|it| **it & 1 != 0).count()
     }
 

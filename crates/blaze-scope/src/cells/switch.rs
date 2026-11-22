@@ -72,12 +72,17 @@ pub(crate) struct Solved<'a> {
     /// The crate's groups as the solve found them (groups.rs), written into records from the
     /// final scopes by the caller.
     pub groups: AVec<'a, super::GroupShape<'a>>,
+    /// D189 step 4: for each body place the caller held (`BodySrc::place`: the fragment's
+    /// owner and the place in it), the length of its module's textual sequence there
+    /// ([`Cells::textual_len_at`]), sorted by place; a place not read here is left out.
+    pub cuts: AVec<'a, ((ItemKey, u32), u32)>,
 }
 
 /// Solves the crate under `root` with the cell core and writes each of its modules' scopes.
 /// `expand(call, def)` makes a call's expansion, which `facts.expansion` then hands back;
 /// `made` lists every module made so far (expansions' modules, blocks); `places` says where
-/// a block's body is written.
+/// a block's body is written; `held` lists the places of the bodies whose blocks are left to
+/// their own solve (D189 step 4, `BlockScopes::Bodies`), each counted into [`Solved::cuts`].
 #[expect(clippy::too_many_arguments, reason = "the solve's inputs, each named; one caller")]
 pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     facts: &F,
@@ -87,7 +92,9 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     root: ItemKey,
     expand: &dyn Fn(ItemKey, Def),
     made: &dyn Fn(&mut AVec<'a, ItemKey>),
+    held: &dyn Fn(&mut AVec<'a, (ItemKey, u32)>),
     check: Option<&dyn Fn() -> u64>,
+    plant: crate::task::DecidePlant,
     groups: bool,
     only: Option<Members<'_>>,
     part: &dyn Fn(NamesPart),
@@ -101,6 +108,11 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     let records = only.map(|o| OutsideRecords { o, alloc, recorded: core::cell::RefCell::new(AVec::new_in(alloc)) });
     part(NamesPart::Load);
     let mut c = Cells::load_reading(facts, root, Some(&deps), super::CellPlant::None, &read, alloc).map_err(Unwritten::Load)?;
+    // A driver's control of its oracle (task/fill.rs `Par::decide_plant`): the plant is read by
+    // the on-demand walk alone (decide.rs), so the whole solve below is unchanged by it.
+    if check.is_some() && plant == crate::task::DecidePlant::CachesOpenCycle {
+        c.plant = super::CellPlant::DecideCachesOpenCycle;
+    }
     c.enums = Some(enums);
     // The root's scope gathers every module's expanded `#[macro_export]`s (task/exports.rs
     // `publish_expanded_exports` reads every scope): a group holding the root reads every
@@ -155,6 +167,13 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
         part(NamesPart::Run);
         c.run(facts, expand, &[]).map_err(Unwritten::Run)?;
     }
+    // Each held body's cut of its module's textual sequence, over the final fragments.
+    let mut at: AVec<'a, (ItemKey, u32)> = AVec::new_in(alloc);
+    held(&mut at);
+    at.sort_unstable();
+    at.dedup();
+    let mut cuts: AVec<'a, ((ItemKey, u32), u32)> = AVec::with_capacity_in(at.len(), alloc);
+    cuts.extend(at.iter().filter_map(|&(owner, pos)| c.textual_len_at(owner, pos).map(|len| ((owner, pos), len))));
     part(NamesPart::Scopes);
     // A member that read a module the solve holds neither the text nor a record of saw it as
     // unknown: the refusal names the cause, before any scope's unknowns (E13's on-demand
@@ -211,7 +230,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     if let Some(r) = c.member_refusal {
         return Err(Unwritten::Member(r));
     }
-    Ok(Solved { done, added_externs, decide, groups })
+    Ok(Solved { done, added_externs, decide, groups, cuts })
 }
 
 /// `bytes` copied into `alloc` at a 16-byte boundary (a record is read in place, aligned).

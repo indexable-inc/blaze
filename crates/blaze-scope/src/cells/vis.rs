@@ -261,6 +261,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let s = self.vis_paths[&(m, ns, name)].segments[j];
             let c = self.cell(at, Namespace::Types, s, Layer::Full);
             let Some(v) = self.current(c, guess) else { return Step::Wait(Node::Cell(c)) };
+            // A module of this crate not made yet (a body solve makes the modules outside its
+            // chain when a lookup reaches them, `Cells::load_body`): reached now, as a path's
+            // own segment would be.
+            if let Value::Found(def, _) = v
+                && def.kind == DefKind::Module
+                && !self.by_key.contains_key(&def.key)
+            {
+                let _ = self.reach_outside(def.key);
+            }
             match self.vis_segment(m, v) {
                 Seg::Module(d) => at = d,
                 Seg::NoAncestor => return Step::Done(Some(vis)),

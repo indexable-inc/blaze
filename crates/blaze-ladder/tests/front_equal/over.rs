@@ -9,11 +9,10 @@
 
 use blaze_build::{OverflowChecks, Panic, UbChecks};
 use blaze_emit::Isa;
-use blaze_ladder::body_ids::Make;
+use blaze_ladder::body_ids::{Fixture, Make};
 use blaze_ladder::code_records::Builder;
-use blaze_ladder::code_records::statics::{make_static_entry, make_template_entry};
 use blaze_ladder::run::RunError;
-use blaze_ladder::run::make_one::{CheckCount, MakerState, make_instance};
+use blaze_ladder::run::make_one::{CheckCount, MakerState, SecondCheck, make_instance};
 use blaze_ladder::seam::FrontEnd;
 use blaze_own::{AVec, Alloc};
 use blaze_typeck::ItemKey;
@@ -69,11 +68,10 @@ impl<'a, P: FrontEnd> Over<'a, P> {
             return Err(RunError::OneBody { key: item, why: "the front end made no value for this static (`FrontEnd::static_records`)" });
         };
         self.program.note(format_args!("static_value {item:?}"), |o| shown::data(o, value));
-        let made = match template {
-            false => make_static_entry(value, kind, self.alloc),
-            true => make_template_entry(value, kind, self.alloc),
+        let Some(state) = self.state.as_mut() else {
+            return Err(RunError::OneBody { key: item, why: "the maker's state was not made (front_equal/over.rs `ensure`)" });
         };
-        match made {
+        match state.static_entry(&self.program, value, kind, template) {
             Ok(made) => {
                 entry.extend_from_slice(&made);
                 Ok(())
@@ -88,20 +86,21 @@ impl<'a, P: FrontEnd> Over<'a, P> {
 
 impl<P: FrontEnd> Make for Over<'_, P> {
     type Error = RunError;
+    type Grant = Fixture;
 
-    fn make(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make(&mut self, _grant: &Fixture, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.ensure(tabled)?;
         let Some(state) = self.state.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's state was not made (front_equal/over.rs `ensure`)" });
         };
-        make_instance(&mut self.program, state, &mut self.checks, tabled, name, entry)
+        make_instance(&mut self.program, &mut SecondCheck, state, &mut self.checks, tabled, name, entry)
     }
 
-    fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make_static(&mut self, _grant: &Fixture, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.static_entry(item, false, entry)
     }
 
-    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make_thread_local(&mut self, _grant: &Fixture, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.static_entry(item, true, entry)
     }
 }

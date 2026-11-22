@@ -24,6 +24,8 @@ blaze-own.workspace = true
 blaze-check.workspace = true
 
 [dev-dependencies]
+# `blaze_own::testing::heap()`: the tests' allocator (no `Global`, no `Alloc::global()`).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-alloc-count.workspace = true
 blaze-rng.workspace = true
 blaze-sim.workspace = true

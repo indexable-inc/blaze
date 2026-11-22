@@ -52,10 +52,16 @@
 // a ring, the head stored after the stamp so a drain never meets a slot still being written,
 // and lost entries reported by number.
 
-use alloc::vec::Vec;
+// A core: atomics over memory it was handed (`Lines` over a named allocator, or a simulation's
+// `Cells`), no clock, no IO; the drain is a step machine a simulation interleaves.
+#![blaze::sans_io]
+
 use core::alloc::Allocator;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
+
+use blaze_own::Vec;
+use blaze_own::planted::{NoPlant, Planted, Plants};
 
 /// The words of a cache line, and of the widest slot.
 pub const LINE: usize = 8;
@@ -64,10 +70,25 @@ pub const MOST_PAYLOAD: usize = LINE - 1;
 /// The most atomic operations of one push: frontier, fence, a plant's wait, payload, stamp,
 /// head.
 pub const MOST_PUSH_OPS: usize = 5 + MOST_PAYLOAD;
-/// The most lanes an emitter may have (a thread each).
+/// The most lanes an emitter may have (a thread each): [`EmitterLimits::SHIPPED`]'s.
 pub const MOST_LANES: usize = 4096;
-/// The most entries a ring may hold.
+/// The most entries a ring may hold: [`EmitterLimits::SHIPPED`]'s.
 pub const MOST_LEN: u64 = 1 << 20;
+
+/// An emitter's caps as one value (D165): the shipped values are [`EmitterLimits::SHIPPED`], and
+/// a simulation draws each down to its smallest legal value ([`Emitter::new_limited_in`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EmitterLimits {
+    /// The most lanes (threads) an emitter is made with, at least 1.
+    pub most_lanes: usize,
+    /// The most entries a ring is made with, a power of two, at least 2.
+    pub most_len: u64,
+}
+
+impl EmitterLimits {
+    /// The caps shipped: [`MOST_LANES`] lanes of at most [`MOST_LEN`] entries.
+    pub const SHIPPED: EmitterLimits = EmitterLimits { most_lanes: MOST_LANES, most_len: MOST_LEN };
+}
 
 /// Entry `n`'s stamp.
 #[inline(always)]
@@ -88,8 +109,9 @@ const fn shape<const W: usize, const P: usize>() {
     assert!(P + 1 == W, "a slot's payload is its words but the stamp");
 }
 
-/// A test-only switch that plants a known bug in the protocol, for the oracles' controls (rule
-/// 53). Always compiled, so a plant is a value the simulation passes, not a build.
+/// The bugs a control plants in the protocol, for the oracles' controls (rule 53, D165): taken
+/// through the [`Planted`] seam ([`push_ops`]' `plant`, [`Drain`]'s `S`), with [`NoPlant`] in
+/// shipped code ([`Emitter::drain`]), where every check compiles to `false`.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Plant {
@@ -102,6 +124,8 @@ pub enum Plant {
     /// A producer waits for the reader before it overwrites a slot: a push blocks.
     WaitForReader,
 }
+
+impl Plants for Plant {}
 
 /// One atomic operation of the protocol.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -260,7 +284,12 @@ pub struct PushOps {
 /// The operations of pushing `payload` as entry `n` of `ring`, in order (the module's steps 1 to
 /// 5): `P + 4` of them whatever the ring holds, no loop, no wait. What a simulation interleaves;
 /// [`Producer::push`] does the same stores directly.
-pub fn push_ops<const W: usize, const P: usize>(ring: Ring<W>, n: u64, payload: &[u64; P], plant: Plant) -> PushOps {
+pub fn push_ops<const W: usize, const P: usize>(
+    ring: Ring<W>,
+    n: u64,
+    payload: &[u64; P],
+    plant: impl Planted<Plant>,
+) -> PushOps {
     const { shape::<W, P>() };
     // The fillers are fences, which order nothing more than the protocol's own operations do.
     let mut ops = [Op::Fence(Ordering::Release); MOST_PUSH_OPS];
@@ -268,7 +297,7 @@ pub fn push_ops<const W: usize, const P: usize>(ring: Ring<W>, n: u64, payload: 
     if n % block == 0 {
         ops[0] = Op::Store { at: ring.frontier(), value: n + block, order: Ordering::Relaxed };
     }
-    if plant == Plant::WaitForReader && n >= ring.len {
+    if plant.has(Plant::WaitForReader) && n >= ring.len {
         // The plant: do not overwrite an entry the reader has not passed.
         ops[2] = Op::Await { at: ring.reader(), least: n + 1 - ring.len };
     }
@@ -330,7 +359,12 @@ enum Phase {
 /// A drain of one ring of `W`-word slots (`P` payload words) from a cursor up to the head it
 /// finds, one atomic operation a step. Holds no lock, writes nothing the producer reads: the
 /// producer never waits on it.
-pub struct Drain<const W: usize, const P: usize> {
+///
+/// `S` is the plant seam: [`NoPlant`] in shipped code ([`Drain::unplanted`], [`Emitter::drain`]),
+/// a [`Plant`] in a control. The default `S = Plant` is kept only so [`Drain::new`]'s callers
+/// (blaze-watch's ring.rs, which sets `plant` before each step) compile unchanged; it goes once
+/// they name `S`.
+pub struct Drain<const W: usize, const P: usize, S: Planted<Plant> = Plant> {
     ring: Ring<W>,
     from: u64,
     head: u64,
@@ -338,13 +372,31 @@ pub struct Drain<const W: usize, const P: usize> {
     words: [u64; P],
     phase: Phase,
     #[doc(hidden)]
-    pub plant: Plant,
+    pub plant: S,
 }
 
-impl<const W: usize, const P: usize> Drain<W, P> {
-    pub fn new(ring: Ring<W>, from: u64) -> Drain<W, P> {
+impl<const W: usize, const P: usize> Drain<W, P, Plant> {
+    /// A drain whose plant is a value set on it (`plant`, [`Plant::None`] here).
+    ///
+    /// Deprecated: shipped code takes [`Drain::unplanted`], a control [`Drain::planted`].
+    /// Kept for blaze-watch's ring.rs (`base::Drain::new`), which sets `plant` before a step.
+    pub fn new(ring: Ring<W>, from: u64) -> Drain<W, P, Plant> {
+        Drain::planted(ring, from, Plant::None)
+    }
+}
+
+impl<const W: usize, const P: usize> Drain<W, P, NoPlant> {
+    /// A drain with no plant: every plant check compiles to `false`.
+    pub fn unplanted(ring: Ring<W>, from: u64) -> Drain<W, P, NoPlant> {
+        Drain::planted(ring, from, NoPlant)
+    }
+}
+
+impl<const W: usize, const P: usize, S: Planted<Plant>> Drain<W, P, S> {
+    /// A drain taking its plant through the seam.
+    pub fn planted(ring: Ring<W>, from: u64, plant: S) -> Drain<W, P, S> {
         const { shape::<W, P>() };
-        Drain { ring, from, head: 0, n: from, words: [0; P], phase: Phase::Head, plant: Plant::None }
+        Drain { ring, from, head: 0, n: from, words: [0; P], phase: Phase::Head, plant }
     }
 
     fn advance(&mut self) {
@@ -366,7 +418,7 @@ impl<const W: usize, const P: usize> Drain<W, P> {
                     self.n = head - ring.len;
                     self.phase = Phase::Stamp;
                     let mut count = self.n - self.from;
-                    if self.plant == Plant::LostOffByOne {
+                    if self.plant.has(Plant::LostOffByOne) {
                         count += 1;
                     }
                     return Ok(Step::Got(Got::Lost { from: self.from, count }));
@@ -390,7 +442,7 @@ impl<const W: usize, const P: usize> Drain<W, P> {
                     self.phase = Phase::Word(w + 1);
                     return Ok(Step::Working);
                 }
-                if self.plant == Plant::NoRecheck {
+                if self.plant.has(Plant::NoRecheck) {
                     let n = self.n;
                     self.advance();
                     return Ok(Step::Got(Got::Entry { n, words: self.words }));
@@ -475,8 +527,14 @@ pub struct Emitter<A: Allocator, const W: usize> {
 }
 
 impl<A: Allocator + Clone, const W: usize> Emitter<A, W> {
+    /// `lanes` rings of `len` entries from `alloc`, under the shipped caps.
     pub fn new_in(lanes: usize, len: u64, alloc: A) -> Result<Emitter<A, W>, EmitterError> {
-        if !(1..=MOST_LANES).contains(&lanes) || !len.is_power_of_two() || !(2..=MOST_LEN).contains(&len) {
+        Emitter::new_limited_in(lanes, len, EmitterLimits::SHIPPED, alloc)
+    }
+
+    /// `lanes` rings of `len` entries from `alloc`, under `limits` (a simulation's drawn caps).
+    pub fn new_limited_in(lanes: usize, len: u64, limits: EmitterLimits, alloc: A) -> Result<Emitter<A, W>, EmitterError> {
+        if !(1..=limits.most_lanes).contains(&lanes) || !len.is_power_of_two() || !(2..=limits.most_len).contains(&len) {
             return Err(EmitterError::Shape { lanes, len });
         }
         let cells = Lines::new_in(lanes * Ring::<W>::words(len) / LINE, alloc.clone());
@@ -543,7 +601,7 @@ impl<A: Allocator, const W: usize> Emitter<A, W> {
     /// Every entry of `lane` from `from` to the head the drain finds, each to `each` in order;
     /// returns the next cursor. Pass `head - len` (or 0) for what the rings keep.
     pub fn drain<const P: usize>(&self, lane: Lane, from: u64, mut each: impl FnMut(Got<P>)) -> Result<u64, DrainError> {
-        let mut drain = Drain::<W, P>::new(self.ring(lane), from);
+        let mut drain = Drain::<W, P, NoPlant>::unplanted(self.ring(lane), from);
         loop {
             match drain.step(&self.cells)? {
                 Step::Working => {}

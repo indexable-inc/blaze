@@ -20,7 +20,7 @@
 use blaze_export::native_so::{SoError, write};
 use blaze_native::Platform;
 use blaze_native::image::{FixTo, Fixup, Image, Import, Placed, Region, TlsReloc};
-use blaze_native::libraries::{Library, LibraryKind};
+use blaze_native::libraries::{Library, LibraryKind, Linked, Source, source};
 use blaze_own::{AVec, Alloc, Vec};
 
 const SONAME: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -127,10 +127,13 @@ fn image(tp_rel: bool) -> Image<'static> {
     exports.push((b"c_tls", 0x3_0080));
     let mut words: AVec<'static, &'static [u8]> = Vec::new_in(a);
     words.push(b"rust_six");
-    let mut libraries: AVec<'static, Library<'static>> = Vec::new_in(a);
-    libraries.push(Library { kind: LibraryKind::Dylib, name: "c" });
-    libraries.push(Library { kind: LibraryKind::Dylib, name: "m" });
-    libraries.push(Library { kind: LibraryKind::Dylib, name: "pthread" });
+    let mut libraries: AVec<'static, Linked<'static>> = Vec::new_in(a);
+    for name in ["c", "m", "pthread"] {
+        match source(Platform::LinuxArm64, Library { kind: LibraryKind::Dylib, name }) {
+            Ok(Source::Linked(linked)) => libraries.push(linked),
+            other => panic!("`{name}` is glibc's: {other:?}"),
+        }
+    }
     Image {
         platform: Platform::LinuxArm64,
         regions,

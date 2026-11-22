@@ -6,6 +6,16 @@ lint = "clippy --all-targets -- --cap-lints warn"
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
 
+# Frame pointers on Linux, for bstd's sampler (D178, telemetry/sampler.rs "Frame pointers"):
+# its walk follows the frame-pointer chain, and rustc omits it there by default. About 1 to 2%
+# in speed and a little code size (one register kept, a push and pop a call). arm64 macOS keeps
+# them always (the platform ABI), so it needs no line.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
 [target.arm-unknown-linux-gnueabihf]
 linker = "arm-linux-gnueabihf-gcc-8"
 

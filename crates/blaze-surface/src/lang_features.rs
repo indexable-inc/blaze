@@ -2,20 +2,17 @@
 //! `#![feature(name)]` means when `name` is a language feature, read by the build-script probe
 //! decider (blaze-build-script `probe_ask`) and by the front end when it gates features.
 //!
-//! The list is rustc's `compiler/rustc_feature/src/{unstable,accepted,removed}.rs` at
-//! rust-lang/rust@16d1ffac17ad8b739e32483ac2e65fe7e1804977, the pinned nightly's commit (MIT or
+//! The list is rustc's `compiler/rustc_feature/src/{unstable,accepted,removed}.rs` at the
+//! pinned nightly's commit (`pins/rust.txt`'s `commit`, `blaze_pins::COMMIT_HASH`; MIT or
 //! Apache-2.0), as the generator `table.py` of the old diagnostics layer read it (its
 //! `table/lang.rs`, blaze main 56c9fef80e): every name with what it is. A pin bump regenerates
-//! it with the toolchain's other facts; `LIST_FOR` names the commit so a key that holds this
-//! list's identity holds the commit.
+//! it with the toolchain's other facts; a key that holds this list's identity holds the pinned
+//! commit from blaze-pins.
 //!
 //! Rust's rule (the Unstable Book; rustc_expand `features`): a name `#![feature]` gives that is
 //! a language feature enables it; an accepted one only warns (`stable_features`); a removed one
 //! is E0557; any other name is taken as a library feature, which some loaded crate's stability
 //! attributes must declare (else E0635).
-
-/// The rustc commit the list is of.
-pub const LIST_FOR: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
 
 /// What a language feature is in the pinned nightly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

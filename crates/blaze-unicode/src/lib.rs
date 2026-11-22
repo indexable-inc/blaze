@@ -10,12 +10,23 @@
 //! `scripts/src/bin/unicode_tables.rs`, run over the Unicode Character Database of
 //! [`UNICODE_VERSION`]; nothing here is edited by hand.
 //!
-//! No dependency; `alloc` only for [`nfd`], which writes into the caller's `String`.
+//! No dependency, and nothing allocates: [`nfd_chars`] gives NFD's characters for the caller to
+//! put where it keeps text. `alloc` only for the deprecated [`nfd`], which writes into a
+//! global-heap `String`, while its one caller (blaze-fetch) moves.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
 
+// Only the deprecated [`nfd`]'s `String`: it goes with its last caller, and this line with it.
 extern crate alloc;
+
+// The tests' `String`, `Vec` and `format!`.
+#[cfg(test)]
+extern crate std;
 
 mod grapheme;
 mod nfd;
@@ -26,7 +37,7 @@ mod width;
 mod tests;
 
 pub use grapheme::{Graphemes, graphemes};
-pub use nfd::{combining_class, nfd};
+pub use nfd::{Nfd, combining_class, nfd, nfd_chars};
 pub use width::{char_width, str_width};
 
 /// The Unicode version of the identifier and emoji tables, the lexer's: rustc's pinned

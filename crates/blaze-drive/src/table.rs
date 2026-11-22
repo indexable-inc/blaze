@@ -1,6 +1,6 @@
-//! The request machine's own maps (drive.md, "Scheduling on many cores"; parallel.md change 3):
-//! every lookup, insert and remove a step makes is constant time on average, so a step costs
-//! the same at ten jobs and at a million.
+//! The drive's map keyed by content ids (drive.md, "Scheduling on many cores"; parallel.md
+//! change 3), used by the engine's code pool: every lookup, insert and remove is constant time
+//! on average, so a step costs the same at ten jobs and at a million.
 //!
 //! [`Table`] is open addressing with linear probing and backward-shift removal (no tombstones),
 //! at most half full, doubling when it would pass that. Its keys are content ids or counters, so

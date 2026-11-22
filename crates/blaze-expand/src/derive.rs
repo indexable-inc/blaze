@@ -135,10 +135,23 @@ pub fn derive_meta<'a>(
     let mut paths = blaze_own::Vec::new_in(alloc);
     let mut at = name + 2;
     while at < close {
+        // A path a macro forwarded as a `$x:path` fragment arrives inside invisible delimiters
+        // (alloy's `wrap_fixed_bytes!` appends its `$extra_derives:path` after `LowerHex`); the
+        // path is the tokens inside, and every invisible group opened here must close after it.
+        let outer = at;
+        while open(at, Delim::Invisible) {
+            at += 1;
+        }
         let start = at;
         // A path: `::`? ident (`::` ident)*, its head possibly `$crate` (crate::attr_path).
-        at = crate::attr_path::path_end(attr, at)?;
+        at = crate::attr_path::path_end(attr, start)?;
         paths.push(index(start)..index(at));
+        for _ in outer..start {
+            if tokens.get(at)?.kind != TokenKind::Close(Delim::Invisible) {
+                return None;
+            }
+            at += 1;
+        }
         match at == close {
             true => {}
             false if punct(at, ',') => at += 1,

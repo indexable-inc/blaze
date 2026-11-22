@@ -20,8 +20,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use blaze_launch::Slot;
+use blaze_sys::posix::{io, signal as os, types::sighandler_t};
 
-use super::{Path, install, own, sigaction};
+use super::{Path, ProgramAction, install, own, sigaction};
 use crate::retired::{Retired, Table};
 
 /// The environment variable naming the case a child runs.
@@ -32,9 +33,8 @@ const CHILD: &str = "signals::tests::child";
 const DEADLINE: Duration = Duration::from_secs(60);
 
 /// The program's handler of cases `handler` and `retired`: ends the process with 42.
-extern "C" fn exit_42(_sig: c_int, _info: *mut libc::siginfo_t, _ctx: *mut c_void) {
-    // SAFETY: async-signal-safe; ends the process.
-    unsafe { libc::_exit(42) }
+extern "C" fn exit_42(_sig: c_int, _info: *mut os::siginfo_t, _ctx: *mut c_void) {
+    os::exit_now(42)
 }
 
 fn page() -> usize {
@@ -44,16 +44,17 @@ fn page() -> usize {
 /// A fresh page mapped with no access: a read of it faults (SIGSEGV on Linux, SIGBUS on macOS).
 fn no_access_page() -> usize {
     // SAFETY: a fresh private anonymous mapping that nothing else names.
-    let at = unsafe { libc::mmap(ptr::null_mut(), page(), libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
-    assert_ne!(at, libc::MAP_FAILED, "mmap of a PROT_NONE page");
-    at as usize
+    let at = unsafe { io::mmap(None, page(), io::Prot::NONE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0) }
+        .expect("mmap of a PROT_NONE page");
+    at.as_ptr() as usize
 }
 
 /// A page that was mapped and is not any more: a read of it is SIGSEGV on both systems.
 fn unmapped_page() -> usize {
     let at = no_access_page();
+    let mapping = ptr::NonNull::new(at as *mut u8).expect("the mapped page");
     // SAFETY: unmaps the page mapped just above, which nothing has read.
-    assert_eq!(unsafe { libc::munmap(at as *mut c_void, page()) }, 0, "munmap");
+    unsafe { io::munmap(mapping, page()) }.expect("munmap");
     at
 }
 
@@ -71,18 +72,18 @@ fn read(at: usize) -> u8 {
 /// Records `exit_42` as the program's action on both owned signals through the launcher's
 /// `sigaction`, and checks each reported SIG_DFL before.
 fn program_handler() {
-    for sig in [libc::SIGSEGV, libc::SIGBUS] {
+    for sig in [os::SIGSEGV, os::SIGBUS] {
         // SAFETY: an all-zero `sigaction` is a valid value of the C struct.
-        let mut h: libc::sigaction = unsafe { core::mem::zeroed() };
-        h.sa_sigaction = exit_42 as extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) as libc::sighandler_t;
-        h.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        let mut h: ProgramAction = unsafe { core::mem::zeroed() };
+        h.sa_sigaction = exit_42 as extern "C" fn(c_int, *mut os::siginfo_t, *mut c_void) as sighandler_t;
+        h.sa_flags = os::SA_SIGINFO | os::SA_ONSTACK;
         // SAFETY: as above.
-        let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+        let mut old: ProgramAction = unsafe { core::mem::zeroed() };
         old.sa_sigaction = 7;
-        // SAFETY: two live locals.
-        let answered = unsafe { sigaction(sig, &h, &mut old) };
+        // SAFETY: two live locals with the target's C action layout.
+        let answered = unsafe { sigaction(sig, ptr::from_ref(&h).cast(), ptr::from_mut(&mut old).cast()) };
         assert_eq!(answered, 0, "the launcher's sigaction({sig}) answered {answered}");
-        assert_eq!(old.sa_sigaction, libc::SIG_DFL, "the launcher's sigaction({sig}) reported {:#x}, not SIG_DFL", old.sa_sigaction);
+        assert_eq!(old.sa_sigaction, os::SIG_DFL, "the launcher's sigaction({sig}) reported {:#x}, not SIG_DFL", old.sa_sigaction);
     }
 }
 
@@ -177,7 +178,7 @@ fn a_retired_address_reports_and_skips_the_program() {
 #[test]
 fn with_no_program_handler_a_fault_ends_by_sigsegv() {
     let (status, err) = run("default");
-    assert_eq!(status.signal(), Some(libc::SIGSEGV), "the child ended {status:?}; its stderr:\n{err}");
+    assert_eq!(status.signal(), Some(os::SIGSEGV), "the child ended {status:?}; its stderr:\n{err}");
 }
 
 /// The one own-symbol table: `pthread_create` is the launcher's only on its own path; the

@@ -50,7 +50,8 @@ fn patterns_match_as_glob_s_do() {
         ("é?", "éé", true),
     ];
     for &(pattern, text, want) in cases {
-        let parsed = Pattern::new(pattern).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        let parsed = Pattern::new_in(pattern, Global).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        assert_eq!(Pattern::new(pattern).as_ref(), Ok(&parsed), "the deprecated form is the same");
         assert_eq!(parsed.matches(text), want, "{pattern:?} on {text:?}");
         assert_eq!(naive(&parsed, text), want, "naive {pattern:?} on {text:?}");
     }
@@ -86,7 +87,7 @@ fn metachars_are_glob_s() {
 }
 
 /// glob 0.3's matcher, backtracking, under its default options: the oracle for the table.
-fn naive(pattern: &Pattern, text: &str) -> bool {
+fn naive(pattern: &Pattern<'_, Global>, text: &str) -> bool {
     #[derive(PartialEq)]
     enum Got {
         Match,
@@ -94,7 +95,7 @@ fn naive(pattern: &Pattern, text: &str) -> bool {
         Entire,
     }
     // glob's `follows_separator` is read only under options cargo does not set, but for `**`.
-    fn from(tokens: &[Token], mut text: std::str::Chars<'_>) -> Got {
+    fn from(tokens: &[Token<Global>], mut text: std::str::Chars<'_>) -> Got {
         for (at, token) in tokens.iter().enumerate() {
             match token {
                 Token::AnySequence | Token::AnyRecursiveSequence => {

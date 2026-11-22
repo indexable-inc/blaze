@@ -69,6 +69,8 @@ pub fn for_each_access<A: Allocator>(flow: &Flow<A>, s: Stmt, mut f: impl FnMut(
             f(Access { place: flow.loan(l).place, write: true, deep: true, except: Some(l) })
         }
         StmtKind::Switch { on, .. } => f(access(on, false, false)),
+        // A `Mention` reads nothing (the Reference, "Wildcard pattern"): no access, so no loan
+        // is invalidated by it. Its use of the place's local is liveness's (`uses_and_def`).
         _ => {}
     }
 }
@@ -191,6 +193,14 @@ fn uses_and_def<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, mut used
             used(local(on));
             None
         }
+        // A mention defines nothing and is an access of nothing (`for_each_access` gives it
+        // none); it uses its local only through a `Deref` (`Flow::mention_use`).
+        StmtKind::Mention(p) => {
+            if let Some(l) = flow.mention_use(p) {
+                used(l);
+            }
+            None
+        }
         StmtKind::Return => {
             used(Local(0));
             None
@@ -205,6 +215,9 @@ pub struct Facts<A: Allocator> {
     pub live: Bits<A>,
     /// Rows are statements, columns loans.
     pub active: Bits<A>,
+    /// Where each drop may run (the move check's dataflow, unplanted): drop-liveness read it,
+    /// and [`loan_parts`] reads it again to find the use that kept a loan live.
+    pub init: Inits<A>,
 }
 
 /// Local liveness (backward, passes in reverse order; bound `2 * stmts * locals + 1` passes),
@@ -304,7 +317,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
             break;
         }
     }
-    Ok(Facts { live, active })
+    Ok(Facts { live, active, init })
 }
 
 /// Statement `s` invalidates loan `l` at its Start.
@@ -333,6 +346,146 @@ impl BorrowFinding {
             BorrowFinding::Invalidated { at, .. } | BorrowFinding::UnprovenOutlives { at, .. } => at,
         }
     }
+}
+
+/// The three parts of an `Invalidated` finding a reader needs (rule 19; rustc's E0502/E0505/
+/// E0597 say the same three): the borrow (its place and the statement that took it), the
+/// conflicting action (the finding's own statement, `at`), and the later use that keeps the
+/// loan live there. One row per `Invalidated` finding, sorted by `(at, loan)` as the findings
+/// are: a column of the body's record beside `borrows` (rule 81).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct LoanParts {
+    pub at: Point,
+    pub loan: Loan,
+    /// The borrowed place (`LoanRow::place`).
+    pub place: Place,
+    /// The item-relative range of the statement that took the borrow (`LoanRow::at`).
+    pub issued: Span,
+    pub kept: Kept,
+}
+
+/// What keeps a loan live where it is invalidated.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Kept {
+    /// A statement at or after the conflict uses a local whose type mentions an origin that
+    /// holds the loan and is live there, reached with no redefinition of that local between:
+    /// the nearest such statement (fewest edges, then lowest index). rustc: "borrow later used
+    /// here".
+    Use { stmt: Stmt, local: Local, span: Span },
+    /// No local's use keeps it: a lifetime of the signature holds it, live at every point (the
+    /// borrow must outlive the call).
+    Signature { origin: Origin },
+    /// Neither was found: liveness said an origin holding the loan is live at the conflict, so
+    /// one of the two must exist. Named, never dropped: the note says the invariant broke.
+    Unfound,
+}
+
+/// The parts of each `Invalidated` finding in `borrows`, in their order ([`LoanParts`]).
+///
+/// Which origins hold the loan at the conflict is the solver's point-sensitive answer, which
+/// the two tiers compute in different forms (dense rows, closed components); the holders here
+/// are taken location-insensitively instead (every origin the loan's own reaches over the
+/// subset relation at any point, intersected with the origins live at the conflict), from the
+/// flow and facts alone, so both tiers' findings get equal parts. The superset can name the
+/// nearer use of a second holder; it never misses the true one, which is among them. Work: per
+/// finding, one sort of the subset edges' endpoints and one forward walk of the statements per
+/// holding local: findings are few, and nothing is computed for a body without one.
+pub fn loan_parts<A: Allocator + Clone>(
+    flow: &Flow<A>,
+    facts: &Facts<A>,
+    borrows: &[BorrowFinding],
+    alloc: A,
+) -> Vec<LoanParts, A> {
+    let mut out = Vec::new_in(alloc.clone());
+    if !borrows.iter().any(|f| matches!(f, BorrowFinding::Invalidated { .. })) {
+        return out;
+    }
+    let o = flow.origins as usize;
+    let n = flow.stmts.len();
+    // The subset relation as rows by `from`, points dropped.
+    let mut edges = Vec::with_capacity_in(flow.subsets.len(), alloc.clone());
+    edges.extend(flow.subsets.iter().map(|&(_, a, b)| (a, b)));
+    edges.sort_unstable();
+    edges.dedup();
+    let mut holds = Vec::with_capacity_in(o, alloc.clone());
+    let mut stack = Vec::new_in(alloc.clone());
+    let mut seen = Vec::with_capacity_in(flow.locals as usize, alloc.clone());
+    let mut dist = Vec::with_capacity_in(n, alloc.clone());
+    let mut queue = Vec::new_in(alloc);
+    for f in borrows {
+        let BorrowFinding::Invalidated { at, loan, .. } = *f else { continue };
+        let row = flow.loan(loan);
+        holds.clear();
+        holds.resize(o, false);
+        holds[row.origin.index()] = true;
+        stack.clear();
+        stack.push(row.origin);
+        while let Some(x) = stack.pop() {
+            let from = edges.partition_point(|&(a, _)| a < x);
+            for &(a, b) in &edges[from..] {
+                if a != x {
+                    break;
+                }
+                if !holds[b.index()] {
+                    holds[b.index()] = true;
+                    stack.push(b);
+                }
+            }
+        }
+        let p = at.index();
+        let s = at.stmt();
+        let mut best: Option<(u32, Stmt, Local)> = None;
+        seen.clear();
+        seen.resize(flow.locals as usize, false);
+        for &(local, origin) in flow.local_origins.iter() {
+            if !holds[origin.index()] || !facts.live.get(p, origin.index()) || seen[local.index()] {
+                continue;
+            }
+            seen[local.index()] = true;
+            // The nearest statement from `s` on that uses `local`, along paths that do not
+            // define it first (a use and a def in one statement is a use: liveness's order).
+            dist.clear();
+            dist.resize(n, u32::MAX);
+            queue.clear();
+            dist[s.index()] = 0;
+            queue.push(s);
+            let mut head = 0;
+            while head < queue.len() {
+                let t = queue[head];
+                head += 1;
+                let d = dist[t.index()];
+                if best.is_some_and(|(bd, _, _)| d > bd) {
+                    break;
+                }
+                let mut used = false;
+                let def = uses_and_def(flow, &facts.init, t, |l| used |= l == local);
+                if used {
+                    if best.is_none_or(|(bd, bs, _)| (d, t) < (bd, bs)) {
+                        best = Some((d, t, local));
+                    }
+                    continue;
+                }
+                if def == Some(local) {
+                    continue;
+                }
+                flow.for_each_succ(t, |u| {
+                    if dist[u.index()] == u32::MAX {
+                        dist[u.index()] = d + 1;
+                        queue.push(u);
+                    }
+                });
+            }
+        }
+        let kept = match best {
+            Some((_, stmt, local)) => Kept::Use { stmt, local, span: flow.stmt(stmt).span },
+            None => match (0..o).find(|&x| holds[x] && flow.placeholder[x]) {
+                Some(x) => Kept::Signature { origin: Origin(x as u32) },
+                None => Kept::Unfound,
+            },
+        };
+        out.push(LoanParts { at, loan, place: row.place, issued: flow.stmt(row.at).span, kept });
+    }
+    out
 }
 
 /// Tier one's answer: it accepts, or it cannot and tier two decides.

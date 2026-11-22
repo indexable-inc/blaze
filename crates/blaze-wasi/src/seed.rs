@@ -40,7 +40,7 @@ use wasmtime::{
 #[cfg(feature = "seed")]
 use crate::{
     Embed, Errno, Stop, W64,
-    calls::{Mem, answered},
+    layout::{Halt, Mem, answered},
 };
 
 /// The module the seed imports these calls from.
@@ -357,21 +357,23 @@ fn fiber_drop<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Resu
 fn call<T: EmbedSeed, R>(
     caller: &mut Caller<'_, T>,
     name: &'static str,
-    f: impl FnOnce(&mut Mem<'_, W64>, &mut dyn Seed) -> Result<R, Stop>, // dyn: as `EmbedSeed::with_seed`
+    f: impl FnOnce(&mut Mem<'_, W64>, &mut dyn Seed) -> Result<R, Halt>, // dyn: as `EmbedSeed::with_seed`
 ) -> wasmtime::Result<R> {
-    T::with_seed(caller, |bytes, seed| f(&mut Mem { bytes, call: name, width: PhantomData }, seed))
+    T::with_seed(caller, |bytes, seed| {
+        f(&mut Mem { bytes, call: name, width: PhantomData }, seed).map_err(Stop::from)
+    })
 }
 
 /// The absolute path at `(ptr, len)`, or `EINVAL` for a relative one.
 #[cfg(feature = "seed")]
-fn path<'m>(mem: &'m Mem<'_, W64>, ptr: u64, len: u64) -> Result<Result<&'m [u8], Errno>, Stop> {
+fn path<'m>(mem: &'m Mem<'_, W64>, ptr: u64, len: u64) -> Result<Result<&'m [u8], Errno>, Halt> {
     let path = mem.get(ptr, len)?;
     Ok(if path.first() == Some(&b'/') { Ok(path) } else { Err(Errno::INVAL) })
 }
 
 /// The `errno` of a call that answers nothing.
 #[cfg(feature = "seed")]
-fn done(answer: Result<(), Errno>) -> Result<i32, Stop> {
+fn done(answer: Result<(), Errno>) -> Result<i32, Halt> {
     answered(answer, |()| Ok(()))
 }
 
@@ -381,7 +383,7 @@ pub fn link<T: EmbedSeed>(l: &mut Linker<T>) -> wasmtime::Result<()> {
     let m = MODULE;
     l.func_wrap(m, "abi_version", |_: Caller<'_, T>| VERSION as i32)?;
     l.func_wrap(m, "decommit", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
-        call(&mut c, "decommit", |mem, seed| seed.decommit(mem.get_mut(ptr, len)?))
+        call(&mut c, "decommit", |mem, seed| Ok(seed.decommit(mem.get_mut(ptr, len)?)?))
     })?;
     l.func_wrap(m, "create_dir", |mut c: Caller<'_, T>, ptr: u64, len: u64| {
         call(&mut c, "create_dir", |mem, seed| {

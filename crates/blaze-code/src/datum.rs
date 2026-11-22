@@ -8,11 +8,17 @@
 //! - `bytes`: its first bytes; the value's other allocations (a slice or string literal it
 //!   points at) are laid out after them by the maker, each a [`OWN_DATUM`] word away.
 //! - `targets`: what its words name, by (space, symbol) as a code record's do: a function
-//!   ([`Space::Func`]: its entry thunk), a static ([`Space::Static`]: its first byte) or a
-//!   vtable ([`Space::Vtable`]: its first word). A thread-local or a C name is refused by name
-//!   ([`DatumError::Space`]) until each is built.
+//!   ([`Space::Func`]: its entry thunk), a static ([`Space::Static`]: its first byte), a
+//!   vtable ([`Space::Vtable`]: its first word) or a C name ([`Space::Outside`]: the address
+//!   the run binds the name to, a C table of function pointers in C code's data). A
+//!   thread-local is refused by name ([`DatumError::Space`]) until it is built.
 //! - `words`: 8-byte words of the bytes the placement fills: the address of `target` plus
 //!   `addend`, or of the datum's own byte `addend` ([`OWN_DATUM`]).
+//! - `names`: each C name target's name, in target order ([`Datum::outside`] adds one): the
+//!   run binds a C name by its text, and a datum is read without the code record that made
+//!   it, so the datum keeps the text itself, checked once on read to hash to its symbol
+//!   ([`Symbol::of_name`]). A datum naming no C name has no names section: its bytes are those
+//!   of the form before C names (`bzdata01`, the fourth count 0).
 //!
 //! [`Datum`] is the builder; [`Datum::seal`] checks it and puts it in its one canonical form
 //! ([`SealedDatum`]), which alone encodes, so two builders write equal bytes (rule 25).
@@ -41,6 +47,8 @@ pub const MOST_ALIGN: u8 = 12;
 const HEAD: usize = 40;
 const TARGET_ROW: usize = 40;
 const WORD_ROW: usize = 16;
+/// One C name's row in the names section: its text's start and length in the section's text.
+const NAME_ROW: usize = 8;
 
 /// Where a datum lives once the program runs (blaze-export input.rs `DataPlace`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,8 +84,17 @@ pub enum DatumError {
     Align { align: u8 },
     /// A `Zeroed` datum keeps bytes or words, or another's length is not its bytes'.
     ZeroedHolds,
-    /// A target of a space a datum does not name yet (a thread-local or a C name).
+    /// A target of a space a datum does not name yet (a thread-local).
     Space { space: Space, symbol: Symbol },
+    /// A C name target `symbol` with no name kept: a target added with [`Datum::target`]
+    /// instead of [`Datum::outside`], or a names section with fewer rows than C name targets.
+    NoName { symbol: Symbol },
+    /// The name kept for C name target `symbol` is not UTF-8 or does not hash to it
+    /// ([`Symbol::of_name`]).
+    NameWrong { symbol: Symbol },
+    /// The names section is not its one form (`why`): rows not end to end, text past the rows,
+    /// padding not zero, or a section where the datum names no C name.
+    Names { why: &'static str },
     /// Target `row` has the space byte `byte`.
     SpaceByte { row: u32, byte: u8 },
     /// A word at `at` names a target index the datum does not list.
@@ -105,7 +122,10 @@ impl fmt::Display for DatumError {
             DatumError::PlaceByte { byte } => write!(f, "{form} has the unknown place {byte}"),
             DatumError::Align { align } => write!(f, "{form} asks an alignment of 2^{align}, past a page (2^{MOST_ALIGN})"),
             DatumError::ZeroedHolds => write!(f, "{form}: a zeroed datum keeps no bytes or words, and another's length is its bytes'"),
-            DatumError::Space { space, symbol } => write!(f, "{form} names {space:?} {symbol}: a static's value naming a thread-local or a C name is not placed yet"),
+            DatumError::Space { space, symbol } => write!(f, "{form} names {space:?} {symbol}: a static's value naming a thread-local is not placed yet"),
+            DatumError::NoName { symbol } => write!(f, "{form} names C name {symbol} and keeps no name for it (a C name is added with `Datum::outside`)"),
+            DatumError::NameWrong { symbol } => write!(f, "{form} keeps a name for C name {symbol} that is not UTF-8 or does not hash to it"),
+            DatumError::Names { why } => write!(f, "{form}'s names section is not its one form: {why}"),
             DatumError::SpaceByte { row, byte } => write!(f, "{form}'s target {row} has the unknown space {byte}"),
             DatumError::NoSuchTarget { at, target } => write!(f, "{form}'s word at {at} names target {target}, which it does not list"),
             DatumError::WordMisaligned { at } => write!(f, "{form}'s word at {at} is not 8-aligned in an 8-aligned datum"),
@@ -129,24 +149,57 @@ pub struct Datum<'a> {
     pub bytes: AVec<'a, u8>,
     pub targets: AVec<'a, Target>,
     pub words: AVec<'a, Word>,
+    /// Each C name added ([`Datum::outside`]): its symbol and its text's start and length in
+    /// `text`. Sealed: one row per C name target, in target order, end to end.
+    names: AVec<'a, (Symbol, u32, u32)>,
+    text: AVec<'a, u8>,
     alloc: Alloc<'a>,
 }
 
 impl<'a> Datum<'a> {
     pub fn new_in(place: Place, align: u8, alloc: Alloc<'a>) -> Datum<'a> {
-        Datum { place, align, bytes: Vec::new_in(alloc), targets: Vec::new_in(alloc), words: Vec::new_in(alloc), alloc }
+        Datum {
+            place,
+            align,
+            bytes: Vec::new_in(alloc),
+            targets: Vec::new_in(alloc),
+            words: Vec::new_in(alloc),
+            names: Vec::new_in(alloc),
+            text: Vec::new_in(alloc),
+            alloc,
+        }
     }
 
-    /// `target`'s index, for a word made before [`Datum::seal`].
+    /// `target`'s index, for a word made before [`Datum::seal`]. A C name is added with
+    /// [`Datum::outside`], which keeps its text; one added here is refused at the seal
+    /// ([`DatumError::NoName`]).
     pub fn target(&mut self, target: Target) -> u32 {
         self.targets.push(target);
         (self.targets.len() - 1) as u32
     }
 
+    /// C name `name`'s index as a target ([`Space::Outside`], [`Symbol::of_name`]), its text
+    /// kept for the run's binding, for a word made before [`Datum::seal`].
+    pub fn outside(&mut self, name: &str) -> u32 {
+        let symbol = Symbol::of_name(name);
+        if !self.names.iter().any(|&(kept, _, _)| kept == symbol) {
+            // A length past a u32 is refused at the seal (`TooLarge`); saturated here.
+            let start = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+            let len = u32::try_from(name.len()).unwrap_or(u32::MAX);
+            self.names.push((symbol, start, len));
+            self.text.extend_from_slice(name.as_bytes());
+        }
+        self.target(Target { space: Space::Outside, symbol })
+    }
+
     /// The datum in its one canonical form: targets sorted and unique (every word renumbered),
-    /// words sorted by offset; every rule checked once here.
+    /// words sorted by offset, one name per C name target in target order; every rule checked
+    /// once here.
     pub fn seal(self) -> Result<SealedDatum<'a>, DatumError> {
-        let Datum { place, align, bytes, targets, mut words, alloc } = self;
+        let Datum { place, align, bytes, targets, mut words, names, text, alloc } = self;
+        if u32::try_from(text.len()).is_err() {
+            return Err(DatumError::TooLarge { what: "C names' text" });
+        }
         if align > MOST_ALIGN {
             return Err(DatumError::Align { align });
         }
@@ -188,16 +241,37 @@ impl<'a> Datum<'a> {
         }
         words.sort_unstable_by_key(|w| w.at);
         check_words(words.iter().copied(), align, len, sorted.len())?;
-        Ok(SealedDatum(Datum { place, align, bytes, targets: sorted, words, alloc }))
+        // One name per C name target, in target order, end to end: the canonical section
+        // (equal data write equal bytes however their names were added).
+        let mut kept: AVec<'a, (Symbol, u32, u32)> = Vec::new_in(alloc);
+        let mut kept_text: AVec<'a, u8> = Vec::new_in(alloc);
+        for t in sorted.iter().filter(|t| t.space == Space::Outside) {
+            let Some(&(_, start, name_len)) = names.iter().find(|&&(symbol, _, _)| symbol == t.symbol) else {
+                return Err(DatumError::NoName { symbol: t.symbol });
+            };
+            let (start, name_len) = (start as usize, name_len as usize);
+            let at = kept_text.len() as u32;
+            kept_text.extend_from_slice(&text[start..start + name_len]);
+            kept.push((t.symbol, at, name_len as u32));
+        }
+        if matches!(place, Place::Zeroed { .. }) && !kept.is_empty() {
+            return Err(DatumError::ZeroedHolds);
+        }
+        Ok(SealedDatum(Datum { place, align, bytes, targets: sorted, words, names: kept, text: kept_text, alloc }))
     }
 }
 
 /// A target a datum may name (the module doc).
 fn allowed(t: Target) -> Result<(), DatumError> {
     match t.space {
-        Space::Func | Space::Static | Space::Vtable => Ok(()),
-        Space::Tls | Space::Outside => Err(DatumError::Space { space: t.space, symbol: t.symbol }),
+        Space::Func | Space::Static | Space::Vtable | Space::Outside => Ok(()),
+        Space::Tls => Err(DatumError::Space { space: t.space, symbol: t.symbol }),
     }
+}
+
+/// The names section's length: a row per C name, then their texts end to end.
+fn names_len(rows: usize, text: usize) -> usize {
+    rows * NAME_ROW + text
 }
 
 /// The words' rules over words sorted by offset: each 8-aligned in an 8-aligned datum, inside
@@ -249,7 +323,8 @@ impl<'a> SealedDatum<'a> {
             Place::ReadOnly | Place::Writable => d.bytes.len() as u64,
         };
         out.extend_from_slice(&len.to_le_bytes());
-        for count in [d.bytes.len(), d.targets.len(), d.words.len(), 0] {
+        let names = if d.names.is_empty() { 0 } else { names_len(d.names.len(), d.text.len()) };
+        for count in [d.bytes.len(), d.targets.len(), d.words.len(), names] {
             out.extend_from_slice(&(count as u32).to_le_bytes());
         }
         out.extend_from_slice(&d.bytes);
@@ -266,6 +341,16 @@ impl<'a> SealedDatum<'a> {
             out.extend_from_slice(&w.target.to_le_bytes());
             out.extend_from_slice(&w.addend.to_le_bytes());
         }
+        // The names section (sealed: one row per C name target, in target order, end to end),
+        // padded to 8; absent when the datum names no C name.
+        for &(_, start, name_len) in d.names.iter() {
+            out.extend_from_slice(&start.to_le_bytes());
+            out.extend_from_slice(&name_len.to_le_bytes());
+        }
+        out.extend_from_slice(&d.text);
+        while (out.len() - start) % 8 != 0 {
+            out.push(0);
+        }
     }
 }
 
@@ -281,7 +366,9 @@ fn get64(b: &[u8], at: usize) -> u64 {
 /// read-only, 1 writable, 2 zeroed), align `u8`, six zero bytes; `len: u64` (its bytes'
 /// length, or a zeroed datum's); four `u32` counts (bytes, targets, words, 0); the bytes padded
 /// to 8; targets (space `u8`, 7 zero bytes, symbol 32); words (`at: u32`, `target: u32`,
-/// `addend: i64`).
+/// `addend: i64`); then, when the fourth count `n` is not 0, the names section of `n` bytes
+/// padded to 8: one row (`start: u32`, `len: u32`) per C name target in target order, then
+/// their texts end to end (row `k`'s text at `start` of the texts).
 #[derive(Clone, Copy)]
 pub struct DatumView<'b> {
     bytes: &'b [u8],
@@ -290,6 +377,12 @@ pub struct DatumView<'b> {
     data: &'b [u8],
     targets: &'b [u8],
     words: &'b [u8],
+    /// The names section's rows and texts (empty when the datum names no C name).
+    name_rows: &'b [u8],
+    name_text: &'b [u8],
+    /// The index of the first C name target: they sort last ([`Space::Outside`] is the last
+    /// space), so target `first_outside + k` is row `k`'s.
+    first_outside: usize,
 }
 
 impl<'b> DatumView<'b> {
@@ -306,7 +399,8 @@ impl<'b> DatumView<'b> {
             return Err(DatumError::Align { align });
         }
         let len = get64(bytes, 16);
-        let (count_bytes, count_targets, count_words) = (get32(bytes, 24) as usize, get32(bytes, 28) as usize, get32(bytes, 32) as usize);
+        let (count_bytes, count_targets, count_words, count_names) =
+            (get32(bytes, 24) as usize, get32(bytes, 28) as usize, get32(bytes, 32) as usize, get32(bytes, 36) as usize);
         let place = match bytes[8] {
             0 => Place::ReadOnly,
             1 => Place::Writable,
@@ -314,23 +408,28 @@ impl<'b> DatumView<'b> {
             byte => return Err(DatumError::PlaceByte { byte }),
         };
         let consistent = match place {
-            Place::Zeroed { .. } => count_bytes == 0 && count_words == 0,
+            Place::Zeroed { .. } => count_bytes == 0 && count_words == 0 && count_names == 0,
             Place::ReadOnly | Place::Writable => len == count_bytes as u64,
         };
-        if !consistent || get32(bytes, 36) != 0 {
+        if !consistent {
             return Err(DatumError::ZeroedHolds);
         }
         let len = u32::try_from(len).map_err(|_| DatumError::TooLarge { what: "length" })?;
         let padded = (count_bytes + 7) & !7;
-        let need = HEAD + padded + count_targets * TARGET_ROW + count_words * WORD_ROW;
+        let names_at = HEAD + padded + count_targets * TARGET_ROW + count_words * WORD_ROW;
+        let need = names_at + ((count_names + 7) & !7);
         if need != bytes.len() {
             return Err(DatumError::Length { need, have: bytes.len() });
         }
         let data = &bytes[HEAD..HEAD + count_bytes];
         let targets = &bytes[HEAD + padded..HEAD + padded + count_targets * TARGET_ROW];
-        let words = &bytes[HEAD + padded + count_targets * TARGET_ROW..];
-        let view = DatumView { bytes, place, align, data, targets, words };
+        let words = &bytes[HEAD + padded + count_targets * TARGET_ROW..names_at];
+        let names = &bytes[names_at..names_at + count_names];
+        if bytes[names_at + count_names..].iter().any(|&byte| byte != 0) {
+            return Err(DatumError::Names { why: "its padding is not zero" });
+        }
         let mut last: Option<Target> = None;
+        let mut first_outside = count_targets;
         for row in 0..count_targets {
             let byte = targets[row * TARGET_ROW];
             let Some(space) = space_of(byte) else {
@@ -341,10 +440,59 @@ impl<'b> DatumView<'b> {
             if last.is_some_and(|before| before >= t) {
                 return Err(DatumError::TargetsOrder);
             }
+            if space == Space::Outside && first_outside == count_targets {
+                first_outside = row;
+            }
             last = Some(t);
         }
+        // The C name targets sort last, so they are rows `first_outside..`; each has its row.
+        let outside = count_targets - first_outside;
+        if outside == 0 && count_names != 0 {
+            return Err(DatumError::Names { why: "the datum names no C name" });
+        }
+        let Some(name_text) = names.get(outside * NAME_ROW..) else {
+            return Err(DatumError::NoName { symbol: symbol_at(targets, (first_outside + names.len() / NAME_ROW) * TARGET_ROW + 8) });
+        };
+        let name_rows = &names[..outside * NAME_ROW];
+        let mut next = 0usize;
+        for k in 0..outside {
+            let (start, name_len) = (get32(name_rows, k * NAME_ROW) as usize, get32(name_rows, k * NAME_ROW + 4) as usize);
+            if start != next || start + name_len > name_text.len() {
+                return Err(DatumError::Names { why: "its rows are not end to end over its texts" });
+            }
+            next = start + name_len;
+            let symbol = symbol_at(targets, (first_outside + k) * TARGET_ROW + 8);
+            match core::str::from_utf8(&name_text[start..next]) {
+                Ok(name) if Symbol::of_name(name) == symbol => {}
+                _ => return Err(DatumError::NameWrong { symbol }),
+            }
+        }
+        if next != name_text.len() {
+            return Err(DatumError::Names { why: "its texts run past its rows" });
+        }
+        let view = DatumView { bytes, place, align, data, targets, words, name_rows, name_text, first_outside };
         check_words((0..count_words).map(|i| view.word(i)), align, len, count_targets)?;
         Ok(view)
+    }
+
+    /// The name kept for C name target `symbol` (checked on read to hash to it), by halving
+    /// over the C name targets; `None` when the datum does not name it.
+    pub fn name(&self, symbol: Symbol) -> Option<&'b str> {
+        let rows = self.name_rows.len() / NAME_ROW;
+        let (mut lo, mut hi) = (0usize, rows);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match symbol_at(self.targets, (self.first_outside + mid) * TARGET_ROW + 8).cmp(&symbol) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let start = get32(self.name_rows, mid * NAME_ROW) as usize;
+                    let len = get32(self.name_rows, mid * NAME_ROW + 4) as usize;
+                    return core::str::from_utf8(self.name_text.get(start..start + len)?).ok();
+                }
+            }
+        }
+        None
     }
 
     /// The whole encoding: equal data are equal bytes.
@@ -435,7 +583,8 @@ impl core::error::Error for FillError {}
 
 /// Static `symbol`'s datum `datum` made at `at`: its bytes copied into `out` (the write view's
 /// bytes at `at`) and every word filled: a target's value from `words` ([`Words::value`]: a
-/// fn's entry thunk, a static's or vtable's address) or the datum's own byte, plus the addend.
+/// fn's entry thunk, a static's or vtable's address, the address a C name is bound to, whose
+/// text the run's words read from [`DatumView::name`]) or the datum's own byte, plus the addend.
 /// Deterministic: the same datum, `at` and answers give the same bytes.
 pub fn fill(datum: &DatumView<'_>, symbol: Symbol, at: u64, words: &mut dyn Words, out: &mut [u8]) -> Result<(), FillError> {
     let want = datum.bytes().len();

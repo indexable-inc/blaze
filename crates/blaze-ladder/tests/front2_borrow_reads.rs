@@ -16,8 +16,8 @@
 //!   "the digest of `moves` moved".
 //! - LIFE: BASE with `pick`'s head written `fn pick<'a>(x: &'a u8) -> &'a u8`. The Reference,
 //!   "Lifetime elision": a single input lifetime is given to the elided output, so both heads
-//!   mean one relation, but the borrow check reads the head's TEXT (a written lifetime, the
-//!   lifetime part `read_signature` reads): `calls`'s `BorrowHead` row about `pick` differs.
+//!   mean one relation, but the borrow check reads the head's region record (D148), which a
+//!   written lifetime moves: `calls`'s `BorrowHead` row about `pick` differs.
 //!
 //! Prints `BORROW READS: moves typeck rows equal, Token's row moved, digest moved; calls pick's
 //! head row moved, digest moved`. Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`.
@@ -164,6 +164,10 @@ fn of_kind(rows: &[Read], kind: FactKind) -> Vec<Read> {
     rows.iter().filter(|r| r.fact.kind == kind).copied().collect()
 }
 
+fn keys_of(rows: &[Read]) -> Vec<u128> {
+    rows.iter().map(|r| r.fact.key).collect()
+}
+
 fn typeck_rows(rows: &[Read]) -> Vec<Read> {
     rows.iter().filter(|r| !matches!(r.fact.kind, FactKind::BorrowAdt | FactKind::BorrowHead)).copied().collect()
 }
@@ -183,15 +187,20 @@ fn borrow_reads_move_the_body_digest() {
     assert_ne!(a[0].answer, b[0].answer, "`Token`'s row moved when it became `Copy`");
     assert_ne!(base.moves.digest, copy.moves.digest, "the digest of `moves` moved");
 
-    // LIFE: only `pick`'s head text moved. Each head the borrow check asks is two facts:
-    // detail 0, its lifetime part and callee facts (borrow_reads.rs), and detail 1, its
-    // declared type-outlives bounds (call_generics.rs). LIFE writes a lifetime and no bound, so
-    // only a detail-0 row moves; the detail-1 rows name the same heads and stay equal.
+    // LIFE: only `pick`'s head text moved. Each head the borrow check asks is three facts:
+    // detail 0, its lifetime part and callee facts (borrow_reads.rs), detail 1, its declared
+    // type-outlives bounds (call_generics.rs), and detail 4, its trait bounds' lifetime ties
+    // (borrows_ties.rs `DETAIL`, piece RB8). LIFE writes a lifetime and no bound, so only a
+    // detail-0 row moves; the detail-1 and detail-4 rows name the same heads and stay equal.
+    const TIES: u64 = 4;
     let (heads, life_heads) = (of_kind(&base.calls.rows, FactKind::BorrowHead), of_kind(&life.calls.rows, FactKind::BorrowHead));
     let detail = |rows: &[Read], d: u64| -> Vec<Read> { rows.iter().filter(|r| r.fact.detail == d).copied().collect() };
     let (a, b) = (detail(&heads, 0), detail(&life_heads, 0));
     let (a1, b1) = (detail(&heads, 1), detail(&life_heads, 1));
-    assert_eq!(heads.len(), a.len() + a1.len(), "every head row is detail 0 or 1: {heads:?}");
+    let (a4, b4) = (detail(&heads, TIES), detail(&life_heads, TIES));
+    assert_eq!(heads.len(), a.len() + a1.len() + a4.len(), "every head row is detail 0, 1 or 4: {heads:?}");
+    assert_eq!(keys_of(&a4), keys_of(&a), "a ties row for each head read: {a4:?} beside {a:?}");
+    assert_eq!(a4, b4, "no trait bound changed, so no ties row moved: {a4:?} then {b4:?}");
     assert_eq!(a.len(), 2, "`calls` reads two heads, its own and `pick`'s: {a:?}");
     assert_eq!(b.len(), 2, "`calls` reads two heads, its own and `pick`'s: {b:?}");
     let keys = |rows: &[Read]| -> Vec<u128> { rows.iter().map(|r| r.fact.key).collect() };

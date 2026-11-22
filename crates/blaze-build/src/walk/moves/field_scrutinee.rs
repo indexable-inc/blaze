@@ -16,8 +16,15 @@
 //! refused it as "a move out of a field of other than a temporary or a local with field flags
 //! (behind a pointer ..)": a misleading reason, as nothing there is behind a pointer.
 //!
+//! A `Box`'s contents on the path are the same (`match *s.bx`, `if let Type::Path(mut ty) =
+//! *group.elem` in syn's `ambig_ty`): [expr.move.movable-place] lets them be moved out of, so
+//! the part `[Field elem, Deref, Variant Path, ..]` moves by the local's word and the local's
+//! drops free the box alone where its contents moved (walk/moves/boxes.rs `box_node`). Before
+//! this, walk/moves.rs `scrutinee_in_place` took such a scrutinee as behind a pointer, owned by
+//! no one, and `move_out` refused the binding ("pattern 9 ... a move out").
+//!
 //! The pieces, each called from the place named:
-//! - `field_chain_local`: the local a scrutinee is a chain of fields of;
+//! - `field_chain_local`: the local a scrutinee is a place path of (fields, box contents);
 //! - `owned_field_scrutinee`: that local when it is owned here and the scrutinee needs drop
 //!   (walk.rs `Expr::Match` and `match_dispatch`, walk/lets.rs `push_scrutinee`,
 //!   walk/matches.rs `tested_place`, walk/moves.rs `own_scrutinee`);
@@ -29,35 +36,38 @@
 use core::alloc::Allocator;
 
 use blaze_lir::func::SlotId;
-use blaze_typeck::{Expr, ExprId, Pat, PatId};
+use blaze_typeck::{ExprId, Pat, PatId};
 
 use super::super::{Walk, malformed};
 use crate::BuildError;
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
-    /// The local `e` is a field of: `e` a chain of one or more struct or tuple fields
-    /// (through parentheses) of a local, with no adjustment on `e` nor on any base on the way
-    /// (an autoderef there puts the place behind a pointer: walk/moves.rs
-    /// `scrutinee_in_place`). `None` for anything else, a whole local included (walk.rs
-    /// handles that as its own owner). Reads nothing but the expressions and their adjustment
-    /// rows, so `scan_flags` may ask before any local is owned.
-    pub(in crate::walk) fn field_chain_local(&self, e: ExprId) -> Result<Option<PatId>, BuildError> {
+    /// The local `e` is a part of: `e` a place path of one or more steps from a local, each a
+    /// struct or tuple field or a `Box`'s contents (an overloaded `*b` of a box, a base's
+    /// autoderef through boxes), through parentheses, with no adjustment on `e` itself: the
+    /// paths walk/moves/boxes.rs `path_steps` follows, so the local found here is the one
+    /// `field_scrutinee_prefix` reaches (one definition of a place a local owns). The
+    /// Reference, [expr.move.movable-place]: "Fields of a place expression which can be moved
+    /// out of and don't implement `Drop`. The result of dereferencing an expression with type
+    /// `Box<T>` and that can also be moved out of": `*group.elem` with `group: TypeGroup` by
+    /// value (syn's `ambig_ty`) is such a place. Any other dereference on the way (a
+    /// reference's, a pointer's, an overloaded `Deref` other than a box's) ends the path: the
+    /// place is behind a pointer (walk/moves.rs `scrutinee_in_place`). `None` for anything
+    /// else, a whole local included (walk.rs handles that as its own owner). Reads the
+    /// expressions, their adjustment rows and the layouts of the bases, never a local's
+    /// ownership, so `scan_flags` may ask before any local is owned.
+    pub(in crate::walk) fn field_chain_local(&mut self, e: ExprId) -> Result<Option<PatId>, BuildError> {
         if !self.adjust_rows(e).is_empty() {
             return Ok(None);
         }
-        let mut cur = e;
-        let mut fields = 0u32;
-        loop {
-            match self.expr(cur)? {
-                Expr::Paren(inner) if self.adjust_rows(inner).is_empty() => cur = inner,
-                Expr::Field { base, .. } | Expr::TupleField { base, .. } if self.adjust_rows(base).is_empty() => {
-                    fields += 1;
-                    cur = base;
-                }
-                Expr::Local(x) if fields > 0 => return Ok(Some(x)),
-                _ => return Ok(None),
-            }
-        }
+        let mark = self.moves.steps.len();
+        let root = self.path_steps(e, 0)?;
+        let steps = self.moves.steps.len() - mark;
+        self.moves.steps.truncate(mark);
+        Ok(match root {
+            Some((x, _)) if steps > 0 => Some(x),
+            _ => None,
+        })
     }
 
     /// Whether scrutinee `scrutinee` is a field of a local this body owns, of a type that needs

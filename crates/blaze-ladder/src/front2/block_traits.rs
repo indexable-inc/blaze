@@ -265,7 +265,13 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
             Ok(r) if r.def.kind == DefKind::Enum && r.consumed + 1 == len => {}
             Ok(_) => return Err(Self::gap(row, PARTIAL)),
             // No type of the name: a fn, a const, a macro (`use tracing::info;`) brings no trait.
-            Err(e) if e.why == PathWhy::NotFound && e.at + 1 == len => {
+            // Nor does a type of the name that is not visible here: an import takes, in each
+            // namespace, only a binding it may name (the Reference, "Use declarations"; "Visibility
+            // and privacy"), so core's `mod poll_fn;` (private) beside `pub use
+            // poll_fn::poll_fn;` leaves `use std::future::poll_fn;` (tokio's `Receiver::recv`)
+            // the fn alone. The walk answers `Private` for that module at the last segment; when
+            // no namespace resolves it either, the `use` is refused below as before.
+            Err(e) if matches!(e.why, PathWhy::NotFound | PathWhy::Private) && e.at + 1 == len => {
                 let value = self.names.walk(at, Namespace::Values, w).is_ok_and(|r| r.consumed == len);
                 if !value && !self.names.walk(at, Namespace::Macros, w).is_ok_and(|r| r.consumed == len) {
                     return Err(Self::gap(row, UNRESOLVED));

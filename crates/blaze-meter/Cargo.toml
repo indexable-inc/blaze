@@ -1,0 +1,27 @@
+[package]
+name = "blaze-meter"
+description = "D169, the one meter: what a stretch of one thread used, not only how long it took. Thread-local counters (the global heap, each frame tag, pages mapped, effects by kind, the store, hashing, lock waits and parks) that the code doing the work adds to, plus this thread's instructions, cycles, times and faults read from the system at a snapshot; `Meter::now()` is a `Copy` snapshot, `Used` the difference of two, printed as one `used:` line. `no_std`, no dependency but blaze-sys"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# blaze-sys only, so the crates at the bottom (blaze-mem's allocator and frames, blaze-ids'
+# hashing, blaze-core's locks and effects) can each add to the counters where they do the work.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+blaze-sys.workspace = true
+
+[features]
+# `testing::stop`: a test's switch that turns every snapshot's readings off, to compare what a
+# command stores with readings and without (rule 25). Turned on by dev-dependencies only.
+testing = []
+
+[lints]
+workspace = true

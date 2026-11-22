@@ -10,9 +10,10 @@
 //!   packages it holds. A package the lock cannot verify (no checksum, an unpinned or non-HTTPS
 //!   git source, another registry) is named in [`plan::Skip`], never fetched and trusted.
 //! - [`fetch`]: the machine (sans-IO, rule 14). It asks the store whether each unit's record is
-//!   held, asks for the rest over HTTPS with a byte limit and a deadline, tries a transient
-//!   failure again a bounded number of times, checks every answer before a byte of it is
-//!   unpacked, and asks the store to keep one record a unit.
+//!   held, asks for the rest over HTTPS with a byte limit and a deadline, ONCE (D172: a
+//!   failure is the unit's outcome, owed to the next command, never tried again in this one),
+//!   checks every answer before a byte of it is unpacked, and asks the store to keep one record
+//!   a unit.
 //! - [`unpack`]: a `.crate` (gzip, then tar) or a git pack, read under limits, every path held
 //!   inside the unit's folder, into [`pack`]: the record's form, its files sorted, its tree's
 //!   listing digest and its own BLAKE3 in it.

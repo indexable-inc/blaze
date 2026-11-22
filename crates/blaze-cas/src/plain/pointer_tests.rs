@@ -237,7 +237,7 @@ fn of_two_processes_the_later_commit_wins() {
 }
 
 /// One name pointed in 48 commits, each a segment of its own, its 20 targets in turn (more
-/// distinct segments than `SEGMENTS_MOST`, so merges run; from the 21st commit on a segment's
+/// distinct tiny segments than tier 0's `K`, so merges run; from the 21st commit on a segment's
 /// bytes repeat an older one's), compaction after every eighth: the newest value is read after
 /// each, and after a reopen. Prints `pointer: N merges between 48 commits kept the newest value
 /// of the name`.

@@ -9,12 +9,6 @@ use super::*;
 const DIRS: usize = 20;
 const FILES: usize = 20;
 const BODIES: usize = 10;
-/// The command's own frame here: an eighth of a task's.
-const COMMAND_FRAME: usize = 8 << 20;
-/// A task's scratch, and each of the drawing's two frames: several of this workspace's largest
-/// outline (2 KiB a top-level item, [`SCRATCH`]'s measure: 40 KiB for 20 items).
-const DRAW_SCRATCH: usize = 256 << 10;
-const TIGHT: work::Sizes = work::Sizes { scratch: DRAW_SCRATCH, batch: TASK_FRAME, plant: work::Plant::None };
 
 /// [`DIRS`] modules of [`FILES`] modules of [`BODIES`] functions each, every body one syntax
 /// error (`let x = ;`: the Rust Reference, "let statements": `=` is followed by an expression).
@@ -39,8 +33,10 @@ fn broken() -> Io {
     io
 }
 
-/// 4,000 findings in 400 files are listed and drawn, each with its id, in a command frame of
-/// 8 MiB and two scratch frames of 256 KiB, and the closing line follows them.
+/// 4,000 findings in 400 files are listed and drawn by the engine's check, each with its id,
+/// and the closing line follows them (ported from the old checker's command, 2026-11-19: the
+/// tight frames it was run in were that command's `work::Sizes`; the engine's request frame is
+/// engine_check.rs `REQUEST_FRAME`, and print.rs `Scratch` is the same drawing).
 ///
 /// What that work takes in all is many times the scratch: the 400 outlines alone are about
 /// 8 MiB (20 KiB each), and the 4,000 drawings more than 256 KiB. Before `Scratch` each FINDING
@@ -55,9 +51,9 @@ fn broken() -> Io {
 #[test]
 fn thousands_of_findings_are_drawn_in_frames_a_fraction_of_their_work() {
     let io = broken();
-    let checked = ask_framed::<fix::Atomic>(&io, (Command::Check, "check"), TIGHT, View::Person, None, COMMAND_FRAME).expect("the request answers");
+    let checked = check(&io);
     let out = stdout(&io);
-    assert!(checked.failed.is_empty(), "{:?}", checked.failed);
+    assert_eq!(checked.failures, 0, "{}", checked.profile);
     let all = DIRS * FILES * BODIES;
     assert_eq!(checked.errors as usize, all, "{}", checked.profile);
     assert_eq!(out.matches("error[syntax]").count(), all, "every finding is drawn");

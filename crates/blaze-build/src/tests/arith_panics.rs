@@ -27,9 +27,10 @@
 //! fn main() -> i64 {
 //!     let x: U = <a's bits>; let y: U = <b's bits>;     // U: the unsigned type of T's width
 //!     let a: T = x as T;    let b: T = y as T;
-//!     (a op b) as i64                                   // or (-a) as i64
+//!     (a op b) as i64                                   // or (-a) as i64, or `a op= b; a as i64`
 //! }
 //! ```
+//! optionally after [`FAR_PAD`] lets, which put the operation past `sp + 32 KiB` in the frame.
 
 use std::alloc::Global;
 use std::format;
@@ -132,30 +133,39 @@ impl Adts for ArithAdts<'_> {
     }
 }
 
-/// An integer type of the table: its width and signedness.
+/// An integer type of the table: its width, signedness, and whether it is `isize`/`usize`
+/// (64 bits on the hosts). The 128-bit types are not in it: the oracle computes in `i128`
+/// (which holds no `u128` and no exact `i128` overflow); their overflow operations are
+/// blaze-emit's pass/wide.rs, whose cells are reached by the same `ld_sp`/`st_sp`.
 #[derive(Clone, Copy, Debug)]
 struct Int {
     bits: u32,
     signed: bool,
+    ptr: bool,
 }
 
-const INTS: [Int; 6] = [
-    Int { bits: 8, signed: true },
-    Int { bits: 32, signed: true },
-    Int { bits: 64, signed: true },
-    Int { bits: 8, signed: false },
-    Int { bits: 32, signed: false },
-    Int { bits: 64, signed: false },
-];
+const fn int(bits: u32, signed: bool) -> Int {
+    Int { bits, signed, ptr: false }
+}
+
+const U8: Int = int(8, false);
+const ISIZE: Int = Int { bits: 64, signed: true, ptr: true };
+const USIZE: Int = Int { bits: 64, signed: false, ptr: true };
+
+const INTS: [Int; 10] = [int(8, true), int(16, true), int(32, true), int(64, true), ISIZE, U8, int(16, false), int(32, false), int(64, false), USIZE];
 
 impl Int {
     fn node(self) -> PNode {
-        match (self.bits, self.signed) {
-            (8, true) => PNode::Int(IntTy::I8),
-            (32, true) => PNode::Int(IntTy::I32),
-            (64, true) => PNode::Int(IntTy::I64),
-            (8, false) => PNode::Uint(UintTy::U8),
-            (32, false) => PNode::Uint(UintTy::U32),
+        match (self.bits, self.signed, self.ptr) {
+            (_, true, true) => PNode::Int(IntTy::Isize),
+            (_, false, true) => PNode::Uint(UintTy::Usize),
+            (8, true, _) => PNode::Int(IntTy::I8),
+            (16, true, _) => PNode::Int(IntTy::I16),
+            (32, true, _) => PNode::Int(IntTy::I32),
+            (64, true, _) => PNode::Int(IntTy::I64),
+            (8, false, _) => PNode::Uint(UintTy::U8),
+            (16, false, _) => PNode::Uint(UintTy::U16),
+            (32, false, _) => PNode::Uint(UintTy::U32),
             _ => PNode::Uint(UintTy::U64),
         }
     }
@@ -188,10 +198,11 @@ impl Int {
     }
 }
 
-/// An operator of the table.
+/// An operator of the table: `a op b`, `a op= b` (then `a`), or `-a`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Form {
     Bin(BinOp),
+    Assign(BinOp),
     Neg,
 }
 
@@ -204,6 +215,18 @@ const FORMS: [Form; 8] = [
     Form::Bin(BinOp::Shl),
     Form::Bin(BinOp::Shr),
     Form::Neg,
+];
+
+/// The checked forms [`arithmetic_past_the_2048th_value_ends_as_the_reference_defines`] runs:
+/// `+ - *`, `+= -= *=` (the property and the edges keep to [`FORMS`], so the control's draw of
+/// `MIN % -1` keeps its odds).
+const CHECKED: [Form; 6] = [
+    Form::Bin(BinOp::Add),
+    Form::Bin(BinOp::Sub),
+    Form::Bin(BinOp::Mul),
+    Form::Assign(BinOp::Add),
+    Form::Assign(BinOp::Sub),
+    Form::Assign(BinOp::Mul),
 ];
 
 /// How a run ended.
@@ -224,6 +247,10 @@ fn definition(form: Form, t: Int, checks: bool, a: u128, b: u128) -> End {
         _ => End::Panic(p),
     };
     match form {
+        // `a op= b` on integers is `a = a op b`, checked alike (the Reference, "Compound
+        // assignment expressions": "If both types are primitives, then the modifying operand
+        // will be evaluated first followed by the assigned operand").
+        Form::Assign(op) => definition(Form::Bin(op), t, checks, a, b),
         Form::Bin(BinOp::Add) => exact(x.checked_add(y), PanicConst::AddOverflow),
         Form::Bin(BinOp::Sub) => exact(x.checked_sub(y), PanicConst::SubOverflow),
         Form::Bin(BinOp::Mul) => exact(x.checked_mul(y), PanicConst::MulOverflow),
@@ -264,28 +291,42 @@ fn put(b: &mut Bb, x: Expr) -> ExprId {
     at
 }
 
-/// The module doc's `main`.
-fn main_body(form: Form, t: Int, a: u128, b: u128) -> (Bb, ExprId, StdVec<(ExprId, u128)>) {
+/// The module doc's `main`, after `pad` statements `let _pad: u64 = <k>;` (each at least one
+/// LIR value, so a `pad` past 2048 puts the operation's cells past `sp + 32 KiB`: see
+/// [`FAR_PAD`]). `Form::Assign` is `let mut a: T = x as T; a op= b; a as i64`.
+fn main_body(form: Form, t: Int, a: u128, b: u128, pad: u32) -> (Bb, ExprId, StdVec<(ExprId, u128)>) {
     let mut bb = Bb::new();
     let mut lits = StdVec::new();
     let mut stmts = StdVec::new();
-    let (ty, uty, i64_) = (bb.ty(t.node()), bb.ty(t.unsigned()), bb.ty(PNode::Int(IntTy::I64)));
-    let mut operand = |bb: &mut Bb, stmts: &mut StdVec<_>, raw: &str, name: &str, bits: u128| {
+    let (ty, uty, i64_, u64_) = (bb.ty(t.node()), bb.ty(t.unsigned()), bb.ty(PNode::Int(IntTy::I64)), bb.ty(PNode::Uint(UintTy::U64)));
+    for k in 0..pad {
+        let lit = bb.int(None);
+        lits.push((lit, u128::from(k)));
+        let p = bb.bind("_pad");
+        stmts.push(bb.let_(p, Some(u64_), lit));
+    }
+    let mut operand = |bb: &mut Bb, stmts: &mut StdVec<_>, raw: &str, name: &str, bits: u128, mutable: bool| {
         let lit = bb.int(None);
         lits.push((lit, bits & t.mask()));
         let p = bb.bind(raw);
         stmts.push(bb.let_(p, Some(uty), lit));
         let x = bb.local(p);
         let cast = put(bb, Expr::Cast { operand: x, ty });
-        let q = bb.bind(name);
+        let q = if mutable { bb.bind_mut(name) } else { bb.bind(name) };
         stmts.push(bb.let_(q, Some(ty), cast));
-        bb.local(q)
+        (q, bb.local(q))
     };
-    let l = operand(&mut bb, &mut stmts, "x", "a", a);
+    let (pa, l) = operand(&mut bb, &mut stmts, "x", "a", a, matches!(form, Form::Assign(_)));
     let value = match form {
         Form::Bin(op) => {
-            let r = operand(&mut bb, &mut stmts, "y", "b", b);
+            let (_, r) = operand(&mut bb, &mut stmts, "y", "b", b, false);
             put(&mut bb, Expr::Binary { op, lhs: l, rhs: r })
+        }
+        Form::Assign(op) => {
+            let (_, r) = operand(&mut bb, &mut stmts, "y", "b", b, false);
+            let assign = put(&mut bb, Expr::AssignOp { op, lhs: l, rhs: r });
+            stmts.push(bb.semi(assign));
+            bb.local(pa)
         }
         Form::Neg => put(&mut bb, Expr::Unary { op: UnOp::Neg, operand: l }),
     };
@@ -342,9 +383,19 @@ host_panics! {
     host_neg = 5, host_shr = 6, host_shl = 7, host_div_zero = 8, host_rem_zero = 9,
 }
 
+/// How a case is built: overflow checks on or off, what is planted, and how many lets come
+/// before the operands ([`main_body`]).
+#[derive(Clone, Copy, Debug)]
+struct Setting {
+    checks: bool,
+    planted: Planted,
+    pad: u32,
+}
+
 /// Builds `main` and runs it in a forked child: how it ended.
-fn run(w: &World, form: Form, t: Int, a: u128, b: u128, checks: bool, planted: Planted) -> Result<End, String> {
-    let (mb, root, lits) = main_body(form, t, a, b);
+fn run(w: &World, form: Form, t: Int, a: u128, b: u128, s: Setting) -> Result<End, String> {
+    let Setting { checks, planted, pad } = s;
+    let (mb, root, lits) = main_body(form, t, a, b, pad);
     let adts = ArithAdts { w, lits: &lits, checks, planted };
     let view = mb.view(w.main, root);
     let checked = checked_of(w, &view)?;
@@ -401,10 +452,11 @@ fn run(w: &World, form: Form, t: Int, a: u128, b: u128, checks: bool, planted: P
 /// The words of the oracle's finding (`blaze_sim::control` looks for them).
 const SAYS: &str = "where the Reference gives";
 
-fn agree(w: &World, form: Form, t: Int, checks: bool, a: u128, b: u128, planted: Planted) -> Result<(), Broke> {
+fn agree(w: &World, form: Form, t: Int, a: u128, b: u128, s: Setting) -> Result<(), Broke> {
+    let (checks, pad) = (s.checks, s.pad);
     let want = definition(form, t, checks, a, b);
-    let what = || format!("{form:?} at {t:?} on {} and {} (overflow checks {checks})", t.value(a), t.value(b));
-    let got = run(w, form, t, a, b, checks, planted).map_err(|e| Broke::Oracle(format!("{}: {e}", what())))?;
+    let what = || format!("{form:?} at {t:?} on {} and {} (overflow checks {checks}, after {pad} lets)", t.value(a), t.value(b));
+    let got = run(w, form, t, a, b, s).map_err(|e| Broke::Oracle(format!("{}: {e}", what())))?;
     if got != want {
         return Err(Broke::Oracle(format!("{} ended {got:?}, {SAYS} {want:?}", what())));
     }
@@ -433,7 +485,7 @@ fn case(w: &World, tape: &Tape, planted: Planted) -> Result<(), Broke> {
     } else {
         (operand(tape, t, "a"), operand(tape, t, "b"))
     };
-    agree(w, form, t, checks, a, b, planted)
+    agree(w, form, t, a, b, Setting { checks, planted, pad: 0 })
 }
 
 /// THE PROPERTY: for generated operands (edges half the time), every operator at every type of
@@ -468,10 +520,85 @@ fn the_edges_end_as_the_reference_defines() {
             for checks in [false, true] {
                 for a in edges {
                     for b in edges {
-                        agree(&w, form, t, checks, a & t.mask(), b & t.mask(), Planted::Nothing).unwrap_or_else(|e| panic!("{e:?}"));
+                        let s = Setting { checks, planted: Planted::Nothing, pad: 0 };
+                        agree(&w, form, t, a & t.mask(), b & t.mask(), s).unwrap_or_else(|e| panic!("{e:?}"));
                     }
                 }
             }
         }
+    }
+}
+
+/// Lets before the operands that put the arithmetic past the 2048th LIR value of `main`, whose
+/// cell is past `sp + 32 KiB`, out of reach of a load's scaled immediate: blaze-emit's far
+/// cells (pass.rs `FAR`). Each let is at least one value.
+const FAR_PAD: u32 = 2100;
+
+/// Bits of the value `v` at `t`.
+fn bits_of(t: Int, v: i128) -> u128 {
+    v as u128 & t.mask()
+}
+
+/// `+ - *`, `+= -= *=` and `-x` at every type of the table, overflow checks on, each built
+/// with no lets before it and after [`FAR_PAD`]: boundary values Rust accepts return their
+/// value (`-5 - 3` at i32, `3 - 5` at i8, `MIN + 1 - 1`, `0 - 1` at isize, `200 - 100` at u8,
+/// `-1 - MAX` at a signed type, which is `MIN`), and their overflowing twins (`3 - 5` and
+/// `0 - 1` unsigned, `MIN - 1`, `MAX + 1`, `(MAX / 2 + 1) * 2`) call their entry point.
+///
+/// 2026-11-21: 61 of tempo's tests panicked with "attempt to add/subtract with overflow" at
+/// lines no value overflows, each in a large function. The cause: blaze-emit addressed a cell
+/// past `sp + 32 KiB` through `x12`, the register an overflow operation holds its flag in
+/// across its result's store, so past the 2048th value every checked operation stored the
+/// cell's address as its flag. The control (rule 23) is the pad: on the tree before pass.rs
+/// `FAR`, every non-overflowing case here returned with no pad and panicked with it.
+#[test]
+fn arithmetic_past_the_2048th_value_ends_as_the_reference_defines() {
+    let w = world();
+    let (mut returned, mut panicked) = (0u32, 0u32);
+    for t in INTS {
+        let (min, max) = (t.min(), t.max());
+        let pairs = [(max - 1, 1), (max, 1), (min + 1, 1), (min, 1), (-5, 3), (3, 5), (0, 1), (200, 100), (max / 2, 2), (max / 2 + 1, 2), (-1, max)];
+        for pad in [0, FAR_PAD] {
+            let s = Setting { checks: true, planted: Planted::Nothing, pad };
+            for form in CHECKED {
+                for (a, b) in pairs {
+                    let (a, b) = (bits_of(t, a), bits_of(t, b));
+                    match definition(form, t, true, a, b) {
+                        End::Value(_) => returned += 1,
+                        End::Panic(_) => panicked += 1,
+                    }
+                    agree(&w, form, t, a, b, s).unwrap_or_else(|e| panic!("{e:?}"));
+                }
+            }
+            if t.signed {
+                for a in [min + 1, min, 0, max] {
+                    agree(&w, Form::Neg, t, bits_of(t, a), 0, s).unwrap_or_else(|e| panic!("{e:?}"));
+                }
+            }
+        }
+    }
+    assert!(returned > 0 && panicked > 0, "the table holds both kinds: {returned} returned, {panicked} panicked");
+}
+
+/// The reduced shapes of tempo's failing sites (t1500, 2026-11-21), each built past the 2048th
+/// value as the real ones were (each in a large function): none overflows, so each returns its
+/// value. `assert_eq!`/`assert_ne!` operands such as tempo-evm's `config.version + 1` are the
+/// same shape as sha2's.
+#[test]
+fn tempo_overflow_sites_return_their_values() {
+    let w = world();
+    let sites: [(&str, Form, Int, i128, i128); 7] = [
+        ("serde_json de.rs check_recursion!: `remaining_depth -= 1`, a u8 at 128", Form::Assign(BinOp::Sub), U8, 128, 1),
+        ("serde_json de.rs check_recursion!: `remaining_depth += 1`, back to 128", Form::Assign(BinOp::Add), U8, 127, 1),
+        ("sha2 sha512/aarch64_sha3.rs:121 `K64[t + 6]`, t from `(16..80).step_by(16)`", Form::Bin(BinOp::Add), USIZE, 16, 6),
+        ("base64 engine/general_purpose/mod.rs:154 `output_index + 2`", Form::Bin(BinOp::Add), USIZE, 40, 2),
+        ("tempo-primitives tt_signature.rs:191 `len - 128` after `(128..=MAX).contains(&len)`", Form::Bin(BinOp::Sub), USIZE, 128, 128),
+        ("tempo-primitives tt_authorization.rs:130 and RlpDecodable `started_len - buf.len()`", Form::Bin(BinOp::Sub), USIZE, 97, 32),
+        ("an isize difference below zero: `(a as isize) - (b as isize)`, b > a", Form::Bin(BinOp::Sub), ISIZE, 3, 40),
+    ];
+    for (site, form, t, a, b) in sites {
+        let (a, b) = (bits_of(t, a), bits_of(t, b));
+        assert!(matches!(definition(form, t, true, a, b), End::Value(_)), "{site}: the reduced shape must not overflow");
+        agree(&w, form, t, a, b, Setting { checks: true, planted: Planted::Nothing, pad: FAR_PAD }).unwrap_or_else(|e| panic!("{site}: {e:?}"));
     }
 }

@@ -36,9 +36,9 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{BuiltinSource, Cand, Cx, Rule as CandRule, Source, Step};
-use crate::error::{Limit, Malformed, SolveError, Stop, Unsupported};
+use crate::error::{Limit, Malformed, ParamHead, SolveError, Stop, Unsupported};
 use crate::facts::{AdtFlags, Facts, FnSigDef, Portable, TraitDef, TraitFlags};
-use crate::fold;
+use crate::fold::{self, Scratch};
 use crate::term::{
     AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, List, Mutbl, Polarity, Pred, Rigid, Safety, Ty, TyKind,
     UintTy, Var, VarKind, children, CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE,
@@ -210,8 +210,9 @@ pub(crate) fn adt_fields<T: Tys, F: Facts>(
 ) -> Result<(), Stop> {
     let adt = cx.adt(d)?;
     cx.scratch.stats.adt_fields += adt.fields.len() as u64;
-    for &f in adt.fields {
-        let t = cx.import(adt.portable, f, args)?;
+    for (field, &f) in adt.fields.iter().enumerate() {
+        let head = ParamHead::Field { adt: d, field: field as u32 };
+        let t = cx.import_head(head, adt.portable, f, args)?;
         out.push(t);
     }
     Ok(())
@@ -791,7 +792,7 @@ fn step_sizedness<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, meta
         TyKind::Adt(d, args) => {
             let adt = cx.adt(d)?;
             match adt.sized_tail {
-                Some(t) => Some(cx.import(adt.portable, t, args)?),
+                Some(t) => Some(cx.import_head(ParamHead::SizedTail { adt: d }, adt.portable, t, args)?),
                 None => None,
             }
         }
@@ -837,17 +838,29 @@ fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> 
         // one; no impl in core).
         TyKind::Pat(base, _) => tys.push(base),
         // impl Copy/Clone for Closure where its tupled upvars: Copy/Clone.
-        TyKind::Closure(_, args) => {
-            if args.len < 3 {
-                return Err(malformed());
-            }
-            tys.push(cx.arg(args, args.len - 1));
-        }
+        TyKind::Closure(def, args) => tys.push(closure_upvars(cx, def, args)?),
         TyKind::Infer(Var { kind: VarKind::Ty, .. }) => return Ok(Step::Done(Certainty::Ambiguous)),
         _ => return Err(malformed()),
     }
     add_constituent_goals(cx, cand.d, &tys)?;
     Ok(Step::Done(Certainty::Yes))
+}
+
+/// A known environment is a tuple, possibly still an inference variable during
+/// body checking: the stored type of each captured PLACE (`T`, `&T` or `&mut T` by its mode,
+/// the Reference's "Capture precision"; blaze-typeck capture_places.rs), in capture order. A
+/// closure whose capture places are unavailable has an opaque environment type identified by
+/// the closure definition. Only a candidate that actually inspects the environment needs its
+/// witness.
+pub(crate) fn closure_upvars<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, def: Def, args: List) -> Result<Ty, Stop> {
+    if args.len < 3 {
+        return Err(malformed());
+    }
+    let env = cx.arg(args, args.len - 1);
+    if cx.kind(env) == TyKind::Foreign(def) {
+        return Err(Stop::Error(SolveError::Unsupported(Unsupported::ClosureCaptureWitness(def))));
+    }
+    Ok(env)
 }
 
 /// `consider_builtin_fn_trait_candidates`, its probe: `probe_and_consider_implied_clause` with
@@ -983,7 +996,7 @@ pub(crate) enum Metadata {
 
 pub(crate) fn normalize_future_output<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, term: Ty) -> Result<Step, Stop> {
     let TyKind::Coroutine(_, args) = cx.kind(self_ty) else { return Ok(Step::No) };
-    if args.len != 2 {
+    if args.len < 2 {
         return Err(malformed());
     }
     if cx.eq(term, cx.arg(args, 0))? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
@@ -1308,13 +1321,13 @@ fn step_struct_unsize<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) 
     let n = adt.generics as usize;
     let mut in_tail: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, n, cx.alloc);
     let mut elsewhere: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, n, cx.alloc);
-    portable_params(adt.portable, tail, &mut in_tail, cx.alloc)?;
+    portable_params(adt.portable, tail, &mut in_tail, cx.scratch)?;
     let Some((&last, before)) = adt.fields.split_last() else { return Err(malformed()) };
     if last != tail {
         return Err(malformed());
     }
     for &f in before {
-        portable_params(adt.portable, f, &mut elsewhere, cx.alloc)?;
+        portable_params(adt.portable, f, &mut elsewhere, cx.scratch)?;
     }
     let mut any = false;
     for i in 0..n {
@@ -1341,39 +1354,76 @@ fn step_struct_unsize<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) 
 }
 
 /// Marks in `out` every type and const parameter `root` of `p` mentions. Children come before
-/// parents in a portable table, so one backward pass from `root` over a reachability mark
-/// visits each node once (no recursion).
-fn portable_params(p: Portable<'_>, root: Ty, out: &mut Vec<bool, Alloc<'_>>, alloc: Alloc<'_>) -> Result<(), Stop> {
+/// parents in a portable table, so a max-ordered worklist visits only the nodes reached from
+/// `root` (no recursion or table-sized mark array).
+fn portable_params(p: Portable<'_>, root: Ty, out: &mut Vec<bool, Alloc<'_>>, scratch: &mut Scratch<'_>) -> Result<(), Stop> {
     let any = |k: TyKind| match k {
         TyKind::Param(x) | TyKind::ConstParam(x) => Some(x),
         _ => None,
     };
-    params_reached(p, &[root], any, out, alloc).map_err(Stop::Error)
+    params_reached(p, &[root], any, out, scratch.params_work()).map_err(Stop::Error)
 }
 
 /// Marks in `out` every parameter `which` picks among the nodes of `p` the `roots` reach, and
 /// no other node of `p`: a record's table may hold other items' terms, over other parameters
-/// (fold.rs `import`). One backward pass over a reachability mark (no recursion).
+/// (fold.rs `import`). A max-ordered worklist visits only reached nodes (no recursion).
 pub(crate) fn params_reached(
     p: Portable<'_>,
     roots: &[Ty],
     which: fn(TyKind) -> Option<u32>,
     out: &mut [bool],
-    alloc: Alloc<'_>,
+    work: &mut Vec<u32, Alloc<'_>>,
 ) -> Result<(), SolveError> {
     let len = p.nodes.len();
-    let Some(top) = roots.iter().map(|t| t.0 as usize).max() else { return Ok(()) };
-    if top >= len {
-        return Err(SolveError::Malformed(Malformed::PortableIndex { node: top as u32, len: len as u32 }));
-    }
-    let mut reach: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, top + 1, alloc);
+    work.clear();
     for t in roots {
-        reach[t.0 as usize] = true;
+        let root = t.0 as usize;
+        if root >= len {
+            return Err(SolveError::Malformed(Malformed::PortableIndex { node: root as u32, len: len as u32 }));
+        }
+        work.push(root as u32);
+        let mut at = work.len() - 1;
+        while at != 0 {
+            let parent = (at - 1) / 2;
+            if work[parent] >= work[at] {
+                break;
+            }
+            work.swap(parent, at);
+            at = parent;
+        }
     }
-    for i in (0..=top).rev() {
-        if !reach[i] {
+    // A max heap visits parents before their smaller children. Since every parent is popped
+    // before it can enqueue a duplicate child, the last popped index is enough to deduplicate
+    // without a table-sized visited bitset.
+    let mut last = u32::MAX;
+    while !work.is_empty() {
+        let i = {
+            let top = work[0];
+            let last_item = work.pop().expect("the non-empty worklist has a last item");
+            if !work.is_empty() {
+                work[0] = last_item;
+                let mut at = 0;
+                loop {
+                    let left = at * 2 + 1;
+                    if left >= work.len() {
+                        break;
+                    }
+                    let right = left + 1;
+                    let child = if right < work.len() && work[right] > work[left] { right } else { left };
+                    if work[at] >= work[child] {
+                        break;
+                    }
+                    work.swap(at, child);
+                    at = child;
+                }
+            }
+            top
+        };
+        if i == last {
             continue;
         }
+        last = i;
+        let i = i as usize;
         let k = p.nodes[i];
         if let Some(x) = which(k)
             && let Some(slot) = out.get_mut(x as usize)
@@ -1385,7 +1435,20 @@ pub(crate) fn params_reached(
             if ci >= i {
                 return Err(SolveError::Malformed(Malformed::PortableIndex { node: c.0, len: i as u32 }));
             }
-            reach[ci] = true;
+            #[cfg(test)]
+            if crate::tests::plant::on(crate::tests::plant::Plant::ParamsReachedDropsChild) {
+                return Ok(());
+            }
+            work.push(c.0);
+            let mut at = work.len() - 1;
+            while at != 0 {
+                let parent = (at - 1) / 2;
+                if work[parent] >= work[at] {
+                    break;
+                }
+                work.swap(parent, at);
+                at = parent;
+            }
             Ok(())
         };
         let list = |l: List, mark: &mut dyn FnMut(Ty) -> Result<(), SolveError>| -> Result<(), SolveError> {

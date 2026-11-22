@@ -95,6 +95,139 @@ per-job state; whole reads of `CrateScope` and `Surface`; the items record's buc
 9. **A live process** is allowed and not needed: everything above is records, so a process that exits
    loses nothing and a restart re-indexes nothing. One may be added later to save process start.
 
+## An edit costs what it moved (D149, the coordinator's design, 2026-11-19)
+
+MEASURED (tempo, one body edited, tree 9cec6e9546; a 1 ms stack sample, 951 main-thread samples):
+the body's own check is about 10 samples. The Bodies phase listed every member's bodies (list_with
+142, index_by_chain 93, outlining files again 176), the answer was printed whole (300: a file lexed
+once per finding; every finding hashed), and one crate's heads were listed whole to place the
+body's reads (56). 39,740 expansion records were read. The command took 2.61 s; its floor is the
+one body (0.1 s) and the reads of what stands. Three partial fixes are in (owed files only; one lex
+a file; no expansion text in the head walk). What is left is three records (rule 51: what outlives
+a task is a record; rule 77: never rebuild what a record holds):
+
+1. **A member's listing row** (piece I1): what the Bodies phase derives from a member's WHOLE
+   listing and publishes each command (its uncovered bodies: the count and the first, and its
+   bodies' item keys by file and outline entry) is a record keyed by the member's names row's out
+   and its files' outline digests. A member none of whose files is owed is read, never listed:
+   `groups` opens only members that hold an owed file. Counter: members opened M of T (floor: the
+   owed files' members).
+2. **A file's head listing** (piece I2): a crate's listing of heads is the in-place join of its
+   files' listing records, each keyed by the crate key, the file's surface, its inside-body facts
+   and the expansion rows its calls name (engine_heads.rs's `ListingKey` is a key within one command
+   only). A plain body edit moves none of these: 0 listings made. Restore equals fresh in bytes.
+3. **A file's rendered lines** (piece I3): the stored rendered answer holds one section a FILE
+   (form BER2), keyed by the presentation, the path, the file's text digest, the digest of its
+   findings rows and its ids' shown lengths; an unmoved file's section is written out as stored and
+   the file is not read; a moved file is rendered alone. The text digest is in the key because
+   `file:line:col` exists only here (rule 71). Counter: files rendered R, replayed P (floor: R = the
+   files that moved).
+
+Also (piece I4): one request for an expansion's marks reads its record once (front2 source.rs
+`text_marks` asks the load twice past the items memo).
+
+## A command's fixed costs do not grow with the project (D150, the coordinator's design, 2026-11-19)
+
+THE TARGET (the owner, 2026-11-19): a check after an edit on tempo in UNDER ONE SECOND, "much, much
+faster than Rust". MEASURED (tempo, tree 9cec6e9546): a no-op is 221 ms in main, of which **journal
+replayed 152 ms**, sweep 55 ms, store committed 8.5 ms, everything else under 12 ms; an edit adds
+**plan (the units read back) 196 ms**, plan (files outlined) 11 ms, layout 11 ms, stored answer
+read 9 ms. These four are paid by every command whatever moved. Their floors:
+
+1. **The journal** (152 ms): a command replays the store's whole journal to learn its state. The
+   state after record N is a record (rule 51): the replayed state is checkpointed (keyed by the
+   journal's prefix digest and length), and a command replays only the suffix appended since the
+   newest checkpoint it can verify. Floor: O(records appended since the last command), a few
+   hundred microseconds on a no-op. A torn or mismatched checkpoint is ignored and the journal is
+   replayed whole (counted in the profile; this is the journal's own recovery rule, not a fallback
+   to a different answer). DST first (rule 43): crashes at every cut, a planted stale checkpoint.
+
+   **What the phase is (read 2026-11-19, F1).** The store has no journal: blaze-cas opens a head
+   and a manifest and maps segments lazily ("store open", under 1 ms). The phase named "journal
+   replayed" (engine_check.rs) held two things: the last answer's printed lines read
+   (engine_answer.rs `load_lines`) and the replay of the SYSTEM's journal of changes
+   (journal_sweep.rs `take`: one FSEvents stream `sinceWhen` the pointer's saved event ID per
+   unit, the checkout's units and blaze's folder in the home, one after another, each waited to
+   `HistoryDone`). The lines read is now its own phase ("stored answer's lines read"), so the
+   profile splits them. The state the replay rebuilds is the set of rows to stat; the place it
+   replays from is the pointer's, and a certificate wrote nothing, so every no-op replayed from
+   the place of the last command that STORED an answer, a suffix that grows with every other
+   write on the volume, and a unit refused once (no place saved: tempo's checkout at the
+   driver's root, whose first answer saves no top-level folder; a reset journal) was refused on
+   every no-op after it ("refused: no place ... statted 1242 of 1245" on tempo's no-op).
+
+   **The checkpoint (journal_checkpoint.rs).** HOLDS: `"BJC1" | the sealed pointer's key [32]
+   | places len u32 | places` (the journal_sweep `Stored` form: per unit, where, name, cursor).
+   KEY: the content id of those bytes; the root `<answer root>.journal` names it (pinned like
+   the answer, one key). MEANING: "the answer under that pointer was certified standing at these
+   places": every write after them is in the journal from them. WRITTEN: only by a command whose
+   certificate stood on that pointer (nothing moved, nothing owed), with the places its own
+   replay returned (taken before its stats, as the pointer's are), merged per unit with the
+   places it replayed from (the later of the two on one journal; the new one across a reset), in
+   the same commit after the answer as the roots' renewal; and only when DUE: the replay from
+   the places used covered at least `DUE_EVENTS` (1: any place that moved) event IDs, or a unit
+   had no place on this journal (the next no-op would sweep it whole). So every no-op replays
+   only the IDs since the last command's place, the floor, for one small record and one root in
+   the commit it makes anyway. The threshold was 65,536 until 2026-11-20, set unmeasured: a no-op
+   loop then replayed every ID since the last stored answer, and fseventsd's replay costs about
+   0.3 microseconds a system-wide ID above a fixed cost (tempo: 99,681 IDs in 139 ms, 5,364,028
+   in 1.73 s; utilization.md U9). FOUND: after the pointer, the root's one key, the record got. VERIFIED,
+   before any place in it is used: the record is served only whole and checked, and it rides one
+   commit with its root, all or nothing (the store's own proofs: blaze-cas root_commit_tests.rs,
+   plain_place.rs `Held`; not checked twice, rule 77), the magic and lengths fit and the places
+   parse whole, and its pointer key
+   is the key the answer's root named in THIS command (a checkpoint of any other answer, an
+   older one or a concurrent command's, is stale and ignored). A place earlier than the
+   pointer's on the same journal is never used (the later wins), so a checkpoint can only
+   shorten a replay over states the certificate saw. Ignored or absent: the pointer's places,
+   the whole suffix, named in the profile. Line: `journal: replayed N of M event ids
+   (checkpoint at K; floor: the ids appended since the last command); ...`. Proof
+   (tests/journal_checkpoint_tests.rs): a DST over a model journal and store (edits, certified
+   and storing commands, a concurrent certifier, resets, crashes before and after the commit,
+   every prefix of a record) with the oracle "the rows a run would stat
+   from the chosen places cover every file that differs from the stored answer, exactly as a
+   replay from the pointer's places does", and plants: an unbound checkpoint (any answer), a
+   cursor taken after the stats, a checkpoint written by a command whose certificate did not
+   stand (then cut before its answer was stored).
+2. **The plan read back** (196 ms). THE PREVIOUS ANSWER IS THE PLAN (2026-11-20): the units
+   stage reads it back only under the sweep's `Stood` proof (engine_units.rs: no layout row the
+   last answer read moved), reading its rows one at a time as asked. The plan index
+   (engine_plan_index.rs, 2026-11-18, never wired) is deleted: it was a memo of the cheap part
+   (about 7 ms of the 180 ms of the read back on tempo, 54 rows read). The 180 ms is the names
+   world made again from the stored graph (names.rs `world`), each step now under its own span
+   (the graph decoded, the shelf opened, the fetch plan, the crate list and the toolchain's packs,
+   the packages placed and the world made, its subjects and scripts), its counts on the profile's
+   `plan:` line (worlds built, graph decodes, fetched records mapped and their bytes, sources
+   statted). Taken already: the fetched records are mapped in place, never read whole into the
+   names frame (every package's sources were copied each command); under `Stood` no fetched
+   source is statted, its one look being the world's map of it (rule 74; one deleted by hand is no
+   mapping, so no world, so the stage discovers, where the fetch's stat finds it gone and fetches
+   it again). Left, the end state: under `Stood` no world is built and no graph decoded (floors 0,
+   0; today 1, 1). The stored crate list (blaze-world crate_list.rs, read in place by
+   `CrateList::open`) already holds what a body edit's readers ask of the world: each crate's
+   key, root, deps, side, script and env facts, and each tree by content. Its consumers on this
+   path read the list directly: engine_check.rs `plan` (the members' roots), `NamesStage` (each
+   crate's key and deps), `tell_public` (the trees' origins), the bodies' handles (body_types.rs
+   already serves them from the list) and crate_label. The world is then needed only where it is
+   made: a discover, which writes the list, and a script or proc-macro run, which places its
+   package's files. Floor: O(changed files), under 1 ms.
+
+   A build script rightly woken by an edit (its `git status` answer moved, D168) does not stand
+   in front of the body check: on the one driver (D157), a body that reads nothing of a script
+   does not wait for it, so the script's 68 ms runs beside the 31 ms body, not before it. Nothing
+   is built for this here: it comes with the one driver.
+3. **The sweep** (55 ms): every file of the checkout is statted to find what moved. The kernel
+   already knows: on macOS the file-system event log is kept by the system and can be read FROM A
+   STORED EVENT ID with no process of ours alive (FSEvents `sinceWhen`, with the volume's UUID
+   checked; rule 45: a system API where it is better, its symbol tested); a history the system
+   says is incomplete (the must-scan flag, a changed UUID, an id from the future) is a full sweep,
+   by name. Linux has no such log without a live process: the full sweep stays there until the
+   optional helper with an expiry (scope) carries an inotify/fanotify set. Floor: O(changed paths).
+4. **Layout and the stored answer's open** (20 ms together): in place, by key, behind 1-3.
+
+With these and D149's three records an edit of one body is the body (0.1 s on tempo's
+`is_empty`), its file's lines, and well under 50 ms of fixed work.
+
 ## Floors (rule 67)
 
 Cold, tempo on an 18-core Mac: UNDER 10 SECONDS (the owner, 2026-11-17, on hearing "about 3 minutes from

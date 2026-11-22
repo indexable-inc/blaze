@@ -144,6 +144,36 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::HasherDefault => {
             out.str("`").str(range).str("` builds its hasher from `Default` (D125): write it, ").str(instead());
         }
+        Template::StaticThreadLocal | Template::StaticMut => {
+            out.str("`").str(range).str("` is state the process keeps with no owner (D170 C3): pass it in as a value its caller owns");
+        }
+        Template::StaticState => {
+            out.str("`").str(range).str("` holds `").str(span(0).unwrap_or("?"));
+            out.str("`, state the process keeps with no owner (D170 C3): pass it in as a value its caller owns");
+        }
+        Template::SansIoPath => {
+            out.str("`").str(range).str("` does IO in a sans-IO core (if it is std's or the system's): return it as the ");
+            out.str("machine's output and let the driver (`#![blaze::driver]`) do it");
+        }
+        Template::SansIoBlocking => {
+            out.str("`").str(range).str("` blocks the thread in a sans-IO core: return what is waited for as the machine's ");
+            out.str("output and take its answer as an input");
+        }
+        Template::SansIoClock => {
+            out.str("`").str(range).str("` reads the wall clock in a sans-IO core: take the time as an input");
+        }
+        Template::SansIoPrint => {
+            out.str("`").str(range).str("` prints in a sans-IO core: return what to say as the machine's output");
+        }
+        Template::LockNoReason => {
+            // The lock's name (its first argument's string), else the constructor's path.
+            out.str("`").str(span(0).unwrap_or(range)).str("`: a lock with no reason: say which D179 shape it could not be");
+            out.str(" (`#[blaze::lock_exception(tried = \"published\"|\"gathered\"|\"claimed\", why = \"..\")]`)");
+        }
+        Template::LockBadReason => {
+            out.str("`").str(range).str("`: a lock's reason says `tried = \"published\"`, `\"gathered\"` or `\"claimed\"` ");
+            out.str("and a `why` that is not empty, each once, and nothing else (D179)");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

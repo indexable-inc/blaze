@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "wave-1124-sansio T0 (make the gate real)",
+  "area": "blaze-lint-defs lints, crate roots' #![deny(blaze::..)], tools/ratchets, crates/blaze-report/tests/*.txt",
+  "annoyance": "`blaze::sans_io_core`, `blaze::process_static`, `blaze::std_use` and `blaze::implicit_allocator` are registered in crates/blaze-lint-defs/src/lints.rs as `externally_loaded`, and crates write `#![deny(blaze::sans_io_core)]` (crates/blaze-remote/src/pull.rs:26), but no code emits any of them: the token linter (crates/blaze-lint) had rules of other names and never read a crate's attributes, and the `blaze-lints` crate the table's doc names is gone. A deny reads as a guard and guards nothing. Beside it, nine of the thirteen lists under tools/ratchets/ were written by scripts that no CI step ran, and crates/blaze-report/tests/backticks.txt and prints.txt had no writer and had drifted far below the tree.",
+  "workaround": "T0 maps the four lints to blaze-lint rules (Rule::lint, Rule::from_lint), adds RootMarks to read a root's marks and denials, and adds CI steps for the unchecked lists; the driver wiring in blaze-cli lints.rs is listed for the coordinator.",
+  "fix": "A test in blaze-lint-defs that every `externally_loaded` lint of `blaze::` has an emitter (a blaze-lint rule's `lint()` or a typed rule), and a CI step for every list under tools/ratchets/ (a list with no step is a gate failure).",
+  "state": "open"
+}

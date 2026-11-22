@@ -83,6 +83,16 @@ impl Id {
         core::str::from_utf8(&self.full[..usize::from(self.shown)]).unwrap_or("")
     }
 
+    /// The whole id and its shown length: what a stored file section keeps (engine_lines.rs BER2).
+    pub(crate) fn parts(&self) -> ([u8; FULL], u8) {
+        (self.full, self.shown)
+    }
+
+    /// The id [`Id::parts`] gave; `None` when a byte is outside [`ALPHABET`] or the shown length is outside `SHORT..=FULL`.
+    pub(crate) fn of_parts(full: [u8; FULL], shown: u8) -> Option<Id> {
+        (full.iter().all(|byte| ALPHABET.contains(byte)) && (SHORT..=FULL).contains(&usize::from(shown))).then_some(Id { full, shown })
+    }
+
     /// Whether `prefix` begins this id.
     fn starts(&self, prefix: &str) -> bool {
         !prefix.is_empty() && self.full.starts_with(prefix.as_bytes())

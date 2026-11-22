@@ -14,6 +14,10 @@
 //! shift-and-mask steps (the unrolled form of protobuf's `ReadVarint64` and `varint-simd`, no
 //! BMI2 `pext`, which is slow on AMD before Zen 3). The encode is the same steps backwards and
 //! one 8-byte store. docs/v2/plan/design/data.md gives the bound.
+//!
+//! The writers append to `blaze_own::Vec<u8, A>` in the caller's allocator ([`write_u64_in`],
+//! [`write_i64_in`]); the `std` feature keeps the deprecated forms over `std`'s `Vec<u8>` for
+//! the callers not yet ported.
 
 use core::alloc::Allocator;
 use core::fmt;
@@ -119,8 +123,9 @@ trait Bytes {
     fn cut(&mut self, len: usize);
 }
 
-// to remove: callers pass an allocator (bstd move)
-impl Bytes for Vec<u8> {
+// to remove: callers pass an allocator (bstd move); the `std` feature's, deprecated.
+#[cfg(feature = "std")]
+impl Bytes for std::vec::Vec<u8> {
     #[inline]
     fn filled(&self) -> usize {
         self.len()
@@ -199,19 +204,23 @@ fn push_i64<B: Bytes>(out: &mut B, value: i64) {
     append(out, &encode(value as u64, len, true), len);
 }
 
-/// Appends `value` unsigned.
+/// DEPRECATED (the `std` feature): appends `value` unsigned to a vector on the global heap.
+/// [`write_u64_in`] replaces it.
 // to remove: callers pass an allocator (bstd move): they hold a `blaze_own::Vec` and call
 // [`write_u64_in`].
+#[cfg(feature = "std")]
 #[inline]
-pub fn write_u64(out: &mut Vec<u8>, value: u64) {
+pub fn write_u64(out: &mut std::vec::Vec<u8>, value: u64) {
     push_u64(out, value);
 }
 
-/// Appends `value` signed.
+/// DEPRECATED (the `std` feature): appends `value` signed to a vector on the global heap.
+/// [`write_i64_in`] replaces it.
 // to remove: callers pass an allocator (bstd move): they hold a `blaze_own::Vec` and call
 // [`write_i64_in`].
+#[cfg(feature = "std")]
 #[inline]
-pub fn write_i64(out: &mut Vec<u8>, value: i64) {
+pub fn write_i64(out: &mut std::vec::Vec<u8>, value: i64) {
     push_i64(out, value);
 }
 

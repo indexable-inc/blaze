@@ -74,6 +74,14 @@ fixed_bytes_macros! { $
     macro address(inner);
 }
 
+// antithesis_sdk 0.3.0 (assert/macros.rs): `assert_sometimes_greater_than!` writes
+// `$crate::numeric_guidance_helper!($crate::assert_sometimes, ..)`, whose transcriber calls the
+// macro its `$assert:path` fragment names: `$assert!(..)`.
+#[macro_export]
+macro_rules! guided { ($assert:path, $e:expr) => { $assert!($e) } }
+#[macro_export]
+macro_rules! sometimes { ($e:expr) => { $crate::guided!($crate::m, $e) } }
+
 // tokio 1.53.2 (macros/try_join.rs): `doc!` adds `#[macro_export]` to the `macro_rules!` item it
 // is handed, and that macro calls itself again through `$crate::try_join!(@ ..)`.
 macro_rules! doc { ($try_join:item) => { #[macro_export] $try_join }; }
@@ -392,6 +400,33 @@ fn dollar_crate_in_a_macro_passed_through_an_item_fragment() {
     assert_clean("fn j() -> u32 { dep::try_join!(5) }", "5");
 }
 
+/// The Reference, "Macros By Example": a `path` fragment may name the macro of a call
+/// (`$assert!(..)`), and Hygiene: `$crate` "refers to the crate defining the macro" that wrote
+/// it, through any macro it is handed to. `dep::sometimes!` hands `$crate::m` to `guided!` (the
+/// shape of antithesis_sdk's `assert_sometimes_greater_than!`, tempo's `fanout`); `user` has no
+/// `m`, so only `dep`'s can expand it. Before the fix the fragment's invisible group hid the
+/// path's first word and its mark, and the call was refused as "`$crate` outside an
+/// expansion". Expected: `test scoped_tests::dollar_crate_in_a_path_fragment_names_the_writing_crate ... ok`.
+#[test]
+fn dollar_crate_in_a_path_fragment_names_the_writing_crate() {
+    assert_clean("fn x() -> u32 { dep::sometimes!(44) }", "44");
+    // A path the CALLER hands in carries no mark: it is read at the call, as written there.
+    assert_clean("fn y() -> u32 { dep::guided!(dep::m, 45) }", "45");
+}
+
+/// The negative twin: a path fragment naming a macro the caller's module does not have is
+/// still refused, a finding at the call naming the path (`m` is `dep`'s, never `user`'s, and a
+/// fragment written in `user`'s text is read in `user`).
+#[test]
+fn a_path_fragment_naming_no_macro_is_a_finding() {
+    let text = "fn z() -> u32 { dep::guided!(m, 46) }";
+    let (dump, unhandled, findings) = lowered(text);
+    assert!(unhandled > 0, "{text}:\n{dump}");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].0.replace(' ', ""), "m", "{findings:?}");
+    assert!(!findings[0].2.contains("$crate"), "a plain path is not a `$crate` refusal: {findings:?}");
+}
+
 /// The standard library's `option_env!` (core macros/mod.rs): "If the named environment
 /// variable is present at compile time, this will expand into an expression of type
 /// `Option<&'static str>` whose value is `Some` of the value of the environment variable. If
@@ -684,4 +719,76 @@ fn a_panic_written_in_a_macro_takes_the_defining_crate_s_edition() {
     let (dump, unhandled, findings) = lowered_in(0, "fn e() { old::fail!() }");
     assert_eq!((unhandled, findings.len()), (0, 0), "{findings:?}\n{dump}");
     assert!(!dump.contains("panic_fmt") && !dump.contains("diag"), "the 2015 form, as `old` writes it:\n{dump}");
+}
+
+/// [`Scoped`], recording each path asked and the written call it is read at
+/// (`PathAt::written`).
+struct Recorded<'d, 'p: 'd> {
+    inner: Scoped<'d, 'p>,
+    seen: core::cell::RefCell<StdVec<(String, Option<blaze_surface::Range>)>>,
+}
+
+impl<'d, 'p: 'd> crate::by_name::MacroNames<'d> for Recorded<'d, 'p> {
+    fn resolve<'a>(
+        &self,
+        path: &str,
+        at: crate::by_name::PathAt,
+        kind: blaze_expand::ProcKind,
+        alloc: Alloc<'a>,
+    ) -> Result<crate::by_name::Resolved<'d, 'a>, NoMacro<'a>>
+    where
+        'd: 'a,
+    {
+        self.seen.borrow_mut().push((path.replace(' ', ""), at.written));
+        crate::by_name::MacroNames::resolve(&self.inner, path, at, kind, alloc)
+    }
+
+    fn local_site(&self) -> Option<blaze_expand::DefSite> {
+        crate::by_name::MacroNames::local_site(&self.inner)
+    }
+}
+
+/// `text` lowered over [`Recorded`]: each path asked, with where it is read.
+fn read_at(text: &str) -> StdVec<(String, Option<blaze_surface::Range>)> {
+    let names = names();
+    let recorded = Recorded {
+        inner: Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) },
+        seen: core::cell::RefCell::new(StdVec::new()),
+    };
+    let mut expander = ByName::with_names(&recorded, Host, Alloc::global());
+    lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    drop(expander);
+    recorded.seen.into_inner()
+}
+
+/// The Reference, "Macros By Example", Hygiene: a path is looked up "as if it appeared at the
+/// invocation site", and "Statements": an item a block declares is in scope in that block. So a
+/// call an expansion wrote reads a call-site path where the WRITTEN call it came from is: tempo's
+/// `fn t() { use serde_json::json; assert_eq!(x, json!("a")); }` (crates/primitives/tests/
+/// configurable_account.rs) has `json!` in `assert_eq!`'s expansion, and `json` only in the
+/// fn's block. Before the fix the inner call had no written range and was read in the body's
+/// module ("segment 0: not found"). Each call here, the inner ones at any depth, is read at
+/// the one written call's range.
+#[test]
+fn a_call_an_expansion_wrote_is_read_at_the_written_call() {
+    let text = "fn w() -> u32 { let a = 1; { dep::m!(dep::m!(dep::m!(8))) } }";
+    let written = "dep::m!(dep::m!(dep::m!(8)))";
+    let start = text.find(written).expect("written");
+    let call = Some(blaze_surface::Range::new(u32::try_from(start).expect("small"), u32::try_from(start + written.len()).expect("small")));
+    assert_eq!(read_at(text), [(String::from("dep::m"), call), (String::from("dep::m"), call), (String::from("dep::m"), call)]);
+}
+
+/// The negative twin: two written calls, each with a call in its expansion: each inner call is
+/// read at ITS written call, never at the other or at the body (a walk that stopped at the
+/// first expansion, or took the last call, would give one range to both).
+#[test]
+fn calls_in_two_expansions_are_read_at_their_own_written_calls() {
+    let text = "fn v() -> u32 { dep::m!(dep::m!(1)) + dep::m!(dep::m!(2)) }";
+    let first = text.find("dep::m!(dep::m!(1))").expect("written");
+    let second = text.find("dep::m!(dep::m!(2))").expect("written");
+    let len = "dep::m!(dep::m!(1))".len();
+    let range = |at: usize| Some(blaze_surface::Range::new(u32::try_from(at).expect("small"), u32::try_from(at + len).expect("small")));
+    let seen = read_at(text);
+    let ranges: StdVec<_> = seen.iter().map(|(_, r)| *r).collect();
+    assert_eq!(ranges, [range(first), range(first), range(second), range(second)], "{seen:?}");
 }

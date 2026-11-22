@@ -93,18 +93,18 @@ fn table() -> EncodedTable<'static> {
 }
 
 fn reference<'a>(func: View<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
-    Reference.emit(func, names, machine, alloc)
+    Reference.emit(blaze_lir::verify(func).expect("the harness's function is LIR"), names, machine, alloc)
 }
 
 fn fast<'a>(func: View<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
     let table = EncodedTable::read(TABLE, Alloc::global()).map_err(|error| TierError::Table { tier: TierName::Fast, error })?;
-    Fast { table: &table, regs: &ARM64 }.emit(func, names, machine, alloc)
+    Fast { table: &table, regs: &ARM64 }.emit(blaze_lir::verify(func).expect("the harness's function is LIR"), names, machine, alloc)
 }
 
 fn fast_planted<'a>(func: View<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
     let table = EncodedTable::read(TABLE, Alloc::global()).map_err(|error| TierError::Table { tier: TierName::Fast, error })?;
     let planted = WrongTemplate::over(&table);
-    Fast { table: &planted, regs: &ARM64 }.emit(func, names, machine, alloc)
+    Fast { table: &planted, regs: &ARM64 }.emit(blaze_lir::verify(func).expect("the harness's function is LIR"), names, machine, alloc)
 }
 
 /// The planted wrong template: every `add` template of `inner` with its bytes' bit 30 set (in the
@@ -415,7 +415,7 @@ fn sum_agrees_in_every_tier() {
 fn reference_refuses_x86_64() {
     let machine = Machine { arch: Arch::X86_64, os: Os::Linux, features: 0 };
     let func = sum_func();
-    match Reference.emit(func.view(), &Nameless, machine, Alloc::global()) {
+    match Reference.emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global()) {
         Err(TierError::Machine { tier: TierName::Reference, machine: refused }) => assert_eq!(refused, machine),
         Err(other) => panic!("the wrong refusal: {other}"),
         Ok(_) => panic!("the Reference tier emitted for x86-64"),

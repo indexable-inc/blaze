@@ -49,8 +49,10 @@ pub const ONE_DEVICE: [&str; 6] = ["audio", "audio_in", "camera", "bluetooth", "
 
 /// The whole capabilities a world has or lacks by its machine, not by a host's offer, so they
 /// are not [`crate::io::Offers`] flags (whose accessor is `Some` exactly when the flag is set):
-/// a `Gpu` is had on a native macOS world and nowhere else yet ([`crate::io::Io::gpu`]).
-pub const BY_MACHINE: [&str; 1] = ["gpu"];
+/// a `Gpu` is had on a native macOS world and nowhere else yet ([`crate::io::Io::gpu`]); a
+/// `Hermetic` ([`crate::procs::hermetic::Hermetic`], D177) wherever the host's spawner is, made
+/// from it and the clock, and narrower than either: it starts only confined children.
+pub const BY_MACHINE: [&str; 2] = ["gpu", "hermetic"];
 
 /// Whether `name` is a capability a whole grant may name: an [`crate::io::Offers::NAMES`] name
 /// or one of [`BY_MACHINE`]. The spec's reader asks it.

@@ -404,15 +404,17 @@ fn something_under(dir: &str, made: &Names, files: &Names) -> bool {
     made.iter().chain(files.iter()).any(|it| *it != dir && is_under(it, dir))
 }
 
-/// Whether the model has `dir` a directory: made, or something under it.
-fn model_dir(dir: &str, made: &Names, files: &Names) -> bool {
-    made.contains(dir) || something_under(dir, made, files)
+/// Whether the model has `dir` a directory: made (by a make of it, or by a write under it),
+/// and not removed since. A directory stays when its last file goes, as a disk's does.
+fn model_dir(dir: &str, made: &Names) -> bool {
+    made.contains(dir)
 }
 
 /// A client that makes and removes directories and writes and removes files under them, one
 /// at a time, one in six failing. The oracle, a model of the disk: each answer is what the
-/// model says (a failure injected changing nothing), so no file goes but by a remove of it,
-/// and after each the simulated disk has the model's files and directories.
+/// model says (a failure injected changing nothing), so no file goes but by a remove of it, a
+/// write makes the directories it is under, and after each the simulated disk has the model's
+/// files and directories.
 fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
     let mut sim = Sim::new(seed, Faults { fail_one_in: 6, ..Faults::default() });
     if let Some(plant) = plant {
@@ -426,10 +428,9 @@ fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
         let file = FILES[rng.index(FILES.len())];
         let (effect, expected) = match rng.below(4) {
             0 => {
-                let parent_there = dir
-                    .rsplit_once('/')
-                    .is_none_or(|(parent, _)| model_dir(parent, &made, &files));
-                let ok = !model_dir(dir, &made, &files) && parent_there;
+                let parent_there =
+                    dir.rsplit_once('/').is_none_or(|(parent, _)| model_dir(parent, &made));
+                let ok = !model_dir(dir, &made) && parent_there;
                 (Effect::MakeDir { dir: name(dir), tag: Tag(1) }, ok)
             }
             1 => {
@@ -465,7 +466,12 @@ fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
             match effect {
                 Effect::MakeDir { .. } => _ = made.insert(dir),
                 Effect::RemoveDir { .. } => _ = made.remove(dir),
-                Effect::Write { .. } => _ = files.insert(file),
+                Effect::Write { .. } => {
+                    files.insert(file);
+                    for (at, _) in file.match_indices('/') {
+                        made.insert(&file[..at]);
+                    }
+                }
                 _ => _ = files.remove(file),
             }
         }
@@ -475,7 +481,7 @@ fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
             }
         }
         for dir in DIRS {
-            if sim.is_dir(&name(dir)) != model_dir(dir, &made, &files) {
+            if sim.is_dir(&name(dir)) != model_dir(dir, &made) {
                 return Err(format!("{what}: {dir} a directory or not, not as the model says"));
             }
         }
@@ -550,6 +556,9 @@ fn each_planted_bug_is_caught() {
             }
             Plant::DirNamesDurable => {
                 unreachable!("{plant:?} is caught by its own controls (sim/host/dir_names/tests.rs)")
+            }
+            Plant::MadeParentsNotSynced => {
+                unreachable!("{plant:?} is caught by scenario (5)'s control (sim/host/dir_names/tests.rs)")
             }
         })
     };

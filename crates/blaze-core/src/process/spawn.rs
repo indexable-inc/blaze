@@ -43,6 +43,42 @@ pub(super) struct Program<'a> {
     pub(super) dir: &'a Path,
 }
 
+/// How a linked start failed: a system call of the parent's or the child's
+/// ([`io::Error`], naming the step), or the child's confinement refused at a step (Linux, D177).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::process) enum StartError {
+    Io(io::Error),
+    #[cfg(target_os = "linux")]
+    Confine { step: blaze_sys::linux::confine::Step, errno: blaze_sys::Errno },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl From<io::Error> for StartError {
+    fn from(error: io::Error) -> StartError {
+        StartError::Io(error)
+    }
+}
+
+/// What the child of a `clone` is asked besides its program and streams.
+#[cfg(target_os = "linux")]
+pub(super) struct ChildAsk<'a> {
+    /// `cgroup.procs` of its cgroup, or -1.
+    pub(super) procs: RawFd,
+    pub(super) extra: &'a [(RawFd, RawFd)],
+    pub(super) group: bool,
+    /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
+    pub(super) parent: libc::pid_t,
+    pub(super) confine: Option<&'a blaze_sys::linux::confine::ChildConfine<'a>>,
+}
+
+/// A `clone` that made a child: started, or refused by its confinement before its program ran
+/// (the child has exited and is reaped).
+#[cfg(target_os = "linux")]
+pub(super) enum Cloned {
+    Started { pid: libc::pid_t, pidfd: OwnedFd },
+    ConfineRefused { step: blaze_sys::linux::confine::Step, errno: blaze_sys::Errno },
+}
+
 pub(super) struct Spawned {
     pub(super) pid: libc::pid_t,
     #[cfg(target_os = "linux")]
@@ -97,8 +133,14 @@ pub(super) fn spawn_with(
     {
         let procs = procs.map(|path| open(path, libc::O_WRONLY)).transpose()?;
         let joins = procs.as_ref().map_or(-1, |it| it.as_raw_fd());
-        let (pid, pidfd) = while_busy(|| clone(&plan, fds, joins, extra, group, 0))?;
-        Ok(Spawned { pid, pidfd, stdin, stdout, stderr })
+        let child = ChildAsk { procs: joins, extra, group, parent: 0, confine: None };
+        match while_busy(|| clone(&plan, fds, &child))? {
+            Cloned::Started { pid, pidfd } => Ok(Spawned { pid, pidfd, stdin, stdout, stderr }),
+            // No confinement was asked of this start (`confine: None` above), so none refused.
+            Cloned::ConfineRefused { .. } => {
+                Err(io::Error::other("spawn_with: a confinement refused, and none was asked (a bug of spawn.rs)"))
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -380,27 +422,30 @@ struct Child<'a> {
     group: bool,
     /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
     parent: libc::pid_t,
-    /// The step that failed (0: none) and its errno.
+    /// The confinement it enters last before `execve` (D177): data the parent made, which the
+    /// child only reads.
+    confine: Option<&'a blaze_sys::linux::confine::ChildConfine<'a>>,
+    /// The error slot, the one memory of the parent's the child writes, read by the parent only
+    /// after the child has exec'd or exited: the step that failed (0: none) and its errno, and
+    /// for a refused confinement ([`CONFINE_STEP`]) which of its steps.
     step: u8,
     failed: libc::c_int,
+    refused: Option<(blaze_sys::linux::confine::Step, blaze_sys::Errno)>,
 }
 
+/// The child's step "entering its confinement" (D177), in [`Child::step`].
 #[cfg(target_os = "linux")]
-fn clone(
-    plan: &Plan,
-    fds: [RawFd; 3],
-    procs: RawFd,
-    extra: &[(RawFd, RawFd)],
-    group: bool,
-    parent: libc::pid_t,
-) -> io::Result<(libc::pid_t, OwnedFd)> {
+const CONFINE_STEP: u8 = 9;
+
+#[cfg(target_os = "linux")]
+fn clone(plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned> {
     blaze_mem::scratch::with_bytes(|stack| {
         // alloc: once per thread that spawns, kept: the child's stack, its room unwritten.
         stack.reserve(STACK);
         // SAFETY: `reserve` made the capacity at least `STACK` bytes, so `STACK` bytes from
         // `as_mut_ptr()` are in the allocation, and the thread's byte buffer is lent to this
         // closure alone until it returns, after `clone_on` has.
-        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, procs, extra, group, parent) }
+        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, ask) }
     })
 }
 
@@ -411,18 +456,21 @@ fn clone(
 /// `stack` is the start of at least `STACK` writable bytes, which nothing else reads or writes
 /// until this returns; the child's frames go there while the calling thread waits.
 #[cfg(target_os = "linux")]
-unsafe fn clone_on(
-    stack: *mut u8,
-    plan: &Plan,
-    fds: [RawFd; 3],
-    procs: RawFd,
-    extra: &[(RawFd, RawFd)],
-    group: bool,
-    parent: libc::pid_t,
-) -> io::Result<(libc::pid_t, OwnedFd)> {
+unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<'_>) -> io::Result<Cloned> {
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
-    let mut child = Child { plan, fds, procs, extra, group, parent, step: 0, failed: 0 };
+    let mut child = Child {
+        plan,
+        fds,
+        procs: ask.procs,
+        extra: ask.extra,
+        group: ask.group,
+        parent: ask.parent,
+        confine: ask.confine,
+        step: 0,
+        failed: 0,
+        refused: None,
+    };
     let mut pidfd: libc::c_int = -1;
     // SAFETY: all zeros is a valid `sigset_t`; the calls below fill it.
     let mut all: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -462,10 +510,15 @@ unsafe fn clone_on(
     let step = unsafe { ptr::read_volatile(&raw const child.step) };
     // SAFETY: as above.
     let failed = unsafe { ptr::read_volatile(&raw const child.failed) };
+    // SAFETY: as above.
+    let refused = unsafe { ptr::read_volatile(&raw const child.refused) };
     if step == 0 {
-        return Ok((pid, pidfd));
+        return Ok(Cloned::Started { pid, pidfd });
     }
     _ = super::reap(pid);
+    if let (CONFINE_STEP, Some((step, errno))) = (step, refused) {
+        return Ok(Cloned::ConfineRefused { step, errno });
+    }
     let what = match step {
         1 => "giving it its input and output",
         2 => "putting it in its cgroup",
@@ -474,6 +527,7 @@ unsafe fn clone_on(
         6 => "giving it its inherited descriptors",
         7 => "arming its kill at its parent's death (PR_SET_PDEATHSIG)",
         8 => "finding its parent alive after arming its kill at the parent's death",
+        CONFINE_STEP => "entering its confinement (D177)",
         _ => "running its program",
     };
     let error = io::Error::from_raw_os_error(failed);
@@ -588,6 +642,38 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     // SAFETY: a NUL-terminated path the parent keeps. Async-signal-safe.
     if unsafe { libc::chdir(child.plan.dir) } != 0 {
         fail(child, 3);
+    }
+    // The confinement, last before `execve`, so every step above ran unconfined and the
+    // seccomp filter (its last step) sees only `execve` and, on a refusal, `_exit` (both
+    // allowed by every filter blaze-sys builds). D177's assumptions, each one the vfork
+    // contract asks:
+    // 1. DATA, not code of the caller's: `confine` is a ruleset descriptor, a slice of BPF
+    //    instructions and a slice of limits the parent made before `clone` and does not touch
+    //    while it waits (CLONE_VFORK); the child only reads them.
+    // 2. Raw system calls only: `enter` is blaze-sys's (`#[blaze::noalloc]`,
+    //    `#[blaze::nopanic]`): `prctl(PR_SET_NO_NEW_PRIVS)`, `prlimit64(0, ..)` per limit,
+    //    `landlock_restrict_self`, `seccomp(SECCOMP_SET_MODE_FILTER, 0, ..)`, each through
+    //    blaze-sys's inline `syscall` (no libc wrapper, no errno TLS write), no allocation, no
+    //    lock, no unwinding; its frames are a few words on the `STACK` bytes.
+    // 3. Each call applies to the calling task alone: no_new_privs and the seccomp filter (no
+    //    `SECCOMP_FILTER_FLAG_TSYNC`) are per task, the Landlock domain is the task's own
+    //    credentials (copied at `clone`: CLONE_VM shares memory, not credentials), and resource
+    //    limits are per process (no CLONE_THREAD: the child has its own). So sharing the
+    //    parent's address space until `execve` changes nothing of the parent's.
+    // 4. RLIMIT_AS is set while the child still runs in the parent's (large) address space: it
+    //    bounds only later mappings, and the child maps nothing before `execve`, which makes a
+    //    new one, measured from zero.
+    // 5. The only memory of the parent's it writes is the error slot (`step`, `failed`,
+    //    `refused` in `Child`), which the parent reads after the child has exec'd or exited.
+    if let Some(confine) = child.confine {
+        if let Err((step, errno)) = blaze_sys::linux::confine::enter(confine) {
+            child.refused = Some((step, errno));
+            child.step = CONFINE_STEP;
+            child.failed = libc::c_int::from(errno.raw());
+            // SAFETY: as `fail`'s `_exit`: the end of the child, running nothing of the
+            // parent's; one system call.
+            unsafe { libc::_exit(crate::exit::Exit::ExecFailed.code()) }
+        }
     }
     // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
     // all kept by the parent until the program runs. Async-signal-safe; on success the child

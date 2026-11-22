@@ -42,7 +42,7 @@ use std::{
     sync::Arc,
 };
 
-use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_hash::{FixedState, Map};
 use std::alloc::Global;
 
 use crate::{

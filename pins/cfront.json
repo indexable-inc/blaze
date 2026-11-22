@@ -1,0 +1,6 @@
+{
+  "comment": "D174 (docs/v2/plan/design/c.md \"The toolchain side\"): blaze-cfront, the C toolchain helper (crates/blaze-cc/helper), built by .github/scripts/llvm.py into the blaze LLVM archive llvm.json pins and linked to that build's clang libraries. `protocol` is the version of the messages it speaks (crates/blaze-cc/src/wire.rs VERSION); `member` its path in the archive; `targets` the sha256 of that member per target, written by `llvm.py pin` from a build that carries it. Empty until the llvm workflow builds an archive with it. Read by scripts/src/bin/toolchain_cut.rs (`cfront`), which puts it on the shelf as <shelf>/cfront/<sha256>/blaze-cfront.",
+  "protocol": 2,
+  "member": "bin/blaze-cfront",
+  "targets": {}
+}

@@ -3075,17 +3075,17 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
 /// of 2026-11-02: workers at `utility` got about 2% of a core each). A pool made where the
 /// budget can't be read (it panics at once in [`crate::exec::shared`]) is not lowered.
 #[cfg(target_os = "macos")]
-fn worker_qos() -> libc::qos_class_t {
+fn worker_qos() -> blaze_sys::posix::proc::qos_class_t {
     match blaze_core::cores::get() {
-        Ok(cores) if cores.lowered() => libc::qos_class_t::QOS_CLASS_DEFAULT,
-        _ => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+        Ok(cores) if cores.lowered() => blaze_sys::posix::proc::QOS_CLASS_DEFAULT,
+        _ => blaze_sys::posix::proc::QOS_CLASS_USER_INITIATED,
     }
 }
 
 #[cfg(target_os = "macos")]
 fn bind_to(cpu: &Cpu) -> io::Result<()> {
     // SAFETY: sets the calling thread's own QoS class; no memory is passed.
-    let got = unsafe { libc::pthread_set_qos_class_self_np(worker_qos(), 0) };
+    let got = unsafe { blaze_sys::posix::thread::pthread_set_qos_class_self_np(worker_qos(), 0) };
     if got == 0 {
         Ok(())
     } else {
@@ -4930,13 +4930,13 @@ mod tests {
             pool.submit(
                 None,
                 move || {
-                    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+                    let mut class = blaze_sys::posix::proc::QOS_CLASS_UNSPECIFIED;
                     let mut relative = 0;
                     // SAFETY: the calling thread's own class and priority, written into the two
                     // locals; the class is one of `qos_class_t`'s, as the kernel only has those.
                     let got = unsafe {
-                        libc::pthread_get_qos_class_np(
-                            libc::pthread_self(),
+                        blaze_sys::posix::thread::pthread_get_qos_class_np(
+                            blaze_sys::posix::thread::pthread_self(),
                             &mut class,
                             &mut relative,
                         )

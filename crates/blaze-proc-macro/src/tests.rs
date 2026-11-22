@@ -258,6 +258,7 @@ fn module_in(dir: &Path, wasm: Vec<u8>, macros: u32) -> ModuleRecord {
         macros: (0..macros).map(|index| Exported { index, kind: ProcKind::FnLike, name: format!("m{index}"), helpers: Vec::new() }).collect(),
         decls: "decls".to_owned(),
         dir: dir.to_owned(),
+        compiled: dir.join("compiled"),
     }
 }
 
@@ -462,7 +463,7 @@ fn reader_outputs(setup: &Setup) -> Vec<Vec<u8>> {
 
 /// The compiled record of `module` under `runtime`'s key.
 fn compiled_path(runtime: &Runtime, module: &ModuleRecord) -> PathBuf {
-    module.dir.join(format!("compiled-{}", runtime.code_key(module)))
+    module.compiled.join(runtime.code_key(module))
 }
 
 /// A second runtime in this process loads the module from its compiled record, compiling
@@ -488,24 +489,25 @@ fn a_second_runtime_loads_the_compiled_record_without_compiling() {
     assert_eq!(reader_outputs(&fresh), reader_outputs(&kept));
 }
 
-/// A record with one byte flipped is refused by name, removed and compiled again.
+/// A record cut short (not the size its seal names) is refused by name, removed and compiled
+/// again. A read checks the seal's size and key, not a hash of the bytes: the seal is the
+/// writer's proof (host.rs `seal`, rule 74).
 #[test]
-fn a_compiled_record_with_a_flipped_byte_is_refused_and_compiled_again() {
-    let dir = folder("flipped");
+fn a_compiled_record_not_its_sealed_size_is_refused_and_compiled_again() {
+    let dir = folder("truncated");
     let first = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = reader_in(&dir);
     first.load(&module).expect("it compiles");
     let path = compiled_path(&first, &module);
-    let mut bytes = std::fs::read(&path).expect("the record");
-    let at = bytes.len() / 2;
-    bytes[at] ^= 1;
-    std::fs::write(&path, &bytes).expect("the flipped record");
+    let bytes = std::fs::read(&path).expect("the record");
+    std::fs::write(&path, &bytes[..bytes.len() - 1]).expect("the cut record");
     let second = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let loaded = second.load(&module).expect("it compiles again");
     assert!(loaded.compiled);
     assert_eq!(second.compiles(), 1);
+    assert_eq!(second.module_loads().taken, 0);
     let findings = second.take_findings();
-    assert!(matches!(&findings[..], [CompiledFinding { record, why: Refused::Digest { .. }, .. }] if *record == path), "{findings:?}");
+    assert!(matches!(&findings[..], [CompiledFinding { record, why: Refused::Size { .. }, .. }] if *record == path), "{findings:?}");
     let third = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     assert!(!third.load(&module).expect("it loads").compiled, "the record written again is loaded");
 }

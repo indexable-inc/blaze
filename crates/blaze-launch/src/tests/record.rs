@@ -4,7 +4,6 @@
 use blaze_protocol::cbor;
 use blaze_sim::{Config, Tape};
 
-use crate::KEPT;
 use crate::place::{Bound, place, place_static, pool};
 use crate::record::{Datum, Fixup, Kind, LAYOUT, Place, Record, To, Unwind, What};
 use crate::wire::{Arch, List, WireError};
@@ -277,7 +276,7 @@ fn an_aarch64_record_is_placed_against_words_thunks_and_its_own_pool() {
     let datum = Datum { id: [7; 32], align: 8, bytes: b"hi", fixups: List::of(&[]), writable: false };
     let data = [datum];
     let record = code(Arch::Aarch64, &bytes, &fixups, &places, &data);
-    let pool = pool(&record, KEPT).expect("laid out");
+    let pool = pool(&record, blaze_own::testing::heap().alloc()).expect("laid out");
     // 44 bytes of code, to 48, and one cell.
     assert_eq!(pool.len, 56);
     let bounds = [Bound::Function { word: WORD, thunk: THUNK }, Bound::At(EXTERN)];
@@ -338,7 +337,7 @@ fn an_x86_64_record_and_thread_locals_are_placed_through_the_pool() {
     ];
     let places = [Place::Function, Place::Weak("gone"), Place::Static];
     let record = code(Arch::X86_64, &bytes, &fixups, &places, &[]);
-    let pool = pool(&record, KEPT).expect("laid out");
+    let pool = pool(&record, blaze_own::testing::heap().alloc()).expect("laid out");
     // 27 bytes of code, to 32; a cell; a thread-local's cell and descriptor.
     assert_eq!(pool.len, 32 + 8 + 32);
     let bounds = [
@@ -371,7 +370,7 @@ fn an_x86_64_record_and_thread_locals_are_placed_through_the_pool() {
         Fixup { at: 12, kind: Kind::TlsDescCall, to, addend: 0 },
     ];
     let record = code(Arch::Aarch64, &bytes, &fixups, &[Place::Static], &[]);
-    let pool = self::pool(&record, KEPT).expect("laid out");
+    let pool = self::pool(&record, blaze_own::testing::heap().alloc()).expect("laid out");
     assert_eq!(pool.len, 32);
     let bounds = [Bound::Tls { thunk: 0xbbbb, arg: 9 }];
     place(&record, &pool, AT, &bounds, &[], &mut out).expect("placed");
@@ -412,5 +411,5 @@ fn a_statics_value_holds_thunks_and_addresses() {
     let zeroed = Record { size: 4096, bytes: &[], fixups: List::of(&[]), ..record };
     place_static(&zeroed, &bounds, &[0x5000], &mut out).expect("placed");
     assert_eq!(out, vec![0; 4096]);
-    assert!(pool(&record, KEPT).is_err(), "a static was laid out as code");
+    assert!(pool(&record, blaze_own::testing::heap().alloc()).is_err(), "a static was laid out as code");
 }

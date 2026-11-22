@@ -17,7 +17,7 @@ use crate::{BLOCK_LEN, IV, MESSAGE};
 /// `x` rotated right by `by` in each lane: a shift and a shift-insert on NEON (`ushr`, `sli`),
 /// `vprord` on AVX-512.
 #[inline(always)]
-fn rotate<const N: usize>(x: Simd<u32, N>, by: u32) -> Simd<u32, N> {
+pub(crate) fn rotate<const N: usize>(x: Simd<u32, N>, by: u32) -> Simd<u32, N> {
     (x >> Simd::splat(by)) | (x << Simd::splat(32 - by))
 }
 
@@ -40,12 +40,17 @@ impl<const BY: usize, const M: usize> Swizzle<M> for ByBytes<BY> {
 /// `x` rotated right by `BY` whole bytes as one byte shuffle (`tbl` on NEON, `vpshufb` on
 /// x86), where shifts take two instructions: at 8 lanes on the owner's M5 Max, 16.0 ns a block
 /// a lane against 17.1 with shifts (blaze-int-1112-notes/nightly-probes/blake3_lanes.rs). The
-/// lane counts the crate runs (4, 8, 16) go through their bytes; any other by shifts. The
-/// `from_slice` round trips are of `N` words into `N` words, so LLVM keeps them in registers.
+/// lane counts the crate runs (2, 4, 8, 16, and 4 for the rows of `crate::rows`) go through
+/// their bytes; any other by shifts. The `from_slice` round trips are of `N` words into `N`
+/// words, so LLVM keeps them in registers.
 #[inline(always)]
-fn rotate_bytes<const N: usize, const BY: usize>(x: Simd<u32, N>) -> Simd<u32, N> {
+pub(crate) fn rotate_bytes<const N: usize, const BY: usize>(x: Simd<u32, N>) -> Simd<u32, N> {
     let words = x.as_array().as_slice();
     match N {
+        2 => {
+            let bytes = Simd::<u32, 2>::from_slice(words).to_ne_bytes();
+            Simd::from_slice(Simd::<u32, 2>::from_ne_bytes(ByBytes::<BY>::swizzle(bytes)).as_array())
+        }
         4 => {
             let bytes = Simd::<u32, 4>::from_slice(words).to_ne_bytes();
             Simd::from_slice(Simd::<u32, 4>::from_ne_bytes(ByBytes::<BY>::swizzle(bytes)).as_array())
@@ -111,33 +116,57 @@ pub fn compress_each<const N: usize>(
     block_len: [u32; N],
     flags: [u32; N],
 ) -> [[u32; N]; 8] {
-    let mut v: [Simd<u32, N>; 16] = [
-        Simd::from_array(cv[0]),
-        Simd::from_array(cv[1]),
-        Simd::from_array(cv[2]),
-        Simd::from_array(cv[3]),
-        Simd::from_array(cv[4]),
-        Simd::from_array(cv[5]),
-        Simd::from_array(cv[6]),
-        Simd::from_array(cv[7]),
-        Simd::splat(IV[0]),
-        Simd::splat(IV[1]),
-        Simd::splat(IV[2]),
-        Simd::splat(IV[3]),
+    let next = compress_in_registers(
+        (*cv).map(Simd::from_array),
+        &(*message).map(Simd::from_array),
         Simd::from_array(counter_low),
         Simd::from_array(counter_high),
         Simd::from_array(block_len),
         Simd::from_array(flags),
+    );
+    next.map(Simd::to_array)
+}
+
+/// [`compress_each`] on vectors, the form a loop over a chunk's blocks keeps its chaining value
+/// in: taken and given by value, so nothing goes through memory between blocks. The array forms
+/// put each block's chaining value on the stack and back (eight `stp q` and eight `ldp q` a
+/// block at four lanes), and a `[64; L]` block length was built by a `memset_pattern16` call
+/// each block (the coordinator's 2026-11-20 build of `examples/cost`, `chunks_lanes::<4>`).
+#[inline(always)]
+pub(crate) fn compress_in_registers<const N: usize>(
+    cv: [Simd<u32, N>; 8],
+    m: &[Simd<u32, N>; 16],
+    counter_low: Simd<u32, N>,
+    counter_high: Simd<u32, N>,
+    block_len: Simd<u32, N>,
+    flags: Simd<u32, N>,
+) -> [Simd<u32, N>; 8] {
+    let mut v: [Simd<u32, N>; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        Simd::splat(IV[0]),
+        Simd::splat(IV[1]),
+        Simd::splat(IV[2]),
+        Simd::splat(IV[3]),
+        counter_low,
+        counter_high,
+        block_len,
+        flags,
     ];
-    let m: [Simd<u32, N>; 16] = message.map(Simd::from_array);
-    round(&mut v, &m, &MESSAGE[0]);
-    round(&mut v, &m, &MESSAGE[1]);
-    round(&mut v, &m, &MESSAGE[2]);
-    round(&mut v, &m, &MESSAGE[3]);
-    round(&mut v, &m, &MESSAGE[4]);
-    round(&mut v, &m, &MESSAGE[5]);
-    round(&mut v, &m, &MESSAGE[6]);
-    core::array::from_fn(|word| (v[word] ^ v[word + 8]).to_array())
+    round(&mut v, m, &MESSAGE[0]);
+    round(&mut v, m, &MESSAGE[1]);
+    round(&mut v, m, &MESSAGE[2]);
+    round(&mut v, m, &MESSAGE[3]);
+    round(&mut v, m, &MESSAGE[4]);
+    round(&mut v, m, &MESSAGE[5]);
+    round(&mut v, m, &MESSAGE[6]);
+    core::array::from_fn(|word| v[word] ^ v[word + 8])
 }
 
 /// One round, its message words read where `t` says: written out seven times by the caller,
@@ -215,14 +244,47 @@ pub fn columns<const S: usize>(rows: &[[u32; 16]; S]) -> [[u32; S]; 16] {
     const { assert!(S.is_power_of_two() && S <= 16) };
     let mut out = [[0; S]; 16];
     for from in (0..16).step_by(S) {
-        let square = transpose(core::array::from_fn(|lane| {
-            Simd::from_array(core::array::from_fn(|word| rows[lane][from + word]))
-        }));
+        // Each lane's `S` words in one vector load from where they lie.
+        let square = transpose(core::array::from_fn(|lane| Simd::from_slice(&rows[lane][from..])));
         for (word, column) in square.iter().enumerate() {
             out[from + word] = column.to_array();
         }
     }
     out
+}
+
+/// [`columns`] of each lane's [`block_words`], read from the blocks' bytes: a lane's `S` words
+/// in one vector load (`ldr q` at four lanes on NEON), then the same square transposes. What a
+/// loop over whole blocks takes; through `block_words` and `columns`, LLVM built each lane's
+/// words from 64-bit loads and lane inserts (`ldr d`, `mov.d`) before the transposes, twice
+/// the instructions of the official crate's `transpose_msg_vecs4` (sixteen `vld1q_u8` and four
+/// `vtrnq` and `vcombine` transposes).
+#[inline(always)]
+pub(crate) fn message_columns<const S: usize>(blocks: &[&[u8; BLOCK_LEN]; S]) -> [Simd<u32, S>; 16] {
+    const { assert!(S.is_power_of_two() && S <= 16) };
+    let mut out = [Simd::splat(0); 16];
+    for from in (0..16).step_by(S) {
+        let square = transpose(core::array::from_fn(|lane| le_words::<S>(&blocks[lane][4 * from..])));
+        out[from..from + S].copy_from_slice(&square);
+    }
+    out
+}
+
+/// The first `S` little-endian words of `bytes` (at least `4 * S` long) as one vector: one
+/// load of `4 * S` bytes at the widths the crate runs, the byte order fixed by `from_le_bytes`
+/// (nothing on a little-endian target). The `from_slice` round trip is of `S` words into `S`
+/// words, as in [`rotate_bytes`].
+#[inline(always)]
+fn le_words<const S: usize>(bytes: &[u8]) -> Simd<u32, S> {
+    match S {
+        2 => Simd::from_slice(Simd::<u32, 2>::from_le_bytes(Simd::<u8, 8>::from_slice(bytes)).as_array()),
+        4 => Simd::from_slice(Simd::<u32, 4>::from_le_bytes(Simd::<u8, 16>::from_slice(bytes)).as_array()),
+        8 => Simd::from_slice(Simd::<u32, 8>::from_le_bytes(Simd::<u8, 32>::from_slice(bytes)).as_array()),
+        16 => Simd::from_slice(Simd::<u32, 16>::from_le_bytes(Simd::<u8, 64>::from_slice(bytes)).as_array()),
+        _ => Simd::from_array(core::array::from_fn(|word| {
+            u32::from_le_bytes(*bytes[4 * word..].first_chunk::<4>().expect("four bytes a word"))
+        })),
+    }
 }
 
 /// Eight words of `S` lanes (a compression's output) as each lane's eight words: [`columns`]'
@@ -259,4 +321,39 @@ fn transpose<const S: usize>(mut v: [Simd<u32, S>; S]) -> [Simd<u32, S>; S] {
         v = next;
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::simd::Simd;
+
+    use blaze_sim::{Config, Tape, check};
+
+    use super::{block_words, columns, message_columns};
+    use crate::BLOCK_LEN;
+
+    /// `S` drawn blocks read by [`message_columns`] are the columns of their scalar words
+    /// ([`block_words`], then [`columns`]): the twin, at every width the crate runs.
+    fn at<const S: usize>(tape: &Tape) {
+        let blocks: [[u8; BLOCK_LEN]; S] = core::array::from_fn(|_| {
+            let mut block = [0; BLOCK_LEN];
+            tape.fill(&mut block, "block");
+            block
+        });
+        let got = message_columns::<S>(&core::array::from_fn(|lane| &blocks[lane]));
+        let want = columns::<S>(&core::array::from_fn(|lane| block_words(&blocks[lane]))).map(Simd::from_array);
+        assert_eq!(got, want, "{S} lanes");
+    }
+
+    #[test]
+    fn message_columns_are_the_columns_of_block_words() {
+        check(Config::cases(500), |tape: &Tape| {
+            at::<2>(tape);
+            at::<4>(tape);
+            at::<8>(tape);
+            at::<16>(tape);
+        });
+    }
 }

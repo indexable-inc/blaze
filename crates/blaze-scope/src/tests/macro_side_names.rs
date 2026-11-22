@@ -143,7 +143,6 @@ fn unit(package: u32, name: &str, kind: UnitKind<'static>, for_host: bool, deps:
         deps: d,
         build_script: None,
         links: None,
-        incomplete: false,
     }
 }
 
@@ -156,7 +155,7 @@ pub(super) fn graph() -> UnitGraph<'static> {
     units.push(unit(1, "dep", UnitKind::Lib, false, &[]));
     units.push(unit(2, "pm", UnitKind::ProcMacro, true, &[("dep", 3)]));
     units.push(unit(1, "dep", UnitKind::Lib, true, &[]));
-    UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V3, meta: AVec::new_in(a()) }
+    UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(a()) }
 }
 
 /// Each crate's one file, at the root the list gave it: by its name.

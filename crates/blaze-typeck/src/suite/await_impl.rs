@@ -181,6 +181,111 @@ fn two_holding_impls_are_refused_by_name() {
     std::println!("B.await with two impls: E0283 naming into_future");
 }
 
+/// reth's `DebugNodeLauncherFuture` (tempo crates/zones/node/tests/it/utils.rs:2658, false
+/// E0282 "undecided: generic argument #3 of <impl<L, Target, N, AddOns, B> IntoFuture for
+/// DebugNodeLauncherFuture<L, Target, N, B> ..>", "no goal is pending on it"), reduced:
+///
+/// ```text
+/// trait Launch<T> { type Node; }
+/// struct Handle<N, A>(N, A);  struct Fut<L, T, N>(L, T, N);  struct Eng;
+/// impl<L, T, N, A> IntoFuture for Fut<L, T, N> where L: Launch<T, Node = Handle<N, A>> {
+///     type Output = Handle<N, A>; type IntoFuture = Ready<Handle<N, A>>; fn into_future(self) -> Ready<Handle<N, A>> }
+/// impl Launch<u8> for Eng { type Node = Handle<u16, u32>; }   // the twin: Handle<u64, u32>
+/// async fn user(x: Fut<Eng, u8, u16>) { let h = x.await; }
+/// ```
+///
+/// `A` is in neither the self type nor the trait: only the projection binding decides it.
+/// Returns the world and `[user, the impl's into_future]`.
+fn launch_world(node_n: PNode) -> (Fx, [ItemKey; 2]) {
+    let mut world = Fx::new();
+    let fx = &mut world;
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let into_future = fx.tr("IntoFuture", 1, Vec::new(), &["Output", "IntoFuture"]);
+    fx.lang(LangItem::IntoFuture, into_future);
+    let [p0, p1, p2, p3] = [fx.param(0), fx.param(1), fx.param(2), fx.param(3)];
+    let held_p0 = fx.alias(into_future, "IntoFuture", &[p0]);
+    let trait_fn = fx.trait_fn(into_future, "into_future", true, &[p0], held_p0);
+    fx.lang_def(LangItem::IntoFutureIntoFuture, Def::Fn(trait_fn));
+    let ready = fx.tuple_strukt("Ready", 1, &[p0]);
+
+    let launch = fx.tr("Launch", 2, Vec::new(), &["Node"]);
+    let handle = fx.tuple_strukt("Handle", 2, &[p0, p1]);
+    let fut = fx.tuple_strukt("Fut", 3, &[p0, p1, p2]);
+    let eng = fx.strukt("Eng", 0, &[]);
+
+    // impl<L, T, N, A> IntoFuture for Fut<L, T, N> where L: Launch<T, Node = Handle<N, A>>
+    let fut_ltn = fx.adt(fut, &[p0, p1, p2]);
+    let handle_na = fx.adt(handle, &[p2, p3]);
+    let ready_handle = fx.adt(ready, &[handle_na]);
+    let l_launch = fx.bound(launch, &[p0, p1]);
+    let l_node = fx.proj(launch, &[p0, p1], "Node", handle_na);
+    let imp = fx.imp(
+        "impl<L, T, N, A> IntoFuture for Fut<L, T, N> where L: Launch<T, Node = Handle<N, A>>",
+        4,
+        fut_ltn,
+        Some((into_future, &[])),
+        &[("Output", handle_na), ("IntoFuture", ready_handle)],
+        std::vec![l_launch, l_node],
+    );
+    let fut_fn = fx.impl_fn(imp, "into_future", true, &[fut_ltn], ready_handle);
+
+    // impl Launch<u8> for Eng { type Node = Handle<node_n, u32>; }
+    let u8_ = fx.u8();
+    let u16_ = fx.u16();
+    let u32_ = fx.ty(PNode::Uint(UintTy::U32));
+    let n = fx.ty(node_n);
+    let eng_t = fx.adt(eng, &[]);
+    let node = fx.adt(handle, &[n, u32_]);
+    fx.imp("impl Launch<u8> for Eng", 0, eng_t, Some((launch, &[u8_])), &[("Node", node)], Vec::new());
+
+    let fut_t = fx.adt(fut, &[eng_t, u8_, u16_]);
+    let unit = fx.unit();
+    let user = fx.func("user", 0, &[fut_t], unit, Vec::new());
+    fx.finish();
+    (world, [user, fut_fn])
+}
+
+/// `async fn user(x: ..) { let h = x.await; }`: expression 1 is the `.await`.
+fn await_into_let(fx: &Fx, owner: ItemKey) -> Checked<'static> {
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let out = b.ty(PNode::Tuple(crate::ids::List::EMPTY));
+    b.async_fn(out);
+    let e0 = b.local(x);
+    let e1 = b.await_(e0);
+    let h = b.bind("h");
+    let s = b.let_(h, None, e1);
+    let root = b.block(&[s], None);
+    check_body(fx, &b, owner, root, Plant::None, InferPlant::None)
+}
+
+/// The reduced reth site: the selected impl's projection binding decides `A = u32`, so the
+/// `.await` is clean and the callee is the impl's `into_future` at `[Eng, u8, u16, u32]`.
+/// Before the fix the selected impl's where-clauses were only asked in the probe and rolled
+/// back, so the callee row kept `?A` and writeback refused it (E0282). Twin:
+/// `Eng::Node = Handle<u64, u32>` cannot be `Handle<u16, A>`: no impl holds, the `.await` is
+/// refused (the `IntoFuture` goal unmet), never E0282 and never a selected impl.
+/// Prints "Fut.await: A = u32 by the projection binding".
+#[test]
+fn an_impl_parameter_only_a_projection_binding_names_is_decided_at_await() {
+    let (fx, [user, fut_fn]) = launch_world(PNode::Uint(UintTy::U16));
+    let c = await_into_let(&fx, user);
+    assert_eq!(codes(&c), Vec::new(), "ORACLE: `A` is decided by `L: Launch<T, Node = Handle<N, A>>`: {:?}", c.diags);
+    assert_eq!(callee_at(&c, ExprId(1)), Some((fut_fn, 4)), "the callee is Fut's impl's into_future at four arguments");
+    let i = c.callees.column::<0>().iter().position(|&x| x == ExprId(1)).expect("the .await's row");
+    let args = c.types.view().list(c.callees.column::<2>()[i]).expect("the callee's arguments");
+    assert!(matches!(c.types.view().node(args[3]), Ok(PNode::Uint(UintTy::U32))), "A = u32: {:?}", c.types.view().node(args[3]));
+
+    let (fx, [user, fut_fn]) = launch_world(PNode::Uint(UintTy::U64));
+    let c = await_into_let(&fx, user);
+    let got = codes(&c);
+    assert!(!got.is_empty(), "TWIN: `Handle<u64, u32>` is not `Handle<u16, A>`, yet the .await is clean");
+    assert!(got.iter().all(|&(code, _, _)| code != DiagCode::AnnotationsNeeded), "TWIN: a mismatch, not an undecided type: {got:?}");
+    assert_ne!(callee_at(&c, ExprId(1)).map(|r| r.0), Some(fut_fn), "TWIN: no impl is selected");
+    std::println!("Fut.await: A = u32 by the projection binding");
+}
+
 /// The control: `async fn by_bound<T: IntoFuture<Output = u32>>(x: T) -> u32 { x.await }`.
 /// `T` has no impl bucket: its `IntoFuture` is the where-clause's, whose `into_future` no impl
 /// defines, so the callee stays the trait's at `[T]` (the flow lowering's relation for an

@@ -123,7 +123,6 @@ fn unit(lock: &Lock<'static>, name: &str, kind: UnitKind<'static>, for_host: boo
         deps: d,
         build_script: None,
         links: None,
-        incomplete: false,
     }
 }
 
@@ -135,7 +134,18 @@ fn graph(lock: &Lock<'static>) -> &'static UnitGraph<'static> {
     units.push(unit(lock, "dep", UnitKind::Lib, true, &[]));
     units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("dep", 1)]));
     units.push(unit(lock, "app", UnitKind::Lib, false, &[("dep", 0), ("pm", 2)]));
-    StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }))
+    StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }))
+}
+
+/// [`graph`]'s units in the reverse order (unit `i` is [`graph`]'s `3 - i`): one graph, its
+/// units numbered otherwise.
+fn graph_reversed(lock: &Lock<'static>) -> &'static UnitGraph<'static> {
+    let mut units = AVec::new_in(a());
+    units.push(unit(lock, "app", UnitKind::Lib, false, &[("dep", 3), ("pm", 1)]));
+    units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("dep", 2)]));
+    units.push(unit(lock, "dep", UnitKind::Lib, true, &[]));
+    units.push(unit(lock, "dep", UnitKind::Lib, false, &[]));
+    StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }))
 }
 
 /// `app` and `pm` in the checkout at their own directories; `dep` a fetched pack.
@@ -240,7 +250,7 @@ fn hello_on(edition: PackageEdition, shelf_of: ShelfOf) -> World<'static> {
     member.edition = edition;
     let mut units = AVec::new_in(a());
     units.push(member);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }));
     let mut places = Places { lock, dep: &[] };
     let (id, files) = shelf_of(TRIPLE, crate::fixture::STD, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
@@ -398,7 +408,7 @@ fn sides_world() -> World<'static> {
     let mut pm_script = unit(lock, "pm", UnitKind::BuildScript, true, &[]);
     pm_script.root = t("build.rs");
     units.push(pm_script);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2, meta: AVec::new_in(a()) }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }));
     let reg = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
     let mut places = Places { lock, dep: StdBox::leak(reg.into_boxed_slice()) };
     let (id, mut shelf) = shelf(true);
@@ -620,6 +630,68 @@ fn the_tree_table_names_each_trees_pack() {
     std::println!("crate list trees: {} trees ({shelf} shelf, {fetched} fetched), dep is tree {k}; control: {control} differences", list.trees());
 }
 
+/// crate_list.rs version 6, rule 25: the rows are in the world's order (the toolchain's crates
+/// in its manifest's order, then by crate key; two crates under one key are refused, so no tie
+/// is left to break), a function of the crates' contents alone: one graph whose units are
+/// numbered in the reverse order makes a world of the same crates at the same indices, and its
+/// list is the same bytes. Nothing of a map's order or of this machine enters (the world's
+/// tables are vectors sorted by key; the list writes rows, then each table, in those orders).
+/// CONTROL: the list of the other fixture world (the cut's macro side on) differs. Prints
+/// `crate list order: <n> crates, <b> bytes, equal over both unit orders; control differs`.
+#[test]
+fn the_list_is_the_same_bytes_whatever_the_units_order() {
+    use crate::crate_list::{CrateGraph as _, CrateList, encode};
+    let made_from = |reversed: bool, macro_side: bool| {
+        let lock = lock();
+        let graph = if reversed { graph_reversed(lock) } else { graph(lock) };
+        let dep = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
+        let mut places = Places { lock, dep: StdBox::leak(dep.into_boxed_slice()) };
+        let (id, mut shelf) = shelf(macro_side);
+        let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+        let listed = StdBox::leak(StdBox::new(listed));
+        world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let (forward, backward) = (made_from(false, true), made_from(true, true));
+    let one = encode(&forward, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+    let two = encode(&backward, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+    let list = CrateList::open(&one).unwrap_or_else(|e| panic!("{e}"));
+    for r in 0..list.len() {
+        assert_eq!(list.key(r), forward.crates[r].input.key, "row {r} is the world's crate {r}");
+        assert_eq!(list.find(forward.crates[r].input.key), Some(r), "row {r} is found by its key");
+    }
+    assert_eq!(forward.crates.len(), backward.crates.len(), "one graph, one set of crates");
+    for at in 0..forward.crates.len() {
+        assert_eq!(forward.crates[at].input.key, backward.crates[at].input.key, "crate {at}: the same crate over both unit orders");
+    }
+    assert!(one.as_slice() == two.as_slice(), "the list's bytes differ over the units' order");
+    let other = encode(&made_from(false, false), &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(other.as_slice() != one.as_slice(), "CONTROL: another world's list must differ");
+    std::println!("crate list order: {} crates, {} bytes, equal over both unit orders; control differs", list.len(), one.len());
+}
+
+/// crate_list.rs version 6: each row's `TEST` flag is its world crate's cfg (`cfg_test`: `test`
+/// with no value), row `r` the world's crate `r`. CONTROL (rule 23): row 0's flag flipped makes
+/// the list differ from its world, so `differences` sees the flag (blaze-cli names.rs
+/// `Names::differences_from` refuses a world made by need on it). Prints
+/// `crate list test flags: <t> of <n> rows test; control: <k> differences`.
+#[test]
+fn a_flipped_test_flag_differs_from_its_world() {
+    use crate::crate_list::{CrateList, FLAGS_AT, HEADER_LEN, TEST, cfg_test, differences, encode};
+    let w = made(true);
+    let bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+    let list = CrateList::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(differences(&w, &list), 0, "the list differs from its world");
+    for at in 0..w.crates.len() {
+        assert_eq!(list.test(at), cfg_test(&w, at), "row {at}: its test flag is its crate's cfg");
+    }
+    let tests = (0..w.crates.len()).filter(|at| list.test(*at)).count();
+    let mut planted = bytes.to_vec();
+    planted[HEADER_LEN + FLAGS_AT] ^= TEST;
+    let control = differences(&w, &CrateList::open(&planted).unwrap_or_else(|e| panic!("{e}")));
+    assert!(control > 0, "CONTROL: a row whose test flag is flipped must differ from its world");
+    std::println!("crate list test flags: {tests} of {} rows test; control: {control} differences", w.crates.len());
+}
+
 /// The bytes of a list's dependency table: its entries counted over every row.
 fn bytes_of_deps(list: &crate::crate_list::CrateList<'_>) -> usize {
     use crate::crate_list::CrateGraph as _;
@@ -634,11 +706,16 @@ fn an_old_crate_list_is_refused_by_name() {
     let w = hello(BLAZE);
     let mut bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}")).to_vec();
     // Version 4: each crate's row carries its package's metadata variables (lane RE3).
-    assert_eq!(VERSION, 4);
+    // Version 5: each crate's row carries its package's version, for diagnostics.
+    // Version 6: rows in the world's order with a by-key table, the test and public flags and
+    // the planners' tables (engine.md item 2): a version-5 list is refused, never read (D160).
+    assert_eq!(VERSION, 6);
     bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
     let refused = CrateList::open(&bytes).err().expect("a version-2 list is refused");
     assert_eq!(refused, ListError::Version { found: 2 });
     let words = std::format!("{refused}");
-    assert!(words.contains("version 2, not 4"), "{words}");
+    assert!(words.contains("version 2, not 6"), "{words}");
+    bytes[4..6].copy_from_slice(&5u16.to_le_bytes());
+    assert_eq!(CrateList::open(&bytes).err(), Some(ListError::Version { found: 5 }), "a version-5 list is refused by name");
     std::println!("crate list: an old list: {words}");
 }

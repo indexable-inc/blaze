@@ -16,8 +16,10 @@ pub enum Pass {
     /// Nothing: a value-less type, or a C zero-sized one.
     Ignore,
     /// One register of `ty`, widened by `ext`. `agg`: the walk holds it as a one-scalar
-    /// aggregate (a C newtype), read and written at its offset 0.
+    /// aggregate, read and written at offset 0.
     Scalar { ty: Ty, ext: Ext, agg: bool },
+    /// A wide pointer: the data pointer followed by its length or vtable pointer.
+    Wide { metadata: Ty },
     /// Rust: an aggregate by the address of the caller's copy; a result by a hidden pointer
     /// first.
     Ref,
@@ -40,6 +42,7 @@ pub fn sig_of_in<A: Allocator + Clone>(inputs: &[Pass], ret: Pass, alloc: A) -> 
         Pass::Ref => params.push(Param::of(Ty::PTR)),
         Pass::Memory { size, align } => params.push(memory(ParamKind::Sret, size, align)),
         Pass::Scalar { ty, ext, .. } => rets.push(Param { ext, ..Param::of(ty) }),
+        Pass::Wide { metadata } => rets.extend([Param::of(Ty::PTR), Param::of(metadata)]),
         Pass::Words { size } => {
             for _ in 0..size.div_ceil(8) {
                 rets.push(Param::of(Ty::I64));
@@ -52,6 +55,7 @@ pub fn sig_of_in<A: Allocator + Clone>(inputs: &[Pass], ret: Pass, alloc: A) -> 
             Pass::Ref => params.push(Param::of(Ty::PTR)),
             Pass::Memory { size, align } => params.push(memory(ParamKind::Byval, size, align)),
             Pass::Scalar { ty, ext, .. } => params.push(Param { ext, ..Param::of(ty) }),
+            Pass::Wide { metadata } => params.extend([Param::of(Ty::PTR), Param::of(metadata)]),
             Pass::Words { size } => {
                 for _ in 0..size.div_ceil(8) {
                     params.push(Param::of(Ty::I64));

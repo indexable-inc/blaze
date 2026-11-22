@@ -34,7 +34,7 @@ use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, Read};
 use blaze_ladder::code_records::{Builder, CodeStore, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::{CheckCount, Maker, NamesRecords, RecordsProgram, walk_records};
 use blaze_ladder::seam::FrontEnd;
@@ -149,18 +149,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: LibKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 
@@ -1189,6 +1189,96 @@ thread_local! {
     static MAIN: core::cell::Cell<Option<ItemKey>> = const { core::cell::Cell::new(None) };
     /// `Unit::three`'s member key, which [`is_inner`] cannot tell from a local's.
     static THREE: core::cell::Cell<Option<ItemKey>> = const { core::cell::Cell::new(None) };
+    /// [`a_local_fn_of_a_written_block_is_found_cold_over_names_records`]'s `Field::mul`
+    /// member key, which [`is_inner`] cannot tell from a local's.
+    static MUL: core::cell::Cell<Option<ItemKey>> = const { core::cell::Cell::new(None) };
+}
+
+/// curve25519-dalek 4.1.3 src/backend/serial/u64/field.rs:116, reduced: a member fn (`mul` of
+/// an impl) whose body declares `fn m` and, after it, makes statement macro calls
+/// (`debug_assert!`). A statement call makes its block one the names library writes as a module
+/// (blaze-scope blocks.rs), but the body's lowering still files `m` under its BODY-LOCAL key
+/// (locals.rs `Locals::keep` keys every local fn by `nested_exports::local_key`), so the lazy
+/// program's cold search must list it under that key (nested_exports.rs `walk_every`). `{CALL}`
+/// is where the call stands, or nothing in the twin.
+const WRITTEN_BLOCK_LOCAL: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+macro_rules! check {
+    ($e:expr) => {
+        let _ = $e;
+    };
+}
+
+struct Field;
+
+impl Field {
+    fn mul() -> i32 {
+        {BEFORE}
+        fn m() -> i32 {
+            2
+        }
+        {AFTER}
+        m() + 1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    Field::mul()
+}
+";
+
+/// A local fn of a body whose block the names library writes as a module, asked COLD by a
+/// fresh maker (its caller `mul` found, never lowered by a check, as the run's first call of
+/// `m`'s symbol asks it), is found and made. tempo-primitives and tempo-consensus-config of
+/// 2026-11-21 15:04: "the key 250521b996853016a29642a14f0032a3 of crate 91 .. is no fn its
+/// records hold; searched .. the items declared in its 71 fns whose bodies hold items, by
+/// text, and 0 bodies lowered", that key being `fn m` of `<&FieldElement51 as Mul>::mul`.
+///
+/// Three shapes: the call after `m` (the real site: the text gives `m`'s key), the call before
+/// it (the text cannot give the ordinal: `Unkeyed::AfterCall`, so `mul` is lowered to file
+/// it), and the twin with no call (the block is not written). The first two were refused
+/// while `walk_every` passed over every fn of a written block; the twin was found either way
+/// (the control that the search itself runs). Each shape: the first walk makes `main`, `mul`
+/// and `m`; then `m` alone, its key salted, is made by a fresh maker.
+///
+/// Prints: `d106 written-block local over names records: <shape> first <counts>; cold <counts>`
+#[test]
+fn a_local_fn_of_a_written_block_is_found_cold_over_names_records() {
+    let shapes = [("call after", "", "check!(1);"), ("call before", "check!(1);", ""), ("twin, no call", "", "")];
+    for (shape, before, after) in shapes {
+        let text = WRITTEN_BLOCK_LOCAL.replace("{BEFORE}", before).replace("{AFTER}", after);
+        let f = fixture(&text);
+        let entry = fn_named(&f, "main");
+        let b = builder();
+        let mut store = MemoryStore::new_in(alloc());
+        let (first, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+        assert_eq!((first.reached, first.found, first.made), (3, 0, 3), "{shape}: `main`, `Field::mul` and the local `m` are made: {first}");
+        let mul = {
+            let records = reader(&f).records;
+            let mut field = None;
+            assert!(records.each_item(0, &mut |key, _| if records.kind_of_item(key) == Some(ItemKind::Impl) {
+                field = Some(checker_of(key));
+            }));
+            let field = field.unwrap_or_else(|| panic!("{shape}: no impl: {:?}", logged(records)));
+            blaze_ladder::front2::keys::member_key_of(field, blaze_ladder::front2::keys::MemberKind::Fn, "mul")
+        };
+        MUL.with(|m| m.set(Some(mul)));
+        fn local(k: ItemKey) -> bool {
+            is_inner(k) && MUL.with(|m| m.get() != Some(k))
+        }
+        let (cold, _) = walk_keeping(&f, &Salted { salted: local }, entry, &mut store, &b);
+        assert_eq!((cold.reached, cold.found, cold.made), (3, 2, 1), "{shape}: `m`, asked cold, is made: {cold}");
+        println!("d106 written-block local over names records: {shape} first {first}; cold {cold}");
+    }
 }
 
 /// The process's start exported from a body a macro wrote ([`NESTED_ENTRY`]), its key given by
@@ -2211,4 +2301,210 @@ pub extern \"C-unwind\" fn main() -> i32 {{
     assert_eq!(foreign_abi_of(&f, ItemKind::Static, "optind"), Some(Some("C")), "`optind`'s block, an expansion's");
     assert_eq!(status, 3);
     println!("d106 macro-written foreign static: {counts}; run status {status}");
+}
+
+/// THE COROUTINE TABLE IS MADE IN LINEAR TIME: over the async programs of this file, the
+/// checked bodies walked to table async blocks (`CheckCount::coroutine_walks`) are at most the
+/// bodies checked, each body walked once when its check hands it over (make_one.rs
+/// `ensure_one` calls front2/coroutines.rs `CoroutineTable::add`; before, the table was re-made
+/// over every body checked so far, quadratic). Control: the counter is not 0.
+///
+/// Prints: `d106 coroutine walks: <case> check_one <n>, coroutine walks <m>` per case
+#[test]
+fn the_coroutine_table_walks_each_checked_body_once() {
+    let abort = builder_with(blaze_build::Panic::Abort);
+    let cases = [
+        ("async rung", async_rung()),
+        ("async awaiting another", async_program(AWAITS_ANOTHER)),
+        ("async move block", async_program(BY_MOVE)),
+        ("async pending once", async_program(PENDING_ONCE)),
+    ];
+    for (case, files) in cases.iter() {
+        let f = fixture_of(files, blaze_build::Panic::Abort);
+        let entry = fn_named(&f, "main");
+        let mut store = MemoryStore::new_in(alloc());
+        let (_, maker) = walk_keeping(&f, &EveryItem, entry, &mut store, &abort);
+        let checks = maker.checks();
+        assert!(checks.coroutine_walks > 0, "{case}: control: an async program tables its blocks: {checks:?}");
+        assert!(checks.coroutine_walks <= checks.check_one, "{case}: a checked body walked more than once for the coroutine table: {checks:?}");
+        println!("d106 coroutine walks: {case} check_one {}, coroutine walks {}", checks.check_one, checks.coroutine_walks);
+    }
+}
+
+/// A closure called through a generic `F: Fn` and one called in its owner, both made in
+/// `main`, the generic one capturing a local by reference.
+const CLOSURES: &str = "
+fn twice<F: Fn(u8) -> u8>(f: F, x: u8) -> u8 {
+    f(f(x))
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let add: u8 = 3;
+    let c = |x: u8| x + add;
+    let d = |x: u8| x;
+    twice(c, d(1)) as i32
+}
+";
+
+/// A closure inside a fn declared in `main`'s body: the closure's owner is itself a body-local
+/// item.
+const CLOSURE_IN_LOCAL_FN: &str = "
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    fn inner() -> u8 {
+        let c = |x: u8| x;
+        c(2)
+    }
+    inner() as i32
+}
+";
+
+/// The entry the start rule gives `f`'s program: `main` exported from a body.
+fn exported_entry(f: &Fixture) -> ItemKey {
+    use blaze_ladder::front2::program::{StartOf, start_of};
+    use blaze_ladder::front2::start::Entry2;
+    let records = reader(f).records;
+    match start_of(records, alloc()).unwrap_or_else(|e| panic!("the start rule over records: {e}")) {
+        StartOf::Exported(Entry2::CMain(lib)) => checker_of(lib),
+        other => panic!("the start is `main` exported from a body, not {other:?}"),
+    }
+}
+
+/// THE TYPING ORACLE over BODY-LOCAL items (typed.rs, "Body-local items"): a closure and an
+/// async block have no key and no record of their own (their columns are their owner's, one
+/// `Checked` per body owner); a fn declared in a body has its own key, derived from its
+/// enclosing body's, and its own record, found by lowering (never checking) the bodies around
+/// it. Each shape walked with [`twin_walk`]: nested fns (an exported entry declared in a body,
+/// a local fn handed over as a value, an impl's fn declaring a fn), closures (through a generic
+/// `Fn`, called in their owner, owned by a local fn); the async blocks are the four async cases
+/// of the test above.
+///
+/// Prints: `d106 typing oracle, body-local: <case> <counts>, <n> entries equal, reading side checked 0` per case
+#[test]
+fn a_run_from_typed_records_makes_body_local_items() {
+    let unwind = builder();
+    let cases: [(&str, Fixture, bool); 5] = [
+        ("nested entry", fixture(NESTED_ENTRY), true),
+        ("local fn value", fixture(LOCAL_FN_VALUE), true),
+        ("macro entry's local fns", fixture(MACRO_ENTRY), false),
+        ("closures", fixture(&format!("{BLOCK_MOD_PRELUDE}{CLOSURES}")), false),
+        ("closure in a local fn", fixture(&format!("{BLOCK_MOD_PRELUDE}{CLOSURE_IN_LOCAL_FN}")), false),
+    ];
+    for (case, f, exported) in cases.iter() {
+        let entry = if *exported { exported_entry(f) } else { fn_named(f, "main") };
+        let (counts, equal, read_checked) = twin_walk(case, f, entry, &unwind);
+        assert!(counts.made > 0, "{case}: the first walk makes: {counts}");
+        assert_eq!(equal, counts.make_calls(), "{case}: every make compared: {counts}");
+        assert_eq!(read_checked, 0, "{case}: the reading side checked a body");
+        println!("d106 typing oracle, body-local: {case} {counts}, {equal} entries equal, reading side checked {read_checked}");
+    }
+}
+
+/// One walk of `f`'s program from `entry` with THE TYPING ORACLE (make_one.rs `Twin`): each
+/// make made by a maker that checks the body (`SecondCheck`) and by one that reads its
+/// checked columns from the typed records' test double (`FromRecord::rechecked`), entry
+/// bytes compared. Returns the walk's counts, the entries held equal, and how many bodies the
+/// reading maker's own program checked (0: it reads, never checks).
+fn twin_walk(case: &str, f: &Fixture, entry: ItemKey, b: &Builder) -> (Counts, usize, u32) {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+    let names = reader(f);
+    let checking = Maker::new(names, Some(entry), b, alloc());
+    let typing = FromRecord::rechecked(names, Some(entry), alloc()).unwrap_or_else(|e| panic!("{case}: the double's program: {e}"));
+    let reading = Maker::typed(names, Some(entry), typing, b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, counts) = walk_records(entry, &EveryItem, &mut store, b, &producer(), &mut twin, alloc()).unwrap_or_else(|e| {
+        println!("{case}: the twin walk: {e}; the records filed {:?}", logged(names.records));
+        panic!("{case}: the twin walk: {e}")
+    });
+    assert!(logged(names.records).is_empty(), "{case}: the records filed {:?}", logged(names.records));
+    let read_checked = twin.reading.program().map_or(0, |p| p.counts().checked);
+    (counts, twin.compared, read_checked)
+}
+
+/// D163 part 2, THE EQUALITY ORACLE of the typing seam: every walking program of this file
+/// (the plain one, async, dyn, statics, fmt, a local fn value, a local union) walked with
+/// [`twin_walk`]: every entry made from the typed record is byte-equal to the entry made by
+/// checking the body again, and the reading side's program checked no body. Control: the
+/// checking side checked every body it made (its count is the first test's [`BODIES`] for
+/// [`PROGRAM`]), so a reading side that quietly checked would show a count above 0.
+///
+/// Prints: `d106 typing oracle: <case> <counts>, <n> entries equal, reading side checked 0` per case
+#[test]
+fn a_run_from_typed_records_makes_the_entries_a_second_check_makes() {
+    let unwind = builder();
+    let abort = builder_with(blaze_build::Panic::Abort);
+    let cases: [(&str, Fixture, &Builder); 10] = [
+        ("program", fixture(PROGRAM), &unwind),
+        ("async rung", fixture_of(&async_rung(), blaze_build::Panic::Abort), &abort),
+        ("async awaiting another", fixture_of(&async_program(AWAITS_ANOTHER), blaze_build::Panic::Abort), &abort),
+        ("async move block", fixture_of(&async_program(BY_MOVE), blaze_build::Panic::Abort), &abort),
+        ("async pending once", fixture_of(&async_program(PENDING_ONCE), blaze_build::Panic::Abort), &abort),
+        ("statics", fixture(STATICS), &unwind),
+        ("fmt", fixture(FMT), &unwind),
+        ("dyn", fixture(DYN), &unwind),
+        ("macro entry", fixture(MACRO_ENTRY), &unwind),
+        ("local union", fixture(CATCH), &unwind),
+    ];
+    for (case, f, b) in cases.iter() {
+        let entry = fn_named(f, "main");
+        let (counts, equal, read_checked) = twin_walk(case, f, entry, b);
+        assert!(counts.made > 0, "{case}: the first walk makes: {counts}");
+        assert_eq!(equal, counts.make_calls(), "{case}: every make compared: {counts}");
+        assert_eq!(read_checked, 0, "{case}: the reading side checked a body");
+        println!("d106 typing oracle: {case} {counts}, {equal} entries equal, reading side checked {read_checked}");
+    }
+}
+
+/// A generic fn instantiated at a closure of ANOTHER fn: `apply::<{closure 0 of main}>`.
+const APPLY_CLOSURE: &str = "
+fn apply<F: FnOnce() -> u32>(f: F) -> u32 {
+    f() + 1
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let k = 40u32;
+    if apply(move || k) == 41 { 42 } else { 1 }
+}
+";
+
+/// An instance whose ARGUMENTS hold a closure of a fn this run found by its record: tempo's 44
+/// tests refused with "a closure whose facts the world did not answer (`LayoutFacts::closure`),
+/// met while listing the coroutines a value holds" (`LocalKey::try_with` at `<closure 0 of
+/// rand::rngs::thread::rng>`). run/make_one.rs `make_instance` checks each owner its instance's
+/// ground arguments hold (`held_owners`); before, it kept only the items the lazy program had a
+/// ROW for (`fn_index`), and a lazy program has no row for a fn until it is checked, so the
+/// owner was skipped and its closure's facts were never made.
+///
+/// (a) the first walk of [`APPLY_CLOSURE`] makes every instance (`main` checked by its own
+/// instance, before `apply`'s);
+/// (b) `apply`'s text edited (`f() + 1` to `1 + f()`, the same value) and walked again over the
+/// same store: `main`'s instance is FOUND (its text is unchanged), so only `apply::<{closure 0
+/// of main}>` is made, and its make checks `apply` and `main`, the closure's owner (two
+/// `check_one`s). Before the fix (b) failed the walk with the refusal above; (a) passed.
+/// CONTROL (c): the same edit over an EMPTY store makes every instance again, `main` checked by
+/// its own instance, as in (a).
+///
+/// Prints: `d106 closure owner held by arguments: first <counts>; edited <counts>, check_one 2; control <counts>`
+#[test]
+fn an_instance_at_another_fns_closure_checks_the_closures_owner() {
+    let b = builder_with(blaze_build::Panic::Abort);
+    let before = fixture_of(&async_program(APPLY_CLOSURE), blaze_build::Panic::Abort);
+    let ids = ids_of(&before, true);
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, _) = walk_keeping(&before, &ids, ids.entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "(a) every instance reached is made: {first}");
+    let edited = APPLY_CLOSURE.replace("    f() + 1\n", "    1 + f()\n");
+    assert_ne!(edited, APPLY_CLOSURE, "the edit applies");
+    let after = fixture_of(&async_program(&edited), blaze_build::Panic::Abort);
+    let ids = ids_of(&after, true);
+    let (again, maker) = walk_keeping(&after, &ids, ids.entry, &mut store, &b);
+    assert!(again.found > 0 && again.made > 0, "(b) `main` found, `apply`'s instance made: {again}");
+    let checks = maker.checks();
+    assert_eq!(checks.check_one, 2, "(b) `apply` and the closure's owner `main` checked: {checks:?}");
+    let (control, _) = walk_keeping(&after, &ids, ids.entry, &mut MemoryStore::new_in(alloc()), &b);
+    assert_eq!((control.found, control.made), (0, control.reached), "(c) control {control}");
+    println!("d106 closure owner held by arguments: first {first}; edited {again}, check_one {}; control {control}", checks.check_one);
 }

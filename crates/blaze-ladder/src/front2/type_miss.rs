@@ -22,6 +22,12 @@ use super::keys::checker_of;
 use super::source::NamesSource;
 use crate::resolve::{Kind, Ns, Paths};
 
+/// Whether the names library DECIDED that the path names nothing (the module docs: only then
+/// is a miss the program's error). [`TypeMiss::of`] maps exactly these reasons to words.
+pub fn decided(e: PathError) -> bool {
+    matches!(e.why, Why::NotFound | Why::Private | Why::Ambiguous | Why::NotAModule | Why::SuperPastRoot)
+}
+
 /// A written type of an item that names nothing: where (`at`, relative to the text the item's
 /// types were read from), the segment that failed as written (`name`), the miss in the
 /// checker's terms, and the finding's words.
@@ -39,6 +45,16 @@ impl TypeMiss {
     /// library did not decide, a path not written in the item's own text (an expansion's, past
     /// its end), a qualified path (`<T as Tr>::X`), or a prefix that does not resolve again here.
     pub fn of<'n, S: NamesSource<'n>>(names: S, text: &str, e: PathError, at: Range) -> Option<TypeMiss> {
+        TypeMiss::named(names, text, e, at, "type")
+    }
+
+    /// [`TypeMiss::of`] for a bound's trait path (rustc's E0405, "cannot find trait `Tr` in
+    /// this scope"): the same rule, the same decided reasons, the words naming a trait.
+    pub fn of_trait<'n, S: NamesSource<'n>>(names: S, text: &str, e: PathError, at: Range) -> Option<TypeMiss> {
+        TypeMiss::named(names, text, e, at, "trait")
+    }
+
+    fn named<'n, S: NamesSource<'n>>(names: S, text: &str, e: PathError, at: Range, what: &str) -> Option<TypeMiss> {
         let (why, reason) = match e.why {
             Why::NotFound => (tc::MissWhy::NotFound, "not found"),
             Why::Private => (tc::MissWhy::Private, "private"),
@@ -66,10 +82,10 @@ impl TypeMiss {
             }
         };
         let words = match (why, shown) {
-            (tc::MissWhy::NotFound, None) => format!("cannot find type `{name}` in this scope (segment {segment})"),
-            (tc::MissWhy::NotFound, Some(p)) => format!("cannot find type `{name}` in {p} (segment {segment})"),
-            (_, None) => format!("type `{name}` (segment {segment}) {reason} in this scope"),
-            (_, Some(p)) => format!("type `{name}` (segment {segment}) {reason} on {p}"),
+            (tc::MissWhy::NotFound, None) => format!("cannot find {what} `{name}` in this scope (segment {segment})"),
+            (tc::MissWhy::NotFound, Some(p)) => format!("cannot find {what} `{name}` in {p} (segment {segment})"),
+            (_, None) => format!("{what} `{name}` (segment {segment}) {reason} in this scope"),
+            (_, Some(p)) => format!("{what} `{name}` (segment {segment}) {reason} on {p}"),
         };
         Some(TypeMiss { at, name: Box::from(name), miss: tc::PathMiss::At { segment, after, why }, words: words.into_boxed_str() })
     }
@@ -77,6 +93,59 @@ impl TypeMiss {
     /// The finding's range, in the checker's terms.
     pub fn range(&self) -> tc::Range {
         tc::Range { start: self.at.start, end: self.at.end }
+    }
+
+    /// The miss of a written type as a fn's head keeps it ([`HeadMiss`]).
+    pub fn kept(&self) -> HeadMiss {
+        self.kept_as(MissOf::Type)
+    }
+
+    /// The miss as a fn's head keeps it, a type's (E0412) or a bound's trait's (E0405).
+    pub fn kept_as(&self, of: MissOf) -> HeadMiss {
+        HeadMiss { at: self.at, words: self.words.clone(), of }
+    }
+}
+
+/// What a head's miss failed to name: a written type (E0412) or a bound's trait (E0405).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissOf {
+    Type,
+    Trait,
+}
+
+impl MissOf {
+    /// Its finding's code.
+    pub fn code(self) -> tc::DiagCode {
+        match self {
+            MissOf::Type => tc::DiagCode::UnresolvedType,
+            MissOf::Trait => tc::DiagCode::UnresolvedTrait,
+        }
+    }
+}
+
+/// A signature's written type that names nothing, as its fn's head keeps it (front2 heads.rs
+/// `Store::type_misses`, and the head's record, which a body task's store is filed from): where
+/// (item-relative, in the fn's text) and the finding's words. The fn's OWN body check says it
+/// as the head's E0412 (front2 check.rs), once; a caller is checked against the rest of the
+/// head (the error type in the miss's place) and never says it. A bound whose trait names
+/// nothing is the head's E0405 the same way, the head made without that bound. A record
+/// carries no [`tc::PathMiss`]: nothing reads a head's miss but its finding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadMiss {
+    pub at: Range,
+    pub words: Box<str>,
+    pub of: MissOf,
+}
+
+impl HeadMiss {
+    /// The finding's range, in the checker's terms.
+    pub fn range(&self) -> tc::Range {
+        tc::Range { start: self.at.start, end: self.at.end }
+    }
+
+    /// The finding: its code, range and words.
+    pub fn finding(&self) -> (tc::DiagCode, tc::Range, Box<str>) {
+        (self.of.code(), self.range(), self.words.clone())
     }
 }
 

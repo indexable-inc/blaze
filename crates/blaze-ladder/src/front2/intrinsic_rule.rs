@@ -23,8 +23,8 @@
 //! holds is never built from its body, and a body is never asked for a name the table lacks
 //! unless the declaration carries one.
 //!
-//! The constant evaluator takes the same rule over its own table (front2/const_fn_fact.rs
-//! `head_fact`).
+//! The constant evaluator takes the same rule from the frozen fn head (front2/heads.rs
+//! `FnHead::const_call`).
 
 use core::fmt;
 use std::boxed::Box;

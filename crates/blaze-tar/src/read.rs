@@ -23,12 +23,15 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::Vec;
+use blaze_own::{
+    Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
     error::{Error, Field, Name, PathWhy, Why},
     path::{normalize, resolve, within},
-    plant::{self, Plant},
+    plant::TarPlant,
 };
 
 pub(crate) const BLOCK: usize = 512;
@@ -105,7 +108,10 @@ pub struct Step<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
+    /// A header block is being taken.
     Header,
+    /// One zero block was read: the block being taken must be zero too, the archive's end.
+    SecondZero,
     Meta { kind: u8, left: u64, pad: u64 },
     Body { left: u64, pad: u64 },
     Skip { left: u64 },
@@ -128,14 +134,13 @@ enum Out {
     End,
 }
 
-/// The tar reader: see the module.
-pub struct Reader<A: Allocator> {
+/// The tar reader: see the module. `P` is the plant seam (D165): shipped code names
+/// [`Reader`], this with [`NoPlant`].
+pub struct PlantedReader<A: Allocator, P> {
     limits: Limits,
     state: State,
     header: [u8; BLOCK],
     have: usize,
-    /// One zero block was read: the next must be zero too.
-    zero: bool,
     meta: Vec<u8, A>,
     /// A GNU or pax long path and link target for the next entry.
     long_path: Option<Vec<u8, A>>,
@@ -157,17 +162,27 @@ pub struct Reader<A: Allocator> {
     entries: u32,
     total: u64,
     alloc: A,
+    plant: P,
 }
 
-impl<A: Allocator + Clone> Reader<A> {
+/// The reader as it ships: [`PlantedReader`] with no plant.
+pub type Reader<A> = PlantedReader<A, NoPlant>;
+
+impl<A: Allocator + Clone> PlantedReader<A, NoPlant> {
     /// A reader held to `limits`, its buffers in `alloc`.
     pub fn new_in(limits: Limits, alloc: A) -> Reader<A> {
-        Reader {
+        PlantedReader::new_planted(limits, alloc, NoPlant)
+    }
+}
+
+impl<A: Allocator + Clone, P: Planted<TarPlant>> PlantedReader<A, P> {
+    /// [`Reader::new_in`] with its plant seam: `plant` is a control's [`TarPlant`].
+    pub fn new_planted(limits: Limits, alloc: A, plant: P) -> PlantedReader<A, P> {
+        PlantedReader {
             limits,
             state: State::Header,
             header: [0; BLOCK],
             have: 0,
-            zero: false,
             meta: Vec::new_in(alloc.clone()),
             long_path: None,
             long_link: None,
@@ -186,6 +201,7 @@ impl<A: Allocator + Clone> Reader<A> {
             entries: 0,
             total: 0,
             alloc,
+            plant,
         }
     }
 
@@ -209,7 +225,7 @@ impl<A: Allocator + Clone> Reader<A> {
             let rest = &input[*at..];
             match self.state {
                 State::End => return Ok(Out::End),
-                State::Header => {
+                State::Header | State::SecondZero => {
                     let n = (BLOCK - self.have).min(rest.len());
                     self.header[self.have..self.have + n].copy_from_slice(&rest[..n]);
                     self.have += n;
@@ -267,15 +283,15 @@ impl<A: Allocator + Clone> Reader<A> {
     /// A whole header block: an end block, a metadata header, or an entry (`Some`).
     fn header(&mut self) -> Result<Option<Out>, Why> {
         let h = &self.header;
+        let second = self.state == State::SecondZero;
         if h.iter().all(|&b| b == 0) {
-            if self.zero {
-                self.state = State::End;
-                return Ok(Some(Out::End));
-            }
-            self.zero = true;
-            return Ok(None);
+            self.state = match second {
+                true => State::End,
+                false => State::SecondZero,
+            };
+            return Ok(second.then_some(Out::End));
         }
-        if self.zero {
+        if second {
             return Err(Why::EndBlock);
         }
         self.path.clear();
@@ -344,7 +360,7 @@ impl<A: Allocator + Clone> Reader<A> {
         };
         // The name first, so a refusal from here on names the entry.
         self.path.try_extend_from_slice(&self.raw).map_err(Why::Alloc)?;
-        normalize(&self.raw, self.limits.most_path, &mut self.resolved)?;
+        normalize(&self.raw, self.limits.most_path, &mut self.resolved, self.plant)?;
         core::mem::swap(&mut self.path, &mut self.resolved);
         let file = self.tag == Tag::File;
         if file {
@@ -392,7 +408,7 @@ impl<A: Allocator + Clone> Reader<A> {
     fn link(&mut self) -> Result<(), Why> {
         match self.tag {
             Tag::HardLink => {
-                normalize(&self.target, self.limits.most_path, &mut self.resolved).map_err(|why| match why {
+                normalize(&self.target, self.limits.most_path, &mut self.resolved, self.plant).map_err(|why| match why {
                     Why::Path(why) => Why::Target(why),
                     other => other,
                 })?;
@@ -404,8 +420,8 @@ impl<A: Allocator + Clone> Reader<A> {
                 }
             }
             _ => {
-                let links = &self.links;
-                let through = |p: &[u8]| !plant::on(Plant::ThroughLinkUnchecked) && is_link(links, p);
+                let (links, plant) = (&self.links, self.plant);
+                let through = |p: &[u8]| !plant.has(TarPlant::ThroughLinkUnchecked) && is_link(links, p);
                 resolve(&self.path, &self.target, self.limits.most_path, through, &mut self.resolved)?;
                 // A link at a directory an earlier link's target runs through moves that target.
                 let path = &self.path;
@@ -425,7 +441,7 @@ impl<A: Allocator + Clone> Reader<A> {
 
     /// Whether `path` is, or runs through, an earlier symbolic link.
     fn through_link(&self, path: &[u8]) -> bool {
-        !plant::on(Plant::ThroughLinkUnchecked) && pairs(&self.links).any(|(link, _)| within(path, link))
+        !self.plant.has(TarPlant::ThroughLinkUnchecked) && pairs(&self.links).any(|(link, _)| within(path, link))
     }
 
     /// A metadata header's bytes taken into the next entry's extensions.
@@ -484,7 +500,7 @@ impl<A: Allocator + Clone> Reader<A> {
     }
 }
 
-impl<A: Allocator> Reader<A> {
+impl<A: Allocator, P> PlantedReader<A, P> {
     /// The input ended: an error unless the archive did.
     pub fn finish(&self) -> Result<(), Error> {
         match self.state {

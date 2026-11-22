@@ -25,7 +25,7 @@ use blaze_impls::{
     DepInput, DirectoryView, EdgeFlags, Edition, ImplFlags, ImplIndexError, ImplRead,
     ImplRecords, ImplRow,
     Incoherent, IntWidth, LangError, LangItem, LangItemsError, LangItemsView, LangName,
-    LangNameError, LangRead, LangRecords, MAX_LANG_NAME,
+    LangNameError, LangRead, LangRecords,
     Mutability, NoImplsOfView, RecordKind, SelfShape, Shape, build_crate_graph, build_impl_index,
     build_lang_items, candidates, inherent_candidates, lang_item,
 };

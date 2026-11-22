@@ -267,7 +267,11 @@ pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKe
         if v.text_at(a.path).map_err(|_| refuse())?.trim() != "link_name" {
             continue;
         }
-        if crate::front::unquote(v.text_at(a.args).map_err(|_| refuse())?) != shim.declared() {
+        // The value cooked as the native image reads it (links.rs `symbol_of`: a value written
+        // as a macro call is the names' row of the item, as the link table's).
+        let written = v.text_at(a.args).map_err(|_| refuse())?;
+        let values_at = super::links::values_key(names, store, h.lib);
+        if super::links::symbol_of(written, Some(values_at), |item| names.attr_value(item, "link_name"), edition, alloc).map_err(|_| refuse())? != shim.declared() {
             return Ok(None);
         }
     }

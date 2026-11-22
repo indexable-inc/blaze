@@ -11,7 +11,7 @@
 use core::fmt;
 
 use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, Target, TrapRow, TrapSource, Word};
-use blaze_lir::View;
+use blaze_lir::Verified;
 use blaze_lir::legalize::LegalizeError;
 use blaze_own::Alloc;
 
@@ -66,7 +66,7 @@ impl fmt::Display for RecordEmitError {
 
 impl core::error::Error for RecordEmitError {}
 
-/// Emits `func` (verified by `blaze_lir::verify`) as a code record in `alloc`, for the core
+/// Emits `func` (the proof `blaze_lir::verify` answered: D163) as a code record in `alloc`, for the core
 /// and system `isa` says: the record form of [`crate::emit`] (lib.rs, "The record form").
 /// Every reference place the function names is named through `names`; no `Via` is asked, since
 /// every call goes through its callee's import word.
@@ -78,7 +78,7 @@ impl core::error::Error for RecordEmitError {}
 /// which the caller declares as its callees. [`RoutinePlaces::NONE`]: an `f128` operation is
 /// refused naming its routine.
 pub fn emit_record<'a>(
-    func: View<'_>,
+    func: Verified<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
     isa: Isa,
@@ -91,7 +91,7 @@ pub fn emit_record<'a>(
 /// also the bytes of instructions at the code's start (what follows is the function's data
 /// rows holding no address: the tests check nothing else does).
 pub(crate) fn emit_record_up_to<'a>(
-    func: View<'_>,
+    func: Verified<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
     isa: Isa,
@@ -105,7 +105,7 @@ pub(crate) fn emit_record_up_to<'a>(
 /// `unreachable`'s `brk` (blaze-code record.rs `TrapRow`); an `unreachable` no source names
 /// gets no row.
 pub(crate) fn emit_record_sourced<'a>(
-    func: View<'_>,
+    func: Verified<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
     isa: Isa,
@@ -113,6 +113,8 @@ pub(crate) fn emit_record_sourced<'a>(
     traps: &[TrapSource],
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    // Below the entry the pass reads the view; the proof was the entry's to take (D163).
+    let func = func.view();
     // The Reference tier takes no vector, `f16` or `f128` arithmetic (INTRINSICS.md 3.2): a
     // function holding any is made scalar first, on a copy in `alloc`, with a reference row for
     // each routine `routines` binds (the rows legalize's calls name); one holding none is

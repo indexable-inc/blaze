@@ -54,7 +54,7 @@ fn world(rc_capture: bool) -> (Fx, ItemKey, ItemKey) {
     fx.lang(LangItem::Future, future);
     let u32_ = fx.u32();
     let p0 = fx.param(0);
-    let rc = fx.tuple_strukt("Rc", 1, &[p0]);
+    let rc = rc_in_scope(&mut fx, p0);
     let rc_p0 = fx.adt(rc, &[p0]);
     let not_send = fx.imp("impl !Send for Rc<T>", 1, rc_p0, Some((send, &[])), &[], Vec::new());
     fx.set_polarity(not_send, crate::world::ImplPolarity::Negative);
@@ -80,6 +80,86 @@ fn world(rc_capture: bool) -> (Fx, ItemKey, ItemKey) {
     let user = fx.func("user", 0, &[], unit, Vec::new());
     fx.finish();
     (fx, user, f)
+}
+
+/// The world above with one generic async fn, `async fn gf<T>(x: T) -> u32`: its hidden type
+/// is its coroutine 0 at its own parameter, `PNode::Coroutine { owner: gf, ordinal: 0, args:
+/// [T] }`, interior `(T,)`. A caller's goal reveals it at the call's argument, a term the
+/// solver makes (blaze-solve alias.rs `normalize_opaque_type`), not one this context made.
+fn generic_world() -> (Fx, ItemKey) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let send = fx.tr("Send", 1, Vec::new(), &[]);
+    fx.auto(send);
+    fx.lang(LangItem::Send, send);
+    let future = fx.tr("Future", 1, Vec::new(), &["Output"]);
+    fx.lang(LangItem::Future, future);
+    let u32_ = fx.u32();
+    let p0 = fx.param(0);
+    let rc = rc_in_scope(&mut fx, p0);
+    let rc_p0 = fx.adt(rc, &[p0]);
+    let not_send = fx.imp("impl !Send for Rc<T>", 1, rc_p0, Some((send, &[])), &[], Vec::new());
+    fx.set_polarity(not_send, crate::world::ImplPolarity::Negative);
+    let o = fx.opaque_key("gf::{opaque#0}");
+    let own = fx.list(&[p0]);
+    let opaque = fx.ty(PNode::Opaque(o, own));
+    let is_future = fx.bound(future, &[opaque]);
+    let out_u32 = fx.proj(future, &[opaque], "Output", u32_);
+    let is_sized = fx.bound(sized, &[opaque]);
+    fx.set_opaque_bounds(o, std::vec![is_future, out_u32, is_sized]);
+    let f = fx.func("gf", 1, &[p0], opaque, Vec::new());
+    let hidden = fx.ty(PNode::Coroutine { owner: f, ordinal: 0, args: own });
+    let interior = fx.tuple(&[p0]);
+    fx.hidden.push((o, hidden));
+    fx.coroutines.push((f, 0, u32_, interior));
+    let is_send = fx.bound(send, &[p0]);
+    let unit = fx.unit();
+    fx.func("need_send", 1, &[p0], unit, std::vec![is_send]);
+    let user = fx.func("user", 0, &[], unit, Vec::new());
+    fx.finish();
+    (fx, user)
+}
+
+/// `need_send(gf(Rc(1u32)))`: the unmet goal's why-chain passes through `gf`'s future at
+/// `[Rc<u32>]`, a coroutine the solver made revealing the opaque. A chain that cannot be built
+/// must never turn the decided answer into a refusal (the ladder's `spawn_held_guard` and
+/// `send_of_an_async_fn_follows_the_awaited_opaque` controls were refused with
+/// `Malformed(Unreadable { what: FutureUnmade })`: the step's goal named that coroutine, which
+/// `view` had no row for). The step's goal is filed first (infer/mod.rs `why_adopt`), or the
+/// chain ends at `NotKept`; either way one E0277 and no refusal (`check_body` panics on one).
+/// Should print: "test suite::coroutine_id::a_generic_async_fns_future_in_a_why_chain_is_no_refusal ... ok".
+#[test]
+fn a_generic_async_fns_future_in_a_why_chain_is_no_refusal() {
+    let (fx, user) = generic_world();
+    let (b, root, _) = caller(&fx, "gf", true);
+    let c = check_body(&fx, &b, user, root, Plant::None, InferPlant::None);
+    let unsatisfied: Vec<_> = c.diags.iter().filter(|d| d.code == DiagCode::Unsatisfied).collect();
+    assert_eq!(unsatisfied.len(), 1, "one E0277 for `Rc<u32>: Send` through `gf`'s future at `[Rc<u32>]`: {:?}", c.diags);
+    assert_eq!(c.diags.len(), 1, "the E0277 is the body's only diagnostic (every path resolves): {:?}", c.diags);
+    let why = unsatisfied[0].why.expect("the E0277 carries its chain (the steps it could build)");
+    assert!(c.why_of(why).is_some_and(|s| !s.is_empty()), "the chain's rows: {why:?}");
+}
+
+/// TWIN: `need_send(gf(1u32))`: the future at `[u32]` holds a `u32`, which is `Send`: clean.
+/// Should print: "test suite::coroutine_id::a_generic_async_fns_send_future_is_clean ... ok".
+#[test]
+fn a_generic_async_fns_send_future_is_clean() {
+    let (fx, user) = generic_world();
+    let (b, root, sent) = caller(&fx, "gf", false);
+    let c = check_body(&fx, &b, user, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(sent, "()")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// `struct Rc<T>(T);` with its ctor `Rc` in the value namespace, so the caller's `Rc(1u32)`
+/// resolves (`tuple_strukt` puts no path in scope). Without it the argument is an unresolved
+/// path: `gf`'s `T` is then the error type and no `Send` goal on `Rc<u32>` is ever asked.
+fn rc_in_scope(fx: &mut Fx, p0: crate::portable::PTy) -> ItemKey {
+    let rc = fx.tuple_strukt("Rc", 1, &[p0]);
+    fx.use_path("Rc", crate::world::Def::Ctor { adt: rc, variant: 0, kind: crate::world::CtorKind::Tuple });
+    rc
 }
 
 /// `{ need_send(NAME(ARG)); }` as `user`'s body; `ARG` is `1u32` for `af` and a path to a

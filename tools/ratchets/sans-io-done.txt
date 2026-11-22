@@ -1,0 +1,6 @@
+# The crates that claim C7 (D170, docs/v2/plan/design/end-state.md), one a line by its directory
+# under crates/. `{"command": "sansio-check"}` of scripts/src/bin/ambient.rs holds each at 0 in
+# every column of tools/ratchets/sans-io.txt, with no row in tools/ratchets/third-party.txt, and
+# its root denying `blaze::std_use`, `blaze::implicit_allocator`, `blaze::process_static` and, for
+# a core (`#![blaze::sans_io]`), `blaze::sans_io_core`. A crate is added by the change that makes
+# it so, never by hand ahead of it; a crate is never taken off.

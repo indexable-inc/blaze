@@ -381,7 +381,7 @@ impl<'a> Emitter<'a> {
         want: List,
     ) -> Result<(), NotCertifiable> {
         let h = ask.impl_header(&mut self.reads, impl_).map_err(NotCertifiable::Stop)?;
-        let vars = coherence::fresh_for(tys, &h, self.alloc).map_err(se)?;
+        let vars = coherence::fresh_for(tys, &mut self.scratch, &h, self.alloc).map_err(se)?;
         let header = import_list(tys, &mut self.scratch, h.portable, h.args, &vars, &mut self.list).map_err(se)?;
         let mismatch = NotCertifiable::Refused(CheckError::HeaderMismatch { step, impl_ });
         if header.len > want.len {

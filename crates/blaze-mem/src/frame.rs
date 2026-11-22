@@ -185,6 +185,8 @@ pub struct Frame {
     lent: Cell<bool>,
     /// The bytes an outer task's frame lent this one, `start..end`; empty when none.
     window: (usize, usize),
+    /// The use before the last allocation the frame refused, until the caller takes it or reset.
+    exhaustion: Cell<Option<usize>>,
     /// [`sealed`] of `id` while the frame is alive, [`UNSEALED`] once dropped: what [`task`]
     /// checks of the frame a thread says encloses it before using it.
     seal: Cell<u64>,
@@ -253,6 +255,7 @@ impl Frame {
             task,
             lent: Cell::new(false),
             window: (0, 0),
+            exhaustion: Cell::new(None),
             seal: Cell::new(sealed(id)),
             opened_at: Location::caller(),
             ended_on: Cell::new(0),
@@ -387,11 +390,17 @@ impl Frame {
     }
 
     fn exhausted(&self, more: usize) -> MemError {
+        self.exhaustion.set(Some(self.used()));
         MemError::Exhausted {
             tag: self.tag.get(),
             reserved: self.limit,
             wanted: self.used().saturating_add(more),
         }
+    }
+
+    /// Takes the use remembered when the frame last refused an allocation.
+    pub fn take_exhaustion(&self) -> Option<usize> {
+        self.exhaustion.take()
     }
 
     /// Makes the current block one `layout` fits in at the cursor: the current span grown, a
@@ -776,6 +785,7 @@ impl Frame {
         self.copied.set(0);
         self.abandons.set(0);
         self.abandoned.set(0);
+        self.exhaustion.set(None);
     }
 
     /// Runs `f` with this frame and frees what it allocated once it returns. What `f` returns
@@ -1165,6 +1175,13 @@ struct Stack {
     heap: Cell<Option<Tag>>,
 }
 
+// D171: this shelf is per-worker state held by the thread, the form the workers' cells
+// (bstd's `workers`) replace. It moves when its callers can reach a worker cell: the shelf
+// becomes a `Shelf` value in the worker's own fields, `task` and `heap_of` take `&Shelf`
+// handed by their driver (`cx.on_worker(|w| frame::task_on(w.shelf(), tag, ..))`), and this
+// `thread_local!` is deleted with the last caller. The global allocator's hook (`heap_of`'s
+// tag, read inside `GlobalAlloc`) is the one exception: an allocator has no context, so its
+// named thread-local stays (C3).
 thread_local! {
     static SHELF_OF: Shelf = const {
         Shelf {
@@ -1788,5 +1805,26 @@ mod tests {
             task(Tag::Other, |_| STACK.with(|stack| stack.current.get()) != at)
         });
         assert!(inner, "the inner task's frame is current inside it");
+    }
+
+    #[test]
+    fn an_exhaustion_is_taken_once_and_reset_clears_it() {
+        let mut frame = Frame::with_reserve(64, Tag::Other).expect("a small frame");
+        let fitting = Layout::from_size_align(32, 1).expect("a layout");
+        let too_large = Layout::from_size_align(40, 1).expect("a layout");
+        assert!(frame.try_alloc_layout(fitting).is_ok());
+        assert_eq!(frame.take_exhaustion(), None, "a fitting allocation leaves no exhaustion");
+
+        let used = frame.used();
+        assert!(frame.try_alloc_layout(too_large).is_err(), "the frame refuses past its reserve");
+        assert_eq!(frame.used(), used, "a refused allocation does not advance the frame");
+        assert_eq!(frame.take_exhaustion(), Some(used), "the refused allocation records its use");
+        assert_eq!(frame.take_exhaustion(), None, "taking exhaustion clears it");
+
+        assert!(frame.try_alloc_layout(too_large).is_err(), "a second allocation is refused");
+        frame.reset();
+        assert_eq!(frame.take_exhaustion(), None, "reset clears an unconsumed exhaustion");
+        assert!(frame.try_alloc_layout(fitting).is_ok());
+        assert_eq!(frame.take_exhaustion(), None, "a fitting allocation after reset leaves none");
     }
 }

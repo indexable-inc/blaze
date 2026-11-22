@@ -47,12 +47,22 @@ const SPAN_EVERY: usize = 256;
 const SPAN_BYTES: usize = 4 << 20;
 
 fn rusage() -> (f64, f64, u64) {
-    // SAFETY: `getrusage` fills the struct it is given; zero is a valid one to start from.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: as above, a live struct of ours.
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) };
-    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
-    (secs(usage.ru_utime), secs(usage.ru_stime), usage.ru_minflt as u64)
+    let Ok(usage) = blaze_sys::posix::thread::process_rusage() else {
+        return (-1.0, -1.0, 0);
+    };
+    #[cfg(target_os = "linux")]
+    let (user, system, faults) = (
+        usage.user[0] as f64 + usage.user[1] as f64 / 1e6,
+        usage.system[0] as f64 + usage.system[1] as f64 / 1e6,
+        usage.rest[3] as u64,
+    );
+    #[cfg(target_os = "macos")]
+    let (user, system, faults) = (
+        usage.user.sec as f64 + usage.user.usec as f64 / 1e6,
+        usage.system.sec as f64 + usage.system.usec as f64 / 1e6,
+        usage.minflt as u64,
+    );
+    (user, system, faults)
 }
 
 fn main() {

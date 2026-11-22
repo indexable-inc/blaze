@@ -9,7 +9,7 @@
 
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -227,7 +227,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
         let features = names(&self.features, &mut strings)?;
         let macro_use = Vec::from_iter_in(self.macro_use.iter().map(|key| key.0), alloc);
 
-        let mut out = Writer::new_in(<CrateRootRoot as Record>::SCHEMA, alloc);
+        let mut out = Writer::new(WriterOpts { schema: <CrateRootRoot as Record>::SCHEMA, alloc: alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let externs = Column::push(&mut out, &externs);
         let deps = Column::push(&mut out, &deps);

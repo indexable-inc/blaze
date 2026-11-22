@@ -10,8 +10,8 @@
 //!
 //! A buffer starts with a [`Header`] naming its [`SchemaHash`]: a reader of another schema
 //! refuses it by name ([`FormatError::Schema`]) and the daemon rebuilds what it held from the
-//! store's results. A `Persist` type (the `alloc` feature) is one a query can return: written
-//! once into a buffer, read in place as its `Persist::Ref`.
+//! store's results. A [`Persist`] type is one a query can return: written once into a buffer
+//! in an allocator its caller names, read in place as its `Persist::Ref`.
 //!
 //! A reference always points at bytes written before the record that holds it: a [`Writer`]
 //! writes children first and the root last. [`Record::check`] refuses any other reference, so
@@ -23,12 +23,19 @@
 //!
 //! # `core` only
 //!
-//! With no feature on, this crate is `#![no_std]` with no `extern crate alloc`, and the
-//! expansion of [`record!`] names `::core` and this crate only, with no `unsafe` (the
-//! [`declared`] module says why that is sound): a `#![no_std]` crate that forbids
-//! `unsafe_code` declares, writes ([`Writer`]`<`[`Own`]`<A>>`, into `blaze_own::Vec<u8, A>`) and
-//! reads records. The `alloc` feature adds `alloc`'s `Vec` as a writer's buffer and what is
-//! defined over it; the `serde` feature, serde's forms of three types.
+//! With no feature on, this crate is `#![no_std]` with no `extern crate alloc`, nothing here
+//! names `Global`, and the expansion of [`record!`] names `::core` and this crate only, with no
+//! `unsafe` (the [`declared`] module says why that is sound): a `#![no_std]` crate that forbids
+//! `unsafe_code` declares, writes ([`Writer`]`<`[`Own`]`<A>>`, made by [`Writer::new`] with the
+//! allocator named, into `blaze_own::Vec<u8, A>`), persists ([`Persist`], [`to_bytes`]) and
+//! reads records. The `alloc` feature adds `alloc`'s `Vec<u8, A>` as a writer's buffer, still in
+//! a named allocator, for the crates not yet moved off it, and the two deprecated items on the
+//! global heap that callers not yet ported use (`Writer::on_the_global_heap_until_ported`,
+//! `Aligned`).
+//!
+//! The core is sans-IO: it reaches no clock, environment or IO. `#![blaze::sans_io]` is on each
+//! module, not the root, for the reason the root's comment gives; `declared.rs` and
+//! `verified.rs`, which define the exported macros, carry it nowhere for the same reason.
 //!
 //! # Nightly features
 //!
@@ -38,12 +45,19 @@
 //! | `const_cmp`, `const_trait_impl` | comparing two `TypeId`s in a constant |
 #![no_std]
 #![feature(type_info, const_cmp, const_trait_impl)]
-// No `#![blaze::trust(unsafe, ..)]` here, though the crate holds `unsafe` (`raw.rs`, the
-// impls of `Record` here and in `declared.rs`): rustc treats a crate whose root carries a tool
-// inner attribute as macro-expanded, and then refuses `$crate::__record_fields!`, the recursion
-// `record!` builds its field list with (`macro_expanded_macro_exports_accessed_by_absolute_paths`,
-// rust-lang/rust#52234). The lint that asks for it, `blaze::workspace_unsafe`, is allow.
+// `register_tool` for `#[blaze::args]` (writer.rs) and each module's `#![blaze::sans_io]`.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// No `#![blaze::trust(unsafe, ..)]` and no `#![blaze::sans_io]` here, though the crate holds
+// `unsafe` (`raw.rs`, the impls of `Record` here and in `declared.rs`) and is a sans-IO core:
+// rustc treats a crate whose root carries a tool inner attribute as macro-expanded, and then
+// refuses `$crate::__record_fields!`, the recursion `record!` builds its field list with
+// (`macro_expanded_macro_exports_accessed_by_absolute_paths`, rust-lang/rust#52234). The lint
+// that asks for the first, `blaze::workspace_unsafe`, is allow; the second is on each module that
+// defines no exported macro (as blaze-sim does).
+#![deny(blaze::sans_io_core)]
 
+// Only `alloc`'s `Vec<u8, A>` as a writer's buffer and the two deprecated global-heap items.
 #[cfg(feature = "alloc")]
 extern crate alloc;
 // Tests use std's collections and printing; the crate itself never sees `std`.
@@ -61,6 +75,8 @@ mod verified;
 mod writer;
 #[cfg(test)]
 mod verified_tests;
+#[cfg(test)]
+mod writer_tests;
 
 use core::{
     alloc::Allocator,
@@ -75,9 +91,13 @@ pub use crate::offset::{Offset, Unfit};
 pub use crate::placed::Placed;
 pub use crate::verified::{Items, Text, Verified};
 pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};
-pub use crate::writer::{Own, WriteBuffer, Writer, WriterIn};
+pub use crate::writer::{
+    AlignedIn, Own, Persist, WRITER_CAPACITY, WriteBuffer, Writer, WriterIn, WriterOpts,
+    read_verified, to_bytes,
+};
+// Deprecated, on the global heap: for the callers not yet ported (writer.rs says which).
 #[cfg(feature = "alloc")]
-pub use crate::writer::{Aligned, Persist, read_verified, to_bytes};
+pub use crate::writer::Aligned;
 
 #[cfg(target_endian = "big")]
 compile_error!("blaze's format is little-endian, as every target blaze runs on is");

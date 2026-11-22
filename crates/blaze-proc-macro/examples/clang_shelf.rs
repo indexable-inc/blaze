@@ -1,7 +1,7 @@
 //! D69: fetches the pinned C toolchain archive for this host to blaze's shelf, once.
 //!
 //! `clang_shelf <shelf>`: `<shelf>` is `<home>/.blaze/v2/toolchain/clang` (made by the caller).
-//! The archive named by `crates/blaze-toolchain/pins/clang.json`'s row for this host is asked over
+//! The archive named by `pins/clang.json`'s row for this host is asked over
 //! HTTPS with blaze-http (redirects followed, HTTPS only, the body held to the pinned size and
 //! streamed, never whole in memory) into `incoming/<sha256>.tar.xz.part` through the effect
 //! layer, its SHA-256 computed as it comes. The size and the digest are checked BEFORE the file
@@ -10,7 +10,8 @@
 
 use std::{process::ExitCode, time::Duration};
 
-use blaze_build_script::toolchain::{PIN, PIN_PATH, clang_pin};
+use blaze_build_script::toolchain::clang_pin;
+use blaze_pins::{CLANG_JSON, CLANG_PATH};
 use blaze_http::{Event, Method, Request, driver::Handle};
 use blaze_proc_macro::record::native_world;
 use bstd::{fs::Durable, mem::TASK_FRAME, path::Path as BPath};
@@ -33,7 +34,7 @@ fn main() -> ExitCode {
         eprintln!("usage: clang_shelf <home>/.blaze/v2/toolchain/clang");
         return ExitCode::from(2);
     };
-    let pin = clang_pin(PIN, HOST).unwrap_or_else(|error| panic!("{error}"));
+    let pin = clang_pin(CLANG_JSON, HOST).unwrap_or_else(|error| panic!("{error}"));
     let want = hex(&pin.sha256);
     let url = format!("{}/{}", pin.release, pin.name);
     let (io, root) = native_world(std::path::Path::new(shelf)).unwrap_or_else(|error| panic!("the shelf {shelf}: {error}"));
@@ -91,12 +92,12 @@ fn main() -> ExitCode {
     if got != pin.size || digest != want {
         root.remove(&cx(), &part, Durable::Yes).unwrap_or_else(|error| panic!("{shelf}/{part_name}: {error}"));
         eprintln!(
-            "{url}: REFUSED (D69): {got} bytes with sha256 {digest}, but {PIN_PATH} pins {} bytes with sha256 {want}; the file is removed, nothing was unpacked",
+            "{url}: REFUSED (D69): {got} bytes with sha256 {digest}, but {CLANG_PATH} pins {} bytes with sha256 {want}; the file is removed, nothing was unpacked",
             pin.size
         );
         return ExitCode::FAILURE;
     }
     root.rename_replacing_synced(&cx(), &part, &done).unwrap_or_else(|error| panic!("{shelf}/{done_name}: {error}"));
-    println!("digest ok: {got} bytes, sha256 {digest} = {PIN_PATH}'s {HOST} pin; kept as {shelf}/{done_name} in {:.1?}", started.elapsed());
+    println!("digest ok: {got} bytes, sha256 {digest} = {CLANG_PATH}'s {HOST} pin; kept as {shelf}/{done_name} in {:.1?}", started.elapsed());
     ExitCode::SUCCESS
 }

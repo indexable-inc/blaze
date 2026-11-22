@@ -21,16 +21,74 @@
 //! - `reused:` no offset of the area is handed out twice;
 //! - `decommit:` no page is given back while something live is in it;
 //! - `leak:` once every thread has reported an empty stack, everything unlinked is freed.
+//!
+//! Each is a value of [`Kind`], and a control names the one its plant must break by that value
+//! (D165), never by the text.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 
+use blaze_own::Alloc;
 use blaze_sim::Tape;
 
-use crate::launch::Plant;
+use crate::launch::LaunchPlant as Plant;
 use crate::{
-    Bind, CodeId, Config, Edit, Frame, FrameKind, KEPT, Kept, Launch, Range, Slot, Target, Thread,
-    Tier, Txn, Write,
+    Bind, CodeId, Config, Edit, Error, Frame, FrameKind, Launch, Range, Slot, Target, Thread, Tier,
+    Txn, Write,
 };
+
+/// Which promise a run broke, or which call the core refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Freed,
+    Word,
+    Together,
+    Abort,
+    Reused,
+    Decommit,
+    Leak,
+    Epoch,
+    /// The core refused `call`, which the machine made only where the core allows it.
+    Refused { call: &'static str, why: Error },
+}
+
+/// What the oracle found: its kind, and the machine's account of it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Found {
+    kind: Kind,
+    what: String,
+}
+
+impl fmt::Display for Found {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.kind {
+            Kind::Freed => "freed",
+            Kind::Word => "word",
+            Kind::Together => "together",
+            Kind::Abort => "abort",
+            Kind::Reused => "reused",
+            Kind::Decommit => "decommit",
+            Kind::Leak => "leak",
+            Kind::Epoch => "epoch",
+            Kind::Refused { call, why } => return write!(f, "{call}: {why}{}", self.what),
+        };
+        write!(f, "{name}: {}", self.what)
+    }
+}
+
+fn found(kind: Kind, what: String) -> Found {
+    Found { kind, what }
+}
+
+/// The core's refusal of `call`, as a finding.
+fn refused(call: &'static str) -> impl FnOnce(Error) -> Found {
+    move |why| Found { kind: Kind::Refused { call, why }, what: String::new() }
+}
+
+/// The run's allocator: the tests' root heap (D170 C1).
+fn alloc() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
+}
 
 const SLOTS: u32 = 6;
 const MOST_THREADS: usize = 4;
@@ -137,8 +195,8 @@ struct StagedEdit {
 }
 
 struct Sim {
-    launch: Launch,
-    out: Vec<Write, Kept>,
+    launch: Launch<Alloc<'static>, Plant>,
+    out: Vec<Write, Alloc<'static>>,
     // The process's memory, as the driver wrote it.
     words: Vec<Target>,
     epoch: u64,
@@ -167,10 +225,9 @@ struct Sim {
 }
 
 impl Sim {
-    fn new(plant: Plant) -> Result<Sim, String> {
-        let alloc = KEPT;
-        let mut launch = Launch::new(CONFIG, alloc).map_err(|it| format!("new: {it}"))?;
-        launch.plant = plant;
+    fn new(plant: Plant) -> Result<Sim, Found> {
+        let alloc = alloc();
+        let launch = Launch::planted(CONFIG, alloc, plant).map_err(refused("new"))?;
         let mut sim = Sim {
             launch,
             out: Vec::new_in(alloc),
@@ -198,19 +255,22 @@ impl Sim {
             history: vec![Vec::new(); SLOTS as usize],
             next_version: 1,
         };
-        sim.launch.declare(SLOTS, &mut sim.out).map_err(|it| format!("declare: {it}"))?;
+        sim.launch.declare(SLOTS, &mut sim.out).map_err(refused("declare"))?;
         sim.queue();
         sim.flush()?;
-        sim.launch.thread_began(Thread(0), 0).map_err(|it| format!("birth: {it}"))?;
+        sim.launch.thread_began(Thread(0), 0).map_err(refused("birth"))?;
         Ok(sim)
     }
 
     /// Moves what the core just handed out onto the control thread's queue.
     fn queue(&mut self) {
-        self.pending.extend(self.out.drain(..));
+        // Not `drain`: std's `Vec::drain` needs `AllocatorNightly`, which `Alloc` lacks; the
+        // core's `Out` is std's `Vec`, and `Write` is `Copy`.
+        self.pending.extend(self.out.iter().copied());
+        self.out.clear();
     }
 
-    fn flush(&mut self) -> Result<(), String> {
+    fn flush(&mut self) -> Result<(), Found> {
         while let Some(write) = self.pending.pop_front() {
             self.apply(write)?;
         }
@@ -218,11 +278,11 @@ impl Sim {
     }
 
     /// A range the core handed out for code.
-    fn hand(&mut self, range: Range) -> Result<(), String> {
+    fn hand(&mut self, range: Range) -> Result<(), Found> {
         if range.at < self.handed {
-            return Err(format!(
-                "reused: {range:?} was handed out though the area was handed out to {}",
-                self.handed
+            return Err(found(
+                Kind::Reused,
+                format!("{range:?} was handed out though the area was handed out to {}", self.handed),
             ));
         }
         self.handed = range.end();
@@ -232,7 +292,7 @@ impl Sim {
     }
 
     /// The control thread carries out one write.
-    fn apply(&mut self, write: Write) -> Result<(), String> {
+    fn apply(&mut self, write: Write) -> Result<(), Found> {
         match write {
             Write::Place { range, .. } => self.hand(range)?,
             Write::Gate { range, .. } => {
@@ -240,7 +300,10 @@ impl Sim {
                 self.flags.insert(range.at, false);
             }
             Write::GateEntry { gate, entry, old, new } => {
-                let staged = self.staged.as_ref().ok_or("word: a gate entry with no staged edit")?;
+                let staged = self
+                    .staged
+                    .as_ref()
+                    .ok_or_else(|| found(Kind::Word, String::from("a gate entry with no staged edit")))?;
                 let slot = staged.binds[entry as usize].slot;
                 self.entries.insert((gate.at, entry), (slot, old, new));
             }
@@ -256,24 +319,24 @@ impl Sim {
             }
             Write::Epoch { epoch } => {
                 if epoch <= self.epoch {
-                    return Err(format!("epoch: {epoch} published after {}", self.epoch));
+                    return Err(found(Kind::Epoch, format!("{epoch} published after {}", self.epoch)));
                 }
                 self.epoch = epoch;
             }
             Write::Forget { range } => {
                 if self.live.remove(&range.at) != Some(range) {
-                    return Err(format!("freed: {range:?} was freed twice or never handed out"));
+                    return Err(found(Kind::Freed, format!("{range:?} was freed twice or never handed out")));
                 }
                 self.freed.push(range);
             }
             Write::Decommit { range } => {
                 if range.at % CONFIG.page != 0 || range.len % CONFIG.page != 0 || range.len == 0 {
-                    return Err(format!("decommit: {range:?} is not whole pages"));
+                    return Err(found(Kind::Decommit, format!("{range:?} is not whole pages")));
                 }
                 if let Some(live) =
                     self.live.values().find(|it| it.at < range.end() && range.at < it.end())
                 {
-                    return Err(format!("decommit: {range:?} given back with {live:?} live in it"));
+                    return Err(found(Kind::Decommit, format!("{range:?} given back with {live:?} live in it")));
                 }
             }
         }
@@ -281,15 +344,15 @@ impl Sim {
     }
 
     /// A thread arrives in a body.
-    fn land(&mut self, thread: usize, range: Range) -> Result<(), String> {
+    fn land(&mut self, thread: usize, range: Range) -> Result<(), Found> {
         if !self.written.contains(&range.at) {
-            return Err(format!("word: thread {thread} entered {range:?}, which was not written"));
+            return Err(found(Kind::Word, format!("thread {thread} entered {range:?}, which was not written")));
         }
         if self.freed.contains(&range) {
-            return Err(format!("freed: thread {thread} entered {range:?}, which was freed"));
+            return Err(found(Kind::Freed, format!("thread {thread} entered {range:?}, which was freed")));
         }
         let Some(&(slot, version)) = self.versions.get(&range.at) else {
-            return Err(format!("word: thread {thread} entered {range:?}, which no commit bound"));
+            return Err(found(Kind::Word, format!("thread {thread} entered {range:?}, which no commit bound")));
         };
         let next = self.history[slot.0 as usize]
             .iter()
@@ -298,10 +361,13 @@ impl Sim {
             .unwrap_or(u64::MAX);
         let actor = &mut self.actors[thread];
         if next <= actor.low {
-            return Err(format!(
-                "together: thread {thread} ran slot {} as of version {version}, which version \
-                 {next} replaced, after it ran a function of version {}",
-                slot.0, actor.low
+            return Err(found(
+                Kind::Together,
+                format!(
+                    "thread {thread} ran slot {} as of version {version}, which version {next} \
+                     replaced, after it ran a function of version {}",
+                    slot.0, actor.low
+                ),
             ));
         }
         actor.low = actor.low.max(version);
@@ -310,14 +376,14 @@ impl Sim {
         Ok(())
     }
 
-    fn drain_births(&mut self) -> Result<(), String> {
+    fn drain_births(&mut self) -> Result<(), Found> {
         for (thread, epoch) in std::mem::take(&mut self.births) {
-            self.launch.thread_began(thread, epoch).map_err(|it| format!("birth: {it}"))?;
+            self.launch.thread_began(thread, epoch).map_err(refused("birth"))?;
         }
         Ok(())
     }
 
-    fn step(&mut self, op: Op) -> Result<(), String> {
+    fn step(&mut self, op: Op) -> Result<(), Found> {
         match op {
             Op::Call(thread, slot) => {
                 let Some(actor) = self.actors.get_mut(thread) else { return Ok(()) };
@@ -333,9 +399,9 @@ impl Sim {
                     At::Loaded { to: Target::Body(body), .. } => self.land(thread, body)?,
                     At::Loaded { to: Target::Gate { gate, entry }, .. } => {
                         if !self.written.contains(&gate.at) {
-                            return Err(format!(
-                                "word: thread {thread} entered a gate at {}, which was not written",
-                                gate.at
+                            return Err(found(
+                                Kind::Word,
+                                format!("thread {thread} entered a gate at {}, which was not written", gate.at),
                             ));
                         }
                         actor.at = At::Gate { gate, entry, decided: None };
@@ -347,10 +413,13 @@ impl Sim {
                     }
                     At::Gate { gate, entry, decided: Some(new) } => {
                         let Some(&(slot, old, body)) = self.entries.get(&(gate.at, entry)) else {
-                            return Err(format!(
-                                "word: thread {thread} is in entry {entry} of the gate at {}, \
-                                 which was not written",
-                                gate.at
+                            return Err(found(
+                                Kind::Word,
+                                format!(
+                                    "thread {thread} is in entry {entry} of the gate at {}, which was not \
+                                     written",
+                                    gate.at
+                                ),
                             ));
                         };
                         let to = if new { Target::Body(body) } else { old };
@@ -358,10 +427,7 @@ impl Sim {
                             Target::Body(body) => self.land(thread, body)?,
                             Target::Stub => actor.at = At::Stub(slot),
                             Target::Gate { .. } => {
-                                return Err(format!(
-                                    "word: the gate at {} leads to a gate",
-                                    gate.at
-                                ));
+                                return Err(found(Kind::Word, format!("the gate at {} leads to a gate", gate.at)));
                             }
                         }
                     }
@@ -437,7 +503,7 @@ impl Sim {
                     .collect();
                 self.launch
                     .stage(&Edit { txn, binds: &binds, together }, &mut self.out)
-                    .map_err(|it| format!("stage: {it}"))?;
+                    .map_err(refused("stage"))?;
                 let ranges = self
                     .out
                     .iter()
@@ -457,11 +523,11 @@ impl Sim {
                     return Ok(());
                 }
                 let Some(staged) = self.staged.take() else { return Ok(()) };
-                self.launch.abort(staged.txn, &mut self.out).map_err(|it| format!("abort: {it}"))?;
+                self.launch.abort(staged.txn, &mut self.out).map_err(refused("abort"))?;
                 if self.out.iter().any(|it| matches!(it, Write::Slot { .. } | Write::Commit { .. }))
                     || self.words != staged.words
                 {
-                    return Err(format!("abort: edit {} changed a word", staged.txn.0));
+                    return Err(found(Kind::Abort, format!("edit {} changed a word", staged.txn.0)));
                 }
                 self.queue();
             }
@@ -472,7 +538,7 @@ impl Sim {
                 let Some(staged) = self.staged.take() else { return Ok(()) };
                 self.launch
                     .commit(staged.txn, &mut self.out)
-                    .map_err(|it| format!("commit: {it}"))?;
+                    .map_err(refused("commit"))?;
                 // The oracle's versions: one for binds that switch together, else one a bind,
                 // in the order their words are stored.
                 let mut version = self.next_version;
@@ -498,9 +564,9 @@ impl Sim {
                     Some(Msg::Report { thread, epoch, frames, complete }) => self
                         .launch
                         .report(thread, epoch, &frames, complete)
-                        .map_err(|it| format!("report: {it}"))?,
+                        .map_err(refused("report"))?,
                     Some(Msg::Ended(thread)) => {
-                        self.launch.thread_ended(thread).map_err(|it| format!("ended: {it}"))?;
+                        self.launch.thread_ended(thread).map_err(refused("ended"))?;
                     }
                     None => {}
                 }
@@ -512,7 +578,7 @@ impl Sim {
                     self.drain_births()?;
                     self.launch
                         .report(id, self.epoch, &frames, true)
-                        .map_err(|it| format!("scan: {it}"))?;
+                        .map_err(refused("scan"))?;
                 }
             }
             Op::Collect => {
@@ -525,17 +591,15 @@ impl Sim {
     }
 
     /// What must hold after every step.
-    fn check(&self) -> Result<(), String> {
+    fn check(&self) -> Result<(), Found> {
         for (thread, actor) in self.actors.iter().enumerate() {
             if let Some(body) = actor.stack.iter().find(|it| self.freed.contains(it)) {
-                return Err(format!(
-                    "freed: thread {thread} has a frame in {body:?}, which was freed"
-                ));
+                return Err(found(Kind::Freed, format!("thread {thread} has a frame in {body:?}, which was freed")));
             }
             if let At::Gate { gate, .. } = actor.at
                 && self.freed.contains(&gate)
             {
-                return Err(format!("freed: thread {thread} is in the gate {gate:?}, freed"));
+                return Err(found(Kind::Freed, format!("thread {thread} is in the gate {gate:?}, freed")));
             }
         }
         Ok(())
@@ -543,7 +607,7 @@ impl Sim {
 
     /// The end of a run: every thread leaves all code and reports, and then nothing unlinked
     /// may be left.
-    fn settle(&mut self) -> Result<(), String> {
+    fn settle(&mut self) -> Result<(), Found> {
         self.flush()?;
         self.step(Op::Abort)?;
         self.flush()?;
@@ -565,31 +629,32 @@ impl Sim {
         self.flush()?;
         self.check()?;
         if self.launch.waiting() != 0 {
-            return Err(format!(
-                "leak: {} batches wait though every thread reported an empty stack",
-                self.launch.waiting()
+            return Err(found(
+                Kind::Leak,
+                format!("{} batches wait though every thread reported an empty stack", self.launch.waiting()),
             ));
         }
         let bound = self.words.iter().filter(|it| matches!(it, Target::Body(_))).count();
         if self.live.len() != bound {
-            return Err(format!(
-                "leak: {} ranges are live for {bound} bound bodies",
-                self.live.len()
-            ));
+            return Err(found(Kind::Leak, format!("{} ranges are live for {bound} bound bodies", self.live.len())));
         }
         Ok(())
     }
 }
 
 /// Runs a schedule against the core with `plant`, checking the oracle after every step.
-fn run(ops: &[Op], plant: Plant) -> Result<(), String> {
+fn run(ops: &[Op], plant: Plant) -> Result<(), Found> {
     let mut sim = Sim::new(plant)?;
     for (index, op) in ops.iter().enumerate() {
-        sim.step(*op)
-            .and_then(|()| sim.check())
-            .map_err(|why| format!("{why} (op {index}: {op:?})"))?;
+        sim.step(*op).and_then(|()| sim.check()).map_err(|mut why| {
+            why.what.push_str(&format!(" (op {index}: {op:?})"));
+            why
+        })?;
     }
-    sim.settle().map_err(|why| format!("{why} (settling)"))
+    sim.settle().map_err(|mut why| {
+        why.what.push_str(" (settling)");
+        why
+    })
 }
 
 fn pick(tape: &Tape, max: usize, label: &'static str) -> usize {
@@ -635,16 +700,16 @@ fn op(tape: &Tape) -> Op {
 fn no_schedule_breaks_what_the_core_promises() {
     blaze_sim::check(blaze_sim::Config::cases(400), |tape| {
         let ops = tape.vec(1..=160, "ops", op);
-        run(&ops, Plant::None)
+        run(&ops, Plant::None).map_err(|why| why.to_string())
     });
 }
 
-/// A control: the schedule passes on the core as it is, and with `plant` the oracle names
-/// `finding`.
-fn the_oracle_catches(ops: &[Op], plant: Plant, finding: &str) {
+/// A control: the schedule passes on the core as it is, and with `plant` the oracle finds a
+/// break of `finding`.
+fn the_oracle_catches(ops: &[Op], plant: Plant, finding: Kind) {
     assert_eq!(run(ops, Plant::None), Ok(()), "the core as it is must pass");
     let why = run(ops, plant).expect_err("the oracle missed the planted bug");
-    assert!(why.starts_with(finding), "{why}");
+    assert_eq!(why.kind, finding, "{why}");
 }
 
 /// Binds `slot` to a new body and carries every write out.
@@ -675,7 +740,7 @@ fn the_oracle_catches_an_edit_stored_without_its_gate() {
         Op::Call(0, 1),
         Op::Step(0),
     ];
-    the_oracle_catches(&ops, Plant::NoGate, "together:");
+    the_oracle_catches(&ops, Plant::NoGate, Kind::Together);
 }
 
 #[test]
@@ -699,14 +764,14 @@ fn the_oracle_catches_an_epoch_published_before_the_unlinking_stores() {
         Op::Collect,
         Op::Flush,
     ];
-    the_oracle_catches(&ops, Plant::EpochFirst, "freed:");
+    the_oracle_catches(&ops, Plant::EpochFirst, Kind::Freed);
 }
 
 #[test]
 fn the_oracle_catches_a_batch_freed_before_its_threads_cleared_it() {
     let [a, b, c, d] = bind(0);
     let ops = [a, b, c, d, Op::Call(0, 0), Op::Step(0), a, b, c, d, Op::Collect, Op::Flush];
-    the_oracle_catches(&ops, Plant::FreeEarly, "freed:");
+    the_oracle_catches(&ops, Plant::FreeEarly, Kind::Freed);
 }
 
 #[test]
@@ -730,7 +795,7 @@ fn the_oracle_catches_a_return_address_at_a_bodys_end_taken_for_outside_it() {
         Op::Collect,
         Op::Flush,
     ];
-    the_oracle_catches(&ops, Plant::ReturnAtEnd, "freed:");
+    the_oracle_catches(&ops, Plant::ReturnAtEnd, Kind::Freed);
 }
 
 /// A thread scanned from outside between a word's load and its jump holds the body in a

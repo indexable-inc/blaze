@@ -4,9 +4,9 @@
 //! Ported from the pinned reference, `vendor/rustc_next_trait_solver/src/solve`:
 //! - `project_goals/mod.rs`: `compute_projection_goal`, `normalize_associated_term`
 //!   ([`Rule::Project`]);
-//! - `project_goals/opaque_types.rs`: `normalize_opaque_type`, the analysis and coherence modes
-//!   only (defining uses are not ported: an opaque with a hidden type the asking body may see
-//!   normalizes to it, as `PostBorrowck`/`PostAnalysis` do, and is rigid otherwise);
+//! - `project_goals/opaque_types.rs`: `normalize_opaque_type`: rigid in analysis (defining uses
+//!   are not ported: the defining body has a variable for its own opaque, blaze-typeck
+//!   rules/opaque_def.rs), its bounds in coherence, its hidden type in post-analysis;
 //! - `normalizes_to.rs`: `compute_normalizes_to_goal`, `match_assumption`, `consider_impl_candidate`
 //!   with `fetch_eligible_assoc_item`, `translate_args`, `consider_error_guaranteed_candidate`,
 //!   `instantiate_normalizes_to_as_rigid`, `probe_and_consider_object_bound_candidate`;
@@ -41,12 +41,12 @@ use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{AStep, BuiltinSource, Cand, Cx, Done, Merger, Rule as CandRule, Source, Step, Via};
 use crate::canon::RespId;
-use crate::error::{Limit, Malformed, SolveError, Stop, Unsupported};
+use crate::error::{Limit, ParamHead, SolveError, Stop, Unsupported};
 use crate::facts::{AssocKind, Facts, ImplPolarity, Portable};
 use crate::fold;
 use crate::term::{
-    AliasKind, Certainty, Def, Flags, GoalSource, Lang, List, Polarity, Pred, Rigid, Ty, TyKind, TypingMode, Var,
-    VarKind,
+    AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, List, Polarity, Pred, Rigid, Ty, TyKind, TypingMode, Var,
+    VarKind, children,
 };
 use crate::trait_goals::TraitGoal;
 use crate::tys::Tys;
@@ -106,6 +106,12 @@ fn unsupported(what: Unsupported) -> Stop {
 
 #[track_caller]
 fn malformed() -> Stop { Stop::Error(SolveError::Malformed(crate::error::bad_pred())) }
+
+/// `item`'s trait is `trait_`, whose facts hold no member for it: a named gap
+/// ([`Unsupported::MemberNotFiled`]), never an answer.
+pub(crate) fn member_not_filed(trait_: Def, item: Def) -> Stop {
+    unsupported(Unsupported::MemberNotFiled { trait_, item })
+}
 
 /// The parts of an alias term.
 fn alias_parts<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, t: Ty) -> Option<(Rigid, AliasKind, Def, List)> {
@@ -201,7 +207,7 @@ fn pred_self<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, p: Pred) -> Option<Ty> {
 /// `Projection` goal relating them (the reference's `EvalCtxt::normalize`, which registers a
 /// projection goal per alias it folds). Aliases inside the replaced ones are normalized by those
 /// goals, lazily.
-fn normalize<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, t: Ty) -> Result<Ty, Stop> {
+pub(crate) fn normalize<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, t: Ty) -> Result<Ty, Stop> {
     if !cx.tys.flags(t).has(Flags::HAS_NON_RIGID_ALIAS) {
         return Ok(t);
     }
@@ -434,7 +440,7 @@ fn bound_pred<'c, T: Tys, F: Facts>(
         AliasKind::Projection => {
             let (trait_, _) = projection_item(cx, def)?;
             let td = cx.trait_def(trait_)?;
-            let Some(at) = td.assoc.iter().find(|a| a.def == def) else { return Err(malformed()) };
+            let Some(at) = td.assoc.iter().find(|a| a.def == def) else { return Err(member_not_filed(trait_, def)) };
             if n >= at.bounds_len {
                 return Err(malformed());
             }
@@ -456,7 +462,8 @@ fn bound_count<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, kind: AliasKind, def
             let td = cx.trait_def(trait_)?;
             match td.assoc.iter().find(|a| a.def == def) {
                 Some(at) => Ok(at.bounds_len),
-                None => Err(malformed()),
+                // Zero bounds would let a rigid alias fail every goal its bounds decide.
+                None => Err(member_not_filed(trait_, def)),
             }
         }
         _ => Ok(0),
@@ -494,7 +501,7 @@ fn push_alias_bounds<T: Tys, F: Facts>(
                     if !wanted {
                         continue;
                     }
-                    let p = cx.import_pred(portable, p, largs)?;
+                    let p = cx.import_alias_bound(d, i, portable, p, largs)?;
                     let is_self = pred_self(cx, p).is_some_and(|s| same_alias(cx, s, t));
                     if is_self != self_bounds {
                         continue;
@@ -660,9 +667,12 @@ fn normalize_opaque_type<T: Tys, F: Facts>(
     def: Def,
     args: List,
 ) -> Result<Step, Stop> {
-    let op = cx.opaque(def)?;
+    // The opaque's fact is read only by the modes that use it: in analysis the answer is the
+    // alias itself, so neither its bounds nor its hidden type is a read of this goal (an edit
+    // of the defining body's hidden type does not recheck a caller through it here).
     match cx.mode {
         TypingMode::Coherence => {
+            let op = cx.opaque(def)?;
             // `add_item_bounds_for_hidden_type`.
             let argv = cx.list(args);
             for &b in op.bounds {
@@ -683,16 +693,196 @@ fn normalize_opaque_type<T: Tys, F: Facts>(
             }
             Ok(Step::Done(Certainty::Ambiguous))
         }
+        // RIGID in analysis (opaque_types.rs, `TypingMode::Analysis` outside the defining
+        // scope: `instantiate_normalizes_to_as_rigid`): a caller may not know the hidden type
+        // (the Reference, "Abstract return types"), only the opaque's item bounds
+        // (`<O as Future>::Output` from `impl Future<Output = u32>`, assembly's alias-bound
+        // candidates). The defining body never asks here: it has a variable for its own
+        // opaque (blaze-typeck rules/opaque_def.rs). The hidden type is seen only by an auto
+        // trait (structural.rs). Revealing it here accepted `let x: u32 = make();` for
+        // `fn make() -> impl Sized { 0u32 }`, and over blaze-ty's relation (which, as rustc's
+        // `generalize_alias_ty`, replaces each alias nested in a bound type by a variable and
+        // a projection goal) a recursive future's hidden type `(.., Box<O>)` asked `O`'s
+        // normalization inside `O`'s own, an inductive cycle: overflow, so `spawn(f())`'s
+        // `Send` was undecided (`OpaqueAutoUndecided`) where rustc accepts it.
         TypingMode::Analysis => {
+            let r = rigid(cx, alias)?;
+            if cx.eq(term, r)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+        }
+        TypingMode::PostAnalysis => {
+            // ONE layer: the hidden type as it is (opaque_types.rs, `TypingMode::PostAnalysis`:
+            // `type_of(def).instantiate(args)`), its own aliases kept as aliases for whoever
+            // relates them next (the Reference, "Impl trait": after type checking an opaque is
+            // its hidden type). By the expected term, resolved:
+            //
+            // - an unbound variable (the goal's fresh one, `normalize_associated_term`): bound
+            //   by structure, deferring nothing. A recursive future's hidden type `(..,
+            //   Pin<Box<O>>)` binds it and does NOT ask `O`'s normalization inside `O`'s own
+            //   (the lazy relation would generalize the inner `O` into a nested `Projection {
+            //   O, ?v }`, canonically this goal: a cycle answered overflow).
+            // - the opaque itself at equal arguments: equal, nothing revealed (a recursive
+            //   future's interior holds `O` on both sides of a relation).
+            // - any other term: equal to the hidden type as the two infinite unfoldings are
+            //   ([`eq_revealing`]: a non-rigid opaque met against another term is revealed one
+            //   more layer, each such pair assumed once, coinductively). The LAZY relation this
+            //   took deferred the inner `O` against a non-alias as `Projection { O, ?x }` with
+            //   `?x` generalized from that term, the `O` inside it a fresh `?y` with its own
+            //   `Projection { O, ?y }`; `?y` bound first to the hidden type `F[O]` made the
+            //   first goal `Projection { O, F[F[O]] }`, its parent again: an inductive cycle
+            //   answered overflow, so `<fn f as FnOnce<()>>::Output == ?U` with `?U` unified
+            //   with `f`'s future was Ambiguous and the instance `NotGround` (blaze-typeck
+            //   suite/opaque_post_analysis_recursive.rs). rustc never meets the question: its
+            //   coroutine type is `Coroutine(def, args)`, the witness computed apart
+            //   (`coroutine_hidden_types`); blaze's future carries its interior as a term, so
+            //   two recursive futures are equal as regular trees are (equi-recursive types:
+            //   Amadio and Cardelli, "Subtyping recursive types", 1993: equal iff their
+            //   unfoldings are, decided by assuming each visited pair).
+            //
+            // In this mode every opaque the caller hands in is non-rigid too (blaze-typeck
+            // infer/mod.rs `mk`, `TyView::Opaque`): a rigid `O` in a goal met this hidden type's
+            // non-rigid `O` as two terms, and `O_rigid` against the revealed coroutine was a
+            // constructor mismatch (an instance's impl `where <fn f as FnOnce<()>>::Output ==
+            // {f's future}` was `NoImpl`).
+            let op = cx.opaque_hidden(def)?;
             let value = match op.hidden {
-                Some(h) => {
-                    let h = cx.import(op.portable, h, args)?;
-                    normalize(cx, h)?
-                }
+                Some(h) => cx.import(op.portable, h, args)?,
                 None => rigid(cx, alias)?,
             };
-            if cx.eq(term, value)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+            let related = if matches!(cx.kind(term), TyKind::Infer(Var { kind: VarKind::Ty, .. })) {
+                cx.eq_structurally(term, value)?
+            } else if cx.eq_structurally(term, alias)? {
+                true
+            } else {
+                eq_revealing(cx, term, alias, value)?
+            };
+            if related { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
         }
+    }
+}
+
+/// Pairs [`eq_revealing`] relates at most: each is a pair of nodes of the two finite terms or
+/// of a hidden type revealed once per assumed pair, so a correct walk ends far below it.
+const MOST_REVEALING_PAIRS: u32 = 1 << 16;
+
+/// `term == alias` after type checking (`TypingMode::PostAnalysis`), `value` the one layer
+/// of `alias` revealed: the two infinite unfoldings equal. A pair is related by structure,
+/// both sides resolved:
+/// - an inference variable on either side binds by structure (the opaque kept unrevealed);
+/// - a pair with no non-rigid alias is the solver's own relation ([`Cx::eq`]);
+/// - a non-rigid OPAQUE against another term is revealed one layer (its hidden type, rigid
+///   when it has none), the pair assumed equal first: met again, it holds (coinduction over
+///   the finitely many pairs of nodes of finite terms);
+/// - another non-rigid alias (a projection, a constant) is the solver's lazy relation, a
+///   nested goal as everywhere else;
+/// - two constructors equal at their heads, their children paired; else not equal.
+///
+/// `false`: not equal; the caller's probe rolls back what bound.
+fn eq_revealing<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, term: Ty, alias: Ty, value: Ty) -> Result<bool, Stop> {
+    let mut work: Vec<(Ty, Ty), Alloc<'_>> = Vec::new_in(cx.alloc);
+    let mut assumed: Vec<(Ty, Ty), Alloc<'_>> = Vec::new_in(cx.alloc);
+    assumed.push((cx.resolve(term), cx.resolve(alias)));
+    work.push((term, value));
+    let mut pairs = 0u32;
+    while let Some((a, b)) = work.pop() {
+        pairs += 1;
+        if pairs > MOST_REVEALING_PAIRS {
+            return Err(Stop::Error(SolveError::Limit(Limit::Walk)));
+        }
+        let (a, b) = (cx.resolve(a), cx.resolve(b));
+        if a == b {
+            continue;
+        }
+        let (ka, kb) = (cx.tys.kind(a), cx.tys.kind(b));
+        if matches!(ka, TyKind::Infer(_)) || matches!(kb, TyKind::Infer(_)) {
+            if !cx.eq_structurally(a, b)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        let non_rigid = |f: Flags| f.has(Flags::HAS_NON_RIGID_ALIAS);
+        if !non_rigid(cx.tys.flags(a)) && !non_rigid(cx.tys.flags(b)) {
+            if !cx.eq(a, b)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        let opaque = |k: TyKind| matches!(k, TyKind::Alias(Rigid::No, AliasKind::Opaque, ..));
+        if opaque(ka) || opaque(kb) {
+            if assumed.contains(&(a, b)) {
+                continue;
+            }
+            assumed.push((a, b));
+            if opaque(ka) {
+                let h = reveal_one(cx, a)?;
+                work.push((h, b));
+            } else {
+                let h = reveal_one(cx, b)?;
+                work.push((a, h));
+            }
+            continue;
+        }
+        if matches!(ka, TyKind::Alias(Rigid::No, ..)) || matches!(kb, TyKind::Alias(Rigid::No, ..)) {
+            if !cx.eq(a, b)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        if !same_head(ka, kb) {
+            return Ok(false);
+        }
+        match (children(ka), children(kb)) {
+            (Children::None, Children::None) => {}
+            (Children::One(x), Children::One(y)) => work.push((x, y)),
+            (Children::Two(x1, x2), Children::Two(y1, y2)) => {
+                work.push((x1, y1));
+                work.push((x2, y2));
+            }
+            (Children::List(l), Children::List(m)) => {
+                for i in 0..l.len {
+                    work.push((cx.arg(l, i), cx.arg(m, i)));
+                }
+            }
+            (Children::ListThen(l, x), Children::ListThen(m, y)) => {
+                for i in 0..l.len {
+                    work.push((cx.arg(l, i), cx.arg(m, i)));
+                }
+                work.push((x, y));
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// One layer of the non-rigid opaque `t`: its hidden type at its arguments, or `t` rigid when
+/// it has none (`normalize_opaque_type`'s post-analysis arm).
+fn reveal_one<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, t: Ty) -> Result<Ty, Stop> {
+    let Some((_, _, def, args)) = alias_parts(cx, t) else { return Err(malformed()) };
+    let op = cx.opaque_hidden(def)?;
+    match op.hidden {
+        Some(h) => cx.import(op.portable, h, args),
+        None => rigid(cx, t),
+    }
+}
+
+/// Whether two kinds are one constructor with the same non-child data and child counts (their
+/// children then related pairwise by [`eq_revealing`]); a childless kind is its own head.
+fn same_head(a: TyKind, b: TyKind) -> bool {
+    match (a, b) {
+        (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Dynamic(x, _), TyKind::Dynamic(y, _)) | (TyKind::Pat(_, x), TyKind::Pat(_, y)) => {
+            x.len == y.len
+        }
+        (TyKind::Ref(_, _, m), TyKind::Ref(_, _, n)) | (TyKind::RawPtr(_, m), TyKind::RawPtr(_, n)) => m == n,
+        (TyKind::Array(..), TyKind::Array(..)) | (TyKind::Slice(_), TyKind::Slice(_)) => true,
+        (TyKind::Adt(d, x), TyKind::Adt(e, y))
+        | (TyKind::FnDef(d, x), TyKind::FnDef(e, y))
+        | (TyKind::Closure(d, x), TyKind::Closure(e, y))
+        | (TyKind::Coroutine(d, x), TyKind::Coroutine(e, y))
+        | (TyKind::ExTrait(d, x), TyKind::ExTrait(e, y))
+        | (TyKind::ExProj(d, x, _), TyKind::ExProj(e, y, _)) => d == e && x.len == y.len,
+        (TyKind::FnPtr(x, h), TyKind::FnPtr(y, g)) => h == g && x.len == y.len,
+        (TyKind::Alias(r, k, d, x), TyKind::Alias(s, j, e, y)) => r == s && k == j && d == e && x.len == y.len,
+        _ => a == b,
     }
 }
 
@@ -727,7 +917,7 @@ fn step_bound<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, self
         return Err(malformed());
     }
     let (p, portable) = bound_pred(cx, lk, ld, cand.n)?;
-    let p = cx.import_pred(portable, p, largs)?;
+    let p = cx.import_alias_bound(ld, cand.n, portable, p, largs)?;
     match cx.goal.pred {
         Pred::Trait { trait_, args, polarity } => {
             let Pred::Trait { trait_: bt, args: bargs, polarity: bp } = p else { return Ok(Step::No) };
@@ -833,7 +1023,7 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
                 all.push(cx.arg(args, i));
             }
             let all = cx.mk_list(&all)?;
-            cx.import(h.portable, ia.value, all)?
+            cx.import_head(ParamHead::ImplValue { impl_: cand.d, item }, h.portable, ia.value, all)?
         }
         // A `default` item is not eligible: ambiguous in coherence, rigid elsewhere.
         Some(_) => return not_eligible(cx, alias, term),
@@ -855,10 +1045,14 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
                 return Ok(Step::No);
             }
             let td = cx.trait_def(trait_)?;
-            match td.assoc.iter().find(|a| a.def == item).and_then(|a| a.default) {
+            // A trait whose facts hold no member for the item: whether it has a default is not
+            // known, so neither is this projection's value (never the error type below, which
+            // stands for the program's E0046 and silences every use).
+            let Some(member) = td.assoc.iter().find(|a| a.def == item) else { return Err(member_not_filed(trait_, item)) };
+            match member.default {
                 // The trait's default, final because the impl is (`translate_args` from the
                 // trait: the goal's own arguments).
-                Some(d) => cx.import(td.portable, d, args)?,
+                Some(d) => cx.import_head(ParamHead::TraitDefault { trait_, item }, td.portable, d, args)?,
                 // A root impl without the item and no default is the program's E0046 at the
                 // impl, reported there; its projections are the error type, so no second
                 // error follows at each use (`consider_impl_candidate`'s `error_response`).
@@ -889,7 +1083,7 @@ fn has_parent<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, trait_: Def, self_ty:
 fn not_eligible<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, alias: Ty, term: Ty) -> Result<Step, Stop> {
     match cx.mode {
         TypingMode::Coherence => Ok(Step::Done(Certainty::Ambiguous)),
-        TypingMode::Analysis => {
+        TypingMode::Analysis | TypingMode::PostAnalysis => {
             let r = rigid(cx, alias)?;
             if cx.eq(term, r)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
         }
@@ -957,6 +1151,7 @@ fn merge_normalizes_to(m: &mut Merger<'_, '_>, cands: &[Done]) -> Result<Option<
         Some(f) if all_equal => Ok(Some(f)),
         // `bail_with_ambiguity`.
         Some(_) => {
+            m.bail = crate::why_maybe::Bail::of(cands.iter().filter(|d| keep(d)).map(|d| &d.cand));
             let mut c = Certainty::Ambiguous;
             for d in cands.iter().filter(|d| keep(d)) {
                 let x = m.certainty(d.resp);

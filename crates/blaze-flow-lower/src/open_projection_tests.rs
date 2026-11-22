@@ -1,8 +1,14 @@
 //! Piece B7: calls related through projections (generic_call.rs, "OPEN PROJECTIONS" and "A
-//! PART WITH NO POSITION"). Each test reads the heads from text as the census does (lifetime
-//! part, generic shape, tie rows as blaze-ladder borrows_ties.rs files them), lowers a body the
-//! real type checker checked, and checks it with blaze-flow. NEVER COMPILED when written
-//! (2026-11-18, lane B7).
+//! PART WITH NO POSITION"). Each test gives the heads as the head records file them (D148: a
+//! fn's lifetime parameters and its signature column, made by hand from the head the test
+//! declares), each head's generic shape read with the same counts, and tie rows as
+//! blaze-ladder borrows_ties.rs files them; lowers a body the real type checker checked, and
+//! checks it with blaze-flow. NEVER COMPILED when written (2026-11-18, lane B7; ported to
+//! region records 2026-11-19).
+//!
+//! Numbering (regions.rs): `Param(i)` is the container's lifetimes, then the item's own in
+//! declaration order, then one per elided input; slots in the type's pre-order. A projection
+//! `T::Error` of `trait De<'de>` has one slot, the trait's `'de` as the bound writes it.
 //!
 //! Sources: the Reference, "Implementations", "Generic implementations" (E0207: an impl's
 //! lifetime in an associated type is in its self type or its trait); "Subtyping and Variance"
@@ -11,17 +17,20 @@
 //! point of it: its place dying is `borrow Invalidated`; a relation the signature does not
 //! state is `borrow UnprovenOutlives`).
 //!
-//! Every allocation of the heads goes to one named buffer per test ([`Inline`]).
+//! The region heads are declared with the shared fixture (region_fixture.rs [`Decls`], laid in
+//! the checked record's own table, the same counts as [`Counts`]) and the lowering runs through
+//! region_fixture.rs `findings`; every allocation of the shapes goes to one named buffer per
+//! test ([`Inline`]).
 
 use std::vec;
 
 use blaze_own::Inline;
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{ExprId, ItemKey, Mutbl, Name, PTy, PatId};
+use blaze_typeck::regions::{Arity, Count};
+use blaze_typeck::{ExprId, ItemKey, Mutbl, Name, PNode, PTy, PatId};
 
-use crate::sig::trait_header;
-use crate::tests::findings_with;
-use crate::{AdtFacts, AssocRead, CallBounds, CalleeFacts, Facts, Plant, Region, Shape, ShapeBuf, SigBuf, SigLife, Tie, Ties, read_shape, read_signature};
+use crate::region_fixture::{Decls, FnHead, findings};
+use crate::{AdtFacts, CallBounds, CalleeFacts, Facts, Plant, Region, Shape, ShapeBuf, Tie, Ties, read_shape};
 
 const BYTES: usize = 1 << 18;
 type Buf<'x> = &'x Inline<BYTES>;
@@ -29,11 +38,30 @@ type Buf<'x> = &'x Inline<BYTES>;
 /// Every head's one type parameter has a trait bound and no type-outlives bound.
 const TRAIT_BOUNDED: &[u32] = &[0];
 
-/// The heads: lifetime parts, shapes and tie rows read from text; which write lifetimes and
+/// The counts the columns and shapes are laid by: no ADT declares a lifetime; every trait
+/// asked declares one, and no associated type is generic, so a projection has one slot.
+struct Counts;
+
+impl Arity for Counts {
+    fn adt_lifetimes(&self, _: ItemKey) -> Count {
+        Count::Known(0)
+    }
+    fn opaque_captures(&self, _: ItemKey) -> Count {
+        Count::NotKnown
+    }
+    fn alias_lifetimes(&self, _: ItemKey, _: Name) -> Count {
+        Count::Known(1)
+    }
+    fn trait_lifetimes(&self, _: ItemKey) -> Count {
+        Count::Known(1)
+    }
+}
+
+/// The heads: their region heads ([`Decls`]), shapes and tie rows; which write lifetimes and
 /// which take `&self`/`&mut self`; the one ADT with a field (`W { k }`).
 struct Heads<'x> {
     buf: Buf<'x>,
-    sigs: vec::Vec<(ItemKey, SigBuf<Buf<'x>>)>,
+    decls: Decls,
     shapes: vec::Vec<(ItemKey, ShapeBuf<Buf<'x>>)>,
     ties: vec::Vec<(ItemKey, vec::Vec<Tie>, vec::Vec<Region>)>,
     writes: vec::Vec<ItemKey>,
@@ -42,62 +70,124 @@ struct Heads<'x> {
 }
 
 impl<'x> Heads<'x> {
-    fn new(buf: Buf<'x>) -> Heads<'x> {
-        Heads { buf, sigs: vec::Vec::new(), shapes: vec::Vec::new(), ties: vec::Vec::new(), writes: vec::Vec::new(), self_ref: vec::Vec::new(), with_field: None }
+    /// `traits`: the traits of the world, each declaring one lifetime and one associated type
+    /// `assoc` with no lifetime of its own (as [`Counts`] says of every trait).
+    fn new(buf: Buf<'x>, traits: &[(ItemKey, &str)]) -> Heads<'x> {
+        let mut decls = Decls::new();
+        for &(t, assoc) in traits {
+            decls.trait_(t, 1);
+            decls.alias(t, assoc, 1);
+        }
+        Heads { buf, decls, shapes: vec::Vec::new(), ties: vec::Vec::new(), writes: vec::Vec::new(), self_ref: vec::Vec::new(), with_field: None }
     }
 
-    /// The lifetime part and the shape of `item`'s head (every trait asked declares a
-    /// lifetime; no associated type is generic).
-    fn read(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) -> SigBuf<Buf<'x>> {
-        let mut sig = SigBuf::new_in(self.buf);
-        if let Err(why) = read_signature(text, fx.t.view(), inputs, output, &|_| Some(0), &mut sig, self.buf) {
-            panic!("`{text}` was not read: {why:?}");
-        }
+    /// `item`'s region head (`count` lifetimes, those in `late` late-bound, its column over
+    /// `fn(inputs..) -> output` `slots`) and its shape by [`Counts`].
+    #[expect(clippy::too_many_arguments, reason = "one head of the fixture, every part named")]
+    fn add(&mut self, fx: &mut Fx, item: ItemKey, count: u32, late: &[u32], inputs: &[PTy], output: PTy, slots: &[Region]) {
+        self.decls.func(item, FnHead { lifetimes: count, late, outlives: &[], inputs, output, slots });
         let mut shape = ShapeBuf::new_in(self.buf);
-        let assoc = |_: ItemKey, _: Name| Some(AssocRead { trait_lifetimes: true, generic: false });
-        if let Err(why) = read_shape(fx.t.view(), inputs, output, &|_| Some(0), &assoc, &mut shape, self.buf) {
-            panic!("`{text}` has no shape: {why:?}");
+        if let Err(why) = read_shape(fx.t.view(), inputs, output, &Counts, &mut shape, self.buf) {
+            panic!("{item:?} has no shape: {why:?}");
         }
         self.shapes.push((item, shape));
-        sig
     }
 
-    /// A trait method and its implicit `Self: Trait<'params>` row (borrows_ties.rs).
-    fn method(&mut self, fx: &Fx, item: ItemKey, trait_: ItemKey, trait_text: &str, text: &str, inputs: &[PTy], output: PTy) {
-        let sig = self.read(fx, item, text, inputs, output);
-        let mut names = blaze_own::Vec::new_in(self.buf);
-        trait_header(trait_text, &mut names, self.buf).expect("a trait header");
-        let mut regions = vec::Vec::new();
-        for (i, n) in names.iter().enumerate() {
-            regions.push(sig.names.iter().find(|(m, _)| m == n).map_or(Region::Named((sig.names.len() + i) as u32), |&(_, r)| r));
-        }
-        self.ties.push((item, vec![Tie { param: 0, trait_, lo: 0, hi: regions.len() as u32, read: true }], regions));
-        self.sigs.push((item, sig));
+    /// A trait method of a trait with one lifetime: its head (the trait's `'de` its own
+    /// `Param(0)`, the container's first) and its implicit `Self: Trait<'de>` as a row
+    /// (borrows_ties.rs, the old model) and as clause column 0 (heads_regions.rs
+    /// `trait_inherited`, the one model).
+    #[expect(clippy::too_many_arguments, reason = "one head of the fixture, every part named")]
+    fn method(&mut self, fx: &mut Fx, item: ItemKey, trait_: ItemKey, count: u32, late: &[u32], inputs: &[PTy], output: PTy, slots: &[Region]) {
+        self.add(fx, item, count, late, inputs, output, slots);
+        self.ties.push((item, vec![Tie { param: 0, trait_, lo: 0, hi: 1, read: true }], vec![Region::Param(0)]));
+        self.bound_clause(fx, item, trait_);
     }
 
-    /// A fn and a row per written trait bound, its parameter `Param(0)` and its trait `trait_`.
-    fn func(&mut self, fx: &Fx, item: ItemKey, trait_: Option<ItemKey>, text: &str, inputs: &[PTy], output: PTy) {
-        let sig = self.read(fx, item, text, inputs, output);
-        let (mut rows, mut regions) = (vec::Vec::new(), vec::Vec::new());
-        for tb in sig.trait_bounds.iter().filter(|tb| !tb.binder) {
-            let lo = regions.len() as u32;
-            regions.extend(sig.trait_bound_regions[tb.lo as usize..tb.hi as usize].iter().copied());
-            rows.push(Tie { param: 0, trait_: trait_.expect("a trait of the fixture"), lo, hi: regions.len() as u32, read: !tb.unread });
-        }
+    /// A fn and, with `bound`, its one written bound `T: Trait<'de>` over its `Param(0)` type,
+    /// `'de` its own `Param(0)`: a row and clause column 0.
+    #[expect(clippy::too_many_arguments, reason = "one head of the fixture, every part named")]
+    fn func(&mut self, fx: &mut Fx, item: ItemKey, bound: Option<ItemKey>, count: u32, late: &[u32], inputs: &[PTy], output: PTy, slots: &[Region]) {
+        self.add(fx, item, count, late, inputs, output, slots);
+        let (rows, regions) = match bound {
+            Some(trait_) => (vec![Tie { param: 0, trait_, lo: 0, hi: 1, read: true }], vec![Region::Param(0)]),
+            None => (vec::Vec::new(), vec::Vec::new()),
+        };
         self.ties.push((item, rows, regions));
-        self.sigs.push((item, sig));
+        if let Some(trait_) = bound {
+            self.bound_clause(fx, item, trait_);
+        }
+    }
+
+    /// `item`'s clause 0, `Param(0): trait_<'de>` (`ExTrait(trait_, [Param(0)])` over
+    /// `[Param(0)]`).
+    fn bound_clause(&mut self, fx: &mut Fx, item: ItemKey, trait_: ItemKey) {
+        let subject = fx.param(0);
+        let list = fx.list(&[subject]);
+        let clause = fx.ty(PNode::ExTrait(trait_, list));
+        self.decls.trait_(trait_, 1);
+        self.decls.clause(item, 0, 0, clause, &[Region::Param(0)]);
     }
 }
 
 impl Facts for Heads<'_> {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, item: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: self.writes.contains(&item), self_ref: self.self_ref.contains(&item) })
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.sigs.iter().find(|(k, _)| *k == item).map(|(_, s)| s.life())
     }
     fn shape(&self, item: ItemKey) -> Option<Shape<'_>> {
         self.shapes.iter().find(|(k, _)| *k == item).map(|(_, s)| s.shape())
@@ -170,32 +260,37 @@ fn a_kept_de_through_an_open_projection() {
     let bb = fx.bound(de, &[p0]);
     let bad = fx.func("bad", 1, &[p0], out, vec![bb]);
     fx.finish();
-    let mut heads = Heads::new(&inline);
-    let header = "pub trait De<'de> { type Error; fn take(self) -> (&'de S, Self::Error); }";
-    heads.method(&fx, take, de, header, "fn take(self) -> (&'de S, Self::Error);", &[p0], out);
+    // `fn take(self) -> (&'de S, Self::Error)`: the trait's `'de` `Param(0)`; the output's
+    // `&'de S` and `Self::Error`'s `'de`: `[Param(0), Param(0)]`.
+    // `fn good<'de, D: De<'de>>(d: D) -> (&'de S, D::Error)`: `[Param(0), Param(0)]`.
+    // `fn bad<'de, 'x, D: De<'de>>(d: D) -> (&'x S, D::Error)`: `'x` `Param(1)`, early (in no
+    // input): `[Param(1), Param(0)]`.
+    let (p_de, p_x) = (Region::Param(0), Region::Param(1));
+    let mut heads = Heads::new(&inline, &[(de, "Error")]);
+    heads.method(&mut fx, take, de, 1, &[], &[p0], out, &[p_de, p_de]);
     heads.writes.push(take);
-    heads.func(&fx, good, Some(de), "fn good<'de, D: De<'de>>(d: D) -> (&'de S, D::Error) { d.take() }", &[p0], out);
-    heads.func(&fx, bad, Some(de), "fn bad<'de, 'x, D: De<'de>>(d: D) -> (&'x S, D::Error) { d.take() }", &[p0], out);
+    heads.func(&mut fx, good, Some(de), 1, &[], &[p0], out, &[p_de, p_de]);
+    heads.func(&mut fx, bad, Some(de), 2, &[], &[p0], out, &[p_x, p_de]);
     let mut b = Bb::new();
     let pd = b.param("d");
     let ld = b.local(pd);
     let call = b.method(ld, "take", &[]);
     let root = b.block(&[], Some(call));
-    let got = findings_with(&fx, &b, good, root, &heads, Plant::None);
+    let got = findings(&fx, &b, good, root, &heads, &heads.decls, Plant::None);
     std::println!("open_projection good: {got:?}");
     assert_eq!(got, clean(), "the caller's `'de` and its own `D::Error`: clean");
-    let got = findings_with(&fx, &b, bad, root, &heads, Plant::None);
+    let got = findings(&fx, &b, bad, root, &heads, &heads.decls, Plant::None);
     std::println!("open_projection bad: {got:?}");
     assert!(any(&got, "borrow UnprovenOutlives"), "`'de: 'x` is not stated: {got:?}");
     let tied = got;
-    let got = findings_with(&fx, &b, bad, root, &heads, Plant::TiesFresh);
+    let got = findings(&fx, &b, bad, root, &heads, &heads.decls, Plant::TiesFresh);
     std::println!("open_projection bad, fresh (control): {got:?}");
     // The control removes the tie's findings only: each one it keeps is one of `bad`'s, and
     // at least one of `bad`'s (those between `'x` and the caller's `'de`) is gone.
     let (Ok(tied), Ok(fresh)) = (&tied, &got) else { panic!("both lowered: {tied:?} {got:?}") };
     assert!(fresh.iter().all(|f| tied.contains(f)), "the control adds no finding: {fresh:?} vs {tied:?}");
     assert!(fresh.len() < tied.len(), "the control: a fresh `'de` misses the tie's errors: {fresh:?} vs {tied:?}");
-    let got = findings_with(&fx, &b, good, root, &heads, Plant::NoKnown);
+    let got = findings(&fx, &b, good, root, &heads, &heads.decls, Plant::NoKnown);
     std::println!("open_projection good, no known (control): {got:?}");
     assert_ne!(got, clean(), "the control: without `'de: ρ` the return is not proven");
 }
@@ -248,30 +343,32 @@ fn next_element_twice_holds_no_loan() {
     let tb = fx.bound(seq, &[p0]);
     let twice = fx.func("twice", 1, &[rm], err, vec![tb]);
     fx.finish();
-    let mut heads = Heads::new(&inline);
-    let header = "pub trait Seq<'de> { type Error; fn next(&mut self) -> Self::Error; }";
-    heads.method(&fx, next, seq, header, "fn next(&mut self) -> Self::Error;", &[rm], err);
+    // `fn next(&mut self) -> Self::Error`: the trait's `'de` `Param(0)`, the elided `&mut
+    // self` `Param(1)` (late): `[Param(1)]` then `[Param(0)]`. `fn eat<T>(t: T)`: none.
+    // `fn visit<'de, A: Seq<'de>>(a: &mut A) -> A::Error` (and `twice`): `'de` `Param(0)`
+    // (early, in the bound), the elided input `Param(1)` (late): the same column as `next`.
+    let (p_de, p_self) = (Region::Param(0), Region::Param(1));
+    let mut heads = Heads::new(&inline, &[(seq, "Error")]);
+    heads.method(&mut fx, next, seq, 2, &[1], &[rm], err, &[p_self, p_de]);
     heads.self_ref.push(next);
-    heads.func(&fx, eat, None, "fn eat<T>(t: T) {}", &[p0], unit);
-    let text = "fn visit<'de, A: Seq<'de>>(a: &mut A) -> A::Error { let x = a.next(); a.next(); x }";
-    heads.func(&fx, visit, Some(seq), text, &[rm], err);
-    let text = "fn twice<'de, A: Seq<'de>>(a: &mut A) -> A::Error { let x = a.next(); a.next(); eat(a); eat(a); x }";
-    heads.func(&fx, twice, Some(seq), text, &[rm], err);
+    heads.func(&mut fx, eat, None, 0, &[], &[p0], unit, &[]);
+    heads.func(&mut fx, visit, Some(seq), 2, &[1], &[rm], err, &[p_self, p_de]);
+    heads.func(&mut fx, twice, Some(seq), 2, &[1], &[rm], err, &[p_self, p_de]);
     let mut b = Bb::new();
     let root = next_twice(&mut b, 0);
-    let got = findings_with(&fx, &b, visit, root, &heads, Plant::None);
+    let got = findings(&fx, &b, visit, root, &heads, &heads.decls, Plant::None);
     std::println!("next_twice visit: {got:?}");
     assert_eq!(got, clean(), "the first result holds no `&mut` loan: clean");
-    let got = findings_with(&fx, &b, visit, root, &heads, Plant::HiddenCoarse);
+    let got = findings(&fx, &b, visit, root, &heads, &heads.decls, Plant::HiddenCoarse);
     std::println!("next_twice visit, coarse (control): {got:?}");
     assert_ne!(got, clean(), "the control: the coarse path is not clean");
     let mut b = Bb::new();
     let root = next_twice(&mut b, 2);
-    let got = findings_with(&fx, &b, twice, root, &heads, Plant::None);
+    let got = findings(&fx, &b, twice, root, &heads, &heads.decls, Plant::None);
     std::println!("next_twice twice: {got:?}");
     assert!(any(&got, "move"), "E0382: {got:?}");
     assert!(!any(&got, "borrow"), "only the move: {got:?}");
-    let got = findings_with(&fx, &b, twice, root, &heads, Plant::AllCopy);
+    let got = findings(&fx, &b, twice, root, &heads, &heads.decls, Plant::AllCopy);
     std::println!("next_twice twice, all copy (control): {got:?}");
     assert!(!any(&got, "move"), "the control: no move, no E0382: {got:?}");
 }
@@ -310,12 +407,14 @@ fn an_operand_with_no_position_relates_nothing() {
     let good = fx.func("good", 0, &[wt, rs], unit, vec![]);
     let bad = fx.func("bad", 0, &[wt, st], unit, vec![]);
     fx.finish();
-    let mut heads = Heads::new(&inline);
+    let mut heads = Heads::new(&inline, &[]);
     heads.with_field = Some(w);
-    heads.func(&fx, keep, None, "fn keep(k: K, s: &'static S) {}", &[kt, rs], unit);
+    // `fn keep(k: K, s: &'static S)` and `fn good(w: W, s: &'static S)`: `['static]`;
+    // `fn bad(w: W, s: S)`: none.
+    heads.func(&mut fx, keep, None, 0, &[], &[kt, rs], unit, &[Region::Static]);
     heads.writes.push(keep);
-    heads.func(&fx, good, None, "fn good(w: W, s: &'static S) { keep(w.k, s) }", &[wt, rs], unit);
-    heads.func(&fx, bad, None, "fn bad(w: W, s: S) { keep(w.k, &s) }", &[wt, st], unit);
+    heads.func(&mut fx, good, None, 0, &[], &[wt, rs], unit, &[Region::Static]);
+    heads.func(&mut fx, bad, None, 0, &[], &[wt, st], unit, &[]);
     for (owner, borrow) in [(good, false), (bad, true)] {
         let mut b = Bb::new();
         let (pw, ps) = (b.param("w"), b.param("s"));
@@ -327,11 +426,11 @@ fn an_operand_with_no_position_relates_nothing() {
         let call = b.call(f, &[wk, arg]);
         let stmt = b.semi(call);
         let root = b.block(&[stmt], None);
-        let got = findings_with(&fx, &b, owner, root, &heads, Plant::None);
+        let got = findings(&fx, &b, owner, root, &heads, &heads.decls, Plant::None);
         if borrow {
             std::println!("zero_part bad: {got:?}");
             assert!(any(&got, "borrow Invalidated"), "E0597: {got:?}");
-            let got = findings_with(&fx, &b, owner, root, &heads, Plant::StaticIgnored);
+            let got = findings(&fx, &b, owner, root, &heads, &heads.decls, Plant::StaticIgnored);
             std::println!("zero_part bad, static ignored (control): {got:?}");
             assert_eq!(got, clean(), "the control: a fresh `'static` misses E0597");
         } else {

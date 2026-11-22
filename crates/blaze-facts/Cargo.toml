@@ -19,14 +19,14 @@ doctest = false
 [dependencies]
 # `ItemKey`, `Name`, `PTy`, `PTys`, `PNode`, `List`, `ExprId`, `PatId`, `Adt`, `FnSig`,
 # `StableHasher`: the checker's portable names and its hasher.
-blaze-typeck = { path = "../blaze-typeck" }
+blaze-typeck.workspace = true
 # `ContentId`: a code identity, an instance key.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # `Vec` for the read list and the term walk, in the allocator the caller gives.
 blaze-own.workspace = true
 # The term digests' memo. By path, as blaze-typeck takes it: the workspace entry turns on
 # adapters to crates from outside the workspace.
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 
 [dev-dependencies]
 # `testing::heap()`: the tests' root allocator capability (D102).

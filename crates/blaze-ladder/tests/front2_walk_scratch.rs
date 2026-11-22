@@ -20,7 +20,7 @@
 //!   `items record: reads N, opens 1 (an open per read: N)`.
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_mem::Frame;
 use blaze_own::{Alloc, Erased};
 use blaze_scope::graph::Sysroot;
@@ -104,11 +104,7 @@ impl<'n> Load<'n> for Kept<'n> {
         None
     }
 
-    fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<&'n str> {
-        None
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'n [u8], &'n [u8])> {
+    fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<LoadedExpansion<'n>> {
         None
     }
 }
@@ -282,7 +278,7 @@ fn an_items_record_is_opened_once() {
     for read in 0..READS {
         let items = records.items_record(0).expect("app's items record");
         let index = (read % files) as u32;
-        assert!(matches!(items.file(index), Ok(Some(_))), "file {index} of app reads");
+        assert!(matches!(items.file_surface(index), Ok(Some(_))), "file {index} of app reads");
         rows += 1;
         // Questions of the records between the reads: they share the one open.
         if read % 8 == 0 {
@@ -296,7 +292,7 @@ fn an_items_record_is_opened_once() {
     let mut per_read = 0usize;
     for read in 0..READS {
         let items = items_record::ItemsRecord::open(items_bytes, a).expect("app's items record opens");
-        assert!(matches!(items.file((read % files) as u32), Ok(Some(_))));
+        assert!(matches!(items.file_surface((read % files) as u32), Ok(Some(_))));
         per_read += items.decoded().crates;
     }
     assert_eq!(per_read, READS, "an open per read is counted per read");

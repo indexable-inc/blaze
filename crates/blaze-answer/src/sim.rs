@@ -2,7 +2,7 @@
 //! moved and moved back, readers added and removed, compactions, crashes between the segments and
 //! the root) are committed to a store of bytes and applied to a plain in-memory model; after every
 //! step the views over the stored bytes equal the model (rows, cells, readers, and the plans,
-//! findings, owed tasks and owed cells columns). Nine planted bugs, each caught. The size
+//! findings, owed tasks and owed cells columns). The controls plant one bug at a time. The size
 //! test prints what an answer of 24,000 rows costs.
 
 use std::collections::BTreeMap;
@@ -47,7 +47,7 @@ fn refused(what: &'static str) -> impl FnOnce(AnswerError) -> Broke {
     move |error| Broke::Oracle(format!("{what}: {error}"))
 }
 
-const ABSENT: [u8; 20] = [0; 20];
+const ABSENT: [u8; 32] = [0; 32];
 
 // ---------------------------------------------------------------------------------------------
 // The universe: twelve bodies, each defining up to three cells, two files.
@@ -67,8 +67,13 @@ fn tag(t: usize) -> Cell {
     Cell([t as u8 + 1; 16])
 }
 
-fn digest(v: u64) -> [u8; 20] {
-    [v as u8; 20]
+// Every generated value shares its first twenty bytes with absence. A suffix-only change
+// must move a cell, including a definition removed and introduced again after a restart.
+fn digest(v: u64) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    bytes[20..24].copy_from_slice(&[0x31, 0xa9, 0x72, 0xe3]);
+    bytes[24..].copy_from_slice(&v.to_be_bytes());
+    bytes
 }
 
 #[derive(Clone, Debug)]
@@ -194,9 +199,9 @@ struct MRow {
     head: RowIn,
     serial: u64,
     reads: StdVec<u32>,
-    defines: BTreeMap<u32, [u8; 20]>,
+    defines: BTreeMap<u32, [u8; 32]>,
     /// The digests of its reads when it was made: a standing row's must be today's.
-    saw: StdVec<[u8; 20]>,
+    saw: StdVec<[u8; 32]>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -250,7 +255,7 @@ impl Model {
         }
     }
 
-    fn digest(&self, cell: u32) -> [u8; 20] {
+    fn digest(&self, cell: u32) -> [u8; 32] {
         let (definer, _) = self.cells[cell as usize];
         self.rows.get(&definer).and_then(|row| row.defines.get(&cell)).copied().unwrap_or(ABSENT)
     }
@@ -390,7 +395,11 @@ fn commit_request(view: &AnswerView<'_>, req: &Request, split: &[usize], plant: 
                 }
                 let mut defines = StdVec::new();
                 for (t, v) in row.defines.iter() {
-                    defines.push((commit.cell(id, tag(*t))?, CellDigest(digest(*v))));
+                    let mut bytes = digest(*v);
+                    if plant == Plant::PrefixPadded {
+                        bytes[20..].fill(0);
+                    }
+                    defines.push((commit.cell(id, tag(*t))?, CellDigest::of(&ContentId(bytes))));
                 }
                 commit.put_row(id, &row_in(row, file), &reads, &defines)?;
                 worker.row_reads(id, view.row(id), &reads);
@@ -451,8 +460,8 @@ fn compare(view: &AnswerView<'_>, model: &Model, at: &str) -> Result<(), Broke> 
                     let (found, _) = view.reads_cell(CellNo(c), task).map_err(refused("a read found by search"))?;
                     oracle(found == m.reads.contains(&c), || format!("{at}: task {t}: reads_cell({c}) is {found}, the model's reads {:?}", m.reads))?;
                 }
-                let defines: StdVec<(u32, [u8; 20])> = row.defines().map(|(cell, d)| (cell.0, d.0)).collect();
-                let want: StdVec<(u32, [u8; 20])> = m.defines.iter().map(|(cell, d)| (*cell, *d)).collect();
+                let defines: StdVec<(u32, [u8; 32])> = row.defines().map(|(cell, d)| (cell.0, d.0)).collect();
+                let want: StdVec<(u32, [u8; 32])> = m.defines.iter().map(|(cell, d)| (*cell, *d)).collect();
                 oracle(defines == want, || format!("{at}: row of task {t} defines {defines:?}, the model's {want:?}"))?;
             }
             (Some(_), None) => return Err(Broke::Oracle(format!("{at}: task {t} has a row, the model none (retired)"))),
@@ -461,7 +470,7 @@ fn compare(view: &AnswerView<'_>, model: &Model, at: &str) -> Result<(), Broke> 
         oracle(view.stands(task) == model.stands(t), || format!("{at}: validity of task {t}: {:?}, the model's {:?}", view.stands(task), model.stands(t)))?;
         if model.stands(t) == Some(true) {
             let row = &model.rows[&t];
-            let today: StdVec<[u8; 20]> = row.reads.iter().map(|cell| model.digest(*cell)).collect();
+            let today: StdVec<[u8; 32]> = row.reads.iter().map(|cell| model.digest(*cell)).collect();
             oracle(today == row.saw, || format!("{at}: the model's serial rule says task {t} stands but a read's digest changed"))?;
         }
     }
@@ -506,7 +515,7 @@ fn check_root(store: &Store, model: &Model, plant: Plant, at: &str) -> Result<()
     compare(&adopted, model, at)?;
     // The root alone gives the summary the opened answer gives (blaze-cli's certificate reads it so).
     oracle(summary_of(root).ok() == Some(adopted.summary()), || format!("{at}: summary_of disagrees with the opened root's summary"))?;
-    let wrong = AnswerView::adopt(&TreeDigest(other), root, |one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), plant, shared());
+    let wrong = AnswerView::adopt(&TreeDigest(other), root, |_| panic!("opened a child of another tree"), plant, shared());
     oracle(matches!(wrong, Err(AnswerError::TreeMismatch)), || format!("{at}: adopt took a root of another tree"))
 }
 
@@ -581,7 +590,7 @@ fn histories(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 /// Plant (c), constructed: D defines X = A at 1; at 2 D makes X = B and R reads X; at 3 D makes
 /// X = A again. X moved at 3, after R was made: R must not stand, though X's digest is the one
-/// D's first row held.
+/// D's first row held. Removal at 4 and reintroduction at 5 each move X once more.
 fn move_back(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let t = tape.index(TAGS, "tag");
     let a = 1 + tape.below(2, "a");
@@ -591,6 +600,8 @@ fn move_back(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         request(StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(t, a)])) }]), 1),
         request(StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(t, b)])) }, Op::Put { task: 1, row: draft(StdVec::from([(0, t)]), StdVec::new()) }]), 2),
         request(StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(t, a)])) }]), 3),
+        request(StdVec::from([Op::Retire { task: 0 }]), 4),
+        request(StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(t, a)])) }]), 5),
     ];
     let mut store = Store::default();
     let mut model = Model::default();
@@ -606,7 +617,15 @@ fn move_back(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         compare(&store.open(plant).map_err(refused("open"))?, &model, &at)?;
     }
     let r = model.task_of(&body(1)).expect("R was named");
-    oracle(model.stands(r) == Some(false), || String::from("the model lets R stand after X moved back"))
+    oracle(model.stands(r) == Some(false), || String::from("the model lets R stand after X moved back"))?;
+    let retire_reader = request(StdVec::from([Op::Retire { task: 1 }]), 6);
+    let effects = {
+        let view = store.open(plant).map_err(refused("open before retiring the sole reader"))?;
+        commit_request(&view, &retire_reader, &[0], plant).map_err(refused("retire the sole reader"))?
+    };
+    store.write(&effects, effects.writes().len());
+    model.apply(&retire_reader);
+    compare(&store.open(plant).map_err(refused("reopen after retiring the sole reader"))?, &model, "sole reader retired")
 }
 
 #[test]
@@ -620,6 +639,51 @@ fn a_move_back_is_a_move() {
 }
 
 #[test]
+fn the_oracle_catches_prefix_padding() {
+    control(SimConfig::cases(20), Plant::None, Plant::PrefixPadded, "defines", move_back);
+}
+
+#[test]
+fn a_prefix_only_answer_reports_its_format_before_fetching_rows() {
+    // BAR1 form 2, empty summary, one 41-byte rows reference. Both a certificate probe and a
+    // normal open must report the old home even if its rows have already been reclaimed.
+    let mut old = [0u8; 88 + 41];
+    old[..4].copy_from_slice(b"BAR1");
+    old[4..8].copy_from_slice(&2u32.to_le_bytes());
+    old[84..88].copy_from_slice(&1u32.to_le_bytes());
+    old[88] = SegmentKind::Rows as u8;
+    let why = AnswerError::Format { segment: crate::ROOT, found: 2 };
+    assert_eq!(nothing_changed(&old, &TreeDigest([0; 32])), Err(why));
+    let opened = AnswerView::open(&old, |_| panic!("opened a form 2 row"), Plant::None, shared());
+    assert_eq!(opened.err(), Some(why));
+}
+
+#[test]
+fn a_scrub_names_the_corrupt_child_of_an_unchanged_root() {
+    check(SimConfig::cases(24), |tape| {
+        let request = Request {
+            ops: StdVec::from([Op::Put { task: 0, row: draft(StdVec::new(), StdVec::from([(0, 1)])) }]),
+            tree: [1; 32], lines: [0; 32], summary: StdVec::new(), owed_cells: None,
+        };
+        let effects = commit_request(&AnswerView::empty(Plant::None, shared()), &request, &[0], Plant::None).map_err(refused("commit"))?;
+        let mut store = Store::default();
+        store.write(&effects, effects.writes().len());
+        let root = store.root.as_deref().expect("committed root");
+        let directory = crate::RootView::parse(root).map_err(refused("parse root"))?;
+        directory.scrub(|one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), shared()).map_err(refused("scrub intact answer"))?;
+        let index = tape.index(directory.segments().len(), "damaged segment");
+        let child = directory.segments().nth(index).expect("chosen directory entry");
+        let bytes = store.segments.get_mut(&child.id.0).expect("committed child");
+        let at = tape.index(bytes.len(), "damaged byte");
+        bytes[at] ^= 1 << tape.below(8, "damaged bit");
+        let same_tree = nothing_changed(root, &TreeDigest(request.tree)).map_err(refused("read root"))?;
+        let result = directory.scrub(|one| store.segments.get(&one.id.0).map(|bytes| &bytes[..]), shared());
+        oracle(same_tree && matches!(result, Err(AnswerError::SegmentDigest { segment, expected, found }) if segment as usize == index && expected == child.id && found != expected),
+            || format!("scrub of damaged child {index} at {at}: {result:?}"))
+    });
+}
+
+#[test]
 fn control_tombstone_ignored() {
     control(SimConfig::cases(300), Plant::None, Plant::TombstoneIgnored, "", histories);
 }
@@ -627,6 +691,11 @@ fn control_tombstone_ignored() {
 #[test]
 fn control_cancelled_kept() {
     control(SimConfig::cases(300), Plant::None, Plant::CancelledKept, "readers", histories);
+}
+
+#[test]
+fn the_oracle_catches_a_missing_last_reader_removal() {
+    control(SimConfig::cases(20), Plant::None, Plant::LastReaderRemovalDropped, "readers of cell", move_back);
 }
 
 #[test]
@@ -727,8 +796,7 @@ fn size_of_the_answer() {
         }
         let mut defines = StdVec::new();
         for c in (t..CELLS).step_by(ROWS) {
-            let mut d = [0u8; 20];
-            d[..8].copy_from_slice(&mix.next().to_le_bytes());
+            let d = digest(mix.next());
             defines.push((cells[c], CellDigest(d)));
         }
         let row = RowIn { key: Key(ContentId([1; 32])), out: ContentId([2; 32]), file, stage: 5, wave: 0, flags: Flags(0), source: ContentId([3; 32]), findings: 0, record: Key(ContentId([4; 32])) };
@@ -750,7 +818,7 @@ fn size_of_the_answer() {
     let per_read = rows.reads as f64 / rows.read_count as f64;
     assert!(per_read <= 4.0, "{per_read} B a read");
     assert_eq!(rows.defines, rows.define_count * DEFINE_BYTES);
-    assert!(rows.defines / rows.define_count <= 24);
+    assert_eq!(rows.defines / rows.define_count, 4 + 32, "one cell number and its complete content id");
     let mut total = 0usize;
     for write in effects.writes() {
         match write {

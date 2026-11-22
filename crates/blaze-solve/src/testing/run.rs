@@ -153,7 +153,8 @@ fn run_case<T: Tys>(case: &CaseA, decls: &[(u32, &DeclA)], tys: &mut T) -> Parse
     }
     let stop = |line: u32, s: Stop| CaseError { line, what: format!("the solver stopped: {s:?}") };
     let env = solver.env(tys, &world, &clauses, &mut reads).map_err(|s| stop(case.line, s))?;
-    let mode = if case.coherence { TypingMode::Coherence } else { TypingMode::Analysis };
+    // A case with no `mode` line is a body's check: analysis.
+    let mode = case.mode.unwrap_or(TypingMode::Analysis);
     let mut out = Vec::new();
     for g in &case.goals {
         let line = g.line;

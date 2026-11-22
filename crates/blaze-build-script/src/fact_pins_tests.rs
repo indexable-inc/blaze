@@ -14,8 +14,8 @@
 use crate::{
     fact_pins::{AppleUserland, CLANG_GUEST_DIR, FactPinsError, UserlandError, apple_userland, fact_pins},
     facts::{answer, question},
-    toolchain::PIN,
 };
+use blaze_pins::CLANG_JSON as PIN;
 
 /// A macOS 27.0.1 `SystemVersion.plist`, as the machine holds it (trimmed of keys not read).
 const PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>BuildID</key>\n\t<string>0B27979E-B7E7-11F1-B3D2-24EC53F49301</string>\n\t<key>ProductBuildVersion</key>\n\t<string>26A434</string>\n\t<key>ProductName</key>\n\t<string>macOS</string>\n\t<key>ProductUserVisibleVersion</key>\n\t<string>27.0.1</string>\n\t<key>ProductVersion</key>\n\t<string>27.0.1</string>\n</dict>\n</plist>\n";

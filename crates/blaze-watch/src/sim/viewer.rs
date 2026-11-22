@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
-use super::{Fixed, base64url, harness, key, oracle};
+use super::{Fixed, Lap, base64url, harness, key, oracle};
 use crate::conn::Credit;
 use crate::feed::Item;
 use crate::frame::{self, Frame, Role};
@@ -22,6 +22,15 @@ use crate::{Nanos, Plant, Seq};
 const KEY: [u8; 32] = [7; 32];
 const UID: u32 = 501;
 const RUN_EPOCH: u64 = 99;
+
+/// The viewer's config for a case: the shipped one, its window cut to 64 KiB and 1024 items.
+/// The shipped window (4 MiB, zeroed when made, window.rs `Window::new_in`) costs every case a
+/// 4 MiB fill per viewer (`requests` makes two); the three tests of this file that ran past
+/// 60 s in a 228 s suite (wave-1119 t60 watch.txt) make thousands of them, unmeasured per test.
+/// No property here but [`flow`]'s reads the window, and it sets its own.
+fn sim_config(script: &'static [u8]) -> v::Config {
+    v::Config { window_bytes: 64 << 10, window_items: 1024, ..v::Config::new(UID, script) }
+}
 
 struct NoHistory;
 
@@ -199,12 +208,14 @@ fn flow(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 #[test]
 fn a_slow_page_never_grows_the_viewer() {
-    check(Config::cases(1500), |tape| flow(tape, Plant::None));
+    let lap = Lap::new("viewer: a slow page");
+    check(Config::cases(1500), |tape| lap.case(flow(tape, Plant::None)));
 }
 
 #[test]
 fn the_oracle_catches_a_page_queue_past_its_bound() {
-    control(Config::cases(1500), Plant::None, Plant::IgnorePageQueue, "page queue", flow);
+    let lap = Lap::new("viewer: control, a page queue past its bound");
+    control(Config::cases(1500), Plant::None, Plant::IgnorePageQueue, "page queue", |tape, plant| lap.case(flow(tape, plant)));
 }
 
 // ------------------------------------------------------------------ requests
@@ -298,8 +309,8 @@ fn expected(tape: &Tape) -> (std::vec::Vec<u8>, Option<u16>, &'static str) {
 fn requests(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     // Two viewers in different states: one fresh, one with a run, a pairing waiting and
     // another epoch. A refused page must not be able to tell them apart.
-    let mut fresh = Rig::new(v::Config::new(UID, b"script"), 1, plant)?;
-    let mut busy = Rig::new(v::Config::new(UID, b"script"), 2, plant)?;
+    let mut fresh = Rig::new(sim_config(b"script"), 1, plant)?;
+    let mut busy = Rig::new(sim_config(b"script"), 2, plant)?;
     busy.with_run(77, Nanos(0))?;
     busy.ask(900, &request("POST", "/v1/pair", &paired_headers()[..2], b""), Nanos(0))?;
     busy.step(Event::Local { conn: LocalId(1), uid: UID, ask: Ask::Pending, now: Nanos(0) })?;
@@ -327,18 +338,20 @@ fn requests(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 #[test]
 fn refused_requests_get_their_status_and_learn_nothing() {
-    check(Config::cases(3000), |tape| requests(tape, Plant::None));
+    let lap = Lap::new("viewer: refused requests");
+    check(Config::cases(3000), |tape| lap.case(requests(tape, Plant::None)));
 }
 
 #[test]
 fn the_oracle_catches_a_route_before_the_origin_check() {
-    control(Config::cases(3000), Plant::None, Plant::RouteBeforeOrigin, "answered", requests);
+    let lap = Lap::new("viewer: control, a route before the origin check");
+    control(Config::cases(3000), Plant::None, Plant::RouteBeforeOrigin, "answered", |tape, plant| lap.case(requests(tape, plant)));
 }
 
 // ------------------------------------------------------------------ toggles
 
 fn toggles(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let mut rig = Rig::new(v::Config::new(UID, b""), 1, plant)?;
+    let mut rig = Rig::new(sim_config(b""), 1, plant)?;
     let run = rig.with_run(5, Nanos(0))?;
     for page in 0..tape.range(1..6, "toggles") {
         let slots: std::vec::Vec<u32> = (0..tape.below(5, "slots")).map(|s| s as u32 * 3).collect();
@@ -385,18 +398,20 @@ fn toggles(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 #[test]
 fn only_a_paired_page_toggles() {
-    check(Config::cases(1000), |tape| toggles(tape, Plant::None));
+    let lap = Lap::new("viewer: only a paired page toggles");
+    check(Config::cases(1000), |tape| lap.case(toggles(tape, Plant::None)));
 }
 
 #[test]
 fn the_oracle_catches_a_toggle_before_the_key_check() {
-    control(Config::cases(1000), Plant::None, Plant::ToggleBeforeKey, "unpaired page", toggles);
+    let lap = Lap::new("viewer: control, a toggle before the key check");
+    control(Config::cases(1000), Plant::None, Plant::ToggleBeforeKey, "unpaired page", |tape, plant| lap.case(toggles(tape, plant)));
 }
 
 // ------------------------------------------------------------------ expiry
 
 fn expiry(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let config = v::Config::new(UID, b"");
+    let config = sim_config(b"");
     let mut rig = Rig::new(config, 1, plant)?;
     let mut now = Nanos(0);
     // The rule, restated: empty since, streams open, the last stream's close.
@@ -451,19 +466,21 @@ fn expiry(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 #[test]
 fn the_viewer_expires_by_its_rule() {
-    check(Config::cases(2000), |tape| expiry(tape, Plant::None));
+    let lap = Lap::new("viewer: expiry by its rule");
+    check(Config::cases(2000), |tape| lap.case(expiry(tape, Plant::None)));
 }
 
 #[test]
 fn the_oracle_catches_a_page_that_holds_the_viewer_forever() {
-    control(Config::cases(3000), Plant::None, Plant::PageHoldsForever, "outlived", expiry);
+    let lap = Lap::new("viewer: control, a page that holds the viewer forever");
+    control(Config::cases(3000), Plant::None, Plant::PageHoldsForever, "outlived", |tape, plant| lap.case(expiry(tape, plant)));
 }
 
 // ------------------------------------------------------------------ pairing
 
 #[test]
 fn a_browser_pairs_once_through_a_local_confirm() {
-    let mut rig = Rig::new(v::Config::new(UID, b""), 1, Plant::None).expect("a viewer");
+    let mut rig = Rig::new(sim_config(b""), 1, Plant::None).expect("a viewer");
     let headers = &paired_headers()[..2];
     let answer = rig.ask(1, &request("POST", "/v1/pair", headers, b""), Nanos(0)).expect("pair");
     assert_eq!(status(&answer), 200);

@@ -8,18 +8,14 @@
 
 use blaze_own::{AVec, Alloc, Vec};
 
-use blaze_id::ContentId;
-
 use crate::{
     call::Inside,
-    cx::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, Place, PlaceOf},
+    cfg::CfgPredicateError,
+    cx::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, Place, PlaceOf, Recorder, RecorderOpts},
     def::BuiltinFn,
     error::{ExpandError, Stream, Unbuilt},
     expand::Out,
-    expansion::{
-        Diagnostic, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, TokenOrigin, ReadAnswer,
-        ReadKind,
-    },
+    expansion::{Diagnostic, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, Reads, TokenOrigin},
     literal::{self, Buf, LitError},
     nested,
     tokens::{Delim, LitKind, Raw, Spacing, TokenKind, TokenStream, Transparency, index},
@@ -34,10 +30,29 @@ pub(crate) enum Step<'a> {
 /// The tokens builtins make: call-site names, def-site `$crate` (rustc's `mixed_site`).
 const MADE: Transparency = Transparency::SemiOpaque;
 
+/// Runs the builtin `which`. The expansion's reads go to a [`Recorder`] over `cx` for the run
+/// and back after it: the builtins below are given the recorder, never `cx`, so every answer
+/// they hold was recorded when it was asked.
 pub(crate) fn expand<'a>(
     which: BuiltinFn,
     out: &mut Out<'_, 'a>,
     cx: &impl ExpandCx,
+) -> Result<Step<'a>, ExpandError> {
+    let alloc = out.alloc;
+    let mut reads = core::mem::replace(&mut out.exp.reads, Reads::new_in(alloc));
+    let edition = out.call.site.edition;
+    let step = {
+        let mut rec = Recorder::new(RecorderOpts { cx, reads: &mut reads, edition, scratch: alloc });
+        run(which, out, &mut rec)
+    };
+    out.exp.reads = reads;
+    step
+}
+
+fn run<'a>(
+    which: BuiltinFn,
+    out: &mut Out<'_, 'a>,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
 ) -> Result<Step<'a>, ExpandError> {
     match which {
         BuiltinFn::Concat
@@ -50,15 +65,15 @@ pub(crate) fn expand<'a>(
         | BuiltinFn::CompileError
         | BuiltinFn::FormatArgs
         | BuiltinFn::FormatArgsNl
-        | BuiltinFn::ConstFormatArgs => return eager(which, out, cx),
+        | BuiltinFn::ConstFormatArgs => return eager(which, out, rec),
         BuiltinFn::Stringify => stringify(out)?,
-        BuiltinFn::Cfg => cfg(out, cx)?,
-        BuiltinFn::CfgSelect => cfg_select(out, cx)?,
+        BuiltinFn::Cfg => cfg(out, rec)?,
+        BuiltinFn::CfgSelect => cfg_select(out, rec)?,
         BuiltinFn::Assert => assert(out)?,
-        BuiltinFn::Line => place(out, cx, HoleOf::Line)?,
-        BuiltinFn::Column => place(out, cx, HoleOf::Column)?,
-        BuiltinFn::File => place(out, cx, HoleOf::File)?,
-        BuiltinFn::ModulePath => place(out, cx, HoleOf::ModulePath)?,
+        BuiltinFn::Line => place(out, rec, HoleOf::Line)?,
+        BuiltinFn::Column => place(out, rec, HoleOf::Column)?,
+        BuiltinFn::File => place(out, rec, HoleOf::File)?,
+        BuiltinFn::ModulePath => place(out, rec, HoleOf::ModulePath)?,
         BuiltinFn::Panic => panic(out, "panic")?,
         BuiltinFn::Unreachable => panic(out, "unreachable")?,
         BuiltinFn::PatternType => pattern_type(out)?,
@@ -234,7 +249,7 @@ enum Atom<'s> {
 fn eager<'a>(
     which: BuiltinFn,
     out: &mut Out<'_, 'a>,
-    cx: &impl ExpandCx,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
 ) -> Result<Step<'a>, ExpandError> {
     let call = out.call;
     let input = call.input();
@@ -253,7 +268,7 @@ fn eager<'a>(
         if given != 0 {
             return Err(ExpandError::EagerAnswers { wanted: 0, given });
         }
-        run_eager(which, &Args { stream: input, from: None }, out, cx)?;
+        run_eager(which, &Args { stream: input, from: None }, out, rec)?;
         return Ok(Step::Done);
     }
     if answers.is_empty() {
@@ -285,7 +300,7 @@ fn eager<'a>(
         from.push(TokenOrigin::Input(index(at)));
         at += 1;
     }
-    run_eager(which, &Args { stream: &stream, from: Some(&from) }, out, cx)?;
+    run_eager(which, &Args { stream: &stream, from: Some(&from) }, out, rec)?;
     Ok(Step::Done)
 }
 
@@ -293,16 +308,16 @@ fn run_eager(
     which: BuiltinFn,
     args: &Args<'_>,
     out: &mut Out<'_, '_>,
-    cx: &impl ExpandCx,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
 ) -> Result<(), ExpandError> {
     match which {
         BuiltinFn::Concat => concat(args, out),
         BuiltinFn::ConcatBytes => concat_bytes(args, out),
-        BuiltinFn::Env => env(args, out, cx, Optional::No),
-        BuiltinFn::OptionEnv => env(args, out, cx, Optional::Yes),
-        BuiltinFn::Include => include(args, out, cx, Inclusion::Tokens),
-        BuiltinFn::IncludeStr => include(args, out, cx, Inclusion::Str),
-        BuiltinFn::IncludeBytes => include(args, out, cx, Inclusion::Bytes),
+        BuiltinFn::Env => env(args, out, rec, Optional::No),
+        BuiltinFn::OptionEnv => env(args, out, rec, Optional::Yes),
+        BuiltinFn::Include => include(args, out, rec, Inclusion::Tokens),
+        BuiltinFn::IncludeStr => include(args, out, rec, Inclusion::Str),
+        BuiltinFn::IncludeBytes => include(args, out, rec, Inclusion::Bytes),
         BuiltinFn::CompileError => compile_error(args, out),
         BuiltinFn::FormatArgs | BuiltinFn::ConstFormatArgs => format_args(args, out, Newline::No),
         BuiltinFn::FormatArgsNl => format_args(args, out, Newline::Yes),
@@ -496,7 +511,7 @@ enum Optional {
 fn env(
     args: &Args<'_>,
     out: &mut Out<'_, '_>,
-    cx: &impl ExpandCx,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
     optional: Optional,
 ) -> Result<(), ExpandError> {
     let pieces = args.split(out.alloc);
@@ -518,8 +533,7 @@ fn env(
     if has_message && let Err((error, at)) = string_arg(args, pieces[1].clone(), &mut message) {
         return refuse(out, error.message(), at);
     }
-    let value = cx.env(name.as_str())?;
-    out.exp.reads.push(ReadKind::Env, name.as_str(), ReadAnswer::of_env(value))?;
+    let value = rec.env(name.as_str())?;
     match (value, optional) {
         (Some(value), Optional::No) => push_str_literal(out, value),
         (None, Optional::No) => {
@@ -564,7 +578,7 @@ enum Inclusion {
 fn include(
     args: &Args<'_>,
     out: &mut Out<'_, '_>,
-    cx: &impl ExpandCx,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
     inclusion: Inclusion,
 ) -> Result<(), ExpandError> {
     let pieces = args.split(out.alloc);
@@ -575,37 +589,25 @@ fn include(
     if let Err((error, at)) = string_arg(args, pieces[0].clone(), &mut path) {
         return refuse(out, error.message(), at);
     }
-    // `include!` reads the file as text, the same fact `include_str!` reads.
-    let (kind, how) = match inclusion {
-        Inclusion::Tokens => (ReadKind::IncludeStr, IncludeAs::Tokens),
-        Inclusion::Str => (ReadKind::IncludeStr, IncludeAs::Str),
-        Inclusion::Bytes => (ReadKind::IncludeBytes, IncludeAs::Bytes),
+    let how = match inclusion {
+        Inclusion::Tokens => IncludeAs::Tokens,
+        Inclusion::Str => IncludeAs::Str,
+        Inclusion::Bytes => IncludeAs::Bytes,
     };
-    // The read list's subject: the root-relative path a host with a read root answers (D60),
-    // else the path as written. A host's root-relative path that is not one is refused, never
-    // recorded: it would put the machine's folder or a spelling into the record.
-    let (subject, found, rooted) = match cx.include(path.as_str(), how)? {
-        Included::Bytes(bytes) => (path.as_str(), Some(bytes), false),
-        Included::Missing => (path.as_str(), None, false),
-        Included::At { path: at, bytes } => (at, Some(bytes), true),
-        Included::MissingAt { path: at } => (at, None, true),
+    // The recorder has recorded the read (under the root-relative path, D60) by now.
+    let bytes = match rec.include(path.as_str(), how)? {
+        Included::Bytes(bytes) | Included::At { bytes, .. } => bytes,
+        Included::Missing | Included::MissingAt { .. } => {
+            let path = out.note(path.as_str())?;
+            out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Missing });
+            return Ok(());
+        }
         Included::Outside => {
             let path = out.note(path.as_str())?;
             out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Outside });
             return Ok(());
         }
     };
-    if rooted && !crate::cx::is_root_relative(subject) {
-        return Err(HostError { ask: HostAsk::Include, why: HostWhy::Unreadable }.into());
-    }
-    let Some(bytes) = found else {
-        out.exp.reads.push(kind, subject, ReadAnswer::Absent)?;
-        let path = out.note(path.as_str())?;
-        out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Missing });
-        return Ok(());
-    };
-    let digest = ContentId::of("blaze v2 expand included file 1", bytes);
-    out.exp.reads.push(kind, subject, ReadAnswer::Digest(digest))?;
     let not_utf8 = |out: &mut Out<'_, '_>| -> Result<(), ExpandError> {
         let path = out.note(path.as_str())?;
         out.diagnose(Diagnostic::Include { path, why: IncludeFailure::NotUtf8 });
@@ -721,11 +723,11 @@ fn assert(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
 
 /// `cfg_select! { pred => { tokens } .. _ => expr }`: the tokens inside the braces of the
 /// first arm whose predicate holds (`_` always does), or its expression up to its `,`. Every
-/// arm is read; the predicates are
-/// asked of the context in order up to the first that holds, each outcome recorded.
+/// arm is read; the predicates are evaluated in order up to the first that holds, each atom's
+/// outcome recorded ([`Recorder::cfg`]).
 fn cfg_select(
     out: &mut Out<'_, '_>,
-    cx: &impl ExpandCx,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
 ) -> Result<(), ExpandError> {
     let input = out.call.input();
     let tokens = input.tokens();
@@ -804,11 +806,10 @@ fn cfg_select(
             true
         } else {
             let predicate = input.copy_in(start..arrow, out.alloc)?;
-            let outcome = cx.cfg(&predicate)?;
-            let mut subject = Buf::new_in(out.alloc);
-            stringified(&predicate, out.alloc, &mut subject)?;
-            out.exp.reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
-            outcome
+            match rec.cfg(&predicate) {
+                Ok(outcome) => outcome,
+                Err(error) => return refuse_predicate(out, error, start),
+            }
         };
         if holds {
             chosen = Some(body);
@@ -1094,24 +1095,43 @@ impl Printed {
     }
 }
 
-/// `cfg!(predicate)`: `true` or `false`, the outcome read.
-fn cfg(out: &mut Out<'_, '_>, cx: &impl ExpandCx) -> Result<(), ExpandError> {
+/// `cfg!(predicate)`: `true` or `false`, each atom's outcome read ([`Recorder::cfg`]).
+fn cfg(out: &mut Out<'_, '_>, rec: &mut Recorder<'_, '_, impl ExpandCx>) -> Result<(), ExpandError> {
     let input = out.call.input();
     if input.is_empty() {
         return refuse(out, "`cfg!` takes a cfg predicate", None);
     }
-    let outcome = cx.cfg(input)?;
-    let mut subject = Buf::new_in(out.alloc);
-    stringified(input, out.alloc, &mut subject)?;
-    out.exp.reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
+    let outcome = match rec.cfg(input) {
+        Ok(outcome) => outcome,
+        Err(error) => return refuse_predicate(out, error, 0),
+    };
     ident(out, if outcome { "true" } else { "false" })
+}
+
+/// A cfg predicate that is none (`cfg!(unix windows)`, `not(a, b)`): the builtin's own error
+/// at its token, the predicate starting at input token `start`. A failed ask stops the
+/// expansion instead.
+fn refuse_predicate(
+    out: &mut Out<'_, '_>,
+    error: CfgPredicateError<ExpandError>,
+    start: usize,
+) -> Result<(), ExpandError> {
+    let token = match error {
+        CfgPredicateError::Malformed { token } | CfgPredicateError::NotTakesOne { token } => token,
+        CfgPredicateError::Atom(error) => return Err(error),
+    };
+    let at = start + token as usize;
+    let at = (at < out.call.input().len()).then(|| TokenOrigin::Input(index(at)));
+    let message = out.note_display(&error)?;
+    out.diagnose(Diagnostic::Builtin { message, at });
+    Ok(())
 }
 
 /// `line!()`, `column!()`, `file!()`, `module_path!()`: a placeholder and a [`Hole`] where the
 /// call is written; inside eager input, the value read.
 fn place(
     out: &mut Out<'_, '_>,
-    cx: &impl ExpandCx,
+    rec: &mut Recorder<'_, '_, impl ExpandCx>,
     of: HoleOf,
 ) -> Result<(), ExpandError> {
     if !out.call.input().is_empty() {
@@ -1133,17 +1153,16 @@ fn place(
         out.exp.holes.push(Hole { token, of });
         return Ok(());
     }
-    let (ask, kind) = match of {
-        HoleOf::Line => (PlaceOf::Line, ReadKind::Line),
-        HoleOf::Column => (PlaceOf::Column, ReadKind::Column),
-        HoleOf::File => (PlaceOf::File, ReadKind::File),
-        HoleOf::ModulePath => (PlaceOf::ModulePath, ReadKind::ModulePath),
+    let ask = match of {
+        HoleOf::Line => PlaceOf::Line,
+        HoleOf::Column => PlaceOf::Column,
+        HoleOf::File => PlaceOf::File,
+        HoleOf::ModulePath => PlaceOf::ModulePath,
     };
     let wrong = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
-    let place = cx.place(ask)?;
-    match (place, number) {
+    // Recorded by now; an answer of the wrong kind stops the expansion, its reads with it.
+    match (rec.place(ask)?, number) {
         (Place::Number(value), true) => {
-            out.exp.reads.push(kind, "", ReadAnswer::of_place(place))?;
             let mut text = Buf::new_in(out.alloc);
             core::fmt::Write::write_fmt(&mut text, format_args!("{value}u32"))
                 .expect("a `Buf` takes any text");
@@ -1155,7 +1174,6 @@ fn place(
             out.made(kind, text.as_str(), MADE)
         }
         (Place::Text(value), false) => {
-            out.exp.reads.push(kind, "", ReadAnswer::of_place(place))?;
             push_str_literal(out, value)
         }
         // The context answered a number for a path or a path for a number.

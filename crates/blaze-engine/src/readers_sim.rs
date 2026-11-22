@@ -22,7 +22,7 @@ use blaze_drive::key::{self, Kind, Name, Tool};
 use blaze_id::ContentId;
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
-use crate::engine::{Answer, Buffer, CellId, Edit, Engine, EngineError, Finished, Phase, Plant, Planned, Pool, Report, SVec, Task, Tools};
+use crate::engine::{Answer, Buffer, CellId, Done, Edit, Engine, EngineError, Everything, Finished, Phase, Plant, Planned, Pool, Report, SVec, Stage, Task, Tools, drive};
 use crate::pages::Kept;
 use crate::readers::{FLOOR_BYTES_PER_EDGE, IndexCost, Mapped, Paired, ReaderIndex};
 use crate::sim::{Crates, POISON, Pools, World, alloc, edit, first_world, grow_names, oracle, work};
@@ -35,6 +35,12 @@ const TOOL: Tool = Tool(ContentId([7; 32]));
 
 /// Each phase a request opened and the tasks it entered, in order.
 type Steps = StdVec<(Phase, StdVec<Name>)>;
+type Memberships = BTreeSet<(CellId, Name)>;
+type Delta = StdVec<((CellId, Name), bool)>;
+
+fn forward_memberships(answer: &Answer<'_>) -> Memberships {
+    answer.rows.iter().flat_map(|(&reader, row)| row.reads.iter().map(move |&(id, _)| (id, reader))).collect()
+}
 
 /// One request on the strategy `R`: the phases it opened, its tasks each, and how it finished.
 fn request<R: ReaderIndex<'static>>(
@@ -44,7 +50,7 @@ fn request<R: ReaderIndex<'static>>(
     scope: Crates,
     plant: Plant,
     mut pool: Pools,
-) -> Result<(Finished<'static>, Steps), EngineError> {
+) -> Result<(Finished<'static>, Steps, Delta), EngineError> {
     let files: StdVec<(Name, &[Planned])> = changed.iter().map(|(name, plan)| (*name, plan.as_slice())).collect();
     let mut engine: Engine<'static, Crates, Answer<'static>, R> = Engine::with_index_in(Tools([TOOL; key::KINDS]), answer, &Edit { files: &files }, scope, plant, alloc())?;
     let mut buffers: StdVec<Buffer<'static>> = (0..4).map(|_| Buffer::new_in(alloc())).collect();
@@ -60,7 +66,12 @@ fn request<R: ReaderIndex<'static>>(
         engine.merge(&mut buffers)?;
         grow_names(world, &mut engine)?;
     }
-    Ok((engine.finish()?, steps))
+    let mut changes = Delta::new();
+    let finished = engine.finish_with_readers(|delta| {
+        changes.extend_from_slice(&delta.edits);
+        Ok(())
+    })?;
+    Ok((finished, steps, changes))
 }
 
 /// The report as a decision: everything but what the index cost.
@@ -106,9 +117,10 @@ fn differential(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         let plans = world.plans();
         let changed: BTreeMap<Name, StdVec<Planned>> =
             plans.iter().filter(|(name, plan)| last_plans.get(*name) != Some(*plan)).map(|(name, plan)| (*name, plan.clone())).collect();
-        let (was, was_steps) = request::<Mapped<'static>>(&world, old, &changed, scope.clone(), Plant::None, pool)
+        let before = forward_memberships(&old);
+        let (was, was_steps, was_delta) = request::<Mapped<'static>>(&world, old, &changed, scope.clone(), Plant::None, pool)
             .map_err(|error| Broke::Harness(format!("request {serial}: the old index refused: {error}")))?;
-        let (now, now_steps) = request::<Paired<'static>>(&world, new, &changed, scope, plant, pool)
+        let (now, now_steps, now_delta) = request::<Paired<'static>>(&world, new, &changed, scope, plant, pool)
             .map_err(|error| Broke::Oracle(format!("request {serial}: {DIFFER}: the columns refused what the maps took: {error}")))?;
         last_plans = plans;
         // Every phase, its tasks in order (a wave's entered tasks in key order, rule 25).
@@ -120,6 +132,9 @@ fn differential(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         oracle(was.causes[..] == now.causes[..], || format!("request {serial}: {DIFFER} in the causes"))?;
         oracle(decided(&was.report) == decided(&now.report), || format!("request {serial}: {DIFFER} in the report: maps {:?}, columns {:?}", was.report, now.report))?;
         let (a, b) = (&was.answer, &now.answer);
+        let after = forward_memberships(a);
+        let want: Delta = before.symmetric_difference(&after).map(|pair| (*pair, after.contains(pair))).collect();
+        oracle(was_delta == want && now_delta == want, || format!("request {serial}: {DIFFER} from the forward membership difference"))?;
         for (table, equal) in [
             ("rows", a.rows == b.rows),
             ("cells", a.cells == b.cells),
@@ -168,6 +183,258 @@ fn scale_cell(j: u32) -> CellId {
     let mut cell = [0u8; 16];
     cell[..4].copy_from_slice(&j.to_le_bytes());
     CellId { of: scale_name(1_000_000 + j % 1_000), cell: Cell(cell) }
+}
+
+/// All rows re-enter with identical output. One swaps a selector in revision one.
+/// Revision two moves the retired selector and one common selector, and reverses
+/// observation order. Only a leaked tombstone can leave the retired selector owed.
+fn membership_history(tape: &Tape, plant: Plant, rows: u32, common: u32) -> Result<(), Broke> {
+    let owner = scale_name(rows);
+    let file = scale_name(rows + 1);
+    let special = tape.index(rows as usize, "reader changing a selector") as u32;
+    let first = tape.index(common as usize, "first common observation") as u32;
+    let selector = |n: u32| {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        CellId { of: owner, cell: Cell(bytes) }
+    };
+    let (removed, added) = (selector(common), selector(common + 1));
+    let digest = ContentId([42; 32]);
+    let mut answer = Answer::new_in(alloc());
+    let mut edits = StdVec::new();
+    for revision in 0u8..3 {
+        let plan: StdVec<_> = (0..=rows).map(|n| {
+            let is_owner = n == rows;
+            let version = if is_owner { u8::from(revision == 2) } else { revision };
+            Planned {
+                name: scale_name(n),
+                file,
+                phase: Phase::new(if is_owner { Stage::Heads } else { Stage::Bodies }, 0),
+                source: ContentId([version; 32]),
+            }
+        }).collect();
+        let run = || -> Result<Finished<'static>, EngineError> {
+            let files = [(file, plan.as_slice())];
+            let mut engine = Engine::new_in(Tools([TOOL; key::KINDS]), answer, &Edit { files: &files }, Everything, plant, alloc())?;
+            let mut buffers = [Buffer::new_in(alloc())];
+            drive(&mut engine, &mut Pools::One, &mut buffers, &|_, view, task, buffer| {
+                let mut defines = SVec::new_in(alloc());
+                let mut reads = SVec::new_in(alloc());
+                let name = task.planned.name;
+                if name == owner {
+                    if revision == 2 {
+                        defines.push((selector(first).cell, digest));
+                        defines.push((removed.cell, digest));
+                    }
+                } else {
+                    for i in 0..common {
+                        let id = selector((first + i) % common);
+                        reads.push((id, view.cell(&id)));
+                    }
+                    if name == scale_name(special) {
+                        let id = if revision == 0 { removed } else { added };
+                        reads.push((id, view.cell(&id)));
+                    }
+                    if revision == 2 {
+                        reads.reverse();
+                    }
+                }
+                buffer.done.push(Done { name, key: task.key, out: digest, reads, defines, findings: 0, failed: false });
+            })?;
+            engine.finish_with_readers(|delta| {
+                if revision == 1 {
+                    edits.extend_from_slice(&delta.edits);
+                }
+                Ok(())
+            })
+        };
+        let finished = run().map_err(|error| Broke::Harness(format!("membership revision {revision}: {error}")))?;
+        let cost = finished.report.index;
+        if revision > 0 {
+            let want = if revision == 1 { 2 } else { 0 };
+            oracle(cost.writes == want, || format!("membership write bound: revision {revision} wrote {}, expected {want}", cost.writes))?;
+            oracle(cost.bytes <= 4096, || format!("membership capacity: revision {revision} reserved {} bytes", cost.bytes))?;
+        }
+        answer = finished.answer;
+        if revision == 2 {
+            oracle(answer.owed_cells.is_empty(), || format!("next edit owes a cell after every current reader saw it: {:?}", answer.owed_cells))?;
+            let row = &answer.rows[&scale_name(special)];
+            oracle(row.reads.first().map(|r| r.0) == Some(added) && row.reads.last() == Some(&(selector(first), digest)), || {
+                String::from("the identical output must retain the new observation order and the moved selector's digest")
+            })?;
+        }
+    }
+    oracle(edits == [((removed, scale_name(special)), false), ((added, scale_name(special)), true)], || format!("unexpected membership delta {edits:?}"))
+}
+
+#[test]
+fn one_swap_among_a_hundred_thousand_standing_memberships() {
+    check(SimConfig::cases(2), |tape| membership_history(tape, Plant::None, 100, 1_000));
+}
+
+#[test]
+fn control_rewriting_all_memberships_breaks_the_write_bound() {
+    control(SimConfig::cases(4), Plant::None, Plant::RewriteAllMemberships, "membership write bound", |tape, plant| membership_history(tape, plant, 8, 12));
+}
+
+#[test]
+fn control_a_lost_tombstone_leaves_the_next_edit_owed() {
+    control(SimConfig::cases(4), Plant::None, Plant::LostReaderTombstone, "next edit owes a cell", |tape, plant| membership_history(tape, plant, 8, 12));
+}
+
+#[test]
+fn membership_reversed_in_a_later_wave_is_absent_from_the_fold() {
+    check(SimConfig::cases(4), |tape| -> Result<(), Broke> {
+        let file = scale_name(70);
+        let owner = scale_name(tape.index(2, "which name merges first") as u32);
+        let reader = if owner == scale_name(0) { scale_name(1) } else { scale_name(0) };
+        let trigger = CellId { of: owner, cell: Cell([0; 16]) };
+        let mut answer = Answer::new_in(alloc());
+        for revision in 1..=2u8 {
+            let source = ContentId([revision; 32]);
+            let plan = [owner, reader].map(|name| Planned { name, file, phase: Phase::new(Stage::Heads, 0), source });
+            let files = [(file, &plan[..])];
+            let mut delta = Delta::new();
+            let run = || -> Result<Finished<'static>, EngineError> {
+                let mut engine = Engine::new_in(Tools([TOOL; key::KINDS]), answer, &Edit { files: &files }, Everything, Plant::None, alloc())?;
+                let mut buffers = [Buffer::new_in(alloc())];
+                drive(&mut engine, &mut Pools::One, &mut buffers, &|_, view, task, buffer| {
+                    let name = task.planned.name;
+                    let (mut reads, mut defines) = (SVec::new_in(alloc()), SVec::new_in(alloc()));
+                    if name == owner {
+                        defines.push((trigger.cell, source));
+                    } else {
+                        let seen = view.cell(&trigger);
+                        reads.push((trigger, seen));
+                        // The first wave sees yesterday's trigger, the next sees today's.
+                        let id = CellId { of: owner, cell: Cell([if seen == source { 1 } else { 2 }; 16]) };
+                        reads.push((id, view.cell(&id)));
+                    }
+                    buffer.done.push(Done { name, key: task.key, out: ContentId([17; 32]), reads, defines, findings: 0, failed: false });
+                })?;
+                engine.finish_with_readers(|changes| {
+                    delta.extend_from_slice(&changes.edits);
+                    Ok(())
+                })
+            };
+            let finished = run().map_err(|error| Broke::Harness(format!("wave revision {revision}: {error}")))?;
+            oracle(finished.entered.iter().filter(|&&name| name == reader).count() == 2, || String::from("the moved trigger must enter its reader in the next wave"))?;
+            if revision == 2 {
+                oracle(finished.report.index.writes == 4 && delta.is_empty(), || format!("two opposite swaps should fold no edits: {delta:?}"))?;
+            }
+            answer = finished.answer;
+        }
+        Ok(())
+    });
+}
+
+fn audit_oracle(answer: &Answer<'_>) -> Result<(), Broke> {
+    let mut examples = StdVec::new();
+    let (mut ordinary, mut signatures, mut heads) = (0u32, 0u32, 0u32);
+    for (&reader, row) in answer.rows.iter() {
+        heads += u32::from(row.phase.stage == Stage::Heads);
+        for &(id, _) in row.reads.iter() {
+            if answer.cells.contains_key(&id) || answer.rows.contains_key(&id.of) {
+                continue;
+            }
+            if id.of.kind == Kind::Signature {
+                signatures += 1;
+            } else {
+                ordinary += 1;
+                if examples.len() < 8 {
+                    examples.push((reader, id));
+                }
+            }
+        }
+    }
+    let proof = answer.read_audit().map_err(|error| Broke::Oracle(format!("the fold lost its base audit: {error}")))?;
+    oracle(proof.heads() == heads && proof.undefined_counts() == (ordinary, signatures) && proof.examples().eq(examples.iter().copied()), || {
+        format!("audit differs from the forward rows: expected {heads} heads, {ordinary} undefined, {signatures} signatures, examples {examples:?}")
+    })
+}
+
+fn audit_history(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let owner = scale_name(80);
+    let signature = Name::new(Kind::Signature, owner.subject);
+    let file = scale_name(81);
+    let rows = 10 + tape.index(8, "rows that read absent selectors") as u32;
+    let mut answer = Answer::new_in(alloc());
+    for revision in 0u8..5 {
+        let mut plan = StdVec::new();
+        let mut plan_row = |name, stage, version| {
+            plan.push(Planned { name, phase: Phase::new(stage, 0), file, source: ContentId([version; 32]) });
+        };
+        for n in 0..rows {
+            // One reader retires permanently. The others re-enter only for the final
+            // change of observation order, when the membership delta is empty.
+            if n != 0 || revision < 2 {
+                plan_row(scale_name(n), Stage::Bodies, u8::from(revision == 4));
+            }
+        }
+        if revision == 1 {
+            plan_row(owner, Stage::Heads, 0);
+        }
+        if revision == 2 || revision == 3 {
+            plan_row(signature, Stage::Heads, 0);
+        }
+        let run = || -> Result<Finished<'static>, EngineError> {
+            let files = [(file, plan.as_slice())];
+            let mut engine = Engine::new_in(Tools([TOOL; key::KINDS]), answer, &Edit { files: &files }, Everything, plant, alloc())?;
+            let mut buffers = [Buffer::new_in(alloc())];
+            drive(&mut engine, &mut Pools::One, &mut buffers, &|_, view, task, buffer| {
+                let name = task.planned.name;
+                let mut reads = SVec::new_in(alloc());
+                if name != owner && name != signature {
+                    for of in [signature, owner, owner] {
+                        let id = CellId { of, cell: Cell([reads.len() as u8; 16]) };
+                        reads.push((id, view.cell(&id)));
+                    }
+                    if revision == 4 {
+                        reads.reverse();
+                    }
+                }
+                // A present row defines no selectors: reads of its absent cells are intentional.
+                buffer.done.push(Done { name, key: task.key, out: ContentId([19; 32]), reads, defines: SVec::new_in(alloc()), findings: 0, failed: false });
+            })?;
+            engine.finish()
+        };
+        answer = run().map_err(|error| Broke::Harness(format!("audit revision {revision}: {error}")))?.answer;
+        audit_oracle(&answer)?;
+        if revision <= 1 {
+            // Seed a fresh process from the current page format (which requires reads
+            // in cell order). Compare the decoded proof with the forward oracle too.
+            let kept = Kept::after(blaze_own::BTreeMap::new_in(alloc()), answer, &[], blaze_own::BTreeMap::new_in(alloc()));
+            let bytes = crate::pages::encode(&kept, None, alloc());
+            let restored = crate::pages::decode(bytes.root, |key| bytes.puts.iter().find(|p| p.0 == key).map(|p| crate::pages::Sealed::hashed(key, p.1.as_slice())), alloc())
+                .map_err(|error| Broke::Harness(format!("restoring the audit fixture: {error}")))?;
+            let encoded_again = crate::pages::encode(&restored, None, alloc());
+            oracle(bytes.root == encoded_again.root, || String::from("audit fixture changed bytes on restore"))?;
+            answer = restored.answer;
+            if revision == 0 {
+                let proof = kept.answer.read_audit().map_err(|error| Broke::Harness(format!("saving the audit: {error}")))?;
+                let mut other_root = bytes.root;
+                other_root.0.0[0] ^= 1;
+                let stale = answer.restore_read_audit(bytes.root, proof.record(other_root), alloc());
+                oracle(matches!(stale, Err(EngineError::AuditBase { .. })), || String::from("restore accepted a proof for a different root"))?;
+                answer.restore_read_audit(bytes.root, proof.record(bytes.root), alloc())
+                    .map_err(|error| Broke::Oracle(format!("restoring the matching audit: {error}")))?;
+            } else {
+                answer.certify_reads(alloc());
+            }
+            audit_oracle(&answer)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn audit_matches_forward_rows_after_definer_changes_and_restore() {
+    check(SimConfig::cases(8), |tape| audit_history(tape, Plant::None));
+}
+
+#[test]
+fn control_skipping_readers_of_an_introduced_definer_is_caught() {
+    control(SimConfig::cases(4), Plant::None, Plant::SkipDefinerReaders, "audit differs from the forward rows", audit_history);
 }
 
 const TASKS: u32 = 20_000;

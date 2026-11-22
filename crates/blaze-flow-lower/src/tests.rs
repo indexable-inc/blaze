@@ -12,15 +12,74 @@ use blaze_own::Alloc;
 use blaze_typeck::fixture::{Bb, Fx};
 use blaze_typeck::{Checked, ExprId, FnPtrHeader, InferCtx, ItemKey, Mutbl, Name, Needs, Outcome, PNode, PTy};
 
-use crate::{
-    AdtFacts, CalleeFacts, CallableRefusal, Facts, Form, Plant, Refusal, Region, SigBuf, SigLife, SigRefusal, lower_planted, read_callable_param,
-    read_signature,
-};
+use crate::region_fixture::{self, BOUND1, Decls, FnHead, P0, P1, P2};
+use crate::{AdtFacts, CalleeFacts, Facts, Form, Plant, Refusal, Region, UnreadWhy};
 
 /// Every ADT of the fixtures is a plain struct with no `Copy` impl, no lifetimes, needing drop.
 struct Plain;
 
 impl Facts for Plain {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
@@ -38,43 +97,104 @@ impl Facts for Plain {
     }
 }
 
-/// The fixtures' facts with lifetime parts: each fn's read from the text given for it by
-/// [`read_signature`], as the census does. `callees_known` false: no callee's head is known
-/// (the lowering relates such a call as one of unknown signature).
+/// Facts whose heads' region facts are declared by hand ([`Decls`], laid in the checked
+/// record's table by region_fixture.rs `run`): what [`findings_laid`] lowers under.
+pub(crate) trait Declared: Facts {
+    fn decls(&self) -> &Decls;
+}
+
+/// The fixtures' facts with the heads' region facts DECLARED (D148: each fn's column and
+/// lifetime parameters by the numbering rule, region_fixture.rs's module doc), never read from
+/// a text. `callees_known` false: no callee's `CalleeFacts` is known.
 pub(crate) struct Sigs {
-    sigs: vec::Vec<(ItemKey, SigBuf<Alloc<'static>>)>,
-    callees_known: bool,
-    /// The text of the body being lowered (`Facts::own_text`); empty: not known.
-    own: String,
+    pub(crate) decls: Decls,
+    pub(crate) callees_known: bool,
 }
 
 impl Sigs {
     pub(crate) fn new() -> Sigs {
-        Sigs { sigs: vec::Vec::new(), callees_known: true, own: String::new() }
+        Sigs { decls: Decls::new(), callees_known: true }
     }
 
-    /// Reads `text` as the signature of `item`, whose erased types are `inputs` and `output`.
-    fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
-        let mut buf = SigBuf::new_in(Alloc::global());
-        match read_signature(text, fx.t.view(), inputs, output, &|_| Some(0), &mut buf, Alloc::global()) {
-            Ok(()) => self.sigs.push((item, buf)),
-            Err(why) => panic!("`{text}` was not read: {why:?}"),
-        }
+    /// `item`'s head: its lifetimes and its column over `fn(inputs..) -> output`.
+    pub(crate) fn add(&mut self, item: ItemKey, head: FnHead<'_>) {
+        self.decls.func(item, head);
+    }
+}
+
+impl Declared for Sigs {
+    fn decls(&self) -> &Decls {
+        &self.decls
     }
 }
 
 impl Facts for Sigs {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         Plain.adt(k)
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
         if self.callees_known { Plain.callee(k) } else { None }
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.sigs.iter().find(|(k, _)| *k == item).map(|(_, s)| s.life())
-    }
-    fn own_text(&self) -> Option<&str> {
-        if self.own.is_empty() { None } else { Some(&self.own) }
     }
     fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
         None
@@ -91,7 +211,8 @@ impl Facts for Sigs {
 pub(crate) fn findings_with<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, plant: Plant) -> Result<vec::Vec<String>, Refusal> {
     let c = checked(fx, b, owner, root);
     let view = b.view(owner, root);
-    let lowered = lower_planted(&view, &c, facts, plant, Alloc::global())?;
+    // Through the call-rule oracle (oracle.rs): both rules, compared per call, production's flow.
+    let lowered = crate::oracle::lower_checked(&view, &c, facts, plant, blaze_own::testing::heap().alloc())?;
     let rec = check(&lowered.flow, Alloc::global()).expect("bounded");
     let mut out = vec::Vec::new();
     for m in rec.moves.iter() {
@@ -101,6 +222,12 @@ pub(crate) fn findings_with<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: Exp
         out.push(format!("borrow {f:?}"));
     }
     Ok(out)
+}
+
+/// The findings of one body under `facts` (their declared heads laid in the body's record,
+/// region_fixture.rs `run`) and `plant`, one line each; or the refusal.
+pub(crate) fn findings_laid<F: Declared>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, plant: Plant) -> Result<vec::Vec<String>, Refusal> {
+    region_fixture::findings(fx, b, owner, root, facts, facts.decls(), plant)
 }
 
 fn checked<'b>(fx: &Fx, b: &'b Bb, owner: ItemKey, root: ExprId) -> Checked<'static> {
@@ -115,39 +242,33 @@ fn checked<'b>(fx: &Fx, b: &'b Bb, owner: ItemKey, root: ExprId) -> Checked<'sta
     }
 }
 
-/// The findings of one body under `plant`, one line each, and the flow's text.
-fn findings(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, plant: Plant) -> (vec::Vec<String>, String) {
-    let c = checked(fx, b, owner, root);
-    let view = b.view(owner, root);
-    let lowered = match lower_planted(&view, &c, &Plain, plant, Alloc::global()) {
-        Ok(l) => l,
+/// The findings of one body under `plant` and `Plain` with `heads` laid, one line each, and the
+/// flow's text.
+fn findings(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, heads: &Decls, plant: Plant) -> (vec::Vec<String>, String) {
+    match region_fixture::run(fx, &b.view(owner, root), &Plain, heads, plant) {
+        Ok(r) => (r.lines, r.flow),
         Err(r) => panic!("refused: {r:?}"),
-    };
-    let mut text = String::new();
-    lowered.flow.print(&mut text).expect("print");
-    let rec = check(&lowered.flow, Alloc::global()).expect("bounded");
-    let mut out = vec::Vec::new();
-    for m in rec.moves.iter() {
-        out.push(format!("move {:?} at {:?} span {}..{}", m.kind, m.at, m.span.lo, m.span.hi));
     }
-    for f in rec.borrows.iter() {
-        out.push(format!("borrow {f:?}"));
-    }
-    (out, text)
 }
 
-/// `struct S; fn g(_: &S); fn f(s: S)`, and the fixture world finished by `body`.
-fn world() -> (Fx, ItemKey, ItemKey) {
+/// `struct S; fn g(_: &S); fn h(_: S); fn f(s: S)`, the world finished, and the three heads.
+fn world() -> (Fx, ItemKey, ItemKey, Decls) {
     let mut fx = Fx::new();
     let s = fx.strukt("S", 0, &[]);
     let st = fx.adt(s, &[]);
     let rs = fx.r(Mutbl::Not, st);
     let unit = fx.unit();
-    let _g = fx.func("g", 0, &[rs], unit, vec![]);
-    let _h = fx.func("h", 0, &[st], unit, vec![]);
+    let g = fx.func("g", 0, &[rs], unit, vec![]);
+    let h = fx.func("h", 0, &[st], unit, vec![]);
     let f = fx.func("f", 0, &[st], unit, vec![]);
     fx.finish();
-    (fx, s, f)
+    let mut heads = Decls::new();
+    // `fn g(_: &S)`: one elided input lifetime, `'0`, late-bound.
+    heads.func(g, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rs], output: unit, slots: &[P0] });
+    // `fn h(_: S)` and `fn f(s: S)`: no lifetime.
+    heads.func(h, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[st], output: unit, slots: &[] });
+    heads.func(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[st], output: unit, slots: &[] });
+    (fx, s, f, heads)
 }
 
 /// The Reference, "Moved and copied types": "After moving out of a place expression that
@@ -156,7 +277,7 @@ fn world() -> (Fx, ItemKey, ItemKey) {
 /// a moved value. Control: lowering every read as a copy (`Plant::AllCopy`) hides it.
 #[test]
 fn moved_twice() {
-    let (fx, _s, f) = world();
+    let (fx, _s, f, heads) = world();
     let mut b = Bb::new();
     let s = b.param("s");
     let (a, bb) = (b.bind("a"), b.bind("b"));
@@ -165,10 +286,10 @@ fn moved_twice() {
     let r2 = b.local(s);
     let st2 = b.let_(bb, None, r2);
     let root = b.block(&[st1, st2], None);
-    let (got, text) = findings(&fx, &b, f, root, Plant::None);
+    let (got, text) = findings(&fx, &b, f, root, &heads, Plant::None);
     std::println!("moved_twice: {got:?}");
     assert!(got.iter().any(|l| l.contains("UseOfMoved")), "the second move is caught:\n{text}");
-    let (planted, _) = findings(&fx, &b, f, root, Plant::AllCopy);
+    let (planted, _) = findings(&fx, &b, f, root, &heads, Plant::AllCopy);
     std::println!("moved_twice, planted AllCopy: {planted:?}");
     assert!(planted.is_empty(), "the control hides it");
 }
@@ -176,7 +297,7 @@ fn moved_twice() {
 /// `fn f(s: S) { let a = s; h(a); }`: one move each: no finding.
 #[test]
 fn moved_once() {
-    let (fx, _s, f) = world();
+    let (fx, _s, f, heads) = world();
     let mut b = Bb::new();
     let s = b.param("s");
     let a = b.bind("a");
@@ -187,7 +308,7 @@ fn moved_once() {
     let call = b.call(h, &[ra]);
     let st2 = b.semi(call);
     let root = b.block(&[st1, st2], None);
-    let (got, text) = findings(&fx, &b, f, root, Plant::None);
+    let (got, text) = findings(&fx, &b, f, root, &heads, Plant::None);
     std::println!("moved_once: {got:?}");
     assert!(got.is_empty(), "{got:?}\n{text}");
 }
@@ -198,7 +319,7 @@ fn moved_once() {
 /// leaves the loan in the borrow's temporary, dead before the move: no finding.
 #[test]
 fn move_while_borrowed() {
-    let (fx, _s, f) = world();
+    let (fx, _s, f, heads) = world();
     let mut b = Bb::new();
     let s = b.param("s");
     let r = b.bind("r");
@@ -214,10 +335,10 @@ fn move_while_borrowed() {
     let c2 = b.call(g, &[lr]);
     let st3 = b.semi(c2);
     let root = b.block(&[st1, st2, st3], None);
-    let (got, text) = findings(&fx, &b, f, root, Plant::None);
+    let (got, text) = findings(&fx, &b, f, root, &heads, Plant::None);
     std::println!("move_while_borrowed: {got:?}");
     assert!(got.iter().any(|l| l.starts_with("borrow Invalidated")), "{got:?}\n{text}");
-    let (planted, _) = findings(&fx, &b, f, root, Plant::NoRelate);
+    let (planted, _) = findings(&fx, &b, f, root, &heads, Plant::NoRelate);
     std::println!("move_while_borrowed, planted NoRelate: {planted:?}");
     assert!(!planted.iter().any(|l| l.starts_with("borrow")), "the control hides it");
 }
@@ -226,7 +347,7 @@ fn move_while_borrowed() {
 /// 2094: "a variable is live if the current value that it holds may be used later").
 #[test]
 fn move_after_last_use() {
-    let (fx, _s, f) = world();
+    let (fx, _s, f, heads) = world();
     let mut b = Bb::new();
     let s = b.param("s");
     let r = b.bind("r");
@@ -242,7 +363,7 @@ fn move_after_last_use() {
     let c1 = b.call(h, &[ls2]);
     let st3 = b.semi(c1);
     let root = b.block(&[st1, st2, st3], None);
-    let (got, text) = findings(&fx, &b, f, root, Plant::None);
+    let (got, text) = findings(&fx, &b, f, root, &heads, Plant::None);
     std::println!("move_after_last_use: {got:?}");
     assert!(got.is_empty(), "{got:?}\n{text}");
 }
@@ -258,59 +379,6 @@ fn sig_base() -> (Fx, PTy, PTy) {
     (fx, st, rs)
 }
 
-fn read(fx: &Fx, text: &str, inputs: &[PTy], output: PTy) -> Result<(vec::Vec<Region>, vec::Vec<u32>, vec::Vec<(Region, Region)>), SigRefusal> {
-    let mut buf = SigBuf::new_in(Alloc::global());
-    read_signature(text, fx.t.view(), inputs, output, &|_| Some(0), &mut buf, Alloc::global())?;
-    Ok((buf.regions.iter().copied().collect(), buf.ends.iter().copied().collect(), buf.bounds.iter().copied().collect()))
-}
-
-/// The reader lines a signature's written lifetimes up with the erased types' positions, by
-/// the Reference's "Lifetime elision" rules (quoted in `sig.rs`), and refuses what it cannot.
-#[test]
-fn signature_text_is_read_by_the_references_rules() {
-    let (mut fx, st, rs) = sig_base();
-    let u8t = fx.u8();
-    let pair = fx.tuple(&[u8t, u8t]);
-    let rpair = fx.r(Mutbl::Not, pair);
-    let ru8 = fx.r(Mutbl::Not, u8t);
-    let rrs = fx.r(Mutbl::Not, rs);
-    let rms = fx.r(Mutbl::Mut, st);
-    use Region::{Anon, Named, Static};
-    // A named lifetime is one region wherever it is written.
-    let got = read(&fx, "fn first<'a>(x: &'a (u8, u8)) -> &'a u8 { &x.0 }", &[rpair], ru8);
-    assert_eq!(got, Ok((vec![Named(0), Named(0)], vec![1], vec![])));
-    // "Each elided lifetime in the parameters becomes a distinct lifetime parameter"; "If there
-    // is exactly one lifetime used in the parameters (elided or not), that lifetime is assigned
-    // to all elided output lifetimes."
-    let got = read(&fx, "fn f(x: &S) -> &S { x }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Anon(0), Anon(0)], vec![1], vec![])));
-    // "If the receiver has type `&Self` or `&mut Self`, then the lifetime of that reference to
-    // `Self` is assigned to all elided output lifetime parameters."
-    let got = read(&fx, "pub fn name(&mut self, other: &S) -> &S { other }", &[rms, rs], rs);
-    assert_eq!(got, Ok((vec![Anon(0), Anon(1), Anon(0)], vec![1, 2], vec![])));
-    // A declared bound, `'b: 'a` (numbered by first appearance: `'b` is 0).
-    let got = read(&fx, "fn g<'a, 'b: 'a>(x: &'b S) -> &'a S { x }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Named(0), Named(1)], vec![1], vec![(Named(0), Named(1))])));
-    // The same in a where clause.
-    let got = read(&fx, "fn g<'a, 'b>(x: &'b S) -> &'a S where 'b: 'a { x }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Named(0), Named(1)], vec![1], vec![(Named(0), Named(1))])));
-    // A nested reference: two positions, outer first.
-    let got = read(&fx, "fn inner<'a, 'b>(x: &'a &'b S) -> &'a S { *x }", &[rrs], rs);
-    assert_eq!(got, Ok((vec![Named(0), Named(1), Named(0)], vec![2], vec![])));
-    // `'static` is the one lifetime used in the parameters.
-    let got = read(&fx, "fn s(x: &'static S) -> &S { x }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Static, Static], vec![1], vec![])));
-    // Two input lifetimes and no receiver: the elided output is an error in Rust; refused.
-    let got = read(&fx, "fn h(x: &S, y: &S) -> &S { x }", &[rs, rs], rs);
-    assert!(matches!(got, Err(SigRefusal::ElisionUndecided { .. })), "{got:?}");
-    // A written type that is not the erased type's form (an alias): refused, never guessed.
-    let got = read(&fx, "fn a(x: Alias) -> u8 { 0 }", &[rs], u8t);
-    assert!(matches!(got, Err(SigRefusal::Unaligned { .. })), "{got:?}");
-    // The parameters of the text are not the head's.
-    let got = read(&fx, "fn a(x: &S) -> u8 { 0 }", &[rs, rs], u8t);
-    assert_eq!(got, Err(SigRefusal::ParamCount { text: 1, head: 2 }));
-}
-
 /// `fn keep<'a, 'b>(x: &'a S, y: &'b S) -> &'a S { x }` is right. Its nearest wrong program,
 /// `fn pick<'a, 'b>(x: &'a S, y: &'b S) -> &'a S { y }`, needs `'b: 'a`, which the signature
 /// does not state (rustc: "lifetime may not live long enough"): `UnprovenOutlives`.
@@ -321,15 +389,18 @@ fn a_returned_reference_must_be_the_signatures() {
     let pick = fx.func("pick", 0, &[rs, rs], rs, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
-    sigs.add(&fx, keep, "fn keep<'a, 'b>(x: &'a S, y: &'b S) -> &'a S { x }", &[rs, rs], rs);
-    sigs.add(&fx, pick, "fn pick<'a, 'b>(x: &'a S, y: &'b S) -> &'a S { y }", &[rs, rs], rs);
+    // `fn keep<'a, 'b>(x: &'a S, y: &'b S) -> &'a S` and `pick`, the same head: `'a` is `P0`,
+    // `'b` `P1`, both late-bound (in the inputs, in no bound); column `[x, y, output]`.
+    for item in [keep, pick] {
+        sigs.add(item, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rs, rs], output: rs, slots: &[P0, P1, P0] });
+    }
     for (owner, tail_is_y, wrong) in [(keep, false, false), (pick, true, true)] {
         let mut b = Bb::new();
         let x = b.param("x");
         let y = b.param("y");
         let tail = b.local(if tail_is_y { y } else { x });
         let root = b.block(&[], Some(tail));
-        let got = findings_with(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
+        let got = findings_laid(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
         std::println!("a_returned_reference_must_be_the_signatures, wrong {wrong}: {got:?}");
         assert_eq!(got.iter().any(|l| l.starts_with("borrow UnprovenOutlives")), wrong, "{got:?}");
         assert_eq!(got.is_empty(), !wrong, "{got:?}");
@@ -346,18 +417,21 @@ fn elision_and_a_declared_bound_are_known() {
     let g = fx.func("g", 0, &[rs], rs, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
-    sigs.add(&fx, f, "fn f(x: &S) -> &S { x }", &[rs], rs);
-    sigs.add(&fx, g, "fn g<'a, 'b: 'a>(x: &'b S) -> &'a S { x }", &[rs], rs);
+    // `fn f(x: &S) -> &S`: one elided input lifetime `P0` (late-bound), the output's by elision.
+    sigs.add(f, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rs], output: rs, slots: &[P0, P0] });
+    // `fn g<'a, 'b: 'a>(x: &'b S) -> &'a S`: `'a` is `P0`, `'b` `P1` (declaration order), both
+    // early-bound (the bound names them); `'b: 'a` declared.
+    sigs.add(g, FnHead { lifetimes: 2, late: &[], outlives: &[(P1, P0)], inputs: &[rs], output: rs, slots: &[P1, P0] });
     for owner in [f, g] {
         let mut b = Bb::new();
         let x = b.param("x");
         let tail = b.local(x);
         let root = b.block(&[], Some(tail));
-        let got = findings_with(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
+        let got = findings_laid(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
         std::println!("elision_and_a_declared_bound_are_known: {got:?}");
         assert!(got.is_empty(), "{got:?}");
         if owner == g {
-            let planted = findings_with(&fx, &b, owner, root, &sigs, Plant::NoKnown).expect("lowered");
+            let planted = findings_laid(&fx, &b, owner, root, &sigs, Plant::NoKnown).expect("lowered");
             std::println!("elision_and_a_declared_bound_are_known, planted NoKnown: {planted:?}");
             assert!(planted.iter().any(|l| l.starts_with("borrow UnprovenOutlives")), "the control refuses g: {planted:?}");
         }
@@ -372,13 +446,14 @@ fn a_reference_to_a_local_is_not_returned() {
     let dangle = fx.func("dangle", 0, &[st], rs, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
-    sigs.add(&fx, dangle, "fn dangle<'a>(s: S) -> &'a S { &s }", &[st], rs);
+    // `fn dangle<'a>(s: S) -> &'a S`: `'a` is `P0`, early-bound (not in the inputs).
+    sigs.add(dangle, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[st], output: rs, slots: &[P0] });
     let mut b = Bb::new();
     let s = b.param("s");
     let ls = b.local(s);
     let bor = b.borrow(Mutbl::Not, ls);
     let root = b.block(&[], Some(bor));
-    let got = findings_with(&fx, &b, dangle, root, &sigs, Plant::None).expect("lowered");
+    let got = findings_laid(&fx, &b, dangle, root, &sigs, Plant::None).expect("lowered");
     std::println!("a_reference_to_a_local_is_not_returned: {got:?}");
     assert!(got.iter().any(|l| l.starts_with("borrow Invalidated")), "{got:?}");
 }
@@ -394,7 +469,8 @@ fn a_tuple_relates_each_element_to_its_own_field() {
     let eq2 = fx.func("eq2", 0, &[rs, rs], unit, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
-    sigs.add(&fx, eq2, "fn eq2(a: &S, b: &S) { let t = (a, b); }", &[rs, rs], unit);
+    // `fn eq2(a: &S, b: &S)`: two elided input lifetimes, `P0` and `P1`, both late-bound.
+    sigs.add(eq2, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rs, rs], output: unit, slots: &[P0, P1] });
     let mut b = Bb::new();
     let (pa, pb) = (b.param("a"), b.param("b"));
     let t = b.bind("t");
@@ -402,10 +478,10 @@ fn a_tuple_relates_each_element_to_its_own_field() {
     let tup = b.tuple(&[la, lb]);
     let st1 = b.let_(t, None, tup);
     let root = b.block(&[st1], None);
-    let got = findings_with(&fx, &b, eq2, root, &sigs, Plant::None).expect("lowered");
+    let got = findings_laid(&fx, &b, eq2, root, &sigs, Plant::None).expect("lowered");
     std::println!("a_tuple_relates_each_element_to_its_own_field: {got:?}");
     assert!(got.is_empty(), "{got:?}");
-    let planted = findings_with(&fx, &b, eq2, root, &sigs, Plant::TupleUnified).expect("lowered");
+    let planted = findings_laid(&fx, &b, eq2, root, &sigs, Plant::TupleUnified).expect("lowered");
     std::println!("a_tuple_relates_each_element_to_its_own_field, planted TupleUnified: {planted:?}");
     assert!(planted.iter().any(|l| l.starts_with("borrow UnprovenOutlives")), "{planted:?}");
 }
@@ -419,13 +495,15 @@ fn a_tuple_of_the_wrong_lifetimes_is_refused() {
     let swap = fx.func("swap", 0, &[rs, rs], out, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
-    sigs.add(&fx, swap, "fn swap<'a, 'b>(a: &'a S, b: &'b S) -> (&'b S, &'a S) { (a, b) }", &[rs, rs], out);
+    // `fn swap<'a, 'b>(a: &'a S, b: &'b S) -> (&'b S, &'a S)`: `'a` is `P0`, `'b` `P1`, both
+    // late-bound; the output tuple's slots in element order.
+    sigs.add(swap, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rs, rs], output: out, slots: &[P0, P1, P1, P0] });
     let mut b = Bb::new();
     let (pa, pb) = (b.param("a"), b.param("b"));
     let (la, lb) = (b.local(pa), b.local(pb));
     let tup = b.tuple(&[la, lb]);
     let root = b.block(&[], Some(tup));
-    let got = findings_with(&fx, &b, swap, root, &sigs, Plant::None).expect("lowered");
+    let got = findings_laid(&fx, &b, swap, root, &sigs, Plant::None).expect("lowered");
     std::println!("a_tuple_of_the_wrong_lifetimes_is_refused: {got:?}");
     assert!(got.iter().any(|l| l.starts_with("borrow UnprovenOutlives")), "{got:?}");
 }
@@ -433,8 +511,9 @@ fn a_tuple_of_the_wrong_lifetimes_is_refused() {
 /// A call is related through its callee's lifetime part, instantiated fresh at the call. With
 /// `fn first<'a, 'b>(x: &'a S, y: &'b S) -> &'a S`: `fn ok<'a, 'b>(x: &'a S, y: &'b S) -> &'a S
 /// { first(x, y) }` is right, and `fn bad<'a, 'b>(x: &'a S, y: &'b S) -> &'b S { first(x, y) }`
-/// is wrong (the result lives for `'a`, returned as `'b`). Without the lifetime part the call is
-/// not lowered at all (`ElisionAmbiguous`: two input lifetimes), which is the census's refusal.
+/// is wrong (the result lives for `'a`, returned as `'b`). Without the callee's lifetime part
+/// the call is not lowered at all: refused by name (`RegionsUnread { item: first, NoHead }`,
+/// D148; before the record it was `ElisionAmbiguous`, two input lifetimes).
 #[test]
 fn a_call_is_related_through_its_callees_signature() {
     let (mut fx, _st, rs) = sig_base();
@@ -442,10 +521,18 @@ fn a_call_is_related_through_its_callees_signature() {
     let ok = fx.func("ok", 0, &[rs, rs], rs, vec![]);
     let bad = fx.func("bad", 0, &[rs, rs], rs, vec![]);
     fx.finish();
+    // `fn first<'a, 'b>(x: &'a S, y: &'b S) -> &'a S` and `fn ok<'a, 'b>(..) -> &'a S`: `'a` is
+    // `P0`, `'b` `P1`, both late-bound.
+    let two_one = FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rs, rs], output: rs, slots: &[P0, P1, P0] };
+    // `fn bad<'a, 'b>(x: &'a S, y: &'b S) -> &'b S`.
+    let two_two = FnHead { slots: &[P0, P1, P1], ..two_one };
     let mut sigs = Sigs::new();
-    sigs.add(&fx, first, "fn first<'a, 'b>(x: &'a S, y: &'b S) -> &'a S { x }", &[rs, rs], rs);
-    sigs.add(&fx, ok, "fn ok<'a, 'b>(x: &'a S, y: &'b S) -> &'a S { first(x, y) }", &[rs, rs], rs);
-    sigs.add(&fx, bad, "fn bad<'a, 'b>(x: &'a S, y: &'b S) -> &'b S { first(x, y) }", &[rs, rs], rs);
+    sigs.add(first, two_one);
+    sigs.add(ok, two_one);
+    sigs.add(bad, two_two);
+    // The control's facts: the owner's head alone, the callee's not laid.
+    let mut no_callee = Sigs::new();
+    no_callee.add(ok, two_one);
     for (owner, wrong) in [(ok, false), (bad, true)] {
         let mut b = Bb::new();
         let (px, py) = (b.param("x"), b.param("y"));
@@ -453,14 +540,17 @@ fn a_call_is_related_through_its_callees_signature() {
         let (lx, ly) = (b.local(px), b.local(py));
         let call = b.call(callee, &[lx, ly]);
         let root = b.block(&[], Some(call));
-        let got = findings_with(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
+        let got = findings_laid(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
         std::println!("a_call_is_related_through_its_callees_signature, wrong {wrong}: {got:?}");
         assert_eq!(got.iter().any(|l| l.starts_with("borrow UnprovenOutlives")), wrong, "{got:?}");
         assert_eq!(got.is_empty(), !wrong, "{got:?}");
         if !wrong {
-            let without = findings_with(&fx, &b, owner, root, &Plain, Plant::None);
+            let without = findings_laid(&fx, &b, owner, root, &no_callee, Plant::None);
             std::println!("a_call_is_related_through_its_callees_signature, no lifetime parts: {without:?}");
-            assert!(matches!(without, Err(Refusal { form: Form::ElisionAmbiguous, .. })), "{without:?}");
+            assert!(
+                matches!(without, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == first),
+                "{without:?}"
+            );
         }
     }
 }
@@ -474,9 +564,10 @@ fn a_call_is_related_through_its_callees_signature() {
 /// this, the opaque's position took the elision path, which needs exactly one input lifetime:
 /// refused `ElisionAmbiguous` (the rung x0-async-01's `compute`). Control: the same call with an
 /// output of a REFERENCE (`fn mk_ref(a: u8) -> &S`, an elided output lifetime with no input
-/// lifetime, E0106) stays refused `ElisionAmbiguous`: the rule is the opaque's, not elision's.
+/// lifetime, E0106) stays refused: its head is refused (D148: `RegionsUnread { item: mk_ref,
+/// HeadRefused }`, before the record `ElisionAmbiguous`): the rule is the opaque's, not elision's.
 ///
-/// Prints: `an opaque output with no input lifetime: lowered, findings []; a reference output: ElisionAmbiguous`
+/// Prints: `an opaque output with no input lifetime: lowered, findings []; a reference output: HeadRefused`
 #[test]
 fn an_opaque_output_with_no_input_lifetime_is_related_to_nothing() {
     let (mut fx, _st, rs) = sig_base();
@@ -488,10 +579,18 @@ fn an_opaque_output_with_no_input_lifetime_is_related_to_nothing() {
     let opaque = fx.ty(PNode::Opaque(opaque_key, none));
     let opaque_sized = fx.bound(sized, &[opaque]);
     fx.set_opaque_bounds(opaque_key, vec![opaque_sized]);
-    fx.func("mk", 0, &[u8_], opaque, vec![]);
-    fx.func("mk_ref", 0, &[u8_], rs, vec![]);
+    let mk = fx.func("mk", 0, &[u8_], opaque, vec![]);
+    let mk_ref = fx.func("mk_ref", 0, &[u8_], rs, vec![]);
     let owner = fx.func("owner", 0, &[], unit, vec![]);
     fx.finish();
+    let mut sigs = Sigs::new();
+    // `fn mk(a: u8) -> impl Sized` (the opaque captures nothing: no lifetime in scope): no slot.
+    sigs.decls.opaque(opaque_key, 0);
+    sigs.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[u8_], output: opaque, slots: &[] });
+    // `fn owner()`: no lifetime.
+    sigs.add(owner, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: unit, slots: &[] });
+    // `fn mk_ref(a: u8) -> &S`: E0106, the head refused.
+    sigs.decls.refuse(mk_ref);
     let body = |callee: &str| {
         let mut b = Bb::new();
         let e0 = b.path(&[callee]);
@@ -503,12 +602,15 @@ fn an_opaque_output_with_no_input_lifetime_is_related_to_nothing() {
         (b, root)
     };
     let (b, root) = body("mk");
-    let got = findings_with(&fx, &b, owner, root, &Plain, Plant::None).unwrap_or_else(|r| panic!("an opaque output with no input lifetime is lowered: {r:?}"));
+    let got = findings_laid(&fx, &b, owner, root, &sigs, Plant::None).unwrap_or_else(|r| panic!("an opaque output with no input lifetime is lowered: {r:?}"));
     assert!(got.is_empty(), "{got:?}");
     let (b, root) = body("mk_ref");
-    let control = findings_with(&fx, &b, owner, root, &Plain, Plant::None);
-    assert!(matches!(control, Err(Refusal { form: Form::ElisionAmbiguous, .. })), "control: {control:?}");
-    std::println!("an opaque output with no input lifetime: lowered, findings {got:?}; a reference output: ElisionAmbiguous");
+    let control = findings_laid(&fx, &b, owner, root, &sigs, Plant::None);
+    assert!(
+        matches!(control, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::HeadRefused }, .. }) if item == mk_ref),
+        "control: {control:?}"
+    );
+    std::println!("an opaque output with no input lifetime: lowered, findings {got:?}; a reference output: HeadRefused");
 }
 
 /// A call whose callee's head is not known: `fn two(a: &S, b: &S) { k(a, b); }` is right: each
@@ -520,12 +622,14 @@ fn an_opaque_output_with_no_input_lifetime_is_related_to_nothing() {
 fn an_unknown_callee_takes_each_reference_one_way() {
     let (mut fx, _st, rs) = sig_base();
     let unit = fx.unit();
-    let _k = fx.func("k", 0, &[rs, rs], unit, vec![]);
+    let k = fx.func("k", 0, &[rs, rs], unit, vec![]);
     let two = fx.func("two", 0, &[rs, rs], unit, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
     sigs.callees_known = false;
-    sigs.add(&fx, two, "fn two(a: &S, b: &S) { k(a, b); }", &[rs, rs], unit);
+    // `fn two(a: &S, b: &S)`: two elided input lifetimes `P0`, `P1`, late-bound; `k`'s head is
+    // not laid.
+    sigs.add(two, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rs, rs], output: unit, slots: &[P0, P1] });
     let mut b = Bb::new();
     let (pa, pb) = (b.param("a"), b.param("b"));
     let callee = b.path(&["k"]);
@@ -534,10 +638,11 @@ fn an_unknown_callee_takes_each_reference_one_way() {
     let st1 = b.semi(call);
     let root = b.block(&[st1], None);
     // SUPERSEDED by the soundness rule below (`an_unknown_callee_is_refused_by_name`): a call
-    // of unknown head with a reference argument is no longer related at all, it is refused.
-    let got = findings_with(&fx, &b, two, root, &sigs, Plant::None);
+    // of unknown head with a reference argument is no longer related at all, it is refused
+    // (D148: by the callee's unread regions, `RegionsUnread`, where it was `CalleeUnknown`).
+    let got = findings_laid(&fx, &b, two, root, &sigs, Plant::None);
     std::println!("an_unknown_callee_takes_each_reference_one_way: {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CalleeUnknown, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == k), "{got:?}");
 }
 
 /// The nearest wrong program to the unknown-callee fixture: `fn leak<'a>(s: S) -> &'a S {
@@ -546,12 +651,13 @@ fn an_unknown_callee_takes_each_reference_one_way() {
 #[test]
 fn an_unknown_callee_still_carries_its_argument_to_its_result() {
     let (mut fx, st, rs) = sig_base();
-    let _k1 = fx.func("k1", 0, &[rs], rs, vec![]);
+    let k1 = fx.func("k1", 0, &[rs], rs, vec![]);
     let leak = fx.func("leak", 0, &[st], rs, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
     sigs.callees_known = false;
-    sigs.add(&fx, leak, "fn leak<'a>(s: S) -> &'a S { k1(&s) }", &[st], rs);
+    // `fn leak<'a>(s: S) -> &'a S`: `'a` is `P0`, early-bound (not in the inputs).
+    sigs.add(leak, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[st], output: rs, slots: &[P0] });
     let mut b = Bb::new();
     let s = b.param("s");
     let callee = b.path(&["k1"]);
@@ -559,30 +665,33 @@ fn an_unknown_callee_still_carries_its_argument_to_its_result() {
     let bor = b.borrow(Mutbl::Not, ls);
     let call = b.call(callee, &[bor]);
     let root = b.block(&[], Some(call));
-    let got = findings_with(&fx, &b, leak, root, &sigs, Plant::None);
+    let got = findings_laid(&fx, &b, leak, root, &sigs, Plant::None);
     std::println!("an_unknown_callee_still_carries_its_argument_to_its_result: {got:?}");
-    // Never accepted: refused by name since the soundness rule (before it: `Invalidated`).
-    assert!(matches!(got, Err(Refusal { form: Form::CalleeUnknown, .. })), "{got:?}");
+    // Never accepted: refused by name since the soundness rule (before it: `Invalidated`; D148:
+    // by the callee's unread regions).
+    assert!(matches!(got, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == k1), "{got:?}");
 }
 
 /// SOUNDNESS: `fn f(s: S) { spawn(&s); }` with `spawn` of unknown head. `spawn` may be `fn
 /// spawn(x: &'static S)` (the Reference, "Lifetime bounds": `'static` "outlives all other
 /// lifetimes"; a local's borrow does not), and one origin for the call cannot say so: the body
-/// is REFUSED by name (`Form::CalleeUnknown`: "the callee's signature is not known"), never
-/// accepted. A call of unknown head in which nothing carries a lifetime (`h(s)`, `s: S`) has
-/// nothing a signature could demand, and is still lowered.
-/// Prints: `an_unknown_callee_is_refused_by_name: Err(Refusal { form: CalleeUnknown, .. })`.
+/// is REFUSED by name (D148: `Form::RegionsUnread { item: spawn, NoHead }`, "the callee's head
+/// regions are not read"; before the record `CalleeUnknown`), never accepted. A call of unknown
+/// head in which nothing carries a lifetime (`h(s)`, `s: S`) has nothing a signature could
+/// demand, and is still lowered.
+/// Prints: `an_unknown_callee_is_refused_by_name: Err(Refusal { form: RegionsUnread { .. }, .. })`.
 #[test]
 fn an_unknown_callee_is_refused_by_name() {
     let (mut fx, st, rs) = sig_base();
     let unit = fx.unit();
-    let _spawn = fx.func("spawn", 0, &[rs], unit, vec![]);
+    let spawn = fx.func("spawn", 0, &[rs], unit, vec![]);
     let _h = fx.func("h", 0, &[st], unit, vec![]);
     let f = fx.func("f", 0, &[st], unit, vec![]);
     fx.finish();
     let mut sigs = Sigs::new();
     sigs.callees_known = false;
-    sigs.add(&fx, f, "fn f(s: S) { spawn(&s); }", &[st], unit);
+    // `fn f(s: S)`: no lifetime; neither `spawn`'s nor `h`'s head is laid.
+    sigs.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[st], output: unit, slots: &[] });
     let mut b = Bb::new();
     let s = b.param("s");
     let callee = b.path(&["spawn"]);
@@ -591,9 +700,9 @@ fn an_unknown_callee_is_refused_by_name() {
     let call = b.call(callee, &[bor]);
     let st1 = b.semi(call);
     let root = b.block(&[st1], None);
-    let got = findings_with(&fx, &b, f, root, &sigs, Plant::None);
+    let got = findings_laid(&fx, &b, f, root, &sigs, Plant::None);
     std::println!("an_unknown_callee_is_refused_by_name: {got:?}");
-    assert!(matches!(got, Err(Refusal { form: Form::CalleeUnknown, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == spawn), "{got:?}");
     // `fn f(s: S) { h(s); }`: no lifetime anywhere in the call.
     let mut b = Bb::new();
     let s = b.param("s");
@@ -602,7 +711,7 @@ fn an_unknown_callee_is_refused_by_name() {
     let call = b.call(callee, &[ls]);
     let st1 = b.semi(call);
     let root = b.block(&[st1], None);
-    let got = findings_with(&fx, &b, f, root, &sigs, Plant::None);
+    let got = findings_laid(&fx, &b, f, root, &sigs, Plant::None);
     std::println!("an_unknown_callee_is_refused_by_name, no lifetime in the call: {got:?}");
     assert_eq!(got, Ok(vec![]), "{got:?}");
 }
@@ -615,7 +724,9 @@ fn an_unknown_callee_is_refused_by_name() {
 /// "outlives all other lifetimes" ("Lifetime bounds") and the borrow of `s` ends with `s`: the
 /// loan reaches the `'static` placeholder and is live when `s` dies: `Invalidated`. Control:
 /// the pointer's `'static` instantiated like any other region (`Plant::StaticIgnored`) accepts
-/// `bad`. Without the body's text the pointer's lifetimes are unknown: refused by name.
+/// `bad`. Without the body's own head regions the pointer's lifetimes are unknown: refused by
+/// name (D148: `RegionsUnread { item: owner, NoHead }`, where the text reader's absence was
+/// `CalleeValueUnknown`).
 /// Prints: `a_fn_pointers_static_is_demanded_of_its_argument bad: ["borrow Invalidated ..`.
 #[test]
 fn a_fn_pointers_static_is_demanded_of_its_argument() {
@@ -626,10 +737,12 @@ fn a_fn_pointers_static_is_demanded_of_its_argument() {
     let ok = fx.func("ok", 0, &[fp, st], unit, vec![]);
     let bad = fx.func("bad", 0, &[fp, st], unit, vec![]);
     fx.finish();
-    for (owner, text, wrong) in [(ok, "fn ok(f: fn(&S), s: S) { f(&s); }", false), (bad, "fn bad(f: fn(&'static S), s: S) { f(&s); }", true)] {
+    // `fn ok(f: fn(&S), s: S)`: no lifetime of its own; the pointer's elided input is the
+    // pointer's binder's (binder 1: the signature's root is 0): `[BOUND1]`.
+    // `fn bad(f: fn(&'static S), s: S)`: `[Static]`.
+    for (owner, text, slot, wrong) in [(ok, "fn ok(f: fn(&S), s: S) { f(&s); }", BOUND1, false), (bad, "fn bad(f: fn(&'static S), s: S) { f(&s); }", Region::Static, true)] {
         let mut sigs = Sigs::new();
-        sigs.add(&fx, owner, text, &[fp, st], unit);
-        sigs.own = String::from(text);
+        sigs.add(owner, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[fp, st], output: unit, slots: &[slot] });
         let mut b = Bb::new();
         let (pf, ps) = (b.param("f"), b.param("s"));
         let (lf, ls) = (b.local(pf), b.local(ps));
@@ -637,19 +750,18 @@ fn a_fn_pointers_static_is_demanded_of_its_argument() {
         let call = b.call(lf, &[bor]);
         let st1 = b.semi(call);
         let root = b.block(&[st1], None);
-        let got = findings_with(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
+        let got = findings_laid(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
         std::println!("a_fn_pointers_static_is_demanded_of_its_argument {}: {got:?}", if wrong { "bad" } else { "ok" });
         assert_eq!(got.iter().any(|l| l.starts_with("borrow Invalidated")), wrong, "{text}: {got:?}");
         if wrong {
-            let planted = findings_with(&fx, &b, owner, root, &sigs, Plant::StaticIgnored).expect("lowered");
+            let planted = findings_laid(&fx, &b, owner, root, &sigs, Plant::StaticIgnored).expect("lowered");
             std::println!("a_fn_pointers_static_is_demanded_of_its_argument, planted StaticIgnored: {planted:?}");
             assert!(planted.is_empty(), "{planted:?}");
         } else {
             assert!(got.is_empty(), "{text}: {got:?}");
         }
-        sigs.own = String::new();
-        let unread = findings_with(&fx, &b, owner, root, &sigs, Plant::None);
-        assert!(matches!(unread, Err(Refusal { form: Form::CalleeValueUnknown, .. })), "{unread:?}");
+        let unread = findings_laid(&fx, &b, owner, root, &Sigs::new(), Plant::None);
+        assert!(matches!(unread, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == owner), "{unread:?}");
     }
 }
 
@@ -666,17 +778,24 @@ fn a_fn_pointers_result_carries_its_argument() {
     let pass = fx.func("pass", 0, &[fp, rs], rs, vec![]);
     let leak = fx.func("leak", 0, &[fp, st], rs, vec![]);
     fx.finish();
+    // `fn pass(f: fn(&S) -> &S, s: &S) -> &S`: the pointer's input and output are its binder's
+    // (`BOUND1`, elision in the pointer's type); `s`'s elided lifetime `P0` (late-bound) is the
+    // output's: `[BOUND1, BOUND1, P0, P0]`.
+    let pass_slots: &[Region] = &[BOUND1, BOUND1, P0, P0];
+    // `fn leak<'a>(f: fn(&S) -> &S, s: S) -> &'a S`: `'a` is `P0`, early-bound (in no input):
+    // `[BOUND1, BOUND1, P0]`.
+    let leak_slots: &[Region] = &[BOUND1, BOUND1, P0];
     for (owner, text, wrong) in [(pass, "fn pass(f: fn(&S) -> &S, s: &S) -> &S { f(s) }", false), (leak, "fn leak<'a>(f: fn(&S) -> &S, s: S) -> &'a S { f(&s) }", true)] {
         let mut sigs = Sigs::new();
-        sigs.add(&fx, owner, text, &[fp, if wrong { st } else { rs }], rs);
-        sigs.own = String::from(text);
+        let (late, slots): (&[u32], &[Region]) = if wrong { (&[], leak_slots) } else { (&[0], pass_slots) };
+        sigs.add(owner, FnHead { lifetimes: 1, late, outlives: &[], inputs: &[fp, if wrong { st } else { rs }], output: rs, slots });
         let mut b = Bb::new();
         let (pf, ps) = (b.param("f"), b.param("s"));
         let (lf, ls) = (b.local(pf), b.local(ps));
         let arg = if wrong { b.borrow(Mutbl::Not, ls) } else { ls };
         let call = b.call(lf, &[arg]);
         let root = b.block(&[], Some(call));
-        let got = findings_with(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
+        let got = findings_laid(&fx, &b, owner, root, &sigs, Plant::None).expect("lowered");
         std::println!("a_fn_pointers_result_carries_its_argument {}: {got:?}", if wrong { "leak" } else { "pass" });
         if wrong {
             assert!(got.iter().any(|l| l.starts_with("borrow Invalidated")), "{text}: {got:?}");
@@ -686,68 +805,97 @@ fn a_fn_pointers_result_carries_its_argument() {
     }
 }
 
-/// The reader of a callable parameter's type (`read_callable_param`), over text and erased
-/// types alone: a fn pointer, a `dyn Fn`, an `impl Fn`, a generic `F: Fn(..)` bounded in the
-/// generics or the where clause; a written `for<'a>` lifetime is the binder's (`Named`), an
-/// elided one its own (`Anon`), `'static` is `Static`; the enclosing fn's lifetime, an alias
-/// and two `Fn` bounds are refused by name.
-/// Prints: `callable_parameter_types_are_read: 8 forms`.
-#[test]
-fn callable_parameter_types_are_read() {
-    let (mut fx, _st, rs) = sig_base();
-    let unit = fx.unit();
-    fx.finish();
-    let read = |text: &str, inputs: &[PTy], output: PTy| -> Result<(vec::Vec<Region>, vec::Vec<u32>), CallableRefusal> {
-        let mut buf = SigBuf::new_in(Alloc::global());
-        read_callable_param(text, fx.t.view(), 0, inputs, output, &|_| Some(0), &mut buf, Alloc::global())?;
-        Ok((buf.regions.iter().copied().collect(), buf.ends.iter().copied().collect()))
-    };
-    let got = read("fn a(f: fn(&'static S), s: S) { f(&s); }", &[rs], unit);
-    assert_eq!(got, Ok((vec![Region::Static], vec![1])));
-    // Lane B15: a lifetime of the callable's binder, written or elided, is `Bound`.
-    let got = read("fn b(f: fn(&S) -> &S, s: &S) -> &S { f(s) }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Region::Bound(0), Region::Bound(0)], vec![1])));
-    let got = read("fn c<F: for<'a> Fn(&'a S) -> &'a S>(f: F, s: &S) -> &S { f(s) }", &[rs], rs);
-    assert_eq!(got, Ok((vec![Region::Bound(0), Region::Bound(0)], vec![1])));
-    let got = read("fn d<F>(f: F, s: S) where F: Fn(&'static S) + Send { f(&s); }", &[rs], unit);
-    assert_eq!(got, Ok((vec![Region::Static], vec![1])));
-    let got = read("fn e(f: &mut dyn FnMut(&S, &S), s: &S) { f(s, s); }", &[rs, rs], unit);
-    assert_eq!(got, Ok((vec![Region::Bound(0), Region::Bound(1)], vec![1, 2])));
-    let got = read("fn g<'a>(f: impl Fn(&'a S), s: &'a S) { f(s); }", &[rs], unit);
-    assert!(matches!(got, Err(CallableRefusal::OuterLifetime { .. })), "{got:?}");
-    let got = read("fn h(f: Callback, s: &S) { f(s); }", &[rs], unit);
-    assert!(matches!(got, Err(CallableRefusal::NotCallable { .. })), "{got:?}");
-    let got = read("fn i<F: Fn(&S) + Fn(&'static S)>(f: F, s: &S) { f(s); }", &[rs], unit);
-    assert!(matches!(got, Err(CallableRefusal::NotCallable { .. })), "{got:?}");
-    std::println!("callable_parameter_types_are_read: 8 forms");
-}
-
-/// [`Sigs`] with one ADT that declares lifetimes (`life`), and closures lowered.
+/// [`Sigs`] with one ADT that declares ONE lifetime (`life`), and closures lowered. The ADT's
+/// count is declared to the column layer too ([`Wide::add`] declares it with each head), so a
+/// head's column and `Facts::adt`'s `lifetimes` agree.
 pub(crate) struct Wide {
     pub(crate) sigs: Sigs,
     pub(crate) life: Option<ItemKey>,
 }
 
 impl Wide {
-    pub(crate) fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
-        let life = self.life;
-        let mut buf = SigBuf::new_in(Alloc::global());
-        match read_signature(text, fx.t.view(), inputs, output, &|k| Some(u32::from(Some(k) == life)), &mut buf, Alloc::global()) {
-            Ok(()) => self.sigs.sigs.push((item, buf)),
-            Err(why) => panic!("`{text}` was not read: {why:?}"),
+    /// `item`'s head (the numbering rule: region_fixture.rs's module doc).
+    pub(crate) fn add(&mut self, item: ItemKey, head: FnHead<'_>) {
+        // A second declaration of the same count is harmless: the first is the one read.
+        if let Some(life) = self.life {
+            self.sigs.decls.adt(life, 1);
         }
+        self.sigs.add(item, head);
+    }
+}
+
+impl Declared for Wide {
+    fn decls(&self) -> &Decls {
+        &self.sigs.decls
     }
 }
 
 impl Facts for Wide {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         Plain.adt(k).map(|f| AdtFacts { lifetimes: u32::from(Some(k) == self.life), ..f })
     }
+    /// The ADT that declares a lifetime is `struct B<'x>(&'x S);`: covariant in `'x` (the
+    /// Reference, "Subtyping and Variance"); every other fixture ADT has no parameter.
+    fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+        Some(region_fixture::all_co(u32::from(Some(k) == self.life)))
+    }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
         self.sigs.callee(k)
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.sigs.sig(item)
     }
     fn closure_bodies_checked(&self) -> bool {
         true
@@ -763,25 +911,13 @@ impl Facts for Wide {
     }
 }
 
-/// The findings of one body, one line each (or the refusal), and its flow's text.
-fn findings_and_flow<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, plant: Plant) -> (Result<vec::Vec<String>, Refusal>, String) {
-    let c = checked(fx, b, owner, root);
-    let view = b.view(owner, root);
-    let lowered = match lower_planted(&view, &c, facts, plant, Alloc::global()) {
-        Ok(l) => l,
-        Err(r) => return (Err(r), String::new()),
-    };
-    let mut text = String::new();
-    lowered.flow.print(&mut text).expect("print");
-    let rec = check(&lowered.flow, Alloc::global()).expect("bounded");
-    let mut out = vec::Vec::new();
-    for m in rec.moves.iter() {
-        out.push(format!("move {:?} at {:?} span {}..{}", m.kind, m.at, m.span.lo, m.span.hi));
+/// The findings of one body, one line each (or the refusal), and its flow's text; `facts`'
+/// declared heads laid in its record (region_fixture.rs `run`).
+fn findings_and_flow<F: Declared>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, facts: &F, plant: Plant) -> (Result<vec::Vec<String>, Refusal>, String) {
+    match region_fixture::run(fx, &b.view(owner, root), facts, facts.decls(), plant) {
+        Ok(r) => (Ok(r.lines), r.flow),
+        Err(r) => (Err(r), String::new()),
     }
-    for f in rec.borrows.iter() {
-        out.push(format!("borrow {f:?}"));
-    }
-    (Ok(out), text)
 }
 
 /// Census 1's class "a live loan invalidated in a derived body" (131): what `#[derive(Debug)]`
@@ -813,7 +949,15 @@ fn a_builder_chain_keeps_each_loan_in_its_result() {
     let finish = fx.impl_fn(imp, "finish", true, &[rmb], unit);
     let fmt = fx.func("fmt", 0, &[bt, rs], unit, vec![]);
     fx.finish();
-    let own = "fn fmt(b: B, s: &S) { b.field(s).field(s).finish(); }";
+    // `fn fmt(b: B<'_>, s: &S)`: two elided input lifetimes, `B`'s `P0` and `s`'s `P1`, both
+    // late-bound.
+    let fmt_head = FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[bt, rs], output: unit, slots: &[P0, P1] };
+    // `impl<'x> B<'x> { fn field(&mut self, v: &S) -> &mut Self }`: the container's `'x` is
+    // `P0` (early), then the elided `&mut self` `P1` and `v`'s `P2` (late); the output's
+    // reference takes the receiver's `P1`, `Self` is `B<'x>`: `[P1, P0, P2, P1, P0]`.
+    let field_head = FnHead { lifetimes: 3, late: &[1, 2], outlives: &[], inputs: &[rmb, rs], output: rmb, slots: &[P1, P0, P2, P1, P0] };
+    // `fn finish(&mut self)` in the same impl: `'x` `P0`, the receiver's `P1` (late): `[P1, P0]`.
+    let finish_head = FnHead { lifetimes: 2, late: &[1], outlives: &[], inputs: &[rmb], output: unit, slots: &[P1, P0] };
     let mut b = Bb::new();
     let (pb, ps) = (b.param("b"), b.param("s"));
     let (lb, s1, s2) = (b.local(pb), b.local(ps), b.local(ps));
@@ -823,25 +967,27 @@ fn a_builder_chain_keeps_each_loan_in_its_result() {
     let st1 = b.semi(c3);
     let root = b.block(&[st1], None);
     let mut known = Wide { sigs: Sigs::new(), life: Some(bk) };
-    known.add(&fx, fmt, own, &[bt, rs], unit);
-    known.add(&fx, field, "fn field(&mut self, v: &S) -> &mut Self { self }", &[rmb, rs], rmb);
-    known.add(&fx, finish, "fn finish(&mut self) {}", &[rmb], unit);
+    known.add(fmt, fmt_head);
+    known.add(field, field_head);
+    known.add(finish, finish_head);
     let (got, flow) = findings_and_flow(&fx, &b, fmt, root, &known, Plant::None);
     std::println!("a_builder_chain_keeps_each_loan_in_its_result: {got:?}");
     assert_eq!(got, Ok(vec![]), "the flow:\n{flow}");
-    // The heads unknown: refused by name; with the old relation put back: the census's finding.
+    // The heads unknown: refused by name (D148: the first callee's regions unread, where it was
+    // `CalleeUnknown`); with the old relation put back: the census's finding.
     let mut unknown = Wide { sigs: Sigs::new(), life: Some(bk) };
     unknown.sigs.callees_known = false;
-    unknown.add(&fx, fmt, own, &[bt, rs], unit);
+    unknown.add(fmt, fmt_head);
     let (got, _) = findings_and_flow(&fx, &b, fmt, root, &unknown, Plant::None);
-    assert!(matches!(got, Err(Refusal { form: Form::CalleeUnknown, .. })), "{got:?}");
+    assert!(matches!(got, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == field), "{got:?}");
     let (planted, flow) = findings_and_flow(&fx, &b, fmt, root, &unknown, Plant::UnknownUnified);
     std::println!("a_builder_chain_keeps_each_loan_in_its_result, planted UnknownUnified: {planted:?}");
     assert!(planted.as_ref().is_ok_and(|p| p.iter().any(|l| l.starts_with("borrow Invalidated"))), "{planted:?}; the flow:\n{flow}");
 }
 
-/// `struct S; fn g(_: &S); fn h(_: S); fn m(_: &mut S); fn f(s: S)` for the closure fixtures.
-fn closure_world() -> (Fx, ItemKey) {
+/// `struct S; fn g(_: &S); fn h(_: S); fn m(_: &mut S); fn f(s: S)` for the closure fixtures,
+/// and the facts with their heads.
+fn closure_world() -> (Fx, ItemKey, Wide) {
     let mut fx = Fx::new();
     // `Copy`, with no impl for `S`: a `move` capture asks whether the captured type is `Copy`
     // ("Capture modes": "by move or, for `Copy` types, by copy").
@@ -852,12 +998,19 @@ fn closure_world() -> (Fx, ItemKey) {
     let rs = fx.r(Mutbl::Not, st);
     let rms = fx.r(Mutbl::Mut, st);
     let unit = fx.unit();
-    let _g = fx.func("g", 0, &[rs], unit, vec![]);
-    let _h = fx.func("h", 0, &[st], unit, vec![]);
-    let _m = fx.func("m", 0, &[rms], unit, vec![]);
+    let g = fx.func("g", 0, &[rs], unit, vec![]);
+    let h = fx.func("h", 0, &[st], unit, vec![]);
+    let m = fx.func("m", 0, &[rms], unit, vec![]);
     let f = fx.func("f", 0, &[st], unit, vec![]);
     fx.finish();
-    (fx, f)
+    let mut facts = Wide { sigs: Sigs::new(), life: None };
+    // `fn g(_: &S)` and `fn m(_: &mut S)`: one elided input lifetime `P0`, late-bound.
+    facts.add(g, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rs], output: unit, slots: &[P0] });
+    facts.add(m, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rms], output: unit, slots: &[P0] });
+    // `fn h(_: S)` and `fn f(s: S)`: no lifetime.
+    facts.add(h, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[st], output: unit, slots: &[] });
+    facts.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[st], output: unit, slots: &[] });
+    (fx, f, facts)
 }
 
 /// The Reference, "Closure types", "Capture modes": "The compiler prefers to capture a
@@ -870,8 +1023,7 @@ fn closure_world() -> (Fx, ItemKey) {
 /// Prints: `a_shared_capture_is_a_live_borrow written: ["borrow Invalidated ..`.
 #[test]
 fn a_shared_capture_is_a_live_borrow() {
-    let (fx, f) = closure_world();
-    let facts = Wide { sigs: Sigs::new(), life: None };
+    let (fx, f, facts) = closure_world();
     for written in [false, true] {
         let mut b = Bb::new();
         let s = b.param("s");
@@ -929,8 +1081,7 @@ fn a_shared_capture_is_a_live_borrow() {
 /// Prints: `a_mutable_capture_after_a_borrow_ends late use: ["borrow Invalidated ..`.
 #[test]
 fn a_mutable_capture_after_a_borrow_ends() {
-    let (fx, f) = closure_world();
-    let facts = Wide { sigs: Sigs::new(), life: None };
+    let (fx, f, facts) = closure_world();
     for late in [false, true] {
         let mut b = Bb::new();
         let s = b.param("s");
@@ -976,8 +1127,7 @@ fn a_mutable_capture_after_a_borrow_ends() {
 /// Prints: `a_move_closure_moves_its_captures: ["move ..`.
 #[test]
 fn a_move_closure_moves_its_captures() {
-    let (fx, f) = closure_world();
-    let facts = Wide { sigs: Sigs::new(), life: None };
+    let (fx, f, facts) = closure_world();
     let mut b = Bb::new();
     let s = b.param("s");
     let (callee, ls) = (b.path(&["h"]), b.local(s));
@@ -1005,8 +1155,7 @@ fn a_move_closure_moves_its_captures() {
 /// Prints: `a_closure_call_is_a_use_of_the_closure: ["borrow Invalidated ..`.
 #[test]
 fn a_closure_call_is_a_use_of_the_closure() {
-    let (fx, f) = closure_world();
-    let facts = Wide { sigs: Sigs::new(), life: None };
+    let (fx, f, facts) = closure_world();
     let mut b = Bb::new();
     let s = b.param("s");
     let (callee, ls) = (b.path(&["g"]), b.local(s));
@@ -1034,6 +1183,67 @@ fn a_closure_call_is_a_use_of_the_closure() {
 struct CopyAll;
 
 impl Facts for CopyAll {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
@@ -1099,7 +1309,7 @@ fn update_findings<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, init
         Err(e) => panic!("{e:?}"),
     };
     assert!(c.diags.is_empty(), "the fixture type-checks clean: {:?}", c.diags);
-    let lowered = lower_planted(&view, &c, facts, Plant::None, Alloc::global())?;
+    let lowered = crate::oracle::lower_checked(&view, &c, facts, Plant::None, blaze_own::testing::heap().alloc())?;
     let rec = check(&lowered.flow, Alloc::global()).expect("bounded");
     let mut out = vec::Vec::new();
     for m in rec.moves.iter() {

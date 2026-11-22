@@ -148,6 +148,7 @@ pub fn record() -> Result<PathBuf, NoRecord> {
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "geteuid, sysconf and getpwuid_r, each one call whose buffers outlive it")]
 mod os {
+    use blaze_sys::{Errno, posix::thread};
     use std::{
         ffi::{CStr, OsStr},
         os::unix::ffi::OsStrExt as _,
@@ -165,18 +166,33 @@ mod os {
     const INTERRUPTED_MOST: u32 = 8;
 
     pub(super) fn record() -> Result<PathBuf, NoRecord> {
-        // SAFETY: `geteuid` takes nothing and always succeeds.
-        let uid = unsafe { libc::geteuid() };
+        let uid = thread::geteuid();
+        #[cfg(target_os = "macos")]
+        let hint = thread::sysconf(thread::_SC_GETPW_R_SIZE_MAX);
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: `sysconf` takes a name by value. It answers -1 where the system has no
         // limit (musl), and its answer is a first size only: `ERANGE` below grows the buffer.
         let hint = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
         let mut len = usize::try_from(hint).ok().filter(|&it| it > 0).unwrap_or(FIRST).min(MOST);
         let mut interrupted = 0;
         loop {
-            let mut buffer = vec![0 as libc::c_char; len]; // alloc: once per ask, only when no variable names the home
+            let mut buffer = vec![0 as core::ffi::c_char; len]; // alloc: once per ask, only when no variable names the home
+            #[cfg(target_os = "macos")]
+            let mut entry = thread::passwd::ZERO;
+            #[cfg(not(target_os = "macos"))]
             // SAFETY: `passwd` is integers and pointers, for which all zeroes is a value.
             let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+            #[cfg(target_os = "macos")]
+            let mut found: *mut thread::passwd = std::ptr::null_mut();
+            #[cfg(not(target_os = "macos"))]
             let mut found: *mut libc::passwd = std::ptr::null_mut();
+            #[cfg(target_os = "macos")]
+            // SAFETY: the entry, scratch buffer and result pointer are writable throughout the
+            // call. The buffer stays live while we read the returned directory.
+            let said = unsafe {
+                thread::getpwuid_r(uid, &raw mut entry, buffer.as_mut_ptr(), buffer.len(), &raw mut found)
+            };
+            #[cfg(not(target_os = "macos"))]
             // SAFETY: `entry`, `buffer` (of `buffer.len()` bytes) and `found` are live and
             // exclusively borrowed for the call; `getpwuid_r` writes the entry into `entry`,
             // its strings into `buffer`, and `&mut entry` or null into `found`, and keeps none
@@ -198,11 +214,13 @@ mod os {
                     }
                     return Ok(PathBuf::from(OsStr::from_bytes(dir)));
                 }
-                libc::ERANGE if len < MOST => len = (len * 2).min(MOST),
-                libc::ERANGE => return Err(NoRecord::TooLong { uid, bytes: len }),
-                libc::EINTR if interrupted < INTERRUPTED_MOST => interrupted += 1,
+                errno if errno == i32::from(Errno::Range.raw()) && len < MOST => len = (len * 2).min(MOST),
+                errno if errno == i32::from(Errno::Range.raw()) => return Err(NoRecord::TooLong { uid, bytes: len }),
+                errno if errno == i32::from(Errno::Intr.raw()) && interrupted < INTERRUPTED_MOST => interrupted += 1,
                 // What some systems say for "no such user" in place of a null result.
-                libc::ENOENT | libc::ESRCH => return Err(NoRecord::NoEntry { uid }),
+                errno if errno == i32::from(Errno::NoEnt.raw()) || errno == i32::from(Errno::Srch.raw()) => {
+                    return Err(NoRecord::NoEntry { uid });
+                }
                 errno => return Err(NoRecord::Failed { uid, errno }),
             }
         }
@@ -214,30 +232,24 @@ mod os {
 mod os {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _, path::PathBuf};
 
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE},
-        Security::TOKEN_QUERY,
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    use blaze_sys::windows::{
+        Handle,
+        foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError},
+        security::{GetUserProfileDirectoryW, TOKEN_QUERY},
+        threading::{GetCurrentProcess, OpenProcessToken},
     };
 
     use super::NoRecord;
-
-    // The documented call for a user's profile directory (userenv.h). windows-sys has it under
-    // `Win32_UI_Shell`, a feature blaze does not otherwise build; declared here it brings none.
-    #[link(name = "userenv")]
-    unsafe extern "system" {
-        fn GetUserProfileDirectoryW(token: HANDLE, dir: *mut u16, len: *mut u32) -> i32;
-    }
 
     pub(super) fn record() -> Result<PathBuf, NoRecord> {
         let failed = |call: &'static str| {
             // SAFETY: `GetLastError` takes nothing and reads the thread's last error.
             NoRecord::Profile { call, code: unsafe { GetLastError() } }
         };
-        let mut token: HANDLE = std::ptr::null_mut();
+        let mut token = Handle::NULL;
         // SAFETY: the pseudo-handle of this process needs no close, and `token` is a live
         // out-pointer the call writes one handle to.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        if !unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.is_true() {
             return Err(failed("OpenProcessToken"));
         }
         let dir = (|| {
@@ -246,13 +258,15 @@ mod os {
             // length: the call fails with ERROR_INSUFFICIENT_BUFFER and writes it to `len`.
             let asked = unsafe { GetUserProfileDirectoryW(token, std::ptr::null_mut(), &raw mut len) };
             // SAFETY: as in `failed`.
-            if asked != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || len == 0 {
+            if asked.is_true() || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || len == 0 {
                 return Err(failed("GetUserProfileDirectoryW"));
             }
             let mut buffer = vec![0u16; len as usize]; // alloc: once per ask, only when no variable names the home
             // SAFETY: `buffer` has `len` units, which the call is told; it writes at most that
             // many, NUL-terminated.
-            if unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &raw mut len) } == 0 {
+            if !unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &raw mut len) }
+                .is_true()
+            {
                 return Err(failed("GetUserProfileDirectoryW"));
             }
             let end = buffer.iter().position(|&it| it == 0).unwrap_or(buffer.len());

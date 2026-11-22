@@ -129,6 +129,10 @@ mod tests {
     #[test]
     fn the_unwind_symbols_resolve() {
         for name in [c"__register_frame", c"__deregister_frame", c"_Unwind_Resume"] {
+            #[cfg(target_os = "macos")]
+            // SAFETY: RTLD_DEFAULT searches loaded images and name is a live C string.
+            let found = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, name.as_ptr()) };
+            #[cfg(target_os = "linux")]
             // SAFETY: a lookup, by a C string's name, among the images this process has loaded.
             let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
             assert!(!found.is_null(), "{name:?} is not in this process");

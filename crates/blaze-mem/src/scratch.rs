@@ -1,3 +1,7 @@
+//! D171: the shelves here are held by the thread today; they move to a worker's cell (bstd's
+//! `workers`, `w.scratch()` for a frame, a `Shelves` value in the worker's own fields for
+//! these) as their callers reach a context, and the thread-locals go with the last caller.
+//!
 //! Scratch buffers reused per worker (docs/v2/plan/design/memory.md, "Scratch buffers reused
 //! per worker"): formatting, hashing, encoding and decompression write into a buffer the
 //! worker keeps, grown once to its high-water mark and never freed in the warm loop.

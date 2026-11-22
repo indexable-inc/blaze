@@ -44,50 +44,183 @@ pub struct ScopedBy<'d, 'n: 'd, S> {
     /// The definitions prepared so far, shared by every body over `names`; `None` prepares a
     /// definition at each call (a signature's type macro, which has no place to keep them).
     pub prepared: Option<&'d Prepares<'n>>,
-    /// The body's written blocks ([`written_blocks`]), in text order: a call-site path of a
-    /// call written inside one is read at the innermost one's module, which declares the
-    /// block's items (blaze-scope blocks.rs) and reaches the blocks around it and the module
-    /// through its `use super::*`. Empty for a text with no block of the names library (a
-    /// signature, a local item's own body).
-    pub blocks: &'d [WrittenBlock],
+    /// The body's blocks as the names library made them modules ([`body_blocks`]). A call-site
+    /// path is read in the innermost block around its call: a block of the body's text
+    /// ([`BlockModules::hand_module`]) or a block an expansion wrote
+    /// ([`BlockModules::expansion_module`]). That block's module declares the block's items
+    /// (blaze-scope blocks.rs, expanded_blocks.rs) and reaches the blocks around it and the
+    /// module through its `use super::*`. `None` for a text with no block of the names library
+    /// (a signature, a local item's own body).
+    pub blocks: Option<&'d dyn BlockModules>,
 }
 
-/// A block of a body that the names library made a module (blaze-scope blocks.rs): where it is
-/// in the body's text, and its module's key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WrittenBlock {
-    /// The offset of its `{` in the body's text.
-    pub open: u32,
-    /// The offset after its `}`.
-    pub close: u32,
-    pub module: ItemKey,
+/// A body's blocks as the names library made them modules. For the body's own text: the scan
+/// of the text and each scanned block's module (blaze-scope `blocks::block_modules`, as front2
+/// locals.rs `Locals::keep` names them). For the expansions lowered in it: each expansion's
+/// blocks, keyed by front2 scope_table.rs `expanded`, the one derivation the body's scope
+/// table uses too. An expansion's blocks are read once, at the first call that needs them.
+pub struct BodyBlocks<'a> {
+    krate: blaze_id::CrateItemKey,
+    nested: blaze_file_items::nested::Nested<'a>,
+    hand: AVec<'a, Option<ItemKey>>,
+    read: core::cell::RefCell<ReadExpansions<'a>>,
+    alloc: Alloc<'a>,
 }
 
-/// The written blocks of `text`, the whole text of the names library's item or member `body`
-/// of the crate `krate`, in text order: the same scan of the same text the library made its
-/// block modules from, so the same keys (blaze-scope `blocks::block_modules`, as front2
-/// locals.rs `Locals::keep` names them). A text whose scan does not end whole has none: its
-/// blocks are not the library's either.
-pub fn written_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str, alloc: Alloc<'a>) -> AVec<'a, WrittenBlock> {
-    let mut out: AVec<'a, WrittenBlock> = Vec::new_in(alloc);
+/// The expansions a [`BodyBlocks`] has read, by index: each one's blocks and the place of its
+/// text (its start and length) when read. The lowering appends expansions and never changes
+/// one, so an entry stays true. A place that no longer matches means another lowering, and
+/// every entry is read again.
+struct ReadExpansions<'a> {
+    made: AVec<'a, Option<super::scope_table::Expanded<'a>>>,
+    at: AVec<'a, Option<(u32, u32)>>,
+}
+
+/// Why a call-site path in a block an expansion wrote is not read, while the names library
+/// filed no module for that block. The block's call is no statement call of a block the
+/// library filed: an expression call outside every block of the item, or a call whose writer
+/// is unfiled too.
+const UNFILED_BLOCK: &str = "the block declares items or holds statement calls, and the names library filed no module for it (its macro call is no statement call of a block the library filed), so a name it binds cannot be read";
+
+/// The body's blocks for `text`, the whole text of the names library's item or member `body`
+/// of the crate `krate`: the same scan of the same text the library made its block modules
+/// from, so the same keys. A text whose scan does not end whole has none (`None`): its blocks
+/// are not the library's either.
+pub fn body_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str, alloc: Alloc<'a>) -> Option<BodyBlocks<'a>> {
     let nested = blaze_file_items::nested::scan(text, alloc);
     if nested.end != blaze_file_items::nested::NestedEnd::Whole {
-        return out;
+        return None;
     }
-    let modules = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
-    for (block, module) in nested.blocks.iter().zip(modules.iter()) {
-        if let Some(module) = *module {
-            out.push(WrittenBlock { open: block.open, close: block.close, module });
-        }
-    }
-    out
+    let hand = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    let read = ReadExpansions { made: Vec::new_in(alloc), at: Vec::new_in(alloc) };
+    Some(BodyBlocks { krate, nested, hand, read: core::cell::RefCell::new(read), alloc })
 }
 
-/// The module a call-site path of the call written at `call` (item-relative) is read at: the
-/// innermost written block holding the call (the last in text order of those that hold it:
-/// a block inside another opens after it), or the body's module when none does.
-fn block_module(blocks: &[WrittenBlock], call: blaze_surface::Range, module: ItemKey) -> ItemKey {
-    blocks.iter().filter(|b| b.open < call.start && call.end <= b.close).last().map_or(module, |b| b.module)
+/// The two questions [`ScopedBy`] asks of a body's blocks ([`BodyBlocks`]). It holds them
+/// behind this trait because a [`BodyBlocks`] keeps the expansions it has read in a cell, so
+/// its lifetime is invariant, and a `&'d BodyBlocks<'d>` of a body's local could not be
+/// borrowed for as long as its own lifetime.
+pub trait BlockModules {
+    /// The module of the innermost block of the body's text holding the call written at
+    /// `call` (item-relative) that the names library made a module. `None` when no such block
+    /// holds the call.
+    fn hand_module(&self, call: blaze_surface::Range) -> Option<ItemKey>;
+
+    /// The module of the innermost block an expansion wrote that holds the body call at `call`
+    /// (a range of `expansions.text`). `Ok(None)` when no such block holds it.
+    fn expansion_module(&self, expansions: blaze_lower::Expansions<'_>, call: blaze_surface::Range) -> Result<Option<ItemKey>, &'static str>;
+}
+
+impl BlockModules for BodyBlocks<'_> {
+    /// The module of the innermost block of the body's text holding the call written at
+    /// `call` (item-relative) that the names library made a module: the last in text order of
+    /// those that hold it, since a block inside another opens after it. `None` when no block
+    /// holds the call.
+    fn hand_module(&self, call: blaze_surface::Range) -> Option<ItemKey> {
+        self.nested.blocks.iter().zip(self.hand.iter()).filter(|(b, m)| m.is_some() && b.open < call.start && call.end <= b.close).last().and_then(|(_, m)| *m)
+    }
+
+    /// The module of the innermost block an expansion wrote that holds the body call at `call`
+    /// (a range of `expansions.text`), walking out from the call through each block around it
+    /// and then each expansion's call. `Ok(None)` when the walk reaches the body's own text
+    /// first: the written call's block is read ([`Self::hand_module`]).
+    ///
+    /// The Reference, "Statements", "Item declarations": "Declaring an item within a statement
+    /// block restricts its scope to the block containing the statement." A block an expansion
+    /// wrote is a block like any other, and item names are not hygienic ("Macros By Example",
+    /// "Hygiene": only "loop labels, block labels, and local variables are looked up at the
+    /// macro definition site"). So whichever text wrote a path, the block holding it is
+    /// decided by where the path stands.
+    ///
+    /// A block that would hold a module and holds none is refused by name
+    /// ([`UNFILED_BLOCK`]). A block the library did not write (no item, no call) binds
+    /// nothing, and the walk goes on to the block around it.
+    fn expansion_module(&self, expansions: blaze_lower::Expansions<'_>, call: blaze_surface::Range) -> Result<Option<ItemKey>, &'static str> {
+        use blaze_lower::scope_origin::CallAt;
+        let Some((mut e, mut at)) = expansions.holding(call.start) else { return Ok(None) };
+        let mut read = self.read.try_borrow_mut().map_err(|_| "the body's expansion blocks were asked while they were being read")?;
+        self.read_chain(&mut read, expansions, e)?;
+        // Each step goes to an earlier expansion (a call is read before the expansion it
+        // makes), so the walk takes at most one step per expansion.
+        for _ in 0..=expansions.len() {
+            let one = read.made.get(e as usize).and_then(|m| m.as_ref()).ok_or("an expansion of the chain was not read")?;
+            let nested = &one.blocks.nested;
+            let pos = at + blaze_scope::expanded_blocks::WRAP_OPEN;
+            // The innermost block holding the call: the last in text order of those holding it.
+            let mut b = nested.blocks.iter().rposition(|blk| blk.open < pos && pos < blk.close).map(|b| b as u32);
+            // Block 0 stands for the calling block (expanded_blocks.rs `wrapped`), whose names
+            // are the writer's, read after this loop.
+            while let Some(i) = b.filter(|i| *i != 0) {
+                if one.blocks.ordinals.get(i as usize).copied().flatten().is_some() {
+                    match one.modules.get(i as usize).copied().flatten() {
+                        Some(module) => return Ok(Some(module)),
+                        None if binds(nested, i) => return Err(UNFILED_BLOCK),
+                        None => {}
+                    }
+                }
+                b = nested.blocks.get(i as usize).and_then(|blk| blk.parent);
+            }
+            match expansions.call_at(e).ok_or("an expansion's call is not in the body's text")? {
+                CallAt::Item { .. } => return Ok(None),
+                CallAt::Expansion { expansion, start } => {
+                    e = expansion;
+                    at = start;
+                }
+            }
+        }
+        Err("an expansion's chain of calls does not reach the body's text")
+    }
+}
+
+impl<'a> BodyBlocks<'a> {
+    /// These blocks as [`ScopedBy::blocks`] holds them.
+    pub fn modules(&self) -> &dyn BlockModules {
+        self
+    }
+
+    /// Reads the blocks of expansion `e` and of every expansion whose text holds a call of
+    /// the chain to it, writers first, each once.
+    fn read_chain(&self, read: &mut ReadExpansions<'a>, expansions: blaze_lower::Expansions<'_>, e: u32) -> Result<(), &'static str> {
+        use blaze_lower::scope_origin::CallAt;
+        let place = |j: u32| -> Option<(u32, u32)> { Some((*expansions.starts.get(j as usize)?, u32::try_from(expansions.text(j)?.len()).ok()?)) };
+        // An entry read from another lowering's expansions: read all again.
+        let stale = read.at.iter().enumerate().any(|(j, p)| p.is_some() && *p != place(j as u32));
+        if stale {
+            read.made.clear();
+            read.at.clear();
+        }
+        let wanted = e as usize + 1;
+        if read.made.len() < wanted {
+            read.made.resize_with(wanted, || None);
+            read.at.resize(wanted, None);
+        }
+        // The chain from `e` out to the body's text, innermost first.
+        let mut chain: AVec<'_, u32> = Vec::new_in(self.alloc);
+        let mut j = e;
+        for _ in 0..=expansions.len() {
+            if read.made.get(j as usize).is_some_and(|m| m.is_some()) {
+                break;
+            }
+            chain.push(j);
+            match expansions.call_at(j).ok_or("an expansion's call is not in the body's text")? {
+                CallAt::Item { .. } => break,
+                CallAt::Expansion { expansion, .. } => j = expansion,
+            }
+        }
+        for &j in chain.iter().rev() {
+            let one = super::scope_table::expanded(self.krate, &self.nested, Some(self.hand.as_slice()), &expansions, j, &read.made, self.alloc).map_err(|r| r.form())?;
+            read.made[j as usize] = Some(one);
+            read.at[j as usize] = place(j);
+        }
+        Ok(())
+    }
+}
+
+/// Whether block `b` of an expansion's scan binds a name: an item declared in it (any kind,
+/// `use` too), or a statement call, whose expansion may declare one. An expression call's
+/// items are its own expansion's.
+fn binds(nested: &blaze_file_items::nested::Nested<'_>, b: u32) -> bool {
+    nested.items.iter().any(|i| i.block == b) || nested.calls.iter().any(|c| c.block == b && !c.expr)
 }
 
 /// A kept definition as this resolver answers it.
@@ -144,9 +277,13 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
         // first in textual scope, the block's `macro_rules!` and then each enclosing module's
         // (the body's module whole: a body's block has no `mod` line there), and only then as a
         // path from the block outward (its items, its `use super::*`, the preludes).
+        // A call an expansion wrote inside a block of its own is read at that block first
+        // (`PathAt::block`, `BlockModules::expansion_module`): proptest's `prop_assert!` writes
+        // `extern crate alloc;` and `alloc::format!(..)` in one `if` block.
         let at_call = site.dollar_crate.is_none() && !matches!(at.mark, Some(m) if m.transparency == blaze_expand::Transparency::Opaque);
-        let module = match at.written {
-            Some(call) if at_call => block_module(self.blocks, call, site.module),
+        let module = match (at.block, at.written) {
+            (Some(block), _) if at_call => block,
+            (None, Some(call)) if at_call => self.blocks.and_then(|b| b.hand_module(call)).unwrap_or(site.module),
             _ => site.module,
         };
         let found = self.names.macro_at(module, written).map_err(|e| NoMacro::Names(MacroDefError::Path(e)))?;
@@ -185,6 +322,15 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
         let krate = self.names.crate_of(self.module)?;
         Some(DefSite { krate: self.names.crate_key(krate)?, module: None })
     }
+
+    /// [`BlockModules::expansion_module`]; with no blocks of the names library (a signature, a
+    /// local item's own body), none.
+    fn expansion_block(&self, expansions: blaze_lower::Expansions<'_>, call: blaze_surface::Range) -> Result<Option<ItemKey>, &'static str> {
+        match self.blocks {
+            Some(blocks) => blocks.expansion_module(expansions, call),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,29 +338,135 @@ mod tests {
     use blaze_id::{ContentId, CrateItemKey, ItemKey};
     use blaze_surface::Range;
 
-    use super::{block_module, written_blocks};
+    use blaze_scope::expanded_blocks::expansion_block_name;
+    use blaze_scope::task::key_of;
+
+    use super::{BlockModules, UNFILED_BLOCK, body_blocks};
+
+    fn key(s: &[u8]) -> ContentId {
+        ContentId::of("blaze-ladder scoped test", s)
+    }
+
+    /// The range of the `n`th occurrence of `s` in `text`.
+    fn nth(text: &str, s: &str, n: usize) -> Range {
+        let start = text.match_indices(s).nth(n).map(|(at, _)| at).unwrap_or_else(|| panic!("occurrence {n} of `{s}` in `{text}`"));
+        let start = u32::try_from(start).unwrap_or(u32::MAX);
+        Range::new(start, start + u32::try_from(s.len()).unwrap_or(u32::MAX))
+    }
 
     /// A derive's `const _: () = { extern crate dep as _dep; _dep::m!(); impl .. };`: its block
     /// is written (a statement call, an impl), and a call inside it is read at the block's
-    /// module, an inner block's call at the inner block's; a call outside every block at the
-    /// body's module (the control: the rule before this fix, for every call).
+    /// module, an inner block's call at the inner block's; a call outside every block at no
+    /// block (the body's module: the control, the rule before blocks were read, for every
+    /// call). A call in the impl's member `f` is in no block of this text: the scan does not
+    /// read into an item (blaze-scope blocks.rs `a_block_with_an_impl_is_a_module`: the impl is
+    /// copied whole), since `f`'s body is its own text, whose blocks are filed under `f`; the
+    /// impl is an item of the constant's block, so that range answers the constant's block.
+    /// (This test once asked that call to answer an inner module of this text: no module
+    /// does, and none is wanted.)
     #[test]
     fn a_call_reads_its_innermost_written_block() {
-        let text = "const _: () = { extern crate dep as _dep; _dep::m!(); impl T for U { fn f(&self) { { _dep::n!(); } } } };";
+        let text = "const _: () = { extern crate dep as _dep; _dep::m!(); impl T for U { fn f(&self) { { _dep::n!(); } } } { _dep::k!(); } };";
         let alloc = blaze_own::testing::heap().alloc();
-        let key = |s: &[u8]| ContentId::of("blaze-ladder scoped test", s);
-        let blocks = written_blocks(CrateItemKey(key(b"app")), ItemKey(key(b"body")), text, alloc);
-        let module = ItemKey(key(b"module"));
-        let at = |s: &str| {
-            let start = u32::try_from(text.find(s).unwrap_or_else(|| panic!("`{s}` in the text"))).unwrap_or(u32::MAX);
-            Range::new(start, start + u32::try_from(s.len()).unwrap_or(u32::MAX))
-        };
-        let outer = blocks.first().copied().unwrap_or_else(|| panic!("the constant's block is written: {blocks:?}"));
-        assert_eq!(outer.open as usize, text.find('{').unwrap_or(0), "the first written block is the constant's: {blocks:?}");
-        assert_eq!(block_module(&blocks, at("_dep::m!();"), module), outer.module, "the call in the constant's block: {blocks:?}");
-        assert_ne!(outer.module, module, "a block's module is not the body's");
-        assert_eq!(block_module(&blocks, at("const _"), module), module, "a range outside every block is read at the body's module");
-        let inner = block_module(&blocks, at("_dep::n!();"), module);
-        assert!(blocks.iter().any(|b| b.module == inner), "the inner call reads a written block's module: {blocks:?}");
+        let krate = CrateItemKey(key(b"app"));
+        let body = ItemKey(key(b"body"));
+        let blocks = body_blocks(krate, body, text, alloc).unwrap_or_else(|| panic!("the text scans whole"));
+        let nested = blaze_file_items::nested::scan(text, alloc);
+        let modules = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+        let outer = modules.first().copied().flatten().unwrap_or_else(|| panic!("the constant's block is written: {modules:?}"));
+        assert_eq!(blocks.hand_module(nth(text, "_dep::m!();", 0)), Some(outer), "the call in the constant's block");
+        assert_eq!(blocks.hand_module(nth(text, "const _", 0)), None, "a range outside every block is read at no block");
+        let inner = blocks.hand_module(nth(text, "_dep::k!();", 0)).unwrap_or_else(|| panic!("the inner call is in a written block: {modules:?}"));
+        assert_ne!(inner, outer, "the inner call reads its own block's module, not the constant's");
+        assert!(modules.contains(&Some(inner)), "the inner call reads a written block's module: {modules:?}");
+        assert_eq!(blocks.hand_module(nth(text, "_dep::n!();", 0)), Some(outer), "a call in the impl's member is read at the block the impl is an item of");
+    }
+
+    /// The module the names library files for the `ordinal`th written block of the expansion
+    /// of the call keyed `call` (scope_table.rs, "The identities").
+    fn expansion_block(krate: CrateItemKey, call: ItemKey, ordinal: u32) -> ItemKey {
+        let alloc = blaze_own::testing::heap().alloc();
+        key_of(krate, call, "mod", expansion_block_name(call, ordinal, alloc).as_str(), 0)
+    }
+
+    /// proptest 1.11.0's `prop_assert!` (sugar.rs:754-757), reduced: a statement call whose
+    /// expansion writes `if x { extern crate dep as __d ; let _m = __d :: unit ! ( ) ; }`. The
+    /// Reference, "Statements": "Declaring an item within a statement block restricts its
+    /// scope to the block containing the statement". So `__d::unit!` in the `if` block is read
+    /// at the module the names library filed for that block, which holds the `extern crate`.
+    /// Twin: the same expansion's `__d :: unit ! ( )` after the block is in no block the
+    /// expansion wrote (`Ok(None)`: the written call's block, where no `__d` is bound, and the
+    /// call is refused there). Control: without the expansion's block, the call would be read
+    /// at the written call's block (`hand_module`), which is another module.
+    #[test]
+    fn a_call_an_expansion_wrote_in_its_own_block_reads_that_block() {
+        let item = "fn f(x: bool) { check!(x); }";
+        let expansion = "if x { extern crate dep as __d ; let _m = __d :: unit ! ( ) ; } __d :: unit ! ( ) ;";
+        let mut text = std::string::String::from(item);
+        text.push_str(expansion);
+        let alloc = blaze_own::testing::heap().alloc();
+        let krate = CrateItemKey(key(b"app"));
+        let body = ItemKey(key(b"body"));
+        let blocks = body_blocks(krate, body, item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
+        let written = nth(item, "check!(x)", 0);
+        let calls = [written];
+        let expansions = blaze_lower::Expansions { text: &text, item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &[0], calls: &calls };
+        // The keys as the names library makes them: the fn's block, its statement call, the
+        // call's `if` block (the expansion's first written block).
+        let fn_block = blocks.hand_module(written).unwrap_or_else(|| panic!("the fn's block is written: it holds a statement call"));
+        let call = key_of(krate, fn_block, "MacroCall", "", 0);
+        let want = expansion_block(krate, call, 0);
+        let inside = nth(&text, "__d :: unit ! ( )", 0);
+        let after = nth(&text, "__d :: unit ! ( )", 1);
+        assert_eq!(blocks.expansion_module(expansions, inside), Ok(Some(want)), "the path in the `if` block reads that block's module");
+        assert_eq!(blocks.expansion_module(expansions, after), Ok(None), "the twin: the path after the block is in no block the expansion wrote");
+        assert_ne!(Some(want), blocks.hand_module(written), "the control: the written call's block is another module");
+        // Read again from the kept expansion: the same answer.
+        assert_eq!(blocks.expansion_module(expansions, inside), Ok(Some(want)), "the second read answers the same");
+    }
+
+    /// Two expansions deep, as proptest's `prop_assert_eq!` calls `$crate::prop_assert!` inside
+    /// `{{ let left = ..; .. }}`: the inner call is keyed under the module of the outer
+    /// expansion's block that holds it, and the inner expansion's `if` block under that call.
+    #[test]
+    fn a_call_two_expansions_deep_reads_the_inner_expansions_block() {
+        let item = "fn f(x: bool) { outer!(x); }";
+        let first = "{ let left = x ; check ! ( left ) ; }";
+        let second = "if left { extern crate dep as __d ; let _m = __d :: unit ! ( ) ; }";
+        let mut text = std::string::String::from(item);
+        text.push_str(first);
+        text.push_str(second);
+        let alloc = blaze_own::testing::heap().alloc();
+        let krate = CrateItemKey(key(b"app"));
+        let body = ItemKey(key(b"body"));
+        let blocks = body_blocks(krate, body, item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
+        let written = nth(item, "outer!(x)", 0);
+        let calls = [written, nth(&text, "check ! ( left )", 0)];
+        let starts = [0, u32::try_from(first.len()).unwrap_or(u32::MAX)];
+        let expansions = blaze_lower::Expansions { text: &text, item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &starts, calls: &calls };
+        let fn_block = blocks.hand_module(written).unwrap_or_else(|| panic!("the fn's block is written"));
+        let outer = key_of(krate, fn_block, "MacroCall", "", 0);
+        let first_block = expansion_block(krate, outer, 0);
+        let check = key_of(krate, first_block, "MacroCall", "", 0);
+        let want = expansion_block(krate, check, 0);
+        assert_eq!(blocks.expansion_module(expansions, nth(&text, "__d :: unit ! ( )", 0)), Ok(Some(want)), "the path reads the inner expansion's `if` block");
+        assert_eq!(blocks.expansion_module(expansions, calls[1]), Ok(Some(first_block)), "the inner call itself stands in the outer expansion's block");
+    }
+
+    /// A block an expansion wrote that declares an item, where the expansion's call is no
+    /// statement call of a block the names library filed (a call outside every block of the
+    /// item, a `const`'s initializer): refused by name, never read at an outer block, where
+    /// the block's `__d` is not bound.
+    #[test]
+    fn an_unfiled_expansion_block_that_binds_is_refused() {
+        let item = "const C: () = check!(x);";
+        let expansion = "if x { extern crate dep as __d ; let _m = __d :: unit ! ( ) ; }";
+        let mut text = std::string::String::from(item);
+        text.push_str(expansion);
+        let alloc = blaze_own::testing::heap().alloc();
+        let blocks = body_blocks(CrateItemKey(key(b"app")), ItemKey(key(b"body")), item, alloc).unwrap_or_else(|| panic!("the item scans whole"));
+        let calls = [nth(item, "check!(x)", 0)];
+        let expansions = blaze_lower::Expansions { text: &text, item_len: u32::try_from(item.len()).unwrap_or(u32::MAX), starts: &[0], calls: &calls };
+        assert_eq!(blocks.expansion_module(expansions, nth(&text, "__d :: unit ! ( )", 0)), Err(UNFILED_BLOCK));
     }
 }

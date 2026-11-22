@@ -16,7 +16,11 @@
 //! - `RUSTC` `rustc` and `RUSTDOC` `rustdoc` (names the sandbox's process host answers, not
 //!   paths), `CARGO` `cargo`, `CARGO_ENCODED_RUSTFLAGS` empty;
 //! - `CARGO_PKG_*` from the manifest, absent values as `""`;
-//! - `DEP_<LINKS>_<KEY>` from each direct dependency's `links` metadata.
+//! - `DEP_<LINKS>_<KEY>` from each direct dependency's `links` metadata;
+//! - for an `-apple-darwin` target, `MACOSX_DEPLOYMENT_TARGET`
+//!   ([`crate::toolchain::MACOS_MIN`]): not cargo's, but what `cc` reads first, so it never asks
+//!   `xcrun --show-sdk-version` (a deferred tool) for the `-mmacosx-version-min` of its
+//!   compiles; a compiler probe's row (pins/answers/clang.json) is keyed with it.
 //!
 //! Not set: `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_LINKER`, `PATH`, `HOME`, and every
 //! variable of the user's: a switch such as `LIBC_CI` is unset.
@@ -274,6 +278,9 @@ pub fn env<'a>(given: &Given<'_, '_>, alloc: Alloc<'a>) -> Env<'a> {
     set(named("RUSTDOC"), "rustdoc");
     set(named("CARGO"), "cargo");
     set(named("CARGO_ENCODED_RUSTFLAGS"), "");
+    if given.target.ends_with("-apple-darwin") {
+        set(named("MACOSX_DEPLOYMENT_TARGET"), crate::toolchain::MACOS_MIN);
+    }
 
     let p = &given.package;
     let (major, minor, patch, pre) = version_parts(p.version);

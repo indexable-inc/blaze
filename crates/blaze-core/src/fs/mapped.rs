@@ -33,6 +33,8 @@
 //! memory to hold it.
 
 use std::{fmt, fs::File, io, ops::Deref, path::Path, ptr::NonNull, slice};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use blaze_sys::{Fd, posix::io as sys_io};
 
 /// The file mapped read-only and shared, whole, as one [`Mapped`] that the last
 /// [`crate::Mapping`] of it unmaps.
@@ -341,12 +343,15 @@ impl Drop for MappedWrite {
 }
 
 /// `path` made (or cut, or grown) to exactly `len` zero bytes and mapped read-write and shared,
-/// for [`crate::Effect::MapWrite`]. Unix only: elsewhere it fails, naming the effect.
+/// for [`crate::Effect::MapWrite`], its missing directories made durably as every effect makes
+/// them (the folders rule, on [`crate::Effect`]; the simulation made them and this did not
+/// before 2026-11-20). Unix only: elsewhere it fails, naming the effect.
 pub(crate) fn map_write(path: &Path, len: u64) -> io::Result<crate::MappingWrite> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        let open = || std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path);
+        let file = super::making_parent(path, open)?;
         // Zero bytes of `len`: a hole, which takes no block until written.
         file.set_len(len)?;
         let len = usize::try_from(len)
@@ -354,22 +359,33 @@ pub(crate) fn map_write(path: &Path, len: u64) -> io::Result<crate::MappingWrite
         if len == 0 {
             return Ok(crate::MappingWrite::file(MappedWrite { base: NonNull::dangling(), len: 0 }));
         }
-        // SAFETY: a shared read-write mapping of `len` bytes of an open file whose length is
-        // `len`; nothing else writes, cuts or maps it while it lives (the effect's contract).
-        let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // SAFETY: the kernel chooses a new address. Nothing else writes, cuts or maps this
+        // file while the shared mapping lives (the effect's contract).
+        let base = unsafe {
+            sys_io::mmap(
+                None,
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
+                sys_io::Prot::READ | sys_io::Prot::WRITE,
+                sys_io::MapFlags::SHARED,
+                Some(Fd::new(file.as_raw_fd())),
                 0,
             )
+        }.map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let base = {
+            // SAFETY: the kernel chooses a new address for the same exclusive file.
+            let at = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED, file.as_raw_fd(), 0,
+                )
+            };
+            if at == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            NonNull::new(at.cast::<u8>()).expect("mmap mapped a file at address 0")
         };
-        if at == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let base = NonNull::new(at.cast::<u8>()).expect("mmap mapped a file at address 0");
         Ok(crate::MappingWrite::file(MappedWrite { base, len }))
     }
     #[cfg(not(unix))]
@@ -384,6 +400,8 @@ mod sys {
     use std::{fs::File, io, os::fd::AsRawFd as _, ptr::NonNull};
 
     use super::MapOptions;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{Fd, sys_io};
 
     /// The page: what `mmap`'s offset is a whole number of.
     pub(super) fn granularity() -> usize {
@@ -406,63 +424,77 @@ mod sys {
         len: usize,
         options: MapOptions,
     ) -> io::Result<NonNull<u8>> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let populate = if options.populate { libc::MAP_POPULATE } else { 0 };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let populate = 0;
-        let offset = libc::off_t::try_from(from).map_err(|_| {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        use blaze_sys::posix::types::off_t;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        use libc::off_t;
+        let offset = off_t::try_from(from).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "a mapping at an offset past off_t")
         })?;
-        // SAFETY: a new shared read-only mapping of `len` bytes of an open descriptor at a
-        // page-aligned offset inside it, at an address the kernel picks, so it overlaps nothing
-        // the program holds; the result is checked against `MAP_FAILED` below. The descriptor
-        // may close after: the mapping keeps the file.
-        let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED | populate,
-                file.as_raw_fd(),
-                offset,
-            )
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let base = {
+            let flags = sys_io::MapFlags::SHARED;
+            #[cfg(target_os = "linux")]
+            let flags = if options.populate { flags | sys_io::MapFlags::POPULATE } else { flags };
+            // SAFETY: the kernel chooses the address. The caller guarantees the shared file
+            // bytes stay immutable and mapped while any reference to them lives.
+            let base = unsafe {
+                sys_io::mmap(None, len, sys_io::Prot::READ, flags, Some(Fd::new(file.as_raw_fd())), offset as u64)
+            }.map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+            advise(base.as_ptr().cast(), len, options);
+            base
         };
-        if at == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        advise(at, len, options);
-        // A mapping with no address asked for is never at 0 (`vm.mmap_min_addr`).
-        Ok(NonNull::new(at.cast::<u8>()).expect("mmap mapped a file at address 0"))
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let base = {
+            #[cfg(target_os = "android")]
+            let populate = if options.populate { libc::MAP_POPULATE } else { 0 };
+            #[cfg(not(target_os = "android"))]
+            let populate = 0;
+            // SAFETY: the caller guarantees the shared file bytes remain immutable. The
+            // kernel chooses the address for this page-aligned range inside the open file.
+            let at = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED | populate,
+                    file.as_raw_fd(), offset,
+                )
+            };
+            if at == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            NonNull::new(at.cast::<u8>()).expect("mmap mapped a file at address 0")
+        };
+        Ok(base)
     }
 
     /// The mapping's advice, which is only advice: a call the system refuses changes nothing
     /// of the bytes read, so its result is not looked at.
-    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_variables))]
-    fn advise(at: *mut libc::c_void, len: usize, options: MapOptions) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn advise(at: *mut blaze_sys::posix::types::c_void, len: usize, options: MapOptions) {
+        let at = NonNull::new(at.cast()).expect("mmap mapped a file at address 0");
         #[cfg(target_os = "linux")]
         if options.huge && len >= super::HUGE {
             // SAFETY: the whole mapping `map` just made; the advice changes how its pages are
             // backed, never their bytes.
-            _ = unsafe { libc::madvise(at, len, libc::MADV_HUGEPAGE) };
+            _ = unsafe { blaze_sys::linux::madvise(at, len, blaze_sys::linux::Advice::HugePage) };
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use super::Advice;
             let advice = match options.advice {
                 Advice::Normal => None,
-                Advice::Sequential => Some(libc::MADV_SEQUENTIAL),
-                Advice::Random => Some(libc::MADV_RANDOM),
-                Advice::WillNeed => Some(libc::MADV_WILLNEED),
+                Advice::Sequential => Some(sys_io::Advice::Sequential),
+                Advice::Random => Some(sys_io::Advice::Random),
+                Advice::WillNeed => Some(sys_io::Advice::WillNeed),
             };
             if let Some(advice) = advice {
-                // SAFETY: as above.
-                _ = unsafe { libc::madvise(at, len, advice) };
+                // SAFETY: the range is live and these hints preserve all its bytes.
+                _ = unsafe { sys_io::madvise(at, len, advice) };
             }
             // macOS has no `MAP_POPULATE`: the whole is read ahead instead.
             #[cfg(target_os = "macos")]
             if options.populate && options.advice != Advice::WillNeed {
-                // SAFETY: as above.
-                _ = unsafe { libc::madvise(at, len, libc::MADV_WILLNEED) };
+                // SAFETY: the live mapping's read-ahead preserves its bytes.
+                _ = unsafe { sys_io::madvise(at, len, sys_io::Advice::WillNeed) };
             }
         }
     }
@@ -471,6 +503,10 @@ mod sys {
     ///
     /// `at` and `len` are a mapping `map` made, unmapped once, that nothing borrows.
     pub(super) unsafe fn unmap(at: NonNull<u8>, len: usize) {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        // SAFETY: no reference or other user of the range survives this call.
+        let _ = unsafe { sys_io::munmap(at, len) };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         // SAFETY: the caller's contract.
         unsafe { libc::munmap(at.as_ptr().cast(), len) };
     }
@@ -485,12 +521,13 @@ mod sys {
         ptr::NonNull,
     };
 
-    use windows_sys::Win32::System::{
-        Memory::{
+    use blaze_sys::windows::{
+        Handle,
+        memory::{
             CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             PAGE_READONLY, PrefetchVirtualMemory, UnmapViewOfFile, WIN32_MEMORY_RANGE_ENTRY,
         },
-        Threading::GetCurrentProcess,
+        threading::GetCurrentProcess,
     };
 
     use super::{Advice, MapOptions};
@@ -521,7 +558,7 @@ mod sys {
         // with no security attributes. The result is checked below.
         let section = unsafe {
             CreateFileMappingW(
-                file.as_raw_handle(),
+                Handle::from_raw(file.as_raw_handle()),
                 std::ptr::null(),
                 PAGE_READONLY,
                 (size >> 32) as u32,
@@ -533,12 +570,12 @@ mod sys {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: the section just made, a handle of its own that nothing else owns.
-        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+        let section = unsafe { OwnedHandle::from_raw_handle(section.raw()) };
         // SAFETY: the section just made; `len` bytes of it from `from`, a whole number of the
         // allocation granularity, to its end, read-only. The result is checked below.
         let view = unsafe {
             MapViewOfFile(
-                section.as_raw_handle(),
+                Handle::from_raw(section.as_raw_handle()),
                 FILE_MAP_READ,
                 (from >> 32) as u32,
                 from as u32,

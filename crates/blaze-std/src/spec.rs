@@ -36,7 +36,7 @@ use blaze_json::{Duplicates, Limits as JsonLimits, What, WriteOptions};
 use blaze_own::{String, Vec};
 use blaze_text::{Put, Show, Shown, Writes as _};
 
-use crate::{env::VarName, io::Offers, net::HostPort, path::Path};
+use crate::{env::VarName, net::HostPort, path::Path};
 
 /// The spec's format version: the `version` field of every spec.
 pub const VERSION: u64 = 1;

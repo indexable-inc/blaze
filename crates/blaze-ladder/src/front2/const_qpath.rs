@@ -414,15 +414,6 @@ impl Table {
         self.tys.as_slice().iter().find(|(k, _)| *k == need).map(|&(_, t)| t)
     }
 
-    /// Files the type of the answered leaf `need`, as its own evaluation does (`eval_asked`):
-    /// for a value another task of the request made and this store takes from the request's
-    /// table (blaze-cli engine_heads_once.rs, lane CX27). Once a leaf.
-    pub fn file_type(&mut self, need: LibKey, ty: PNode) {
-        if self.ty(need).is_none() {
-            self.tys.push((need, ty));
-        }
-    }
-
     fn has(&self, need: LibKey) -> bool {
         self.asked.as_slice().iter().any(|a| a.need == need)
     }
@@ -659,7 +650,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         }
         match out {
             Ok((bits, ty)) => {
-                r.store.maps.const_bits.insert(need, bits);
+                r.store.maps.file_bits(need, bits);
                 r.store.maps.qpaths.borrow_mut().tys.push((need, ty));
             }
             Err(e) => {
@@ -668,6 +659,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
                 if write!(why, "{e}").is_err() {
                     why.push_str(" (the rest of this refusal could not be written)");
                 }
+                r.store.maps.noted_const_result(need);
                 r.store.maps.anon_failed.insert(need, why.as_str().into());
             }
         }

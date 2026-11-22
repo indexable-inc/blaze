@@ -25,7 +25,25 @@
 //!   c-requests  argv (the program first), joined by NUL
 //! then the stored files, a u32 count and its entries:
 //!   stored      name, u64 length, u32 mode (`0o100644` or `0o100755`), 32 bytes SHA-256
+//! then the C inputs, three sections, each a u32 count and its entries:
+//!   c-states    u32 count, then each entry: name, u8 kind (0 a folder, 1 held, 2 final),
+//!               [32 bytes digest, held only]; sorted by name
+//!   c-at        u32 state, one per c-request, in order (the count is c-requests')
+//!   c-bytes     32 bytes digest, u64 offset, u64 length; sorted by digest, distinct; then
+//!               the bytes, at each offset from the end of the entries
 //! ```
+//!
+//! THE C INPUTS. A deferred request is a promise to run LATER what the script asked NOW, so it
+//! reads `OUT_DIR` as it was at the spawn, never as the script left it: aws-lc-sys writes
+//! `apple_core_services_check.c`, defers its compile and removes the folder; cc-rs rewrites one
+//! `flag_check.c` between requests; a script may write `gen.c` twice. Each request names a
+//! STATE of `OUT_DIR` ([`CRequest::state`]): every folder and file in it at the spawn, a file
+//! by the digest of its bytes ([`snap_digest`]). A new state is taken only at a spawn after
+//! `OUT_DIR` was edited (the sandbox's `OutDir` counts its edits); one equal to the last is the
+//! last. A file whose bytes are the record's own file of that name ([`Snap::Final`]) is not held
+//! twice; any other is held once by digest in `c-bytes` ([`Snap::Held`]). The whole state, not
+//! just the request's arguments, is kept: a compile's generated headers (`#include` from
+//! `OUT_DIR`) are among its files, and which ones it reads is known only after it runs.
 //!
 //! A stored file is one the record names and does not hold: a native script's `OUT_DIR` file
 //! (a C library's `.a` is hundreds of MB: librocksdb-sys's is 810 MB), whose bytes went from
@@ -61,10 +79,52 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 use crate::instr::{self, Instr, Line, LinkTo, Malformed, OutputError, OutputLimits, SearchKind};
 
 /// The record's layout word: `bzbsout` and the layout's number. `bzbsout5` added the stored
-/// files; a `bzbsout3` record is another layout ([`RecordError::Layout`]) and the run key
-/// holds this word (`key.rs`), so an old home's records are never found and are made again
-/// (rule 26).
-pub const LAYOUT: u64 = u64::from_le_bytes(*b"bzbsout5");
+/// files, `bzbsout6` the C inputs; a `bzbsout5` record is another layout
+/// ([`RecordError::Layout`]) and the run key holds this word (`key.rs`), so an old home's
+/// records are never found and are made again (rule 26).
+pub const LAYOUT: u64 = u64::from_le_bytes(*b"bzbsout6");
+
+/// The domain of [`snap_digest`].
+pub const SNAP_DOMAIN: &str = "blaze build-script c input 1";
+
+/// The digest a C input's bytes are held by.
+pub fn snap_digest(bytes: &[u8]) -> [u8; 32] {
+    blaze_ids::ContentId::of(SNAP_DOMAIN, bytes).0
+}
+
+/// One deferred request: its argv joined by NUL, and the `OUT_DIR` state it saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CRequest<'a> {
+    pub argv: AString<'a>,
+    /// An index of [`Outputs::c_states`].
+    pub state: u32,
+}
+
+/// One entry of an `OUT_DIR` state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Snap {
+    Folder,
+    /// A file whose bytes are held in the C inputs by this digest ([`snap_digest`]).
+    Held([u8; 32]),
+    /// A file whose bytes are the record's own inline file of the same name.
+    Final,
+}
+
+impl Snap {
+    fn kind(self) -> u8 {
+        match self {
+            Snap::Folder => 0,
+            Snap::Held(_) => 1,
+            Snap::Final => 2,
+        }
+    }
+}
+
+/// `OUT_DIR` at one deferred spawn: its entries by name from it, sorted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CState<'a> {
+    pub entries: AVec<'a, (AString<'a>, Snap)>,
+}
 
 /// The home's file area, under `<home>/.blaze/v2`: each stored file at `<this>/<sha256 hex>`,
 /// placed once by whoever ran the script and read by every command that opens its record.
@@ -241,10 +301,16 @@ pub struct Outputs<'a> {
     /// Sorted by name.
     pub files: AVec<'a, OutFile<'a>>,
     /// The native tool spawns a `check` run deferred (the C toolchain, `perl`, `make`, a
-    /// `configure`: `probe::is_deferred_tool`): each argv joined by NUL, in spawn order.
-    pub c_requests: AVec<'a, AString<'a>>,
+    /// `configure`: `probe::is_deferred_tool`), in spawn order, each with the `OUT_DIR` state
+    /// it saw.
+    pub c_requests: AVec<'a, CRequest<'a>>,
     /// Sorted by name; no name of `files` among them.
     pub stored: AVec<'a, StoredFile<'a>>,
+    /// The `OUT_DIR` states the requests saw (the module's THE C INPUTS).
+    pub c_states: AVec<'a, CState<'a>>,
+    /// The bytes of each [`Snap::Held`] file, by digest: sorted, distinct
+    /// ([`Outputs::hold_c_bytes`]).
+    pub c_bytes: AVec<'a, ([u8; 32], AVec<'a, u8>)>,
 }
 
 /// How much a script may write into `OUT_DIR`.
@@ -258,8 +324,7 @@ pub struct FileLimits {
 }
 
 impl FileLimits {
-    /// 1 GiB and 4096 files: a file over [`crate::outputs4::BLOB_OVER`] is its own record in
-    /// `bzbsout4` (NATIVE.md 3.8), so the total no longer sizes one record.
+    /// 1 GiB and 4096 files (NATIVE.md 3.8).
     pub const DEFAULT: FileLimits = FileLimits { bytes: 1 << 30, files: 4096 };
 }
 
@@ -299,6 +364,17 @@ impl<'a> Outputs<'a> {
             files: Vec::new_in(alloc),
             c_requests: Vec::new_in(alloc),
             stored: Vec::new_in(alloc),
+            c_states: Vec::new_in(alloc),
+            c_bytes: Vec::new_in(alloc),
+        }
+    }
+
+    /// `bytes`, whose digest is `digest` ([`snap_digest`]), held once in [`Outputs::c_bytes`].
+    pub fn hold_c_bytes(&mut self, digest: [u8; 32], bytes: &[u8], alloc: Alloc<'a>) {
+        if let Err(at) = self.c_bytes.binary_search_by(|(held, _)| held.cmp(&digest)) {
+            let mut owned = Vec::with_capacity_in(bytes.len(), alloc);
+            owned.extend_from_slice(bytes);
+            self.c_bytes.insert(at, (digest, owned));
         }
     }
 
@@ -422,10 +498,35 @@ impl<'a> Outputs<'a> {
             out.extend_from_slice(&file.mode.word().to_le_bytes());
             out.extend_from_slice(&file.sha256);
         }
+        count(out, self.c_states.len());
+        for state in self.c_states.iter() {
+            count(out, state.entries.len());
+            for (name, snap) in state.entries.iter() {
+                text(out, name);
+                out.push(snap.kind());
+                if let Snap::Held(digest) = snap {
+                    out.extend_from_slice(digest);
+                }
+            }
+        }
+        count(out, self.c_requests.len());
+        for request in self.c_requests.iter() {
+            out.extend_from_slice(&request.state.to_le_bytes());
+        }
+        count(out, self.c_bytes.len());
+        let mut offset = 0u64;
+        for (digest, bytes) in self.c_bytes.iter() {
+            out.extend_from_slice(digest);
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            offset += bytes.len() as u64;
+        }
+        for (_, bytes) in self.c_bytes.iter() {
+            out.extend_from_slice(bytes);
+        }
     }
 
-    /// The layout word `layout`, the `OUT_DIR` and the ten sections before the files: one
-    /// encoding for every layout (`bzbsout4` in [`crate::outputs4`] shares it).
+    /// The layout word `layout`, the `OUT_DIR` and the ten sections before the files.
     pub(crate) fn encode_head(&self, layout: u64, out: &mut AVec<'_, u8>) {
         out.extend_from_slice(&layout.to_le_bytes());
         text(out, &self.out_dir);
@@ -472,7 +573,7 @@ impl<'a> Outputs<'a> {
     /// The section after the files: the C requests.
     pub(crate) fn encode_tail(&self, out: &mut AVec<'_, u8>) {
         count(out, self.c_requests.len());
-        self.c_requests.iter().for_each(|it| text(out, it));
+        self.c_requests.iter().for_each(|it| text(out, &it.argv));
     }
 }
 
@@ -508,13 +609,9 @@ pub enum RecordError {
     Trailing { at: usize },
     /// The `OUT_DIR` at `at` is not an absolute path.
     OutDir { at: usize },
-    /// The record is of the earlier layout `tag` (`bzbsout3` read by
-    /// [`crate::outputs4::Outputs4Ref::open`]): an old home, reported and rebuilt (rule 26),
-    /// never read.
-    OldHome { tag: u64 },
-    /// A `bzbsout4` file's form byte at `at` disagrees with its length: inline over
-    /// [`crate::outputs4::BLOB_OVER`] or a blob not over it (one outputs, one encoding).
-    FileForm { at: usize },
+    /// The C inputs at `at` are not whole: a request's state that is not there, a count of
+    /// states other than the requests', a held digest with no bytes, bytes out of order.
+    CInput { at: usize },
 }
 
 /// A cursor over a record's bytes.
@@ -575,9 +672,37 @@ pub struct OutputsRef<'b> {
     starts: [(usize, u32); SECTIONS],
     /// The stored files' section: its start (after its count) and count.
     stored_at: (usize, u32),
+    /// The C inputs' sections: the states, the requests' states, the bytes' entries; each its
+    /// start (after its count) and count. `c_blobs` is where the held bytes start.
+    c_states: (usize, u32),
+    c_at: (usize, u32),
+    c_bytes: (usize, u32),
+    c_blobs: usize,
     /// Where its stored files' bytes are read; `None` until [`OutputsRef::with_area`].
     area: Option<&'b dyn StoredBytes>,
 }
+
+/// One entry of a C input state, checked.
+fn c_entry<'b>(cur: &mut Cursor<'b>) -> Result<(&'b str, Snap), RecordError> {
+    let name = cur.text()?;
+    let at = cur.at;
+    Ok((
+        name,
+        match cur.u8()? {
+            0 => Snap::Folder,
+            1 => {
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(cur.take(32)?);
+                Snap::Held(digest)
+            }
+            2 => Snap::Final,
+            _ => return Err(RecordError::Kind { at }),
+        },
+    ))
+}
+
+/// The width of one `c-bytes` entry: digest, offset, length.
+const C_BYTES_ENTRY: usize = 32 + 8 + 8;
 
 /// One stored file's entry, checked.
 fn stored_entry<'b>(cur: &mut Cursor<'b>) -> Result<StoredRef<'b>, RecordError> {
@@ -661,10 +786,124 @@ impl<'b> OutputsRef<'b> {
         for _ in 0..n {
             stored_entry(&mut cur)?;
         }
+        let n = cur.u32()?;
+        let c_states = (cur.at, n);
+        for _ in 0..n {
+            let entries = cur.u32()?;
+            for _ in 0..entries {
+                c_entry(&mut cur)?;
+            }
+        }
+        let count_at = cur.at;
+        let n = cur.u32()?;
+        if n != starts[11].1 {
+            return Err(RecordError::CInput { at: count_at });
+        }
+        let c_at = (cur.at, n);
+        for _ in 0..n {
+            let at = cur.at;
+            if cur.u32()? >= c_states.1 {
+                return Err(RecordError::CInput { at });
+            }
+        }
+        let n = cur.u32()?;
+        let c_bytes = (cur.at, n);
+        let mut last: Option<&[u8]> = None;
+        let mut offset = 0u64;
+        for _ in 0..n {
+            let at = cur.at;
+            let digest = cur.take(32)?;
+            let (from, len) = (cur.u64()?, cur.u64()?);
+            if last.is_some_and(|last| last >= digest) || from != offset {
+                return Err(RecordError::CInput { at });
+            }
+            last = Some(digest);
+            offset = offset.checked_add(len).ok_or(RecordError::CInput { at })?;
+        }
+        let c_blobs = cur.at;
+        let blobs = usize::try_from(offset).map_err(|_| RecordError::Short { at: c_blobs })?;
+        cur.take(blobs)?;
         if cur.at != bytes.len() {
             return Err(RecordError::Trailing { at: cur.at });
         }
-        Ok(OutputsRef { bytes, out_dir, starts, stored_at, area: None })
+        let opened = OutputsRef { bytes, out_dir, starts, stored_at, c_states, c_at, c_bytes, c_blobs, area: None };
+        // Each held digest has its bytes (a final file is looked up by name where it is laid).
+        let mut cur = Cursor { bytes, at: c_states.0 };
+        for _ in 0..c_states.1 {
+            let entries = cur.u32()?;
+            for _ in 0..entries {
+                let at = cur.at;
+                if let (_, Snap::Held(digest)) = c_entry(&mut cur)?
+                    && opened.c_held(&digest).is_none()
+                {
+                    return Err(RecordError::CInput { at });
+                }
+            }
+        }
+        Ok(opened)
+    }
+
+    /// Each deferred request's `OUT_DIR` state, in the requests' order ([`Self::c_state`]).
+    pub fn c_request_states(&self) -> impl Iterator<Item = u32> + use<'b> {
+        let (at, n) = self.c_at;
+        let mut cur = Cursor { bytes: self.bytes, at };
+        (0..n).map_while(move |_| cur.u32().ok())
+    }
+
+    /// How many `OUT_DIR` states the requests saw.
+    pub fn c_state_count(&self) -> u32 {
+        self.c_states.1
+    }
+
+    /// The `OUT_DIR` state `state`: its entries, sorted by name; `None` past the last.
+    pub fn c_state(&self, state: u32) -> Option<impl Iterator<Item = (&'b str, Snap)> + use<'b>> {
+        if state >= self.c_states.1 {
+            return None;
+        }
+        let mut cur = Cursor { bytes: self.bytes, at: self.c_states.0 };
+        for _ in 0..state {
+            let entries = cur.u32().ok()?;
+            for _ in 0..entries {
+                c_entry(&mut cur).ok()?;
+            }
+        }
+        let entries = cur.u32().ok()?;
+        Some((0..entries).map_while(move |_| c_entry(&mut cur).ok()))
+    }
+
+    /// The held bytes of `digest`, by a search of the sorted entries.
+    pub fn c_held(&self, digest: &[u8; 32]) -> Option<&'b [u8]> {
+        let (start, n) = self.c_bytes;
+        let entry = |at: usize| &self.bytes[start + at * C_BYTES_ENTRY..start + (at + 1) * C_BYTES_ENTRY];
+        let (mut lo, mut hi) = (0usize, n as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let one = entry(mid);
+            match one[..32].cmp(&digest[..]) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let word = |at: usize| u64::from_le_bytes(one[at..at + 8].try_into().unwrap_or([0; 8]));
+                    let (from, len) = (usize::try_from(word(32)).ok()?, usize::try_from(word(40)).ok()?);
+                    return self.bytes.get(self.c_blobs + from..self.c_blobs + from + len);
+                }
+            }
+        }
+        None
+    }
+
+    /// The bytes of the state entry `name`, `snap` ([`Self::c_state`]): held ones from the C
+    /// inputs, a final one the record's inline file of that name; `None` for a folder or a
+    /// final file the record does not hold inline.
+    pub fn c_snap_bytes(&self, name: &str, snap: Snap) -> Option<&'b [u8]> {
+        match snap {
+            Snap::Folder => None,
+            Snap::Held(digest) => self.c_held(&digest),
+            Snap::Final => match self.file(name)? {
+                OutFileRef::Inline(bytes) => Some(bytes),
+                OutFileRef::Stored(_) => None,
+            },
+        }
     }
 
     /// This record with its stored files read from `area`.
@@ -703,9 +942,9 @@ impl<'b> OutputsRef<'b> {
             let end = self.starts[section + 1].0 - 4;
             hasher.update(&n.to_le_bytes()).part(&self.bytes[start..end]);
         }
-        // The stored files' section runs to the record's end.
+        // The stored files' section runs to the C inputs' first count.
         let (start, n) = self.stored_at;
-        hasher.update(&n.to_le_bytes()).part(&self.bytes[start..]);
+        hasher.update(&n.to_le_bytes()).part(&self.bytes[start..self.c_states.0 - 4]);
         hasher.finish()
     }
 
@@ -837,9 +1076,26 @@ impl<'b> OutputsRef<'b> {
             owned.extend_from_slice(bytes);
             out.files.push(OutFile { name: own(name, alloc), bytes: owned });
         }
-        self.c_requests().for_each(|it| out.c_requests.push(own(it, alloc)));
+        for (argv, state) in self.c_requests().zip(self.c_request_states()) {
+            out.c_requests.push(CRequest { argv: own(argv, alloc), state });
+        }
         for stored in self.stored() {
             out.stored.push(StoredFile { name: own(stored.name, alloc), len: stored.len, mode: stored.mode, sha256: *stored.sha256 });
+        }
+        for state in 0..self.c_state_count() {
+            let mut entries = Vec::new_in(alloc);
+            if let Some(state) = self.c_state(state) {
+                state.for_each(|(name, snap)| entries.push((own(name, alloc), snap)));
+            }
+            out.c_states.push(CState { entries });
+        }
+        let (start, n) = self.c_bytes;
+        for at in 0..n as usize {
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&self.bytes[start + at * C_BYTES_ENTRY..start + at * C_BYTES_ENTRY + 32]);
+            if let Some(bytes) = self.c_held(&digest) {
+                out.hold_c_bytes(digest, bytes, alloc);
+            }
         }
         out
     }

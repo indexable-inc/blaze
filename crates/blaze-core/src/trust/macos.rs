@@ -19,6 +19,8 @@ use std::{
     ffi::{CStr, c_char, c_void},
 };
 
+use blaze_sys::posix::thread::{self, RtldFlags};
+
 use super::{Looked, Place, Roots, TrustError, Why};
 
 type CfRef = *const c_void;
@@ -152,7 +154,7 @@ impl Drop for Owned<'_> {
 
 fn open(path: &'static CStr, name: &'static str) -> Result<*mut c_void, Looked> {
     // SAFETY: a NUL-terminated path; the handle is never closed, so what it gives stays valid.
-    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    let handle = unsafe { thread::dlopen(path.as_ptr(), (RtldFlags::LAZY | RtldFlags::LOCAL).bits()) };
     match handle.is_null() {
         true => Err(Looked { place: Place::System(name), why: Why::Missing { symbol: None } }),
         false => Ok(handle),
@@ -165,7 +167,7 @@ fn open(path: &'static CStr, name: &'static str) -> Result<*mut c_void, Looked> 
 unsafe fn symbol<F: Copy>(handle: *mut c_void, framework: &'static str, name: &'static CStr) -> Result<F, Looked> {
     const { assert!(size_of::<F>() == size_of::<*mut c_void>(), "a symbol is one address") };
     // SAFETY: a handle `open` returned, never closed, and a NUL-terminated name.
-    let found = unsafe { libc::dlsym(handle, name.as_ptr()) };
+    let found = unsafe { thread::dlsym(handle, name.as_ptr()) };
     if found.is_null() {
         let symbol = name.to_str().ok();
         return Err(Looked { place: Place::System(framework), why: Why::Missing { symbol } });

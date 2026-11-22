@@ -2,7 +2,7 @@
 //! prints for `--version` in the guest, and the declared Apple userland's `sw_vers` values
 //! (port27/tempo-deps NOTES, brief P; READINESS 1f, W5).
 //!
-//! Sans-IO: the clang pin table's text ([`crate::toolchain::PIN`]) and the userland's text
+//! Sans-IO: the clang pin table's text ([`blaze_pins::CLANG_JSON`]) and the userland's text
 //! (its `SystemVersion.plist` and its kernel release, read once at the command's edge and handed
 //! down: rule 75) in, owned pins out. Nothing here reads the machine.
 //!
@@ -31,12 +31,9 @@
 #![blaze::sans_io]
 
 use blaze_own::{AString, Alloc, String};
+use blaze_pins::{CLANG_PATH, RUSTC_LLVM};
 
-use crate::{
-    facts::Pins,
-    probe,
-    toolchain::{PIN_PATH, scalar},
-};
+use crate::{facts::Pins, toolchain::scalar};
 
 /// Where the guest sees the pinned C toolchain (`clang`, `clang++`, `llvm-ar`): the folder cc-rs
 /// and a script's `cc` find a C compiler in on macOS. It is the `InstalledDir` the fact prints.
@@ -84,7 +81,7 @@ impl core::fmt::Display for UserlandError<'_> {
 pub enum FactPinsError<'t> {
     /// The table lacks `field` at its top level, or it is not of its form.
     Pin { field: &'static str },
-    /// The table's `version` is not the LLVM the facts' `-dumpversion` answers ([`probe::LLVM`]):
+    /// The table's `version` is not the LLVM the facts' `-dumpversion` answers ([`blaze_pins::RUSTC_LLVM`]):
     /// two answers for one clang.
     VersionMismatch { pinned: &'t str },
     /// No default triple is stated for this target's pinned clang.
@@ -94,11 +91,10 @@ pub enum FactPinsError<'t> {
 impl core::fmt::Display for FactPinsError<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FactPinsError::Pin { field } => write!(f, "{PIN_PATH}: no top-level `{field}` of its form: `clang --version` cannot be derived (brief P)"),
+            FactPinsError::Pin { field } => write!(f, "{CLANG_PATH}: no top-level `{field}` of its form: `clang --version` cannot be derived (brief P)"),
             FactPinsError::VersionMismatch { pinned } => write!(
                 f,
-                "{PIN_PATH}: version {pinned} is not the LLVM {} the facts answer for `-dumpversion` (probe::LLVM): one clang, one version",
-                probe::LLVM
+                "{CLANG_PATH}: version {pinned} is not the LLVM {RUSTC_LLVM} the facts answer for `-dumpversion` (blaze_pins::RUSTC_LLVM): one clang, one version"
             ),
             FactPinsError::NoTriple { target } => {
                 write!(f, "no default triple is stated for the pinned clang of {target}: its derived facts are not answered (brief P)")
@@ -183,7 +179,7 @@ fn triple_stem(target: &str) -> Option<&'static str> {
 }
 
 /// The derived facts' pins for a script whose guest is `target` (its host): `clang --version`
-/// composed from the pin table `pin` ([`crate::toolchain::PIN`]) and `userland`, the clang seen in
+/// composed from the pin table `pin` ([`blaze_pins::CLANG_JSON`]) and `userland`, the clang seen in
 /// `clang_dir` ([`CLANG_GUEST_DIR`]); the `sw_vers` values from `userland`.
 pub fn fact_pins<'a, 't>(
     pin: &'t str,
@@ -194,7 +190,7 @@ pub fn fact_pins<'a, 't>(
 ) -> Result<OwnedPins<'a>, FactPinsError<'t>> {
     let field = |field: &'static str| scalar(pin, field).filter(|v| !v.is_empty() && !v.contains(' ')).ok_or(FactPinsError::Pin { field });
     let version = field("version")?;
-    if version != probe::LLVM {
+    if version != RUSTC_LLVM {
         return Err(FactPinsError::VersionMismatch { pinned: version });
     }
     let repository = field("repository")?;

@@ -26,7 +26,7 @@ use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::buckets::{TableSet, write_impl_tables};
 use blaze_ladder::front2::heads::NeedsMet;
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::cost::{Cost, Gauge, PARTS, Spent};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::head::{ConstValues, SeededHeads, SeededHeadsOpts, StoreConsts};
@@ -428,18 +428,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 
@@ -618,7 +618,7 @@ fn cost_of_one_body() {
     let mut all_reads: HashMap<ItemKey, Vec<String>> = HashMap::new();
     let start = Instant::now();
     for (key, _) in bodies.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: None, sources: None, goals: None, census: None };
         let (before, b0, t0) = (cost.spent(), BYTES.load(Ordering::Relaxed), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let us = t0.elapsed().as_micros() as u64;
@@ -682,7 +682,7 @@ fn cost_of_one_body() {
     let mut differ: Vec<String> = Vec::new();
     let mut reads_differ: Vec<String> = Vec::new();
     for (key, bytes, reads) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::First, heads: None, sources: None, goals: None, census: None };
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
         let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
         if out.bytes.as_slice() != bytes.as_slice() {
@@ -717,7 +717,7 @@ fn cost_of_one_body() {
         let mut differ: Vec<String> = Vec::new();
         let mut per_body: Vec<(String, usize)> = Vec::new();
         for (key, bytes, _) in order {
-            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table) };
+            let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: Some(table), census: None };
             let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"));
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?").to_string();
             if out.bytes.as_slice() != bytes.as_slice() {
@@ -767,7 +767,7 @@ fn cost_of_one_body() {
     // type: counted with its reason, and left out of the seeded run.
     let mut refused: HashMap<ItemKey, String> = HashMap::new();
     for (key, _, _) in kept_outs.iter() {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: None, needs: NeedsMet::All, heads: Some(freezing), sources: None, goals: None, census: None };
         if let Err(e) = check_body(view, &task_of(*key), &body_frame, &NameMake, shared) {
             let label = NamesSource::name_of(task_records, *key).unwrap_or("?");
             note!("SEED REFUSED `{label}`: {e}");
@@ -798,7 +798,7 @@ fn cost_of_one_body() {
     // `Part::Heads` entries) and its impl questions filed (`Part::Impls` entries), its name.
     let mut per_body: Vec<(u64, u64, u64, String)> = Vec::new();
     for (key, bytes, _) in kept_outs.iter().filter(|(k, _, _)| !refused.contains_key(k)) {
-        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None };
+        let body_frame = BodyFrame { frame: frame(), alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::All, heads: Some(table), sources: None, goals: None, census: None };
         let (before, t0) = (cost.spent(), Instant::now());
         let out = check_body(view, &task_of(*key), &body_frame, &NameMake, shared).unwrap_or_else(|e| panic!("seeded, the body task of {key:x}: {e}"));
         let spent = cost.spent().since(&before);

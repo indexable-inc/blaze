@@ -263,6 +263,21 @@ impl fmt::Debug for End {
     }
 }
 
+/// The most bytes a local socket's absolute path may hold, its NUL counted: the size of
+/// `sockaddr_un.sun_path` (104 on macOS, 108 on Linux). A path longer cannot be bound or
+/// connected to; a caller that knows its root's text checks a socket's path against this before
+/// either, and says so as its own typed error naming the path (blaze-cli journal_ask.rs
+/// `SocketFits`), rather than reading it from a driver's string.
+#[cfg(target_os = "macos")]
+pub const SOCKET_PATH_MOST: usize = 104;
+/// See the macOS item: Linux's `sun_path` is 108 bytes.
+#[cfg(not(target_os = "macos"))]
+pub const SOCKET_PATH_MOST: usize = 108;
+
+// The constant is the system's: blaze-sys' `sockaddr_un` is the one the driver binds through.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const _: () = assert!(SOCKET_PATH_MOST == blaze_sys::posix::net::sockaddr_un::ZERO.sun_path.len());
+
 /// The named local sockets beneath one directory: from [`Local::beneath`].
 #[derive(Clone)]
 pub struct Local {

@@ -38,7 +38,7 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static FREED_BYTES: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static UNTRACKED: AtomicU64 = AtomicU64::new(0);
-static QUEUE: OnceLock<ArrayQueue<Record>> = OnceLock::new();
+static QUEUE: OnceLock<ArrayQueue<Record, std::alloc::Global>> =OnceLock::new();
 static SAMPLED: [AtomicU64; TABLE] = [const { AtomicU64::new(EMPTY) }; TABLE];
 
 /// A sampled allocation or the free of one.
@@ -451,6 +451,12 @@ fn frame_pointer() -> Option<u64> {
 fn stack_high() -> Option<u64> {
     #[cfg(target_vendor = "apple")]
     {
+        #[cfg(target_os = "macos")]
+        use blaze_sys::posix::thread::{pthread_get_stackaddr_np, pthread_self};
+        #[cfg(target_os = "macos")]
+        // SAFETY: the calling thread's own pthread, alive.
+        let high = unsafe { pthread_get_stackaddr_np(pthread_self()) } as u64;
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: the calling thread's own pthread, alive.
         let high = unsafe { libc::pthread_get_stackaddr_np(libc::pthread_self()) } as u64;
         (high != 0).then_some(high)
@@ -463,8 +469,8 @@ fn stack_high() -> Option<u64> {
         if unsafe { libc::pthread_getattr_np(libc::pthread_self(), &mut attr) } != 0 {
             return None;
         }
-        let mut addr: *mut libc::c_void = std::ptr::null_mut();
-        let mut size: libc::size_t = 0;
+        let mut addr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut size: usize = 0;
         // SAFETY: `attr` was filled above.
         let ok = unsafe { libc::pthread_attr_getstack(&attr, &mut addr, &mut size) } == 0;
         // SAFETY: filled by `pthread_getattr_np`, destroyed once.

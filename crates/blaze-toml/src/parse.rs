@@ -2,17 +2,17 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::{String, Vec};
+use blaze_own::{
+    String, Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
-    Error, Expected, Limits, MOST_KEY_PARTS, What,
+    Error, Expected, Limits, MOST_FLOAT_LEN, MOST_KEY_PARTS, TomlPlant, What,
     doc::{
         Date, Datetime, Document, Kind, NONE, Node, Nodes, Offset, Origin, Span, Text, Time, narrow, pack, widen,
     },
 };
-
-/// The most characters of a float as written, underscores aside.
-const MOST_FLOAT_LEN: usize = 256;
 
 /// One part of a dotted key: its decoded text and where it is written.
 #[derive(Clone, Copy)]
@@ -58,6 +58,17 @@ impl Key {
 impl<'t, A: Allocator + Clone> Document<'t, A> {
     /// `text` read as TOML 1.0, within `limits`, the document's columns in `alloc`.
     pub fn parse_in(text: &'t str, limits: Limits, alloc: A) -> Result<Document<'t, A>, Error> {
+        Document::parse_in_planted(text, limits, alloc, NoPlant)
+    }
+
+    /// [`Document::parse_in`] with its plant seam: `plant` is [`NoPlant`] where it ships and a
+    /// [`TomlPlant`] under a control (D165).
+    pub fn parse_in_planted(
+        text: &'t str,
+        limits: Limits,
+        alloc: A,
+        plant: impl Planted<TomlPlant>,
+    ) -> Result<Document<'t, A>, Error> {
         let most = limits.most_bytes.min(widen(u32::MAX));
         if text.len() > most {
             return Err(Error { at: 0, what: What::TooLarge { len: text.len(), most } });
@@ -82,13 +93,13 @@ impl<'t, A: Allocator + Clone> Document<'t, A> {
                 next_sibling: NONE,
             })
             .map_err(|refused| Error { at: 0, what: What::Memory(refused.why) })?;
-        Parser { text, b: text.as_bytes(), at: 0, limits, doc: &mut doc, table: 0, section: 0, depth: 0 }
+        Parser { text, b: text.as_bytes(), at: 0, limits, doc: &mut doc, table: 0, section: 0, depth: 0, plant }
             .document()?;
         Ok(doc)
     }
 }
 
-struct Parser<'t, 'd, A: Allocator> {
+struct Parser<'t, 'd, A: Allocator, P: Planted<TomlPlant>> {
     text: &'t str,
     b: &'t [u8],
     at: usize,
@@ -100,6 +111,8 @@ struct Parser<'t, 'd, A: Allocator> {
     section: u32,
     /// Arrays and inline tables open.
     depth: usize,
+    /// The planted bug, if any: asked where it would be.
+    plant: P,
 }
 
 fn is_control(ch: char) -> bool {
@@ -120,7 +133,7 @@ fn days_in_month(year: u16, month: u8) -> u8 {
     }
 }
 
-impl<'t, A: Allocator> Parser<'t, '_, A> {
+impl<'t, A: Allocator, P: Planted<TomlPlant>> Parser<'t, '_, A, P> {
     fn peek(&self) -> Option<u8> {
         self.b.get(self.at).copied()
     }
@@ -212,7 +225,10 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                 Some(_) => {
                     self.keyval(self.table)?;
                     self.end_of_line()?;
-                    let end = crate::plant::body_end(self.at);
+                    let end = match self.plant.has(TomlPlant::BodyEndShort) {
+                        true => self.at.saturating_sub(1),
+                        false => self.at,
+                    };
                     self.doc.nodes.payloads_mut()[widen(self.section)] = u64::from(narrow(end));
                 }
             }
@@ -258,9 +274,10 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
     /// A dotted key: simple keys joined by `.`, blanks allowed around each dot.
     fn key(&mut self) -> Result<Key, Error> {
         let mut key = Key { parts: [Part::EMPTY; MOST_KEY_PARTS], len: 0 };
+        let most = self.limits.most_key_parts.min(MOST_KEY_PARTS);
         loop {
-            if key.len == MOST_KEY_PARTS {
-                return Err(self.err(self.at, What::KeyTooLong { most: MOST_KEY_PARTS }));
+            if key.len == most {
+                return Err(self.err(self.at, What::KeyTooLong { most }));
             }
             key.parts[key.len] = self.simple_key()?;
             key.len += 1;
@@ -928,10 +945,11 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
         self.at = end;
         if float {
             let mut buf = [0u8; MOST_FLOAT_LEN];
+            let most = self.limits.most_float_len.min(MOST_FLOAT_LEN);
             let mut len = 0;
             for &b in self.b[start..end].iter().filter(|&&b| b != b'_') {
-                if len == MOST_FLOAT_LEN {
-                    return Err(self.err(start, What::NumberTooLong { most: MOST_FLOAT_LEN }));
+                if len == most {
+                    return Err(self.err(start, What::NumberTooLong { most }));
                 }
                 buf[len] = b;
                 len += 1;

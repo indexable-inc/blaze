@@ -15,7 +15,7 @@ use blaze_drive::Key;
 use blaze_ids::ContentId;
 use std::alloc::Global;
 
-use super::{Facts, PlaceError, PlacePlant, PlainPlace, StoreAlloc, after_answer, config, open};
+use super::{Facts, PlaceError, PlacePlant, PlainPlace, StoreAlloc, after_answer, config, open, test_cx};
 
 fn key(n: u32) -> Key {
     Key(ContentId::of("plain place test key", &n.to_le_bytes()))
@@ -64,7 +64,7 @@ fn records_are_read_in_place_and_reach_the_next_process_by_the_commit_after_the_
         assert_eq!(read(&place, n), Some(value(n)), "record {n} from the arena");
     }
     drop(place);
-    let first = after_answer(&lent, 0).expect("the commit after the answer");
+    let first = after_answer(&test_cx(), &lent, 0).expect("the commit after the answer");
     assert_eq!(first.segments_written, 1);
     let lent = process(back(lent), 2, u64::MAX);
     let mut place = PlainPlace::new(&lent, false);
@@ -145,7 +145,7 @@ fn a_refused_put_names_its_record_and_where_the_two_differ() {
     println!("plain place: {own}");
     // Against a committed record (an earlier command's) the line says what to run.
     drop(place);
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&test_cx(), &lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 2, u64::MAX);
     let mut place = PlainPlace::new(&lent, false);
     let refused = match place.put(key(1), false, &other) {
@@ -179,7 +179,7 @@ fn a_crash_loses_a_commands_records_but_never_serves_other_bytes() {
             // The seed decides whether this command reached its commit.
             drop(place);
             if (seed >> cmd) & 1 == 1 {
-                after_answer(&lent, 1).expect("the commit after the answer");
+                after_answer(&test_cx(), &lent, 1).expect("the commit after the answer");
             }
             sim = back(lent);
         }
@@ -222,9 +222,9 @@ fn pinned_after_compaction(plant: PlacePlant) -> (Vec<u32>, usize) {
         place.commit().expect("a later commit");
     }
     drop(place);
-    after_answer(&lent, 1).expect("the first process's commit after the answer");
+    after_answer(&test_cx(), &lent, 1).expect("the first process's commit after the answer");
     let lent = process(back(lent), 2, CAP);
-    after_answer(&lent, 1).expect("the second process's slice past the cap");
+    after_answer(&test_cx(), &lent, 1).expect("the second process's slice past the cap");
     let lent = process(back(lent), 3, CAP);
     let place = PlainPlace::new(&lent, false);
     let missing: Vec<u32> = (0..20).filter(|n| read(&place, *n) != Some(value(*n))).collect();

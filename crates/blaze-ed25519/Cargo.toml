@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 # Integer conversions that say what they do: limb products are truncated on purpose.
 blaze-int.workspace = true
+# The plant seam (`Planted<P>`, D165): no_std, and itself depends only on blaze-memchr.
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

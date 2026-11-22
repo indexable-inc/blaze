@@ -184,7 +184,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use blaze_lir::{Op, View};
+use blaze_lir::{Op, Verified};
 
 /// The `asm!` template reader and its mnemonic table (pass/asm.rs lowers the block).
 mod asm;
@@ -569,10 +569,11 @@ impl fmt::Display for EmitError {
 
 impl core::error::Error for EmitError {}
 
-/// Emits `func` (verified by `blaze_lir::verify`) into `out`, which is cleared first, for a
-/// core and system `isa` says. `via` has one entry per function reference place the function
-/// names.
-pub fn emit<A: Allocator>(func: View<'_>, via: &[Via], isa: Isa, out: &mut Code<A>) -> Result<(), EmitError> {
+/// Emits `func` into `out`, which is cleared first, for a core and system `isa` says. `func`
+/// is the proof `blaze_lir::verify` answered (or a `VerifiedFunc`'s): unchecked LIR cannot be
+/// handed in, and nothing here checks it again (D163, rule 74). `via` has one entry per
+/// function reference place the function names.
+pub fn emit<A: Allocator>(func: Verified<'_>, via: &[Via], isa: Isa, out: &mut Code<A>) -> Result<(), EmitError> {
     emit_inline_up_to(func, via, &RoutinePlaces::NONE, isa, BULK_INLINE_MOST, out).map(|_| ())
 }
 
@@ -582,14 +583,14 @@ pub fn emit<A: Allocator>(func: View<'_>, via: &[Via], isa: Isa, out: &mut Code<
 /// references, as the record path does, front2/builtins_shim.rs `Bound::bind`). Answers the
 /// routines the code calls. The one rule of both paths: the in-process build and the record
 /// emitter legalize with the same table.
-pub fn emit_with_routines<A: Allocator>(func: View<'_>, via: &[Via], routines: &RoutinePlaces, isa: Isa, out: &mut Code<A>) -> Result<Called, EmitError> {
+pub fn emit_with_routines<A: Allocator>(func: Verified<'_>, via: &[Via], routines: &RoutinePlaces, isa: Isa, out: &mut Code<A>) -> Result<Called, EmitError> {
     emit_inline_up_to(func, via, routines, isa, BULK_INLINE_MOST, out)
 }
 
 /// [`emit`], inlining a bulk operation of a constant length up to `inline_most` bytes (the
 /// measurement compares both sides of [`BULK_INLINE_MOST`]).
 pub(crate) fn emit_inline_up_to<A: Allocator>(
-    func: View<'_>,
+    func: Verified<'_>,
     via: &[Via],
     bound: &RoutinePlaces,
     isa: Isa,
@@ -602,7 +603,7 @@ pub(crate) fn emit_inline_up_to<A: Allocator>(
 /// [`emit_inline_up_to`] with the pass's `reach` (pass/reach.rs): [`pass::Reach::ShortOnly`]
 /// is the reach tests' control, the pass with no island and no long form.
 pub(crate) fn emit_reaching<A: Allocator>(
-    func: View<'_>,
+    func: Verified<'_>,
     via: &[Via],
     bound: &RoutinePlaces,
     isa: Isa,
@@ -610,6 +611,8 @@ pub(crate) fn emit_reaching<A: Allocator>(
     reach: pass::Reach,
     out: &mut Code<A>,
 ) -> Result<Called, EmitError> {
+    // Below the entry the pass reads the view; the proof was the entry's to take.
+    let func = func.view();
     out.bytes.clear();
     out.fixups.clear();
     out.relocs.clear();

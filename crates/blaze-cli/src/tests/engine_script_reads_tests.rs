@@ -48,7 +48,7 @@ fn remove(io: &Io, path: &str) {
 
 /// What one run of the fake script gives: its read list as cells (through the sandbox's
 /// subjects and `cells_of`, `plant` applied) and its outputs, a digest of everything it saw.
-fn run(io: &Io, script: &[(ReadKind, &str)], plant: ReadsPlant) -> (std::vec::Vec<CheckoutRead>, blaze_ids::ContentId) {
+fn run(io: &Io, script: &[(ReadKind, &str)], plant: ReadsPlant) -> (reads::ReadList, blaze_ids::ContentId) {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let frame = cx.frame();
@@ -64,7 +64,7 @@ fn run(io: &Io, script: &[(ReadKind, &str)], plant: ReadsPlant) -> (std::vec::Ve
         };
         // The sandbox records no digest for nothing there.
         recorded.push((format!("{word}:{path}"), (answer != reads::NONE).then_some(answer)));
-        saw.push(CheckoutRead { kind: *kind, path: std::string::String::from(*path), answer });
+        saw.push(CheckoutRead { kind: *kind, path: reads::Subject::from_str_in(path, blaze_own::testing::heap().shared()), answer });
     }
     let cells = reads::cells_of(recorded.iter().map(|(subject, digest)| (subject.as_str(), *digest)), plant).expect("every read has a cell");
     (cells, reads::outputs_of(&saw))
@@ -189,14 +189,264 @@ fn control_a_dropped_file_read_misses_the_edit() {
 /// here (the sandbox records none).
 #[test]
 fn reads_with_no_cell_are_refused_by_name() {
-    // A git fact read from `.git` files has a cell (lane NR2); `status` reads every tracked
-    // file's stat and has none yet.
-    assert!(reads::parse("git:pkg\nrev-parse HEAD", None).is_ok(), "a git fact has a cell");
-    assert!(matches!(reads::parse("git:pkg\nstatus --porcelain", None), Err(NoCell::Git { .. })));
+    // A successful git invocation has an answer even when its stdout is empty.
+    let answer = Some(blaze_ids::ContentId([5; 32]));
+    assert!(reads::parse("git:pkg\nrev-parse HEAD", answer).is_ok());
+    assert!(reads::parse("git:pkg\nstatus --porcelain", answer).is_ok());
+    assert!(matches!(reads::parse("git:pkg\nstatus --porcelain", None), Err(NoCell::Unobserved { .. })));
+    assert!(matches!(reads::parse("git:pkg\nstatus  --porcelain", answer), Err(NoCell::Git { .. })));
     assert!(matches!(reads::parse("env:HOME", None), Err(NoCell::Kind { .. })));
     assert!(matches!(reads::parse("file:/etc/passwd", None), Err(NoCell::Path { .. })));
     assert!(matches!(reads::parse("file:pkg/../x", None), Err(NoCell::Path { .. })));
     let root = reads::parse("dir:", None).expect("the checkout's root is a path");
     assert_eq!((root.kind, root.path.as_str(), root.answer), (ReadKind::Listing, "", reads::NONE));
     assert_ne!(reads::cell_name(ReadKind::File, "a"), reads::cell_name(ReadKind::Stat, "a"), "a path's reads of two kinds are two cells");
+}
+
+/// A v2 index with one tracked path, f (100644, "a\n"), its TREE extension
+/// and trailing SHA-1. HEAD names a loose commit of that tree. Neither the
+/// fixture nor the oracle needs an installed git or a user's configuration.
+pub(super) fn status_files(link: bool) -> std::vec::Vec<(std::string::String, std::vec::Vec<u8>)> {
+    use blaze_build_script::git::Oid;
+    let (mode, tree, commit, checksum) = if link {
+        (0o120000, "8c49c088e07eb22abdb91ceb2fdfaf5a0bf3cda0", "2057df0b2b4d97921e6550f774c49d74f0098135", "26773b48995bdaa67a1eee8fba876211d795758a")
+    } else {
+        (0o100644, "3be22be77da4887e869c981806d8452f034dd014", "ebf714d841b7fd510630ee5965b2ef0bdc3b5c08", "7c818220f432877458e9a7c7d5aea57cc66c3ee8")
+    };
+    let mut index = b"DIRC".to_vec();
+    for field in [2u32, 1, 0, 0, 0, 0, 0, 0, mode, 0, 0, 2] {
+        index.extend_from_slice(&field.to_be_bytes());
+    }
+    index.extend_from_slice(&Oid::parse_hex(b"78981922613b2afb6025042ff6bd878ac1994e85").unwrap().0);
+    index.extend_from_slice(b"\0\x01f\0TREE\0\0\0\x19\x001 0\n");
+    index.extend_from_slice(&Oid::parse_hex(tree.as_bytes()).unwrap().0);
+    index.extend_from_slice(&Oid::parse_hex(checksum.as_bytes()).unwrap().0);
+    let body = format!("tree {tree}\nauthor A <a@b> 1 +0000\ncommitter A <a@b> 1 +0000\n\nfixture\n");
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut object = blaze_own::Vec::new_in(alloc);
+    blaze_deflate::zlib(format!("commit {}\0{body}", body.len()).as_bytes(), blaze_deflate::Level::Fast, alloc, &mut object).unwrap();
+    vec![
+        (".git/HEAD".into(), format!("{commit}\n").into_bytes()),
+        (format!(".git/objects/{}/{}", &commit[..2], &commit[2..]), object.to_vec()),
+        (".git/index".into(), index),
+        ("f".into(), b"a\n".to_vec()),
+    ]
+}
+
+fn porcelain(stdout: &[u8]) -> blaze_ids::ContentId {
+    let mut reply = 0i32.to_le_bytes().to_vec();
+    reply.extend_from_slice(&(stdout.len() as u64).to_le_bytes());
+    reply.extend_from_slice(stdout);
+    reply.extend_from_slice(&0u64.to_le_bytes()); // stderr
+    blaze_proc_macro::script_sandbox::file_answer(&reply)
+}
+
+const PORCELAIN: &str = "one\nstatus --porcelain";
+const TRACKED: &str = "two\nstatus --porcelain --untracked-files=no";
+
+fn status_history(tape: &blaze_sim::Tape, plant: ReadsPlant) -> Result<(), blaze_sim::Broke> {
+    use blaze_proc_macro::script_sandbox::{answer_now, mem_tree};
+    let io = world();
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = cx.frame();
+    let base = status_files(false);
+    let mut previous: Option<(std::vec::Vec<u8>, u64)> = None;
+    let mut previous_all: Option<(std::vec::Vec<u8>, blaze_ids::ContentId)> = None;
+    // Always start clean, repeat, edit twice with the same porcelain line,
+    // revert, create an untracked file, delete it, then vary those states.
+    for tick in 0..12 {
+        let state = match tick {
+            0 | 1 | 4 | 6 => 0,
+            2 => 1,
+            3 => 2,
+            5 => 3,
+            _ => tape.below(4, "worktree edit"),
+        };
+        let mut files = base.clone();
+        let contents: &[u8] = match state { 1 => b"b\n", 2 => b"c\n", _ => b"a\n" };
+        files.iter_mut().find(|(name, _)| name == "f").unwrap().1 = contents.to_vec();
+        if state == 3 {
+            files.push(("new".into(), b"x".to_vec()));
+        }
+        let tree = mem_tree(files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())), "", None);
+        let mut sweep = reads::CheckoutSweep::new(tree.clone(), blaze_own::testing::heap().alloc(), frame);
+        let mut status_bytes = if contents == b"a\n" { b"".to_vec() } else { b" M f\n".to_vec() };
+        if state == 3 {
+            status_bytes.extend_from_slice(b"?? new\n");
+        }
+        let expected = porcelain(&status_bytes);
+        let tracked_expected = porcelain(if contents == b"a\n" { b"" } else { b" M f\n" });
+        let mut saved_tracked = None;
+        for (ask, wanted) in [(TRACKED, Some(tracked_expected)), (PORCELAIN, Some(expected))] {
+            let subject = format!("git:{ask}");
+            let sandbox = answer_now(&tree, &subject).expect("a supported question");
+            assert_eq!(sandbox, wanted, "porcelain answer in state {state}");
+            let (folder, command) = ask.split_once('\n').unwrap();
+            let binding = format!("git-scope:{folder}");
+            let work = blaze_proc_macro::script_sandbox::status_scope(&tree, folder, blaze_own::testing::heap().alloc());
+            assert_eq!(work, "");
+            let canonical = format!("git:{work}\n{command}");
+            if ask == PORCELAIN && let Some((bytes, old_answer)) = previous_all.take() {
+                let (last, _) = Leaves::of(&bytes).expect("the default porcelain run's saved rows");
+                let moved = (0..last.len()).any(|i| sweep.row(ReadKind::Git, last.path(i)).unwrap().2 != last.row(i).id);
+                assert_eq!(moved, sandbox != Some(old_answer), "an untracked file breaks a clean certificate");
+            }
+            let mut cells = reads::ReadList::new_in(blaze_own::testing::heap().shared());
+            if sandbox.is_none() {
+                assert_eq!(sweep.answer(ask).unwrap(), reads::NONE);
+                assert!(matches!(reads::collect_reads([(canonical.as_str(), None)].into_iter(), plant, Some(sweep.view()), &mut cells), Err(NoCell::Unobserved { .. })));
+                continue;
+            }
+            let observed = [(binding.as_str(), answer_now(&tree, &binding).unwrap()), (canonical.as_str(), sandbox)];
+            if reads::collect_reads(observed.into_iter(), plant, Some(sweep.view()), &mut cells).is_err() {
+                return Err(blaze_sim::Broke::Oracle("an observed status was always owed".into()));
+            }
+            for read in &cells {
+                assert_eq!(sweep.row(read.kind, &read.path).unwrap().2, read.answer);
+            }
+            if ask == TRACKED {
+                saved_tracked = Some(table(&io, &cells));
+            } else {
+                previous_all = Some((table(&io, &cells), sandbox.unwrap()));
+            }
+        }
+        // A second package asks the first question in the same checkout.
+        assert_eq!(sweep.answer("three\nstatus --porcelain --untracked-files=no").unwrap(), tracked_expected);
+        assert_eq!(sweep.status_questions(), 2, "one answer per repository and untracked mode");
+        if let Some((old, old_state)) = previous {
+            let (last, _) = Leaves::of(&old).expect("a restored table");
+            let moved = (0..last.len()).any(|i| sweep.row(ReadKind::Git, last.path(i)).unwrap().2 != last.row(i).id);
+            assert_eq!(moved, matches!(state, 1 | 2) != matches!(old_state, 1 | 2));
+            if !moved {
+                assert_eq!(&old, saved_tracked.as_ref().unwrap(), "standing and fresh leaf records have identical bytes");
+            }
+        }
+        previous = Some((saved_tracked.expect("the tracked-only script had a complete run"), state));
+    }
+    Ok(())
+}
+
+#[test]
+fn status_cells_stand_on_the_served_porcelain_answer() {
+    blaze_sim::check(blaze_sim::Config::cases(24), |tape| status_history(tape, ReadsPlant::None));
+}
+
+#[test]
+fn control_an_always_owed_status_is_caught() {
+    blaze_sim::control(blaze_sim::Config::cases(24), ReadsPlant::None, ReadsPlant::StatusAlwaysOwed, "always owed", status_history);
+}
+
+#[test]
+fn a_new_nested_worktree_rebinds_only_the_scripts_beneath_it() {
+    use blaze_proc_macro::script_sandbox::{answer_now, mem_tree, scope_answer};
+    let io = world();
+    let cx = io.cx(BUDGET, TASK_FRAME).unwrap();
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut files = status_files(false);
+    files.iter_mut().find(|(name, _)| name == "f").unwrap().1 = b"b\n".to_vec();
+    for nested in [false, true] {
+        if nested {
+            files.extend(status_files(false).into_iter().map(|(name, bytes)| (format!("pkg/{name}"), bytes)));
+        }
+        let tree = mem_tree(files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())), "", None);
+        let mut sweep = reads::CheckoutSweep::new(tree.clone(), alloc, cx.frame());
+        for (folder, work) in [("pkg/sub", if nested { "pkg" } else { "" }), ("other", "")] {
+            let binding = format!("git-scope:{folder}");
+            assert_eq!(answer_now(&tree, &binding).unwrap(), Some(scope_answer(work)));
+            assert_eq!(sweep.row(ReadKind::Git, folder).unwrap().2, scope_answer(work));
+            let asked = format!("{folder}\nstatus --porcelain --untracked-files=no");
+            let canonical = format!("{work}\nstatus --porcelain --untracked-files=no");
+            let answer = porcelain(if work.is_empty() { b" M f\n" } else { b"" });
+            assert_eq!(answer_now(&tree, &format!("git:{asked}")).unwrap(), Some(answer));
+            assert_eq!(sweep.answer(&canonical).unwrap(), answer);
+        }
+        assert_eq!(sweep.status_questions(), if nested { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn a_pinned_tree_covers_only_observations_named_by_its_grant() {
+    let alloc = blaze_own::testing::heap().shared();
+    let file = Some(blaze_proc_macro::script_sandbox::file_answer(b"private"));
+    let valid = [("file:header.h", file), ("stat:missing", None)];
+    assert_eq!(reads::pinned_reads(valid.into_iter(), alloc), Ok(()));
+    for (subject, variant) in [("changed-during-run:file:header.h", "Conflicting"), ("unknown:header.h", "Kind"), ("git:pkg\nrev-parse HEAD", "Unobserved")] {
+        let rejected = reads::pinned_reads(valid.into_iter().chain([(subject, None)]), alloc).unwrap_err();
+        let expected = subject.strip_prefix("changed-during-run:").unwrap_or(subject);
+        assert_eq!(rejected.first_rejected(), (variant, expected));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn file_replay_distinguishes_a_revoked_grant_from_absence() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use blaze_proc_macro::script_sandbox::{RealRoot, TreeRead, dir_tree};
+    let dir = std::env::temp_dir().join(format!("blaze-script-grant-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let checkout = dir.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(dir.join("private"), b"private").unwrap();
+    let tree = dir_tree(&RealRoot::resolve(&checkout).expect("the fixture's folder resolves"));
+    let io = world();
+    let cx = io.cx(BUDGET, TASK_FRAME).unwrap();
+    let mut sweep = reads::CheckoutSweep::new(tree.clone(), blaze_own::testing::heap().alloc(), cx.frame());
+    assert_eq!(sweep.row(ReadKind::File, "input").unwrap().2, reads::NONE);
+    symlink("../private", checkout.join("input")).unwrap();
+    assert!(TreeRead::File.answer(&tree, "input").is_err());
+    let denied = sweep.row(ReadKind::File, "input").unwrap().2;
+    assert_ne!(denied, reads::NONE);
+    assert_ne!(denied, blaze_proc_macro::script_sandbox::file_answer(b"private"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn status_replay_observes_index_mode_links_and_root_entries() {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use blaze_proc_macro::script_sandbox::{RealRoot, answer_now, dir_tree};
+    let dir = std::env::temp_dir().join(format!("blaze-script-status-{}", std::process::id()));
+    fs::create_dir(&dir).expect("a private fixture folder");
+    let tree = dir_tree(&RealRoot::resolve(&dir).expect("the fixture's folder resolves"));
+    let io = world();
+    let cx = io.cx(BUDGET, TASK_FRAME).unwrap();
+    let install = |link| {
+        for (name, bytes) in status_files(link) {
+            let path = dir.join(&name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if link && name == "f" {
+                symlink("a\n", path).unwrap();
+            } else {
+                fs::write(path, bytes).unwrap();
+            }
+        }
+    };
+    let check = |asked: &str, expected| {
+        let sandbox = answer_now(&tree, &format!("git:{asked}")).unwrap();
+        assert_eq!(sandbox, expected, "{asked}");
+        let mut sweep = reads::CheckoutSweep::new(tree.clone(), blaze_own::testing::heap().alloc(), cx.frame());
+        assert_eq!(sweep.answer(asked).unwrap(), sandbox.unwrap_or(reads::NONE));
+    };
+    install(false);
+    let clean = Some(porcelain(b""));
+    let dirty = Some(porcelain(b" M f\n"));
+    check(PORCELAIN, clean);
+    fs::set_permissions(dir.join("f"), fs::Permissions::from_mode(0o755)).unwrap();
+    check(TRACKED, dirty);
+    fs::write(dir.join("new"), b"x").unwrap();
+    check(PORCELAIN, Some(porcelain(b" M f\n?? new\n")));
+    check(TRACKED, dirty);
+    fs::remove_file(dir.join("new")).unwrap();
+    check(PORCELAIN, dirty);
+    fs::remove_file(dir.join("f")).unwrap();
+    install(true);
+    check(PORCELAIN, clean);
+    fs::remove_file(dir.join("f")).unwrap();
+    symlink("b\n", dir.join("f")).unwrap();
+    check(TRACKED, dirty);
+    fs::write(dir.join(".git/index"), b"not an index").unwrap();
+    check(TRACKED, None);
+    fs::remove_dir_all(dir).unwrap();
 }

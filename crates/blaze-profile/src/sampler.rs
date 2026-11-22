@@ -290,16 +290,11 @@ impl Thread {
 pub(crate) fn os_tid() -> u64 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // SAFETY: `gettid` has no precondition.
-        let tid = unsafe { libc::gettid() };
-        tid as u64
+        blaze_sys::posix::thread::thread_id()
     }
     #[cfg(target_vendor = "apple")]
     {
-        let mut tid = 0u64;
-        // SAFETY: a null thread is the calling one; `tid` is a `u64` to write.
-        unsafe { libc::pthread_threadid_np(0 as libc::pthread_t, &mut tid) };
-        tid
+        blaze_sys::posix::thread::thread_id()
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {

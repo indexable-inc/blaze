@@ -33,6 +33,8 @@ pub mod b3;
 pub mod bits;
 #[allow(unsafe_code)]
 pub mod crc32c;
+/// [`ContentId::of_array`] and [`ContentId::of_each`]: many IDs into the caller's slots.
+mod each;
 pub mod fuse;
 pub mod keyed;
 mod many;
@@ -67,11 +69,13 @@ impl ContentId {
     /// and the version of their schema (`"blaze v2 file 1"`): equal bytes of two domains have
     /// two IDs.
     pub fn of(domain: &'static str, bytes: &[u8]) -> ContentId {
+        hashed(bytes.len(), 1);
         ContentId(b3::derive_key_with(context_key(domain), bytes))
     }
 
     /// [`ContentId::of`] for a [`Domain`], its context key read with one acquire load.
     pub fn of_domain(domain: &Domain, bytes: &[u8]) -> ContentId {
+        hashed(bytes.len(), 1);
         ContentId(b3::derive_key_with(domain.key(), bytes))
     }
 
@@ -83,12 +87,14 @@ impl ContentId {
     /// last blocks. A longer input goes through the hasher, which hashes its whole chunks
     /// side by side.
     pub fn of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId> {
+        hashed(inputs.iter().map(|it| it.len()).sum(), inputs.len());
         many::of_many(context_key(domain), inputs)
     }
 
     /// [`ContentId::of_many`] into `out` (cleared first): a warm call with room allocates
     /// nothing.
     pub fn of_many_into(domain: &'static str, inputs: &[&[u8]], out: &mut Vec<ContentId>) {
+        hashed(inputs.iter().map(|it| it.len()).sum(), inputs.len());
         many::of_many_into::<b3::Many>(context_key(domain), inputs, out)
     }
 
@@ -228,14 +234,27 @@ impl Hasher {
     }
 
     pub fn update(&mut self, bytes: &[u8]) -> &mut Hasher {
+        hashed(bytes.len(), 0);
         self.0.update(bytes);
         self
     }
 
     /// A length-prefixed part, so `("ab", "c")` and `("a", "bc")` hash apart.
     pub fn part(&mut self, bytes: &[u8]) -> &mut Hasher {
-        self.0.update(&(bytes.len() as u64).to_le_bytes());
-        self.0.update(bytes);
+        hashed(8 + bytes.len(), 0);
+        let len = (bytes.len() as u64).to_le_bytes();
+        // A part that fits a block with its length goes in as one update, the length and the
+        // bytes together: one call and one append to the hasher's held block, not two. The
+        // bytes fed are the same, so the digest is.
+        if bytes.len() <= 56 {
+            let mut framed = [0u8; 64];
+            framed[..8].copy_from_slice(&len);
+            framed[8..8 + bytes.len()].copy_from_slice(bytes);
+            self.0.update(&framed[..8 + bytes.len()]);
+        } else {
+            self.0.update(&len);
+            self.0.update(bytes);
+        }
         self
     }
 
@@ -248,13 +267,22 @@ impl Hasher {
     }
 
     pub fn id(&mut self, id: &ContentId) -> &mut Hasher {
+        hashed(32, 0);
         self.0.update(&id.0);
         self
     }
 
     pub fn finish(&self) -> ContentId {
+        hashed(0, 1);
         ContentId(self.0.finalize())
     }
+}
+
+/// The thread's meter (D169): `bytes` fed to BLAKE3 and `digests` made. Two thread-local adds.
+#[inline(always)]
+fn hashed(bytes: usize, digests: usize) {
+    blaze_meter::add(blaze_meter::Count::Hashed, bytes as u64);
+    blaze_meter::add(blaze_meter::Count::Digests, digests as u64);
 }
 
 /// 128 bits that stand for a result's value: a rerun that produces the same fingerprint stops
@@ -909,6 +937,34 @@ mod tests {
         let ab_c = Hasher::new("blaze v2 test 1").part(b"ab").part(b"c").finish();
         let a_bc = Hasher::new("blaze v2 test 1").part(b"a").part(b"bc").finish();
         assert_ne!(ab_c, a_bc);
+    }
+
+    /// The folded `part` (its length and a short part in one update) feeds the bytes the two
+    /// updates did, at every length across the fold's edge and after held bytes of every count.
+    #[test]
+    fn a_folded_part_is_its_two_updates() {
+        let bytes: Vec<u8> = (0..16 * 1024 + 200u32).map(|at| (at.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        // Held counts at block edges, and at 1, 2, 4, 8 and 16 chunks and a byte either side,
+        // so the part lands on a lazily merged stack and straddles a block and a chunk edge.
+        let mut helds = vec![0, 1, 7, 55, 56, 63, 64, 1000, 1023];
+        for chunks in [1, 2, 3, 4, 8, 16] {
+            helds.extend([chunks * 1024 - 60, chunks * 1024 - 1, chunks * 1024, chunks * 1024 + 1]);
+        }
+        let domain = "blaze v2 test 1";
+        for held in helds {
+            for len in 0..=130 {
+                let part = &bytes[held..held + len];
+                let folded = Hasher::new(domain).update(&bytes[..held]).part(part).finish();
+                let mut two = Hasher::new(domain);
+                two.update(&bytes[..held]).update(&(len as u64).to_le_bytes()).update(part);
+                assert_eq!(folded, two.finish(), "{held} held, a part of {len}");
+                // And the bytes fed, as official BLAKE3 hashes them in one piece.
+                let mut fed = bytes[..held].to_vec();
+                fed.extend_from_slice(&(len as u64).to_le_bytes());
+                fed.extend_from_slice(part);
+                assert_eq!(folded, ContentId(blake3::derive_key(domain, &fed)), "{held} held, a part of {len}, official");
+            }
+        }
     }
 
     fn id(n: u64) -> ContentId {

@@ -55,7 +55,7 @@ use crate::{
 /// What an answer may hold as blaze-h1 reads it: a head of at most 64 KiB and 100 headers
 /// (hyper's), a body of any length (the client holds it to the request's bound itself, as sent
 /// and once decoded, [`Kind::TooBig`]).
-pub(crate) const ANSWER: Limits = Limits { most_head: 64 << 10, most_headers: 100, most_body: u64::MAX };
+pub(crate) const ANSWER: Limits = Limits { most_head: 64 << 10, most_headers: 100, most_body: u64::MAX, ..Limits::SHIPPED };
 
 /// An answer read by blaze-h1, its buffers in the global allocator.
 type Answer = blaze_h1::Response<Global>;

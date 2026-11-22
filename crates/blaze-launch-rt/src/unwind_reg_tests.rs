@@ -16,9 +16,11 @@ fn span(code_lo: u64, code_hi: u64) -> Span {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_dynamic_sections_finder_exists() {
+    use blaze_sys::posix::thread::{RTLD_DEFAULT, symbol};
+
     // SAFETY: `dlsym` with `RTLD_DEFAULT` and a NUL-ended name only reads the name.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__unw_add_find_dynamic_unwind_sections".as_ptr()) };
-    assert!(!symbol.is_null(), "{}", RegError::Missing { symbol: super::FINDER_SYMBOL });
+    let found = unsafe { symbol(RTLD_DEFAULT, c"__unw_add_find_dynamic_unwind_sections") };
+    assert!(found.is_some(), "{}", RegError::Missing { symbol: super::FINDER_SYMBOL });
     println!("unwind_reg: {} resolves", super::FINDER_SYMBOL);
 }
 

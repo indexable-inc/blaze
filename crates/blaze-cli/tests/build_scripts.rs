@@ -142,11 +142,18 @@ fn check(dir: &Path, home: &Path) -> (bool, String) {
 
 /// `blaze <word>` in `dir` with the home `home`: whether it exited 0, and its output.
 fn run(dir: &Path, home: &Path, word: &str) -> (bool, String) {
+    let (_, ok, said) = run_with_args(dir, home, word, &[]);
+    (ok, said)
+}
+
+/// The pid also names this command's jobserver FIFO.
+fn run_with_args(dir: &Path, home: &Path, word: &str, args: &[&str]) -> (u32, bool, String) {
     let said = dir.with_extension(word);
     let file = File::create(&said).unwrap_or_else(|error| panic!("making {}: {error}", said.display()));
     let file_err = file.try_clone().expect("the output file, twice");
     let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
         .arg(word)
+        .args(args)
         .current_dir(dir)
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
@@ -157,6 +164,7 @@ fn run(dir: &Path, home: &Path, word: &str) -> (bool, String) {
         .stderr(Stdio::from(file_err))
         .spawn()
         .expect("blaze starts");
+    let pid = child.id();
     let started = Instant::now();
     // Waiting for: `blaze check` of one member with a build script, at most DEADLINE.
     let status = loop {
@@ -180,7 +188,7 @@ fn run(dir: &Path, home: &Path, word: &str) -> (bool, String) {
         }
     };
     let text = std::fs::read_to_string(&said).unwrap_or_else(|error| panic!("reading {}: {error}", said.display()));
-    (status.success(), text)
+    (pid, status.success(), text)
 }
 
 /// The script's `cargo:rustc-cfg=from_script` reaches `#[cfg(from_script)] fn made`, so
@@ -246,17 +254,21 @@ fn engine_phases(dir: &Path) -> Vec<(String, u32, u32, u32)> {
 /// Every phase entered each task it planned, once. Prints "engine scripts: <phases>". CONTROL:
 /// before the stage, `engine-check` said "a crate with a build script: `engine-check` runs no
 /// build script yet" here.
+///
+/// Since 2026-11-19 (check_command.rs: "Now `check` and `engine-check` (its old name, an alias)
+/// both enter here, and the old checker is gone") the first `check` IS the engine's run, so its
+/// profile holds the phases; the `engine-check` after it is the same command over the stored
+/// answer, which enters no phase (t82 read its profile and saw `[]`).
 #[test]
 fn engine_check_runs_the_script_and_lists_what_check_lists() {
     let base = fresh_home("build_scripts_engine", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
     put_module(&home);
-    let (_, old) = check(&at, &home);
+    let (_, said) = check(&at, &home);
     // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
-    assert!(old.contains("0 errors: blaze check") && !old.contains("not checked because"), "check of the fixture failed:\n{old}");
-    let (_, said) = run(&at, &home, "engine-check");
-    assert!(!said.contains("runs no build script"), "engine-check refused the build script:\n{said}");
+    assert!(said.contains("0 errors: blaze check") && !said.contains("not checked because"), "check of the fixture failed:\n{said}");
+    assert!(!said.contains("runs no build script"), "the engine refused the build script:\n{said}");
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
     assert!(!said.lines().any(|line| line.contains("`made`")), "the script's cfg did not reach #[cfg(from_script)] on the engine:\n{said}");
     assert!(!said.contains("not run: each waits"), "a task waited on a failed one:\n{said}");
@@ -266,6 +278,12 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     }
     let scripts: Vec<(u32, u32)> = phases.iter().filter(|(stage, ..)| stage == "Scripts").map(|(_, wave, planned, _)| (*wave, *planned)).collect();
     assert_eq!(scripts, [(0, 1), (1, 1)], "one module lookup, then one run: {phases:?}");
+    // The old name is the one command (2026-11-19, check_command.rs): over the stored answer it
+    // lists what `check` listed and enters no phase.
+    let (_, again) = run(&at, &home, "engine-check");
+    assert!(again.contains("0 errors: blaze check") && !again.lines().any(|line| line.contains("`made`")), "`engine-check` is `check`'s old name: the same answer over the stored one:\n{again}");
+    let rerun = engine_phases(&at);
+    assert!(rerun.is_empty(), "`engine-check` after `check` (one command since 2026-11-19) enters no phase: {rerun:?}");
     println!("engine scripts: {phases:?}");
 }
 
@@ -286,4 +304,98 @@ fn engine_check_names_a_missing_script_module() {
         assert_eq!(planned, entered, "{stage} {wave}: tasks planned and entered:\n{phases:?}");
     }
     println!("engine failed by name");
+}
+
+/// `check` (the engine, the one command path since the old checker went, 2026-11-19) must give
+/// a native child the command's FIFO and every explicit token. sha3-asm is native in check mode with a cc build dependency. Its normal macOS
+/// grant includes Perl, so the fixture can inspect the FIFO inside the production sandbox.
+#[cfg(all(feature = "sandbox", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_pooled_native_script_sees_the_commands_jobserver() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const PROBE: &str = r#"#!/usr/bin/perl
+use strict;
+use warnings;
+use Fcntl qw(O_RDWR O_NONBLOCK);
+
+if (!@ARGV) {
+    system($0, 'probe') == 0 or die "jobserver probe failed: $?";
+    # Plant a lost handoff before starting the same consumer again. Keep NUM_JOBS.
+    delete $ENV{CARGO_MAKEFLAGS};
+    exec($0, 'probe') or die "start control: $!";
+}
+
+my $flags = $ENV{CARGO_MAKEFLAGS} // 'unset';
+my $tokens = '';
+if ($flags =~ / --jobserver-auth=fifo:(.+)\z/) {
+    sysopen(my $fifo, $1, O_RDWR | O_NONBLOCK) or die "open FIFO $1: $!";
+    -p $fifo or die "jobserver is not a FIFO";
+    my $n = sysread($fifo, $tokens, 16);
+    defined($n) or die "read FIFO: $!";
+    syswrite($fifo, $tokens) == $n or die "return FIFO tokens: $!";
+}
+open(my $report, '>>', "$ENV{OUT_DIR}/jobs") or die "open jobs report: $!";
+print $report join('|', $ENV{NUM_JOBS} // 'unset', $ENV{MAKEFLAGS} // 'unset', $flags, $tokens), "\n";
+close($report) or die "close jobs report: $!";
+"#;
+
+    for word in ["check"] {
+        let base = fresh_home(&format!("native_jobs_{word}"), true);
+        let home = base.join("home").canonicalize().expect("the temporary home");
+        let ws = base.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("cc/src")).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "\
+[package]
+name = \"sha3-asm\"
+version = \"0.1.0\"
+edition = \"2021\"
+[build-dependencies]
+cc = { path = \"cc\" }
+[workspace]
+members = [\"cc\"]
+resolver = \"2\"
+").unwrap();
+        std::fs::write(ws.join("Cargo.lock"), "\
+version = 4
+[[package]]
+name = \"cc\"
+version = \"0.1.0\"
+[[package]]
+name = \"sha3-asm\"
+version = \"0.1.0\"
+dependencies = [\"cc\"]
+").unwrap();
+        std::fs::write(ws.join("cc/Cargo.toml"), "[package]\nname = \"cc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(ws.join("cc/src/lib.rs"), "").unwrap();
+        std::fs::write(ws.join("src/lib.rs"), "").unwrap();
+        std::fs::write(ws.join("build.rs"), "fn main() {}\n").unwrap();
+
+        let store = home.join(".blaze/v2");
+        let module = store.join("build-script/modules/sha3-asm-jobs");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("identity"), "name sha3-asm\nversion 0.1.0\nfeatures \ntarget aarch64-apple-darwin\n").unwrap();
+        let program = module.join("script.bin");
+        std::fs::write(&program, PROBE).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let digest: String = blaze_sha256::digest(PROBE.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(module.join("bin-sha256"), digest).unwrap();
+
+        let (pid, _, said) = run_with_args(&ws, &home, word, &["--workers", "16"]);
+        let area = store.join(blaze_build_script::outputs::FILE_AREA);
+        let mut files = std::fs::read_dir(&area).unwrap_or_else(|e| panic!("{word}: {}: {e}\n{said}", area.display()));
+        let report = files.next().unwrap_or_else(|| panic!("{word}: native probe produced no report\n{said}")).unwrap();
+        assert!(files.next().is_none(), "{word}: the probe writes one file");
+        let report = std::fs::read_to_string(report.path()).expect("the child's report");
+        let (live, dropped) = report.trim_end().split_once('\n').expect("the probe and its control");
+        let fifo = store.join("native-work/blaze/jobs").join(pid.to_string());
+        let fifo = fifo.display();
+        let expected = format!("16|unset|-j --jobserver-fds=fifo:{fifo} --jobserver-auth=fifo:{fifo}|{}", "+".repeat(15));
+        assert_eq!(live, expected, "{word}: the child's environment and available tokens");
+        assert_ne!(dropped, expected, "{word}: the oracle accepted the dropped jobserver");
+        assert_eq!(dropped, "16|unset|unset|", "{word}: the count alone gave the control no FIFO");
+        std::fs::remove_dir_all(base).expect("remove the temporary checkout and home");
+    }
+    println!("the native path saw NUM_JOBS=16 and all 15 FIFO tokens, and the dropped jobserver was caught");
 }

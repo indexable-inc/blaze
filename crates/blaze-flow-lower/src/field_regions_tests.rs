@@ -12,24 +12,18 @@
 //! refuses (a finding); and the CONTROL (rule 23): the same accepted body with no
 //! `field_regions` row finds again, so the row is the cause.
 
-use std::format;
 use std::string::String;
 use std::vec;
 
-use blaze_flow::record::check;
-use blaze_own::Alloc;
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{ExprId, FieldInit, InferCtx, ItemKey, List, Mutbl, Name, Needs, Outcome, PTy, PatId, StructBase};
+use blaze_typeck::{ExprId, FieldInit, ItemKey, List, Mutbl, Name, PTy, PatId, StructBase};
 
-use crate::{AdtFacts, CalleeFacts, Facts, FieldRegion, Form, Plant, Refusal, SigBuf, SigLife, lower_planted, read_signature};
-
-fn alloc() -> Alloc<'static> {
-    blaze_own::testing::heap().alloc()
-}
+use crate::region_fixture::{self, Decls, FnHead, P0, P1, P2};
+use crate::{AdtFacts, CalleeFacts, Facts, FieldRegion, Form, Plant, Refusal, Region};
 
 /// `struct S;`, `struct B<'f, 'a> { file: &'f S, held: &'a S }`, `struct T<'a> { r: &'a S,
-/// name: &'static S }`; each fn's lifetime part read from its text. `regions` false: no field's
-/// declared type is known (the control).
+/// name: &'static S }`; each fn's head declared by hand ([`Decls`], D148). `regions` false: no
+/// field's declared type is known (the control).
 struct World {
     fx: Fx,
     b: ItemKey,
@@ -40,7 +34,7 @@ struct World {
     regions: bool,
     /// A row that does not line up with `B`'s `held` (a lifetime past `B`'s two).
     misaligned: bool,
-    sigs: vec::Vec<(ItemKey, SigBuf<Alloc<'static>>)>,
+    decls: Decls,
 }
 
 const B_FILE: [FieldRegion; 1] = [FieldRegion::Lifetime(0)];
@@ -59,26 +53,80 @@ impl World {
         let t = fx.strukt("T", 0, &[("r", rs), ("name", rs)]);
         let bt = fx.adt(b, &[]);
         let tt = fx.adt(t, &[]);
-        World { fx, b, t, rs, bt, tt, regions: true, misaligned: false, sigs: vec::Vec::new() }
+        let mut decls = Decls::new();
+        // `B<'f, 'a>` declares two lifetimes, `T<'a>` one (as `Facts::adt` below says).
+        decls.adt(b, 2);
+        decls.adt(t, 1);
+        World { fx, b, t, rs, bt, tt, regions: true, misaligned: false, decls }
     }
 
-    /// The one fn of the case, `name` of `inputs` and `output`; the world is then finished and
-    /// the fn's lifetime part read from `text` (as storage_end_tests.rs reads after `finish`).
-    fn func(&mut self, name: &str, text: &str, inputs: &[PTy], output: PTy) -> ItemKey {
+    /// The one fn of the case, `name` of `inputs` and `output`, the world then finished; its
+    /// head `lifetimes` (the `late` ones late-bound) and its column `slots` over `fn(inputs..)
+    /// -> output`.
+    fn func(&mut self, name: &str, inputs: &[PTy], output: PTy, lifetimes: u32, late: &[u32], slots: &[Region]) -> ItemKey {
         let f = self.fx.func(name, 0, inputs, output, vec![]);
         self.fx.finish();
-        let (b, t) = (self.b, self.t);
-        let lifetimes = move |k: ItemKey| Some(if k == b { 2 } else if k == t { 1 } else { 0 });
-        let mut buf = SigBuf::new_in(alloc());
-        if let Err(why) = read_signature(text, self.fx.t.view(), inputs, output, &lifetimes, &mut buf, alloc()) {
-            panic!("`{text}` was not read: {why:?}");
-        }
-        self.sigs.push((f, buf));
+        self.decls.func(f, FnHead { lifetimes, late, outlives: &[], inputs, output, slots });
         f
     }
 }
 
 impl Facts for World {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         let lifetimes = if k == self.b {
             2
@@ -89,11 +137,20 @@ impl Facts for World {
         };
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
     }
+    /// `B<'f, 'a> { file: &'f S, held: &'a S }` and `T<'a> { r: &'a S, name: &'static S }`:
+    /// each lifetime only under a shared reference, so covariant (the Reference, "Subtyping and
+    /// Variance"); `S` has no parameter.
+    fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+        Some(region_fixture::all_co(if k == self.b {
+            2
+        } else if k == self.t {
+            1
+        } else {
+            0
+        }))
+    }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: true, self_ref: false })
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.sigs.iter().find(|(k, _)| *k == item).map(|(_, s)| s.life())
     }
     fn field(&self, adt: ItemKey, _: u32, name: Name) -> Option<u32> {
         let names: &[&str] = if adt == self.b {
@@ -143,46 +200,36 @@ fn literal(b: &mut Bb, n: u32) -> ExprId {
     at
 }
 
-/// The findings of `root`, the body of `owner`, with the view's `field_inits` set to `inits`;
-/// or the refusal.
+/// The findings of `root`, the body of `owner`, with the view's `field_inits` set to `inits`
+/// and the world's heads laid in its record (region_fixture.rs `run`); or the refusal.
 fn run(w: &World, b: &Bb, owner: ItemKey, root: ExprId, inits: &[FieldInit]) -> Result<vec::Vec<String>, Refusal> {
-    let a = alloc();
     let mut view = b.view(owner, root);
     view.field_inits = inits;
-    let mut cx = InferCtx::new_in(a);
-    let c = match blaze_typeck::check(&view, &w.fx, &mut cx, &Needs::new_in(a), a) {
-        Ok(Outcome::Done(c)) => {
-            assert!(c.diags.is_empty(), "the fixture type-checks clean: {:?}", c.diags);
-            c
-        }
-        Ok(Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
-        Err(e) => panic!("{e:?}"),
-    };
-    let lowered = lower_planted(&view, &c, w, Plant::None, a)?;
-    let rec = check(&lowered.flow, a).expect("bounded");
-    let mut out = vec::Vec::new();
-    for m in rec.moves.iter() {
-        out.push(format!("move {:?} at {:?}", m.kind, m.at));
-    }
-    for f in rec.borrows.iter() {
-        out.push(format!("borrow {f:?}"));
-    }
-    Ok(out)
+    region_fixture::run(&w.fx, &view, w, &w.decls, Plant::None).map(|r| r.lines)
 }
 
 fn outlives(got: &Result<vec::Vec<String>, Refusal>) -> bool {
     matches!(got, Ok(lines) if lines.iter().any(|l| l.contains("UnprovenOutlives")))
 }
 
-/// `fn get<..>(x: &<adt>) -> <out> { x.<name> }` under `regions`, its text `text`.
-fn read_field(regions: bool, misaligned: bool, of_t: bool, text: &str, name: &str) -> Result<vec::Vec<String>, Refusal> {
+/// `fn get<'f, 'a>(x: &B<'f, 'a>) -> &'a S`: `'f` is `P0`, `'a` `P1`, `x`'s elided reference
+/// `P2`, all late-bound; the column `[x's &, B's 'f, B's 'a, output]`.
+const GET_B: (u32, &[u32], &[Region]) = (3, &[0, 1, 2], &[P2, P0, P1, P1]);
+/// `fn get<'a>(x: &T<'a>) -> &'static S`: `'a` is `P0`, `x`'s elided reference `P1`, both
+/// late-bound; the column `[x's &, T's 'a, output]`.
+const GET_T: (u32, &[u32], &[Region]) = (2, &[0, 1], &[P1, P0, Region::Static]);
+
+/// `fn get<..>(x: &<adt>) -> <out> { x.<name> }` under `regions`, its head `head` (`GET_B`,
+/// `GET_T`: lifetimes, late-bound, column).
+fn read_field(regions: bool, misaligned: bool, of_t: bool, head: (u32, &[u32], &[Region]), name: &str) -> Result<vec::Vec<String>, Refusal> {
     let mut w = World::new();
     w.regions = regions;
     w.misaligned = misaligned;
     let held = if of_t { w.tt } else { w.bt };
     let input = w.fx.r(Mutbl::Not, held);
     let rs = w.rs;
-    let f = w.func("get", text, &[input], rs);
+    let (lifetimes, late, slots) = head;
+    let f = w.func("get", &[input], rs, lifetimes, late, slots);
     let mut b = Bb::new();
     let x = b.param("x");
     let lx = b.local(x);
@@ -197,16 +244,22 @@ fn read_field(regions: bool, misaligned: bool, of_t: bool, text: &str, name: &st
 /// long enough"). CONTROL: no row, the field is all of `B`'s positions, `'f: 'a` again.
 #[test]
 fn a_field_of_one_lifetime_takes_only_that_lifetime() {
-    let sig = "fn get<'f, 'a>(x: &B<'f, 'a>) -> &'a S { x.held }";
-    let fine = read_field(true, false, false, sig, "held");
+    let fine = read_field(true, false, false, GET_B, "held");
     std::println!("field_regions held: {fine:?}");
     assert_eq!(fine, Ok(vec::Vec::new()));
-    let wrong = read_field(true, false, false, "fn get<'f, 'a>(x: &B<'f, 'a>) -> &'a S { x.file }", "file");
+    let wrong = read_field(true, false, false, GET_B, "file");
     std::println!("field_regions file as 'a: {wrong:?}");
     assert!(outlives(&wrong), "'f: 'a is not given: {wrong:?}");
-    let control = read_field(false, false, false, sig, "held");
+    // The control: with no row `x.held` stands for both of `B`'s positions, and relating it
+    // (two positions) to the `&'a S` result (one) is the coarse relation (lib.rs `relate`,
+    // noted `ValueInexact`). Its finding (`'f: 'a`) is the relation's artifact, so the body is
+    // refused by the relation's name, never reported and never clean: the row is the cause.
+    let control = read_field(false, false, false, GET_B, "held");
     std::println!("field_regions held, no row: {control:?}");
-    assert!(outlives(&control), "the control finds the coarse relation: {control:?}");
+    assert!(
+        matches!(control, Err(Refusal { form: Form::Unified { why: crate::Unified::ValueInexact }, .. })),
+        "the control is refused by the coarse relation's name: {control:?}"
+    );
 }
 
 /// `Bytes::arena` and `Task::name` in miniature: `fn get<'a>(x: &T<'a>) -> &'static S {
@@ -214,14 +267,13 @@ fn a_field_of_one_lifetime_takes_only_that_lifetime() {
 /// `'a: 'static`. CONTROL: no row, `x.name` stands for `'a` too and asks `'a: 'static`.
 #[test]
 fn a_static_field_is_static() {
-    let sig = "fn get<'a>(x: &T<'a>) -> &'static S { x.name }";
-    let fine = read_field(true, false, true, sig, "name");
+    let fine = read_field(true, false, true, GET_T, "name");
     std::println!("field_regions name: {fine:?}");
     assert_eq!(fine, Ok(vec::Vec::new()));
-    let wrong = read_field(true, false, true, "fn get<'a>(x: &T<'a>) -> &'static S { x.r }", "r");
+    let wrong = read_field(true, false, true, GET_T, "r");
     std::println!("field_regions r as 'static: {wrong:?}");
     assert!(outlives(&wrong), "'a: 'static is not given: {wrong:?}");
-    let control = read_field(false, false, true, sig, "name");
+    let control = read_field(false, false, true, GET_T, "name");
     std::println!("field_regions name, no row: {control:?}");
     assert!(outlives(&control), "the control finds the coarse relation: {control:?}");
 }
@@ -229,7 +281,7 @@ fn a_static_field_is_static() {
 /// A row past the ADT's lifetimes is refused by name, never related another way (rule 3).
 #[test]
 fn a_misaligned_row_is_refused() {
-    let got = read_field(true, true, false, "fn get<'f, 'a>(x: &B<'f, 'a>) -> &'a S { x.held }", "held");
+    let got = read_field(true, true, false, GET_B, "held");
     std::println!("field_regions misaligned: {got:?}");
     assert!(matches!(got, Err(ref r) if matches!(r.form, Form::FieldRegionsUnaligned { .. })), "{got:?}");
 }
@@ -240,7 +292,9 @@ fn make(regions: bool, swap: bool) -> Result<vec::Vec<String>, Refusal> {
     let mut w = World::new();
     w.regions = regions;
     let (rs, bt) = (w.rs, w.bt);
-    let f = w.func("mk", "fn mk<'f, 'a>(file: &'f S, held: &'a S) -> B<'f, 'a> { B { file, held } }", &[rs, rs], bt);
+    // `fn mk<'f, 'a>(file: &'f S, held: &'a S) -> B<'f, 'a>`: `'f` is `P0`, `'a` `P1`, both
+    // late-bound; the column `[file, held, B's 'f, B's 'a]`.
+    let f = w.func("mk", &[rs, rs], bt, 2, &[0, 1], &[P0, P1, P0, P1]);
     let mut b = Bb::new();
     let file = b.param("file");
     let held = b.param("held");
@@ -264,7 +318,13 @@ fn a_struct_literal_relates_each_field_to_its_own_positions() {
     let wrong = make(true, true);
     std::println!("field_regions literal swapped: {wrong:?}");
     assert!(outlives(&wrong), "the swapped literal asks 'a: 'f: {wrong:?}");
+    // The control: with no row the literal goes through one hub (lib.rs, noted
+    // `AggregateHub`: four positions), which ties `'f` and `'a`; that finding is the hub's
+    // artifact, so the body is refused by its name, never reported and never clean.
     let control = make(false, false);
     std::println!("field_regions literal, no row: {control:?}");
-    assert!(outlives(&control), "the control finds the coarse relation: {control:?}");
+    assert!(
+        matches!(control, Err(Refusal { form: Form::Unified { why: crate::Unified::AggregateHub }, .. })),
+        "the control is refused by the coarse relation's name: {control:?}"
+    );
 }

@@ -236,7 +236,9 @@ fn ended_or_stopped(child: &mut Child, stop: &Stop) -> io::Result<Option<ExitSta
     #[cfg(unix)]
     let watched = child.id();
     #[cfg(windows)]
-    let watched = std::os::windows::io::AsRawHandle::as_raw_handle(child) as usize;
+    let watched = blaze_sys::windows::Handle::from_raw(
+        std::os::windows::io::AsRawHandle::as_raw_handle(child),
+    );
     let (exited, heard) = blaze_core::chan::bounded::<io::Result<()>>(1);
     std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -281,19 +283,15 @@ fn ended_or_stopped(_child: &mut Child, _stop: &Stop) -> io::Result<Option<ExitS
 /// Waits until the child `pid` has ended, leaving it to be reaped by its `Child`.
 #[cfg(unix)]
 fn exit_heard(pid: u32) -> io::Result<()> {
-    let pid = libc::id_t::try_from(pid).map_err(io::Error::other)?;
+    let pid = i32::try_from(pid).map_err(io::Error::other)?;
     loop {
-        // SAFETY: all zeros is a `siginfo_t` of nothing, for the call to write over.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is live for the call to write. `WNOWAIT` leaves the child unreaped, so
-        // its number names it alone until its `Child` waits for it.
-        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0
-        {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        match blaze_sys::posix::proc::wait_id(
+            pid,
+            blaze_sys::posix::proc::WaitFlags::EXITED | blaze_sys::posix::proc::WaitFlags::NO_WAIT,
+        ) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(blaze_sys::Errno::Intr) => continue,
+            Err(error) => return Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
         }
     }
 }
@@ -304,15 +302,14 @@ fn exit_heard(pid: u32) -> io::Result<()> {
     clippy::disallowed_methods,
     reason = "a child's exit on a scoped thread of its own, no pool thread or fiber; blocking child waits move to the driver in step 5 of docs/v2/plan/design/deadline-waits.md"
 )]
-fn exit_heard(handle: usize) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Foundation::WAIT_OBJECT_0,
-        System::Threading::{INFINITE, WaitForSingleObject},
+fn exit_heard(handle: blaze_sys::windows::Handle) -> io::Result<()> {
+    use blaze_sys::windows::{
+        foundation::WAIT_OBJECT_0,
+        threading::{INFINITE, WaitForSingleObject},
     };
     // SAFETY: the process handle of a `Child` that outlives this call: `ended_or_stopped` waits
     // on a scoped thread, and its `Child` is borrowed for the whole scope.
-    match unsafe { WaitForSingleObject(handle as windows_sys::Win32::Foundation::HANDLE, INFINITE) }
-    {
+    match unsafe { WaitForSingleObject(handle, INFINITE) } {
         WAIT_OBJECT_0 => Ok(()),
         _ => Err(io::Error::last_os_error()),
     }

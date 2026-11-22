@@ -38,7 +38,7 @@
 //! the index by design, the answers equal: a trait row whose lowered header names no trait is the question's gap
 //! ([`Buckets::by_text`] holds every trait row), never an impl left out unseen.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::fmt;
 
 use blaze_drive as drive;
@@ -82,7 +82,8 @@ pub struct ImplTables<'a> {
     pub no_checker_type: u32,
     /// The cells the tables define (drive cells.rs: a 128-bit key and its digest), sorted by
     /// key: one per bucket ([`bucket_cell`]: the bucket's hash, its record's content id) and one
-    /// per trait the crate has an impl of ([`trait_cell`], [`TRAIT_HELD`]). A lookup's reads
+    /// per known trait ([`trait_cell`], [`TRAIT_HELD`]). A crate with any unread trait or
+    /// blind impl also defines the shared [`Probe::UnreadTrait`] cell. A lookup's reads
     /// map onto them by [`cell_read`]; a cell a reader finds no row for is absent, a value it
     /// reads, so an impl added at a new shape or of a new trait dirties exactly the readers
     /// that probed that bucket or that trait.
@@ -94,6 +95,10 @@ const TRAIT_CELL_DOMAIN: &str = "blaze-ladder impl tables trait cell 1";
 
 /// What a [`trait_cell`] holds when the crate has an impl of the trait.
 pub const TRAIT_HELD: ContentId = ContentId([1; 32]);
+
+/// The crate-wide part of the trait precheck. The first unread or blind bucket defines
+/// the cell, the last one's removal makes it absent, and each bucket has its own content cell.
+const UNREAD_TRAIT_CELL: [u8; 16] = *b"unread traits v1";
 
 /// The cell of the tables that says whether the crate has an impl of `trait_`: what a
 /// `NoImplsOf` trait probe reads.
@@ -111,17 +116,25 @@ pub fn bucket_cell(hash: surface::BucketHash) -> [u8; 16] {
     hash.0
 }
 
+fn probe_cell(probe: Probe) -> [u8; 16] {
+    match probe {
+        Probe::Trait(t) => trait_cell(t),
+        Probe::UnreadTrait => UNREAD_TRAIT_CELL,
+        Probe::Bucket(hash) => bucket_cell(hash),
+    }
+}
+
 /// The cell of its crate's tables one lookup read maps to (module docs): `None` for a bucket
 /// record's read, which its directory cell covers.
 pub fn cell_read(read: &ImplRead) -> Option<[u8; 16]> {
     match read {
-        ImplRead::Filter { probe: Probe::Trait(t), .. } => Some(trait_cell(*t)),
-        ImplRead::Filter { probe: Probe::Bucket(hash), .. } | ImplRead::Directory { bucket: hash, .. } => Some(bucket_cell(*hash)),
+        ImplRead::Filter { probe, .. } => Some(probe_cell(*probe)),
+        ImplRead::Directory { bucket, .. } => Some(bucket_cell(*bucket)),
         ImplRead::Bucket { .. } => None,
     }
 }
 
-/// THE ONE MAP from a lookup's read to the task read a body's recorder lists (front2
+/// Maps a physical lookup note to the task read a body's recorder lists (front2
 /// tables/recorder.rs [`TableRead::Impls`]): the crate's impl tables (its key's first 16 bytes:
 /// [`ReadOf::Impls`](crate::front2::tables::recorder::ReadOf::Impls), whose record is the crate's
 /// [`impl_tables_name`]) at the cell [`cell_read`] gives. A body that found NO impl reads a cell
@@ -337,7 +350,10 @@ pub fn write_impl_tables<'n, 'a, S: NamesSource<'n>>(names: S, krate: usize, row
     let records = surface::build_impl_index(crate_key, &out, alloc).map_err(TablesError::Index)?;
     let mut defines: AVec<'a, ([u8; 16], ContentId)> = AVec::with_capacity_in(records.buckets.len() + out.len(), alloc);
     defines.extend(records.buckets.iter().map(|b| (bucket_cell(b.hash), b.id)));
-    defines.extend(out.iter().filter_map(|row| row.trait_).map(|t| (trait_cell(t), TRAIT_HELD)));
+    defines.extend(records.buckets.iter().filter_map(|b| b.key.trait_()).map(|t| (trait_cell(t), TRAIT_HELD)));
+    if records.buckets.iter().any(|b| b.key.is_unread()) {
+        defines.push((UNREAD_TRAIT_CELL, TRAIT_HELD));
+    }
     defines.sort_unstable();
     defines.dedup();
     Ok(ImplTables { krate: crate_key, key, records, named, counts, no_checker_type, defines })
@@ -609,8 +625,13 @@ impl core::error::Error for ShelvedTwice {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShelfError {
     Twice(ShelvedTwice),
-    /// The bytes are not [`framed`]'s form: cut short, or not its magic, at byte `at`.
+    /// The bytes are not [`framed`]'s form: cut short, not its magic, or padding that is not
+    /// zeros, at byte `at`.
     Malformed { krate: CrateItemKey, at: usize },
+    /// The form, but at an address not aligned to [`FRAMED_ALIGN`]: its parts cannot be read in
+    /// place ([`check_framed`]; a store payload is aligned, blaze-drive record.rs
+    /// `PAYLOAD_ALIGN`).
+    Unaligned { krate: CrateItemKey },
 }
 
 impl fmt::Display for ShelfError {
@@ -618,41 +639,156 @@ impl fmt::Display for ShelfError {
         match self {
             ShelfError::Twice(twice) => twice.fmt(f),
             ShelfError::Malformed { krate, at } => write!(f, "crate {:x}'s framed impl tables are malformed at byte {at} (front2 buckets/records.rs `framed`)", krate.0),
+            ShelfError::Unaligned { krate } => write!(
+                f,
+                "crate {:x}'s framed impl tables are not at an address aligned to {FRAMED_ALIGN} bytes, so their records cannot be read in place (front2 buckets/records.rs `check_framed`)",
+                krate.0
+            ),
         }
     }
 }
 
 impl core::error::Error for ShelfError {}
 
-/// The first bytes of [`framed`]'s form.
-const FRAMED_MAGIC: &[u8; 8] = b"bzimpl1\0";
+/// Where a reader ([`TableSet::paged`]) finds a crate its shelf does not hold: the [`framed`]
+/// payload of that crate's Heads record, read on the first ask (the ready edit, D187: only the
+/// crates a body probes are read, never every crate before the bodies run). `None` means the
+/// crate has no tables (its task failed, or it has no row), and the same ask answers the same
+/// again. Bytes that are not [`framed`]'s form are the source's to refuse ([`check_framed`])
+/// before it hands them on: it keeps its own first error for its request (rule 3), and a reader
+/// handed malformed bytes panics, failing its own job (rule 20).
+pub trait ShelfSource: Sync {
+    fn framed(&self, krate: CrateItemKey) -> Option<&[u8]>;
+}
+
+/// `bytes` read as [`framed`]'s form, refused where they are not, all in one pass, and refused
+/// at an address its parts cannot be read in place at ([`ShelfError::Unaligned`]). A
+/// [`ShelfSource`] calls it before handing bytes on.
+pub fn check_framed(krate: CrateItemKey, bytes: &[u8]) -> Result<(), ShelfError> {
+    open_framed(krate, bytes, None).map(|_| ())
+}
+
+/// One crate's framed tables read in place: no byte copied, the buckets' places indexed into
+/// `alloc` (or only counted, when `alloc` is `None`).
+struct Opened<'a> {
+    krate: CrateItemKey,
+    directory: &'a [u8],
+    no_impls_of: &'a [u8],
+    /// Each bucket by its content id, sorted (the form's own order).
+    buckets: Option<AVec<'a, (ContentId, &'a [u8])>>,
+}
+
+/// [`ImplShelf::put_framed`]'s reading without its copies: the same checks in the same order,
+/// then the address. Each part is handed to a blaze-format reader IN PLACE, which refuses a
+/// buffer not aligned to 16 (blaze-format-core `header`): form 1 packed its parts, so every
+/// part past the first was refused by its address and a paged reader's lookups failed where
+/// the shelf's own copies read (front2_tables_task.rs `a_paged_shelf_answers_as_the_whole_one`).
+fn open_framed<'a>(krate: CrateItemKey, bytes: &'a [u8], alloc: Option<Alloc<'a>>) -> Result<Opened<'a>, ShelfError> {
+    let mut r = Unframe { bytes, at: 0 };
+    let malformed = |r: &Unframe<'_>| ShelfError::Malformed { krate, at: r.at };
+    if r.take(FRAMED_ALIGN) != Some(&FRAMED_MAGIC[..]) {
+        return Err(ShelfError::Malformed { krate, at: 0 });
+    }
+    let directory = r.part().ok_or_else(|| malformed(&r))?;
+    let no_impls_of = r.part().ok_or_else(|| malformed(&r))?;
+    let count = r.len().ok_or_else(|| malformed(&r))?;
+    // Each bucket is at least its id and its length word: a count past the bytes is refused
+    // before the room.
+    if count > bytes.len() / FRAMED_BUCKET_LEAST {
+        return Err(malformed(&r));
+    }
+    let mut buckets = alloc.map(|alloc| AVec::with_capacity_in(count, alloc));
+    let mut last: Option<ContentId> = None;
+    for _ in 0..count {
+        let mut id = [0u8; 32];
+        id.copy_from_slice(r.take(32).ok_or_else(|| malformed(&r))?);
+        let id = ContentId(id);
+        let held = r.part().ok_or_else(|| malformed(&r))?;
+        if last.is_some_and(|before| before > id) {
+            return Err(malformed(&r));
+        }
+        last = Some(id);
+        if let Some(buckets) = buckets.as_mut() {
+            buckets.push((id, held));
+        }
+    }
+    if r.at != bytes.len() {
+        return Err(malformed(&r));
+    }
+    // The form is the bytes'; the address is where they lie: a part is aligned only when the
+    // payload is (each starts a multiple of `FRAMED_ALIGN` from it).
+    if !bytes.as_ptr().addr().is_multiple_of(FRAMED_ALIGN) {
+        return Err(ShelfError::Unaligned { krate });
+    }
+    Ok(Opened { krate, directory, no_impls_of, buckets })
+}
+
+/// Where each part of [`framed`]'s form starts: a multiple of this from the payload's first
+/// byte. A part is a blaze-format record, read in place only at an address aligned to 16
+/// (blaze-format-core `header`, `ALIGN`); the store hands a record's payload at an address
+/// aligned to `PAYLOAD_ALIGN` (blaze-drive record.rs), so a part of it is aligned too.
+const FRAMED_ALIGN: usize = drive::record::PAYLOAD_ALIGN;
+
+/// What a bucket takes at least: its content id and its length word.
+const FRAMED_BUCKET_LEAST: usize = 32 + FRAMED_ALIGN;
+
+// A length word holds its u64; a bucket's 32-byte id keeps the next part aligned.
+const _: () = assert!(FRAMED_ALIGN >= 8 && 32 % FRAMED_ALIGN == 0, "framed's words and ids keep its parts aligned");
+
+/// The first bytes of [`framed`]'s form, one aligned word. Form 2: every part aligned. Form 1
+/// packed them, and a reader of its parts in place was refused by their addresses; its records
+/// are made again, never read (D160): a task's key holds the binary's id (blaze-cli home.rs
+/// `tools`), so a rebuilt blaze never meets one under a standing key, and a form-1 payload met
+/// anyway is refused by this magic as `ShelfError::Malformed`, by name.
+const FRAMED_MAGIC: &[u8; FRAMED_ALIGN] = b"bzimpl2\0\0\0\0\0\0\0\0\0";
 
 /// A crate's three kinds of record as ONE payload (the Heads task's record in the store, which a
-/// later request puts on its shelf by [`ImplShelf::put_framed`]): the magic, the directory and
-/// `NoImplsOf` each as a little-endian u64 length then its bytes, the bucket count (u64), then
-/// each bucket sorted by content id as its id (32 bytes), its length (u64), its bytes.
+/// later request puts on its shelf by [`ImplShelf::put_framed`], or reads in place through a
+/// [`TableSet::paged`]): the magic, then the directory and `NoImplsOf` each as its length word
+/// (a little-endian u64, zeros to [`FRAMED_ALIGN`]), its bytes and zeros to the next multiple of
+/// [`FRAMED_ALIGN`], then the bucket count's length word, then each bucket sorted by content id
+/// as its id (32 bytes) and its part as before. Every part starts a multiple of [`FRAMED_ALIGN`]
+/// from the first byte, so in an aligned payload each is read where it lies.
 pub fn framed<A: core::alloc::Allocator>(records: &CrateImpls<'_>, alloc: A) -> std::vec::Vec<u8, A> {
-    let size = 8 + 16 + records.directory.len() + records.no_impls_of.len() + 8 + records.buckets.iter().map(|b| 40 + b.bytes.len()).sum::<usize>();
+    let part = |n: usize| FRAMED_ALIGN + n.next_multiple_of(FRAMED_ALIGN);
+    let size = FRAMED_ALIGN
+        + part(records.directory.len())
+        + part(records.no_impls_of.len())
+        + FRAMED_ALIGN
+        + records.buckets.iter().map(|b| 32 + part(b.bytes.len())).sum::<usize>();
     let mut out = std::vec::Vec::with_capacity_in(size, alloc);
     out.extend_from_slice(FRAMED_MAGIC);
-    for part in [&records.directory[..], &records.no_impls_of[..]] {
-        out.extend_from_slice(&(part.len() as u64).to_le_bytes());
-        out.extend_from_slice(part);
-    }
+    put_part(&mut out, &records.directory[..]);
+    put_part(&mut out, &records.no_impls_of[..]);
     let mut order: std::vec::Vec<usize, Global> = std::vec::Vec::with_capacity_in(records.buckets.len(), Global);
     order.extend(0..records.buckets.len());
     order.sort_unstable_by_key(|at| records.buckets[*at].id);
-    out.extend_from_slice(&(order.len() as u64).to_le_bytes());
+    put_len(&mut out, order.len());
     for at in order {
         let b = &records.buckets[at];
         out.extend_from_slice(&b.id.0);
-        out.extend_from_slice(&(b.bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(&b.bytes);
+        put_part(&mut out, &b.bytes[..]);
     }
+    debug_assert_eq!(out.len(), size, "framed's size is what it writes");
     out
 }
 
-/// A reader of [`framed`]'s form: each step refuses a cut by its place.
+/// `n` as [`framed`]'s length word: a little-endian u64, then zeros to [`FRAMED_ALIGN`].
+fn put_len<A: core::alloc::Allocator>(out: &mut std::vec::Vec<u8, A>, n: usize) {
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.resize(out.len() + (FRAMED_ALIGN - 8), 0);
+}
+
+/// `part` as [`framed`] writes one: its length word, its bytes, zeros to the next multiple of
+/// [`FRAMED_ALIGN`].
+fn put_part<A: core::alloc::Allocator>(out: &mut std::vec::Vec<u8, A>, part: &[u8]) {
+    put_len(out, part.len());
+    out.extend_from_slice(part);
+    out.resize(out.len().next_multiple_of(FRAMED_ALIGN), 0);
+}
+
+/// A reader of [`framed`]'s form: each step refuses a cut, or padding that is not zeros, by
+/// its place (one form, one byte string per tables: rule 25).
 struct Unframe<'b> {
     bytes: &'b [u8],
     at: usize,
@@ -666,16 +802,30 @@ impl<'b> Unframe<'b> {
         Some(part)
     }
 
+    /// `n` bytes of padding: none when they are not all zeros.
+    fn zeros(&mut self, n: usize) -> Option<()> {
+        self.take(n)?.iter().all(|b| *b == 0).then_some(())
+    }
+
     fn len(&mut self) -> Option<usize> {
         let mut b = [0u8; 8];
         b.copy_from_slice(self.take(8)?);
+        self.zeros(FRAMED_ALIGN - 8)?;
         usize::try_from(u64::from_le_bytes(b)).ok()
     }
 
-    fn owned(&mut self) -> Option<std::vec::Vec<u8, Global>> {
+    /// A part: its length word, its bytes (returned), its padding. `take` has bounded `n` by
+    /// the bytes, so the padding's sum cannot overflow.
+    fn part(&mut self) -> Option<&'b [u8]> {
         let n = self.len()?;
         let part = self.take(n)?;
-        let mut held = std::vec::Vec::with_capacity_in(n, Global);
+        self.zeros(n.next_multiple_of(FRAMED_ALIGN) - n)?;
+        Some(part)
+    }
+
+    fn owned(&mut self) -> Option<std::vec::Vec<u8, Global>> {
+        let part = self.part()?;
+        let mut held = std::vec::Vec::with_capacity_in(part.len(), Global);
         held.extend_from_slice(part);
         Some(held)
     }
@@ -693,6 +843,8 @@ impl ImplShelf {
             Err(ShelfError::Twice(twice)) => Err(twice),
             // `framed` wrote them this call: a malformed read of its own bytes is this file's fault.
             Err(ShelfError::Malformed { at, .. }) => panic!("impl tables framed here read back malformed at byte {at} (front2 buckets/records.rs `ImplShelf::put`)"),
+            // `put_framed` copies, so it never asks the address.
+            Err(ShelfError::Unaligned { .. }) => panic!("impl tables put by copy were refused for their address (front2 buckets/records.rs `ImplShelf::put`)"),
         }
     }
 
@@ -705,14 +857,15 @@ impl ImplShelf {
         };
         let mut r = Unframe { bytes, at: 0 };
         let malformed = |r: &Unframe<'_>| ShelfError::Malformed { krate, at: r.at };
-        if r.take(8) != Some(&FRAMED_MAGIC[..]) {
+        if r.take(FRAMED_ALIGN) != Some(&FRAMED_MAGIC[..]) {
             return Err(ShelfError::Malformed { krate, at: 0 });
         }
         let directory = r.owned().ok_or_else(|| malformed(&r))?;
         let no_impls_of = r.owned().ok_or_else(|| malformed(&r))?;
         let count = r.len().ok_or_else(|| malformed(&r))?;
-        // Each bucket is at least 40 bytes: a count past the bytes is refused before the room.
-        if count > bytes.len() / 40 {
+        // Each bucket is at least its id and its length word: a count past the bytes is refused
+        // before the room.
+        if count > bytes.len() / FRAMED_BUCKET_LEAST {
             return Err(malformed(&r));
         }
         let mut buckets = std::vec::Vec::with_capacity_in(count, Global);
@@ -759,6 +912,9 @@ enum Held<'a> {
     },
     /// A request's shelf, shared read-only by every reader ([`TableSet::lent`]).
     Lent(&'a ImplShelf),
+    /// A request's shelf, and on a miss its source's framed tables, opened in place on this
+    /// reader's first ask of the crate and kept for its later asks ([`TableSet::paged`]).
+    Paged { shelf: &'a ImplShelf, source: &'a dyn ShelfSource, opened: RefCell<AVec<'a, Opened<'a>>> },
 }
 
 /// The impl tables of a set of crates as ONE reader reads them: the [`ImplRecords`] the reader
@@ -767,17 +923,119 @@ enum Held<'a> {
 pub struct TableSet<'a> {
     held: Held<'a>,
     notes: RefCell<AVec<'a, ImplRead>>,
+    hashes: RefCell<blaze_own::BTreeMap<surface::BucketKey, surface::BucketHash, Alloc<'a>>>,
+    probes: RefCell<HashMap<ProbeKey, ProbeName, Alloc<'a>>>,
+    probe_derivations: Cell<usize>,
     alloc: Alloc<'a>,
 }
 
+/// The marks used for an in-memory probe. Equality still compares the complete key,
+/// including the trait key's crate and all bytes beyond its mark.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProbeKey(Probe);
+
+impl core::hash::Hash for ProbeKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        match self.0 {
+            Probe::Trait(t) => state.write_u64(blaze_impls::trait_mark(t)),
+            Probe::UnreadTrait => state.write(&UNREAD_TRAIT_CELL),
+            Probe::Bucket(hash) => state.write_u64(hash.mark()),
+        }
+    }
+}
+
+/// The stable names published by the two read-list consumers. Neither includes the
+/// observing crate or the current answer.
+#[derive(Clone, Copy)]
+struct ProbeName {
+    fact: u64,
+    cell: [u8; 16],
+}
+
+impl ProbeName {
+    // A fixed name for the one crate-wide bit. No table probe or hash derivation is needed.
+    const UNREAD: Self = Self { fact: u64::from_be_bytes(*b"unreadT1"), cell: UNREAD_TRAIT_CELL };
+
+    fn of(probe: Probe) -> Self {
+        let fact = match probe {
+            Probe::Trait(t) => ContentId::of(PROBE_DOMAIN, &t.0.0),
+            Probe::UnreadTrait => return Self::UNREAD,
+            Probe::Bucket(hash) => ContentId::of(PROBE_BUCKET_DOMAIN, &hash.0),
+        };
+        Self { fact: first8(&fact.0), cell: probe_cell(probe) }
+    }
+}
+
+/// The dense slot exists only in this list. A body records the stable cell bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ProbeId(usize);
+
 impl<'a> TableSet<'a> {
     pub fn new(alloc: Alloc<'a>) -> TableSet<'a> {
-        TableSet { held: Held::Own { tables: AVec::new_in(alloc), ids: AVec::new_in(alloc) }, notes: RefCell::new(AVec::new_in(alloc)), alloc }
+        Self::reader(Held::Own { tables: AVec::new_in(alloc), ids: AVec::new_in(alloc) }, alloc)
     }
 
     /// A reader of the shelf `shelf`, its notes in `alloc`: O(1), nothing copied.
     pub fn lent(shelf: &'a ImplShelf, alloc: Alloc<'a>) -> TableSet<'a> {
-        TableSet { held: Held::Lent(shelf), notes: RefCell::new(AVec::new_in(alloc)), alloc }
+        Self::reader(Held::Lent(shelf), alloc)
+    }
+
+    /// A reader of the shelf `shelf` that reads a crate the shelf lacks from `source` on its
+    /// first ask ([`ShelfSource`]): only the crates its body probes are ever read. It answers
+    /// as [`TableSet::lent`] over a shelf holding every crate (front2_tables_task.rs
+    /// `a_paged_shelf_answers_as_the_whole_one`).
+    pub fn paged(shelf: &'a ImplShelf, source: &'a dyn ShelfSource, alloc: Alloc<'a>) -> TableSet<'a> {
+        Self::reader(Held::Paged { shelf, source, opened: RefCell::new(AVec::new_in(alloc)) }, alloc)
+    }
+
+    /// Crate `krate`'s directory and `NoImplsOf` from the source, opened once a reader, and
+    /// with `bucket`, that bucket's bytes. `missing` when the source has no tables for it or the
+    /// bucket is not among them; bytes that do not read break the source's contract
+    /// ([`check_framed`]) and panic.
+    fn paged_of(&self, source: &'a dyn ShelfSource, opened: &RefCell<AVec<'a, Opened<'a>>>, krate: CrateItemKey, bucket: Option<ContentId>, missing: NoTables) -> Result<(&'a [u8], &'a [u8], Option<&'a [u8]>), NoTables> {
+        let mut held = opened.borrow_mut();
+        let at = match held.binary_search_by_key(&krate, |one| one.krate) {
+            Ok(at) => at,
+            Err(at) => {
+                let bytes = source.framed(krate).ok_or(missing)?;
+                let one = open_framed(krate, bytes, Some(self.alloc)).unwrap_or_else(|e| panic!("{e}: a `ShelfSource` handed bytes `check_framed` refuses (front2 buckets/records.rs `TableSet::paged_of`)"));
+                held.insert(at, one);
+                at
+            }
+        };
+        let one = &held[at];
+        let found = match (bucket, one.buckets.as_ref()) {
+            (Some(id), Some(buckets)) => Some(buckets.binary_search_by_key(&id, |(one, _)| *one).map(|place| buckets[place].1).map_err(|_| missing)?),
+            _ => None,
+        };
+        Ok((one.directory, one.no_impls_of, found))
+    }
+
+    fn reader(held: Held<'a>, alloc: Alloc<'a>) -> Self {
+        Self {
+            held,
+            notes: RefCell::new(AVec::new_in(alloc)),
+            hashes: RefCell::new(blaze_own::BTreeMap::new_in(alloc)),
+            probes: RefCell::new(HashMap::new_in(alloc)),
+            probe_derivations: Cell::new(0),
+            alloc,
+        }
+    }
+
+    fn probe(&self, probe: Probe) -> ProbeName {
+        if probe == Probe::UnreadTrait {
+            return ProbeName::UNREAD;
+        }
+        let mut probes = self.probes.borrow_mut();
+        *probes.entry(ProbeKey(probe)).or_insert_with(|| {
+            self.probe_derivations.set(self.probe_derivations.get() + 1);
+            ProbeName::of(probe)
+        })
+    }
+
+    /// Stable names derived in the stretch. The unread-impl probe has a constant name.
+    pub fn probe_ids_derived(&self) -> usize {
+        self.probe_derivations.get()
     }
 
     /// Holds `tables`, replacing the crate's earlier ones. A lent set holds the shelf's alone:
@@ -815,14 +1073,22 @@ impl<'a> TableSet<'a> {
     }
 }
 
-impl ImplRecords for TableSet<'_> {
+impl<'a> ImplRecords for TableSet<'a> {
     type Error = NoTables;
+
+    fn bucket_hash(&self, key: surface::BucketKey) -> surface::BucketHash {
+        *self.hashes.borrow_mut().entry(key).or_insert_with(|| key.hash())
+    }
 
     fn no_impls_of(&self, krate: CrateItemKey) -> Result<&[u8], NoTables> {
         let record = RecordKind::NoImplsOf;
         match &self.held {
             Held::Own { tables, .. } => tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &tables[at].records.no_impls_of[..]).map_err(|_| NoTables { krate, record }),
             Held::Lent(shelf) => Ok(&shelf.of(krate, record)?.no_impls_of),
+            Held::Paged { shelf, source, opened } => match shelf.of(krate, record) {
+                Ok(one) => Ok(&one.no_impls_of),
+                Err(missing) => self.paged_of(*source, opened, krate, None, missing).map(|(_, no_impls_of, _)| no_impls_of),
+            },
         }
     }
 
@@ -831,6 +1097,10 @@ impl ImplRecords for TableSet<'_> {
         match &self.held {
             Held::Own { tables, .. } => tables.binary_search_by_key(&krate, |t| t.krate).map(|at| &tables[at].records.directory[..]).map_err(|_| NoTables { krate, record }),
             Held::Lent(shelf) => Ok(&shelf.of(krate, record)?.directory),
+            Held::Paged { shelf, source, opened } => match shelf.of(krate, record) {
+                Ok(one) => Ok(&one.directory),
+                Err(missing) => self.paged_of(*source, opened, krate, None, missing).map(|(directory, _, _)| directory),
+            },
         }
     }
 
@@ -848,6 +1118,13 @@ impl ImplRecords for TableSet<'_> {
                 let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
                 Ok(&one.buckets[place].1)
             }
+            Held::Paged { shelf, source, opened } => match shelf.of(krate, RecordKind::Bucket) {
+                Ok(one) => {
+                    let place = one.buckets.binary_search_by_key(&bucket, |(id, _)| *id).map_err(|_| missing)?;
+                    Ok(&one.buckets[place].1)
+                }
+                Err(_) => self.paged_of(*source, opened, krate, Some(bucket), missing).and_then(|(_, _, found)| found.ok_or(missing)),
+            },
         }
     }
 
@@ -868,21 +1145,62 @@ fn first16(id: ContentId) -> u128 {
     u128::from_be_bytes(b)
 }
 
-/// One lookup read as a read-list row: (the crate, what was asked, what it answered).
-fn bucket_read(read: ImplRead) -> BucketRead {
-    match read {
-        ImplRead::Filter { krate, probe, may_hold } => {
-            let bucket = match probe {
-                Probe::Trait(t) => first8(&ContentId::of(PROBE_DOMAIN, &t.0.0).0),
-                // Not `hash.mark()`: that is the bucket's directory read, whose answer is the
-                // bucket's digest; a probe's answer is "may hold", so the two are two facts
-                // (one fact with two answers is refused, rule 21).
-                Probe::Bucket(hash) => first8(&ContentId::of(PROBE_BUCKET_DOMAIN, &hash.0).0),
-            };
-            BucketRead { krate: first16(krate.0), bucket, answer: u64::from(may_hold) }
+/// Mark a probe in one body's crate row. A directory hit or miss reads the same cell
+/// as its preceding bucket filter. The directory digest covers the contents too.
+fn first_read<A: core::alloc::Allocator>(words: &mut Vec<u64, A>, ProbeId(id): ProbeId) -> bool {
+    let word = id / u64::BITS as usize;
+    if word >= words.len() {
+        words.resize(word + 1, 0);
+    }
+    let bit = 1u64 << (id % u64::BITS as usize);
+    let first = words[word] & bit == 0;
+    words[word] |= bit;
+    first
+}
+
+/// A union for one list of reads, with one bit per dense name in each crate.
+/// A lookup supplies the crate's index. A consumer of portable rows interns the crate
+/// half as well, including the graph-wide incoherence fact.
+pub struct BucketReadUnion<A: core::alloc::Allocator + Copy> {
+    cells: blaze_hash::IndexSet<u128, A>,
+    crate_keys: blaze_hash::IndexSet<u128, A>,
+    words: Vec<Vec<u64, A>, A>,
+    alloc: A,
+}
+
+impl<A: core::alloc::Allocator + Copy> BucketReadUnion<A> {
+    pub fn new(alloc: A) -> Self {
+        Self { cells: blaze_hash::IndexSet::new_in(alloc), crate_keys: blaze_hash::IndexSet::new_in(alloc), words: Vec::new_in(alloc), alloc }
+    }
+
+    /// Keep each impl dependency once for the group. Other read kinds pass through.
+    pub fn keep(&mut self, read: TableRead) -> bool {
+        let TableRead::Impls { krate, bucket } = read else { return true };
+        self.insert(u128::from_be_bytes(krate), u128::from_be_bytes(bucket))
+    }
+
+    /// Keep a question's bucket fact in the checker's read list. Include its answer so
+    /// that differing answers reach the existing TwoAnswers check.
+    pub fn keep_fact(&mut self, read: &BucketRead) -> bool {
+        self.insert(read.krate, (u128::from(read.bucket) << 64) | u128::from(read.answer))
+    }
+
+    fn insert(&mut self, krate: u128, cell: u128) -> bool {
+        let (krate, _) = self.crate_keys.insert_full(krate);
+        let id = self.id(cell);
+        self.mark(krate, id)
+    }
+
+    fn id(&mut self, cell: u128) -> ProbeId {
+        ProbeId(self.cells.insert_full(cell).0)
+    }
+
+    fn mark(&mut self, krate: usize, id: ProbeId) -> bool {
+        if self.words.len() <= krate {
+            let alloc = self.alloc;
+            self.words.resize_with(krate + 1, || Vec::new_in(alloc));
         }
-        ImplRead::Directory { krate, bucket, found } => BucketRead { krate: first16(krate.0), bucket: bucket.mark(), answer: found.map_or(0, |id| first8(&id.0)) },
-        ImplRead::Bucket { krate, bucket } => BucketRead { krate: first16(krate.0), bucket: first8(&bucket.0), answer: first8(&bucket.0) },
+        first_read(&mut self.words[krate], id)
     }
 }
 
@@ -920,7 +1238,7 @@ impl BucketIndex {
     /// `tables` (module docs): the crates `home` admits, as [`Buckets::admit_asked`] chooses
     /// them, each asked through blaze-impls' lookups at every shape `ask`'s stands for. A
     /// question asked before is not asked again. Returns how many rows this call filed.
-    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>) -> Result<usize, TablesReadError> {
+    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>, alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
         let asked = match ask {
             Ask::Trait(t, shape) => self.indexed.trait_reads.contains_key(&(t, shape)),
             Ask::Inherent(shape) => self.indexed.inherent_reads.contains_key(&shape),
@@ -974,28 +1292,77 @@ impl BucketIndex {
             indexes.push(krate);
         }
         let mut filed = 0usize;
-        tables.take_notes();
-        for s in shapes.iter() {
+        for (width, s) in shapes.iter().enumerate() {
+            if crates.is_empty() {
+                break;
+            }
+            // A trait rejection covers every width of a numeric survey. Only holders
+            // that passed the first width's trait check need the remaining heads.
+            let narrow = width == 0 && shapes.len() > 1 && lib_trait.is_some();
+            let remaining = RefCell::new(Vec::new_in(alloc));
+            // Slots are local to a concrete shape. Its nth want is the same probe in
+            // every holder, so only the first holder needs the stretch interner.
+            let slots = [const { OnceCell::new() }; Probe::SLOTS];
+            let ix = RefCell::new(&mut *self);
+            let lookups = Cell::new(0u32);
+            let rows = RefCell::new(&mut reads);
+            let note = |holder: usize, slot: usize, read: ImplRead| {
+                let row = match read {
+                    ImplRead::Filter { krate, probe, may_hold } => {
+                        if width != 0 && matches!(probe, Probe::Trait(_) | Probe::UnreadTrait) {
+                            return;
+                        }
+                        if narrow && may_hold && matches!(probe, Probe::Trait(_)) {
+                            remaining.borrow_mut().push(holder);
+                        }
+                        let mut ix = ix.borrow_mut();
+                        let probes = ix.table_reads.get_or_insert_with(|| BucketReadUnion::new(alloc));
+                        let &(id, name) = slots[slot].get_or_init(|| {
+                            let name = tables.probe(probe);
+                            (probes.id(u128::from_be_bytes(name.cell)), name)
+                        });
+                        let krate = first16(krate.0);
+                        if probes.mark(indexes[holder], id) {
+                            names.impls_read(TableRead::Impls { krate: krate.to_be_bytes(), bucket: name.cell });
+                        }
+                        BucketRead { krate, bucket: name.fact, answer: u64::from(may_hold) }
+                    }
+                    ImplRead::Directory { krate, bucket, found } => BucketRead {
+                        krate: first16(krate.0),
+                        bucket: bucket.mark(),
+                        answer: found.map_or(0, |id| first8(&id.0)),
+                    },
+                    ImplRead::Bucket { krate, bucket } => {
+                        lookups.set(lookups.get() + 1);
+                        let digest = first8(&bucket.0);
+                        BucketRead { krate: first16(krate.0), bucket: digest, answer: digest }
+                    }
+                };
+                rows.borrow_mut().push(row);
+            };
             let found = match lib_trait {
                 Some(t) => candidates_in(&crates, t, *s, tables),
                 None => inherent_candidates_in(&crates, *s, tables),
             };
-            for row in found {
+            // The first width has already filed and recorded the blanket, unread-at-any
+            // and blind buckets. Every following width adds only its shaped buckets.
+            let found = if width == 0 { found } else { found.only_at_shape() };
+            for row in found.recording(&note) {
                 let row = row.map_err(TablesReadError::Lookup)?;
                 let at = crates.iter().position(|c| row.impl_.is_of(*c)).ok_or(TablesReadError::Crate { impl_: row.impl_ })?;
                 let filing = filing_of(names, &row)?;
-                self.take(names, indexes[at], filing);
+                ix.borrow_mut().take(names, indexes[at], filing);
                 filed += 1;
             }
-        }
-        for read in tables.take_notes().iter() {
-            if matches!(read, ImplRead::Bucket { .. }) {
-                self.indexed.lookups += 1;
-            }
-            reads.push(bucket_read(*read));
-            // The task's recorder (front2 tables/view.rs), as a cell of the crate's tables.
-            if let Some(cell) = cells_of(read) {
-                names.impls_read(cell);
+            ix.borrow_mut().indexed.lookups += lookups.get();
+            if narrow {
+                let kept = remaining.into_inner();
+                for (to, &from) in kept.iter().enumerate() {
+                    crates[to] = crates[from];
+                    indexes[to] = indexes[from];
+                }
+                crates.truncate(kept.len());
+                indexes.truncate(kept.len());
             }
         }
         self.indexed.asks += 1;
@@ -1014,7 +1381,7 @@ impl BucketIndex {
 /// tables stand behind (rule 78), each tested equal (tests/front2_buckets_order.rs).
 pub trait BucketSource {
     /// Files what `ask` at `home` can be answered from; how many impls it filed.
-    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError>;
+    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: Alloc<'static>) -> Result<usize, TablesReadError>;
 }
 
 /// Today's index: whole crates by their rows ([`Buckets::admit`]), else the items records'
@@ -1022,14 +1389,74 @@ pub trait BucketSource {
 pub struct ItemsIndex;
 
 impl BucketSource for ItemsIndex {
-    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
+    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, _alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
         let whole = b.admit(names, home);
         Ok(whole + b.admit_asked(names, keys, home, ask))
     }
 }
 
 impl BucketSource for TableSet<'_> {
-    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
-        b.admit_tables(names, keys, home, ask, self)
+    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
+        b.admit_tables(names, keys, home, ask, self, alloc)
+    }
+}
+
+#[cfg(test)]
+mod read_id_tests {
+    use super::*;
+
+    #[test]
+    fn two_probe_keys_with_the_same_mark_require_two_read_ids() {
+        let tables = TableSet::new(blaze_own::testing::heap().alloc());
+        let first = surface::BucketHash([0; 16]);
+        let mut second = first;
+        second.0[15] = 1;
+        assert_eq!(first.mark(), second.mark());
+        let a = tables.probe(Probe::Bucket(first)).cell;
+        let b = tables.probe(Probe::Bucket(second)).cell;
+        let mut body = BucketReadUnion::new(tables.alloc);
+        let id_a = body.id(u128::from_be_bytes(a));
+        let id_b = body.id(u128::from_be_bytes(b));
+        assert_eq!(body.id(u128::from_be_bytes(tables.probe(Probe::Bucket(first)).cell)), id_a);
+        assert_eq!(tables.probe_ids_derived(), 2);
+
+        // The oracle compares writer-visible names. Plant the first slot on the second
+        // bucket before marking it, exactly where an alias would lose its dependency.
+        let collected = |second_slot| {
+            let mut words = Vec::new();
+            [(id_a, a), (second_slot, b)].into_iter()
+                .filter_map(|(id, cell)| first_read(&mut words, id).then_some(cell))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(collected(id_b), [first.0, second.0]);
+        assert_eq!(collected(id_a), [first.0]);
+        assert_ne!(collected(id_a), [first.0, second.0]);
+        std::println!("two buckets sharing a mark keep two cells; reusing a dense ID loses the second");
+    }
+
+    #[test]
+    fn expansion_items_share_one_bucket_union_only_inside_their_task() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut group = BucketReadUnion::new(alloc);
+        let mut next = BucketReadUnion::new(alloc);
+        for item in 0..3 {
+            for i in 0..130u128 {
+                for krate in [[1; 16], [2; 16]] {
+                    let cell = TableRead::Impls { krate, bucket: i.to_be_bytes() };
+                    assert_eq!(group.keep(cell), item == 0);
+                    if item == 2 {
+                        assert!(next.keep(cell));
+                    }
+                }
+            }
+        }
+        let head = TableRead::Head { item: [1; 16], part: 0 };
+        assert!(group.keep(head) && group.keep(head));
+        let mut facts = BucketReadUnion::new(alloc);
+        let missing = BucketRead { krate: 1, bucket: 7, answer: 0 };
+        assert!(facts.keep_fact(&missing));
+        assert!(!facts.keep_fact(&missing));
+        assert!(facts.keep_fact(&BucketRead { answer: 1, ..missing }));
+        std::println!("three expansion items retain 260 bucket reads; a second task retains its own 260");
     }
 }

@@ -193,7 +193,7 @@ content), and there is one such number per kind of entry:
 | `UNIT` | dependency units | a unit's contents for one key would change |
 | `TESTS` | test pass records | the reach hash, the sandbox's recording, the fixed environment or the harness changes what a pass means |
 
-A toolchain bump (`harness/toolchain`) is still a new identity: the std and the language blaze
+A toolchain bump (`pins/toolchain`) is still a new identity: the std and the language blaze
 matches move with it ([AGENTS.md](../AGENTS.md), own-nightly). The local store takes the same
 identity, so what the remote serves drops into it unchanged.
 

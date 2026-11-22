@@ -174,6 +174,9 @@ pub struct FetchEnv<'f> {
     pub clock: bstd::clock::Clock,
     /// The checkout, relative to where blaze was started ("" for there).
     pub checkout: &'f str,
+    /// The checkout's absolute root, resolved once at the command's edge
+    /// (engine_script_reads.rs `Served::at_edge`): what a script's served tree is rooted at.
+    pub served: crate::engine_script_reads::Served<'f>,
     /// `SSL_CERT_FILE` and `SSL_CERT_DIR`, read at the edge (rule 75): where the HTTPS
     /// client's roots are looked for, besides the machine's store.
     pub cert_file: Option<&'f str>,
@@ -185,8 +188,9 @@ pub struct FetchEnv<'f> {
     /// when neither is set. Its `registry/cache` is the second place a crate's archive comes
     /// from (fetch.md, "Where bytes come from"), adopted only by the lock's pin.
     pub cargo_home: Option<&'f str>,
-    /// The folder blaze was started in (`PWD`), read at the edge: the toolchain's shelf under
-    /// the home is reached from it (toolchain.rs). `None` when `PWD` is not set.
+    /// The checkout's root as the edge resolved it (`Served::at_edge`, one realpath; never
+    /// `PWD`, rule 75). `None` in a simulated world. No stage reads it today: the shelf is opened
+    /// from `home` alone (toolchain.rs `HomeShelf::open`).
     pub start: Option<&'f str>,
     /// The toolchain this command opens, given by `main` (`blaze_toolchain::PINNED`) and never
     /// read deeper (rule 75): the target's cfg, the units' output and the names world take it.
@@ -308,7 +312,10 @@ pub(crate) fn run<'b>(
             };
             // Not lasting, with the network: the network's or the store's fault, which the
             // next command may not meet. No record; the job fails with the words, and the
-            // answer is not written, so the next command asks again.
+            // stage owes it (engine_units.rs `owes`), so the answer's certificate does not stand
+            // and the next command runs it again. (Until 2026-11-20 nothing owed it: the
+            // answer was written with the failure in it and the next command's certificate
+            // replayed it, turso's 152 fetches, though the sources were in cargo's cache.)
             if !lasting && cfg!(feature = "fetch") {
                 return Ok(Did::Hole(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now (the network's or the store's fault); the next command asks again", rule: "fetch_task::made" } }, held_str(message.as_str(), held)));
             }
@@ -538,6 +545,15 @@ fn adopt_local<'c>(
 #[path = "fetch_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    /// A test's network: `false` and the HTTPS client is not made (`net::client`), so a unit no
+    /// place on the machine holds fails as with no network, deterministically and with no
+    /// socket opened (only ever in this crate's tests; macOS reads no `SSL_CERT_FILE`, so a test
+    /// cannot break the client by its environment).
+    pub(crate) static NETWORK: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+}
+
 #[cfg(feature = "fetch")]
 mod net {
     //! The machine and its IO: blaze-http's driver thread for HTTPS, the records' files, the
@@ -569,9 +585,10 @@ mod net {
     /// How long one step waits when no deadline is due: the machine's own bound.
     const STEP_MOST_NS: u64 = 1_000_000_000;
     /// Steps past which a unit that has not settled is a hang (rule 18): the machine's requests
-    /// each end by their deadline (`Limits::REAL.ask_ns`, tried `tries_most` times), so a unit
-    /// settles within that many seconds' steps.
-    const STEPS_MOST: u64 = 4 * 120 * 4;
+    /// each end by their deadline (`Limits::REAL.ask_ns`, each tried once, D172), so a unit
+    /// settles within that many seconds' steps: the advert's and the pack's for a git unit, a
+    /// resized ask past `most` at most twice.
+    const STEPS_MOST: u64 = 4 * 120;
 
     /// Why HTTPS is not set up: each names what.
     #[derive(Clone, Debug)] // clone: an error's words, once a unit that needed them
@@ -802,7 +819,6 @@ mod net {
             match mailbox::answer("a dependency's HTTPS answer", &self.io.answers, wait) {
                 Ok(Some((key, fetched))) => {
                     let ask = Ask { unit: (key >> 32) as u32, seq: key as u32 };
-                    let at = self.now();
                     let reply = match fetched {
                         Fetched::Answered { status, body, .. } => {
                             let (_, body) = self.io.last.insert((ask.unit, body));
@@ -811,7 +827,7 @@ mod net {
                         Fetched::Failed(error) => Reply::Failed(failure(&error.kind)),
                         Fetched::TimedOut => Reply::Failed(NetFailure::Timeout),
                     };
-                    Woke::Answer { ask, at, reply }
+                    Woke::Answer { ask, reply }
                 }
                 // The channel's sender is held here, so it never closes while this waits.
                 Ok(None) => Woke::Other,
@@ -897,6 +913,10 @@ mod net {
     /// The HTTPS client, made at the first request (never at start, and never when every
     /// unit's record stands): the machine's roots read now, from where the environment points.
     fn client(cert_file: Option<&std::ffi::OsStr>, cert_dir: Option<&std::ffi::OsStr>) -> Result<Handle, Untrusted> {
+        #[cfg(test)]
+        if !super::NETWORK.get() {
+            return Err(Untrusted::Driver(std::string::String::from("no network in this test (fetch.rs `NETWORK`)")));
+        }
         let tls = blaze_http::roots::system(blaze_http::roots::Places { cert_file, cert_dir }).map_err(|setup| Untrusted::Tls(setup.to_string()))?;
         let client = blaze_http::Client::new(blaze_http::Config::new(tls, USER_AGENT, Duration::from_secs(60)));
         Handle::spawn(client, Limits::REAL.in_flight_most as usize).map_err(|error| Untrusted::Driver(error.to_string()))

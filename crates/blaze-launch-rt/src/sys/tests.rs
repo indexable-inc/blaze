@@ -81,21 +81,23 @@ fn code_written_through_one_view_runs_through_the_other_and_is_rewritten() {
 #[cfg(target_os = "macos")]
 #[test]
 fn neither_view_can_gain_the_others_protection() {
+    use blaze_sys::posix::io::{Prot, mprotect};
+
     let page = page().expect("a page size");
     let code = Code::map(page).expect("a mapping");
-    let (run, write) = (code.base() as *mut libc::c_void, code.write.as_ptr().cast::<libc::c_void>());
-    let rw = libc::PROT_READ | libc::PROT_WRITE;
-    let rx = libc::PROT_READ | libc::PROT_EXEC;
+    let (run, write) = (code.exec, code.write);
+    let rw = Prot::READ | Prot::WRITE;
+    let rx = Prot::READ | Prot::EXEC;
     for (view, protection, what) in [
         (run, rw, "the run view writable"),
-        (run, rw | libc::PROT_EXEC, "the run view writable and executable"),
+        (run, rw | Prot::EXEC, "the run view writable and executable"),
         (write, rx, "the write view executable"),
-        (write, rw | libc::PROT_EXEC, "the write view writable and executable"),
+        (write, rw | Prot::EXEC, "the write view writable and executable"),
     ] {
         // SAFETY: a protection change of a page of `code`'s own views, which the kernel is
-        // expected to refuse; were it allowed, nothing runs or writes the page meanwhile.
-        let changed = unsafe { libc::mprotect(view, page, protection) };
-        assert_ne!(changed, 0, "mprotect made {what}");
+        // expected to refuse; no reference needs a permission the call could take away.
+        let changed = unsafe { mprotect(view, page, protection) };
+        assert!(changed.is_err(), "mprotect made {what}");
     }
 }
 
@@ -180,47 +182,53 @@ fn a_decommit_takes_its_pages_out_of_the_footprint() {
 /// parent's new code (the memfd's pages are shared).
 #[test]
 fn a_forked_child_runs_its_code_and_holds_no_write_view() {
+    use blaze_sys::posix::{io, proc, signal};
+
     let page = page().expect("a page size");
     let mut code = Code::map(page).expect("a mapping");
     code.write(0, &returns(42)).expect("the body");
     let (run, write) = (code.base(), code.write.as_ptr() as usize);
-    let mut pipe = [0; 2];
-    // SAFETY: `pipe` is two live descriptors' room.
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let (reader, writer) = io::pipe().expect("pipe");
+    #[cfg(target_os = "macos")]
+    let pipe = [reader.fd().raw(), writer.fd().raw()];
+    // SAFETY: the child only reads a byte, probes the mapping, calls code that allocates
+    // nothing and takes no lock, then exits without running destructors.
+    #[cfg(target_os = "macos")]
+    let pid = unsafe { proc::fork() };
     // SAFETY: `fork` in a process with other threads: the child only reads a byte, asks the
     // kernel of a range, calls code that allocates nothing and takes no lock, and `_exit`s.
+    #[cfg(target_os = "linux")]
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
     if pid == 0 {
         let mut byte = 0u8;
+        #[cfg(target_os = "linux")]
+        let _ = blaze_sys::linux::read(reader.fd(), core::slice::from_mut(&mut byte));
         // SAFETY: one byte into a live local, from the pipe's read end.
+        #[cfg(target_os = "macos")]
         unsafe { libc::read(pipe[0], (&raw mut byte).cast(), 1) };
         // SAFETY: asks whether `write..write + page` is mapped; it touches no byte.
-        if unsafe { libc::msync(write as *mut libc::c_void, page, libc::MS_ASYNC) } == 0 {
-            // SAFETY: leaves the child at once.
-            unsafe { libc::_exit(200) };
+        if unsafe { libc::msync(write as *mut core::ffi::c_void, page, io::MsyncFlags::ASYNC.bits() as i32) } == 0 {
+            signal::exit_now(200);
         }
         let got = call(run);
-        // SAFETY: leaves the child at once, running nothing of the parent's.
-        unsafe { libc::_exit(got as i32) };
+        signal::exit_now(got as i32);
     }
     code.write(0, &returns(7)).expect("the parent's new body");
-    // SAFETY: one byte from a live local to the pipe's write end: the child may go on.
-    assert_eq!(unsafe { libc::write(pipe[1], [0u8].as_ptr().cast(), 1) }, 1, "write to the pipe");
-    let mut status = 0;
-    // SAFETY: waits for the child just forked.
-    let waited = unsafe { libc::waitpid(pid, &raw mut status, 0) };
-    assert_eq!(waited, pid, "waitpid: {}", std::io::Error::last_os_error());
-    for end in pipe {
-        // SAFETY: the pipe's own descriptors, used no more.
-        unsafe { libc::close(end) };
+    assert_eq!(io::write(writer.fd(), &[0]), Ok(1), "write to the pipe");
+    let (waited, proc::WaitStatus(status)) = proc::wait_pid(pid, proc::WaitFlags::NONE)
+        .unwrap_or_else(|err| panic!("waitpid: {}", std::io::Error::from_raw_os_error(err.raw().into())))
+        .expect("waitpid with no WNOHANG returns a child");
+    assert_eq!(waited, pid, "waitpid");
+    for end in [reader, writer] {
+        let _ = io::close(end);
     }
     let expected = if cfg!(target_os = "macos") { 42 } else { 7 };
     assert!(
-        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == expected,
+        proc::WIFEXITED(status) && proc::WEXITSTATUS(status) == expected,
         "the child ended with status {status:#x} (signal {}; 200 is a write view it should not \
          hold), not by returning {expected} from its code",
-        if libc::WIFSIGNALED(status) { libc::WTERMSIG(status) } else { 0 },
+        if proc::WIFSIGNALED(status) { proc::WTERMSIG(status) } else { 0 },
     );
     assert_eq!(call(run), 7, "the parent runs its new body");
 }

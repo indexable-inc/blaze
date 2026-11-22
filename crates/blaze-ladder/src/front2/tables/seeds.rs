@@ -37,7 +37,7 @@ use blaze_own::{AVec, Alloc};
 use super::super::heads::{Seeded, Store, Want};
 use super::super::keys::Keys;
 use super::super::source::NamesSource;
-use super::head::{CellFailure, FreezeError, FrozenHead, HeadSource, Known, KnownHeads, NotTheirs, SeededHeads, cell_of, seed, want_bytes};
+use super::head::{CellFailure, FreezeError, FrozenHead, HeadSource, Known, KnownHeads, NotTheirs, SeededHeads, cell_of, file_frozen, seed, want_bytes};
 
 /// What a body's store asks for each head it needs (heads.rs `Store::seeds`).
 pub trait HeadSeed<'n> {
@@ -96,6 +96,78 @@ impl core::fmt::Display for SeedError {
             SeedError::NotInItsUnit { said, .. } | SeedError::NoMemberCell { said, .. } => write!(f, "{said}"),
         }
     }
+}
+
+/// THE GATE'S FETCH (D168; typeck.md "The gate fetches, the recorder records"): the head cells
+/// of a body's gate set (its last read list's head cells, on an edit) filed into the body's
+/// store before the body is entered, together, by `seeds`. One entry for the gate and for the
+/// engine's writer.
+///
+/// A fetch is never a read: nothing here reaches the body's recorder. `seeds` must read its
+/// names through a view whose sink is [`FetchReads`] (`Tables::reading_into(&FetchReads)`), so
+/// a cell the check then never asks leaves no row in the read list, and one it asks is
+/// recorded by the check's own fact (task.rs `fact_read`), as without a fetch. The list a
+/// fetched body records is the list it records unfetched (the gate's oracle compares the two).
+///
+/// A cell already made is skipped; a cell its seed answers [`Seeded::Lower`] (an item of the
+/// body, or one its own store makes) is left to the body's store and counted. A seed's refusal
+/// is the fetch's, naming the cell (rule 19): never fetched another way (rule 3).
+pub fn fetch_cells<'n, 'c>(store: &Store<'n>, keys: &Keys, seeds: &dyn HeadSeed<'n>, cells: &'c [Want], scratch: Alloc<'static>) -> Result<Fetched<'c>, FetchError> {
+    let (mut filed, mut left) = (0u32, 0u32);
+    for &cell in cells {
+        if store.made(cell) {
+            continue;
+        }
+        match seeds.seed(store, keys, cell, scratch) {
+            Ok(Seeded::Filed) => filed += 1,
+            Ok(Seeded::Lower) => left += 1,
+            Err(error) => return Err(FetchError { cell, error }),
+        }
+    }
+    Ok(Fetched { cells, filed, left })
+}
+
+/// The proof a gate's cells were fetched (rule 74): made only by [`fetch_cells`], taken by the
+/// body's entry, so a body is entered after its fetch, never before.
+#[derive(Debug)]
+pub struct Fetched<'c> {
+    cells: &'c [Want],
+    filed: u32,
+    left: u32,
+}
+
+impl Fetched<'_> {
+    /// The cells of the gate set.
+    pub fn cells(&self) -> &[Want] {
+        self.cells
+    }
+
+    /// How many the fetch filed from frozen records.
+    pub fn filed(&self) -> u32 {
+        self.filed
+    }
+
+    /// How many were left to the body's store ([`Seeded::Lower`]).
+    pub fn left(&self) -> u32 {
+        self.left
+    }
+}
+
+/// A gate cell whose seed refused (rule 19: the cell and the seed's error).
+#[derive(Debug)]
+pub struct FetchError {
+    pub cell: Want,
+    pub error: SeedError,
+}
+
+/// The sink a fetch reads names through: it keeps no read, by design ([`fetch_cells`]: a fetch
+/// is not a read; what the check asks is recorded by the check).
+pub struct FetchReads;
+
+impl super::recorder::ReadSink for FetchReads {
+    fn read(&self, _: super::recorder::TableRead) {}
+
+    fn binding(&self, _: blaze_id::ItemKey, _: blaze_surface::Namespace, _: &str) {}
 }
 
 /// Whether `need` is of an item declared in a body that `store` lowered (module docs, "AN ITEM
@@ -232,26 +304,6 @@ impl<'a> FrozenTable<'a> {
     }
 }
 
-/// One cell's record, as [`seed`] reads it: it asks only the cell of the need it was given.
-struct OneCell<'t> {
-    cell: Want,
-    bytes: &'t [u8],
-}
-
-impl HeadSource for OneCell<'_> {
-    fn frozen(&mut self, want: Want) -> Result<FrozenHead<'_>, FreezeError> {
-        if want != self.cell {
-            // `seed` asks the cell of the need it is given, found before it is called.
-            return Err(FreezeError::NotACell { want, cell: self.cell });
-        }
-        FrozenHead::read(self.bytes).map_err(|error| FreezeError::Read { want, error })
-    }
-
-    fn open(&mut self, _want: Want) -> bool {
-        false
-    }
-}
-
 impl<'n, N: NamesSource<'n>> HeadSeed<'n> for TableView<'_, '_, N> {
     fn seed(&self, store: &Store<'n>, keys: &Keys, need: Want, scratch: Alloc<'static>) -> Result<Seeded, SeedError> {
         if of_the_body(store, need) {
@@ -259,7 +311,9 @@ impl<'n, N: NamesSource<'n>> HeadSeed<'n> for TableView<'_, '_, N> {
         }
         let cell = cell_of(self.names, need).map_err(SeedError::Freeze)?;
         let bytes = self.table.bytes_of(cell).ok_or(SeedError::NotFrozen { need, cell })?;
-        seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze)
+        let frozen = FrozenHead::read(bytes).map_err(|error| SeedError::Freeze(FreezeError::Read { want: cell, error }))?;
+        file_frozen(self.names, cell, frozen, store, keys, scratch).map_err(SeedError::Freeze)?;
+        Ok(Seeded::Filed)
     }
 }
 
@@ -364,7 +418,9 @@ impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, '
         match self.heads.known(cell) {
             Known::Bytes(bytes) => {
                 self.known.set(self.known.get().saturating_add(1));
-                return seed(self.names, None, need, &mut OneCell { cell, bytes }, store, keys, scratch).map_err(SeedError::Freeze);
+                let frozen = FrozenHead::read(bytes).map_err(|error| SeedError::Freeze(FreezeError::Read { want: cell, error }))?;
+                file_frozen(self.names, cell, frozen, store, keys, scratch).map_err(SeedError::Freeze)?;
+                return Ok(Seeded::Filed);
             }
             // Not this stretch's to freeze (a member crate's head its task did not freeze for
             // this unit): refused, typed, before any freeze (rule 3).

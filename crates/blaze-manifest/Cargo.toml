@@ -25,7 +25,6 @@ cargo = [
     "dep:blaze-hash",
     "dep:blaze-ids",
     "dep:blaze-resolve",
-    "dep:blaze-serde",
     "dep:blaze-source",
     "dep:serde",
     "dep:serde_json",
@@ -35,6 +34,8 @@ cargo = [
 
 [dependencies]
 blaze-own.workspace = true
+# The pinned cargo's version, as its messages name it (`features`; pins/rust.txt).
+blaze-pins.workspace = true
 # Cargo.toml and .cargo/config.toml, read with every key's byte range (`schema`, `layout`), and
 # the `cargo config get` output written in cargo's spelling.
 blaze-toml.workspace = true
@@ -51,7 +52,6 @@ blaze-core = { workspace = true, optional = true }
 blaze-hash = { workspace = true, optional = true }
 blaze-ids = { workspace = true, optional = true }
 blaze-resolve = { workspace = true, optional = true }
-blaze-serde = { workspace = true, optional = true }
 blaze-source = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }

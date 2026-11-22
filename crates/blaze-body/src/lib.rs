@@ -8,6 +8,8 @@
 //! - [`text`]: the text form, printed and parsed with an exact round trip.
 //! - [`verify`]: the well-formedness check, returning the [`Verified`] proof later passes take.
 //! - [`record`]: the body as one blaze-format record, written once and read in place.
+//! - [`kept`]: the body with the portable type table it indexes, as the Bodies stage keeps
+//!   it for a run to build instances from (run.md R4).
 //!
 //! Every function is sans-IO and takes the allocator it allocates in.
 
@@ -21,6 +23,7 @@ extern crate std;
 pub mod body;
 pub mod build;
 pub mod code;
+pub mod kept;
 pub mod record;
 pub mod text;
 pub mod verify;
@@ -35,6 +38,7 @@ pub use body::{
     StmtRow, Subset, Table, TyError, TyListRef, UnOp, Unwind, Value,
 };
 pub use build::{BodyBuilder, BuildError};
+pub use kept::{KEPT_VERSION, Kept, KeptColumn, KeptError, KeptRoot, TableId};
 pub use record::{EncodeError, OpenError, VERSION, encode, open, try_encode};
 pub use text::{ParseError, ParseWhat, PrintError, parse, print};
 pub use verify::{Site, Verified, VerifyError, verify, verify_ref};

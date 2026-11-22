@@ -752,6 +752,27 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.take_sliced()
     }
 
+    /// After the answer's commit, whose flip named the cleanup's first slice (`first`, its
+    /// outcome): more slices, each folded and named by a commit of nothing else, while
+    /// `Plain::cleanup_goes_on` says so (the last was a tiered merge that replaced something, or in sweep mode a merge is due next after a sweep or after a first slice the lease left empty, at most
+    /// `CLEANUP_SLICES_MOST`, the bytes read under this process's work budget). The slices
+    /// summed (`Sliced::and`) and how many replaced something.
+    pub fn clean_on(&self, first: Option<Sliced>) -> Result<(Option<Sliced>, u32), LentError> {
+        let Some(mut so_far) = first else { return Ok((None, 0)) };
+        let (mut last, mut slices) = (so_far, u32::from(so_far.segments > 0 && !so_far.aborted));
+        while self.inner.borrow().store.core().cleanup_goes_on(&so_far, slices, &last) {
+            if !self.fold_slice()? {
+                break;
+            }
+            self.commit()?;
+            let Some(next) = self.take_sliced() else { break };
+            slices += u32::from(next.segments > 0 && !next.aborted);
+            so_far = so_far.and(next);
+            last = next;
+        }
+        Ok((Some(so_far), slices))
+    }
+
     /// [`Lent::root`], kept for `life_ns` from the commit that sets it (`Plain::root_for`).
     pub fn root_for(&self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, LentError> {
         self.inner.borrow_mut().store.root_for(name, keys, life_ns).map_err(stopped("setting a root"))
@@ -815,6 +836,12 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// `(segments mapped, segments named)`: `--stats` "segments mapped N of M named".
     pub fn mapped_of_named(&self) -> (u32, u32) {
         self.inner.borrow().store.core().mapped_of_named()
+    }
+
+    /// The most segments the generation may name once cleanup has run (`Plain::named_most`):
+    /// what [`Lent::mapped_of_named`]'s named count is held against.
+    pub fn named_most(&self) -> u32 {
+        self.inner.borrow().store.core().named_most()
     }
 
     /// Probes per get: `--stats` "probes per get (mean, most)".

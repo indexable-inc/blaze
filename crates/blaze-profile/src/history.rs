@@ -290,10 +290,8 @@ pub fn writer(dir: &Path) -> Option<u32> {
 /// Whether a process `pid` is alive: one this user may not signal is, one that is gone is not.
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
-    // SAFETY: signal 0 sends nothing: the kernel only checks that `pid` names a process.
-    let sent = unsafe { libc::kill(pid, 0) };
-    sent == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    matches!(blaze_sys::posix::signal::kill(pid, 0), Ok(()) | Err(blaze_sys::Errno::Perm))
 }
 
 #[cfg(not(unix))]

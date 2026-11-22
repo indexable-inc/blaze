@@ -137,6 +137,17 @@ errnos! {
     Stale = "ESTALE", 116, 70, "a stale file handle";
     DQuot = "EDQUOT", 122, 69, "over the disk quota";
     Canceled = "ECANCELED", 125, 89, "the operation was cancelled";
+    // D180 (replaces libc::ENODATA, libc::EPROTO, libc::ENOPROTOOPT, libc::EHOSTDOWN,
+    // libc::ENONET, libc::ENOTSUP). An error a target does not have is given a number above
+    // 4095, which no call there returns (the kernel's errors are 1 to 4095): macOS has no
+    // `ENONET`, and Linux's `ENOTSUP` is `EOPNOTSUPP`'s number, so on Linux a caller that meant
+    // `ENOTSUP` matches [`Errno::OpNotSupp`].
+    NoData = "ENODATA", 61, 96, "no data: no such attribute";
+    Proto = "EPROTO", 71, 100, "a protocol error";
+    NoProtoOpt = "ENOPROTOOPT", 92, 42, "the protocol has no such option";
+    HostDown = "EHOSTDOWN", 112, 64, "the host is down";
+    NoNet = "ENONET", 64, 65534, "the machine is not on the network";
+    NotSup = "ENOTSUP", 65535, 45, "the operation is not supported";
 }
 
 impl core::fmt::Display for Errno {

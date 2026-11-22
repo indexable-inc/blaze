@@ -4,7 +4,7 @@
 //! placer and the run path the same [`Emitted`]. It is the oracle tier: the tier equality harness
 //! (tier_tests.rs) runs it and every other tier against LIR's evaluator.
 
-use blaze_lir::View;
+use blaze_lir::Verified;
 use blaze_own::Alloc;
 use blaze_tier::{Arch, Emitted, Machine, Names, Tier, TierError, TierName};
 
@@ -16,7 +16,7 @@ pub struct Reference;
 impl Tier for Reference {
     const NAME: TierName = TierName::Reference;
 
-    fn emit<'a>(&self, func: View<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
+    fn emit<'a>(&self, func: Verified<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
         if machine.arch != Arch::Arm64 {
             return Err(TierError::Machine { tier: Self::NAME, machine });
         }

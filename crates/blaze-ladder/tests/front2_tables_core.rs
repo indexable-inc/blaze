@@ -35,14 +35,14 @@ use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::lower_fn;
-use blaze_ladder::front2::buckets::{Ask, BucketSource, Buckets, ItemsIndex, TableSet, impl_tables_name, impl_tables_task, inherent_home, row_answers, rows_key, trait_home, write_impl_tables};
+use blaze_ladder::front2::buckets::{Ask, BucketSource, Buckets, ItemsIndex, TableSet, impl_tables_name, impl_tables_task, inherent_home, prepare_home, row_answers, rows_key, trait_home, write_impl_tables};
 use blaze_ladder::front2::tables::recorder::TableRead;
 use blaze_scope::names_cells::NameCell;
 use blaze_ladder::front2::check::{self, BuildOrder, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
 use blaze_ladder::front2::keys::Keys;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_lower::scoped::Prepares;
 use blaze_own::Alloc;
@@ -155,18 +155,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 
@@ -180,13 +180,14 @@ struct Answer {
 
 /// `q` asked alone, in a fresh index over `source`, as the check asks it (`make_once`): its
 /// answer and how many (crate, bucket) it read.
-fn alone<B: BucketSource>(source: &B, records: &'static Records<'static>, keys: &Keys, store: &Store<'_>, q: Ask) -> (Answer, u32) {
+fn alone<B: BucketSource>(source: &B, records: &'static Records<'static>, keys: &mut Keys, store: &mut Store<'static>, q: Ask) -> (Answer, u32) {
     let mut b = Buckets::lazy(records);
+    prepare_home(records, keys, store, q).unwrap_or_else(|e| panic!("{q:?}: prepare coherence: {e}"));
     let home = match q {
-        Ask::Trait(t, shape) => trait_home(records, keys, store, t, shape),
-        Ask::Inherent(shape) => inherent_home(records, keys, shape),
+        Ask::Trait(t, shape) => trait_home(records, keys, store, t, shape).unwrap_or_else(|e| panic!("{q:?}: trait home: {e}")),
+        Ask::Inherent(shape) => inherent_home(records, keys, store, shape).unwrap_or_else(|e| panic!("{q:?}: inherent home: {e}")),
     };
-    source.admit(&mut b, records, keys, home, q).unwrap_or_else(|e| panic!("{q:?}: {e}"));
+    source.admit(&mut b, records, keys, home, q, store.tys.alloc()).unwrap_or_else(|e| panic!("{q:?}: {e}"));
     let (mut candidates, mut negatives) = match q {
         Ask::Trait(t, shape) => (b.trait_candidates(t, shape, home).to_vec(), b.negative_of(t, shape, home).to_vec()),
         Ask::Inherent(shape) => (b.inherent_candidates(shape, home).to_vec(), Vec::new()),
@@ -244,6 +245,7 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
     assert!(fns.len() >= 10, "the root has its fns: {}", fns.len());
 
     // Over the records alone.
+    // Keep the synthetic store frame alive for the `'static` records used by this test.
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the reader's frame")));
     let log: &'static Log<'static> = Box::leak(Box::new(Log::new(crate_names, g)));
     let load: &'static Kept = Box::leak(Box::new(kept));
@@ -253,7 +255,7 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
     // 1. The real check: every fn of the root.
     let start = Instant::now();
     let prepared = Prepares::new_in(g);
-    let mut store = Store::new(front.index.lang("sized"), frame, g);
+    let mut store: Store<'static> = Store::new(front.index.lang("sized"), frame, g);
     let mut buckets: Option<Buckets> = None;
     let mut consts = Consts::default();
     let mut clean = 0usize;
@@ -277,8 +279,6 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
     let asked = buckets.as_ref().map(|b| b.asked()).unwrap_or_default();
     say!("CHECKED {} bodies ({clean} clean) in {} ms; {} questions asked", fns.len(), start.elapsed().as_millis(), asked.len());
     assert!(asked.len() >= 20, "the check asked {} impl questions", asked.len());
-    let keys_map = &front.keys;
-
     // 2. Every crate's impl tables.
     let mut tables = TableSet::new(g);
     let mut crate_keys: Vec<CrateItemKey> = Vec::new();
@@ -360,8 +360,8 @@ fn a_real_check_s_questions_answer_alike_over_the_impl_tables() {
     let (mut over_tables, mut over_index, mut most, mut most_index) = (0u64, 0u64, 0u32, 0u32);
     let mut candidates = 0usize;
     for q in asked.iter() {
-        let (index, index_reads) = alone(&ItemsIndex, records, keys_map, &store, *q);
-        let (t, reads) = alone(&tables, records, keys_map, &store, *q);
+        let (index, index_reads) = alone(&ItemsIndex, records, &mut front.keys, &mut store, *q);
+        let (t, reads) = alone(&tables, records, &mut front.keys, &mut store, *q);
         assert_eq!(t.candidates, index.candidates, "{q:?}: the tables' candidates differ from the index's");
         assert_eq!(t.unread, index.unread, "{q:?}: the tables' unread candidates differ from the index's");
         let shape = match q {

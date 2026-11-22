@@ -220,7 +220,18 @@ pub(crate) fn render<'a>(
                 out.push_str("\n");
             }
             Event::Call(i) => {
-                let r = nested.calls[i as usize].range;
+                let c = nested.calls[i as usize];
+                // An expression call goes under its statement's outer attributes: a false
+                // `cfg` removes it as it removes the statement (the Reference, "Conditional
+                // compilation"; tempo actor.rs:325, `#[cfg(feature = "fuzz")] let details =
+                // serde_json::json!(..);`, whose crate is no name without the feature). A
+                // statement call's path holds its own.
+                if c.attrs.end > c.attrs.start {
+                    copy(&out, c.attrs.start, c.attrs.end - c.attrs.start);
+                    out.push_str(&text[c.attrs.start as usize..c.attrs.end as usize]);
+                    out.push_str("\n");
+                }
+                let r = c.range;
                 let call = &text[r.start as usize..r.end as usize];
                 copy(&out, r.start, r.end - r.start);
                 out.push_str(call);

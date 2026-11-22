@@ -78,6 +78,8 @@ mod handle;
 mod spec;
 // Lists, Texts and `get_or_insert_with` against their std forms.
 mod shapes;
+// `Heap4` against a sorted vector, and its plant's typed control.
+mod heap4;
 
 // ---------------------------------------------------------------------------------------------
 // The counting allocator.

@@ -40,6 +40,7 @@ mod checkout;
 pub mod check_scope;
 pub mod crate_list;
 pub mod fixture;
+pub mod lib_features_record;
 #[cfg(feature = "procs")]
 pub mod procs;
 mod list;

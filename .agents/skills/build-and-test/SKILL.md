@@ -10,9 +10,9 @@ description: "How blaze is built, checked, tested and measured, and how a lane r
 ## blaze-builds-blaze (rule 2)
 
 Interim, by the owner's decision of 2026-11-11: blaze's own tree is built, checked and unit-tested
-in the dev loop with cargo and the pinned nightly (`harness/toolchain`): `cargo +nightly-<date>
+in the dev loop with cargo and the pinned nightly (`pins/toolchain`): `cargo +nightly-<date>
 check -p blaze-engine`, `cargo +nightly-<date> build --release -p blaze-engine`, with
-`LLVM_SYS_231_PREFIX` naming the LLVM `crates/blaze-toolchain/pins/llvm.json` pins (blaze's own copy
+`LLVM_SYS_231_PREFIX` naming the LLVM `pins/llvm.json` pins (blaze's own copy
 under `~/.blaze/native/` serves). On 2026-11-11 that check took under two minutes and a release
 build 292 s on an 18-core Mac, where blaze building blaze took about 80 minutes and 175 GB on 64
 cores. A blaze cargo built is a legal stage 0 and the daily driver. What does not change: blaze must
@@ -45,7 +45,7 @@ See [docs/harness.md](../../../docs/harness.md).
 
 ## own-nightly (rule 8)
 
-blaze is its own toolchain: it builds every project with its pinned nightly (`harness/toolchain`,
+blaze is its own toolchain: it builds every project with its pinned nightly (`pins/toolchain`,
 bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN` and `RUSTC`. Projects pin
 the blaze version, not Rust's.
 
@@ -283,8 +283,8 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   in a shell, the Bash tool's `timeout`, `timeout=` in Python. On expiry take `blaze debug inspect`
   or `blaze slow` before the kill and quote it.
 - The main agent compiles each piece as it is reported, while cargo builds blaze (rule 2):
-  `cargo +<harness/toolchain> check -p <crate> --all-targets`, then
-  `cargo +<harness/toolchain> check --workspace --all-targets` with the piece applied alone onto
+  `cargo +<pins/toolchain> check -p <crate> --all-targets`, then
+  `cargo +<pins/toolchain> check --workspace --all-targets` with the piece applied alone onto
   the last green head; the head moves only if that passes. Errors go back to the lane at once.
 - Rounds on the green head: the one VM builds the whole tree once and runs everything,
   keep-going, every failure handed back with the tree, command and

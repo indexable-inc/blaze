@@ -79,7 +79,7 @@ pub(crate) enum BindItem {
     Goto(Block, PatId),
 }
 
-impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
+impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// Each name `root` binds with its first binding pattern in source order (pre-order, left to
     /// right): the variable every or-alternative's binding of that name binds.
     pub(crate) fn first_binds(&self, root: PatId, out: &mut Vec<(Name, PatId), A>) -> Result<(), Refusal> {

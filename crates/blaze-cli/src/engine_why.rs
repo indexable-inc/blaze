@@ -33,7 +33,7 @@ pub(crate) fn explain(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, 
     let place = &opts.place;
     let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
-    let answer_root = crate::engine_answer::root_name(place.checkout, &opts.tools, frame);
+    let answer_root = crate::engine_answer::root_name(place.checkout, frame);
     let mut text = blaze_own::String::new_in(frame);
     let status = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
         None => {
@@ -55,14 +55,14 @@ pub(crate) fn explain(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, 
             Ok((kept, _)) => {
                 let editions = crate::engine_units::stored_editions(cx, &mut store, &kept.records, frame)?;
                 let names = Names { cx, root, leaves: &pointer.leaves, kept: &kept, editions: &editions, frame };
-                walk(&names, target, &mut text)?
+                walk(&names, target, &mut text, || crate::engine_answer::load_lines(cx, &mut store, pointer.lines, opts.heap.shared()))?
             }
         },
     };
     out.write_all(cx, text.as_bytes())?;
     crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
     drop(store);
-    crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
+    crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
     Ok(status)
 }
 
@@ -182,7 +182,12 @@ fn cell_words(id: &CellId, into: &mut blaze_own::String<&Frame>) {
 }
 
 /// The task `target` names, then each step of why it was entered, into `text`.
-fn walk(names: &Names<'_, '_, '_>, target: &str, text: &mut blaze_own::String<&Frame>) -> Result<Status, CliError> {
+fn walk<'m, 'a>(
+    names: &Names<'_, '_, '_>,
+    target: &str,
+    text: &mut blaze_own::String<&Frame>,
+    load_lines: impl FnOnce() -> Result<Result<crate::engine_lines::Last<'m, 'a>, crate::engine_answer::Unreadable>, CliError>,
+) -> Result<Status, CliError> {
     let (path, item) = match target.split_once("::") {
         Some((path, item)) => (path, Some(item)),
         None => (target, None),
@@ -212,6 +217,36 @@ fn walk(names: &Names<'_, '_, '_>, target: &str, text: &mut blaze_own::String<&F
         line(text, format_args!("{} is no task of the stored answer (request {})", names.label(start)?, kept.answer.serial.0));
         return Ok(Status::FAILED);
     }
+    // A refused body that stands on its reads (FR1): its stored refusal, and the first read
+    // whose move would enter it again. A failed body whose refusal is not stored is an error.
+    if let Some(row) = kept.answer.rows.get(&start)
+        && start.kind == Kind::BodyCheck
+        && !kept.answer.owed_tasks.contains_key(&start)
+        && row.reads.iter().all(|(id, saw)| kept.answer.cell(id) == *saw)
+    {
+        let refusal = load_lines()?.and_then(|lines| lines.body_refusal(start).map_err(crate::engine_answer::Unreadable::Lines));
+        match refusal {
+            Ok(Some(cause)) => {
+                let mut trigger = blaze_own::String::new_in(names.frame);
+                if let Some((id, _)) = row.reads.first() {
+                    line_into(&mut trigger, format_args!("{}'s ", names.label(id.of)?));
+                    cell_words(id, &mut trigger);
+                } else {
+                    trigger.push_str("its own key");
+                }
+                line(text, format_args!("stands refused: {cause}; reads {}; would be entered if {trigger} moved", row.reads.len()));
+            }
+            Ok(None) if row.failed => {
+                line(text, format_args!("{}: the failed body's stored refusal is missing", names.label(start)?));
+                return Ok(Status::FAILED);
+            }
+            Ok(None) => {}
+            Err(why) => {
+                line(text, format_args!("{why}"));
+                return Ok(Status::FAILED);
+            }
+        }
+    }
     // One step a task, each task once: the chain ends at the edit, or at a task seen already.
     let mut at = start;
     let mut seen: blaze_own::Vec<Name, &Frame> = blaze_own::Vec::new_in(names.frame);
@@ -232,13 +267,7 @@ fn walk(names: &Names<'_, '_, '_>, target: &str, text: &mut blaze_own::String<&F
                 let mut cell = blaze_own::String::new_in(names.frame);
                 cell_words(&read, &mut cell);
                 let definer = names.label(read.of)?;
-                line(
-                    text,
-                    format_args!(
-                        "{label}: entered in request {n}{latest}: a read moved: {definer}'s {cell} ({:02x}{:02x}.. to {:02x}{:02x}..)",
-                        was.0[0], was.0[1], now.0[0], now.0[1]
-                    ),
-                );
+                line(text, format_args!("{label}: entered in request {n}{latest}: a read moved: {definer}'s {cell} ({was:x} to {now:x})"));
             }
         }
         seen.push(at);
@@ -260,7 +289,7 @@ pub(crate) fn with_kept<R>(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<
     let place = &opts.place;
     let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
-    let answer_root = crate::engine_answer::root_name(place.checkout, &opts.tools, frame);
+    let answer_root = crate::engine_answer::root_name(place.checkout, frame);
     let got = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
         Some(Ok(pointer)) => match crate::engine_answer::load_answer(cx, &mut store, pointer.root, opts.heap.shared())? {
             Ok((kept, _)) => Some(with(&kept)),
@@ -270,6 +299,6 @@ pub(crate) fn with_kept<R>(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<
     };
     crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
     drop(store);
-    crate::store::after_answer_printed(cx, opened.lent, false, phases.clock(), err)?;
+    crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
     Ok(got)
 }

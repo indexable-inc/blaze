@@ -38,8 +38,14 @@ fn resident(region: &Region, at: usize, len: usize) -> usize {
     let page = crate::page_size();
     let mut pages = vec![0u8; len / page]; // alloc: a test's residency vector
     // SAFETY: the range is page-aligned inside the live region; `pages` holds one byte a page.
-    let rc = unsafe { libc::mincore(region.at(at).as_ptr().cast(), len, pages.as_mut_ptr()) };
-    assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+    unsafe {
+        blaze_sys::posix::io::mincore(
+            region.at(at),
+            len,
+            &mut pages,
+        )
+    }
+    .expect("mincore");
     pages.iter().filter(|&&it| it & 1 != 0).count()
 }
 

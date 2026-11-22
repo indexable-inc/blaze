@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "wave-1124-sansio T0 (make the gate real), manifests-check",
+  "area": "Cargo.toml, crates/*/Cargo.toml, scripts/src/bin/thirdparty/manifests.rs",
+  "annoyance": "111 member dependency entries named a sibling by `path = \"../x\"` (or a third-party package by version), and 21 members had no [workspace.dependencies] entry at all, because nothing checked the shape: each new crate copied its neighbour's manifest. [workspace.dependencies] has never been sorted (83 keys sort before the one above them), so 'add it in sorted position' has no meaning while writers append at the end. crates/blaze-comptime is named in the root while its manifest is not yet written.",
+  "workaround": "thirdparty `manifests-check` (a row of tools/gate.txt) refuses a member entry not on `workspace = true` with the line to write, and a member with no root entry; every existing one was rewritten. The unsorted table is held at 83 descents, so a new entry cannot add one.",
+  "fix": "One sort of [workspace.dependencies] by key when no writer is in the root manifest, then DESCENTS = 0 in manifests.rs; a `blaze new` that writes the root entry and the member's `workspace = true` lines itself.",
+  "state": "open"
+}

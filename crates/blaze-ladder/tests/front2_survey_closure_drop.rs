@@ -20,8 +20,8 @@
 //! closure never reaches it; and a closure inside an ADT is imported since the front2 world
 //! answers any checked body's closures (front2/foreign_closures.rs). What the head-first
 //! answer alone decides is an ADT over an async future: selection imports every argument, and
-//! import refuses a future (blaze-typeck instance.rs: `Asked` has no `future_of`, which answers
-//! `Limit::Export`; a `Coroutine` is `BodyTypeInRecord`). [`ASYNC_MAIN`] holds one; its test
+//! import refuses a future (blaze-typeck instance.rs: `Asked` inherits `future_of`, which returns
+//! `Malformed::InstanceImportFuture { block }`; a `Coroutine` is `BodyTypeInRecord`). [`ASYNC_MAIN`] holds one; its test
 //! fails with "selecting a `Drop` impl:" when run.rs `drop_impl` selects instead.
 
 #![feature(allocator_api)]
@@ -197,7 +197,7 @@ fn a_closure_value_has_no_drop_impl_lookup() {
 /// `test an_adt_over_a_future_asks_its_drop_impl_by_its_head ... ok`.
 /// Without run.rs `drop_impl`'s head-first answer (selecting `Drop` at `Held<{future}>`): a
 /// refusal "selecting a `Drop` impl: .." from importing the future (blaze-typeck instance.rs
-/// `import`: `Limit::Export` for `PNode::Future`, `BodyTypeInRecord(Coroutine(` for
+/// `import`: `Malformed::InstanceImportFuture { block }` for `PNode::Future`, `BodyTypeInRecord(Coroutine(` for
 /// `PNode::Coroutine`).
 #[test]
 fn an_adt_over_a_future_asks_its_drop_impl_by_its_head() {

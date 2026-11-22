@@ -12,7 +12,7 @@
 //!   features and `SYSROOT_FEATURES`, as rustc's own build of std asks them) on
 //!   `library/Cargo.lock`, and `blaze-std` (its default features) on the tree's
 //!   `Cargo.lock`. A target's cfgs are those rustc printed for it, as `harness/answers.py`
-//!   recorded them in `crates/blaze-units/src/stdlib/rustc.json` (no compiler is asked).
+//!   recorded them in `pins/answers/rustc.json` (no compiler is asked).
 //! - Packs: one of `library/` (kind 3), one of the blaze crates beneath bstd (kind 3, each
 //!   crate's folder under its path in the tree), and one per registry crate beneath bstd, made
 //!   from the `.crate` the lock pins exactly as `Fetch` makes it (kind 1).
@@ -24,6 +24,10 @@
 //!   library proc macros and build scripts are built against, kept apart from the target side's
 //!   by type. The triples cut are the targets and the macro side's, sorted, each once; one not
 //!   among the pinned nightly's recorded targets is refused by name before anything is resolved.
+//! - With `cfront`, the path of an unpacked blaze LLVM prefix (`llvm.py fetch`), also puts its
+//!   C toolchain helper on the shelf (D174, docs/v2/plan/design/c.md "The toolchain side"):
+//!   `bin/blaze-cfront`, checked against `pins/cfront.json` for the prefix's target, as
+//!   `<shelf>/cfront/<sha256>/blaze-cfront`, beside the clang shelf's `<shelf>/clang/<sha256>/`.
 
 #![feature(allocator_api)]
 
@@ -55,10 +59,13 @@ struct Args {
     write_pin: bool,
     check: bool,
     macro_side: bool,
+    /// D174: an unpacked blaze LLVM prefix whose `bin/blaze-cfront` is put on the shelf
+    /// (`place_cfront`); empty for none.
+    cfront: String,
 }
 
 impl Input for Args {
-    const FIELDS: &'static [&'static str] = &["tree", "targets", "registry", "shelf", "write_pin", "check", "macro_side"];
+    const FIELDS: &'static [&'static str] = &["tree", "targets", "registry", "shelf", "write_pin", "check", "macro_side", "cfront"];
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
             tree: f.str("tree", None)?,
@@ -68,6 +75,7 @@ impl Input for Args {
             write_pin: f.bool("write_pin", Some(false))?,
             check: f.bool("check", Some(false))?,
             macro_side: f.bool("macro_side", Some(false))?,
+            cfront: f.str("cfront", Some(""))?,
         })
     }
 }
@@ -148,10 +156,10 @@ fn layout(files: &Files<'_>, start: &str, alloc: Alloc<'static>) -> Result<Units
 /// A target's cfgs as rustc printed them for the pinned nightly, from the recorded answers: as
 /// blaze-unit-graph takes them, and as the record holds them ((name, value), sorted, each once).
 fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<'static>, Vec<(String, Option<String>)>) {
-    let path = tree.join("crates/blaze-units/src/stdlib/rustc.json");
+    let path = tree.join(blaze_pins::ANSWERS_PATH);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
     let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let Some(target) = data.get("targets").and_then(|t| t.get(triple)) else {
+    let Some(target) =data.get("targets").and_then(|t| t.get(triple)) else {
         fail(&format!("{}: no recorded answers for the target `{triple}`", path.display()))
     };
     let strs = |key: &str| -> Vec<String> {
@@ -185,10 +193,10 @@ fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<
 /// The targets the pinned nightly's answers are recorded for: the keys of `rustc.json`'s
 /// `targets` (the same file `target_desc` reads a target's cfgs from).
 fn recorded_targets(tree: &Path) -> Vec<String> {
-    let path = tree.join("crates/blaze-units/src/stdlib/rustc.json");
+    let path = tree.join(blaze_pins::ANSWERS_PATH);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
     let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let Some(targets) = data.get("targets").and_then(|t| t.as_object()) else {
+    let Some(targets) =data.get("targets").and_then(|t| t.as_object()) else {
         fail(&format!("{}: no `targets` object", path.display()))
     };
     targets.keys().cloned().collect()
@@ -351,12 +359,12 @@ fn resolve(side: &mut Side, root: &str, features: &[&str], target: &'static Targ
     }
     for _ in 0..64 {
         match res.pass().unwrap_or_else(|e| fail(&format!("{}: {e}", side.dir.display()))) {
-            Pass::Done(graph) => {
-                if let Some(id) = graph.unavailable.first() {
-                    let p = lock.package(*id);
-                    fail(&format!("{}: no manifest for {} {}", side.dir.display(), p.name, p.version));
-                }
-                return graph;
+            Pass::Done(graph) => return graph,
+            // A package the graph reaches has no manifest: the cut cannot be made (the graph
+            // offers no units then; blaze-unit-graph `PartialGraph`).
+            Pass::Partial(partial) => {
+                let p = lock.package(partial.missing()[0]);
+                fail(&format!("{}: no manifest for {} {} ({} package(s) missing in all)", side.dir.display(), p.name, p.version, partial.missing().len()));
             }
             Pass::Need(needs) => {
                 for id in needs.iter() {
@@ -622,6 +630,54 @@ fn place(shelf: &Path, digest: &[u8; 32], bytes: &[u8]) -> bool {
     true
 }
 
+/// D174: the blaze-cfront helper of the unpacked blaze LLVM prefix `prefix` on the shelf, as
+/// `<shelf>/cfront/<sha256>/blaze-cfront` (mode 0755). The prefix's `blaze-llvm.json` names its
+/// target; `pins/cfront.json` pins the helper's sha256 for that target, which the bytes must
+/// have. Written to a temporary name and renamed; a helper already there is compared.
+fn place_cfront(tree: &Path, shelf: &Path, prefix: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let json = |path: &Path| -> serde_json::Value {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+        serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())))
+    };
+    let marker = prefix.join("blaze-llvm.json");
+    let built = json(&marker);
+    let Some(target) = built["target"].as_str() else {
+        fail(&format!("{}: no `target`: not a blaze LLVM prefix", marker.display()))
+    };
+    let pin_path = tree.join("pins/cfront.json");
+    let pin = json(&pin_path);
+    let Some(member) = pin["member"].as_str() else { fail(&format!("{}: no `member`", pin_path.display())) };
+    let Some(want) = pin["targets"][target]["sha256"].as_str() else {
+        fail(&format!(
+            "{} pins no helper for {target}: build the LLVM archive with the llvm workflow, then `llvm.py pin`",
+            pin_path.display()
+        ))
+    };
+    let from = prefix.join(member);
+    let bytes = std::fs::read(&from).unwrap_or_else(|e| fail(&format!("{}: {e}", from.display())));
+    let got = Hex::of(&blaze_sha256::digest(&bytes));
+    if got.as_str() != want {
+        fail(&format!("{}: sha256 {got}, {} pins {want} for {target}", from.display(), pin_path.display()));
+    }
+    let dir = shelf.join("cfront").join(want);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| fail(&format!("{}: {e}", dir.display())));
+    let path = dir.join("blaze-cfront");
+    if let Ok(there) = std::fs::read(&path) {
+        if there != bytes {
+            fail(&format!("{}: a helper under this digest holds other bytes; remove it", path.display()));
+        }
+        println!("cfront        {} (already there)", path.display());
+        return;
+    }
+    let temporary = dir.join(format!(".blaze-cfront.{}", std::process::id()));
+    std::fs::write(&temporary, &bytes).unwrap_or_else(|e| fail(&format!("{}: {e}", temporary.display())));
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| fail(&format!("{}: {e}", temporary.display())));
+    std::fs::rename(&temporary, &path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+    println!("cfront        {}", path.display());
+}
+
 fn main() {
     let argument = std::env::args().nth(1).unwrap_or_else(|| fail("usage: toolchain_cut <json>"));
     let args: Args = input::parse(&argument, SCRIPT);
@@ -821,6 +877,9 @@ fn main() {
     }
     written += usize::from(place(&shelf, &id.0, &manifest));
     println!("shelf         {}: {written} files written, {} already there", shelf.display(), packs.len() + 1 - written);
+    if !args.cfront.is_empty() {
+        place_cfront(&tree, &shelf, Path::new(&args.cfront));
+    }
     if args.write_pin {
         std::fs::write(&pinned_path, format!("{id}\n")).unwrap_or_else(|e| fail(&format!("{}: {e}", pinned_path.display())));
         println!("pinned        {}", pinned_path.display());

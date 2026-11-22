@@ -1,0 +1,44 @@
+[package]
+name = "blaze-cad"
+description = "The CAD library a program imports (D183): parts and placed assemblies, rounded edges with a solved distance grid, design checks with three-way verdicts and record keys (min_wall, no_interference, fits_within), mass properties in blaze-units' quantities, glTF export and pictures, one prelude; no_std, no alloc, no registry package"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Base crates only, each on workspace crates alone (D180: no package from a registry).
+[dependencies]
+# Solids, tapes, the inspectors the checks are built on.
+blaze-cad-field.workspace = true
+# The mesher, its piece cache, the verified mesh and its mass integrals.
+blaze-cad-mesh.workspace = true
+# The glTF writer and its scene.
+blaze-cad-out.workspace = true
+# Pictures of a solid.
+blaze-cad-picture.workspace = true
+# `Vec3`, `Aabb3`, `Interval`.
+blaze-math.workspace = true
+# Lengths, angles, densities, masses, volumes at the public boundary (D184).
+blaze-units.workspace = true
+# `Vec`, `Alloc`, the plant seam.
+blaze-own.workspace = true
+# `Show`: findings and verdicts as sentences, printed by integer arithmetic (`Shown` for `{}`).
+blaze-text.workspace = true
+
+[dev-dependencies]
+# Property tests and typed planted-bug controls (D165).
+blaze-sim.workspace = true
+# The PNG's compression level in the hull example.
+blaze-deflate.workspace = true
+# `testing::heap()`: a test's root allocator (D170 C1: no `Global` in tests either).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

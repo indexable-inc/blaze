@@ -1,0 +1,15 @@
+{
+ "id": "sys-imports-no-pinned-nm",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane N7 of the no-C-library change",
+ "where": "pins/clang.json (shelf_programs), pins/rust.txt; crates/blaze-sys/src/macos_block.rs, macos.rs ffi, seatbelt.rs, posix/proc/status.rs",
+ "what": "Writing scripts/src/bin/sys_imports.rs (nm -u over a built blaze-sys rlib): the only pinned llvm-nm is the macOS arm64 shelf's (clang.json: aarch64-unknown-linux-gnu's shelf names nothing) and the Rust pin has no llvm-tools component, so a Linux gate host has no pinned nm to run, and the Mac needs the shelf's path, which nothing prints. Reading blaze-sys for the macOS list also met: crates/blaze-sys/src/macos_block.rs is declared by no `mod` (it reads like compiled code and is not), and `clonefile` and `__error` are each declared twice (macos.rs's ffi and posix/proc/status.rs; macos.rs's ffi and seatbelt.rs), against rule 30.",
+ "cost": "about twenty minutes of grepping for an nm and checking which files are compiled",
+ "cause": "the shelf pins only what native build scripts start; the orphan file and the second declarations came from parallel lanes",
+ "whys": "no check asks for a binary-level tool on every host; nothing refuses a .rs file under src/ that no module declares",
+ "class": "a tool a gate needs that is pinned on one host only; a source file that is not compiled",
+ "prevention": "pin llvm-nm for every host (the shelf's row for Linux hosts, or llvm-tools in pins/rust.txt), and a docs-style check that every .rs under a crate's src/ is reached by a `mod` or `#[path]`",
+ "annoyance": "the sys_imports input takes `nm` as a path because no pinned one exists everywhere",
+ "workaround": "the coordinator passes the shelf's <shelf>/bin/llvm-nm on the Mac, or any llvm-nm on Linux (llvm-nm reads ELF and Mach-O on any host)",
+ "state": "open"
+}

@@ -142,7 +142,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Cargo is the dev-loop builder for now; blaze still builds itself and makes every verdict.
 - **7. verify-on-real-projects**: Judge blaze by real projects it builds passing their own tests, never against cargo.
-- **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
+- **8. own-nightly**: Each project builds with `pins/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
 - **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
 - **35. fan-out-write-only**: Lanes write and check their own crate through the one build lock; the main agent admits the tree.

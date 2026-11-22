@@ -662,6 +662,9 @@ fn lower_cx<'w, T>(w: &'w CrateWalk<'w, T>, facts: &CrateFacts<'w>, entry: bool)
         walked: &w.tree,
         procs: ProcDecls::Text,
         entry,
+        // The proc-macro harness (D175) is made by blaze-scope's cells driver only: this source
+        // answers no `CallRole::ProcMacroHarness` call yet, so it writes none.
+        harness: false,
         order: AttrOrder::Written,
     }
 }

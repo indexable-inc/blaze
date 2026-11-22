@@ -365,3 +365,29 @@ impl ContentHash for LangItem {
         h.tag(*self as u8);
     }
 }
+
+impl LangItem {
+    /// Every lang item in declaration order: `ALL[i] as u8 == i`, the tag its content hash
+    /// and the checked-body record ([`crate::checked_record`]) write. The one home of the list
+    /// (blaze-ladder's front2/langs.rs `ALL` names this one; tests/front2_bounds.rs checks its
+    /// length against `variant_count` and its order, so a new variant cannot be left out).
+    pub const ALL: [LangItem; 98] = {
+        use LangItem::*;
+        [
+            Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
+            BitXorAssign, ShlAssign, ShrAssign, Neg, Not, PartialEq, PartialOrd, Index, IndexMut, FnOnce, FnMut, Fn, MetaSized, PointeeSized, Clone, Send, Sync, Unpin, Drop, Destruct, Tuple,
+            Unsize, CoerceUnsized, DispatchFromDyn, FnPtrTrait, FnOnceOutput, Pointee, Metadata, DynMetadata, DiscriminantKind, Discriminant, PhantomData, OwnedBox, CStr, ManuallyDrop, Future,
+            IntoFuture, FormatArguments, FmtDisplay, FmtDebug, FmtLowerHex, FmtUpperHex, FmtOctal, FmtBinary, FmtLowerExp, FmtUpperExp, FmtPointer, PanicBoundsCheck, IntoIterIntoIter,
+            IteratorNext, OptionSome, OptionNone, TryTraitBranch, TryTraitFromResidual, ControlFlowContinue, ControlFlowBreak, Range, RangeFrom, RangeTo, RangeFull, RangeInclusiveNew,
+            RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
+            Freeze,
+            AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
+        ]
+    };
+
+    /// The lang item whose tag (`as u8`) is `tag`, or `None` for a byte no item has.
+    pub fn of_tag(tag: u8) -> Option<LangItem> {
+        let item = *LangItem::ALL.get(usize::from(tag))?;
+        (item as u8 == tag).then_some(item)
+    }
+}

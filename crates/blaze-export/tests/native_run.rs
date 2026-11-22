@@ -24,7 +24,7 @@
 //!
 //! Ignored: they need the pinned C toolchain unpacked on the shelf
 //! (`$HOME/.blaze/v2/toolchain/clang/<sha256>`, the digest from
-//! `blaze_build_script::toolchain::PIN`) and run the exported files. The integrator runs them by
+//! `blaze_pins::CLANG_JSON`) and run the exported files. The integrator runs them by
 //! name on an arm64 Mac: `cargo test -p blaze-export --test native_run -- --ignored --nocapture`.
 //!
 //! The test is a driver at the edge: it names the clock, the file system, `HOME` and the process
@@ -38,7 +38,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-use blaze_build_script::toolchain::{PIN, clang_pin};
+use blaze_build_script::toolchain::clang_pin;
+use blaze_pins::CLANG_JSON as PIN;
 use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Symbol, Target};
 use blaze_code::unwind::{self, Action, Frame, Row};
 use blaze_export::{CExport, Entry, Function, Panic, Platform, ProgramIn, Tier, export};
@@ -46,7 +47,7 @@ use blaze_hash::FixedState;
 use blaze_native::Platform as NativePlatform;
 use blaze_native::image::{Image, Region};
 use blaze_native::layout::{Layout, lay};
-use blaze_native::libraries::{Library, LibraryKind};
+use blaze_native::libraries::{Library, LibraryKind, Linked, Source, source};
 use blaze_native::resolve::{Input, InputKind, Origin, Wanted, plan};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -59,7 +60,7 @@ const RET: u32 = 0xD65F_03C0;
 const MOV_W0_1: u32 = 0x5280_0020;
 const MOV_W0_42: u32 = 0x5280_0540;
 
-/// The host's row in the pin table (crates/blaze-toolchain/pins/clang.json).
+/// The host's row in the pin table (pins/clang.json).
 const HOST: &str = "aarch64-apple-darwin";
 const CLANG_DEADLINE: Duration = Duration::from_secs(60);
 const RUN_DEADLINE: Duration = Duration::from_secs(20);
@@ -79,7 +80,14 @@ extern "C" int native_throw_catch(int value) {
 const THROW_CATCH_ROOTS: &[&[u8]] = &[b"_native_throw_catch"];
 /// `__cxa_throw`, `__gxx_personality_v0` and `typeinfo for int` are libc++abi's, which
 /// libc++.1.dylib re-exports.
-const THROW_CATCH_LIBRARIES: &[Library<'static>] = &[Library { kind: LibraryKind::Dylib, name: "c++" }];
+/// `-lc++` linked as the macOS 27.2 SDK's `usr/lib/libc++.tbd` states it (blaze-native
+/// libraries.rs: a macOS library's install name is its stub's, read).
+fn throw_catch_libraries() -> &'static [Linked<'static>] {
+    let Ok(Source::Stub(at)) = source(NativePlatform::MacosArm64, Library { kind: LibraryKind::Dylib, name: "c++" }) else { panic!("`c++` is named by its stub") };
+    let stub: &'static [u8] = b"--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\ninstall-name: '/usr/lib/libc++.1.dylib'\n...\n";
+    let linked = at.linked(stub).unwrap_or_else(|e| panic!("the stub of `c++`: {e}"));
+    Box::leak(Box::new([linked]))
+}
 
 /// Test 2's native code: the callback's caller keeps a frame (the `return 1` after the call is
 /// no tail call), so the unwinder must walk through a C frame.
@@ -203,7 +211,7 @@ fn export_and_run(program: &ProgramIn<'_>, dir: &Path) -> ExitStatus {
 fn cxx_throw_is_caught_inside_the_native_code() {
     let dir = scratch("throw-catch");
     let object = compile(THROW_CATCH, "throw_catch", &dir);
-    let image = native(&object, "throw_catch.o", Wanted { roots: THROW_CATCH_ROOTS, rust: &[], libraries: THROW_CATCH_LIBRARIES });
+    let image = native(&object, "throw_catch.o", Wanted { roots: THROW_CATCH_ROOTS, rust: &[], libraries: throw_catch_libraries() });
     // main: w0 = 42; w0 = native_throw_catch(w0); exit(w0).
     let main = rec(
         &[

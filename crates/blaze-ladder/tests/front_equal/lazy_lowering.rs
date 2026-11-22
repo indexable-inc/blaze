@@ -17,7 +17,7 @@ use crate::front2::program::{lazy::LazyProgram, run_entry::root_main};
 use crate::program_texts::ProgramTexts;
 use crate::refusal::SourceFile;
 use crate::run::NewFront;
-use crate::run::make_one::{CheckCount, LoweringCounts, MakerState, make_instance};
+use crate::run::make_one::{CheckCount, LoweringCounts, MakerState, SecondCheck, make_instance};
 use crate::seam::FrontEnd;
 use crate::symbols::{decode_instance, encode_instance};
 
@@ -72,7 +72,7 @@ impl<'n> Side<'n> {
 
     fn make(&mut self, item: ItemKey, name: &[u8], alloc: Alloc<'static>) -> AVec<'static, u8> {
         let mut bytes = AVec::new_in(alloc);
-        make_instance(&mut self.program, &mut self.state, &mut self.checks, item, name, &mut bytes)
+        make_instance(&mut self.program, &mut SecondCheck, &mut self.state, &mut self.checks, item, name, &mut bytes)
             .unwrap_or_else(|e| panic!("make instance {item:?}: {e}"));
         bytes
     }
@@ -244,7 +244,7 @@ pub extern "C" fn main() -> u32 {
         let [project, closed, ready, grow] = ["project", "closed", "ready", "grow"].map(key);
         for owner in [project, closed, ready, grow] {
             for side in [&mut new, &mut old] {
-                side.state.ensure(&mut side.program, owner, &mut side.checks).unwrap().expect("a fixture body");
+                side.state.ensure(&mut side.program, &mut SecondCheck, owner, &mut side.checks).unwrap().expect("a fixture body");
             }
         }
         let u32_ty = PNode::Uint(UintTy::U32);

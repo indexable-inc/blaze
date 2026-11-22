@@ -486,7 +486,7 @@ builds it in a few minutes on the same machine. Its build needs `nix develop .#b
 ## Fairness
 
 - Same machine, same source, same moment: the two builds alternate after every edit.
-- Same toolchain on both sides: the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`;
+- Same toolchain on both sides: the pinned nightly (`pins/toolchain`, `nightly-2026-10-25`;
   the runs dated before 2026-10-25 were on Rust 1.99.0), from the flake's
   `devShells.bench`, which also pins LLVM 23 for the LLVM tier.
 - Cargo is warm and incremental: the dev profile's default (`CARGO_INCREMENTAL` unset).
@@ -530,7 +530,7 @@ into a target directory of its own, right after plain cargo, on the same source:
 The flags go in through `--config target.'cfg(all())'.rustflags`, which cargo adds to each
 project's own (helix sets `--cfg tokio_unstable` there; `RUSTFLAGS` would replace it).
 `-Zshare-generics` is not a column: it is already on in every debug build. The nightly is
-`harness/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
+`pins/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
 the flake (`BLAZE_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
 after that.
 
@@ -743,7 +743,7 @@ writes the table to the run's summary and fails.
 
 ## Run it yourself
 
-As v1 was measured (against v2 this stops where [the top of the page](#benchmarks) says), on any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
+As v1 was measured (against v2 this stops where [the top of the page](#benchmarks) says), on any of the platforms with Nix (or with the pinned nightly of `pins/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
 
 ```
 nix develop .#bench

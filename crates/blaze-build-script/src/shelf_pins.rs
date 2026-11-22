@@ -1,6 +1,6 @@
 //! shelf-pins (main's design, wave 3): the shelf's programs are pinned one by one.
 //!
-//! The pin table ([`crate::toolchain::PIN`], `crates/blaze-toolchain/pins/clang.json`) pins the whole
+//! The pin table ([`blaze_pins::CLANG_JSON`], `pins/clang.json`) pins the whole
 //! archive by its SHA-256 (`targets`). Beside it, `shelf_programs` holds per host target one row
 //! per program placed on the shelf (clang-23, libclang.dylib, lld, llvm-ar, llvm-nm): the
 //! member's path in the archive (`member`, under the archive's top folder) and the member's own
@@ -20,7 +20,9 @@
 
 use blaze_own::{AVec, Alloc, Vec};
 
-use crate::toolchain::{PIN_PATH, SHELF_MEMBERS, hex32, object, scalar};
+use blaze_pins::CLANG_PATH;
+
+use crate::toolchain::{SHELF_MEMBERS, hex32, object, scalar};
 
 /// One program's row: the archive member and its SHA-256.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,19 +68,19 @@ impl core::fmt::Display for Hex<'_> {
 impl core::fmt::Display for ShelfPinError<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ShelfPinError::NoTable { target } => write!(f, "{PIN_PATH}: no `shelf_programs` row for {target}: no program is placed on its shelf (shelf-pins)"),
+            ShelfPinError::NoTable { target } => write!(f, "{CLANG_PATH}: no `shelf_programs` row for {target}: no program is placed on its shelf (shelf-pins)"),
             ShelfPinError::NoProgram { target, program } => {
-                write!(f, "{PIN_PATH}: {target}'s `shelf_programs` has no row `{program}`: it is not on the shelf and cannot be granted (shelf-pins)")
+                write!(f, "{CLANG_PATH}: {target}'s `shelf_programs` has no row `{program}`: it is not on the shelf and cannot be granted (shelf-pins)")
             }
             ShelfPinError::NoRow { target, member } => {
-                write!(f, "{member}: no row of {PIN_PATH}'s `shelf_programs` for {target} pins this archive member: it is not placed on the shelf (shelf-pins)")
+                write!(f, "{member}: no row of {CLANG_PATH}'s `shelf_programs` for {target} pins this archive member: it is not placed on the shelf (shelf-pins)")
             }
             ShelfPinError::Malformed { target, program, field } => {
-                write!(f, "{PIN_PATH}: {target}'s shelf program `{program}` has no `{field}` of its form (shelf-pins)")
+                write!(f, "{CLANG_PATH}: {target}'s shelf program `{program}` has no `{field}` of its form (shelf-pins)")
             }
             ShelfPinError::Differs { target, member, want, got } => write!(
                 f,
-                "{member}: sha256 {} after extraction, but {PIN_PATH}'s `shelf_programs` for {target} pins {}: it is not placed on the shelf (shelf-pins)",
+                "{member}: sha256 {} after extraction, but {CLANG_PATH}'s `shelf_programs` for {target} pins {}: it is not placed on the shelf (shelf-pins)",
                 Hex(got),
                 Hex(want)
             ),
@@ -113,7 +115,7 @@ fn program_row<'t>(row: &'t str, target: &'t str, program: &'t str) -> Result<Sh
     Ok(ShelfProgram { name: program, member, shelf_path, sha256 })
 }
 
-/// Every row of `target`'s table in `text` ([`crate::toolchain::PIN`]), in `names`' (sorted)
+/// Every row of `target`'s table in `text` ([`blaze_pins::CLANG_JSON`]), in `names`' (sorted)
 /// order; a name out of order or given twice is refused (field `names`).
 pub fn shelf_programs<'t, 'a>(text: &'t str, target: &'t str, alloc: Alloc<'a>) -> Result<AVec<'a, ShelfProgram<'t>>, ShelfPinError<'t>> {
     let (row, names) = table(text, target)?;

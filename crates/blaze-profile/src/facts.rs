@@ -283,7 +283,7 @@ pub struct TestRunRow {
     blaze::process_static,
     reason = "drained by each history flush: bounded by the children one flush interval reaps"
 )]
-static CHILDREN: blaze_queue::SegQueue<ProcessRow> = blaze_queue::SegQueue::new();
+static CHILDREN: blaze_queue::SegQueue<ProcessRow, Global> =blaze_queue::SegQueue::new();
 
 /// Has every child a driver reaps from now on queued as a `processes` row, each label naming
 /// the build this thread works for and the span it is inside ([`crate::flight::current_build`],

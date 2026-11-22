@@ -6,18 +6,18 @@ runs no rustc.
 
     answers.py --write   write what rustc answers into blaze's data
 
-The data is crates/blaze-units/src/stdlib/rustc.json, of the toolchain in harness/toolchain,
-which blaze's target table reads. The target specs depend on the host rustc was built for (x86-64 Linux's links with its
+The data is pins/answers/rustc.json, of the toolchain in pins/toolchain, which blaze's target
+table reads (blaze-pins checks at compile time that its `version` and commit are rust.txt's). The target specs depend on the host rustc was built for (x86-64 Linux's links with its
 own lld): --write keeps those of the other hosts and writes this host's, so it is run on each
 host CI has (Linux x86-64 and AArch64, macOS arm64). On a host not written (Windows) blaze
 answers the spec all written hosts print, and has no answer of one they differ on.
 """
 import concurrent.futures, json, os, subprocess, sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
-DATA = os.path.join(ROOT, "crates/blaze-units/src/stdlib", "rustc.json")
+import toolchain_pins
+
+TOOLCHAIN = toolchain_pins.toolchain()
+DATA = toolchain_pins.ANSWERS
 TARGETS = [
     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin",

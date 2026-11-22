@@ -20,6 +20,7 @@
 //!
 //! [`Seeker`] seeks a batch of keys in ascending order, each from where the one before it ended,
 //! so the rows' pages are touched in ascending order and a page the keys share is probed once.
+#![blaze::sans_io]
 
 use core::cmp::Ordering;
 
@@ -39,12 +40,59 @@ pub const fn most_probes(n: usize) -> u32 {
 
 /// A key's first eight bytes, big-endian, zeros past a shorter key's end: monotone in the
 /// bytes' order for keys of one length.
+///
+/// And for keys of any lengths, one way: `prefix(a) < prefix(b)` implies `a < b` in the bytes'
+/// (lexicographic) order. At the first of the eight places where the zero-padded words differ,
+/// either both keys have a byte there and `a`'s is the smaller, or `a` has ended (its pad is 0)
+/// and `b` has a byte above 0 there, so `a` is a proper prefix of `b`; `b` ending first cannot
+/// make its pad the larger. So [`order_by_prefix`] is the bytes' order with the bytes compared
+/// only where the words tie.
 #[inline]
 pub fn prefix(key: &[u8]) -> u64 {
+    if let Some(head) = key.first_chunk::<8>() {
+        return u64::from_be_bytes(*head);
+    }
     let mut word = [0u8; 8];
-    let take = key.len().min(8);
-    word[..take].copy_from_slice(&key[..take]);
+    word[..key.len()].copy_from_slice(key);
     u64::from_be_bytes(word)
+}
+
+/// [`prefix`] of `bytes[start..start + len]`, which lies inside `bytes`: read as one eight-byte
+/// load where `bytes` holds eight bytes from `start` (a short key's bytes past its end masked
+/// off), so a name in a string table costs no byte loop and no call. Panics where the range is
+/// not inside `bytes`, as indexing does.
+#[inline]
+pub fn prefix_in(bytes: &[u8], start: usize, len: usize) -> u64 {
+    let key = &bytes[start..start + len];
+    if let Some(head) = key.first_chunk::<8>() {
+        return u64::from_be_bytes(*head);
+    }
+    // `len` is below 8 here: the shift is below 64, and at 0 the mask keeps nothing.
+    match bytes[start..].first_chunk::<8>() {
+        Some(eight) => u64::from_be_bytes(*eight) & !(u64::MAX >> (8 * len)),
+        None => prefix(key),
+    }
+}
+
+/// `a.cmp(b)`, the bytes' order, with `a`'s [`prefix`] already in hand as `a_prefix` and `b`'s
+/// as `b_prefix`: the words decide unless they tie, and only then are the bytes compared (see
+/// [`prefix`] for why the two orders agree). For keys that are digests the words tie only on
+/// the row sought, so a search over them calls `memcmp` once.
+#[inline]
+pub fn order_by_prefix(a_prefix: u64, a: &[u8], b_prefix: u64, b: &[u8]) -> Ordering {
+    a_prefix.cmp(&b_prefix).then_with(|| a.cmp(b))
+}
+
+/// Estimates `distance * n / span` for a prefix distance in `0..=span` and a nonzero span.
+/// Keeping the span's top 32 bits makes the product fit in a u64. When bits are dropped,
+/// the shifted span is at least 2^31 and each operand loses less than one shifted unit.
+/// The ratio changes by less than 1 / 2^31, so for n < 2^32 the integer estimates differ
+/// by at most ceil(n / 2^32) + 1 rows.
+#[inline]
+pub fn interpolated_offset(distance: u64, span: u64, n: u32) -> u64 {
+    debug_assert!(span != 0 && distance <= span);
+    let shift = (u64::BITS - span.leading_zeros()).saturating_sub(u32::BITS);
+    ((distance >> shift) * u64::from(n)) / (span >> shift)
 }
 
 /// The key of row `i` of `rows`: `key_len` bytes `key_at` bytes into it, rows `width` bytes
@@ -88,9 +136,18 @@ pub fn seek_from<'a>(
     while lo < hi {
         let at = if guesses + 1 < INTERPOLATIONS && most > least {
             guesses += 1;
-            // `want - least <= most - least < span`, so the guess is in `lo..hi`.
-            let span = u128::from(most - least) + 1;
-            lo + ((u128::from(want - least) * (hi - lo) as u128) / span) as usize
+            let distance = want - least;
+            let count = hi - lo;
+            // The inclusive span of the whole prefix space is 2^64. Its exact quotient
+            // is the high half of the product, including for counts wider than u32.
+            let offset = match (most - least).checked_add(1) {
+                None => ((u128::from(distance) * count as u128) >> u64::BITS) as usize,
+                Some(span) => match u32::try_from(count) {
+                    Ok(n) => interpolated_offset(distance, span, n) as usize,
+                    Err(_) => ((u128::from(distance) * count as u128) / u128::from(span)) as usize,
+                },
+            };
+            lo + offset.min(count - 1)
         } else if guesses + 1 == INTERPOLATIONS && hi - lo > 2 * FENCE && moved.is_some() {
             // The last guess's slot is a fence: guesses that all landed on one side of the key
             // leave the other end of the range where it began (the run's end, a whole run
@@ -106,16 +163,20 @@ pub fn seek_from<'a>(
             lo + (hi - lo) / 2
         };
         let probe = key_of(at);
-        match probe.cmp(key) {
+        // The probe's prefix is wanted for the bounds anyway; it decides the order too, and the
+        // bytes are compared only when it ties with the key's (`order_by_prefix`: the same order
+        // as `probe.cmp(key)`, so the same probes and the same answer).
+        let probe_prefix = prefix(probe);
+        match order_by_prefix(probe_prefix, probe, want, key) {
             Ordering::Equal => return Ok(at),
             Ordering::Less => {
                 lo = at + 1;
-                least = prefix(probe);
+                least = probe_prefix;
                 moved = Some(Ordering::Less);
             }
             Ordering::Greater => {
                 hi = at;
-                most = prefix(probe);
+                most = probe_prefix;
                 moved = Some(Ordering::Greater);
             }
         }
@@ -331,6 +392,50 @@ mod tests {
         );
         assert!(held_pages < 3.0 && absent_pages < 3.0, "pages a lookup: {held_pages:.2} held, {absent_pages:.2} absent");
         assert!(held_probes < 8.0 && absent_probes < 8.0, "probes a lookup: {held_probes:.2} held, {absent_probes:.2} absent");
+    }
+
+    /// A byte of a drawn key: few values, zero among them, so keys share prefixes, one ends
+    /// where another has a zero byte, and words tie often.
+    fn key_byte(tape: &blaze_sim::Tape) -> u8 {
+        [0u8, 1, b'a', b'b', 0xff][tape.index(5, "byte")]
+    }
+
+    /// The prefix-first order is the bytes' order for keys of ANY two lengths (0 to 12 bytes),
+    /// and `prefix_in` is `prefix` of the range at every start and length of a drawn buffer,
+    /// with eight bytes after the range and without. The twin of the comparison `seek_from` and
+    /// `ScopeView::get` make: the old one was `a.cmp(b)`. Prints nothing.
+    #[test]
+    fn the_prefix_order_is_the_bytes_order() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let a: Vec<u8> = tape.vec(0..=12, "a", key_byte);
+            let b: Vec<u8> = if tape.coin("b from a") {
+                let mut b: Vec<u8> = Vec::new();
+                b.extend_from_slice(&a[..tape.index(a.len() + 1, "cut")]);
+                b.extend(tape.vec(0..=4, "b tail", key_byte));
+                b
+            } else {
+                tape.vec(0..=12, "b", key_byte)
+            };
+            assert_eq!(order_by_prefix(prefix(&a), &a, prefix(&b), &b), a.cmp(&b), "{a:x?} against {b:x?}");
+            if prefix(&a) < prefix(&b) {
+                assert!(a < b, "{a:x?} has the smaller prefix but is not below {b:x?}");
+            }
+            let buffer: Vec<u8> = tape.vec(0..=24, "buffer", key_byte);
+            for start in 0..=buffer.len() {
+                for len in 0..=buffer.len() - start {
+                    assert_eq!(prefix_in(&buffer, start, len), prefix(&buffer[start..start + len]), "{start}+{len} of {buffer:x?}");
+                }
+            }
+        });
+    }
+
+    /// A planted comparison that drops the tie-break (words alone) must be caught by the order
+    /// oracle above: keys of one prefix and different tails differ under it. Prints nothing.
+    #[test]
+    fn the_prefix_order_oracle_catches_a_missing_tie_break() {
+        let (a, b) = (*b"abcdefgh1", *b"abcdefgh2");
+        assert_eq!(order_by_prefix(prefix(&a), &a, prefix(&b), &b), Ordering::Less);
+        assert_ne!(prefix(&a).cmp(&prefix(&b)), a.cmp(&b), "the plant: words alone tie here");
     }
 
     /// The bound is a binary search's plus the guesses. Prints nothing.

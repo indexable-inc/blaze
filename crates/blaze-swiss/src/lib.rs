@@ -24,11 +24,21 @@
 // `core::hint::prefetch_read`: a batch's lookups start every home group's load before the
 // first probe, so their misses overlap ([`Index::find_many`], `blaze_hash`'s `get_many`).
 #![feature(hint_prefetch)]
+// blaze's lints and its core marker name their tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+// No IO, no clock, no environment, no process state: atomics, the allocator an `Index` is
+// handed, and backoffs bounded by a `BackoffLimits` value (`sync`).
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
 #![deny(unsafe_code)]
 
-// The tests' threads, collections and global allocator: `core` has none.
+// The tests' threads, collections and counting allocator: `core` has none.
 #[cfg(test)]
 extern crate std;
+
+use blaze_own::planted::{NoPlant, Planted, Plants};
 
 use core::{alloc::Allocator, fmt};
 
@@ -211,8 +221,8 @@ pub fn find<const SLOTS: usize, T>(
     hash: u64,
     tag: u8,
     groups: usize,
-    mut ctrl: impl FnMut(usize) -> Ctrl<SLOTS>,
-    mut hit: impl FnMut(At<SLOTS>) -> Option<T>,
+    ctrl: impl FnMut(usize) -> Ctrl<SLOTS>,
+    hit: impl FnMut(At<SLOTS>) -> Option<T>,
 ) -> Option<T> {
     find_or_vacant(hash, tag, groups, ctrl, hit).ok()
 }
@@ -446,20 +456,23 @@ impl<A: Allocator + Clone> Drop for Growing<'_, A> {
     }
 }
 
-/// The ratchet's (tools/ratchets): an index in a default allocator, for the callers that made
-/// one by `Index::new()` before it named its allocator. New code calls [`Index::new_in`].
-impl<A: Allocator + Clone + Default> Default for Index<A> {
-    fn default() -> Index<A> {
-        Index::new_in(A::default())
-    }
+// `Default` and `Index::new()` (an index in `A::default()`, an allocator chosen by no caller:
+// ambient, D170 C1) were removed on 2026-11-20; nothing in the tree called either.
+// [`Index::new_in`] is the one constructor.
+
+/// The bugs a model test plants in an [`Index`]'s growth, through the [`Planted`] seam
+/// (`blaze_own::planted`, D165). Shipped code passes [`NoPlant`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IndexPlant {
+    /// The index as it is.
+    #[cfg_attr(not(all(test, blaze_check)), expect(dead_code, reason = "named by the model tests alone"))]
+    None,
+    /// [`Built::publish`] swaps in what the build saw without re-checking the log under the
+    /// writer's lock: an insert made during the build is lost.
+    SkipsRecheck,
 }
 
-impl<A: Allocator + Clone + Default> Index<A> {
-    /// The ratchet's, as [`Default`]: [`Index::new_in`] of `A::default()`.
-    pub fn new() -> Index<A> {
-        Index::new_in(A::default())
-    }
-}
+impl Plants for IndexPlant {}
 
 impl<A: Allocator + Clone> Index<A> {
     /// An empty index whose tables go in `alloc`: no allocation until the first insert.
@@ -667,17 +680,19 @@ impl<A: Allocator + Clone> Built<'_, A> {
     /// Re-checks the log under the writer's lock, copies the values inserted since
     /// [`Grow::build`] read it, and publishes the level: O(inserts during the build).
     pub fn publish(self, hash_of: impl Fn(u32) -> u64) {
-        let index = self.growing.index;
-        let from = index.table_at(self.level).expect("a growth's level is published");
-        // Relaxed: the writer's lock, which we hold, ordered every logging insert.
-        let logged = index.logged.load(Ordering::Relaxed);
-        copy_log(&self.table, &from.log[self.copied..logged], &hash_of);
-        self.swap();
+        self.publish_planted(hash_of, NoPlant);
     }
 
-    /// The planted bug of the model test: publishing what the build saw, without the re-check.
-    #[cfg(all(test, blaze_check))]
-    fn publish_without_recheck(self) {
+    /// [`Built::publish`] with a plant: [`IndexPlant::SkipsRecheck`] publishes what the build
+    /// saw, without the re-check (the model test's planted bug).
+    pub(crate) fn publish_planted(self, hash_of: impl Fn(u32) -> u64, plant: impl Planted<IndexPlant>) {
+        if !plant.has(IndexPlant::SkipsRecheck) {
+            let index = self.growing.index;
+            let from = index.table_at(self.level).expect("a growth's level is published");
+            // Relaxed: the writer's lock, which we hold, ordered every logging insert.
+            let logged = index.logged.load(Ordering::Relaxed);
+            copy_log(&self.table, &from.log[self.copied..logged], &hash_of);
+        }
         self.swap();
     }
 
@@ -717,7 +732,11 @@ fn put(groups: &[Group], hash: u64, value: u32, publish: Ordering) {
 
 #[cfg(test)]
 mod tests {
-    use std::{alloc::Global, boxed::Box, vec, vec::Vec};
+    use std::{boxed::Box, vec, vec::Vec};
+
+    // The index's tests alone, which a model build leaves out.
+    #[cfg(not(blaze_check))]
+    use blaze_own::testing::heap;
 
     use blaze_sim::{Config, Tape};
 
@@ -959,7 +978,7 @@ mod tests {
     fn index_agrees_with_a_map() {
         let (steps, distinct) = sized!((40_000, 9_000), (600, 150));
         for seed in 0..sized!(4u64, 1) {
-            let mut index = Index::new_in(Global);
+            let mut index = Index::new_in(heap().shared());
             assert_eq!(index.capacity(), 0);
             let mut keys: Vec<u64> = Vec::new();
             let mut model: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
@@ -995,7 +1014,7 @@ mod tests {
     #[test]
     fn find_many_is_find_of_each() {
         blaze_sim::check(Config::cases(CASES), |tape: &Tape| {
-            let index = Index::new_in(Global);
+            let index = Index::new_in(heap().shared());
             let mut keys: Vec<u64> = Vec::new();
             let held = tape.below(sized!(400, 60), "held");
             for _ in 0..held {
@@ -1038,7 +1057,7 @@ mod tests {
 
         const KEYS: usize = sized!(20_000, 400);
         const EARLY: u64 = sized!(100, 20);
-        let index = Index::new_in(Global);
+        let index = Index::new_in(heap().shared());
         let column: Box<[Key]> = (0..KEYS).map(|_| Key::new(u64::MAX)).collect();
         let len = Mutex::new(0usize);
         let intern = |key: u64| -> u32 {
@@ -1084,7 +1103,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn index_groups_never_straddle_a_line() {
-        let index = Index::new_in(Global);
+        let index = Index::new_in(heap().shared());
         // Under Miri, enough for six levels: the sixth (32 groups) is made at the 73rd value.
         let keys: Vec<u64> = (0..sized!(5_000, 200)).collect();
         for (len, &key) in keys.iter().enumerate() {
@@ -1103,7 +1122,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn an_index_allocates_only_to_grow() {
-        let index = blaze_alloc_count::assert_at_most(0, "a new index", || Index::new_in(Global));
+        let index = blaze_alloc_count::assert_at_most(0, "a new index", || Index::new_in(heap().shared()));
         let keys: Vec<u64> = (0..sized!(1_000, 100)).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
@@ -1137,9 +1156,10 @@ mod tests {
 /// finds a value from before the growth and one inserted during it.
 #[cfg(all(test, blaze_check))]
 mod model {
-    use std::{alloc::Global, sync::Arc};
+    use std::sync::Arc;
 
     use blaze_check::thread;
+    use blaze_own::testing::heap;
 
     use super::*;
     use crate::sync::Spin;
@@ -1152,7 +1172,7 @@ mod model {
     #[test]
     fn model_swiss_reader_races_growth() {
         blaze_check::model(|| {
-            let index = Arc::new(Index::new_in(Global));
+            let index = Arc::new(Index::new_in(heap().shared()));
             for value in 0..4u32 {
                 index.insert(value as usize, HASH, value, |_| HASH);
             }
@@ -1185,11 +1205,12 @@ mod model {
 
     /// The swap of a growth built outside the writer's lock: one thread starts the growth,
     /// builds the next level unlocked and publishes it under the lock, while another inserts
-    /// under the lock at any point of that. `recheck: false` is the planted bug, a publish that
-    /// does not re-check the log after the build: the other's value is lost in some schedule.
-    fn swap_keeps_an_insert_during_the_build(recheck: bool) {
+    /// under the lock at any point of that. [`IndexPlant::SkipsRecheck`] is the planted bug, a
+    /// publish that does not re-check the log after the build: the other's value is lost in
+    /// some schedule.
+    fn swap_keeps_an_insert_during_the_build(plant: IndexPlant) {
         blaze_check::model(move || {
-            let index = Arc::new(Index::new_in(Global));
+            let index = Arc::new(Index::new_in(heap().shared()));
             for value in 0..BEFORE_GROWTH {
                 index.insert(value as usize, HASH, value, |_| HASH);
             }
@@ -1213,11 +1234,7 @@ mod model {
             let built = grow.build(|_| HASH);
             {
                 let _len = len.lock();
-                if recheck {
-                    built.publish(|_| HASH);
-                } else {
-                    built.publish_without_recheck();
-                }
+                built.publish_planted(|_| HASH, plant);
             }
             other.join().unwrap();
             assert_eq!(index.level(), 4, "one growth published");
@@ -1233,13 +1250,13 @@ mod model {
 
     #[test]
     fn model_swiss_swap_keeps_an_insert_during_the_build() {
-        swap_keeps_an_insert_during_the_build(true);
+        swap_keeps_an_insert_during_the_build(IndexPlant::None);
     }
 
     /// The control: without the re-check the model finds the lost insert.
     #[test]
     #[should_panic(expected = "kept across the swap")]
     fn model_swiss_swap_without_recheck_loses_an_insert() {
-        swap_keeps_an_insert_during_the_build(false);
+        swap_keeps_an_insert_during_the_build(IndexPlant::SkipsRecheck);
     }
 }

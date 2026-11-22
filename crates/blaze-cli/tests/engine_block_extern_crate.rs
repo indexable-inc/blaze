@@ -182,10 +182,16 @@ fn a_call_through_a_blocks_extern_crate_is_checked_on_the_engine() {
     let clean_errors = errors(&clean);
     assert_eq!(clean_errors, 0, "the clean fixture has errors:\n{clean}");
     assert!(!clean.contains(FINDINGS), "the clean fixture has findings:\n{clean}");
-    // Each item body checked once: the hand-written constant and its block's `f`; `implement!`'s
-    // constant and its block's `f`; `g`. Three tasks: the constant, the call's entry, `g`.
+    // Each item body checked once a view: the hand-written constant and its block's `f`;
+    // `implement!`'s constant and its block's `f`; `g`. Three tasks: the constant, the call's
+    // entry, `g`. `app` is a library, so its test build holds every body too, and D191: "Every
+    // unit that holds a body checks it; the first holder in rank keeps the body's plain name
+    // (the base), each other holder's row is the name at its view": five bodies in three tasks
+    // at the base and at the test build's view (the profile's "base rows 3 checked, view rows 3
+    // checked"). `implement!`'s block's `f` is the block's alone (covered.rs `block_stops`),
+    // never also a body the call wrote: before that, 12 in 6.
     let (items, tasks, uncovered, line) = item_bodies(&ws);
-    assert_eq!((items, tasks), (5, 3), "each item body checked once, the blocks' fns with their constants: {line}\n{}", profile_of(&ws));
+    assert_eq!((items, tasks), (10, 6), "each item body checked once a view (D191: \"Every unit that holds a body checks it\"), the blocks' fns with their constants: {line}\n{}", profile_of(&ws));
     assert_eq!(uncovered, 0, "no body a macro wrote is left without a task: {line}");
     // The control: `let _x: u32 = T;` beside the block's call. engine-check
     // carries a body's finding count, not yet its words (engine_bodies.rs `note`): the note

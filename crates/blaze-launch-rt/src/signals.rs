@@ -37,6 +37,10 @@ use core::ops::Range;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
+use blaze_sys::posix::{io, signal as os};
+use blaze_sys::posix::types::sighandler_t;
+use blaze_sys::{Errno, Fd};
+
 use crate::retired::Table;
 use crate::sys::{self, SysError};
 
@@ -50,6 +54,17 @@ mod row_model;
 mod tests;
 
 use row::{Busy, Plant, Row, Value};
+
+// The program calls the C library's ABI. macOS uses that same layout in blaze-sys;
+// glibc's action and 1024-bit set are larger than the Linux kernel's forms.
+#[cfg(target_os = "macos")]
+type ProgramAction = os::sigaction;
+#[cfg(target_os = "linux")]
+type ProgramAction = libc::sigaction;
+#[cfg(target_os = "macos")]
+type ProgramMask = os::sigset_t;
+#[cfg(target_os = "linux")]
+type ProgramMask = libc::sigset_t;
 
 /// Which placement path asks [`own`]: the launcher binary (`blaze-launcher`, where the program's
 /// threads must be announced to the core), or the ladder's in-process shortcut (every function
@@ -86,13 +101,13 @@ pub fn own(name: &str, path: Path) -> Option<u64> {
 }
 
 /// The signals the launcher owns, in row order.
-const OWNED: [c_int; 2] = [libc::SIGSEGV, libc::SIGBUS];
+const OWNED: [c_int; 2] = [os::SIGSEGV, os::SIGBUS];
 
 /// Attempts a row read or write makes before the process stops (rule 18).
 pub const TRIES: u32 = 1 << 20;
 
 /// The words of one `sigset_t`.
-const MASK_WORDS: usize = core::mem::size_of::<libc::sigset_t>().div_ceil(8);
+const MASK_WORDS: usize = core::mem::size_of::<ProgramMask>().div_ceil(8);
 
 /// Most launcher threads [`launcher_thread`] marks.
 const LAUNCHER_THREADS: usize = 8;
@@ -130,7 +145,7 @@ pub unsafe fn install<const N: usize>(table: &'static Table<N>, area: Range<usiz
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Err(SysError {
             call: "signals::install a second time (previous would be the launcher's own handler)",
-            errno: libc::EALREADY,
+            errno: i32::from(Errno::Already.raw()),
             at: 0,
             len: 0,
         });
@@ -142,27 +157,25 @@ pub unsafe fn install<const N: usize>(table: &'static Table<N>, area: Range<usiz
     AREA_END.store(area.end, Ordering::Release);
     alternate_stack()?;
     for (slot, &sig) in OWNED.iter().enumerate() {
-        // SAFETY: an all-zero `sigaction` is a valid value of the C struct.
-        let mut before: libc::sigaction = unsafe { core::mem::zeroed() };
-        // SAFETY: reads the current action into a live local; no action is changed.
-        if unsafe { libc::sigaction(sig, ptr::null(), &mut before) } != 0 {
-            return Err(failed("sigaction (reading the launcher's own SIGSEGV/SIGBUS action)"));
-        }
-        if PREVIOUS[slot].replace(&value_of(&before), TRIES, Plant::None).is_err() {
+        let before = os::get_action(sig)
+            .map_err(|error| failed("sigaction (reading the launcher's own SIGSEGV/SIGBUS action)", error))?;
+        let mut mask = [0; MASK_WORDS];
+        #[cfg(target_os = "linux")]
+        { mask[0] = before.sa_mask.0; }
+        #[cfg(target_os = "macos")]
+        { mask[0] = u64::from(before.sa_mask); }
+        let value = Value { handler: before.sa_sigaction, flags: flags_word(before.sa_flags), mask };
+        if PREVIOUS[slot].replace(&value, TRIES, Plant::None).is_err() {
             // Only this call writes `PREVIOUS`, once: a busy row is a second writer.
-            return Err(SysError { call: "signals::install (the previous-action row was busy)", errno: libc::EBUSY, at: 0, len: 0 });
+            return Err(failed("signals::install (the previous-action row was busy)", Errno::Busy));
         }
-        // SAFETY: an all-zero `sigaction` is a valid value of the C struct.
-        let mut ours: libc::sigaction = unsafe { core::mem::zeroed() };
-        ours.sa_sigaction = on_fault as extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) as libc::sighandler_t;
-        ours.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        // SAFETY: empties a live local mask.
-        unsafe { libc::sigemptyset(&mut ours.sa_mask) };
+        let mut ours = os::sigaction::DEFAULT;
+        ours.sa_sigaction = on_fault as extern "C" fn(c_int, *mut os::siginfo_t, *mut c_void) as sighandler_t;
+        ours.sa_flags = os::SA_SIGINFO | os::SA_ONSTACK;
         // SAFETY: `ours` names `on_fault`, which is async-signal-safe and lives as long as the
         // process (a function of this binary).
-        if unsafe { libc::sigaction(sig, &ours, ptr::null_mut()) } != 0 {
-            return Err(failed("sigaction (installing the launcher's fault handler)"));
-        }
+        unsafe { os::set_action(sig, &ours) }
+            .map_err(|error| failed("sigaction (installing the launcher's fault handler)", error))?;
     }
     Ok(())
 }
@@ -171,6 +184,9 @@ pub unsafe fn install<const N: usize>(table: &'static Table<N>, area: Range<usiz
 /// `previous` (the launcher's std handler, which names the launcher's thread) instead of the
 /// default. Called first thing by each launcher thread (the control thread).
 pub fn launcher_thread() -> Result<(), SysError> {
+    #[cfg(target_os = "macos")]
+    let me = blaze_sys::posix::thread::pthread_self() as usize;
+    #[cfg(target_os = "linux")]
     // SAFETY: the calling thread's own handle.
     let me = unsafe { libc::pthread_self() } as usize;
     for row in LAUNCHER.iter() {
@@ -183,7 +199,7 @@ pub fn launcher_thread() -> Result<(), SysError> {
     }
     Err(SysError {
         call: "signals::launcher_thread (every launcher-thread row is taken)",
-        errno: libc::ENOSPC,
+        errno: i32::from(Errno::NoSpc.raw()),
         at: 0,
         len: LAUNCHER_THREADS,
     })
@@ -197,11 +213,15 @@ pub fn launcher_thread() -> Result<(), SysError> {
 /// As libc's `sigaction`: `act` and `old` are each null or point to a live `sigaction`.
 pub unsafe extern "C" fn sigaction(sig: c_int, act: *const libc::sigaction, old: *mut libc::sigaction) -> c_int {
     let Some(slot) = slot(sig) else {
+        #[cfg(target_os = "macos")]
+        // SAFETY: macOS uses the same C action layout. Both pointers satisfy the caller's contract.
+        return unsafe { os::sigaction(sig, act.cast(), old.cast()) };
+        #[cfg(target_os = "linux")]
         // SAFETY: the caller's pointers, as libc's own contract states them.
         return unsafe { libc::sigaction(sig, act, old) };
     };
-    // SAFETY: `act` is null or a live `sigaction` (the caller's contract).
-    let current = match unsafe { act.as_ref() } {
+    // SAFETY: `act` is null or a live C action. ProgramAction has its layout on this target.
+    let current = match unsafe { act.cast::<ProgramAction>().as_ref() } {
         None => match PROGRAM[slot].read(TRIES) {
             Ok(current) => current,
             Err(Busy) => stuck(sig),
@@ -210,7 +230,7 @@ pub unsafe extern "C" fn sigaction(sig: c_int, act: *const libc::sigaction, old:
             let value = value_of(act);
             if let Some(flag) = refused_flag(act.sa_flags) {
                 refuse(sig, flag);
-                set_errno(libc::EINVAL);
+                set_errno(i32::from(Errno::Inval.raw()));
                 return -1;
             }
             // SAFETY: called on this thread with no row write of its own in progress.
@@ -220,8 +240,8 @@ pub unsafe extern "C" fn sigaction(sig: c_int, act: *const libc::sigaction, old:
             }
         }
     };
-    // SAFETY: `old` is null or a live `sigaction` (the caller's contract).
-    if let Some(old) = unsafe { old.as_mut() } {
+    // SAFETY: `old` is null or writable as a C action, with the layout of ProgramAction.
+    if let Some(old) = unsafe { old.cast::<ProgramAction>().as_mut() } {
         *old = action_of(&current);
     }
     0
@@ -234,16 +254,20 @@ pub unsafe extern "C" fn sigaction(sig: c_int, act: *const libc::sigaction, old:
 /// # Safety
 ///
 /// As libc's `signal`: `handler` is SIG_DFL, SIG_IGN or a function taking the signal number.
-pub unsafe extern "C" fn signal(sig: c_int, handler: libc::sighandler_t) -> libc::sighandler_t {
+pub unsafe extern "C" fn signal(sig: c_int, handler: sighandler_t) -> sighandler_t {
     let Some(slot) = slot(sig) else {
+        #[cfg(target_os = "macos")]
+        // SAFETY: the caller supplies SIG_DFL, SIG_IGN or a live one-argument C handler.
+        return unsafe { os::signal(sig, handler) };
+        #[cfg(target_os = "linux")]
         // SAFETY: the caller's handler, as libc's own contract states it.
         return unsafe { libc::signal(sig, handler) };
     };
-    if handler == libc::SIG_ERR {
-        set_errno(libc::EINVAL);
-        return libc::SIG_ERR;
+    if handler == os::SIG_ERR {
+        set_errno(i32::from(Errno::Inval.raw()));
+        return os::SIG_ERR;
     }
-    let value = Value { handler, flags: flags_word(libc::SA_RESTART), mask: [0; MASK_WORDS] };
+    let value = Value { handler, flags: flags_word(os::SA_RESTART), mask: [0; MASK_WORDS] };
     // SAFETY: called on this thread with no row write of its own in progress.
     match unsafe { record(slot, &value) } {
         Ok(before) => before.handler,
@@ -257,21 +281,23 @@ pub unsafe extern "C" fn signal(sig: c_int, handler: libc::sighandler_t) -> libc
 /// `pthread_sigmask` and `sigaction`, which may set it, and a program handler that resumes the
 /// faulting code (a guard-page or write-barrier handler) would otherwise hand that code a
 /// changed `errno` (POSIX, signal concepts: a handler that may return saves and restores it).
-extern "C" fn on_fault(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
+extern "C" fn on_fault(sig: c_int, info: *mut os::siginfo_t, ctx: *mut c_void) {
     let saved = errno();
     dispatch(sig, info, ctx);
     set_errno(saved);
 }
 
 /// [`on_fault`]'s body.
-fn dispatch(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
+fn dispatch(sig: c_int, info: *mut os::siginfo_t, ctx: *mut c_void) {
     let Some(slot) = slot(sig) else {
         // Installed for the owned signals only.
         return;
     };
     // SAFETY: the kernel hands an SA_SIGINFO handler a live `siginfo_t`.
-    let (address, from_fault) = unsafe { ((*info).si_addr() as usize, is_fault((*info).si_code)) };
+    let from_fault = is_fault(unsafe { (*info).si_code });
     if from_fault {
+        // SAFETY: this kernel delivery of SIGSEGV or SIGBUS carries a fault address.
+        let address = unsafe { (*info).si_addr() } as usize;
         let check = RETIRED_AT.load(Ordering::Acquire);
         if !check.is_null() {
             // SAFETY: `install` stored `retired_at::<N>` for its table's `N` in this word, and
@@ -289,7 +315,7 @@ fn dispatch(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
         Ok(program) => program,
         Err(Busy) => stuck(sig),
     };
-    if program.handler != libc::SIG_DFL {
+    if program.handler != os::SIG_DFL {
         // SAFETY: `info` and `ctx` are the kernel's for this delivery.
         unsafe { run(sig, info, ctx, &program, from_fault) };
         return;
@@ -312,25 +338,25 @@ fn dispatch(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
 ///
 /// `info` and `ctx` are the kernel's for this delivery; `action.handler`, when neither SIG_DFL
 /// nor SIG_IGN, is a handler some `sigaction` or `signal` call was given.
-unsafe fn run(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void, action: &Value<MASK_WORDS>, from_fault: bool) {
+unsafe fn run(sig: c_int, info: *mut os::siginfo_t, ctx: *mut c_void, action: &Value<MASK_WORDS>, from_fault: bool) {
     match action.handler {
-        libc::SIG_DFL => default(sig, from_fault),
+        os::SIG_DFL => default(sig, from_fault),
         // A synchronous fault cannot be ignored (the kernel forces the default); a signal a
         // process sent can.
-        libc::SIG_IGN if from_fault => default(sig, from_fault),
-        libc::SIG_IGN => {}
+        os::SIG_IGN if from_fault => default(sig, from_fault),
+        os::SIG_IGN => {}
         handler => {
+            #[cfg(target_os = "linux")]
+            let mask = blaze_sys::linux::SigSet(action.mask[0]);
+            #[cfg(target_os = "macos")]
             let mask = set_of(&action.mask);
-            // SAFETY: an all-zero `sigset_t` is a valid value; filled by the call below.
-            let mut before: libc::sigset_t = unsafe { core::mem::zeroed() };
-            // SAFETY: async-signal-safe; blocks the action's mask on this thread around the
-            // call, as the kernel would have, and puts the thread's mask back after.
-            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut before) };
-            if action.flags & flags_word(libc::SA_SIGINFO) != 0 {
+            // The old out-parameter started empty if blocking the mask failed.
+            let before = os::set_mask(os::SIG_BLOCK, &mask).unwrap_or(os::SIGSET_EMPTY);
+            if action.flags & flags_word(os::SA_SIGINFO) != 0 {
                 // SAFETY: the action was recorded with SA_SIGINFO, so its word is a
                 // three-argument handler (the caller's contract).
                 let handler = unsafe {
-                    core::mem::transmute::<usize, extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void)>(handler)
+                    core::mem::transmute::<usize, extern "C" fn(c_int, *mut os::siginfo_t, *mut c_void)>(handler)
                 };
                 handler(sig, info, ctx);
             } else {
@@ -338,8 +364,7 @@ unsafe fn run(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void, action: 
                 let handler = unsafe { core::mem::transmute::<usize, extern "C" fn(c_int)>(handler) };
                 handler(sig);
             }
-            // SAFETY: puts back the mask read above.
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &before, ptr::null_mut()) };
+            let _ = os::set_mask(os::SIG_SETMASK, &before);
         }
     }
 }
@@ -348,13 +373,10 @@ unsafe fn run(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void, action: 
 /// handler returns; a signal a process sent is raised again (it stays pending while the
 /// handler runs, then the default ends the process).
 fn default(sig: c_int, from_fault: bool) {
-    // SAFETY: an all-zero `sigaction` is SIG_DFL with no flags and an empty mask.
-    let dfl: libc::sigaction = unsafe { core::mem::zeroed() };
     // SAFETY: async-signal-safe; installs the default for `sig`.
-    unsafe { libc::sigaction(sig, &dfl, ptr::null_mut()) };
+    let _ = unsafe { os::set_action(sig, &os::sigaction::DEFAULT) };
     if !from_fault {
-        // SAFETY: async-signal-safe.
-        unsafe { libc::raise(sig) };
+        let _ = os::raise_signal(sig);
     }
 }
 
@@ -374,6 +396,9 @@ unsafe fn retired_at<const N: usize>(address: usize) {
 
 /// Whether the calling thread is one [`launcher_thread`] marked.
 fn is_launcher_thread() -> bool {
+    #[cfg(target_os = "macos")]
+    let me = blaze_sys::posix::thread::pthread_self() as usize;
+    #[cfg(target_os = "linux")]
     // SAFETY: the calling thread's own handle. `pthread_self` is a register or TSD read on
     // macOS and glibc, safe in a signal handler though POSIX does not list it.
     let me = unsafe { libc::pthread_self() } as usize;
@@ -404,25 +429,17 @@ fn is_fault(code: c_int) -> bool {
 /// signal while a write is open; such a re-entry spins [`TRIES`] times and stops).
 unsafe fn record(slot: usize, value: &Value<MASK_WORDS>) -> Result<Value<MASK_WORDS>, Busy> {
     let both = owned_set();
-    // SAFETY: an all-zero `sigset_t` is a valid value; filled by the call below.
-    let mut before: libc::sigset_t = unsafe { core::mem::zeroed() };
-    // SAFETY: async-signal-safe; changes this thread's mask only.
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &both, &mut before) };
+    let before = os::set_mask(os::SIG_BLOCK, &both).unwrap_or(os::SIGSET_EMPTY);
     let wrote = PROGRAM[slot].replace(value, TRIES, Plant::None);
-    // SAFETY: puts back the mask read above.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &before, ptr::null_mut()) };
+    let _ = os::set_mask(os::SIG_SETMASK, &before);
     wrote
 }
 
 /// The set {SIGSEGV, SIGBUS}.
-fn owned_set() -> libc::sigset_t {
-    // SAFETY: an all-zero `sigset_t` is a valid value; emptied and filled below.
-    let mut set: libc::sigset_t = unsafe { core::mem::zeroed() };
-    // SAFETY: a live local set; both calls are async-signal-safe.
-    unsafe { libc::sigemptyset(&mut set) };
+fn owned_set() -> os::sigset_t {
+    let mut set = os::SIGSET_EMPTY;
     for &sig in OWNED.iter() {
-        // SAFETY: as above.
-        unsafe { libc::sigaddset(&mut set, sig) };
+        let _ = os::add_to_set(&mut set, sig);
     }
     set
 }
@@ -431,9 +448,9 @@ fn owned_set() -> libc::sigset_t {
 /// to be reset from inside the handler) and SA_NODEFER (the handler runs with the signal
 /// blocked).
 fn refused_flag(flags: c_int) -> Option<&'static [u8]> {
-    if flags & libc::SA_RESETHAND != 0 {
+    if flags & os::SA_RESETHAND != 0 {
         Some(b"SA_RESETHAND")
-    } else if flags & libc::SA_NODEFER != 0 {
+    } else if flags & os::SA_NODEFER != 0 {
         Some(b"SA_NODEFER")
     } else {
         None
@@ -445,7 +462,7 @@ fn flags_word(flags: c_int) -> u32 {
     u32::from_ne_bytes(flags.to_ne_bytes())
 }
 
-fn value_of(act: &libc::sigaction) -> Value<MASK_WORDS> {
+fn value_of(act: &ProgramAction) -> Value<MASK_WORDS> {
     let mut mask = [0u64; MASK_WORDS];
     // SAFETY: copies the `size_of::<sigset_t>()` bytes of a live set into `MASK_WORDS * 8`
     // bytes, at least as many; the regions are distinct locals.
@@ -453,29 +470,29 @@ fn value_of(act: &libc::sigaction) -> Value<MASK_WORDS> {
         ptr::copy_nonoverlapping(
             ptr::from_ref(&act.sa_mask).cast::<u8>(),
             mask.as_mut_ptr().cast::<u8>(),
-            core::mem::size_of::<libc::sigset_t>(),
+            core::mem::size_of::<ProgramMask>(),
         )
     };
     Value { handler: act.sa_sigaction, flags: flags_word(act.sa_flags), mask }
 }
 
-fn set_of(mask: &[u64; MASK_WORDS]) -> libc::sigset_t {
+fn set_of(mask: &[u64; MASK_WORDS]) -> ProgramMask {
     // SAFETY: an all-zero `sigset_t` is a valid value; overwritten below.
-    let mut set: libc::sigset_t = unsafe { core::mem::zeroed() };
+    let mut set: ProgramMask = unsafe { core::mem::zeroed() };
     // SAFETY: copies `size_of::<sigset_t>()` bytes, no more than `mask` holds, into the set.
     unsafe {
         ptr::copy_nonoverlapping(
             mask.as_ptr().cast::<u8>(),
             ptr::from_mut(&mut set).cast::<u8>(),
-            core::mem::size_of::<libc::sigset_t>(),
+            core::mem::size_of::<ProgramMask>(),
         )
     };
     set
 }
 
-fn action_of(value: &Value<MASK_WORDS>) -> libc::sigaction {
+fn action_of(value: &Value<MASK_WORDS>) -> ProgramAction {
     // SAFETY: an all-zero `sigaction` is a valid value of the C struct.
-    let mut act: libc::sigaction = unsafe { core::mem::zeroed() };
+    let mut act: ProgramAction = unsafe { core::mem::zeroed() };
     act.sa_sigaction = value.handler;
     act.sa_flags = c_int::from_ne_bytes(value.flags.to_ne_bytes());
     act.sa_mask = set_of(&value.mask);
@@ -485,51 +502,38 @@ fn action_of(value: &Value<MASK_WORDS>) -> libc::sigaction {
 /// Gives the calling thread an alternate signal stack when it has none:
 /// `max(SIGSTKSZ, 64 KiB)` rounded to pages, with an inaccessible guard page below it.
 fn alternate_stack() -> Result<(), SysError> {
-    // SAFETY: an all-zero `stack_t` is a valid value; filled by the call below.
-    let mut current: libc::stack_t = unsafe { core::mem::zeroed() };
-    // SAFETY: reads this thread's alternate stack into a live local; changes nothing.
-    if unsafe { libc::sigaltstack(ptr::null(), &mut current) } != 0 {
-        return Err(failed("sigaltstack (reading the thread's alternate stack)"));
-    }
-    if current.ss_flags & libc::SS_DISABLE == 0 {
+    let current = os::alt_stack().map_err(|error| failed("sigaltstack (reading the thread's alternate stack)", error))?;
+    if current.ss_flags & os::SS_DISABLE == 0 {
         return Ok(());
     }
     let page = sys::page()?;
-    let size = core::cmp::max(libc::SIGSTKSZ, 64 << 10).next_multiple_of(page);
+    let size = core::cmp::max(os::SIGSTKSZ, 64 << 10).next_multiple_of(page);
     let whole = size + page;
     // SAFETY: a fresh private anonymous mapping; nothing else names its range.
     let base = unsafe {
-        libc::mmap(ptr::null_mut(), whole, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
-    };
-    if base == libc::MAP_FAILED {
-        return Err(failed("mmap (an alternate signal stack)"));
-    }
+        io::mmap(None, whole, io::Prot::READ | io::Prot::WRITE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0)
+    }.map_err(|error| failed("mmap (an alternate signal stack)", error))?;
     // SAFETY: the mapping's first page, made inaccessible: the guard below the stack.
-    if unsafe { libc::mprotect(base, page, libc::PROT_NONE) } != 0 {
-        return Err(failed("mprotect (the alternate stack's guard page)"));
-    }
-    // SAFETY: an all-zero `stack_t` is a valid value; its fields are set below.
-    let mut stack: libc::stack_t = unsafe { core::mem::zeroed() };
-    stack.ss_sp = base.cast::<u8>().wrapping_add(page).cast::<c_void>();
+    unsafe { io::mprotect(base, page, io::Prot::NONE) }
+        .map_err(|error| failed("mprotect (the alternate stack's guard page)", error))?;
+    let mut stack = os::stack_t::DISABLED;
+    stack.ss_sp = base.as_ptr().wrapping_add(page).cast::<c_void>();
     stack.ss_size = size;
     stack.ss_flags = 0;
     // SAFETY: `size` bytes above the guard page, mapped read+write and never unmapped (the
     // thread keeps the stack for its life; the launcher's threads live as long as the process).
-    if unsafe { libc::sigaltstack(&stack, ptr::null_mut()) } != 0 {
-        return Err(failed("sigaltstack (installing the thread's alternate stack)"));
-    }
-    Ok(())
+    unsafe { os::set_alt_stack(&stack) }
+        .map_err(|error| failed("sigaltstack (installing the thread's alternate stack)", error))
 }
 
-/// The error of `call`, from `errno`.
-fn failed(call: &'static str) -> SysError {
-    SysError { call, errno: errno(), at: 0, len: 0 }
+fn failed(call: &'static str, error: Errno) -> SysError {
+    SysError { call, errno: i32::from(error.raw()), at: 0, len: 0 }
 }
 
 fn errno() -> c_int {
     // SAFETY: the calling thread's errno word.
     #[cfg(target_os = "macos")]
-    let at = unsafe { libc::__error() };
+    let at = unsafe { (io::real().errno)() };
     // SAFETY: as above.
     #[cfg(target_os = "linux")]
     let at = unsafe { libc::__errno_location() };
@@ -540,7 +544,7 @@ fn errno() -> c_int {
 fn set_errno(value: c_int) {
     // SAFETY: the calling thread's errno word.
     #[cfg(target_os = "macos")]
-    let at = unsafe { libc::__error() };
+    let at = unsafe { (io::real().errno)() };
     // SAFETY: as above.
     #[cfg(target_os = "linux")]
     let at = unsafe { libc::__errno_location() };
@@ -549,7 +553,7 @@ fn set_errno(value: c_int) {
 }
 
 fn name(sig: c_int) -> &'static [u8] {
-    if sig == libc::SIGSEGV { b"SIGSEGV" } else { b"SIGBUS" }
+    if sig == os::SIGSEGV { b"SIGSEGV" } else { b"SIGBUS" }
 }
 
 /// A line of at most [`LINE_MAX`] bytes, built by copies only (async-signal-safe).
@@ -588,8 +592,7 @@ impl Line {
 
     /// Writes the line to descriptor 2.
     fn write(&self) {
-        // SAFETY: `at` live bytes of `bytes`; `write` is async-signal-safe.
-        unsafe { libc::write(2, self.bytes.as_ptr().cast(), self.at) };
+        let _ = io::write(Fd::STDERR, &self.bytes[..self.at]);
     }
 }
 
@@ -600,8 +603,7 @@ fn stuck(sig: c_int) -> ! {
     line.put(name(sig));
     line.put(b" action row did not settle in 1048576 tries (signals.rs, rule 18)\n");
     line.write();
-    // SAFETY: async-signal-safe; ends the process.
-    unsafe { libc::_exit(70) }
+    os::exit_now(70)
 }
 
 /// A fault in the launcher's code area outside every retired body: no program code lives in
@@ -614,8 +616,7 @@ fn in_area(sig: c_int, address: usize) -> ! {
     line.hex(address);
     line.put(b" in the launcher's code area, outside every retired body; this is a blaze bug\n");
     line.write();
-    // SAFETY: async-signal-safe; ends the process.
-    unsafe { libc::_exit(134) }
+    os::exit_now(134)
 }
 
 /// A flag the program asked for that this module does not carry out: one line naming it.

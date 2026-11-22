@@ -15,17 +15,18 @@ use std::{
     sync::OnceLock,
 };
 
-use windows_sys::Win32::{
-    Networking::WinSock::{
+use blaze_sys::windows::{
+    Bool, Socket,
+    io::OVERLAPPED,
+    net::{
         AF_INET, AF_INET6, AF_UNIX, AcceptEx, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
-        INVALID_SOCKET, IPPROTO_TCP, LPFN_CONNECTEX, SD_BOTH, SIO_GET_EXTENSION_FUNCTION_POINTER,
+        IPPROTO_TCP, LPFN_CONNECTEX, SD_BOTH, SIO_GET_EXTENSION_FUNCTION_POINTER,
         SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
-        SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKADDR_UN, SOCKET, SOL_SOCKET,
-        TCP_NODELAY, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF,
-        WSADATA, WSAENOTCONN, WSAGetLastError, WSAID_CONNECTEX, WSAIoctl, WSARecv, WSASend,
-        WSASocketW, WSAStartup, bind, connect, getsockname, setsockopt, shutdown,
+        SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKADDR_UN, SOL_SOCKET, TCP_NODELAY,
+        WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, WSABUF, WSADATA,
+        WSAENOTCONN, WSAGetLastError, WSAID_CONNECTEX, WSAIoctl, WSARecv, WSASend, WSASocketW,
+        WSAStartup, bind, connect, getsockname, setsockopt, shutdown,
     },
-    System::IO::OVERLAPPED,
 };
 
 use crate::Address;
@@ -54,8 +55,8 @@ fn started() -> io::Result<()> {
     }
 }
 
-pub(super) fn raw(socket: &OwnedSocket) -> SOCKET {
-    socket.as_raw_socket() as SOCKET
+pub(super) fn raw(socket: &OwnedSocket) -> Socket {
+    Socket::from_raw(socket.as_raw_socket() as usize)
 }
 
 /// A stream socket of `family`, overlapped and kept from children.
@@ -76,11 +77,11 @@ fn stream(family: u16) -> io::Result<OwnedSocket> {
             WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
         )
     };
-    if socket == INVALID_SOCKET {
+    if socket == Socket::INVALID {
         return Err(last());
     }
     // SAFETY: the socket just made, owned from here.
-    Ok(unsafe { OwnedSocket::from_raw_socket(socket as u64) })
+    Ok(unsafe { OwnedSocket::from_raw_socket(socket.raw() as u64) })
 }
 
 /// An address as Winsock takes one.
@@ -237,7 +238,7 @@ pub(super) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
     // The most Winsock takes (`SOMAXCONN` of winsock2.h).
     // SAFETY: a bound socket.
     // Winsock's `listen`, by path: this module's own `listen` above takes the name.
-    if unsafe { windows_sys::Win32::Networking::WinSock::listen(raw(&listener.socket), i32::MAX) }
+    if unsafe { blaze_sys::windows::net::listen(raw(&listener.socket), i32::MAX) }
         != 0
     {
         return Err(last());
@@ -292,7 +293,7 @@ impl Accepting {
             )
         };
         self.accepted = Some(accepted);
-        pending(ok != 0)
+        pending(ok.is_true())
     }
 
     /// The connection the completed accept made.
@@ -350,8 +351,8 @@ impl Connecting {
     }
 
     /// The socket the connect is on, once asked for: what a cancel names.
-    pub(super) fn raw(&self) -> SOCKET {
-        self.socket.as_ref().map_or(INVALID_SOCKET, raw)
+    pub(super) fn raw(&self) -> Socket {
+        self.socket.as_ref().map_or(Socket::INVALID, raw)
     }
 
     /// Asks for the connect, through `overlapped`.
@@ -395,7 +396,7 @@ impl Connecting {
             )
         };
         self.socket = Some(socket);
-        pending(ok != 0)
+        pending(ok.is_true())
     }
 
     /// The connection, once the connect has completed.
@@ -414,15 +415,16 @@ impl Connecting {
     }
 }
 
+/// What [`LPFN_CONNECTEX`] holds when Winsock hands one out (mswsock.h's prototype).
 type ConnectEx = unsafe extern "system" fn(
-    SOCKET,
+    Socket,
     *const SOCKADDR,
     i32,
     *const core::ffi::c_void,
     u32,
     *mut u32,
     *mut OVERLAPPED,
-) -> windows_sys::core::BOOL;
+) -> Bool;
 
 /// `ConnectEx`, which Winsock hands out per socket.
 fn connect_ex(socket: &OwnedSocket) -> io::Result<ConnectEx> {
@@ -477,7 +479,7 @@ pub(super) fn connect_blocking(root: &Path, at: &Address) -> io::Result<OwnedSoc
 /// unread by anything else, until the completion is dequeued, as Winsock writes them after
 /// this returns. `socket` is open.
 pub(super) unsafe fn recv(
-    socket: SOCKET,
+    socket: Socket,
     into: *mut u8,
     len: usize,
     flags: *mut u32,
@@ -500,7 +502,7 @@ pub(super) unsafe fn recv(
 /// are, alive and unwritten, until the completion is dequeued: Winsock reads the bytes after
 /// this returns, past the borrow. `socket` is open.
 pub(super) unsafe fn send(
-    socket: SOCKET,
+    socket: Socket,
     bytes: &[u8],
     overlapped: *mut OVERLAPPED,
 ) -> io::Result<()> {

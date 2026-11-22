@@ -46,8 +46,10 @@
 #[cfg(test)]
 extern crate std;
 
+mod allowed;
 mod engine;
 mod fix;
+mod marks;
 mod matcher;
 mod message;
 mod sequences;
@@ -60,6 +62,8 @@ mod tests;
 use blaze_own::{AVec, Alloc};
 
 pub use fix::{FixError, apply, apply_all};
+pub use allowed::{ALLOWED_STATICS, Allowed, AllowedStatic, statics_of_path};
+pub use marks::{OwnHeads, RootMarks};
 pub use message::show_message;
 pub use units::{UnitLinted, UnitPlan, Units};
 pub use variants::Variants;
@@ -179,6 +183,27 @@ pub enum Rule {
     /// Edition Guide, "unsafe_op_in_unsafe_fn warning"). A TYPED rule (blaze-typeck
     /// rules/unsafety.rs), filed only for 2024 bodies; advice at every step, as rustc warns.
     UnsafeOpInUnsafeFn = 19,
+    /// State the process keeps with no owner (D170 C3): `thread_local!`, `static mut`, and a
+    /// `static` whose type holds interior state (a cell, a lock, an atomic, a once or lazy
+    /// value). A `#[global_allocator]` static is not reported; the profile ring and the signal
+    /// handler, C3's other two, are (text cannot tell them from others), so the crates that hold
+    /// them do not deny the lint. The lint `blaze::process_static` ([`Rule::lint`]).
+    ProcessStatic = 20,
+    /// In a sans-IO core (a crate or module whose root says `#![blaze::sans_io]`, which its
+    /// [`Scope::sans_io`] carries): a path to the file system, the network, a process, the OS,
+    /// the environment or a thread, a print, a blocking wait, or a wall-clock read. A core
+    /// returns what to do as its machine's output; its driver (`#![blaze::driver]`) does it. The
+    /// lint `blaze::sans_io_core`.
+    SansIoCore = 21,
+    /// A lock constructed in shipped code with no reason (D179): `Lock::new`, `Lock::unrecorded`,
+    /// `Lock::probed`, `ReadLock::new`, `ReadLock::unrecorded` (blaze-core's lock.rs), bstd's
+    /// `Lock::new`, `RwLock::new` and `RankedLock::new`, and `SharedMap::new_in`, where no
+    /// `#[blaze::lock_exception(tried = "..", why = "..")]` is on the statement, field,
+    /// `static`, `const` or item that holds the call ([`Scope::lock_reason`] for one on an
+    /// ancestor item). State shared between workers is published, gathered or claimed; a lock
+    /// is the named exception, and says which shape it could not be. The lint
+    /// `blaze::lock_without_reason`.
+    LockWithoutReason = 22,
 }
 
 impl Rule {
@@ -206,6 +231,9 @@ impl Rule {
         Rule::VariantCount,
         Rule::ArgsInline,
         Rule::UnsafeOpInUnsafeFn,
+        Rule::ProcessStatic,
+        Rule::SansIoCore,
+        Rule::LockWithoutReason,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -249,7 +277,29 @@ impl Rule {
             Rule::VariantCount => "variant-count",
             Rule::ArgsInline => "args-inline",
             Rule::UnsafeOpInUnsafeFn => "unsafe-op-in-unsafe-fn",
+            Rule::ProcessStatic => "process-static",
+            Rule::SansIoCore => "sans-io-core",
+            Rule::LockWithoutReason => "lock-without-reason",
         }
+    }
+
+    /// The tool lint a crate names this rule by in an attribute (`#![deny(blaze::std_use)]`),
+    /// without its `blaze::`: one rule per lint, so a level a crate sets lands on one rule. The
+    /// lints are blaze-lint-defs' (`lints.rs`); a rule no lint names has none.
+    pub const fn lint(self) -> Option<&'static str> {
+        match self {
+            Rule::Ambient => Some("std_use"),
+            Rule::AmbientHeap => Some("implicit_allocator"),
+            Rule::ProcessStatic => Some("process_static"),
+            Rule::SansIoCore => Some("sans_io_core"),
+            Rule::LockWithoutReason => Some("lock_without_reason"),
+            _ => None,
+        }
+    }
+
+    /// The rule the tool lint `name` is ([`Rule::lint`]'s spelling, without `blaze::`), if any.
+    pub fn from_lint(name: &str) -> Option<Rule> {
+        Rule::ALL.into_iter().find(|rule| rule.lint() == Some(name))
     }
 
     /// Whether the rule is typed: decided by the body check from types (its findings are the
@@ -398,6 +448,30 @@ pub enum Template {
     /// A literal that is the variant count of two or more enums of the file: which it counts is
     /// for a person; arguments: a placeholder, then each enum's name.
     VariantCountMany = 151,
+    /// `thread_local!`.
+    StaticThreadLocal = 160,
+    /// `static mut`.
+    StaticMut = 161,
+    /// A `static` whose type holds interior state; argument: the stateful type's range.
+    StaticState = 162,
+    /// In a sans-IO core, a path to IO (`fs::`, `std::net`, `File::open`, `libc::`); the range
+    /// is the word that names it.
+    SansIoPath = 170,
+    /// In a sans-IO core, a blocking wait (`.recv()`, `.join()`, `.lock()`, `.wait(`,
+    /// `block_on(`).
+    SansIoBlocking = 171,
+    /// In a sans-IO core, the wall clock read (`Instant::now`, `SystemTime::now`).
+    SansIoClock = 172,
+    /// In a sans-IO core, a print to the process's streams (`println!`, `dbg!`).
+    SansIoPrint = 173,
+    /// A lock's constructor called where no `#[blaze::lock_exception(..)]` holds it; the range
+    /// is the constructor's path (`Lock::new`); argument, when its first argument is a string
+    /// literal: the lock's name, the text between the quotes.
+    LockNoReason = 180,
+    /// A `#[blaze::lock_exception(..)]` whose `tried` is not `"published"`, `"gathered"` or
+    /// `"claimed"`, whose `why` is missing or empty, or which says anything else; the range is
+    /// the attribute.
+    LockBadReason = 181,
 }
 
 impl Template {
@@ -419,6 +493,9 @@ impl Template {
             120..=123 => Rule::LeftUndone,
             130..=131 => Rule::UnboundedWait,
             140..=141 => Rule::AmbientHasher,
+            160..=162 => Rule::ProcessStatic,
+            170..=173 => Rule::SansIoCore,
+            180..=181 => Rule::LockWithoutReason,
             _ => Rule::VariantCount,
         }
     }
@@ -476,6 +553,15 @@ impl Template {
             Template::HasherDefault => "default-hasher",
             Template::VariantCount => "count",
             Template::VariantCountMany => "count-many",
+            Template::StaticThreadLocal => "thread-local",
+            Template::StaticMut => "static-mut",
+            Template::StaticState => "static-state",
+            Template::SansIoPath => "io",
+            Template::SansIoBlocking => "blocking",
+            Template::SansIoClock => "clock",
+            Template::SansIoPrint => "print",
+            Template::LockNoReason => "no-reason",
+            Template::LockBadReason => "bad-reason",
         }
     }
 }
@@ -710,11 +796,23 @@ pub struct Scope {
     pub bin_root: bool,
     /// The file is a build script (`build.rs` outside `src`).
     pub build_script: bool,
+    /// The file is in a sans-IO core: its crate's root, or the file's own top, says
+    /// `#![blaze::sans_io]` ([`RootMarks`]). What `sans-io-core` reads.
+    pub sans_io: bool,
+    /// The IO module names the file makes its own ([`OwnHeads`]): a bare head of one (`io::x`)
+    /// is the crate's module there, which `sans-io-core` does not report.
+    pub own_heads: OwnHeads,
+    /// The rows of [`ALLOWED_STATICS`] of the file's crate, a bit each ([`statics_of_path`]):
+    /// the statics `process-static` does not report there.
+    pub statics: u16,
+    /// An ancestor item carries `#[blaze::lock_exception(..)]` (D179): the locks the item
+    /// constructs have their reason, which `lock-without-reason` reads.
+    pub lock_reason: bool,
     pub context: Context,
 }
 
 impl Scope {
-    /// A file's root scope, from its facts.
+    /// A file's root scope, from its facts; not in a sans-IO core ([`Scope::in_core`]).
     pub const fn file(test: TestBits, bin_root: bool, build_script: bool) -> Scope {
         Scope {
             test,
@@ -723,6 +821,10 @@ impl Scope {
             in_module: false,
             bin_root,
             build_script,
+            sans_io: false,
+            own_heads: OwnHeads::NONE,
+            statics: 0,
+            lock_reason: false,
             context: Context {
                 clone_above: Walk::NONE,
                 clone_after: None,
@@ -731,6 +833,19 @@ impl Scope {
                 recursion_above: 0,
             },
         }
+    }
+
+    /// The same scope in a sans-IO core: what a driver gives a file whose crate root or own top
+    /// says `#![blaze::sans_io]` ([`RootMarks::scope`]).
+    pub const fn in_core(self) -> Scope {
+        Scope { sans_io: true, ..self }
+    }
+
+    /// The same scope in a file with these facts of its own text and crate: the IO module
+    /// names it makes its own ([`OwnHeads::read`] of the file) and its crate's allowed statics
+    /// ([`statics_of_path`] of its path). What a driver gives every file.
+    pub const fn with_file_facts(self, own_heads: OwnHeads, statics: u16) -> Scope {
+        Scope { own_heads, statics, ..self }
     }
 
     /// Everything in the scope as one integer, for the record's key: two scopes with one key
@@ -754,6 +869,10 @@ impl Scope {
             | (c.safety_above.mark as u64) << 23
             | (c.safety_after as u64) << 26
             | (c.recursion_above as u64) << 27
+            | (self.sans_io as u64) << 35
+            | (self.own_heads.0 as u64) << 36
+            | (self.statics as u64) << 44
+            | (self.lock_reason as u64) << 60
     }
 }
 
@@ -861,10 +980,15 @@ impl RuleSet {
         self.renames
     }
 
-    /// The rule set's identity: a digest of the format, each enabled rule's id and version, and
-    /// the rename table, in order. It joins every finding record's key.
+    /// The rule set's identity: a digest of the format, the number of rules this build has
+    /// ([`Rule::COUNT`]), each enabled rule's id and version, and the rename table, in order. It
+    /// joins every finding record's key. The count is in it because a record's layout follows
+    /// it (a unit record's cost is one word per rule, blaze-cli lints.rs `COST_BYTES`): a build
+    /// with another count keys every record apart, so an older record is a miss, never read with
+    /// the wrong width (rule 21).
     pub fn id(&self) -> [u8; 32] {
         let mut hasher = blaze_blake3::Hasher::new_derive_key("blaze-lint rule set 1");
+        hasher.update(&(Rule::COUNT as u32).to_le_bytes());
         for rule in Rule::ALL {
             if self.runs(rule) {
                 hasher.update(&rule.id().to_le_bytes());
@@ -920,8 +1044,9 @@ pub enum Step {
     Edition,
     /// The ten house rules ([`Rule::HOUSE`]), at blaze's own levels, and `variant-count`, which
     /// every step from [`Step::Suggest`] runs. The other rules after them (`ambient-heap`,
-    /// `no-async`, `ambient-read`, `left-undone`, `unbounded-wait`, `ambient-hasher`) are on only
-    /// where a workspace names them: a step adds them with [`RuleSet::with`].
+    /// `no-async`, `ambient-read`, `left-undone`, `unbounded-wait`, `ambient-hasher`,
+    /// `process-static`, `sans-io-core`) are on only where a workspace names them, or a crate
+    /// denies their lint ([`RootMarks::rules`]): a step adds them with [`RuleSet::with`].
     Strict,
 }
 

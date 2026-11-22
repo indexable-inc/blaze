@@ -29,7 +29,7 @@ use core::fmt::Write as _;
 use blaze_own::{FixedString, FixedVec, Inline};
 use blaze_sim::{Broke, Config, Tape, check, control};
 
-use super::harness;
+use super::{Lap, harness};
 use crate::Nanos;
 use crate::since::{self, Answer, AskId, CannotVouch, Fault, Place, SincePlant, Step, Watcher};
 
@@ -504,37 +504,44 @@ fn run_journal(tape: &Tape) -> Result<(), Broke> {
 
 #[test]
 fn the_helper_names_every_change_since_a_place_or_cannot_vouch() {
-    check(Config::cases(3000), |tape| run_helper(tape, SincePlant::None));
+    let lap = Lap::new("since: the helper names every change");
+    check(Config::cases(3000), |tape| lap.case(run_helper(tape, SincePlant::None)));
 }
 
 #[test]
 fn the_journal_source_meets_the_same_oracle() {
-    check(Config::cases(1000), run_journal);
+    let lap = Lap::new("since: the journal source");
+    check(Config::cases(1000), |tape| lap.case(run_journal(tape)));
 }
 
 #[test]
 fn the_oracle_catches_an_answer_with_no_flush() {
-    control(Config::cases(4000), SincePlant::None, SincePlant::NoFlush, "not named", run_helper);
+    let lap = Lap::new("since: control, no flush");
+    control(Config::cases(4000), SincePlant::None, SincePlant::NoFlush, "not named", |tape, plant| lap.case(run_helper(tape, plant)));
 }
 
 #[test]
 fn the_oracle_catches_an_ask_joined_to_an_earlier_flush() {
-    control(Config::cases(6000), SincePlant::None, SincePlant::JoinOutstandingFlush, "not named", run_helper);
+    let lap = Lap::new("since: control, an ask joined to an earlier flush");
+    control(Config::cases(6000), SincePlant::None, SincePlant::JoinOutstandingFlush, "not named", |tape, plant| lap.case(run_helper(tape, plant)));
 }
 
 #[test]
 fn the_oracle_catches_an_overflow_taken_as_whole() {
-    control(Config::cases(4000), SincePlant::None, SincePlant::OverflowIgnored, "not named", run_helper);
+    let lap = Lap::new("since: control, an overflow taken as whole");
+    control(Config::cases(4000), SincePlant::None, SincePlant::OverflowIgnored, "not named", |tape, plant| lap.case(run_helper(tape, plant)));
 }
 
 #[test]
 fn the_oracle_catches_a_place_of_a_dead_instance_accepted() {
-    control(Config::cases(6000), SincePlant::None, SincePlant::OtherInstanceAccepted, "not named", run_helper);
+    let lap = Lap::new("since: control, a dead instance's place accepted");
+    control(Config::cases(6000), SincePlant::None, SincePlant::OtherInstanceAccepted, "not named", |tape, plant| lap.case(run_helper(tape, plant)));
 }
 
 #[test]
 fn the_oracle_catches_names_dropped_without_forgetting_their_places() {
-    control(Config::cases(6000), SincePlant::None, SincePlant::ForgetSilently, "not named", run_helper);
+    let lap = Lap::new("since: control, names dropped silently");
+    control(Config::cases(6000), SincePlant::None, SincePlant::ForgetSilently, "not named", |tape, plant| lap.case(run_helper(tape, plant)));
 }
 
 /// The walk through one quiet interval, by hand: the first flush issues place 1; an ask with

@@ -399,6 +399,9 @@ extern "C" fn hook_resolve(stub: usize, retaddr: usize) {
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use blaze_sys::posix::thread;
+
     use super::*;
     use crate::sys::Code;
 
@@ -546,7 +549,7 @@ mod tests {
         hook: u64,
         /// The pthread key whose value is the bitmap base (macOS).
         #[cfg(target_os = "macos")]
-        key: libc::pthread_key_t,
+        key: thread::pthread_key_t,
     }
 
     const MARKED: u32 = 5;
@@ -569,11 +572,9 @@ mod tests {
 
             #[cfg(target_os = "macos")]
             let (mark_at, key) = {
-                let mut key: libc::pthread_key_t = 0;
-                // SAFETY: `key` is a live local the call fills; no destructor.
-                assert_eq!(unsafe { libc::pthread_key_create(&mut key, None) }, 0, "a pthread key");
-                // SAFETY: the value is the bitmap in the data region, live while the rig is.
-                assert_eq!(unsafe { libc::pthread_setspecific(key, (data + BITMAP) as *const _) }, 0);
+                let key = thread::key_create(None).expect("a pthread key");
+                // SAFETY: key is live with no destructor. The bitmap stays live with the rig.
+                assert_eq!(unsafe { thread::set_specific(key, (data + BITMAP) as *const _) }, Ok(()));
                 let at = 64u64;
                 let tp_off = u32::try_from(key * 8).expect("a TSD offset");
                 let stub = mark(base + at, tp_off, MARKED, body).expect("in reach");
@@ -660,8 +661,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     impl Drop for Rig {
         fn drop(&mut self) {
-            // SAFETY: the key this rig made, which no stub reads once the rig is gone.
-            unsafe { libc::pthread_key_delete(self.key) };
+            let _ = thread::key_delete(self.key);
         }
     }
 

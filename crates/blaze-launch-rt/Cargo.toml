@@ -26,18 +26,24 @@ blaze-run.workspace = true
 blaze-own.workspace = true
 # `code_unwind`: a code record's unwind entry (blaze-code eh.rs), registered before its slot's
 # word is published.
-blaze-code = { path = "../blaze-code" }
+blaze-code.workspace = true
 # `native_lib`: the native library record's descriptor (BNL2), whose one home is blaze-native's
 # descriptor.rs (sans-IO, no_std).
-blaze-native = { path = "../blaze-native" }
+blaze-native.workspace = true
 # `sample`: the sample ring's entry (`sample::SampleEntry`), piece 0 of code generation.
 blaze-tier.workspace = true
 # `stub_wait`: a stub's kernel wait to a deadline and the control thread's bell
 # (`wait::wait_shared`, `wake_shared`; THREADS.md D6).
 blaze-core.workspace = true
+# run_mode/bind.rs `Table`: a compile-time run's outside names bound through the table and the
+# layer's C functions (D175; feature `child`, the functions themselves).
+blaze-comptime-sys = { workspace = true, features = ["child"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# `zygote`: a test's process group killed through the one wrapper (`kill_group`, D177); already
+# below blaze-core, so no new crate is built.
+blaze-sys.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std", "testing"] }
@@ -47,6 +53,9 @@ blaze-mem.workspace = true
 blaze-sim.workspace = true
 # stub_wait_tests.rs: the stub path's allocation count (`#[global_allocator]` of the test binary).
 blaze-alloc-count.workspace = true
+# tests/native_load.rs: a tiny native library record written without a compiler (W4's writer),
+# loaded by the real `dlopen` path. blaze-export does not depend on this crate: no cycle.
+blaze-export.workspace = true
 
 # sample/ring_wait.rs: the ring under the interleaving checker (`--cfg blaze_check`).
 [target.'cfg(blaze_check)'.dependencies]

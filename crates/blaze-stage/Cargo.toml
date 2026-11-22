@@ -21,9 +21,9 @@ blaze-int.workspace = true
 # `ContentId` and `Hasher`: a record's key and its digest, in a named domain.
 blaze-ids.workspace = true
 # `ItemKey`: the item a finding's place is relative to (rule 71).
-blaze-id = { path = "../blaze-id" }
+blaze-id.workspace = true
 # `Stage`: which of the engine's seven stages a protocol instance is (one concept, one home: rule 30).
-blaze-engine = { path = "../blaze-engine" }
+blaze-engine.workspace = true
 
 [dev-dependencies]
 # The simulation: generated phases, completion in any order, stops, failing commits, stalls, panics.

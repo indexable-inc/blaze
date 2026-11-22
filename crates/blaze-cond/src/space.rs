@@ -17,10 +17,11 @@ use core::fmt;
 use core::ops::Range;
 
 use blaze_int::{Int, idx};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, planted::Planted};
 
-use crate::bdd::{Bdd, Cond, Var};
+use crate::bdd::{Cond, PlantedBdd, Var};
 use crate::error::{CondError, SpaceError};
+use crate::plant::CondPlant;
 
 /// The derivation context of a variable's key; a change of it is a change of every stored
 /// condition, so it is dated.
@@ -356,7 +357,7 @@ impl Space<'_> {
     /// The configurations the request allows, in `bdd`: one of its targets (each a full cube
     /// over the target atoms), every implication between features. `TRUE` with no targets and
     /// no implications.
-    pub fn valid_in(&self, bdd: &mut Bdd<'_>) -> Result<Cond, CondError> {
+    pub fn valid_in(&self, bdd: &mut PlantedBdd<'_, impl Planted<CondPlant>>) -> Result<Cond, CondError> {
         let mut atoms: AVec<'_, u16> = AVec::new_in(bdd.alloc());
         for (i, v) in self.vars.iter().enumerate() {
             if v.kind == VarKind::TargetAtom {

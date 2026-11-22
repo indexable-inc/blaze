@@ -1,6 +1,6 @@
 [package]
 name = "blaze-apple-sdk"
-description = "The macOS SDK's one home: where its folder is (`SDKROOT`, else what `xcrun --sdk macosx --show-sdk-path` printed, else a typed refusal naming both), its version from `SDKSettings.json` as the identity every key built or run against it holds (never its path), and Apple's `major[.minor[.patch]]` versions as `xxxx.yy.zz` nibbles; a sans-IO core over what the edge read, `no_std`, no dependencies"
+description = "The macOS SDK's one home: where its folder is (`SDKROOT`, else what `xcrun --sdk macosx --show-sdk-path` printed, else a typed refusal naming both), its version from `SDKSettings.json` and its build from `SystemVersion.plist` as the identity every key built or run against it holds (never its path), and Apple's `major[.minor[.patch]]` versions as `xxxx.yy.zz` nibbles; a sans-IO core over what the edge read, `no_std`, no dependencies"
 publish = false
 
 version.workspace = true

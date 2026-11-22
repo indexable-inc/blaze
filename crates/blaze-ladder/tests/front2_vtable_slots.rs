@@ -130,7 +130,7 @@ fn every_slot_of_a_made_table_is_reached() {
             .unwrap_or_else(|| panic!("`{name}` from the crate root"))
     };
     let run = lib(Namespace::Values, "run");
-    let mut key = |ns: Namespace, n: &'static str| -> (ItemKey, &'static str) { (front.keys.item(lib(ns, n)).unwrap_or_else(|e| panic!("{n}'s key: {e:?}")), n) };
+    let key = |ns: Namespace, n: &'static str| -> (ItemKey, &'static str) { (front.keys.item(lib(ns, n)).unwrap_or_else(|e| panic!("{n}'s key: {e:?}")), n) };
     let types: Vec<(ItemKey, &'static str)> = ["A", "B", "C"].iter().map(|&t| key(Namespace::Types, t)).collect();
     let traits: Vec<(ItemKey, &'static str)> = ["Base", "Tr", "Other"].iter().map(|&t| key(Namespace::Types, t)).collect();
     let prepared = Prepares::new_in(heap.alloc());

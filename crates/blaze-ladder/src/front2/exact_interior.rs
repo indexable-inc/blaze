@@ -17,9 +17,10 @@
 //! ends at the end of its enclosing statement, blaze-flow-lower lib.rs `CloseTemps`, so one made
 //! before an `.await` in the `.await`'s own statement is counted). blaze-flow-lower
 //! `interior_parts` reads it for the interior, and `state_recipe` reads the same rule over the
-//! same lowering for the layout (run/lay_states.rs). The block is lowered as the borrow check
-//! lowers it (`lower_async` over [`NestedFacts`], the facts gathered by borrows.rs
-//! `gather_facts`, their one home).
+//! same lowering for the layout (run/lay_states.rs). The block is lowered as its WITNESS
+//! (`lower_async_witness` over [`NestedFacts`], the facts gathered by borrows.rs `gather_facts`,
+//! their one home): the borrow check's statements, loans and saved bits, with no region related
+//! (one_call.rs `Erased`), so only a form or layout refusal leaves the row a superset.
 //!
 //! KEYS (rule 21): the row is made in this command from the body's own check record and the
 //! facts `gather_facts` reads of the records (ADT facts, callee heads); `Store::hidden` lives one
@@ -33,7 +34,7 @@
 //! unsizing site takes as the interior gap (blaze-typeck rules/coerce_interior.rs). Owed: the
 //! row says which it holds, so a plain auto goal resting on a superset `No` is the gap too.
 
-use blaze_flow_lower::{InteriorPart, Refusal, interior_parts, lower_async};
+use blaze_flow_lower::{InteriorPart, Refusal, lower_async_witness};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 
@@ -77,7 +78,9 @@ pub fn exact_interiors<'n, 'a, S: NamesSource<'n>>(
     }
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, body.typeck.owner, done, langs, alloc);
-    let nested = NestedFacts::new(&facts);
+    // Every fn's signature regions are its head record's, read in place (D148).
+    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let nested = NestedFacts::new(facts.read_by(&reader, r.store.tys.view()));
     let tys = body.tys.view(&r.store.tys)?;
     let view = body.typeck.view(tys);
     let mut blocks = AVec::new_in(alloc);
@@ -86,7 +89,10 @@ pub fn exact_interiors<'n, 'a, S: NamesSource<'n>>(
             continue;
         }
         let block = tc::ExprId(i as u32);
-        let got = match lower_async(&view, done, block, &nested, alloc).and_then(|lowered| interior_parts(&lowered, done, block, alloc)) {
+        // The WITNESS lowering (one_call.rs `Erased`): what the state stores needs no region, so
+        // a region refusal of the borrow lowering (tempo's 45 and 65 rows) no longer leaves the
+        // row a superset; only a form or layout refusal does (typeck.md "Witness records", W1).
+        let got = match lower_async_witness(&view, done, block, &nested, alloc).and_then(|w| w.interior_parts(done, block, alloc)) {
             Ok(parts) => BlockInterior::Exact(parts),
             Err(why) => BlockInterior::Refused(why),
         };

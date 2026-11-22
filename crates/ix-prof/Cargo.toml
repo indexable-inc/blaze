@@ -70,6 +70,9 @@ blaze-http = { workspace = true, optional = true }
 blaze-sha256 = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+blaze-sys.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

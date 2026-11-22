@@ -25,10 +25,10 @@ use crate::board::{
 #[cfg(test)]
 use crate::search::Plant;
 use crate::search::{
-    Broke, Config, Ended, Failed, Failure, Given, GivenError, Next, Origin, Passed, SEED, SEEDS,
-    Search, TAPE, Verdict,
+    Broke, Broken, Config, Ended, Failed, Failure, Given, GivenError, Next, Origin, Passed, SEED,
+    SEEDS, Search, TAPE, Verdict,
 };
-use crate::observe;
+use crate::observe::{self, ObserveMode};
 use crate::tape::{Record, Tail, Tape};
 use crate::text;
 
@@ -62,6 +62,22 @@ impl Outcome for Result<(), Broke> {
             Ok(()) => Ended::Passed,
             Err(Broke::Oracle(text)) => Ended::Failed(Failure { origin: Origin::Oracle, text }),
             Err(Broke::Harness(text)) => Ended::Failed(Failure { origin: Origin::Harness, text }),
+        }
+    }
+}
+
+impl<E: fmt::Display> Outcome for Result<(), Broken<E>> {
+    /// The typed oracle's finding as the search records a failure: its origin is the oracle, its
+    /// text the error's `Display` (a control judges the typed value itself, control.rs).
+    #[blaze::pure]
+    #[blaze::nonblocking]
+    fn ended(self) -> Ended {
+        match self {
+            Ok(()) => Ended::Passed,
+            Err(Broken::Oracle(broken)) => {
+                Ended::Failed(Failure { origin: Origin::Oracle, text: broken.to_string() })
+            }
+            Err(Broken::Harness(text)) => Ended::Failed(Failure { origin: Origin::Harness, text }),
         }
     }
 }
@@ -210,8 +226,44 @@ impl Drop for Inside {
 }
 
 /// Runs the search over `body` and gives its verdict. Reads nothing from outside: `config` is all.
+/// A verdict judges no observation, so `ObserveMode::Enforce` is refused by name here (the
+/// driver's entry points, `check`, `simulate` and `controls`, judge it).
 pub fn search<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) -> Verdict {
+    config.observe.refused_without_driver();
     drive(Search::new(config), body)
+}
+
+/// What `ObserveMode::Enforce` says of a run that passed: under `mode` Enforce, a passing
+/// `verdict` whose `tally` has "never varied" lines fails, and this is the text it fails with
+/// (D165), naming each label; `None` when the run is not failed by it.
+pub(crate) fn enforced(
+    mode: ObserveMode,
+    verdict: &Verdict,
+    tally: &observe::Tally,
+    place: &str,
+) -> Option<String> {
+    match (mode, verdict) {
+        (ObserveMode::Enforce, Verdict::Passed(passed)) => {
+            let mut lines = observed_lines();
+            if tally.never_varied_into(&mut lines) == 0 {
+                return None;
+            }
+            Some(format!(
+                "blaze-sim: `{place}`: under `ObserveMode::Enforce`, a draw that took one value in every passing case (of {} cases) fails the run, since none of its other values was tested (D165):\n{lines}",
+                passed.cases
+            ))
+        }
+        (ObserveMode::Observe, _)
+        | (
+            ObserveMode::Enforce,
+            Verdict::Failed(_)
+            | Verdict::NotAFunction { .. }
+            | Verdict::DrewNothing { .. }
+            | Verdict::AllDiscarded { .. }
+            | Verdict::Unreached { .. }
+            | Verdict::Misfit { .. },
+        ) => None,
+    }
 }
 
 /// `search` with a bug planted in the search, for a control.
@@ -336,7 +388,22 @@ pub fn search_on_board<O: Outcome, P: Page>(
     check: u32,
     plan: &Plan<'_>,
     board: &mut Writer<P>,
+    body: impl FnMut(&Tape) -> O,
+) -> Result<Verdict, BoardError> {
+    let mut observed = observe::Tally::new();
+    search_on_board_observing(config, check, plan, board, body, &mut observed)
+}
+
+/// `search_on_board`, also leaving in `observed` what the passing cases of its seed phase drew
+/// (observe.rs; the given tapes before it are not a run and are not tallied), for
+/// `ObserveMode::Enforce`.
+fn search_on_board_observing<O: Outcome, P: Page>(
+    config: Config,
+    check: u32,
+    plan: &Plan<'_>,
+    board: &mut Writer<P>,
     mut body: impl FnMut(&Tape) -> O,
+    observed: &mut observe::Tally,
 ) -> Result<Verdict, BoardError> {
     let shape = board.shape();
     let target = check == shape.target_check;
@@ -420,6 +487,7 @@ pub fn search_on_board<O: Outcome, P: Page>(
         let proposal = match search.next() {
             Next::Done(verdict) => {
                 let verdict = with_given(verdict.clone(), given_run, given_tally);
+                observed.clone_from(search.tally());
                 return end_on_board(board, case, tally, verdict);
             }
             Next::Run(proposal) => proposal,
@@ -664,13 +732,20 @@ fn check_on_board<O: Outcome>(
     };
     let (_turn, check) = OnBoard::take();
     let mut writer = Writer::new(FilePage { file }, shape);
-    let verdict = match search_on_board(config, check, &plan, &mut writer, body) {
-        Ok(verdict) => verdict,
-        Err(error) => board_refused("a write", &error),
-    };
+    let mode = config.observe;
+    let mut observed = observe::Tally::new();
+    let verdict =
+        match search_on_board_observing(config, check, &plan, &mut writer, body, &mut observed) {
+            Ok(verdict) => verdict,
+            Err(error) => board_refused("a write", &error),
+        };
+    let here = with_test_name(|test| place(at, test));
+    if let Some(refused) = enforced(mode, &verdict, &observed, &here) {
+        panic!("{refused}");
+    }
     match &verdict {
         Verdict::Passed(passed) => {
-            say_passed(&with_test_name(|test| place(at, test)), passed.cases, passed.choices);
+            say_passed(&here, passed.cases, passed.choices);
         }
         Verdict::Failed(_)
         | Verdict::NotAFunction { .. }
@@ -711,13 +786,18 @@ pub fn check<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) {
 #[track_caller]
 pub fn check_given<O: Outcome>(config: Config, given: Given, body: impl FnMut(&Tape) -> O) {
     let at = Location::caller();
+    let mode = config.observe;
     let (verdict, searched) = search_observing(config.given(given), body);
     let mut observed = observed_lines();
     searched.tally().lines_into(&mut observed);
     say_observed(at, &observed);
+    let here = with_test_name(|test| place(at, test));
+    if let Some(refused) = enforced(mode, &verdict, searched.tally(), &here) {
+        panic!("{refused}");
+    }
     match &verdict {
         Verdict::Passed(passed) => {
-            say_passed(&with_test_name(|test| place(at, test)), passed.cases, passed.choices);
+            say_passed(&here, passed.cases, passed.choices);
         }
         Verdict::Failed(_)
         | Verdict::NotAFunction { .. }
@@ -830,7 +910,7 @@ pub(crate) fn observed_lines() -> blaze_own::String<Global> {
 }
 
 /// The test's name, or else `file:line` of the check.
-fn place(at: &Location<'_>, test: Option<&str>) -> String {
+pub(crate) fn place(at: &Location<'_>, test: Option<&str>) -> String {
     match test {
         Some(test) => test.to_owned(),
         None => format!("{}:{}", at.file(), at.line()),

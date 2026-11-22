@@ -2,20 +2,19 @@
 //! piece 1): one per (tool, request shape), each a file `.blaze/v2/at/<name>` whose name is 16
 //! hex digits of H(tool, shape), at most [`KEPT`] of them.
 //!
-//! Why one per (tool, shape): the machine walks forward only from its own tool's and shape's
-//! last answer (request.rs `begin`). With one pointer a checkout, a `test` between two `check`s,
-//! or a second build of blaze, replaced the pointer the next `check` would have walked from, so
-//! that `check` walked the whole build from the units again (and, before request.rs
-//! `walks_from`, was handed no dependency graph at all: blaze's own checkout, 2026-11-16). With
-//! one pointer per (tool, shape) each command of each build finds its own last answer.
+//! Why one per (tool, shape): a command walks forward only from its own tool's and shape's last
+//! answer. With one pointer a checkout, a `test` between two `check`s, or a second build of
+//! blaze, replaced the pointer the next `check` would have walked from, so that `check` walked
+//! the whole build from the units again (blaze's own checkout, 2026-11-16). With one pointer per
+//! (tool, shape) each command of each build finds its own last answer.
 //!
 //! Why at most [`KEPT`]: every rebuilt blaze is another tool, so the folder would grow by a
 //! pointer a build. A pointer is derived data (a request with none answers in full against the
 //! store's records), so the least recently written ones go when a new one is written.
 //!
 //! Sans-IO: this file names a pointer and says which to remove; the command (blaze-cli seal.rs)
-//! lists the folder, stats the pointers and removes what [`evicted`] names. Proof: sim.rs,
-//! `each_tool_and_shape_walks_forward_from_its_own_pointer` and its planted bugs.
+//! lists the folder, stats the pointers and removes what [`evicted`] names. Proof: this file's
+//! tests and their planted bugs.
 
 use blaze_id::ContentId;
 use blaze_ids::Hasher;
@@ -46,7 +45,8 @@ pub enum Plant {
 pub struct PointerName([u8; 16]);
 
 impl PointerName {
-    /// The name of `tool`'s pointer for requests of `shape` (request.rs `shape_of`).
+    /// The name of `tool`'s pointer for commands of `shape` (the digest of the command and its
+    /// arguments, the caller's).
     pub fn of(tool: Tool, shape: &ContentId) -> PointerName {
         PointerName::planted(tool, shape, Plant::None)
     }
@@ -99,5 +99,111 @@ pub fn evicted(held: &mut [(PointerName, u64)], writing: PointerName, plant: Pla
         if others >= KEPT {
             out.push(*name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The pointer properties the deleted request simulation held through whole commands
+    //! (`each_tool_and_shape_walks_forward_from_its_own_pointer`,
+    //! `a_checkout_keeps_the_pointers_written_last`), at their one home: names and eviction.
+    //! Expected: "test pointers::tests::<name> ... ok"; each control passes when its plant is
+    //! caught, with the message it names.
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::format;
+    use std::vec::Vec as StdVec;
+
+    use blaze_id::ContentId;
+    use blaze_own::Vec;
+    use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
+
+    use super::{KEPT, Plant, PointerName, evicted};
+    use crate::key::Tool;
+
+    fn tool(n: u8) -> Tool {
+        Tool(ContentId([n; 32]))
+    }
+
+    fn shape(n: u8) -> ContentId {
+        ContentId::of("blaze-drive pointers test shape", &[n])
+    }
+
+    /// Distinct (tool, shape) pairs, drawn: each has its own name, so a command of one never
+    /// reads another's last answer; the same pair names one pointer, and a name parses back.
+    fn own_names(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+        let pairs = 2 + tape.index(6, "pairs");
+        let mut seen: BTreeMap<PointerName, (u8, u8)> = BTreeMap::new();
+        for at in 0..pairs {
+            let pair = (at as u8, tape.index(3, "shape") as u8);
+            let name = PointerName::planted(tool(pair.0), &shape(pair.1), plant);
+            if name != PointerName::planted(tool(pair.0), &shape(pair.1), plant) {
+                return Err(Broke::Oracle(format!("the pair {pair:?} named two pointers")));
+            }
+            let text = core::str::from_utf8(name.bytes()).map_err(|_| Broke::Oracle(format!("the pointer of {pair:?} is not text")))?;
+            if PointerName::parse(text) != Some(name) {
+                return Err(Broke::Oracle(format!("the pointer of {pair:?} does not parse back")));
+            }
+            if let Some(other) = seen.insert(name, pair) {
+                return Err(Broke::Oracle(format!("one pointer for {other:?} and {pair:?}: a command walks from another's answer")));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn each_tool_and_shape_has_its_own_pointer() {
+        check(SimConfig::cases(200), |tape| own_names(tape, Plant::None));
+    }
+
+    #[test]
+    fn control_one_pointer_for_every_tool_and_shape_is_caught() {
+        control(SimConfig::cases(200), Plant::None, Plant::OneName, "a command walks from another's answer", own_names);
+    }
+
+    /// More builds than [`KEPT`] write their pointers in one folder, in a drawn order with
+    /// repeats; after each write the folder (what blaze-cli keeps, removing what [`evicted`]
+    /// names) holds exactly the at most `KEPT` names written last, the one written included.
+    fn kept_last(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+        let builds = KEPT + 1 + tape.index(8, "builds past the cap");
+        let mut held: BTreeMap<PointerName, u64> = BTreeMap::new();
+        let mut order: StdVec<PointerName> = StdVec::new();
+        for stamp in 1..=builds as u64 + tape.index(8, "repeats") as u64 {
+            let build = match stamp as usize <= builds {
+                true => stamp as u8,
+                false => 1 + tape.index(builds, "a repeat") as u8,
+            };
+            let name = PointerName::of(tool(build), &shape(0));
+            let mut listed: StdVec<(PointerName, u64)> = held.iter().map(|(name, at)| (*name, *at)).collect();
+            let mut gone = Vec::new_in(blaze_own::testing::heap().alloc());
+            evicted(&mut listed, name, plant, &mut gone);
+            for removed in gone.iter() {
+                held.remove(removed);
+            }
+            held.insert(name, stamp);
+            order.retain(|n| *n != name);
+            order.push(name);
+            let want: BTreeSet<PointerName> = order.iter().rev().take(KEPT).copied().collect();
+            let have: BTreeSet<PointerName> = held.keys().copied().collect();
+            if have != want {
+                return Err(Broke::Oracle(format!(
+                    "after write {stamp} the folder holds {} pointers, {} of the {} written last",
+                    have.len(),
+                    have.intersection(&want).count(),
+                    want.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkout_keeps_the_pointers_written_last() {
+        check(SimConfig::cases(200), |tape| kept_last(tape, Plant::None));
+    }
+
+    #[test]
+    fn control_evicting_the_newest_is_caught() {
+        control(SimConfig::cases(200), Plant::None, Plant::EvictNewest, "written last", kept_last);
     }
 }

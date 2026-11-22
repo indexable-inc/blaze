@@ -1,6 +1,7 @@
 //! D70 through the command: ids, the views, and `blaze check --fix` on the simulated file
 //! system (fix.rs). A child of main.rs's tests: its helpers are theirs.
 
+use blaze_own::Alloc;
 use blaze_report::frame::words::{Area, HelpKind};
 use blaze_typeck::suggest::{Cand, Hole, Suggests, Taken};
 use blaze_typeck::{PTy, PatId, Range};
@@ -18,7 +19,7 @@ const BORROWS_WHY: &str = "note: NOT checked: borrows: the move and borrow check
 
 fn agent(io: &Io, fix: Option<&[&str]>) -> (Checked, std::string::String) {
     let before = stdout(io).len();
-    let checked = ask_view::<fix::Atomic>(io, (Command::Check, "check"), work::Sizes::USUAL, View::Agent, fix).expect("the request answers");
+    let checked = check_view::<fix::Atomic>(io, View::Agent, fix);
     (checked, stdout(io)[before..].to_owned())
 }
 
@@ -40,6 +41,17 @@ fn read(io: &Io, path: &str) -> std::string::String {
     std::string::String::from_utf8(bytes.as_slice().to_vec()).expect("UTF-8")
 }
 
+/// The ids this tree gives the two findings (run t82, 2026-11-21; `gv7fz` and `xqq2p` before).
+/// D70: "THE ID is derived from what the finding IS ... a digest of the item it sits in, its
+/// code and its item-relative range"; the item enters through its chain (fix.rs `item_in`,
+/// work.rs `item_chain`), which hashes the outline's item digests (blaze-file-items chain.rs:
+/// `item.hash` / `item.signature_hash`). The code, the path and the ranges are unchanged (the
+/// columns are), so the item digests are what moved (blaze-file-items digest.rs changed
+/// since C3). That cause is not isolated by a run. An id is a function of the tree that drew
+/// it, never pinned across a change of what it digests.
+const UNRESOLVED_ID: &str = "yvsnk";
+const SYNTAX_ID: &str = "8f3db";
+
 /// The agent view of the command, exactly: a syntax error inside a body and an unresolved import.
 #[test]
 fn the_agent_view_of_a_syntax_error_and_an_unresolved_import() {
@@ -48,16 +60,18 @@ fn the_agent_view_of_a_syntax_error_and_an_unresolved_import() {
     write(&io, "src/lib.rs", "use crate::nope;\nfn f() { let x = ; }\n");
     let (checked, out) = agent(&io, None);
     assert_eq!(checked.status, Some(1), "{out}");
-    assert_eq!(out, format!("gv7fz  error[unresolved]  src/lib.rs:1:12  no `nope` in `crate`\nxqq2p  error[syntax]  src/lib.rs:2:17  expected expression\n{BORROWS_WHY}\nincomplete: NOT checked: borrows\n2 errors: blaze check\n"));
+    assert_eq!(out, format!("{UNRESOLVED_ID}  error[unresolved]  src/lib.rs:1:12  no `nope` in `crate`\n{SYNTAX_ID}  error[syntax]  src/lib.rs:2:17  expected expression\n{BORROWS_WHY}\nincomplete: NOT checked: borrows\n2 errors: blaze check\n"), "D70: the id is \"a digest of the item it sits in, its code and its item-relative range\"");
     let (_, again) = agent(&io, None);
     assert_eq!(again, out, "an unchanged repeat says the same");
     let before = stdout(&io).len();
-    ask_view::<fix::Atomic>(&io, (Command::Check, "check"), work::Sizes::USUAL, View::Json, None).expect("the request answers");
+    let _ = check_view::<fix::Atomic>(&io, View::Json, None);
+    let unresolved = format!(r#"{{"id":"{UNRESOLVED_ID}","severity":"error","code":"unresolved","path":"src/lib.rs","line":1,"col":12,"end_line":1,"end_col":16,"message":"no `nope` in `crate`","fix":null}}"#);
+    let syntax = format!(r#"{{"id":"{SYNTAX_ID}","severity":"error","code":"syntax","path":"src/lib.rs","line":2,"col":17,"end_line":2,"end_col":17,"message":"expected expression","fix":null}}"#);
     golden(
         &stdout(&io)[before..],
         &[
-            r#"{"id":"gv7fz","severity":"error","code":"unresolved","path":"src/lib.rs","line":1,"col":12,"end_line":1,"end_col":16,"message":"no `nope` in `crate`","fix":null}"#,
-            r#"{"id":"xqq2p","severity":"error","code":"syntax","path":"src/lib.rs","line":2,"col":17,"end_line":2,"end_col":17,"message":"expected expression","fix":null}"#,
+            unresolved.as_str(),
+            syntax.as_str(),
             r#"{"note":"NOT checked: borrows: the move and borrow check ran, but its findings stay notes until the flow census reads none false (`BORROWS_ARE_ERRORS`)"}"#,
             r#"{"errors":2,"warnings":0,"fixes":0,"command":"blaze check","not_checked":["borrows"]}"#,
         ],

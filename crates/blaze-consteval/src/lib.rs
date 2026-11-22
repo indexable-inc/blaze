@@ -241,6 +241,9 @@ pub trait ConstWorld: LayoutFacts {
     /// explicit discriminant's expression. `Missing`: not checked yet (the evaluation returns
     /// `Need`); `None`: the item has no body.
     fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>>;
+    /// Called on the first execution of a body in this evaluation, including
+    /// when a previous evaluation compiled its code.
+    fn entered_body(&self, _item: ItemKey) {}
     /// What a call of fn item `item` does.
     fn fn_kind(&self, item: ItemKey) -> FnKind;
     /// The item that runs for an associated fn or const at ground arguments `args` (impl

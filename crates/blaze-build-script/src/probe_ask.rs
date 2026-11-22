@@ -43,7 +43,9 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_surface::lang_features::Lang;
 
-use crate::probe::{COMMIT_HASH, Row, Table, VERSION};
+use blaze_pins::{COMMIT_HASH, RUSTC_V};
+
+use crate::probe::{Row, Table};
 
 /// The identity of [`decide`]: held in the answers' identity (`probe::answers_id`), so a
 /// change to what blaze decides itself reruns every script that probed.
@@ -403,7 +405,7 @@ impl<'s> Compile<'_, 's> {
     /// The probe's key (module docs): what its verdict is a function of, normalized.
     pub fn key(&self, host: &str, snippet: &[u8]) -> ContentId {
         let mut h = Hasher::new(KEY_DOMAIN);
-        h.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(self.target_or(host).as_bytes());
+        h.part(RUSTC_V.as_bytes()).part(COMMIT_HASH.as_bytes()).part(self.target_or(host).as_bytes());
         let list = |h: &mut Hasher, label: &[u8], values: &[&str]| {
             h.part(label).update(&(values.len() as u64).to_le_bytes());
             for value in values {
@@ -432,7 +434,7 @@ impl<'s> Compile<'_, 's> {
 /// the answers table, made from the toolchain's sysroot of the side whose target it is.
 pub fn ships_key(target: &str, krate: &str) -> ContentId {
     let mut h = Hasher::new(SHIPS_DOMAIN);
-    h.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(krate.as_bytes());
+    h.part(RUSTC_V.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(krate.as_bytes());
     h.finish()
 }
 
@@ -451,7 +453,7 @@ pub fn ships_rows<'a, 'c>(target: &str, crates: impl IntoIterator<Item = &'c str
 /// a name only mentioned in a macro's tokens or a body (known neither way).
 pub fn feature_key(target: &str, needs: Needs, name: &str) -> ContentId {
     let mut h = Hasher::new(FEATURE_DOMAIN);
-    h.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(needs.krate().as_bytes());
+    h.part(RUSTC_V.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(needs.krate().as_bytes());
     h.update(&[1]).part(name.as_bytes());
     h.finish()
 }
@@ -460,7 +462,7 @@ pub fn feature_key(target: &str, needs: Needs, name: &str) -> ContentId {
 /// name no [`feature_key`] row holds is declared by none of the crates loaded (E0635).
 pub fn features_listed_key(target: &str, needs: Needs) -> ContentId {
     let mut h = Hasher::new(FEATURE_DOMAIN);
-    h.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(needs.krate().as_bytes());
+    h.part(RUSTC_V.as_bytes()).part(COMMIT_HASH.as_bytes()).part(target.as_bytes()).part(needs.krate().as_bytes());
     h.update(&[0]);
     h.finish()
 }

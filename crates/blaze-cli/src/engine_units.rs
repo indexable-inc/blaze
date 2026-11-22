@@ -24,8 +24,27 @@
 //! - the graph's row stands by its key, `unit_graph_task::source` over the lock's bytes, the
 //!   layout's reads (`sweep::units_source`), the target and host (cfg from the toolchain's
 //!   manifest and the profile's panic) and the ask;
-//! - every stored `Fetch` row stands ([`fetch_stands`]): its key, and for a held one its record
-//!   still in the sources store (one stat; the bytes were checked once when fetched, rule 74).
+//! - every stored `Fetch` row stands ([`fetch_row_stands`]): its key and its out. A held one's
+//!   record is looked at once, by its reader: the world maps it to place its package (names.rs
+//!   `Folder`); one gone is no world, and the discover's stat ([`held_stands`]) fetches it again.
+//!
+//! THE PREVIOUS ANSWER IS THE PLAN (end-state.md rule 3; D150's plan index deleted 2026-11-20).
+//! The read back is taken only under a [`Stood`]: the sweep's proof (rule 74) that no layout row
+//! the last answer read moved (manifests, the lock, listings, the home's module listings, the
+//! member macro crates). Without one the graph's key has moved by construction (its source is
+//! `sweep::units_source` over those rows), so the stage discovers and says why
+//! ([`UnitsCause::NotSwept`]). Under one, the stage reads the stored answer's own pages, one row
+//! at a time as asked ([`Back`], counted): the members' units rows (their out holds the
+//! toolchain's id, which no sweep row holds), the graph's, and each `Fetch` row (its out: held, or
+//! a lasting refusal). The `MacroModule` parts come from the graph the names world already
+//! decoded (`macros::parts_of`), never a second decode, and nothing is written: no side record,
+//! index or memo holds what the answer's pages hold (the deleted index saved about 7 ms of the
+//! 180 ms read back on tempo, 2026-11-19, so it was a memo of the cheap part). No held fetch is
+//! statted under the proof: its record's one look is the world's map of it (rule 74). The
+//! profile's `plan:` line counts the rows read, the sources statted, the bytes written, the worlds
+//! built, the graph decodes and the fetched records mapped (floors 0 for the stats, bytes, worlds
+//! and decodes under the proof; the world and the decode are 1 until the world is read in place
+//! from the stored crate list, engine.md item 2).
 //!
 //! Anything else is a full discover, and the profile's phase line names why ([`UnitsCause`]). A
 //! stored record that cannot be read back is a typed refusal ([`BackRefused`]), never a quiet
@@ -36,6 +55,7 @@
 //! merged one), so a stage's tasks are planned from the merged records of the stage before
 //! instead of by the planner ahead of the first phase.
 
+use core::cell::Cell;
 use core::fmt;
 
 use blaze_drive::{Condition, Input, Key, Kind, Locate, Name, Part, Task, TaskFailure};
@@ -65,11 +85,238 @@ pub(crate) struct Units {
     pub(crate) fetches_run: u32,
 }
 
-/// The stored answer as `check` loaded it (engine_answer.rs `load_answer`): each row, and each
-/// row's record key. Both empty for a fresh request or none stored.
+/// The stored answer's units-stage rows, read one at a time as the stage asks for them
+/// (engine_check.rs `AnswerUnits`, over the answer's header pages); none for a fresh request or
+/// none stored.
+pub(crate) trait StoredUnits<'a> {
+    /// The name of every units-stage row the stored answer holds (pages.rs `Root::units`).
+    fn names(&self) -> &[Name];
+    /// The stored row of `name`; `None` when the answer holds none.
+    fn row(&self, name: Name) -> Result<Option<Row<'a>>, CliError>;
+    /// The record key the stored answer names for `name`'s row (pages.rs `records`).
+    fn record(&self, name: Name) -> Result<Option<Key>, CliError>;
+}
+
+/// The stored answer as the stage reads it: each row it asks for counted, so the profile's
+/// `plan:` line says how many of the stage's rows a request read ([`PlanRows`]).
 pub(crate) struct Back<'b, 'a> {
-    pub(crate) rows: &'b SMap<'a, Name, Row<'a>>,
-    pub(crate) records: &'b SMap<'a, Name, Key>,
+    stored: &'b dyn StoredUnits<'a>,
+    read: Cell<u32>,
+}
+
+impl<'b, 'a> Back<'b, 'a> {
+    pub(crate) fn new(stored: &'b dyn StoredUnits<'a>) -> Back<'b, 'a> {
+        Back { stored, read: Cell::new(0) }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.stored.names().is_empty()
+    }
+
+    /// One stored row, counted.
+    fn row(&self, name: Name) -> Result<Option<Row<'a>>, CliError> {
+        self.read.set(self.read.get().saturating_add(1));
+        self.stored.row(name)
+    }
+
+    /// The record key of a row: the row's own header, not another row.
+    fn record(&self, name: Name) -> Result<Option<Key>, CliError> {
+        self.stored.record(name)
+    }
+
+    /// The stored answer's `Fetch` names, sorted (so the first fetch that moved is the same on
+    /// every machine, rule 25). Names only: no row is read.
+    fn fetches<'f>(&self, frame: &'f Frame) -> Vec<Name, &'f Frame> {
+        let mut fetches = Vec::new_in(frame);
+        fetches.extend(self.stored.names().iter().copied().filter(|name| name.kind == Kind::Fetch));
+        fetches.sort_unstable();
+        fetches
+    }
+
+    fn total(&self) -> u32 {
+        u32::try_from(self.stored.names().len()).unwrap_or(u32::MAX)
+    }
+}
+
+/// The sweep's proof (rule 74) that no layout row of the last answer moved: every manifest, the
+/// lock, every listing the layout made, the home's module listings and each member macro crate's
+/// files stand as the stored answer read them. Made only by [`Stood::of`] from the sweep's
+/// [`crate::sweep::Followed`], so the units stage's read back can be taken only where the sweep
+/// checked its inputs; the stage then trusts the stored answer's pages as its plan and checks
+/// only what no sweep row holds (the toolchain's id, by the units rows' out; each held fetch's
+/// record, by the world's one map of it). Not `Clone`: one proof, taken once by [`discover`].
+#[derive(Debug)]
+pub(crate) struct Stood {
+    _sealed: (),
+}
+
+impl Stood {
+    /// The proof, when the sweep `followed` the last answer's rows and no layout row moved (the
+    /// sweep's `layout_moved`, which a moved manifest, listing, home listing or macro crate sets).
+    pub(crate) fn of(followed: &crate::sweep::Followed<'_>) -> Option<Stood> {
+        (!followed.layout_moved).then_some(Stood { _sealed: () })
+    }
+}
+
+/// How the stage plans when the read back may be taken: one seam (rule 78), each way tested equal
+/// (tests/engine_plan_answer_tests.rs, the oracle over every edit shape).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PlanPlant {
+    /// As built: under a [`Stood`], the stored answer is the plan.
+    Built,
+    /// The control: the proof dropped, every request discovers the graph in full (the fetches'
+    /// rows still stand, so none runs).
+    Discover,
+    /// As built, and the graph's record sealed with a list whose first member row has `flag`
+    /// flipped ([`sealed`]): a fact of the list moved under one graph key (the `PUBLIC` flag
+    /// is what a lock entry's checksum moving would move), which a world made by need must
+    /// refuse (names.rs `made_or_make`).
+    SealsFlipped { flag: u8 },
+    /// As built, and the read back makes the world at once (the eager make the switch removed):
+    /// the control of the tests that count the world's makes. A ready request takes the phase
+    /// path's setup under it ([`ready_lays_out`]), so it has a read back to plant in.
+    WorldAtReadBack,
+    /// A ready request takes the phase path's setup (the layout, this stage, the file walk) in
+    /// place of its own (engine_check.rs `ready_setup`): the control of the test that counts the
+    /// setup steps a ready request takes.
+    ReadyLaysOut,
+    /// As built, and the plan's reach (D191, engine_bodies.rs `plan_reach`) read from the crate
+    /// list of the graph's record in the store, as it was read before 2026-11-21: the control
+    /// of tests/engine_unit_files_tests.rs's reach tests (the record is filed only when the
+    /// engine merges the Units stage, after the plan: a request whose Units stage runs stops).
+    ReachFromStore,
+}
+
+/// The span of the units stage ([`discover`]): a ready request never opens it (engine_check.rs
+/// `ready_setup` reads the graph's row and list in its place).
+pub(crate) const UNITS_STAGE_SPAN: &str = "engine: the units stage found";
+
+/// Whether a ready request takes the phase path's setup in place of its own: never as built;
+/// under the tests' plants [`PlanPlant::WorldAtReadBack`] and [`PlanPlant::ReadyLaysOut`].
+#[cfg(not(test))]
+pub(crate) fn ready_lays_out() -> bool {
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn ready_lays_out() -> bool {
+    matches!(PLAN_PLANT.with(Cell::get), PlanPlant::WorldAtReadBack | PlanPlant::ReadyLaysOut)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PLAN_PLANT: Cell<PlanPlant> = const { Cell::new(PlanPlant::Built) };
+    /// The bug planted by the owed fixture's control (engine_body_reads_memory_tests.rs): [`owes`]
+    /// owes nothing, so a failed fetch stands as the certificate replays it (turso, before
+    /// 2026-11-20).
+    pub(crate) static OWES_NOTHING: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(not(test))]
+fn planted(stood: Option<Stood>) -> Option<Stood> {
+    stood
+}
+
+#[cfg(test)]
+fn planted(stood: Option<Stood>) -> Option<Stood> {
+    match PLAN_PLANT.with(Cell::get) {
+        PlanPlant::Built | PlanPlant::SealsFlipped { .. } | PlanPlant::WorldAtReadBack | PlanPlant::ReadyLaysOut | PlanPlant::ReachFromStore => stood,
+        PlanPlant::Discover => None,
+    }
+}
+
+/// The list bytes the graph's record is sealed with: as written.
+#[cfg(not(test))]
+fn sealed<'b>(list: &'b [u8], _frame: &'b Frame) -> &'b [u8] {
+    list
+}
+
+/// The list bytes the graph's record is sealed with: as written, or under
+/// [`PlanPlant::SealsFlipped`] a copy whose first member row has its flag flipped.
+#[cfg(test)]
+fn sealed<'b>(list: &'b [u8], frame: &'b Frame) -> &'b [u8] {
+    use blaze_world::crate_list::{CrateGraph, CrateList, FLAGS_AT, HEADER_LEN, ROW};
+    let PlanPlant::SealsFlipped { flag } = PLAN_PLANT.with(Cell::get) else { return list };
+    let opened = CrateList::open(list).expect("SealsFlipped: the list written opens");
+    let row = (0..CrateGraph::len(&opened)).find(|r| opened.member(*r)).expect("SealsFlipped: the world has a member row to plant in");
+    let mut planted = Vec::from_slice_in(list, frame);
+    planted[HEADER_LEN + row * ROW + FLAGS_AT] ^= flag;
+    planted.leak()
+}
+
+/// The plan's reads of the stored answer, the profile's `plan:` line: the units stage's rows read
+/// of the stored ones, the files' rows read of the files walked (engine_check.rs `Kept`), the
+/// sources statted, and the bytes the stage wrote to the store. The floor for an edit under a
+/// [`Stood`]: the changed files' rows, their units' rows, the graph's row and one row per fetch;
+/// no stat; zero bytes written.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct PlanRows {
+    pub(crate) units_read: u32,
+    pub(crate) units_total: u32,
+    pub(crate) files_read: u32,
+    pub(crate) files_total: u32,
+    /// One stat of the sources store for each held fetch the stage looked at beside its reader
+    /// ([`held_stands`]: a discover only; 0 under a [`Stood`]).
+    pub(crate) sources_statted: u32,
+    /// What the stage itself put in the store: nothing since the plan index went (the graph's
+    /// and the fetches' records are put by the answer's commit, counted there).
+    pub(crate) bytes_written: u64,
+    /// Whether the sweep's [`Stood`] was handed to the stage.
+    pub(crate) stood: bool,
+    /// The names worlds made by the stage (names.rs `world`; floor 0 under a [`Stood`] once the
+    /// world is read in place from the stored crate list, engine.md item 2), and the graph
+    /// decodes they made (floor 0 likewise).
+    pub(crate) worlds_built: u32,
+    pub(crate) graph_decodes: u32,
+    /// The fetched records the world mapped in place (names.rs `Folder`, the one look at each),
+    /// and their bytes.
+    pub(crate) records_mapped: u32,
+    pub(crate) mapped_bytes: u64,
+    /// Fetches run again because the last command owed them (fetch.md, "The rule for a failure
+    /// outside the checkout": their stored row failed, or this build could not fetch them), and
+    /// how many of those failed again now (owed once more).
+    pub(crate) owed_again: u32,
+    pub(crate) owed_still: u32,
+}
+
+impl PlanRows {
+    /// What making `names`' world did, counted into the line: nothing when the names were read
+    /// from the list and no world was made (its floor, engine.md item 2).
+    fn world(&mut self, names: &Names<'_>) {
+        let Some(made) = names.made() else { return };
+        let opened = made.opened();
+        self.worlds_built = self.worlds_built.saturating_add(1);
+        self.graph_decodes = self.graph_decodes.saturating_add(opened.graph_decodes.get());
+        self.records_mapped = self.records_mapped.saturating_add(opened.records_mapped.get());
+        self.mapped_bytes = self.mapped_bytes.saturating_add(opened.mapped_bytes.get());
+    }
+}
+
+impl fmt::Display for PlanRows {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let read = self.units_read.saturating_add(self.files_read);
+        let total = self.units_total.saturating_add(self.files_total);
+        let proof = if self.stood { "the sweep's proof held (no layout row moved)" } else { "no sweep proof (a layout row moved, or none was followed)" };
+        write!(
+            f,
+            "plan: rows read {read} of {total} (units {} of {}, files {} of {}; floor: the changed files and their units); sources statted {}; bytes written {}; {proof}; \
+             worlds built {}, graph decodes {} (floor 0, 0 under the proof); fetched records mapped {} ({} bytes); \
+             owed again {} (fetches the last command failed outside the checkout, run again), {} still owed",
+            self.units_read,
+            self.units_total,
+            self.files_read,
+            self.files_total,
+            self.sources_statted,
+            self.bytes_written,
+            self.worlds_built,
+            self.graph_decodes,
+            self.records_mapped,
+            self.mapped_bytes,
+            self.owed_again,
+            self.owed_still,
+        )
+    }
 }
 
 /// Why the graph was or was not read back: the profile's phase line says it ([`UnitsCause::phase`]).
@@ -81,6 +328,9 @@ pub(crate) enum UnitsCause {
     NoAnswer,
     /// No lock, so no graph this request: only the units records.
     NoGraph,
+    /// The sweep handed no [`Stood`]: a layout row moved (so the graph's key moved with it), or
+    /// no last answer's rows were followed.
+    NotSwept,
     /// A units record is new, failed, or moved (a manifest, a listing, the toolchain's id).
     UnitsMoved { name: Name },
     /// The graph's key moved: the lock, the layout's reads, the target, the host or the ask.
@@ -106,6 +356,7 @@ impl UnitsCause {
         match self {
             UnitsCause::ReadBack => "plan (the units read back: the graph's record, no fetch run, no graph walk)",
             UnitsCause::NoAnswer | UnitsCause::NoGraph => "plan (the units, the fetches and the graph)",
+            UnitsCause::NotSwept => "plan (the units, the fetches and the graph: no sweep proof, a layout row moved)",
             UnitsCause::UnitsMoved { .. } => "plan (the units, the fetches and the graph: a units record moved)",
             UnitsCause::GraphMoved => "plan (the units, the fetches and the graph: the graph's key moved)",
             UnitsCause::Failed { .. } => "plan (the units, the fetches and the graph: a stored fetch or graph had failed)",
@@ -141,8 +392,11 @@ pub(crate) enum BackRefused {
     Out { key: Key },
     /// The payload is not a sealed graph and crate list (graph_payload.rs).
     Payload { key: Key, why: PayloadError },
-    /// The graph section does not decode (macros.rs `parts`).
+    /// The graph section does not decode (`stored_editions`).
     Graph { key: Key, why: blaze_unit_graph::record::RecordRefused },
+    /// The crate list it was sealed with does not open: a version 5 list of an old home (D160),
+    /// or bytes of no list.
+    List { key: Key, why: blaze_world::crate_list::ListError },
 }
 
 impl fmt::Display for BackRefused {
@@ -155,6 +409,7 @@ impl fmt::Display for BackRefused {
             BackRefused::Out { key } => write!(f, "the record at {key:?} has another out than its row"),
             BackRefused::Payload { key, why } => write!(f, "the record at {key:?}: {why}"),
             BackRefused::Graph { key, why } => write!(f, "the record at {key:?}: {why}"),
+            BackRefused::List { key, why } => write!(f, "the record at {key:?}: its crate list: {why}"),
         }
     }
 }
@@ -187,12 +442,52 @@ pub(crate) struct Discovered<'f> {
     /// What the stage did, and why.
     pub(crate) units: Units,
     pub(crate) cause: UnitsCause,
+    /// The stage's reads of the stored answer, its stats and bytes written (the caller adds the
+    /// files' rows).
+    pub(crate) plan: PlanRows,
+    /// The tasks that failed for a reason outside the checkout ([`owes`]), sorted: each is owed
+    /// again on every command until it succeeds (fetch.md, "The rule for a failure outside the
+    /// checkout"), so the Units phase puts it on the engine's owed list (engine_check.rs) and
+    /// the answer's certificate does not stand while one is.
+    pub(crate) owed: Vec<Name, &'f Frame>,
+}
+
+impl<'f> Discovered<'f> {
+    /// The ready path's (engine_check.rs `ready_setup`, D187): no units task planned, run or
+    /// read back, and no names here (the setup reads them from the crate list itself). Taken
+    /// only under the sweep's `Stood`, which the setup takes by value: the plan row says the
+    /// proof held.
+    pub(crate) fn ready(_stood: &Stood, frame: &'f Frame) -> Discovered<'f> {
+        Discovered {
+            published: Vec::new_in(frame),
+            names: None,
+            units: Units::default(),
+            cause: UnitsCause::ReadBack,
+            plan: PlanRows { stood: true, ..PlanRows::default() },
+            owed: Vec::new_in(frame),
+        }
+    }
 }
 
 impl Discovered<'_> {
     /// The record of `name`, if it was made.
     pub(crate) fn get(&self, name: Name) -> Option<&Published<'_>> {
         self.published.binary_search_by(|one| one.name.cmp(&name)).ok().map(|at| &self.published[at])
+    }
+
+    /// How the Units task `name`'s result stands: owed to the next command when it failed for a
+    /// reason outside the checkout ([`Discovered::owed`]), else by its key and reads.
+    pub(crate) fn stands(&self, name: Name) -> blaze_engine::Stands {
+        match self.owed.binary_search(&name) {
+            Ok(_) => blaze_engine::Stands::OwedNextRequest,
+            Err(_) => blaze_engine::Stands::ByReads,
+        }
+    }
+
+    /// The graph record's standing `(name, out)` witness, when this request made or read one.
+    /// Consumers use the witness to open the plan directory without decoding every graph row.
+    pub(crate) fn graph_witness(&self) -> Option<(Name, ContentId)> {
+        self.get(Name::unit_graph()).and_then(|one| one.made.as_ref().ok().map(|made| (one.name, made.out)))
     }
 }
 
@@ -228,9 +523,30 @@ pub(crate) fn published<'f>(name: Name, did: Did<'f>) -> Result<Result<Made<'f>,
     }
 }
 
+/// Whether the stage's task `name` failed for a reason outside the checkout, so is owed again on
+/// every command until it succeeds (fetch.md, "The rule for a failure outside the checkout", the
+/// one statement of it): a hole (no record: a fetch the network or the store failed, or the graph
+/// whose sources were not fetched, fetch.rs and graph.rs), or a fetch this build could not make
+/// (built without `fetch`: cargo's cache, its read list, is no stamp of the sweep's,
+/// [`fetch_row_stands`]'s `Unfetched`). A failure of the bytes or of the checkout's own text
+/// stands by its key and reads.
+fn owes(name: Name, did: &Did<'_>) -> bool {
+    #[cfg(test)]
+    if OWES_NOTHING.with(Cell::get) {
+        return false;
+    }
+    match did {
+        Did::Hole(..) => true,
+        Did::Done(made) => name.kind == Kind::Fetch && made.out != name.subject && !cfg!(feature = "fetch"),
+        Did::Failed(_) | Did::FailedSaying(..) | Did::Need(_) => false,
+    }
+}
+
 /// The sources store (fetch.rs `sources_dir`), opened at the first stored `Fetch` row looked at.
 struct Sources {
     dir: Option<Dir<ReadWrite>>,
+    /// The stats made of it ([`held_stands`]).
+    statted: u32,
 }
 
 impl Sources {
@@ -243,12 +559,6 @@ impl Sources {
     }
 }
 
-/// The stored answer's `Fetch` rows, in name order: names sort by kind first, so they are one run
-/// of the map, found in `log n` (never a walk of every row).
-fn stored_fetches<'b, 'a>(rows: &'b SMap<'a, Name, Row<'a>>) -> impl Iterator<Item = (&'b Name, &'b Row<'a>)> + 'b {
-    rows.range(Name::new(Kind::Fetch, ContentId([0; 32]))..).take_while(|(name, _)| name.kind == Kind::Fetch)
-}
-
 /// Whether the stored row of the `Fetch` task `name` stands, and so its out, without running it.
 /// Its read list (rule 21): the lock entry's record key, which is its subject and its source
 /// (fetch_task.rs `source`), in its key; for a held record, the record at that key in the sources
@@ -257,64 +567,123 @@ fn stored_fetches<'b, 'a>(rows: &'b SMap<'a, Name, Row<'a>>) -> impl Iterator<It
 /// it the refusal also read cargo's archive cache, which no stamp of the sweep's covers: it never
 /// stands, and is asked again each command.
 fn fetch_stands(cx: &Cx, name: Name, row: &Row<'_>, tools: blaze_engine::Tools, sources: &mut Sources, env: &FetchEnv<'_>) -> Result<Result<ContentId, UnitsCause>, CliError> {
-    if row.failed {
-        return Ok(Err(UnitsCause::Failed { name }));
-    }
-    if row.phase.stage != Stage::Units || row.key != tools.key(name, &name.subject) {
-        return Ok(Err(UnitsCause::GraphMoved));
-    }
-    match row.out == name.subject {
-        true => match crate::fetch::holds(cx, sources.open(cx, env)?, &name.subject)? {
-            true => Ok(Ok(row.out)),
-            false => Ok(Err(UnitsCause::SourceGone { name })),
-        },
-        false if cfg!(feature = "fetch") => Ok(Ok(row.out)),
-        false => Ok(Err(UnitsCause::Unfetched { name })),
+    match fetch_row_stands(name, row, tools) {
+        Ok(Fetched::Held) => held_stands(cx, name, sources, env),
+        Ok(Fetched::Refused(out)) => Ok(Ok(out)),
+        Err(why) => Ok(Err(why)),
     }
 }
 
-/// `None` when the stored graph stands with every input it is a function of: each units record
-/// today's layout made (`records`) by its row's key and out, the graph's row by `graph_key`, every
-/// stored fetch by [`fetch_stands`]. Else the first input that moved.
-#[expect(clippy::too_many_arguments, reason = "the planner's edge: each argument one handle or fact of it")]
-fn stood(cx: &Cx, records: &[Published<'_>], back: &Back<'_, '_>, units: ContentId, graph_key: Key, tools: blaze_engine::Tools, sources: &mut Sources, env: &FetchEnv<'_>) -> Result<Option<UnitsCause>, CliError> {
-    if back.rows.is_empty() {
-        return Ok(Some(UnitsCause::NoAnswer));
+/// What a stored `Fetch` row that stands by its key says ([`fetch_row_stands`]).
+enum Fetched {
+    /// Its record is in the sources store (its out is its subject): looked at by its reader.
+    Held,
+    /// A lasting refusal, with its out.
+    Refused(ContentId),
+}
+
+/// The row half of [`fetch_stands`]: its key, its failure and its out, no file looked at. Under a
+/// [`Stood`] this is the whole check: the record of a held fetch is looked at ONCE, by the one
+/// reader that maps it (names.rs `Folder`, the world's placing of its package), never by a stat
+/// beside it (rule 74). A record gone by hand is no mapping there, so the world is not made and
+/// the stage discovers ([`UnitsCause::World`]), where [`held_stands`] finds it gone and fetches it.
+fn fetch_row_stands(name: Name, row: &Row<'_>, tools: blaze_engine::Tools) -> Result<Fetched, UnitsCause> {
+    if row.failed {
+        return Err(UnitsCause::Failed { name });
+    }
+    if row.phase.stage != Stage::Units || row.key != tools.key(name, &name.subject) {
+        return Err(UnitsCause::GraphMoved);
+    }
+    match row.out == name.subject {
+        true => Ok(Fetched::Held),
+        false if cfg!(feature = "fetch") => Ok(Fetched::Refused(row.out)),
+        false => Err(UnitsCause::Unfetched { name }),
+    }
+}
+
+/// Whether the held fetch `name`'s record is still in the sources store, by one stat (its bytes
+/// were checked once, when fetched or adopted, rule 74): its out (its subject), or why not.
+fn held_stands(cx: &Cx, name: Name, sources: &mut Sources, env: &FetchEnv<'_>) -> Result<Result<ContentId, UnitsCause>, CliError> {
+    sources.statted = sources.statted.saturating_add(1);
+    match crate::fetch::holds(cx, sources.open(cx, env)?, &name.subject)? {
+        true => Ok(Ok(name.subject)),
+        false => Ok(Err(UnitsCause::SourceGone { name })),
+    }
+}
+
+/// What [`stood`] found standing, handed to [`read_back`]: the graph's stored row (its out and
+/// reads) and record key, and each stored fetch that stands with its out.
+struct Standing<'f> {
+    graph_out: ContentId,
+    graph_reads: Vec<(Name, ContentId), &'f Frame>,
+    graph_record: Key,
+    fetches: Vec<(Name, ContentId), &'f Frame>,
+}
+
+/// `Ok` when, under the sweep's `proof`, the stored graph stands with every input no sweep row
+/// holds: each units record today's layout made (`records`) by its row's key and out (the out
+/// holds the toolchain's id), the graph's row by `graph_key` and its record key, and every stored
+/// `Fetch` row by its row alone ([`fetch_row_stands`]: no stat, the world's map of each held
+/// record is its one look). Else the first input that moved. The proof is taken, not looked at:
+/// its existence is the check (rule 74).
+fn stood<'f>(
+    proof: Stood,
+    records: &[Published<'_>],
+    back: &Back<'_, '_>,
+    units: ContentId,
+    graph_key: Key,
+    tools: blaze_engine::Tools,
+    frame: &'f Frame,
+) -> Result<Result<Standing<'f>, UnitsCause>, CliError> {
+    let Stood { _sealed: () } = proof;
+    if back.is_empty() {
+        return Ok(Err(UnitsCause::NoAnswer));
     }
     for one in records.iter() {
-        let Ok(made) = &one.made else { return Ok(Some(UnitsCause::UnitsMoved { name: one.name })) };
-        match back.rows.get(&one.name) {
+        let Ok(made) = &one.made else { return Ok(Err(UnitsCause::UnitsMoved { name: one.name })) };
+        match back.row(one.name)? {
             Some(row) if !row.failed && row.key == tools.key(one.name, &units) && row.out == made.out => {}
-            _ => return Ok(Some(UnitsCause::UnitsMoved { name: one.name })),
+            _ => return Ok(Err(UnitsCause::UnitsMoved { name: one.name })),
         }
     }
     let name = Name::unit_graph();
-    match back.rows.get(&name) {
-        Some(row) if row.key != graph_key => return Ok(Some(UnitsCause::GraphMoved)),
-        Some(row) if row.failed => return Ok(Some(UnitsCause::Failed { name })),
-        Some(_) => {}
-        None => return Ok(Some(UnitsCause::GraphMoved)),
-    }
-    for (fetch, row) in stored_fetches(back.rows) {
-        if let Err(why) = fetch_stands(cx, *fetch, row, tools, sources, env)? {
-            return Ok(Some(why));
+    let row = match back.row(name)? {
+        Some(row) if row.key != graph_key => return Ok(Err(UnitsCause::GraphMoved)),
+        Some(row) if row.failed => return Ok(Err(UnitsCause::Failed { name })),
+        Some(row) => row,
+        None => return Ok(Err(UnitsCause::GraphMoved)),
+    };
+    let Some(graph_record) = back.record(name)? else { return Ok(Err(UnitsCause::Refused(BackRefused::NoKey))) };
+    let mut graph_reads = Vec::with_capacity_in(row.reads.len(), frame);
+    graph_reads.extend(row.reads.iter().map(|(id, out)| (id.of, *out)));
+    let stored_fetches = back.fetches(frame);
+    let mut fetches = Vec::with_capacity_in(stored_fetches.len(), frame);
+    for fetch in stored_fetches.iter() {
+        let Some(row) = back.row(*fetch)? else {
+            return Err(crate::engine_check::EngineCheckError::MissingIndexedRow { name: *fetch }.into());
+        };
+        // No stat: a held record is looked at by its one reader, the world's map ([`fetch_row_stands`]).
+        match fetch_row_stands(*fetch, &row, tools) {
+            Ok(Fetched::Held) => fetches.push((*fetch, fetch.subject)),
+            Ok(Fetched::Refused(out)) => fetches.push((*fetch, out)),
+            Err(why) => return Ok(Err(why)),
         }
     }
-    Ok(None)
+    Ok(Ok(Standing { graph_out: row.out, graph_reads, graph_record, fetches }))
 }
 
 /// The graph's stored record read back under its standing row (`stood` said so): its out and
-/// payload as put, its `MacroModule` parts made again from its graph section (the store keeps a
-/// units record's head without parts, engine_store.rs `put_all`), each stored fetch row as its
-/// record, all pushed onto `records`; and the names world made from the graph section. Nothing is
-/// fetched, no level of the lock walked, no crate list written. `Err` names why not (rule 3):
-/// nothing is pushed then, and the caller discovers in full.
+/// payload as put, its `MacroModule` parts made from the graph the names world decoded (the store
+/// keeps a units record's head without parts, engine_store.rs `put_all`), each fetch that stood
+/// as its record, all pushed onto `records`; and the names world made from the graph section.
+/// Nothing is fetched, no level of the lock walked, no crate list written, nothing put. `Err`
+/// names why not (rule 3): nothing is pushed then, and the caller discovers in full.
 #[expect(clippy::too_many_arguments, reason = "the planner's edge: each argument one handle or fact of it")]
 fn read_back<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     store: &mut dyn crate::store::Store<'_>,
-    back: &Back<'_, '_>,
+    standing: Standing<'f>,
     lockfile: &crate::fetch::Lockfile<'f>,
     graph: &crate::graph::Graph<'f>,
     records: &mut Vec<Published<'f>, &'f Frame>,
@@ -323,45 +692,58 @@ fn read_back<'f>(
 ) -> Result<Result<Option<Names<'f>>, UnitsCause>, CliError> {
     let _cx = cx.span("engine: the unit graph read back");
     let name = Name::unit_graph();
-    let Some(row) = back.rows.get(&name) else { return Ok(Err(UnitsCause::GraphMoved)) };
     let refused = |why: BackRefused| -> Result<Result<Option<Names<'f>>, UnitsCause>, CliError> { Ok(Err(UnitsCause::Refused(why))) };
-    let (key, view, sections) = match stored_graph(cx, store, back.records)? {
+    let key = standing.graph_record;
+    let (view, sections) = match stored_graph_at(cx, store, key)? {
         Ok(found) => found,
         Err(why) => return refused(why),
     };
-    if view.out != row.out {
+    if view.out != standing.graph_out {
         return refused(BackRefused::Out { key });
     }
-    // The module lookups' parts, as graph.rs `run` names them from the same bytes.
-    let parts = match crate::macros::parts(graph.source, sections.graph, env.heap.alloc()) {
-        Ok(parts) => parts,
-        Err(why) => return refused(BackRefused::Graph { key, why }),
-    };
     // A record sealed with no list holds the finding of a world that could not be made, which a
     // units record keeps nowhere but its record: discovered in full, so the finding is made
     // again (rare: the names did not resolve).
     if sections.list.is_empty() {
         return Ok(Err(UnitsCause::World));
     }
-    // The names world, from the graph section as the full discover makes it. A world that is
-    // not made from bytes it was made from before is a moved input under one key: discovered in
-    // full.
-    let world = {
-        let _cx = cx.span("names: make the world");
-        crate::names::world(cx, root, sections.graph, Some(lockfile.lock), Some(graph.member_dirs()), env)
+    // The names from the crate list the record was sealed with (crate_list.rs version 6), read
+    // in place: no world made, no graph section decoded (engine.md item 2). The world is made by
+    // need, from this record by its key, when a names, script or proc-macro task runs (names.rs
+    // `made_or_make`). A list of an old home (version 5) is refused by its version and the graph
+    // discovered in full (D160).
+    let names = {
+        let _cx = cx.span("names: the crate list read back");
+        let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
+        held.extend_from_slice(sections.list);
+        let held: &'static [u8] = held.leak();
+        let maker = crate::names::Maker::new(key, view.out, lockfile.lock, graph.member_dirs(), frame);
+        crate::names::Names::of_list(held, Some(maker), env.heap.alloc())
     };
-    let Ok(made) = world else { return Ok(Err(UnitsCause::World)) };
+    let made = match names {
+        Ok(made) => made,
+        Err(crate::names::NamesError::List(why)) => return refused(BackRefused::List { key, why }),
+        Err(_) => return Ok(Err(UnitsCause::World)),
+    };
+    // The control of the tests that count the world's makes: the eager make, planted.
+    #[cfg(test)]
+    if PLAN_PLANT.with(Cell::get) == PlanPlant::WorldAtReadBack {
+        let _planted = made.made_or_make(cx, root, store, env, crate::names::NeededBy::NamesTask)?.expect("WorldAtReadBack: the world is made from the record read back");
+    }
+    // The module lookups' parts, as graph.rs `run` names them from the same bytes, from the
+    // list's proc-macro table: the graph section is not decoded.
+    let parts = crate::macros::parts_of_subjects(graph.source, made.list().macros().map(ContentId), frame);
     crate::names::tell_public(store, &made);
-    for (fetch, row) in stored_fetches(back.rows) {
+    for (fetch, out) in standing.fetches.iter() {
         let mut record = Made::new_in(*fetch, frame);
-        record.out = row.out;
+        record.out = *out;
         records.push(Published { name: *fetch, source: fetch.subject, wave: 0, made: Ok(record) });
     }
     let mut record = Made::new_in(name, frame);
     record.out = view.out;
     // Its reads as its stored row holds them (none, for a graph made whole: `graph::run` records
     // none), so the row put again equals the row stored.
-    record.reads.extend(row.reads.iter().map(|(id, out)| (id.of, *out)));
+    record.reads.extend(standing.graph_reads.iter().copied());
     record.parts.extend(parts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 }));
     record.payload.extend_from_slice(view.payload);
     records.push(Published { name, source: graph.source, wave: 1, made: Ok(record) });
@@ -372,6 +754,8 @@ fn read_back<'f>(
 /// moved ([`read_back`]), else found forward from the layout: the fetches level by level (each
 /// stored fetch whose row stands handed as it was, not run), the graph, and the names world made
 /// from it.
+/// `stood`: the sweep's proof that no layout row moved ([`Stood::of`]); without it the read back
+/// is not taken.
 #[expect(clippy::too_many_arguments, reason = "the planner's edge: each argument one handle or fact of it")]
 pub(crate) fn discover<'f>(
     cx: &Cx,
@@ -381,31 +765,46 @@ pub(crate) fn discover<'f>(
     units: ContentId,
     tools: blaze_engine::Tools,
     back: &Back<'_, '_>,
+    stood_proof: Option<Stood>,
     env: &FetchEnv<'_>,
     frame: &'f Frame,
 ) -> Result<Discovered<'f>, CliError> {
-    let cx = cx.span("engine: the units stage found");
+    let cx = cx.span(UNITS_STAGE_SPAN);
     let alloc = env.heap.alloc();
     let mut records: Vec<Published<'f>, &'f Frame> = Vec::new_in(frame);
     let mut counts = Units::default();
+    // The tasks owed to the next command ([`owes`]), each pushed where its result is made.
+    let mut owed: Vec<Name, &'f Frame> = Vec::new_in(frame);
     // The units records, the root's and each member's.
     let mut unit_names: Vec<Name, &Frame> = Vec::new_in(frame);
     unit_names.push(Name::units());
     unit_names.extend(laid.members.iter().map(|(name, _)| *name));
     for name in unit_names.iter() {
         let task = drive_task(*name, tools.key(*name, &units), units, Vec::new_in(alloc), Vec::new_in(alloc), alloc);
-        let made = published(*name, crate::units::run(laid, &task, frame)?)?;
+        let did = crate::units::run(laid, &task, frame)?;
+        if owes(*name, &did) {
+            owed.push(*name);
+        }
+        let made = published(*name, did)?;
         records.push(Published { name: *name, source: units, wave: 0, made });
     }
     let mut names = None;
     let mut cause = UnitsCause::NoGraph;
-    let mut sources = Sources { dir: None };
+    let mut sources = Sources { dir: None, statted: 0 };
+    let stood_proof = planted(stood_proof);
+    let mut plan = PlanRows { units_total: back.total(), stood: stood_proof.is_some(), ..PlanRows::default() };
     if let Some((lockfile, graph)) = laid.lock.as_mut().zip(laid.graph.as_mut()) {
         let name = Name::unit_graph();
         let key = tools.key(name, &graph.source);
-        cause = match stood(&cx, &records, back, units, key, tools, &mut sources, env)? {
-            Some(why) => why,
-            None => match read_back(&cx, root, store, back, lockfile, graph, &mut records, env, frame)? {
+        let standing = match stood_proof {
+            // No answer to plan from says so before the missing proof does.
+            None if back.is_empty() => Ok(Err(UnitsCause::NoAnswer)),
+            None => Ok(Err(UnitsCause::NotSwept)),
+            Some(proof) => stood(proof, &records, back, units, key, tools, frame),
+        };
+        cause = match standing? {
+            Err(why) => why,
+            Ok(standing) => match read_back(&cx, root, store, standing, lockfile, graph, &mut records, env, frame)? {
                 Ok(world) => {
                     names = world;
                     UnitsCause::ReadBack
@@ -416,7 +815,15 @@ pub(crate) fn discover<'f>(
         if cause == UnitsCause::ReadBack {
             counts.read_back = 1;
             records.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-            return Ok(Discovered { published: records, names, units: counts, cause });
+            plan.units_read = back.read.get();
+            plan.sources_statted = sources.statted;
+            if let Some(made) = &names {
+                plan.world(made);
+            }
+            // Read back, every fetch and the graph stood: none failed, so only a units record
+            // can be owed here.
+            owed.sort_unstable();
+            return Ok(Discovered { published: records, names, units: counts, cause, plan, owed });
         }
         counts.discovered = 1;
         let mut inputs: Vec<Input, blaze_own::Alloc<'_>> = Vec::new_in(alloc);
@@ -431,7 +838,13 @@ pub(crate) fn discover<'f>(
             let did = crate::graph::run(&cx, lockfile, graph, &task, env, frame, frame)?;
             let wants = match did {
                 Did::Need(wants) => wants,
-                did => break published(name, did)?,
+                did => {
+                    // The graph whose sources were not fetched is owed with them.
+                    if owes(name, &did) {
+                        owed.push(name);
+                    }
+                    break published(name, did)?;
+                }
             };
             // One level's lock entries, each fetched and handed to the next level.
             for want in wants.iter() {
@@ -441,20 +854,27 @@ pub(crate) fn discover<'f>(
                 }
                 let fetch_key = tools.key(fetch, &fetch.subject);
                 // A fetch whose stored row stands is handed as it was (rule 77): only a fetch
-                // one of whose inputs moved, or one never made, runs.
-                let stands = match back.rows.get(&fetch) {
-                    Some(row) => fetch_stands(&cx, fetch, row, tools, &mut sources, env)?.ok(),
-                    None => None,
+                // one of whose inputs moved, one never made, or one the last command owed runs.
+                let stands = match back.row(fetch)? {
+                    Some(row) => fetch_stands(&cx, fetch, &row, tools, &mut sources, env)?,
+                    None => Err(UnitsCause::NoAnswer),
                 };
                 let made = match stands {
-                    Some(out) => {
+                    Ok(out) => {
                         let mut record = Made::new_in(fetch, frame);
                         record.out = out;
                         Ok(record)
                     }
-                    None => {
+                    Err(why) => {
                         counts.fetches_run += 1;
-                        published(fetch, crate::fetch::run(&cx, lockfile, env, fetch, frame)?)?
+                        let again = matches!(why, UnitsCause::Failed { .. } | UnitsCause::Unfetched { .. });
+                        plan.owed_again = plan.owed_again.saturating_add(u32::from(again));
+                        let did = crate::fetch::run(&cx, lockfile, env, fetch, frame)?;
+                        if owes(fetch, &did) {
+                            owed.push(fetch);
+                            plan.owed_still = plan.owed_still.saturating_add(u32::from(again));
+                        }
+                        published(fetch, did)?
                     }
                 };
                 match &made {
@@ -473,21 +893,21 @@ pub(crate) fn discover<'f>(
                 };
                 // The record sealed with the crate list as work.rs's arm seals it: its readers
                 // (a `Script` job, a macro module's lookup) open its two sections
-                // (graph_payload.rs); unsealed, they were refused "no trailer mark".
+                // (graph_payload.rs); unsealed, they were refused "no trailer mark". Version 6
+                // (crate_list.rs), written with the world (names.rs `world`): the planners' facts
+                // too, so a later request plans from the list alone.
                 match world {
-                    Ok(made) => match blaze_world::crate_list::encode(made.world(), &|at| made.script_name_of(at), env.heap.alloc()) {
-                        Ok(list) => {
-                            record.out = crate::work::seal_graph(&mut record, &list);
-                            crate::names::tell_public(store, &made);
-                            names = Some(made);
-                            Ok(record)
-                        }
-                        Err(error) => {
-                            let words = bstd::mem::format_in!(frame, "the crate list of the world could not be written: {error}");
-                            let failure = TaskFailure { name, why: blaze_drive::Why::Refused { what: "the crate list", rule: "crate_list.rs" } };
-                            Err(Failure { failure, words: Some(crate::work::held_str(words.as_str(), frame)) })
-                        }
-                    },
+                    Ok(made) => {
+                        record.out = crate::work::seal_graph(&mut record, sealed(made.list_bytes(), frame));
+                        crate::names::tell_public(store, &made);
+                        names = Some(made);
+                        Ok(record)
+                    }
+                    Err(error @ (crate::names::NamesError::List(_) | crate::names::NamesError::ListDiffers { .. })) => {
+                        let words = bstd::mem::format_in!(frame, "the crate list of the world could not be written: {error}");
+                        let failure = TaskFailure { name, why: blaze_drive::Why::Refused { what: "the crate list", rule: "crate_list.rs" } };
+                        Err(Failure { failure, words: Some(crate::work::held_str(words.as_str(), frame)) })
+                    }
                     Err(error) => {
                         let words = bstd::mem::format_in!(frame, "names not resolved: {error}");
                         record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);
@@ -501,7 +921,14 @@ pub(crate) fn discover<'f>(
         records.push(Published { name, source: graph.source, wave: 1, made });
     }
     records.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    Ok(Discovered { published: records, names, units: counts, cause })
+    plan.units_read = back.read.get();
+    plan.sources_statted = sources.statted;
+    if let Some(made) = &names {
+        plan.world(made);
+    }
+    owed.sort_unstable();
+    owed.dedup();
+    Ok(Discovered { published: records, names, units: counts, cause, plan, owed })
 }
 
 /// The graph's record the stored answer names (`records`, pages.rs), opened whole, and its two
@@ -510,8 +937,14 @@ pub(crate) fn discover<'f>(
 type StoredGraph<'m> = (Key, blaze_drive::record::WholeView<'m>, crate::graph_payload::Sections<'m>);
 
 fn stored_graph<'m>(cx: &Cx, store: &mut dyn crate::store::Store<'m>, records: &SMap<'_, Name, Key>) -> Result<Result<StoredGraph<'m>, BackRefused>, CliError> {
+    let Some(&key) = records.get(&Name::unit_graph()) else { return Ok(Err(BackRefused::NoKey)) };
+    Ok(stored_graph_at(cx, store, key)?.map(|(view, sections)| (key, view, sections)))
+}
+
+/// The graph's record at `key`, opened whole, and its two sections, borrowed from the store's
+/// mapping. `Err` names why not (rule 3).
+pub(crate) fn stored_graph_at<'m>(cx: &Cx, store: &mut dyn crate::store::Store<'m>, key: Key) -> Result<Result<(blaze_drive::record::WholeView<'m>, crate::graph_payload::Sections<'m>), BackRefused>, CliError> {
     let name = Name::unit_graph();
-    let Some(&key) = records.get(&name) else { return Ok(Err(BackRefused::NoKey)) };
     let Some(held) = store.get(cx, key)? else { return Ok(Err(BackRefused::Missing { key })) };
     let view = match blaze_drive::record::open(held.bytes) {
         Ok(blaze_drive::record::Stored::Whole(view)) if view.name == name => view,
@@ -519,7 +952,7 @@ fn stored_graph<'m>(cx: &Cx, store: &mut dyn crate::store::Store<'m>, records: &
         Err(why) => return Ok(Err(BackRefused::Unreadable { key, why: Some(why) })),
     };
     match crate::graph_payload::sections(view.payload) {
-        Ok(sections) => Ok(Ok((key, view, sections))),
+        Ok(sections) => Ok(Ok((view, sections))),
         Err(why) => Ok(Err(BackRefused::Payload { key, why })),
     }
 }
@@ -576,4 +1009,86 @@ pub(crate) fn stored_editions<'f>(cx: &Cx, store: &mut dyn crate::store::Store<'
         roots.push((folder, crate::units::syntax_of(unit.edition.syntax)));
     }
     Ok(Ok(Editions { roots }))
+}
+
+/// THE GRAPH'S CRATE CELLS (D187, the hot reader list of 2026-11-20): the `UnitGraph` task
+/// defines, beside its whole record's cell, one cell per crate of its crate list, so a body's
+/// read of what the graph settles about one crate is a read of that crate's cell, never of the
+/// whole graph. On tempo the whole cell had 16,666 readers (every body), so any edit moving the
+/// graph (one dependency bumped) re-entered every body and read 58 MB of reader lists.
+///
+/// What a body takes from the graph, each now one of these cells:
+/// - a SETTLED crate's names and impl tables (engine_scope_reads.rs `ReadGrain::Graph`): that
+///   crate's inputs are fixed by its pack, so its records are a function of its key;
+/// - the lang crates and the owner's unit a body was looked up in (engine_bodies.rs, where a
+///   body's scope is not required): the owner's and each sysroot crate's cell.
+///
+/// The cell is keyed by the crate's key ([`crate_cell`]), and the crate key is already a
+/// function of everything the crate is made from (blaze-world list.rs `crate_key`: name,
+/// version, source, edition, cfg, each dependency's name and KEY, the implicit externs, the
+/// member's directory, a correction, the archive's checksum). So a bump of one dependency gives
+/// it, and every crate that depends on it transitively, a new key: the cells the bodies reading
+/// those crates read are no longer defined (read [`blaze_drive::key::ABSENT`] today), and only
+/// those bodies enter. The digest adds what the key does not hold: the pack the crate's tree is
+/// read from (its origin and its files' digest), and the crate's position-free facts the list
+/// keeps beside it (its root path in its tree).
+///
+/// [`CRATE_CELLS`] marks that the graph defines them (a graph record made before this defines
+/// only its whole cell): readers place a settled read at the crate's cell only where the mark
+/// is defined (engine_scope_reads.rs `ReadGrains::new`), the way a `CrateScope` task's `CELLS`
+/// mark says it defines its cell table.
+pub(crate) const CRATE_CELLS: blaze_drive::cells::Cell = blaze_drive::cells::Cell([3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+/// The `UnitGraph` cell of the crate keyed `key`: the first 16 bytes of a hash of the key under
+/// its own domain (never the `WHOLE`, `CRATE_CELLS` or another small constant cell: a hash
+/// prefix of 128 bits).
+pub(crate) fn crate_cell(key: &blaze_id::CrateItemKey) -> blaze_drive::cells::Cell {
+    let digest = ContentId::of("blaze unit graph crate cell 1", &key.0.0);
+    let mut cell = [0u8; 16];
+    cell.copy_from_slice(&digest.0[..16]);
+    blaze_drive::cells::Cell(cell)
+}
+
+/// The `UnitGraph` cell id of the crate keyed `key` ([`crate_cell`]).
+pub(crate) fn crate_cell_id(key: &blaze_id::CrateItemKey) -> blaze_engine::CellId {
+    blaze_engine::CellId { of: Name::unit_graph(), cell: crate_cell(key) }
+}
+
+/// The cells the `UnitGraph` task defines beyond its whole record's: [`CRATE_CELLS`] (digest:
+/// the record's `out`) and each crate's ([`crate_cell`]), appended to `into` (the caller sorts
+/// its defines once, `Defines::sorted`'s rule). `payload` is the graph record's payload
+/// (graph_payload.rs `sections`); a graph with no crate list (no world: its finding says why)
+/// defines neither the mark nor a crate cell, so every settled read stays on the whole cell.
+pub(crate) fn crate_cells<'a>(payload: &[u8], out: ContentId, into: &mut blaze_engine::SVec<'a, (blaze_drive::cells::Cell, ContentId)>) -> Result<(), PayloadError> {
+    use blaze_world::crate_list::CrateGraph;
+    let Some(list) = crate::graph_payload::sections(payload)?.crates()? else {
+        return Ok(());
+    };
+    into.push((CRATE_CELLS, out));
+    for at in 0..CrateGraph::len(&list) {
+        let key = list.key(at);
+        let mut h = blaze_ids::Hasher::new("blaze unit graph crate cell digest 1");
+        h.part(&key.0.0).part(list.root(at).as_bytes());
+        let tree = list.root(at).strip_prefix('/').and_then(|s| s.split_once('/')).and_then(|(tree, _)| tree.parse::<usize>().ok());
+        match tree.and_then(|k| list.tree(k)) {
+            Some(row) => {
+                match row.origin {
+                    blaze_world::PackOrigin::Shelf { digest } => h.part(b"shelf").part(&digest),
+                    blaze_world::PackOrigin::Source { key } => h.part(b"source").part(&key.0),
+                };
+                h.part(&row.files);
+            }
+            None => {
+                h.part(b"checkout");
+            }
+        }
+        into.push((crate_cell(&key), h.finish()));
+    }
+    // One crate listed twice under one key (the same unit seen from two places) is one cell:
+    // equal pairs folded; two digests under one cell stay, and `Defines::sorted` refuses them
+    // naming the cell (rule 21: the fix is the key).
+    let start = into.len() - CrateGraph::len(&list);
+    into[start..].sort_unstable();
+    into.dedup();
+    Ok(())
 }

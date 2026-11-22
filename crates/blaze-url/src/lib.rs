@@ -8,9 +8,16 @@
 
 #![no_std]
 // `#[blaze::pure]` and the other markers name blaze's tool; inert under rustc.
-#![feature(register_tool)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+// Not yet `blaze::implicit_allocator`: `Scheme`, `HostPort`, `Url` and both errors hold
+// global-heap text (`Arc<str>`, `String`) in their public types, which bstd and blaze-http
+// name; they move as one port with those callers (wave-1124-sansio, W1 group a's report).
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::process_static)]
+#![forbid(unsafe_code)]
 
+// The global heap, until that port: every use says `// alloc:` beside it.
 extern crate alloc;
 
 #[cfg(test)]

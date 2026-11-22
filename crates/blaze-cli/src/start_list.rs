@@ -1,7 +1,7 @@
 //! The start list (docs/v2/plan/design/run.md, stage 7 of "End state (D113)", "Start list" in
 //! "The child and the parent", and "The cut to the lazy parent (D124)"): a HINT, one mutable
 //! root a (program, request shape) and user. It holds the certificate it was written under,
-//! then at most [`MOST_ROWS`] rows ([`Line`]) in the order the parent first answered inside
+//! then at most [`MOST_ROWS`] rows ([`Group`]s of them) in the order the parent first answered inside
 //! the start window: each first answer is a GROUP, its `Data` rows (the statics its answer sent
 //! the child, each `(symbol, datum record)`, in the batch's order: every datum once in the list,
 //! in the group of the first answer that sent it), then its `Named` rows (every static its
@@ -65,6 +65,14 @@
 //! | 1 | 32 | the fn's symbol | the static's symbol | the static's symbol |
 //! | 33 | 32 | the code record's key | the datum record's id | zero |
 //! | 65 | 32 | the code record's id | zero | zero |
+//!
+//! A values row (kind 3, version 5), [`ROW`] bytes: 0 the kind, 1 the count of value bytes it
+//! holds (1 to [`VALUES_ROW`]), 2.. those bytes, the rest zero. A positioned record's group
+//! (one whose code record has source-position rows, D143) holds them between its named rows
+//! and its code row: the values its `Positioned` sent, in order. They are a function of the
+//! CERTIFICATE (under it every file's text is the same), so they are placed only under the
+//! certificate the list was written under ([`Held::Today`]); under another the group resolves
+//! at its first call like any row ([`Held::Other`]).
 
 use core::fmt;
 use std::alloc::Allocator;
@@ -86,12 +94,18 @@ pub(crate) const MAGIC: [u8; 8] = *b"blzstart";
 
 /// The form's version. A list of another is refused by name ([`ReadError::Old`] for an older
 /// one, [`ReadError::Version`] for a newer): the run proceeds as with none, says so, and
-/// writes today's form at exit. Version 4: a first answer is a group, its data and the statics
+/// writes today's form at exit. Version 6: the code rows' records are of entry form 8
+/// (`blaze_ladder::code_records::ENTRY_FORM`), whose instance names are form 2, a shared forest
+/// (symbols.rs); a version 5 list's symbols name instances in the old tree form, so it is
+/// `Old` at its head, before any row or entry is read. Version 5: a positioned record's group holds its position
+/// values ([`Values`] rows), so a warm run places it too (version 4 kept such a group off the
+/// list, and a hello world's panic path resolved again every run, building the front end).
+/// Version 4: a first answer is a group, its data and the statics
 /// it names before its code row, so a record naming a static is a row too. Version 3 held no
 /// record naming a static (so `println!`'s path was resolved again on every run, building the
 /// front end); version 2 could hold a record naming a static an earlier answer told, which the
 /// child then met before that static's `Data`.
-pub(crate) const VERSION: u32 = 4;
+pub(crate) const VERSION: u32 = 6;
 
 /// The most rows a list holds (run.md stage 7: "a cap of 8,192 rows"); one more is refused by
 /// name ([`CapError::Full`]).
@@ -107,6 +121,7 @@ const fn form_word(form: EntryForm) -> u32 {
         EntryForm::Unit => 0,
         EntryForm::CMain => 1,
         EntryForm::Hosted => 2,
+        EntryForm::Comptime => 3,
     }
 }
 
@@ -116,6 +131,7 @@ const fn word_form(word: u32) -> Option<EntryForm> {
         0 => Some(EntryForm::Unit),
         1 => Some(EntryForm::CMain),
         2 => Some(EntryForm::Hosted),
+        3 => Some(EntryForm::Comptime),
         _ => None,
     }
 }
@@ -123,12 +139,61 @@ const fn word_form(word: u32) -> Option<EntryForm> {
 /// A row's bytes: its kind, then three words (the module's second table).
 pub(crate) const ROW: usize = 1 + 32 * 3;
 
-/// A code row's kind byte.
-const KIND_CODE: u8 = 0;
-/// A datum row's kind byte.
-const KIND_DATUM: u8 = 1;
-/// A named row's kind byte.
-const KIND_NAMED: u8 = 2;
+/// A row's kind byte (the module's second table), decoded once by [`read`]: a byte no kind is
+/// is [`ReadError::Kind`], never read as another kind.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowKind {
+    Code = 0,
+    Datum = 1,
+    Named = 2,
+    /// Version 5.
+    Values = 3,
+}
+
+impl TryFrom<u8> for RowKind {
+    type Error = u8;
+
+    fn try_from(byte: u8) -> Result<RowKind, u8> {
+        Ok(match byte {
+            0 => RowKind::Code,
+            1 => RowKind::Datum,
+            2 => RowKind::Named,
+            3 => RowKind::Values,
+            found => return Err(found),
+        })
+    }
+}
+
+/// The most value bytes one values row holds: the row less its kind and its count byte.
+pub(crate) const VALUES_ROW: usize = ROW - 2;
+
+/// One values row of a positioned group (version 5; the module's third table): `len` bytes,
+/// 1 to [`VALUES_ROW`], of the position values the group's `Positioned` sent (run_parent.rs
+/// `position_values`, each field's little-endian bytes in the record's row order), the rest
+/// zero. A group's values are its values rows' bytes in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Values {
+    len: u8,
+    bytes: [u8; VALUES_ROW],
+}
+
+impl Values {
+    /// The row's value bytes.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// `values` cut into rows of at most [`VALUES_ROW`] bytes, in order; none for none.
+    pub(crate) fn rows(values: &[u8]) -> impl ExactSizeIterator<Item = Values> + '_ {
+        values.chunks(VALUES_ROW).map(|chunk| {
+            let mut bytes = [0u8; VALUES_ROW];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            // At most VALUES_ROW (95) bytes a chunk: fits in a byte.
+            Values { len: chunk.len() as u8, bytes }
+        })
+    }
+}
 
 /// The longest list: a longer input is refused before any of it is read.
 pub(crate) const LONGEST: usize = HEAD + MOST_ROWS * ROW;
@@ -146,10 +211,42 @@ const NAME_DOMAIN: &str = "blaze-cli start list name 1";
 /// The domain of a list record's content key.
 const RECORD_DOMAIN: &str = "blaze-cli start list record 1";
 
-/// The certificate a list was written under: the request's (blaze-drive `Request::certificate`,
-/// the tool, the command and every input's digest).
+/// The certificate a list was written under: the root of the command's standing answer (the
+/// request's certificate: the tool, the command and every input's digest), as the check that
+/// stored it left it.
+///
+/// It CANNOT BE FORGED (states.md item 14, rule 76): its field is private and its one maker is
+/// [`Certificate::of_answer`], from the checked answer. A list's bytes carry the certificate
+/// they were written under only as bytes ([`ListView`] keeps them so), compared with today's in
+/// [`ListView::under`]; nothing made from a list is a `Certificate`. So no row is placed as
+/// today's unless the command's own check stood under the certificate it was written under.
+///
+/// ```compile_fail
+/// // Outside this module the field is private: no certificate is made from bytes.
+/// let forged = crate::start_list::Certificate([0; 32]);
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct Certificate(pub [u8; 32]);
+pub(crate) struct Certificate([u8; 32]);
+
+impl Certificate {
+    /// THE ONE MAKER: the certificate of `standing`, the answer the command's check just stored
+    /// and read back (engine_check.rs `Standing::root`).
+    pub(crate) fn of_answer(standing: &crate::engine_check::Standing<'_, '_>) -> Certificate {
+        Certificate(standing.root.0)
+    }
+
+    /// FOR TESTS ONLY: a certificate of `bytes`, with no answer behind it. A test that writes a
+    /// list under one certificate and reads it under another names both so.
+    #[cfg(test)]
+    pub(crate) const fn for_tests(bytes: [u8; 32]) -> Certificate {
+        Certificate(bytes)
+    }
+
+    /// Its bytes, as the list's head holds them.
+    fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// The name a (program, request shape) list hangs from: a key derived from the request's shape
 /// (blaze-drive `request::shape_of`, which holds the command and the program), in the user's
@@ -191,8 +288,44 @@ pub(crate) struct Row {
     pub record: RecordId,
 }
 
+/// ONE FIRST ANSWER of a list as its writer hands it (finding 10): `data` (what its answer sent
+/// the child, each a static's symbol and datum record), `named` (every static its record and
+/// those data name, ascending, each once), `values` (a positioned record's position values,
+/// none for a record with no position rows; version 5), then its `code` row. A group always
+/// ends in its code row, so [`encode`] cannot write data or names with no code row after them:
+///
+/// ```compile_fail
+/// // A bare datum row is no group: `encode` takes groups, each with its code row.
+/// crate::start_list::encode(&today, head, &[Line::Datum(datum)], &mut out);
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Group<'g> {
+    pub data: &'g [Datum],
+    pub named: &'g [Symbol],
+    pub values: &'g [u8],
+    pub code: Row,
+}
+
+impl Group<'static> {
+    /// A code row alone: no data, naming nothing, no positions.
+    pub(crate) const fn code(code: Row) -> Group<'static> {
+        Group { data: &[], named: &[], values: &[], code }
+    }
+}
+
+impl Group<'_> {
+    /// The rows the group takes in a list, its code row included.
+    pub(crate) fn rows(&self) -> usize {
+        Rows::group_rows(self.data.len(), self.named.len(), self.values.len())
+    }
+}
+
 /// One row of a list (the module's second table), in first-answer order: a first answer's
-/// group is its `Datum` rows, then its `Named` rows, then its `Code` row.
+/// group is its `Datum` rows, then its `Named` rows, then its `Values` rows (a positioned
+/// record's), then its `Code` row. A test's view of the rows ([`encode_lines`] writes any of
+/// them, a malformed group too, so [`read`]'s refusals can be shown); the parent reads and
+/// writes groups.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Line {
     /// A function instance the parent answered: its symbol, code key then, and record.
@@ -202,15 +335,21 @@ pub(crate) enum Line {
     Datum(Datum),
     /// A static the group's record or data name: on the child before its `Publish`.
     Named(Symbol),
+    /// Part of the position values its record's `Positioned` carried ([`Values`]): a function
+    /// of the certificate, since under it every file's text is the same, so placed only under
+    /// the certificate the list was written under ([`Held::Today`]).
+    Values(Values),
 }
 
+#[cfg(test)]
 impl Line {
-    /// The row's symbol: the fn's or the static's.
-    pub(crate) fn symbol(&self) -> Symbol {
+    /// The row's symbol: the fn's or the static's; a values row has none.
+    pub(crate) fn symbol(&self) -> Option<Symbol> {
         match self {
-            Line::Code(row) => row.symbol,
-            Line::Datum(datum) => datum.symbol,
-            Line::Named(symbol) => *symbol,
+            Line::Code(row) => Some(row.symbol),
+            Line::Datum(datum) => Some(datum.symbol),
+            Line::Named(symbol) => Some(*symbol),
+            Line::Values(_) => None,
         }
     }
 
@@ -218,18 +357,27 @@ impl Line {
     pub(crate) fn code(&self) -> Option<Row> {
         match self {
             Line::Code(row) => Some(*row),
-            Line::Datum(_) | Line::Named(_) => None,
+            Line::Datum(_) | Line::Named(_) | Line::Values(_) => None,
         }
     }
 }
 
+#[cfg(test)]
 impl From<Row> for Line {
     fn from(row: Row) -> Line {
         Line::Code(row)
     }
 }
 
-/// A list over its cap: the row that did not fit, by its symbol.
+/// One group's rows as [`Line`]s, in its order (data, names, values, its code row): a test's view.
+#[cfg(test)]
+fn lines_of(data: impl Iterator<Item = Datum>, named: impl Iterator<Item = Symbol>, values: impl Iterator<Item = Values>, code: Row) -> impl Iterator<Item = Line> {
+    data.map(Line::Datum).chain(named.map(Line::Named)).chain(values.map(Line::Values)).chain(core::iter::once(Line::Code(code)))
+}
+
+/// A list over its cap: the group that did not fit, by its code row's symbol. Every group ends
+/// in its code row, so no rows past the cap are without one (the variant `ValuesPast`, rows of
+/// values with no code row, is gone with the bare-row encoder).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CapError {
     Full { symbol: Symbol },
@@ -239,9 +387,9 @@ impl fmt::Display for CapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CapError::Full { symbol } => {
-                write!(f, "the start list holds at most {MOST_ROWS} rows, and the row of symbol ")?;
+                write!(f, "the start list holds at most {MOST_ROWS} rows, and the group of symbol ")?;
                 hex(f, &symbol.0)?;
-                f.write_str(" is one more (run.md stage 7)")
+                f.write_str(" does not fit (run.md stage 7)")
             }
         }
     }
@@ -249,68 +397,186 @@ impl fmt::Display for CapError {
 
 impl core::error::Error for CapError {}
 
-/// The rows of a list being made, in the order pushed; at most [`MOST_ROWS`].
+/// Where one group's parts are in [`Rows`]' arenas.
+#[derive(Clone, Copy, Debug)]
+struct Spans {
+    data: (u32, u32),
+    named: (u32, u32),
+    values: (u32, u32),
+    code: Row,
+}
+
+/// The groups of a list being made, in the order pushed; at most [`MOST_ROWS`] rows. Kept as
+/// groups (each part in one arena), so a group is whole by construction: there is no row of
+/// data or names without its code row to push.
 pub(crate) struct Rows<'a> {
-    rows: AVec<'a, Line>,
+    data: AVec<'a, Datum>,
+    named: AVec<'a, Symbol>,
+    values: AVec<'a, u8>,
+    groups: AVec<'a, Spans>,
+    /// The rows the groups take in a list.
+    rows: usize,
+}
+
+/// `(start, end)` of one part in its arena, as u32.
+fn span(start: usize, end: usize) -> (u32, u32) {
+    // The arenas hold at most MOST_ROWS rows' worth (`fits`, checked before each push): within
+    // 32 bits.
+    (start as u32, end as u32)
 }
 
 impl<'a> Rows<'a> {
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Rows<'a> {
-        Rows { rows: Vec::new_in(alloc) }
+        Rows { data: Vec::new_in(alloc), named: Vec::new_in(alloc), values: Vec::new_in(alloc), groups: Vec::new_in(alloc), rows: 0 }
     }
 
     /// A code row with no data and naming nothing, after the others; past [`MOST_ROWS`]
     /// refused, naming it.
     #[cfg(test)]
     pub(crate) fn push(&mut self, row: Row) -> Result<(), CapError> {
-        self.push_answer(&[], &[], row)
+        self.push_answer(&[], &[], &[], row)
+    }
+
+    /// The rows a group of `data`, `named` and `values` bytes takes, its code row included.
+    pub(crate) fn group_rows(data: usize, named: usize, values: usize) -> usize {
+        data + named + values.div_ceil(VALUES_ROW) + 1
     }
 
     /// One first answer's group after the others (the module's doc): `data` (what its answer
-    /// sent), `named` (ascending, each once), then `row`. All or nothing: a group that does not
-    /// fit under [`MOST_ROWS`] is refused whole, naming `row`.
-    pub(crate) fn push_answer(&mut self, data: &[Datum], named: &[Symbol], row: Row) -> Result<(), CapError> {
-        if !self.fits(data.len() + named.len() + 1) {
+    /// sent), `named` (ascending, each once), `values` (its record's position values, none for
+    /// a record with no position rows, as [`Values`] rows), then `row`. All or nothing: a group
+    /// that does not fit under [`MOST_ROWS`] is refused whole, naming `row`.
+    pub(crate) fn push_answer(&mut self, data: &[Datum], named: &[Symbol], values: &[u8], row: Row) -> Result<(), CapError> {
+        if !self.fits(Rows::group_rows(data.len(), named.len(), values.len())) {
             return Err(CapError::Full { symbol: row.symbol });
         }
-        for datum in data {
-            self.rows.push(Line::Datum(*datum));
-        }
-        for symbol in named {
-            self.rows.push(Line::Named(*symbol));
-        }
-        self.rows.push(Line::Code(row));
+        let at = (self.data.len(), self.named.len(), self.values.len());
+        self.data.extend_from_slice(data);
+        self.named.extend_from_slice(named);
+        self.values.extend_from_slice(values);
+        self.groups.push(Spans { data: span(at.0, self.data.len()), named: span(at.1, self.named.len()), values: span(at.2, self.values.len()), code: row });
+        self.rows += Rows::group_rows(data.len(), named.len(), values.len());
         Ok(())
     }
 
     /// Whether `rows` more fit under [`MOST_ROWS`].
     pub(crate) fn fits(&self, rows: usize) -> bool {
-        self.rows.len().saturating_add(rows) <= MOST_ROWS
+        self.rows.saturating_add(rows) <= MOST_ROWS
     }
 
     #[cfg(test)]
     pub(crate) fn is_full(&self) -> bool {
-        self.rows.len() >= MOST_ROWS
+        self.rows >= MOST_ROWS
     }
 
-    pub(crate) fn as_slice(&self) -> &[Line] {
-        self.rows.as_slice()
+    /// The rows the groups take in a list.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether no group was pushed.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The groups, in the order pushed.
+    pub(crate) fn groups(&self) -> impl ExactSizeIterator<Item = Group<'_>> + Clone + '_ {
+        let range = |(from, to): (u32, u32)| from as usize..to as usize;
+        self.groups.iter().map(move |at| Group { data: &self.data[range(at.data)], named: &self.named[range(at.named)], values: &self.values[range(at.values)], code: at.code })
+    }
+
+    /// Every row as a [`Line`], in list order: a test's view.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> impl Iterator<Item = Line> + '_ {
+        self.groups().flat_map(|group| lines_of(group.data.iter().copied(), group.named.iter().copied(), Values::rows(group.values), group.code))
+    }
+
+    /// The groups as a list under `certificate` with the run's `head`, onto the end of `out`
+    /// ([`encode`], with nothing gathered first).
+    pub(crate) fn encode(&self, certificate: &Certificate, head: StartHead, out: &mut AVec<'_, u8>) -> Result<(), CapError> {
+        encode_groups(certificate, head, self.groups(), out)
     }
 }
 
-/// The list of `rows` (code rows alone, or whole [`Line`]s) under `certificate` with the run's
-/// `head`, its bytes onto the end of `out` (the module's tables). Equal inputs, equal bytes.
-/// More than [`MOST_ROWS`] rows is refused, naming the first past it.
-pub(crate) fn encode<L: Copy + Into<Line>>(certificate: Certificate, head: StartHead, rows: &[L], out: &mut AVec<'_, u8>) -> Result<(), CapError> {
-    let entry = head.line;
-    if let Some(past) = rows.get(MOST_ROWS) {
-        return Err(CapError::Full { symbol: Into::<Line>::into(*past).symbol() });
+/// The list of `groups` under `certificate` with the run's `head`, its bytes onto the end of
+/// `out` (the module's tables). Equal inputs, equal bytes; the bytes are [`VERSION`]'s, row for
+/// row (a group's data rows, its named rows, its values rows, its code row). Groups past
+/// [`MOST_ROWS`] rows are refused, naming the first that does not fit, and nothing is written.
+pub(crate) fn encode(certificate: &Certificate, head: StartHead, groups: &[Group<'_>], out: &mut AVec<'_, u8>) -> Result<(), CapError> {
+    encode_groups(certificate, head, groups.iter().copied(), out)
+}
+
+fn encode_groups<'g>(certificate: &Certificate, head: StartHead, groups: impl Iterator<Item = Group<'g>> + Clone, out: &mut AVec<'_, u8>) -> Result<(), CapError> {
+    let mut count = 0usize;
+    for group in groups.clone() {
+        count += group.rows();
+        if count > MOST_ROWS {
+            return Err(CapError::Full { symbol: group.code.symbol });
+        }
     }
+    put_head(certificate.bytes(), head, count, out);
+    for group in groups {
+        for datum in group.data {
+            put_symbol_row(RowKind::Datum, datum.symbol, datum.record.0, [0u8; 32], out);
+        }
+        for symbol in group.named {
+            put_symbol_row(RowKind::Named, *symbol, [0u8; 32], [0u8; 32], out);
+        }
+        for chunk in Values::rows(group.values) {
+            put_values_row(chunk, out);
+        }
+        put_symbol_row(RowKind::Code, group.code.symbol, group.code.key.0.0, group.code.record.0, out);
+    }
+    Ok(())
+}
+
+/// FOR TESTS ONLY, the planted writer: any rows, a malformed group too (data after names, a
+/// datum with no code row), so the tests show [`read`] refuses each by name. The parent writes
+/// groups ([`encode`]), which cannot be malformed. Past [`MOST_ROWS`] rows it is refused by the
+/// first row past the cap with a symbol, as [`encode`] does.
+#[cfg(test)]
+pub(crate) fn encode_lines<L: Copy + Into<Line>>(certificate: &Certificate, head: StartHead, rows: &[L], out: &mut AVec<'_, u8>) -> Result<(), CapError> {
+    if rows.len() > MOST_ROWS {
+        let past = rows[MOST_ROWS..].iter().find_map(|past| Into::<Line>::into(*past).symbol());
+        return Err(CapError::Full { symbol: past.expect("a test's rows past the cap hold a row with a symbol") });
+    }
+    put_head(certificate.bytes(), head, rows.len(), out);
+    for row in rows {
+        match Into::<Line>::into(*row) {
+            Line::Code(row) => put_symbol_row(RowKind::Code, row.symbol, row.key.0.0, row.record.0, out),
+            Line::Datum(datum) => put_symbol_row(RowKind::Datum, datum.symbol, datum.record.0, [0u8; 32], out),
+            Line::Named(symbol) => put_symbol_row(RowKind::Named, symbol, [0u8; 32], [0u8; 32], out),
+            Line::Values(values) => put_values_row(values, out),
+        }
+    }
+    Ok(())
+}
+
+/// A row of kind `kind`: its symbol, then two words.
+fn put_symbol_row(kind: RowKind, symbol: Symbol, first: [u8; 32], second: [u8; 32], out: &mut AVec<'_, u8>) {
+    out.push(kind as u8);
+    out.extend_from_slice(&symbol.0);
+    out.extend_from_slice(&first);
+    out.extend_from_slice(&second);
+}
+
+/// A values row: its kind, its count, its bytes (the rest zero).
+fn put_values_row(values: Values, out: &mut AVec<'_, u8>) {
+    out.push(RowKind::Values as u8);
+    out.push(values.len);
+    out.extend_from_slice(&values.bytes);
+}
+
+/// The head of a list of `rows` rows (at most [`MOST_ROWS`], checked by the caller).
+fn put_head(certificate: &[u8; 32], head: StartHead, rows: usize, out: &mut AVec<'_, u8>) {
+    let entry = head.line;
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    // At most MOST_ROWS (checked above): fits in 32 bits.
-    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    out.extend_from_slice(&certificate.0);
+    // At most MOST_ROWS (checked by the caller): fits in 32 bits.
+    out.extend_from_slice(&(rows as u32).to_le_bytes());
+    out.extend_from_slice(certificate);
     out.extend_from_slice(&form_word(entry.form).to_le_bytes());
     out.extend_from_slice(&entry.symbol.0);
     match head.personality {
@@ -323,19 +589,6 @@ pub(crate) fn encode<L: Copy + Into<Line>>(certificate: Certificate, head: Start
             out.extend_from_slice(&symbol.0);
         }
     }
-    for row in rows {
-        let line: Line = (*row).into();
-        let (kind, first, second) = match line {
-            Line::Code(row) => (KIND_CODE, row.key.0.0, row.record.0),
-            Line::Datum(datum) => (KIND_DATUM, datum.record.0, [0u8; 32]),
-            Line::Named(_) => (KIND_NAMED, [0u8; 32], [0u8; 32]),
-        };
-        out.push(kind);
-        out.extend_from_slice(&line.symbol().0);
-        out.extend_from_slice(&first);
-        out.extend_from_slice(&second);
-    }
-    Ok(())
 }
 
 /// Why bytes are not a start list, by name. Each is checked before any row is trusted.
@@ -374,6 +627,8 @@ pub(crate) enum ReadError {
     DatumTwice { symbol: Symbol },
     /// The last `rows` rows are data or names with no code row after them.
     Dangling { rows: u32 },
+    /// Values row `row` says it holds `len` bytes: 1 to [`VALUES_ROW`] is read, nothing else.
+    ValuesLength { row: u32, len: u8 },
 }
 
 impl fmt::Display for ReadError {
@@ -396,9 +651,10 @@ impl fmt::Display for ReadError {
                 hex(f, &symbol.0)?;
                 f.write_str(" in two code rows")
             }
-            ReadError::Kind { row, found } => write!(f, "{what}'s row {row} is of kind {found}: 0 (a code row), 1 (a datum row) or 2 (a named row) is read, nothing else"),
+            ReadError::Kind { row, found } => write!(f, "{what}'s row {row} is of kind {found}: 0 (a code row), 1 (a datum row), 2 (a named row) or 3 (a values row) is read, nothing else"),
             ReadError::Padding { row } => write!(f, "{what}'s row {row} has bytes past its kind's words that are not zero"),
-            ReadError::Order { row } => write!(f, "{what}'s row {row} is out of its group's order: data, then the statics named ascending, then the code row"),
+            ReadError::Order { row } => write!(f, "{what}'s row {row} is out of its group's order: data, then the statics named ascending, then the values, then the code row"),
+            ReadError::ValuesLength { row, len } => write!(f, "{what}'s values row {row} says {len} bytes: 1 to {VALUES_ROW} is read, nothing else"),
             ReadError::DatumTwice { symbol } => {
                 write!(f, "{what} holds the datum of static ")?;
                 hex(f, &symbol.0)?;
@@ -411,11 +667,12 @@ impl fmt::Display for ReadError {
 
 impl core::error::Error for ReadError {}
 
-/// A list read in place: its certificate, its head and its rows' bytes, every limit checked.
+/// A list read in place: the certificate it was written under (its bytes alone: no
+/// [`Certificate`] is made from a list), its head and its rows' bytes, every limit checked.
 /// The head is handed out only under today's certificate ([`TodayRows::head`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ListView<'b> {
-    pub certificate: Certificate,
+    written: [u8; 32],
     head: StartHead,
     rows: &'b [u8],
 }
@@ -463,23 +720,37 @@ pub(crate) fn read<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> Result<ListView<'b>
         found => return Err(ReadError::Personality { found }),
     };
     let line = EntryLine { form, symbol: blaze_code::record::Symbol(entry) };
-    let view = ListView { certificate: Certificate(certificate), head: StartHead { line, personality }, rows: &bytes[HEAD..] };
+    let view = ListView { written: certificate, head: StartHead { line, personality }, rows: &bytes[HEAD..] };
     // Each row's kind and padding, each group's order, before any row is decoded.
     let mut in_names = false;
+    let mut in_values = false;
     let mut last_named: Option<[u8; 32]> = None;
     let mut open = 0u32;
     for (at, row) in view.rows.chunks_exact(ROW).enumerate() {
         // At most MOST_ROWS rows (checked above): fits in 32 bits.
         let at = at as u32;
         let zero = |from: usize| row[from..].iter().all(|byte| *byte == 0);
-        match row[0] {
-            KIND_CODE => {
+        let kind = RowKind::try_from(row[0]).map_err(|found| ReadError::Kind { row: at, found })?;
+        match kind {
+            RowKind::Code => {
                 in_names = false;
+                in_values = false;
                 last_named = None;
                 open = 0;
             }
-            KIND_DATUM => {
-                if in_names {
+            RowKind::Values => {
+                let len = row[1];
+                if len == 0 || usize::from(len) > VALUES_ROW {
+                    return Err(ReadError::ValuesLength { row: at, len });
+                }
+                if !zero(2 + usize::from(len)) {
+                    return Err(ReadError::Padding { row: at });
+                }
+                in_values = true;
+                open += 1;
+            }
+            RowKind::Datum => {
+                if in_names || in_values {
                     return Err(ReadError::Order { row: at });
                 }
                 if !zero(65) {
@@ -487,7 +758,10 @@ pub(crate) fn read<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> Result<ListView<'b>
                 }
                 open += 1;
             }
-            KIND_NAMED => {
+            RowKind::Named => {
+                if in_values {
+                    return Err(ReadError::Order { row: at });
+                }
                 if !zero(33) {
                     return Err(ReadError::Padding { row: at });
                 }
@@ -500,7 +774,6 @@ pub(crate) fn read<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> Result<ListView<'b>
                 last_named = Some(symbol);
                 open += 1;
             }
-            found => return Err(ReadError::Kind { row: at, found }),
         }
     }
     if open > 0 {
@@ -508,22 +781,74 @@ pub(crate) fn read<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> Result<ListView<'b>
     }
     let mut seen: ByHashSet<[u8; 32], Alloc<'_>> = ByHashSet::with_capacity_in(count as usize, alloc);
     let mut data: ByHashSet<[u8; 32], Alloc<'_>> = ByHashSet::with_capacity_in(count as usize, alloc);
-    for line in view.lines() {
-        match line {
-            Line::Code(row) => {
-                if !seen.insert(row.symbol.0) {
-                    return Err(ReadError::Twice { symbol: row.symbol });
-                }
+    for group in view.groups() {
+        if !seen.insert(group.code().symbol.0) {
+            return Err(ReadError::Twice { symbol: group.code().symbol });
+        }
+        for datum in group.data() {
+            if !data.insert(datum.symbol.0) {
+                return Err(ReadError::DatumTwice { symbol: datum.symbol });
             }
-            Line::Datum(datum) => {
-                if !data.insert(datum.symbol.0) {
-                    return Err(ReadError::DatumTwice { symbol: datum.symbol });
-                }
-            }
-            Line::Named(_) => {}
         }
     }
     Ok(view)
+}
+
+/// A 32-byte word of `row` at `at`.
+fn word(row: &[u8], at: usize) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&row[at..at + 32]);
+    out
+}
+
+/// The rows of one group of a list read ([`ListView::groups`]), in place: its data rows, its
+/// named rows, its values rows, then its code row. Made only from a list [`read`] checked, so
+/// each part is the rows of its kind and the last row is the code row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupView<'b> {
+    data: &'b [u8],
+    named: &'b [u8],
+    values: &'b [u8],
+    code: &'b [u8],
+}
+
+impl<'b> GroupView<'b> {
+    /// What its answer sent the child, in order.
+    pub(crate) fn data(&self) -> impl ExactSizeIterator<Item = Datum> + Clone + 'b {
+        self.data.chunks_exact(ROW).map(|row| Datum { symbol: Symbol(word(row, 1)), record: RecordId(word(row, 33)) })
+    }
+
+    /// The statics its record and data name, ascending.
+    pub(crate) fn named(&self) -> impl ExactSizeIterator<Item = Symbol> + Clone + 'b {
+        self.named.chunks_exact(ROW).map(|row| Symbol(word(row, 1)))
+    }
+
+    /// Its position values' rows, in order: each row's bytes.
+    pub(crate) fn values(&self) -> impl ExactSizeIterator<Item = &'b [u8]> + Clone + 'b {
+        self.values.chunks_exact(ROW).map(|row| &row[2..2 + usize::from(row[1])])
+    }
+
+    /// Its code row.
+    pub(crate) fn code(&self) -> Row {
+        let row = self.code;
+        Row { symbol: Symbol(word(row, 1)), key: CodeKey(ContentId(word(row, 33))), record: RecordId(word(row, 65)) }
+    }
+
+    /// Its rows as [`Line`]s, in order: a test's view.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> impl Iterator<Item = Line> + 'b {
+        let values = self.values.chunks_exact(ROW).map(|row| {
+            let mut bytes = [0u8; VALUES_ROW];
+            bytes.copy_from_slice(&row[2..ROW]);
+            Values { len: row[1], bytes }
+        });
+        lines_of(self.data(), self.named(), values, self.code())
+    }
+}
+
+/// The number of rows at the front of `rows` whose kind byte is `kind`.
+fn run_of(rows: &[u8], kind: RowKind) -> usize {
+    rows.chunks_exact(ROW).take_while(|row| row[0] == kind as u8).count()
 }
 
 impl<'b> ListView<'b> {
@@ -534,30 +859,41 @@ impl<'b> ListView<'b> {
 
     /// The code rows in first-answer order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = Row> + Clone + 'b {
-        self.lines().filter_map(|line| line.code())
+        self.groups().map(|group| group.code())
     }
 
-    /// Every row in first-answer order, each group whole ([`read`] checked each kind).
-    pub(crate) fn lines(&self) -> impl Iterator<Item = Line> + Clone + 'b {
-        self.rows.chunks_exact(ROW).map(|row| {
-            let word = |at: usize| {
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&row[at..at + 32]);
-                out
-            };
-            match row[0] {
-                KIND_CODE => Line::Code(Row { symbol: Symbol(word(1)), key: CodeKey(ContentId(word(33))), record: RecordId(word(65)) }),
-                KIND_DATUM => Line::Datum(Datum { symbol: Symbol(word(1)), record: RecordId(word(33)) }),
-                // KIND_NAMED: `read` refused every other kind.
-                _ => Line::Named(Symbol(word(1))),
+    /// The groups in first-answer order. [`read`] checked the grammar (each group's data rows,
+    /// then its named rows, then its values rows, then one code row; no rows after the last
+    /// code row), so each group is the run of data rows, then of named rows, then of values
+    /// rows from where the last one ended, and the row after them is its code row.
+    pub(crate) fn groups(&self) -> impl Iterator<Item = GroupView<'b>> + Clone + 'b {
+        let mut rest: &'b [u8] = self.rows;
+        core::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
             }
+            let data = run_of(rest, RowKind::Datum) * ROW;
+            let named = run_of(&rest[data..], RowKind::Named) * ROW;
+            let values = run_of(&rest[data + named..], RowKind::Values) * ROW;
+            let end = data + named + values;
+            let group = GroupView { data: &rest[..data], named: &rest[data..data + named], values: &rest[data + named..end], code: &rest[end..end + ROW] };
+            rest = &rest[end + ROW..];
+            Some(group)
         })
+    }
+
+    /// Every row in first-answer order, each group whole: a test's view.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> impl Iterator<Item = Line> + 'b {
+        // Each group's rows are collected: a group's iterator borrows the group, which the
+        // closure owns (a test's view; the allocation is the test's).
+        self.groups().flat_map(|group| group.lines().collect::<std::vec::Vec<Line>>())
     }
 
     /// What the list is to a run under `today`: its rows as they are when it was written under
     /// today's certificate, its symbols alone under any other.
-    pub(crate) fn under(self, today: Certificate) -> Held<'b> {
-        match self.certificate == today {
+    pub(crate) fn under(self, today: &Certificate) -> Held<'b> {
+        match self.written == *today.bytes() {
             true => Held::Today(TodayRows { view: self }),
             false => Held::Other(Symbols { view: self }),
         }
@@ -569,7 +905,11 @@ impl<'b> ListView<'b> {
 pub(crate) enum Held<'b> {
     /// Written under today's certificate: its rows are placed as they are.
     Today(TodayRows<'b>),
-    /// Written under another: only its symbols, each resolved like any first call.
+    /// Written under another: only its symbols, each resolved like any first call. Its values
+    /// rows are not used: an edit may have moved the lines they hold, so a positioned group
+    /// resolves as any first call, through the front end. The end state there (NOT BUILT YET):
+    /// positions made from records, the item's line from its file's outline record plus the
+    /// item-relative position kept beside the code, never from a rebuilt front end.
     #[allow(dead_code, reason = "compiled-behind (run.md piece 10) reads the symbols; today a run resolves each at its first call")]
     Other(Symbols<'b>),
 }
@@ -587,8 +927,16 @@ impl<'b> TodayRows<'b> {
         self.view.iter()
     }
 
-    /// Every row, each group whole, in first-answer order: what a replay places.
-    pub(crate) fn lines(&self) -> impl Iterator<Item = Line> + Clone + 'b {
+    /// Every group, in first-answer order: what a replay places, each a [`TodayGroup`] (the
+    /// one form a placed row's proof that it may run is made from: run_ids.rs
+    /// `Runnable::listed`).
+    pub(crate) fn groups(&self) -> impl Iterator<Item = TodayGroup<'b>> + Clone + 'b {
+        self.view.groups().map(|view| TodayGroup { view })
+    }
+
+    /// Every row, each group whole, in first-answer order: a test's view.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> impl Iterator<Item = Line> + 'b {
         self.view.lines()
     }
 
@@ -596,6 +944,29 @@ impl<'b> TodayRows<'b> {
     /// (every input of the program's start and of its personality routine is under it).
     pub(crate) fn head(&self) -> StartHead {
         self.view.head
+    }
+}
+
+/// One group of a list under TODAY's certificate ([`TodayRows::groups`]): made nowhere else, so
+/// holding one says the list it is of was written under the certificate the command's own check
+/// stands under. The run that wrote it answered this group's code row under that certificate,
+/// which it did only for a body its gate let run; every input of that check is under the
+/// certificate. So the row's proof that it may run is the list's ([`crate::run_ids::Runnable::listed`]),
+/// and it is never checked again (rule 74).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TodayGroup<'b> {
+    view: GroupView<'b>,
+}
+
+impl<'b> TodayGroup<'b> {
+    /// The group's rows, read in place.
+    pub(crate) fn view(&self) -> &GroupView<'b> {
+        &self.view
+    }
+
+    /// Its code row.
+    pub(crate) fn code(&self) -> Row {
+        self.view.code()
     }
 }
 
@@ -682,7 +1053,7 @@ pub(crate) fn rooted_keys<D: Driver, A: Allocator + Clone, B: Allocator>(lent: &
     out.push(CasKey(ContentId::of(RECORD_DOMAIN, bytes)));
     let mut stale = 0u32;
     for row in bytes.get(HEAD..).unwrap_or(&[]).chunks_exact(ROW) {
-        if row[0] != KIND_CODE {
+        if row[0] != RowKind::Code as u8 {
             continue;
         }
         let mut key = [0u8; 32];

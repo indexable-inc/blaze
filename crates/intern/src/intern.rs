@@ -21,7 +21,6 @@ use std::{
 };
 
 use blaze_hash::LazyKey;
-use std::alloc::Global;
 
 use crate::{
     sync::OnceLock,
@@ -246,6 +245,8 @@ pub use crate::_impl_internable as impl_internable;
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Global;
+
     use super::*;
 
     #[derive(PartialEq, Eq, Hash, Debug)]

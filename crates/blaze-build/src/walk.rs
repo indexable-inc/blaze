@@ -27,6 +27,8 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 #[path = "closure.rs"]
 mod closure;
 pub(crate) use closure::{build_builtin_clone, build_ctor_fn, build_fn_shim, closures_in};
+#[cfg(test)]
+pub(crate) use closure::{empty_record as empty_record_for_tests, empty_view as empty_view_for_tests};
 #[path = "coroutine.rs"]
 pub(crate) mod coroutine;
 
@@ -164,6 +166,14 @@ fn ground_err(error: BuildError) -> TyErr {
     }
 }
 
+fn signature_error(error: TyErr) -> BuildError {
+    match error {
+        TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+        TyErr::Malformed(what) => malformed(what),
+        TyErr::Other(error) => error,
+    }
+}
+
 /// Layout's refusals as type errors (`Layouts` is the one layout: rule 30).
 fn layout_err(error: LayoutError) -> TyErr {
     match error.why {
@@ -185,6 +195,7 @@ fn prim_ty(prim: Prim) -> Ty {
 /// An aggregate's walk row at its arguments: what `Layouts` says of it (size, alignment,
 /// offsets, stride), with how each part is held (`Repr`) and whether it needs drop.
 struct Layout {
+    id: LayoutId,
     /// The aggregate's type, of the ground table.
     ty: PTy,
     size: u32,
@@ -232,6 +243,10 @@ enum Held {
     /// An extended temporary (walk/temps.rs `hold_temp`): its `let`'s block's, dropped with its
     /// locals; made under a branch, `flag` is its drop flag and the slot holding its address.
     Temp { at: (Value, i32), l: u32, flag: Option<(SlotId, SlotId)> },
+    /// A by-value field of the environment an `FnOnce` body or an `async` block owns, a place
+    /// below its binding whose type needs drop (walk/moves/env_places.rs `bind_env_place`): the
+    /// field's index, dropped with the body's outermost scope unless moved out.
+    EnvPlace(u32),
 }
 
 /// Who owns a `match`'s scrutinee while its arms move out of it.
@@ -544,6 +559,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     scope_marks: Vec<u32, A>,
     /// The parts matches by tests moved out of their scrutinees (walk/moves.rs).
     moves: moves::Moves<A>,
+    /// The fields of the environment of the closure being built when one holds a captured
+    /// place below its binding (walk/moves/env_places.rs).
+    env_places: moves::env_places::EnvPlaces<A>,
     /// `Some` while a coroutine's body is built (coroutine.rs `run_coroutine`).
     co: Option<coroutine::Co>,
     /// `Some` while a coroutine's body is built into a state laid from types: the flow's table
@@ -570,6 +588,16 @@ fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
 
 fn malformed(what: &'static str) -> BuildError {
     BuildError::Malformed { what }
+}
+
+/// Unwinding permission is separate from the machine signature of a C-family pointer.
+fn pointer_abi(abi: blaze_typeck::Abi) -> Option<Abi> {
+    match abi {
+        blaze_typeck::Abi::Rust => Some(Abi::Rust),
+        blaze_typeck::Abi::C | blaze_typeck::Abi::CUnwind => Some(Abi::C),
+        blaze_typeck::Abi::RustCall => Some(Abi::RustCall),
+        _ => None,
+    }
 }
 
 fn int_ty(i: IntTy) -> Result<Ty, TyErr> {
@@ -599,23 +627,6 @@ fn align_up(at: u32, align: u8) -> Option<u32> {
 
 fn mask(value: u128, bits: u32) -> u128 {
     if bits >= 128 { value } else { value & ((1u128 << bits) - 1) }
-}
-
-/// A signature's parameter or return of a scalar: a `bool` and the integers under 32 bits
-/// widened by their signedness.
-fn abi_param(repr: Repr, ty: Ty) -> Param {
-    let ext = match repr {
-        Repr::Bool => Ext::Zext,
-        Repr::Int { ty, signed } if ty.bits(PTR_BITS) < 32 => {
-            if signed {
-                Ext::Sext
-            } else {
-                Ext::Zext
-            }
-        }
-        Repr::Int { .. } | Repr::Float(_) | Repr::Ptr | Repr::None | Repr::Agg(_) => Ext::None,
-    };
-    Param { ext, ..Param::of(ty) }
 }
 
 /// The integer types of 1, 2, 4 and 8 bytes, by log2 of the size.
@@ -725,8 +736,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
             other => BuildError::Lir(other),
         })?;
-        blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
         let traps = trap_sources(&func, &trap_marks, alloc)?;
+        // The one verification of the walk's function: its proof travels in `Built` to the
+        // emitter, which takes it and checks nothing again (D163).
+        let func = blaze_lir::VerifiedFunc::new(func).map_err(BuildError::Verify)?;
         Ok(Built { func, refs, statics, thread_locals, vtables, traps })
     }
 }
@@ -851,6 +864,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         scope_pats: Vec::new_in(alloc.clone()),
         scope_marks: Vec::new_in(alloc.clone()),
         moves: moves::Moves::new_in(alloc.clone()),
+        env_places: moves::env_places::EnvPlaces::new_in(alloc.clone()),
         co: None,
         names: None,
         cleanup: false,
@@ -961,16 +975,21 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.layouts.iter().position(|l| l.ty == ty).map(|it| it as u32)
     }
 
+    fn pattern_base(&self, mut g: PTy) -> Result<PTy, TyErr> {
+        for _ in 0..=self.ground.view().len() {
+            match self.ground_node(g)? {
+                PNode::Pat(base, _) => g = base,
+                _ => return Ok(g),
+            }
+        }
+        Err(TyErr::Malformed("a cycle in the base types of a pattern type"))
+    }
+
     /// How ground type `g` is held.
     fn repr(&mut self, g: PTy) -> Result<Repr, TyErr> {
-        // A pattern type is held as its base (typeck.md, "Pattern types"): its valid range is
-        // the layout's, not the value's.
-        let g = match self.ground_node(g)? {
-            PNode::Pat(base, _) => base,
-            _ => g,
-        };
+        let g = self.pattern_base(g)?;
         Ok(match self.ground_node(g)? {
-            PNode::Pat(..) => return Err(TyErr::Unsupported("a pattern type over a pattern type")),
+            PNode::Pat(..) => return Err(TyErr::Malformed("a pattern type still wrapped after finding its base")),
             PNode::Bool => Repr::Bool,
             PNode::Int(i) => Repr::Int { ty: int_ty(i)?, signed: true },
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
@@ -1092,6 +1111,38 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             _ => Err(malformed("a variant past its type's variants")),
         }
+    }
+
+    /// Field `j` (by DECLARATION index) of variant `variant` of layout `l`: its offset, its row
+    /// in `layout_fields` and the enum's id when `l` is an enum. The one lookup of a field by
+    /// index. THE PROMISE it rests on, checked here on every lookup: `layout` pushes the rows
+    /// in declaration order (`for (j, ..) in parts.iter().enumerate()`), each at `ls`'s offset
+    /// for index `j` (a `repr(Rust)` aggregate's OFFSETS are reordered by alignment, never its
+    /// rows), so the row is `first + j` and carries the declared field's name: an ADT's field
+    /// `j` of that variant, and `Name(j)` for a tuple, a closure's environment, a coroutine's
+    /// one field and a wide pointer's two words. A row of another name is
+    /// [`BuildError::FieldOrder`], never an offset read from the wrong field.
+    fn decl_field(&self, l: u32, variant: u32, j: u32) -> Result<(u32, u32, Option<LayoutId>), BuildError> {
+        let (first, len, id) = self.variant_rows(l, variant)?;
+        if j >= len {
+            return Err(malformed("a field past its aggregate's fields"));
+        }
+        let row = first + j;
+        let &(found, off, _) = self.layout_fields.get(row as usize).ok_or(malformed("a layout's fields past their table"))?;
+        let node = self.ground.view().node(self.layouts[l as usize].ty).map_err(|_| malformed("a layout's type past the ground table"))?;
+        let declared = match node {
+            PNode::Adt(k, _) => {
+                let adt = self.adts.adt(k).ok_or(BuildError::NoAdt { adt: k })?;
+                let v = adt.variants.get(variant as usize).ok_or(malformed("a variant past its ADT's variants"))?;
+                let fields = adt.fields.get(v.fields.range()).ok_or(malformed("an ADT's fields past their column"))?;
+                fields.get(j as usize).ok_or(malformed("a field past its ADT's fields"))?.name
+            }
+            _ => Name(u64::from(j)),
+        };
+        if found != declared {
+            return Err(BuildError::FieldOrder { ty: node, field: j, found });
+        }
+        Ok((off, row, id))
     }
 
     /// Makes variant `variant` of the enum of layout `id` at `at`: stores what `ls.tag_write`
@@ -1240,10 +1291,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 // A pattern type is held as its base (`repr`): a wide pointer under one
                 // (core's `NonNull<dyn T>` holds `pattern_type!(*const dyn T is !null)`) is laid
                 // out first too, so no row is made between this row's fields below.
-                let held = match self.ground_node(pt)? {
-                    PNode::Pat(base, _) => base,
-                    _ => pt,
-                };
+                let held = self.pattern_base(pt)?;
                 // Every part whose `repr` makes a layout row is laid out first: an aggregate,
                 // and a closure that captures nothing (not an aggregate, but `repr` lays it out
                 // to see it is zero-sized). One laid out below, between this row's fields, would
@@ -1391,7 +1439,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // Uninhabited: it never has a value to copy.
                     let leaves = if lt.uninhabited { 0 } else { most.saturating_add(1) };
                     let shape = Shape::Enum { id, first: vfirst, len: n as u32 };
-                    Layout { ty: t, size, align, leaves, shape, needs_drop, placed, drop_fn, is_union }
+                    Layout { id, ty: t, size, align, leaves, shape, needs_drop, placed, drop_fn, is_union }
                 }
                 Some(n) => {
                     let elem = self.repr(parts[0].1)?;
@@ -1401,7 +1449,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let stride = u32::try_from(stride).map_err(|_| too_big())?;
                     let len = u32::try_from(n).map_err(|_| TyErr::Unsupported("an array of 2^32 elements or more"))?;
                     let leaves = self.leaves(elem).saturating_mul(n);
-                    Layout { ty: t, size, align, leaves, shape: Shape::Array { elem, len, stride }, needs_drop, placed, drop_fn, is_union }
+                    Layout { id, ty: t, size, align, leaves, shape: Shape::Array { elem, len, stride }, needs_drop, placed, drop_fn, is_union }
                 }
                 // A struct's or tuple's fields at `ls`'s offsets (a `repr(Rust)` one reordered by
                 // decreasing alignment), by declaration index.
@@ -1426,7 +1474,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     if unsized_tail {
                         self.unsized_tails.push(self.layouts.len() as u32);
                     }
-                    Layout { ty: t, size, align, leaves, shape: Shape::Fields { first, len }, needs_drop, placed, drop_fn, is_union }
+                    Layout { id, ty: t, size, align, leaves, shape: Shape::Fields { first, len }, needs_drop, placed, drop_fn, is_union }
                 }
             };
             self.layouts.push(layout);
@@ -2270,6 +2318,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Held::Rest { at, l, variant, moved } => self.drop_rest(at, l, variant, moved),
             Held::Moved { at, g, mask } => self.drop_moved(g, at, mask, false),
             Held::Temp { at, l, flag } => self.drop_temp(at, l, flag),
+            Held::EnvPlace(j) => self.drop_env_place(j, kill),
         }
     }
 
@@ -2589,31 +2638,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 c = up;
             }
             let up = parent[c as usize].0;
-            // A first adjustment that borrows the local (an autoref, an overloaded
-            // dereference's `&self`) uses it in place, wherever it stands.
-            let rows = self.adjust_rows(ExprId(c));
-            let borrowed_first = matches!(
-                self.checked.adjusts.column::<1>().get(rows.start).filter(|_| !rows.is_empty()),
-                Some(AdjustKind::Borrow { .. } | AdjustKind::Deref { overloaded: Some(_) })
-            );
-            let in_place = borrowed_first
-                || up != NO_EXPR
-                && match body.exprs[up as usize] {
-                    Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
-                    Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
-                    Expr::AssignOp { lhs, .. } => lhs.0 == c,
-                    // [expr.cmp.place]: a comparison's operands are borrowed in place.
-                    Expr::Binary { op, lhs, rhs } if operators::comparison(op) => lhs.0 == c || rhs.0 == c,
-                    // A place expression: matched in place, its arms' moves are marked below.
-                    Expr::Match { scrutinee, .. } => scrutinee.0 == c,
-                    // A `let` condition's scrutinee likewise (walk/lets.rs: nothing moves out).
-                    Expr::Let { init, .. } => init.0 == c,
-                    // A struct update's base: a place, only its taken fields move
-                    // (walk/moves/struct_update.rs).
-                    Expr::Struct { base: blaze_typeck::StructBase::Expr(b), .. } => b.0 == c,
-                    _ => false,
-                };
-            if in_place {
+            if self.use_keeps_state(c, up) {
                 continue;
             }
             let home = *decl.get(p.ix()).ok_or(malformed("a local past `pats`"))?;
@@ -2633,10 +2658,48 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // A part moved out by a place expression (a field, a box's contents) gives its local
         // field flags (walk/moves/boxes.rs).
         self.scan_part_moves(&parent)?;
+        // A part moved out by a closure's by-value capture of a place below its binding
+        // likewise (walk/moves/env_places.rs).
+        self.scan_env_moves()?;
         // A field taken out of a struct update's base likewise (walk/moves/struct_update.rs).
         self.scan_update_moves()?;
         self.expr_parent = parent;
         self.scan_temp_scopes()
+    }
+
+    /// Whether the use of place expression `c` (the outermost parenthesis around it), whose
+    /// parent is `up` (`NO_EXPR`: none), keeps the place's drop state: a first adjustment that
+    /// borrows it (an autoref, an overloaded dereference's `&self`), wherever it stands, or a
+    /// parent that takes a place (a borrow, a field's or an index's base, a compound
+    /// assignment's left side, a comparison's operand, a `match` or `let` scrutinee, a struct
+    /// update's base). Anything else changes it: a move, and an assignment's left side (which
+    /// makes it held). The rule of a drop flag: `scan_flags` (a local's) and
+    /// walk/moves/env_places.rs (an owned environment field's). Not walk/moves/boxes.rs
+    /// `used_in_place`, which asks whether a use MOVES a part (an assignment's left side does
+    /// not; adjustments are its caller's).
+    fn use_keeps_state(&self, c: u32, up: u32) -> bool {
+        let rows = self.adjust_rows(ExprId(c));
+        let borrowed_first = matches!(
+            self.checked.adjusts.column::<1>().get(rows.start).filter(|_| !rows.is_empty()),
+            Some(AdjustKind::Borrow { .. } | AdjustKind::Deref { overloaded: Some(_) })
+        );
+        borrowed_first
+            || up != NO_EXPR
+                && match self.body.exprs[up as usize] {
+                    Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
+                    Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
+                    Expr::AssignOp { lhs, .. } => lhs.0 == c,
+                    // [expr.cmp.place]: a comparison's operands are borrowed in place.
+                    Expr::Binary { op, lhs, rhs } if operators::comparison(op) => lhs.0 == c || rhs.0 == c,
+                    // A place expression: matched in place, its arms' moves are marked below.
+                    Expr::Match { scrutinee, .. } => scrutinee.0 == c,
+                    // A `let` condition's scrutinee likewise (walk/lets.rs: nothing moves out).
+                    Expr::Let { init, .. } => init.0 == c,
+                    // A struct update's base: a place, only its taken fields move
+                    // (walk/moves/struct_update.rs).
+                    Expr::Struct { base: blaze_typeck::StructBase::Expr(b), .. } => b.0 == c,
+                    _ => false,
+                }
     }
 
     /// Every binding of pattern `p` is declared by expression `by`.
@@ -2795,7 +2858,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             if abi == Abi::RustCall && i + 1 == sig.inputs.len() && kind == Kind::Body {
                 spread = self.rust_call_fields(repr)?;
                 for &(_, frepr) in spread.iter() {
-                    passes.push(Self::rust_pass(frepr)?);
+                    passes.push(self.rust_pass(frepr)?);
                 }
             } else {
                 passes.push(self.pass(g, repr, abi, Some(owner))?);
@@ -2834,52 +2897,34 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
         }
         if kind == Kind::DropGlue {
-            // `drop_in_place::<dyn Tr>`: its parameter is the wide pointer, passed by
-            // reference; the glue is the table's word 0 on the data word.
+            // Reconstitute the wide pointer exactly as for an ordinary parameter.
             let g = *self.args.first().ok_or(malformed("`drop_in_place` without its type argument"))?;
-            if let (PNode::Dynamic(_), &[Repr::Agg(_)], Repr::None, &[q]) =
-                (self.ground_node(g).map_err(sig_err)?, reprs.as_slice(), self.ret, values.as_slice())
-            {
-                let data = self.b.load(Ty::PTR, Flags::NONE, q, 0, MemAttrs::aligned(3));
-                let vt = self.b.load(Ty::PTR, Flags::NONE, q, 8, MemAttrs::aligned(3));
-                self.dyn_glue(data, vt)?;
-                self.b.ret(&[]);
-                if let Some(error) = self.b.error() {
-                    return Err(BuildError::Lir(error.clone()));
-                }
-                return Ok(());
-            }
-            // `drop_glue::<[U]>` and `drop_glue::<str>`: the wide pointer by reference; each
-            // element's glue in order (walk/slice_glue.rs).
-            if let (true, &[Repr::Agg(_)], Repr::None, &[q]) =
-                (self.is_slice_pointee(g)?, reprs.as_slice(), self.ret, values.as_slice())
-            {
-                self.slice_glue(g, q)?;
-                self.b.ret(&[]);
-                if let Some(error) = self.b.error() {
-                    return Err(BuildError::Lir(error.clone()));
-                }
-                return Ok(());
-            }
-            // `drop_glue::<S>` of a struct or tuple whose last field is unsized (core's `CStr`,
-            // std's `OsStr` and `Path`, `ArcInner<[T]>`): its parameter is the wide pointer, by
-            // reference (walk/unsized_tail.rs). The Reference, "Destructors": a type with no
-            // `Drop` impl and no part that needs drop runs nothing, so its glue is empty; one
-            // whose parts need drop is refused by name until its parts' glue is built.
-            if let (&[Repr::Agg(_)], Repr::None, &[_]) = (reprs.as_slice(), self.ret, values.as_slice()) {
-                let l = self.layout(g).map_err(sig_err)?;
-                if self.has_unsized_tail(l) {
+            if let (&[repr @ Repr::Agg(_)], &[pass], Repr::None) = (reprs.as_slice(), passes.as_slice(), self.ret) {
+                let value = self.take_passed(repr, pass, &mut next)?;
+                let at = self.place(value, repr)?;
+                let q = self.address(at);
+                if matches!(self.ground_node(g).map_err(sig_err)?, PNode::Dynamic(_)) {
+                    let data = self.b.load(Ty::PTR, Flags::NONE, q, 0, MemAttrs::aligned(3));
+                    let vt = self.b.load(Ty::PTR, Flags::NONE, q, 8, MemAttrs::aligned(3));
+                    self.dyn_glue(data, vt)?;
+                } else if self.is_slice_pointee(g)? {
+                    self.slice_glue(g, q)?;
+                } else {
+                    let l = self.layout(g).map_err(sig_err)?;
+                    if !self.has_unsized_tail(l) {
+                        return Err(malformed("a wide drop-glue parameter without an unsized pointee"));
+                    }
                     if self.needs_drop(g).map_err(sig_err)? {
                         return Err(BuildError::UnsupportedSig {
                             what: "the drop glue of a struct or tuple with an unsized tail that needs drop (its prefix fields, then its slice tail's elements or its `dyn` tail at the vtable's alignment)",
                         });
                     }
-                    self.b.ret(&[]);
-                    if let Some(error) = self.b.error() {
-                        return Err(BuildError::Lir(error.clone()));
-                    }
-                    return Ok(());
                 }
+                self.b.ret(&[]);
+                if let Some(error) = self.b.error() {
+                    return Err(BuildError::Lir(error.clone()));
+                }
+                return Ok(());
             }
             let (&[Repr::Ptr], Repr::None, &[p]) = (reprs.as_slice(), self.ret, values.as_slice()) else {
                 return Err(malformed("a `drop_glue` parameter that is neither a thin pointer, a slice, `str` nor `dyn`"));
@@ -2968,16 +3013,18 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// How a value held as `repr` crosses a call of the Rust ABI (lib.rs, "Rust ABI"): nothing
-    /// for a zero-sized value, an aggregate by the address of the caller's copy, a scalar in
-    /// one register.
-    fn rust_pass(repr: Repr) -> Result<Pass, BuildError> {
+    /// Adapt the walk's value storage to the layout's call convention.
+    fn rust_pass(&self, repr: Repr) -> Result<Pass, BuildError> {
         Ok(match repr {
             Repr::None => Pass::Ignore,
-            Repr::Agg(_) => Pass::Ref,
+            Repr::Agg(row) => {
+                let row = &self.layouts[row as usize];
+                self.ls.get(row.id).rust_pass(self.ground.view())
+                    .map_err(|why| signature_error(layout_err(LayoutError { ty: row.ty, why })))?
+            }
             _ => {
                 let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
-                Pass::Scalar { ty, ext: abi_param(repr, ty).ext, agg: false }
+                crate::layout::rust_scalar(ty, matches!(repr, Repr::Int { signed: true, .. }), false)
             }
         })
     }
@@ -3029,7 +3076,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             };
             self.push_val(fv, None);
             reprs.push(frepr);
-            passes.push(Self::rust_pass(frepr)?);
+            passes.push(self.rust_pass(frepr)?);
         }
         Ok(())
     }
@@ -3037,19 +3084,18 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// How a value of ground type `g`, held as `repr`, crosses a call of `abi` (lib.rs, "Rust
     /// ABI" and "The C ABI"); `item` is the fn a C refusal names (`None` through a pointer).
     fn pass(&mut self, g: PTy, repr: Repr, abi: Abi, item: Option<ItemKey>) -> Result<Pass, BuildError> {
-        let scalar = |repr: Repr| -> Result<Pass, BuildError> {
-            let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
-            Ok(Pass::Scalar { ty, ext: abi_param(repr, ty).ext, agg: false })
-        };
         // "rust-call" passes each parameter (its tuple's fields too) as the Rust ABI does.
         if let Abi::Rust | Abi::RustCall = abi {
-            return Self::rust_pass(repr);
+            return self.rust_pass(repr);
         }
         let refuse = |why| BuildError::CAbi { item, why };
         let adts = self.adts;
         let class = {
             let mut cx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
-            cabi::class_of(&mut self.ls, g, &mut cx, self.alloc.clone())
+            self.ls.of(g, &mut cx).map_err(CAbiError::Layout).and_then(|id| {
+                let base = self.ls.get(id).call_ty;
+                cabi::class_of(&mut self.ls, base, &mut cx, self.alloc.clone())
+            })
         };
         let class = class.map_err(|error| match error {
             CAbiError::Layout(error) => match layout_err(error) {
@@ -3109,7 +3155,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // AAPCS64 C.8 starts it at an even register, which a run of `i64`s cannot say.
             Class::Composite { align: 4.., .. } => return Err(refuse("a 16-byte-aligned composite (an even register pair)")),
-            Class::Composite { size, .. } => Pass::Words { size: size as u32 },
+            Class::Composite { size, .. } => match self.rust_pass(repr)? {
+                wide @ Pass::Wide { .. } => wide,
+                _ => Pass::Words { size: size as u32 },
+            },
         })
     }
 
@@ -3178,6 +3227,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let at = self.place(v, repr)?;
                 out.push(self.address(at));
             }
+            Pass::Wide { metadata } => {
+                let (ptr, off) = self.place(v, repr)?;
+                let attrs = self.mem(repr);
+                out.push(self.b.load(Ty::PTR, Flags::NONE, ptr, off, attrs));
+                out.push(self.b.load(metadata, Flags::NONE, ptr, off + 8, attrs));
+            }
             Pass::Words { size } => {
                 let at = self.place(v, repr)?;
                 let align = self.size_align(repr).1;
@@ -3194,6 +3249,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn take_passed(&mut self, repr: Repr, p: Pass, next: &mut dyn Iterator<Item = Value>) -> Result<V, BuildError> {
         let mut one = || next.next().ok_or(malformed("a passed value without its register"));
         Ok(match p {
+            Pass::Ignore if matches!(repr, Repr::Agg(_)) => {
+                // A ZST with a destructor still needs an aligned place in this frame.
+                let (ptr, off) = self.temp(repr);
+                V::Place(ptr, off)
+            }
             Pass::Ignore => V::None,
             Pass::Scalar { agg: false, .. } => V::Scalar(one()?),
             Pass::Scalar { agg: true, .. } => {
@@ -3204,6 +3264,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 V::Place(at.0, at.1)
             }
             Pass::Ref | Pass::Memory { .. } => V::Place(one()?, 0),
+            Pass::Wide { .. } => {
+                let (ptr, off) = self.temp(repr);
+                let attrs = self.mem(repr);
+                self.b.store(Flags::NONE, one()?, ptr, off, attrs);
+                self.b.store(Flags::NONE, one()?, ptr, off + 8, attrs);
+                V::Place(ptr, off)
+            }
             Pass::Words { size } => {
                 let at = self.temp(repr);
                 let align = self.size_align(repr).1;
@@ -3267,7 +3334,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// Whether `e` builds its aggregate value in a temporary of its own, which a binding or a
-    /// call may then take as is: a call, a literal.
+    /// call may then take as is: a call (a method call too), a literal.
     fn is_fresh(&self, e: ExprId) -> Result<bool, BuildError> {
         let mut e = e;
         loop {
@@ -3276,7 +3343,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             match self.expr(e)? {
                 Expr::Paren(inner) => e = inner,
-                Expr::Call { .. } | Expr::Tuple { .. } | Expr::Array { .. } | Expr::Repeat { .. } | Expr::Struct { .. } => {
+                // A method call is a call (`raw`'s `Expr::MethodCall` arm: `Task::Call`), its
+                // result in the slot the call made: the Reference, "Place Expressions and Value
+                // Expressions", a value expression as a call is. Not here: an `Index` (a place,
+                // `*index(&a, i)`), a `?` (its value is a place in the matched temporary), and,
+                // until a test shows the slot left alive, an `.await`'s result and an overloaded
+                // operator's call.
+                Expr::Call { .. } | Expr::MethodCall { .. } | Expr::Tuple { .. } | Expr::Array { .. } | Expr::Repeat { .. } | Expr::Struct { .. } => {
                     return Ok(true);
                 }
                 _ => return Ok(false),
@@ -3634,8 +3707,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         None => {
                             let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
                             let g = self.layouts[l as usize].ty;
-                            // A field of a local with field flags drops by its bits (walk/moves.rs).
-                            self.assign_over(lhs, g, at, v, repr)?;
+                            // An owned field of a closure body's environment drops by its state
+                            // (walk/moves/env_places.rs); a field of a local with field flags by
+                            // its bits (walk/moves.rs).
+                            if !self.assign_env_place(lhs, at, v, repr)? {
+                                self.assign_over(lhs, g, at, v, repr)?;
+                            }
                         }
                     }
                 } else {
@@ -4484,7 +4561,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             },
             _ => return Ok(None),
         };
-        Ok(Some(self.data_rows(x, record, &[])?))
+        Ok(Some(self.data_rows(x, record)?))
     }
 
     /// The value of expression `e` from evaluated record `record` (lib.rs, "Consts"): a constant
@@ -4510,7 +4587,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let ty = scalar.scalar().ok_or(malformed("a scalar of no type"))?;
                 if !root.relocs.is_empty() {
                     // A pointer to data: the root's own row holds it, read as any place.
-                    let at = self.data_rows(e, record, &[])?;
+                    let at = self.data_rows(e, record)?;
                     return Ok(self.load(scalar, (at, 0)));
                 }
                 let width = (ty.bits(PTR_BITS) / 8) as usize;
@@ -4522,7 +4599,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 return Ok(V::Scalar(self.const_scalar(ty, value)?));
             }
         }
-        let at = self.data_rows(e, record, &[])?;
+        let at = self.data_rows(e, record)?;
         // A copy, as any use of a const is a fresh value: its row is never written.
         let to = self.temp(repr);
         self.copy(repr, (at, 0), to)?;
@@ -4685,6 +4762,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Pushes the tasks that evaluate `e` as a place after `n` builtin dereferences of its
     /// value; its own adjustments are the caller's.
     fn place_derefs(&mut self, e: ExprId, n: u32) -> Result<(), BuildError> {
+        // A closure body's use of a place its environment holds (walk/moves/env_places.rs).
+        if self.env_use(e, n, false)? {
+            return Ok(());
+        }
         if n > 0 {
             // The value is the first pointer; each step but the last loads the next one, at the
             // type adjustment row `row` left (a wide pointer whole). Pushed last to first: the
@@ -4780,6 +4861,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Pushes the tasks of `e` (its adjustments are the caller's), or evaluates a leaf.
     fn raw(&mut self, e: ExprId) -> Result<(), BuildError> {
+        // A closure body's use of a place its environment holds (walk/moves/env_places.rs).
+        if self.env_use(e, 0, true)? {
+            return Ok(());
+        }
         match self.expr(e)? {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
@@ -5122,7 +5207,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // The Reference, "Constant promotion": a borrow the checker promoted is of a
             // `'static` slot: the address of the value's constant row (walk/promote.rs).
-            Expr::Ref { operand, mutbl: Mutbl::Not } if self.is_promoted(e) => self.promoted_ref(e, operand)?,
+            Expr::Ref { mutbl: Mutbl::Not, .. } if self.is_promoted(e) => self.promoted_ref(e)?,
             Expr::Ref { operand, mutbl } => {
                 if mutbl == Mutbl::Mut {
                     self.refuse_mut_through_overloaded_index(operand)?;
@@ -5540,7 +5625,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let repr = self.repr_at(a, t)?;
             reprs.push(repr);
             passes.push(match declared {
-                Some(d) if k >= d => Self::vararg_pass(a, repr)?,
+                Some(d) if k >= d => self.unnamed_c_pass(a, g, repr)?,
                 _ => self.pass(g, repr, abi, Some(item))?,
             });
         }
@@ -5665,12 +5750,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// The thin form of dynamic receiver type `g` (ground) of argument `a`: the trait object
-    /// replaced by `()` (any sized type has the same thin pointer). `self: Rc<Self>`,
-    /// `Arc<Self>` and `Pin<P>` are refused by name: their glue and layout are not read yet.
+    /// The thin ABI type of a dynamic receiver. A transparent receiver such as
+    /// `Pin<&mut Self>` inherits its pointer field before metadata is removed.
     fn thin_receiver(&mut self, a: ExprId, g: PTy) -> Result<PTy, BuildError> {
         let full = |_| malformed("the ground table is full");
         let unit = self.ground.intern(PNode::Tuple(List::EMPTY)).map_err(full)?;
+        let id = self.ls_of(g).map_err(|error| Self::ty_err(a, error))?;
+        let g = self.ls.get(id).call_ty;
         let node = match self.ground_node(g).map_err(|error| Self::ty_err(a, error))? {
             PNode::Ref(m, _) => PNode::Ref(m, unit),
             PNode::Ptr(m, _) => PNode::Ptr(m, unit),
@@ -5685,22 +5771,33 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 PNode::Adt(k, self.ground.intern_list(&args).map_err(full)?)
             }
-            _ => return Err(unsupported(a, "a `self: Rc<Self>`, `Arc<Self>` or `Pin<P>` receiver called on a trait object")),
+            _ => return Err(unsupported(a, "a dynamic receiver whose ABI field is neither a pointer nor the owned box")),
         };
         self.ground.intern(node).map_err(full)
+    }
+
+    /// The declared C parameters use `pass`. The ellipsis requires a promoted
+    /// scalar, including one stored at offset zero in a transparent argument.
+    fn unnamed_c_pass(&mut self, e: ExprId, ty: PTy, repr: Repr) -> Result<Pass, BuildError> {
+        if let Repr::Agg(_) = repr {
+            let id = self.ls_of(ty).map_err(|error| Self::ty_err(e, error))?;
+            let base = self.ls.get(id).call_ty;
+            if base != ty {
+                let inner = self.repr(base).map_err(|error| Self::ty_err(e, error))?;
+                let Pass::Scalar { ty, ext, .. } = Self::vararg_pass(e, inner)? else {
+                    return Err(malformed("a promoted C variable argument without a scalar pass"));
+                };
+                return Ok(Pass::Scalar { ty, ext, agg: true });
+            }
+        }
+        Self::vararg_pass(e, repr)
     }
 
     /// Call `e` through a fn pointer of ABI `abi`: the pointer under the arguments `list` on
     /// the stack; the signature lowered from the arguments' and the result's types, by the
     /// pointer's ABI (lib.rs, "Fn pointers").
     fn call_pointer(&mut self, e: ExprId, list: &[ExprId], abi: blaze_typeck::Abi) -> Result<(), BuildError> {
-        let abi = match abi {
-            blaze_typeck::Abi::Rust => Abi::Rust,
-            blaze_typeck::Abi::C => Abi::C,
-            // Its written tuple is spread below, as for a direct call (lib.rs `Abi::RustCall`).
-            blaze_typeck::Abi::RustCall => Abi::RustCall,
-            _ => return Err(unsupported(e, "a call through a fn pointer of an ABI other than \"Rust\" and \"C\"")),
-        };
+        let abi = pointer_abi(abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
         let n = list.len();
         let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
         let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
@@ -6108,7 +6205,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     self.arm_effect(moves::Pending::OwnPat(arm.pat), true)?;
                 }
                 if moved != 0 {
-                    let variant = Self::def_variant(self.pat_def(arm.pat)).ok_or(malformed("a variant pattern the check did not resolve"))?;
+                    let _variant = Self::def_variant(self.pat_def(arm.pat)).ok_or(malformed("a variant pattern the check did not resolve"))?;
                     if self.layouts[l as usize].drop_fn.is_some() {
                         return Err(BuildError::UnsupportedPat {
                             pat: arm.pat,

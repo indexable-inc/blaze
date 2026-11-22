@@ -28,7 +28,7 @@
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
-use blaze_ladder::front2::buckets::{Buckets, inherent_home, trait_home};
+use blaze_ladder::front2::buckets::{Ask, Buckets, inherent_home, prepare_home, trait_home};
 use blaze_ladder::front2::heads::Store;
 use blaze_ladder::front2::keys::Keys;
 use blaze_ladder::refusal::SourceFile;
@@ -66,7 +66,7 @@ fn a_refused_header_is_a_candidate_only_where_coherence_allows() {
     let front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let root = names.root(0);
     let mut keys = Keys::new();
-    let mut checker = |path: &[&str]| {
+    let checker = |path: &[&str]| {
         let lib = Paths { names: &names }.path(root, false, path, Ns::Type).unwrap_or_else(|e| panic!("`{path:?}` from the crate root: {e}")).key;
         keys.item(lib).unwrap_or_else(|e| panic!("filing `{path:?}`: {e}"))
     };
@@ -93,29 +93,37 @@ fn a_refused_header_is_a_candidate_only_where_coherence_allows() {
         found[0]
     };
 
-    let store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let b = Buckets::new(&names, &front.index);
-    let of_trait = |trait_, shape| {
-        let home = trait_home(&names, &keys, &store, trait_, shape);
-        b.trait_candidates(trait_, shape, home)
+    let mut candidates = |ask| {
+        prepare_home(&names, &mut keys, &mut store, ask).unwrap_or_else(|e| panic!("{ask:?}: prepare coherence: {e}"));
+        match ask {
+            Ask::Trait(trait_, shape) => {
+                let home = trait_home(&names, &keys, &store, trait_, shape).unwrap_or_else(|e| panic!("{ask:?}: trait home: {e}"));
+                b.trait_candidates(trait_, shape, home)
+            }
+            Ask::Inherent(shape) => {
+                let home = inherent_home(&names, &keys, &store, shape).unwrap_or_else(|e| panic!("{ask:?}: inherent home: {e}"));
+                b.inherent_candidates(shape, home)
+            }
+        }
     };
-    let of_inherent = |shape| b.inherent_candidates(shape, inherent_home(&names, &keys, shape));
 
     // `Debug` (core's, written bare) for a self path that names nothing: only where the self
     // type can be `c`'s local type.
     for (shape, may) in [(local, true), (Shape::Ref(Mutbl::Not), true), (pin, true), (u8_, false), (ordering, false), (Shape::Param, false), (Shape::Closure, false)] {
-        let got = of_trait(debug, shape).contains(&debug_impl);
+        let got = candidates(Ask::Trait(debug, shape)).contains(&debug_impl);
         assert_eq!(got, may, "`impl Debug for Missing` a candidate of `Debug` at {shape:?}: {got}, the rules say {may}");
     }
     // A foreign trait written with an argument (which may be the local type) and a local trait:
     // a candidate wherever its trait's crates allow, as before.
     for shape in [u8_, Shape::Param, local] {
-        assert!(of_trait(partial_eq, shape).contains(&eq_impl), "`impl PartialEq<Local> for Missing` dropped at {shape:?}");
-        assert!(of_trait(mine, shape).contains(&mine_impl), "`impl Mine for Missing` dropped at {shape:?}");
+        assert!(candidates(Ask::Trait(partial_eq, shape)).contains(&eq_impl), "`impl PartialEq<Local> for Missing` dropped at {shape:?}");
+        assert!(candidates(Ask::Trait(mine, shape)).contains(&mine_impl), "`impl Mine for Missing` dropped at {shape:?}");
     }
     // An inherent impl: only of a type `c` defines.
     for (shape, may) in [(local, true), (Shape::Param, false), (ordering, false), (u8_, false), (Shape::Ref(Mutbl::Not), false)] {
-        let got = of_inherent(shape).contains(&inherent_impl);
+        let got = candidates(Ask::Inherent(shape)).contains(&inherent_impl);
         assert_eq!(got, may, "`impl Missing` a candidate of the inherent question at {shape:?}: {got}, the rules say {may}");
     }
     println!("orphan bounded: Debug for Missing: candidate at Local, Ref, Pin; not at u8, Ordering, Param, Closure; PartialEq<Local> and Mine wide; impl Missing at Local only");

@@ -78,7 +78,7 @@ impl Input for Wrapped {
 }
 
 /// The host the native mode builds for; the only one with a pinned clang and a sysroot today
-/// (crates/blaze-toolchain/pins/clang.json: Linux's sysroot is not pinned).
+/// (pins/clang.json: Linux's sysroot is not pinned).
 const HOST: &str = "aarch64-apple-darwin";
 
 /// `native`: the scripts are built as host binaries (no process shim: they really start the
@@ -350,7 +350,15 @@ struct BuiltScript {
 
 impl Plan<'_> {
     /// One package's script: its workspace, its sandboxed offline build, its record.
-    fn build_script(&self, at: usize, library: &Path, shim_digest: &str, rt_digest: &str, native: Option<&Native>) -> Result<BuiltScript, Failure> {
+    fn build_script(
+        &self,
+        at: usize,
+        library: &Path,
+        shim_digest: &str,
+        rt_digest: &str,
+        native: Option<&Native>,
+        alloc: blaze_own::Alloc<'_>,
+    ) -> Result<BuiltScript, Failure> {
         let (wanted, origin) = (&self.args.crates[at], self.origin(at)?);
         let no_module = |why: String| Failure::NoModule { name: wanted.name.clone(), version: wanted.version.clone(), why };
         let original = self.manifest_of(at)?;
@@ -392,7 +400,9 @@ impl Plan<'_> {
         }
         let ws = self.work.join("bs-ws").join(format!("{}-{}", wanted.name, wanted.version));
         write(&ws.join("Cargo.toml"), "[workspace]\nmembers = [\"script\"]\nresolver = \"2\"\n\n[profile.release]\ndebug = false\nincremental = false\npanic = \"abort\"\ncodegen-units = 16\n")?;
-        write(&ws.join("script/Cargo.toml"), script_manifest(&original, &script, &wanted.name, &wanted.version, &features))?;
+        let path = source.join("Cargo.toml");
+        let manifest = super::member_dependencies::filtered_manifest(&script_only(&original), &path, &features, alloc)?;
+        write(&ws.join("script/Cargo.toml"), script_manifest(manifest.as_str(), &script, &wanted.name, &wanted.version, &features))?;
         write(&ws.join("Cargo.lock"), member_lock(&read(&self.work.join("fetch/Cargo.lock"))?, &wanted.name, &wanted.version))?;
         write(
             &ws.join(".cargo/config.toml"),
@@ -580,14 +590,14 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     let started = Instant::now();
     match &args.vendor_from {
         Some(store) => plan.vendor_from(store, script_only, heap.alloc()),
-        None => plan.fetch(),
+        None => plan.fetch(heap.alloc()),
     }
     .unwrap_or_else(|failure| fail(failure));
     println!("{SCRIPT}: fetched in {:.1}s", started.elapsed().as_secs_f64());
     let mut failed = 0;
     for (at, wanted) in args.crates.iter().enumerate() {
         let started = Instant::now();
-        match plan.build_script(at, &library, &shim_digest, &rt_digest, native) {
+        match plan.build_script(at, &library, &shim_digest, &rt_digest, native, heap.alloc()) {
             Ok(built) => println!(
                 "{} {} [{}]: script module {} wasm-sha256 {} {} bytes{} in {:.1}s",
                 wanted.name,

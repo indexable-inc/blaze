@@ -62,8 +62,12 @@ fn outer() {
 }
 ";
 
-/// The type error's label (blaze-report frame/words.rs, Cli rule 17: "type error {0}").
-const E0308: &str = "type error E0308";
+/// The type error's code as the agent view prints it. D70: "`agent` is one or two plain lines
+/// per finding with nothing decorative: the id, the code, `file:line:col`, the message", and
+/// the agent view is the one a file is given; the checker's message ends in the code and its
+/// class: "found `&str`, expected `u8` (E0308 Mismatch)". The person view's frame label ("type
+/// error {0}", blaze-report frame/words.rs Cli rule 17) is drawn on a terminal alone.
+const E0308: &str = "(E0308 Mismatch)";
 
 /// `blaze check` in `dir` with the home `home`: standard output and error together, through a
 /// file (no pipe can fill and stall the child), waited for at most [`DEADLINE`].
@@ -121,9 +125,14 @@ fn every_written_body_is_checked_by_the_command() {
 
     let printed = said.matches(E0308).count();
     assert_eq!(printed, 2, "2 planted E0308, {printed} printed:\n{said}");
-    // Each finding says which body it is in (covered.rs `Shown`): the body the user wrote in
-    // the replaced `main`, and `deep` two blocks down.
-    assert!(said.contains("`{the expansion that took `main`}::main`"), "the written main's E0308 names its body:\n{said}");
+    // Each finding says which body it is in (covered.rs `Shown`): the body the user wrote, the
+    // local `main` of the launcher `main!` wrote in its place (D104), and `deep` two blocks
+    // down. The launcher is a body a macro wrote at the entry (covered.rs `written_by`), named
+    // by its macro, so its local is `<the launcher>::main`; the entry's REPLACED_MAIN name
+    // (engine_bodies.rs) stands only where no written body is found at the entry. Once, under
+    // one name (rule 77: the block's module of the launcher lists it no second time,
+    // covered.rs `in_blocks`).
+    assert!(said.contains("in `{the expansion of `std::main!`}::main::main`"), "the written main's E0308 names its body:\n{said}");
     assert!(said.contains("in `outer::mid::deep`"), "deep's E0308 names its body:\n{said}");
     // Never a pass for a body that was not checked: no "lists no body" note for `main`.
     assert!(!said.contains("front2 lists no body at this item"), "an entry left unchecked:\n{said}");

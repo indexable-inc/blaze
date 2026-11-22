@@ -12,7 +12,7 @@
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::key::Name;
-use crate::request::{TaskFailure, Why};
+use crate::task::{TaskFailure, Why};
 
 /// The task a group of waited tasks comes down to.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

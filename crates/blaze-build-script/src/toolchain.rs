@@ -2,7 +2,7 @@
 //! against, the environment that makes the `cc` and `bindgen` crates find only those, the
 //! headers a compile read (from clang's `-MD` files), and where a script runs in each mode.
 //!
-//! The pin's one home is `crates/blaze-toolchain/pins/clang.json`, beside llvm.json: per host target
+//! The pin's one home is `pins/clang.json`, beside llvm.json (read by blaze-pins): per host target
 //! the LLVM project's release archive (23.1.4, the LLVM the pinned nightly reports), its size
 //! and SHA-256. The archive is fetched once to `<home>/.blaze/v2/toolchain/clang/` (by
 //! blaze-proc-macro's `clang_shelf` example: blaze-http, the digest checked before anything is
@@ -19,10 +19,8 @@ use crate::native::Runner;
 #[cfg(test)]
 mod tests;
 
-/// The pin table's text, as checked in.
-pub const PIN: &str = include_str!("../../blaze-toolchain/pins/clang.json");
-/// The pin table's path, for errors.
-pub const PIN_PATH: &str = "crates/blaze-toolchain/pins/clang.json";
+// The pin table's text and path are blaze-pins's: `CLANG_JSON` and `CLANG_PATH`.
+use blaze_pins::CLANG_PATH;
 
 /// One target's pinned archive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,15 +50,15 @@ pub enum PinError<'t> {
 impl core::fmt::Display for PinError<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PinError::NoRow { target } => write!(f, "{PIN_PATH}: no pinned C toolchain for {target} (D69): its native build scripts cannot run"),
-            PinError::Malformed { target, field } => write!(f, "{PIN_PATH}: {target}'s row has no `{field}` of its form (D69)"),
+            PinError::NoRow { target } => write!(f, "{CLANG_PATH}: no pinned C toolchain for {target} (D69): its native build scripts cannot run"),
+            PinError::Malformed { target, field } => write!(f, "{CLANG_PATH}: {target}'s row has no `{field}` of its form (D69)"),
             PinError::NoSysroot { target } => write!(
                 f,
-                "{PIN_PATH}: no sysroot pinned for {target}: its C library headers (a glibc sysroot by digest, D69) are not fetched yet, so no native build script runs there"
+                "{CLANG_PATH}: no sysroot pinned for {target}: its C library headers (a glibc sysroot by digest, D69) are not fetched yet, so no native build script runs there"
             ),
             PinError::NoVersion => write!(
                 f,
-                "{PIN_PATH}: no top-level `version` of the form `<major>.<minor>.<patch>`: libclang's resource dir `lib/clang/<major>` on the shelf cannot be named (D112 N5)"
+                "{CLANG_PATH}: no top-level `version` of the form `<major>.<minor>.<patch>`: libclang's resource dir `lib/clang/<major>` on the shelf cannot be named (D112 N5)"
             ),
         }
     }
@@ -118,7 +116,7 @@ pub(crate) fn hex32(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// `target`'s pinned archive in the table `text` ([`PIN`]).
+/// `target`'s pinned archive in the table `text` ([`blaze_pins::CLANG_JSON`]).
 pub fn clang_pin<'t>(text: &'t str, target: &'t str) -> Result<ClangPin<'t>, PinError<'t>> {
     let malformed = |field| PinError::Malformed { target, field };
     let release = scalar(text, "release").ok_or(malformed("release"))?;
@@ -153,7 +151,7 @@ pub fn sysroot<'t>(text: &'t str, target: &'t str) -> Result<Sysroot, PinError<'
     }
 }
 
-/// The major of the pinned clang (`version` in the table `text`, [`PIN`]): the name of its
+/// The major of the pinned clang (`version` in the table `text`, [`blaze_pins::CLANG_JSON`]): the name of its
 /// resource dir under the shelf's `lib/clang/`. Refused by name when absent or not numeric.
 pub fn clang_major<'t>(text: &'t str) -> Result<&'t str, PinError<'t>> {
     let version = scalar(text, "version").ok_or(PinError::NoVersion)?;
@@ -225,6 +223,12 @@ pub struct CInputs<'c> {
     /// The deployment target the record is keyed by.
     pub macos_min: &'c str,
 }
+
+/// The macOS deployment target every script is given (`MACOSX_DEPLOYMENT_TARGET`, crate::env
+/// `env` for an `-apple-darwin` target) and every native C compile is made for: a constant, so
+/// the keyed environment covers it. Without it `cc` asks `xcrun --show-sdk-version`, a deferred
+/// tool in a wasm run, and compiles with an empty `-mmacosx-version-min=`.
+pub const MACOS_MIN: &str = "11.0";
 
 /// The variables a native script runs with so that `cc` and `bindgen` find only the pinned
 /// toolchain and the granted headers, never by searching the machine's `PATH` (which is empty):

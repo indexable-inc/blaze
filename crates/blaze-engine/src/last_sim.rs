@@ -535,6 +535,221 @@ fn twin_engines_answer_alike() {
     check(SimConfig::cases(300), |tape| twin(tape, Plant::None));
 }
 
+/// A small DAG fits on one real answer page. Reopen the page after each publication,
+/// including edits which rewrite observations while retaining the same reader edges.
+struct DagPage<'b> {
+    page: crate::pages::VerifiedPage<'b>,
+    headers: BTreeMap<usize, crate::pages::IndexedHeaders<'b>>,
+}
+
+impl crate::StoredPages for DagPage<'_> {
+    fn page(&self, _: Name) -> Result<Option<&crate::pages::VerifiedPage<'_>>, crate::pages::PagesError> {
+        Ok(Some(&self.page))
+    }
+
+    fn header(&self, name: Name) -> Result<Option<crate::pages::Header>, crate::pages::PagesError> {
+        Ok(match crate::pages::HeaderPages::slot(name) {
+            Some(slot) => self.headers.get(&slot).and_then(|headers| headers.get(name)),
+            None => crate::pages::Header::from_page(&self.page, name),
+        })
+    }
+
+    fn finding(&self, _: Name) -> Option<u32> { None }
+
+    fn refusal(&self) -> Option<crate::pages::PagesError> { None }
+
+    fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), LastError>) -> Result<(), LastError> {
+        self.page.row_names().try_for_each(visit)
+    }
+}
+
+const SELECTORS: usize = 5;
+
+fn dag_cell(of: Name, selector: usize) -> CellId {
+    // WHOLE is zero. Fine selectors share their first fifteen bytes.
+    let mut bytes = [0; 16];
+    bytes[15] = selector as u8;
+    CellId { of, cell: blaze_drive::cells::Cell(bytes) }
+}
+
+fn dag_body(i: usize) -> Name {
+    Name::new(blaze_drive::Kind::BodyCheck, ContentId([i as u8; 32]))
+}
+
+fn dag_outline_source(revision: u8, values: &[ContentId; SELECTORS]) -> ContentId {
+    let mut source = StdVec::from([revision]);
+    for value in values {
+        source.extend_from_slice(&value.0);
+    }
+    ContentId::of("DAG outline source", &source)
+}
+
+fn dag_body_source(revision: u8, selectors: &[usize]) -> ContentId {
+    let mut source = StdVec::from([revision]);
+    source.extend(selectors.iter().map(|&s| s as u8));
+    ContentId::of("DAG body source", &source)
+}
+
+fn dag_request<'a>(
+    last: Answer<'a>, files: &[(Name, &[Planned])], outline: Name, scope: Name,
+    values: &[ContentId; SELECTORS], readers: &[StdVec<usize>],
+) -> Result<crate::Finished<'a>, EngineError> {
+    let tools = crate::Tools([blaze_drive::Tool(ContentId([7; 32])); blaze_drive::key::KINDS]);
+    let mut engine = crate::Engine::new_in(tools, last, &crate::Edit { files }, crate::Everything, Plant::None, alloc())?;
+    let mut batch = crate::Buffer::new_in(alloc());
+    while engine.next_phase()?.is_some() {
+        for task in engine.tasks() {
+            let name = task.planned.name;
+            let mut defines = Vec::new_in(alloc());
+            let mut reads = Vec::new_in(alloc());
+            let out = if name == outline {
+                defines.push((dag_cell(outline, 0).cell, task.planned.source));
+                // The outline's item digest can stand while the file digest moves.
+                defines.push((dag_cell(outline, 1).cell, values[1]));
+                task.planned.source
+            } else if name == scope {
+                let id = dag_cell(outline, 0);
+                reads.push((id, engine.view().cell(&id)));
+                defines.extend(values.iter().enumerate().map(|(i, &digest)| (dag_cell(scope, i).cell, digest)));
+                values[0]
+            } else {
+                let i = usize::from(name.subject.0[0]);
+                if i >= SELECTORS {
+                    let id = dag_cell(outline, 1);
+                    reads.push((id, engine.view().cell(&id)));
+                }
+                for &selector in &readers[i] {
+                    let id = dag_cell(scope, selector);
+                    reads.push((id, engine.view().cell(&id)));
+                }
+                name.subject
+            };
+            batch.done.push(crate::Done { name, key: task.key, out, reads, defines, findings: 0, failed: false });
+        }
+        engine.merge(core::slice::from_mut(&mut batch))?;
+    }
+    engine.finish()
+}
+
+fn paged_dag(tape: &Tape) -> Result<(), Broke> {
+    use crate::pages::{HeaderPages, IndexedHeaders, Kept, Sealed, VerifiedPage, decode_root, encode, encode_changes};
+    use crate::{Cause, Stage};
+
+    let outline = Name::file(b"src/lib.rs");
+    let scope = Name::new(blaze_drive::Kind::CrateScope, ContentId([6; 32]));
+    let mut readers: StdVec<StdVec<usize>> = (0..SELECTORS).map(|s| StdVec::from([s])).collect();
+    for _ in 0..1 + tape.index(5, "extra bodies") {
+        // Reverse selector order to exercise the stored row's read-order index.
+        readers.push((0..SELECTORS).rev().filter(|_| tape.one_in(2, "body reads selector")).collect());
+    }
+    let plan = |name, stage| Planned { name, phase: Phase::new(stage, 0), file: outline, source: ContentId([1; 32]) };
+    let mut plans = StdVec::from([plan(outline, Stage::Outlines), plan(scope, Stage::Names)]);
+    plans.extend(readers.iter().enumerate().map(|(i, selectors)| Planned {
+        source: dag_body_source(0, selectors), ..plan(dag_body(i), Stage::Bodies)
+    }));
+    let mut values: [ContentId; SELECTORS] = core::array::from_fn(|i| ContentId([10 + i as u8; 32]));
+    plans[0].source = dag_outline_source(0, &values);
+    let cold = dag_request(Answer::new_in(alloc()), &[(outline, &plans)], outline, scope, &values, &readers)
+        .map_err(|e| Broke::Harness(format!("cold DAG: {e}")))?;
+    let mut memory = Kept::after(crate::SMap::new_in(alloc()), cold.answer, &cold.causes, crate::SMap::new_in(alloc()));
+    let mut encoded = encode(&memory, None, alloc());
+    let (mut header_keys, writes) = HeaderPages::encode(&memory, None, |_| Ok(None), alloc())
+        .map_err(|e| Broke::Harness(format!("cold DAG headers: {e}")))?;
+    let mut header_bytes: BTreeMap<_, _> = writes.into_iter().collect();
+    let fine_only = 1 << (1 + tape.index(SELECTORS - 1, "one fine selector"));
+    let random = tape.index(1 << SELECTORS, "changed selector mask");
+    for (step, mask) in [0, fine_only, random, 1].into_iter().enumerate() {
+        let old = values;
+        let old_source = plans[0].source;
+        for (i, digest) in values.iter_mut().enumerate() {
+            if mask & (1 << i) != 0 {
+                digest.0[31] ^= 1;
+            }
+        }
+        plans[0].source = dag_outline_source(1 + step as u8, &values);
+        // A prior edit can replace a body's read list while the names outputs stand.
+        // Give that reader a changed source so its new memberships get published.
+        if step == 0 {
+            for (i, selectors) in readers.iter_mut().enumerate().skip(SELECTORS) {
+                selectors.clear();
+                selectors.extend((0..SELECTORS).rev().filter(|_| tape.one_in(2, "edited body reads selector")));
+                plans[2 + i].source = dag_body_source(1, selectors);
+            }
+        }
+        let files = [(outline, plans.as_slice())];
+        let eager = dag_request(memory.answer, &files, outline, scope, &values, &readers)
+            .map_err(|e| Broke::Harness(format!("in-memory DAG step {step}: {e}")))?;
+        let mut expected = BTreeMap::from([
+            (outline, Cause::KeyMoved),
+            (scope, Cause::ReadMoved { read: dag_cell(outline, 0), was: old_source, now: plans[0].source }),
+        ]);
+        for (i, selectors) in readers.iter().enumerate() {
+            if i >= SELECTORS && step == 0 {
+                expected.insert(dag_body(i), Cause::KeyMoved);
+            } else if i >= SELECTORS && old[1] != values[1] {
+                expected.insert(dag_body(i), Cause::ReadMoved { read: dag_cell(outline, 1), was: old[1], now: values[1] });
+            } else if let Some(&s) = selectors.iter().find(|&&s| old[s] != values[s]) {
+                expected.insert(dag_body(i), Cause::ReadMoved { read: dag_cell(scope, s), was: old[s], now: values[s] });
+            }
+        }
+        let actual: BTreeMap<_, _> = eager.causes.iter().map(|row| (row.name, row.cause)).collect();
+        oracle(expected == actual && eager.entered.len() == expected.len(), || format!("DAG mask {mask:#b}: expected {expected:?}, memory {actual:?}"))?;
+        let scope_entry = eager.causes.iter().find(|row| row.name == scope);
+        oracle(scope_entry.is_some_and(|row| row.identical == (old[0] == values[0])), || {
+            format!("DAG mask {mask:#b}: scope output {:?} -> {:?}, entry {scope_entry:?}", old[0], values[0])
+        })?;
+        let (next, (next_headers, writes)) = {
+            let bytes = |key| encoded.puts.iter().find(|(k, _)| *k == key).expect("this edit rewrites the single page and root").1.as_slice();
+            // Each record hashed against its key (no store proves them here), then each page and
+            // shard walked whole: the simulation reads in verify mode.
+            fn sealed(key: Key, bytes: &[u8]) -> Result<Sealed<'_>, Broke> {
+                Sealed::hashed(key, bytes).map_err(|torn| Broke::Oracle(format!("DAG record {key:?}: {torn:?}")))
+            }
+            let root = decode_root(sealed(encoded.root, bytes(encoded.root))?, alloc()).map_err(|e| Broke::Oracle(format!("DAG root: {e}")))?;
+            assert_eq!(root.bits, 0, "the small DAG fits on one page");
+            let key = root.pages[0];
+            let page = VerifiedPage::open_whole(sealed(key, bytes(key))?, 0, root.bits).map_err(|e| Broke::Oracle(format!("DAG page: {e}")))?;
+            let mut headers = BTreeMap::new();
+            for (slot, &key) in header_keys.keys.iter().enumerate().filter(|(_, key)| **key != Key::default()) {
+                let shard = IndexedHeaders::open_whole(sealed(key, &header_bytes[&key])?, slot).map_err(|e| Broke::Oracle(format!("DAG header {slot}: {e}")))?;
+                headers.insert(slot, shard);
+            }
+            let stored = DagPage { page, headers };
+            for (&name, &cause) in memory.causes.iter() {
+                let saved = stored.page.cause(name);
+                oracle(saved == Some(cause), || format!("before DAG step {step}: {name:?} expected {cause:?}, page {saved:?}"))?;
+            }
+            let view = dag_request(Answer::from_pages(&stored, root.serial, alloc()), &files, outline, scope, &values, &readers)
+                .map_err(|e| Broke::Oracle(format!("paged DAG step {step}: {e}")))?;
+            oracle(eager.entered[..] == view.entered[..] && eager.causes[..] == view.causes[..], || {
+                format!("DAG mask {mask:#b}: memory {:?}, page {:?}", &eager.causes[..], &view.causes[..])
+            })?;
+            let changed = Kept::after(crate::SMap::new_in(alloc()), view.answer, &view.causes, crate::SMap::new_in(alloc()));
+            let next = encode_changes(&changed, &root, alloc()).map_err(|e| Broke::Oracle(format!("publish DAG step {step}: {e}")))?;
+            let headers = HeaderPages::encode(&changed, Some(&header_keys), |slot| Ok(stored.headers.get(&slot)), alloc())
+                .map_err(|e| Broke::Oracle(format!("publish DAG headers at step {step}: {e}")))?;
+            (next, headers)
+        };
+        memory = Kept::after(memory.causes, eager.answer, &eager.causes, memory.records);
+        let expected_root = encode(&memory, None, alloc()).root;
+        oracle(next.root == expected_root, || {
+            format!("after DAG step {step}, mask {mask:#b}: in-memory root {expected_root:?}, published {:?}", next.root)
+        })?;
+        encoded = next;
+        header_keys = next_headers;
+        header_bytes.extend(writes);
+    }
+    Ok(())
+}
+
+/// Compare task entry and each cause, including the selector and both complete digests,
+/// over both the general history and page-backed re-runs with independent cell changes.
+#[test]
+fn stored_view_and_memory_enter_the_same_random_dag() {
+    check(SimConfig::cases(500), |tape| twin(tape, Plant::None));
+    check(SimConfig::cases(500), paged_dag);
+}
+
 /// The planted bug: the overlay answers a cell's readers ignoring this request's removals. A row
 /// that stopped reading a made record keeps it alive, or a dropped reader is entered again.
 #[test]

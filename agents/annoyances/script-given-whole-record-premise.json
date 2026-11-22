@@ -1,0 +1,13 @@
+{
+ "id": "script-given-whole-record-premise",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer lane, pieces 1 and 2 of the tempo body-edit floor",
+ "where": "the tempo score's edit profile (score-c1725wave42, tempo-score.edit.profile.txt): 'read moved Given 619593091d8c (whole record)'; engine_check.rs's cause words; crates/blaze-cli/src/engine_script_reads.rs",
+ "what": "The brief read '(whole record)' as a coarse Given that should be split into cells. The Givens are already one per read (a file, a listing, a stat, one git question); 'whole record' is the engine's word for a read of a cell's WHOLE id, which for a git question is its whole answer. The two moved Givens are smolgen's `git status --porcelain` and `git status --porcelain --untracked-files=no` (tempo crates/node/build.rs and crates/zones/node/build.rs, smolgen gitcl.rs compute_dirty): the score's edit of orderbook.rs adds a ` M` line to the porcelain stdout, so the answer moved for real and the two reruns are correct by rule 21. The scripts reduce stdout to `!is_empty()`, so their outputs come out the same.",
+ "cost": "about an hour tracing the cell ids back to the sandbox's git subjects before the premise was visibly wrong",
+ "cause": "the profile names a moved cell by its hex id and the word 'whole record' only, never the read's kind and path, so a fine cell reads like a coarse one",
+ "whys": "the cause line is made in engine_check.rs from the CellId alone; the Given's path lives in the scripts stage, which printed no counters of its own",
+ "class": "a profile line that names a cell by id without what it reads",
+ "fix": "engine_scripts.rs now prints 'given cells moved; scripts entered again; identical again' and one line per rerun that made the same bytes, with the Given cell, its kind and its path. The deeper fix (a git answer projected to what the script uses, e.g. dirty or not) needs the script's own code to say so: a narrower question asked of the sandbox, which smolgen does not ask.",
+ "status": "counter written; projection not started"
+}

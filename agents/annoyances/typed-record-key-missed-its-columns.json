@@ -1,0 +1,15 @@
+{
+ "id": "typed-record-key-missed-its-columns",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer of the D168 typed put, who fixed it",
+ "where": "crates/blaze-cli/src/engine_body_record.rs `typed_key`, engine_bodies.rs (the Bodies phase's typed put), engine_body_facts.rs (form 3)",
+ "what": "Twelve tests failed on their second command: the store refused `TwoValues { tag: 65533, differs_at: 24 or 12 }`. The typed body record was keyed by (check name, row out). A clean body's out is the digest of its verdict, and the verdict does not move when an edit adds an expression and the body stays clean. The record's ExprTy row count, at byte 24, does move.",
+ "cost": "12 red tests in one round; one round of diagnosis without a run",
+ "cause": "the key was a stand-in for the value (`out`) instead of the value's own bytes; the test of the key checked only that two outs give two keys",
+ "whys": "the typed record was added beside the verdict and assumed to be a function of it; nothing proved that, and the store's write-once check was the first thing to notice",
+ "class": "a name-keyed record whose key misses an input of its value (rule 21)",
+ "prevention": "the record is keyed by its bytes; the body's run facts (keyed by their bytes too) name the key, so a reader follows the answer's record column to it; the unit test plants a one-byte change at offset 24",
+ "annoyance": "the failure text names the key, tag and offset but not the put site; with a hash-of-bytes key the offending writer has to be found by matching record lengths and offsets against each name-keyed put",
+ "workaround": "list every `store.put` whose key is not a hash of its bytes (rg 'store.put'), then match the offset against each form's layout",
+ "state": "fixed in the tree, not yet compiled"
+}

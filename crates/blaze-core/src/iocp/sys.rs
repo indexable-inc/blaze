@@ -16,12 +16,13 @@ use std::{
 };
 
 use blaze_mem::{MemError, Region, Tag as MemTag};
-use windows_sys::Win32::{
-    Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{GetFullPathNameW, SetFileCompletionNotificationModes},
-    System::IO::{
-        CreateIoCompletionPort, OVERLAPPED, OVERLAPPED_0_0,
-        OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
+use blaze_sys::windows::{
+    Bool, Handle, WinError,
+    foundation::{ERROR_IO_PENDING, GetLastError},
+    fs::{GetFullPathNameW, SetFileCompletionNotificationModes},
+    io::{
+        CreateIoCompletionPort, OVERLAPPED, OVERLAPPED_0_0, OVERLAPPED_ENTRY,
+        PostQueuedCompletionStatus,
     },
 };
 
@@ -264,27 +265,32 @@ fn full_path(wide: &[u16], into: &mut Vec<u16>) -> io::Result<()> {
 }
 
 /// The handle a call returned, or the error it set where it returned none.
-pub(super) fn owned(raw: HANDLE) -> io::Result<OwnedHandle> {
-    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+pub(super) fn owned(raw: Handle) -> io::Result<OwnedHandle> {
+    if raw.is_null() || raw.is_invalid() {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: a handle the call just made, owned by no one else.
-    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw.raw()) })
+}
+
+/// The handle std's `handle` owns, as the declarations take it; it stays `handle`'s.
+pub(super) fn handle_of(handle: &impl std::os::windows::io::AsRawHandle) -> Handle {
+    Handle::from_raw(handle.as_raw_handle())
 }
 
 /// Ok where a call that returns a `BOOL` returned true.
-pub(super) fn check(ok: windows_sys::core::BOOL) -> io::Result<()> {
-    match ok {
-        0 => Err(io::Error::last_os_error()),
-        _ => Ok(()),
+pub(super) fn check(ok: Bool) -> io::Result<()> {
+    match ok.is_true() {
+        false => Err(io::Error::last_os_error()),
+        true => Ok(()),
     }
 }
 
 /// Ok where an overlapped call is in flight: it returned true, or false with
 /// `ERROR_IO_PENDING`. Either way its completion comes to the port: for a handle that does not
 /// skip the port on success ([`Port::associate`]).
-pub(super) fn pending(ok: windows_sys::core::BOOL) -> io::Result<()> {
-    match ok != 0 || last() == ERROR_IO_PENDING {
+pub(super) fn pending(ok: Bool) -> io::Result<()> {
+    match ok.is_true() || last() == ERROR_IO_PENDING {
         true => Ok(()),
         false => Err(io::Error::last_os_error()),
     }
@@ -294,8 +300,8 @@ pub(super) fn pending(ok: windows_sys::core::BOOL) -> io::Result<()> {
 /// ([`Port::associate_skipping`]) started: `Ok(true)` where it ended at once, so no packet
 /// comes and how it ended is in its `OVERLAPPED` already ([`Head::result`]); `Ok(false)` where
 /// it is in flight and its packet comes.
-pub(super) fn started(ok: windows_sys::core::BOOL) -> io::Result<bool> {
-    if ok != 0 {
+pub(super) fn started(ok: Bool) -> io::Result<bool> {
+    if ok.is_true() {
         return Ok(true);
     }
     match last() {
@@ -371,8 +377,7 @@ impl Head {
         let overlapped = unsafe { &*self.overlapped() };
         let status = overlapped.Internal as i32;
         match status < 0 {
-            // SAFETY: no pointers.
-            true => Err(unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) }),
+            true => Err(WinError::from_ntstatus(status).code()),
             false => Ok(overlapped.InternalHigh as u32),
         }
     }
@@ -453,16 +458,16 @@ impl Port {
     pub(super) fn new() -> io::Result<Port> {
         // SAFETY: no handle to associate; a new port, for one thread at a time.
         let port =
-            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+            unsafe { CreateIoCompletionPort(Handle::INVALID, Handle::NULL, 0, 1) };
         Ok(Port(owned(port)?))
     }
 
-    pub(super) fn raw(&self) -> HANDLE {
-        self.0.as_raw_handle()
+    pub(super) fn raw(&self) -> Handle {
+        Handle::from_raw(self.0.as_raw_handle())
     }
 
     /// Completions of overlapped requests of `handle` come to this port, with [`KEY_IO`].
-    pub(super) fn associate(&self, handle: HANDLE) -> io::Result<()> {
+    pub(super) fn associate(&self, handle: Handle) -> io::Result<()> {
         // SAFETY: an open handle of the caller's and this port.
         let port = unsafe { CreateIoCompletionPort(handle, self.raw(), KEY_IO, 0) };
         match port.is_null() {
@@ -475,7 +480,7 @@ impl Port {
     /// the cache holds, a write it takes) posts no packet: [`started`] says so, and the driver
     /// ends it where it asked. Only for handles whose every request is asked through
     /// [`started`]: the files' (`Op::Read`, `Op::Write`).
-    pub(super) fn associate_skipping(&self, handle: HANDLE) -> io::Result<()> {
+    pub(super) fn associate_skipping(&self, handle: Handle) -> io::Result<()> {
         self.associate(handle)?;
         // SAFETY: an open handle of the caller's, no request yet on it.
         check(unsafe { SetFileCompletionNotificationModes(handle, SKIP_ON_SUCCESS) })
@@ -505,7 +510,7 @@ impl Port {
 /// A packet of `key` posted to the port `port`, which is open; `carried` is a number of the
 /// key's. Refuses [`KEY_IO`]: the driver reads a `KEY_IO` packet's `OVERLAPPED` through as a
 /// [`Head`], so only the kernel's completions, or [`post_head`], may carry that key.
-pub(super) fn post(port: HANDLE, key: usize, bytes: u32, carried: usize) -> io::Result<()> {
+pub(super) fn post(port: Handle, key: usize, bytes: u32, carried: usize) -> io::Result<()> {
     if key == KEY_IO {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -524,7 +529,7 @@ pub(super) fn post(port: HANDLE, key: usize, bytes: u32, carried: usize) -> io::
 /// `head` is a [`Head::overlapped`] whose `Head` stays where it is, alive, until the driver has
 /// taken the packet: the driver reads the head's id through it.
 #[cfg(test)]
-pub(super) unsafe fn post_head(port: HANDLE, head: *mut OVERLAPPED) -> io::Result<()> {
+pub(super) unsafe fn post_head(port: Handle, head: *mut OVERLAPPED) -> io::Result<()> {
     // SAFETY: an open port; the caller keeps `head` alive until the packet is taken.
     check(unsafe { PostQueuedCompletionStatus(port, 0, KEY_IO, head) })
 }

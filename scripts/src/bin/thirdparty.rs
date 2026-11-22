@@ -82,6 +82,14 @@ use blaze_script::{
     universal_newlines,
 };
 
+/// The manifests' shape: every dependency through the root's `[workspace.dependencies]`.
+#[path = "thirdparty/manifests.rs"]
+mod manifests;
+
+/// The packages cargo's resolve reaches, held at D180's ratchet, target 0.
+#[path = "thirdparty/reach.rs"]
+mod reach;
+
 const SCRIPT: &str = "thirdparty";
 /// The list, from the root.
 const LIST: &str = "tools/ratchets/third-party.txt";
@@ -115,16 +123,23 @@ struct Args {
     command: String,
     root: String,
     base: Option<String>,
+    /// For `reach-*`: the path of `cargo metadata --format-version 1 --offline --locked`'s output.
+    metadata: Option<String>,
 }
 
 impl Input for Args {
-    const FIELDS: &'static [&'static str] = &["command", "root", "base"];
+    const FIELDS: &'static [&'static str] = &["command", "root", "base", "metadata"];
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write"], None)?,
+            command: f.one_of(
+                "command",
+                &["check", "write", "manifests-check", "manifests-report", "reach-check", "reach-write", "reach-report"],
+                None,
+            )?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
+            metadata: f.str_or_null("metadata")?,
         })
     }
 }
@@ -532,6 +547,28 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
         return Err(DepsError::Shape { at: Place { file: ROOT.to_owned(), line: 1 }, key: "workspace".to_owned(), want: "a table: the root is no workspace" });
     };
     let root_deps = get_table(ws, "dependencies", ROOT)?;
+    let members = members_of(tree, root, ws)?;
+    // Each directory to read, and the line that named it (none for a member).
+    let mut todo: Vec<(String, Option<Place>)> = members.iter().rev().map(|dir| (dir.clone(), None)).collect();
+    if let Some(patches) = get_table(root, "patch", ROOT)? {
+        for patch in patches.children() {
+            if !patch.is_table() {
+                return Err(shape(patch, &format!("patch.{}", patch.key()), ROOT, "a table"));
+            }
+            for value in patch.children() {
+                let at = Place { file: ROOT.to_owned(), line: line_of(value) };
+                if let Some(path) = dep_of(value.key(), value, DepKind::Normal, &at, "", None)?.path {
+                    todo.push((path, Some(at)));
+                }
+            }
+        }
+    }
+    workspace_from(tree, root, root_deps, &members, todo)
+}
+
+/// The members' directories, from the root (`""` for a root package): `[workspace] members`, each
+/// a path or `<dir>/*` (every directory of `<dir>` with a Cargo.toml), less `exclude`.
+fn members_of(tree: &dyn Tree, root: toml::Node<'_, '_>, ws: toml::Node<'_, '_>) -> Result<BTreeSet<String>, DepsError> {
     let excluded: BTreeSet<String> = get_strs(ws, "exclude", ROOT)?
         .map_or_else(Vec::new, |(_, them)| them)
         .iter()
@@ -558,21 +595,17 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
             }
         }
     }
-    // Each directory to read, and the line that named it (none for a member).
-    let mut todo: Vec<(String, Option<Place>)> = members.iter().rev().map(|dir| (dir.clone(), None)).collect();
-    if let Some(patches) = get_table(root, "patch", ROOT)? {
-        for patch in patches.children() {
-            if !patch.is_table() {
-                return Err(shape(patch, &format!("patch.{}", patch.key()), ROOT, "a table"));
-            }
-            for value in patch.children() {
-                let at = Place { file: ROOT.to_owned(), line: line_of(value) };
-                if let Some(path) = dep_of(value.key(), value, DepKind::Normal, &at, "", None)?.path {
-                    todo.push((path, Some(at)));
-                }
-            }
-        }
-    }
+    Ok(members)
+}
+
+/// [`workspace`] from its members and the directories `todo` to read.
+fn workspace_from(
+    tree: &dyn Tree,
+    root: toml::Node<'_, '_>,
+    root_deps: Option<toml::Node<'_, '_>>,
+    members: &BTreeSet<String>,
+    mut todo: Vec<(String, Option<Place>)>,
+) -> Result<BTreeMap<String, Manifest>, DepsError> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out: BTreeMap<String, Manifest> = BTreeMap::new();
     // Bounded: a directory is read once, and each read adds only the directories it names.
@@ -891,6 +924,82 @@ fn census(tree: &dyn Tree) -> Result<Census, DepsError> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The crates the binaries reach (D173): written here, the one home of the manifests' graph, and
+// read by the ambient tool's no_std check (ambient/sansio.rs, the `bare` column).
+
+/// The packages whose binaries ship: `blaze` (blaze-cli) and the launcher.
+const BINARIES: [&str; 2] = ["blaze-cli", "blaze-launcher"];
+
+/// The list of the workspace crates the binaries reach, from the root.
+const REACHED_LIST: &str = "tools/ratchets/reached.txt";
+
+const REACHED_HEADER: &str = "# The workspace crates the shipped binaries (blaze-cli's `blaze`, blaze-launcher's) reach\n\
+                              # through normal and build dependencies (never dev), every target's and every optional one\n\
+                              # the lock lists, from the manifests and Cargo.lock: the crate's directory, its third-party\n\
+                              # packages named directly, and the workspace crates it names directly (`-` for none). Written\n\
+                              # by scripts/src/bin/thirdparty.rs (`{\"command\": \"write\"}`), and its `check` refuses a\n\
+                              # list that is not as `write` writes it; read by the ambient tool's no_std check (D173).\n\
+                              # crate\tthird_party\tdepends_on\n";
+
+/// One reached workspace crate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Reached {
+    /// Its third-party packages named directly by a normal or build dependency.
+    direct: BTreeSet<Pkg>,
+    /// The directories of the workspace crates it names by a normal or build dependency.
+    deps: BTreeSet<String>,
+}
+
+/// Every workspace crate [`BINARIES`] reach, by its directory, from the tree's manifests and lock.
+fn reached(tree: &dyn Tree) -> Result<BTreeMap<String, Reached>, DepsError> {
+    reached_from(tree, &BINARIES)
+}
+
+/// Every workspace crate the packages `roots` reach, by its directory, the roots with them.
+fn reached_from(tree: &dyn Tree, roots: &[&str]) -> Result<BTreeMap<String, Reached>, DepsError> {
+    let manifests = workspace(tree)?;
+    let lock = read_lock(tree)?;
+    let graph = Graph { manifests: &manifests, lock: &lock, reached: BTreeMap::new() };
+    let mut out: BTreeMap<String, Reached> = BTreeMap::new();
+    let mut todo: Vec<String> = roots.iter().map(|it| (*it).to_owned()).collect();
+    // Bounded: a crate is expanded once (by its directory), and only an expanded crate pushes.
+    while let Some(name) = todo.pop() {
+        let Some(m) = manifests.get(&name) else { return Err(DepsError::UnknownPath { name }) };
+        if out.contains_key(&m.dir) {
+            continue;
+        }
+        let mut row = Reached::default();
+        for dep in m.deps.iter().filter(|it| it.kind != DepKind::Dev) {
+            match graph.node_of_dep(m, dep)? {
+                Some(Node::Ours(next)) => {
+                    if let Some(target) = manifests.get(&next) {
+                        row.deps.insert(target.dir.clone());
+                    }
+                    todo.push(next);
+                }
+                Some(Node::Third(at)) => {
+                    row.direct.insert(graph.pkg(at));
+                }
+                None => {}
+            }
+        }
+        out.insert(m.dir.clone(), row);
+    }
+    Ok(out)
+}
+
+/// The reached list's text: its header, then a row per crate, sorted.
+fn render_reached(reached: &BTreeMap<String, Reached>) -> String {
+    let mut out = REACHED_HEADER.to_owned();
+    for (dir, row) in reached {
+        let deps: Vec<&str> = row.deps.iter().map(String::as_str).collect();
+        let deps = if deps.is_empty() { "-".to_owned() } else { deps.join(",") };
+        out.push_str(&format!("{dir}\t{}\t{deps}\n", row.direct.len()));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
 // The list.
 
 /// A column of the list.
@@ -1148,14 +1257,43 @@ fn main_with(it: &Args) {
     // `Path(root).resolve()`.
     let root: PathBuf =
         std::fs::canonicalize(&it.root).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&it.root));
+    if let Some(what) = it.command.strip_prefix("reach-") {
+        if let Err(why) = reach::run(&Disk { root: root.clone() }, &root, what, it.metadata.as_deref()) {
+            eprintln!("{why}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(what) = it.command.strip_prefix("manifests-") {
+        let shape = manifests::shape(&Disk { root: root.clone() }).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+        if what == "report" {
+            print!("{}", manifests::report(&shape));
+            return;
+        }
+        if !shape.problems.is_empty() {
+            let lines: Vec<String> = shape.problems.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
+            eprintln!("{}\n{SCRIPT}: {} manifest problems", lines.join("\n"), shape.problems.len());
+            std::process::exit(1);
+        }
+        print!("{SCRIPT}: manifests hold: {}", manifests::report(&shape).lines().last().map_or(String::new(), |it| format!("{it}\n")));
+        return;
+    }
     let now = census(&Disk { root: root.clone() }).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     let text = render(&now);
+    let reached_now = reached(&Disk { root: root.clone() }).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+    let reached_text = render_reached(&reached_now);
     if it.command == "write" {
         if let Err(e) = std::fs::write(root.join(LIST), &text) {
             fail(SCRIPT, &format!("{LIST} is not written: {e}"));
         }
-        println!("{SCRIPT}: wrote {LIST}: {}", summary(&now));
+        if let Err(e) = std::fs::write(root.join(REACHED_LIST), &reached_text) {
+            fail(SCRIPT, &format!("{REACHED_LIST} is not written: {e}"));
+        }
+        println!("{SCRIPT}: wrote {LIST}: {}; wrote {REACHED_LIST}: {} crates reached", summary(&now), reached_now.len());
         return;
+    }
+    if read_text(&root.join(REACHED_LIST)).as_deref() != Some(reached_text.as_str()) {
+        fail(SCRIPT, &format!("{REACHED_LIST} is not as command `write` writes it from the manifests (the crates the binaries reach): run it"));
     }
     let Some(listed) = read_text(&root.join(LIST)) else {
         fail(SCRIPT, &format!("{LIST} could not be read: every crate is held to its row there (command `write` makes it)"))
@@ -1411,6 +1549,16 @@ fn refused(edits: &[(&str, &str, &str)]) -> Option<DepsError> {
 }
 
 fn selftest() {
+    // The reach of the shipped binaries' crates: from `t`, through normal and build
+    // dependencies only (`a`'s dev `moved` is none), each crate once by its directory, and a
+    // crate nothing reaches (`c`) is not there.
+    let from_t = reached_from(&fixture(&[]), &["t"]).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &format!("the fixture's reach: {e}")));
+    let dirs: Vec<&str> = from_t.keys().map(String::as_str).collect();
+    expect(dirs.contains(&"tools/t") && dirs.contains(&"crates/a") && dirs.contains(&"crates/b") && !dirs.contains(&"crates/c"), &format!("the reach: {dirs:?}"));
+    expect(from_t.get("tools/t").is_some_and(|it| it.deps.contains("crates/a")), "t names a");
+    expect(from_t.get("crates/a").is_some_and(|it| it.deps.contains("crates/b") && !it.direct.iter().any(|p| p.name == "moved")), "a names b, and not its dev packages");
+    let text = render_reached(&from_t);
+    expect(text.starts_with(REACHED_HEADER) && text.contains("\ntools/t\t1\tcrates/a\n"), &format!("the reached list: {text}"));
     // TOML, read by blaze-toml (whose own tests hold the language): a refusal names the file
     // and line, and a key of the wrong shape its line.
     let twice = read_toml("t.toml", "x = 1\na = 1\na = 2\n").err();
@@ -1615,6 +1763,8 @@ fn selftest() {
             && parse_rows("\t1\t0\t0\n").is_err(),
         "a bad row is refused, naming its line",
     );
+    manifests::selftest();
+    reach::selftest();
     println!("{SCRIPT} selftest: ok");
 }
 
@@ -1624,7 +1774,7 @@ fn main() {
         [one] if one == "selftest" => selftest(),
         [one] => main_with(&input::parse::<Args>(one, SCRIPT)),
         _ => {
-            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}");
+            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}{}", manifests::MANIFESTS_DOC, reach::REACH_DOC);
             std::process::exit(1);
         }
     }

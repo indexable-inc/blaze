@@ -1,0 +1,15 @@
+{
+ "id": "d164-findings-as-records",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer DA1, D164",
+ "where": "crates/blaze-report (frame::words, finding, query), blaze-cli engine_lines.rs, engine_bodies.rs, print.rs, docs on structured output",
+ "what": "Making a body's note a record: (1) the structured-output doc describes a finding shape that is no longer the code's, so it misled the first read; (2) blaze_report::frame::Finding (a drawn finding) and the new blaze_report::finding::Finding (a record) share a name; (3) the producers of notes are spread over files of other lanes (engine_head_notes, engine_body_plan, engine_lints, engine_check), so one lane cannot switch every note; (4) engine_bodies.rs and blaze-report lib.rs changed on disk under the lane during its edits; (5) the lane edited one Rust file with a python string replace, against the edit-tools rule.",
+ "cost": "about half an hour of re-reading files after the on-disk changes and checking which doc was current",
+ "cause": "notes were words written at each producer, so the shape lived in prose and in each producer's format string, not in one type",
+ "whys": "no record type for a note existed; each new note added a Class and a sentence; the doc was written for a plan and not marked when the plan changed",
+ "class": "a concept with no type: its shape drifts between doc and producers",
+ "prevention": "the finding record and the cause enum in blaze-report, with a test that each cause has a rule and words; the remaining producers to switch are listed under LINES ELSEWHERE of D164; mark the structured-output doc superseded",
+ "annoyance": "a write-only lane with files changing under it cannot tell a merge from its own edit without git",
+ "workaround": "re-read a file before each edit when another lane may hold it",
+ "state": "open"
+}

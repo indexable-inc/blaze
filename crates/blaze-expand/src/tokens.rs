@@ -334,6 +334,82 @@ impl Sink for AVec<'_, u8> {
     }
 }
 
+/// The bytes a [`Buffered`] holds before it feeds its hasher: four BLAKE3 chunks.
+const BUFFERED: usize = 4 * blaze_ids::b3::CHUNK_LEN;
+
+/// A [`Sink`] that feeds a [`blaze_ids::Hasher`] in runs of up to [`BUFFERED`] bytes. A
+/// stream's canonical bytes ([`TokenStream::encode`]) are four or five tiny puts a token, and
+/// each `Hasher::update` pays the meter's two thread-local adds (blaze-ids `hashed`, D169) and
+/// the hasher's own buffering; here a put is a copy onto the stack. The held bytes are fed when
+/// the buffer is dropped, which the borrow of the hasher makes happen before the hasher can be
+/// used again, so none is ever left out of its digest. The digest is the one the hasher fed the
+/// puts itself gives: BLAKE3 hashes a stream by its bytes, not by how its updates cut it
+/// (`buffered_encode_is_encode`). What key.rs and def.rs hash a stream's bytes through.
+pub(crate) struct Buffered<'h> {
+    hasher: &'h mut blaze_ids::Hasher,
+    /// `held[..len]` wait to be fed.
+    held: [u8; BUFFERED],
+    len: usize,
+}
+
+impl<'h> Buffered<'h> {
+    /// A buffer in front of `hasher`, fed when dropped.
+    pub(crate) fn new(hasher: &'h mut blaze_ids::Hasher) -> Buffered<'h> {
+        Buffered { hasher, held: [0; BUFFERED], len: 0 }
+    }
+
+    fn feed(&mut self) {
+        if self.len > 0 {
+            self.hasher.update(&self.held[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
+impl Sink for Buffered<'_> {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        let room = BUFFERED - self.len;
+        if bytes.len() <= room {
+            self.held[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            return;
+        }
+        // Fill the held bytes to a whole feed, then feed what is left of `bytes` straight from
+        // them when it is a feed or more (a long literal: no copy), else hold it.
+        let (first, rest) = bytes.split_at(room);
+        self.held[self.len..].copy_from_slice(first);
+        self.len = BUFFERED;
+        self.feed();
+        if rest.len() >= BUFFERED {
+            self.hasher.update(rest);
+        } else {
+            self.held[..rest.len()].copy_from_slice(rest);
+            self.len = rest.len();
+        }
+    }
+}
+
+impl Drop for Buffered<'_> {
+    fn drop(&mut self) {
+        self.feed();
+    }
+}
+
+/// A text that is one whole `str`: what a stream's text table is made of. Made only from a
+/// `&str` ([`WholeText::of`], and so [`TokenStream::whole_at`]), so holding one is the proof;
+/// [`TokenStream::push_whole`], the one way a token's text enters a table, takes it. So the
+/// whole table is one `str` and a token's text reads back with no second UTF-8 check
+/// ([`TokenStream::text_of`], rule 74).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WholeText<'t>(&'t str);
+
+impl<'t> WholeText<'t> {
+    pub(crate) fn of(text: &'t str) -> WholeText<'t> {
+        WholeText(text)
+    }
+}
+
 /// A flat token stream: tokens, their text and their contexts, in the allocator it was made in.
 #[derive(Clone, Debug)]
 pub struct TokenStream<'a> {
@@ -371,9 +447,24 @@ impl<'a> TokenStream<'a> {
         &self.text
     }
 
-    /// A token's text.
+    /// A token's text: the table read as the one `str` it is, with no UTF-8 check, and cut at
+    /// the token's range, which is checked to be inside it and on character boundaries (a
+    /// [`Token`] is plain data: one made by hand, or another stream's, is refused with a panic,
+    /// never read off a character).
     pub fn text_of(&self, token: &Token) -> &str {
-        token.text.of(&self.text)
+        // SAFETY: `self.text` is always one whole UTF-8 `str`. It is private to this module
+        // and changes only so: `push_bytes` (private; its one caller is `push_whole`, which
+        // takes a `WholeText`, made only from a `&str`) and `push_joined` (two `&str`s through
+        // `push_text`) append whole `str`s; `truncate` cuts only at a character's start (it
+        // asserts so) or past the end; `clear` empties it; `new_in` starts it empty and
+        // `clone_in` copies another stream's table, itself one `str`. Nothing else in this
+        // crate or outside it reaches the field. A whole `str` cut at character boundaries is
+        // a whole `str`, and `str` indexing below checks both bounds and boundaries.
+        let table = unsafe { core::str::from_utf8_unchecked(&self.text) };
+        let (at, len) = (token.text.at as usize, token.text.len as usize);
+        table
+            .get(at..at + len)
+            .expect("a token's text is a range of its own stream's table, on character boundaries")
     }
 
     /// The text of the token at `at`.
@@ -452,9 +543,10 @@ impl<'a> TokenStream<'a> {
         out.put(&index(self.tokens.len()).to_be_bytes());
         for token in &self.tokens {
             token.kind.encode(out);
-            let text = self.text_of(token);
-            out.put(&index(text.len()).to_be_bytes());
-            out.put(text.as_bytes());
+            // The text's bytes, as `text_of(token).as_bytes()` are: no `str` is needed here.
+            let (at, len) = (token.text.at as usize, token.text.len as usize);
+            out.put(&token.text.len.to_be_bytes());
+            out.put(&self.text[at..at + len]);
             out.put(&token.ctx.0.to_be_bytes());
         }
         out.put(&index(self.contexts.len()).to_be_bytes());
@@ -491,13 +583,19 @@ impl<'a> TokenStream<'a> {
 
     /// Appends a token of `kind`, `text` and `ctx`, a context of this stream.
     pub fn push(&mut self, kind: TokenKind, text: &str, ctx: Ctx) -> Result<(), StreamError> {
-        self.push_bytes(kind, text.as_bytes(), ctx)
+        self.push_whole(kind, WholeText::of(text), ctx)
     }
 
-    /// [`TokenStream::push`] of text given as bytes: a `&str`'s, or a whole token's text of a
-    /// stream ([`TokenStream::bytes_at`]), so the table holds only whole `&str`s. A copy of a
-    /// token reads and writes its text so, with no UTF-8 check.
-    pub(crate) fn push_bytes(
+    /// [`TokenStream::push`] of a text proved a whole `str` ([`WholeText`]): a copy of a token
+    /// reads and writes its text so, with no UTF-8 check. Every token's text enters a table
+    /// through here (or [`TokenStream::push_joined`]).
+    pub(crate) fn push_whole(&mut self, kind: TokenKind, text: WholeText<'_>, ctx: Ctx) -> Result<(), StreamError> {
+        self.push_bytes(kind, text.0.as_bytes(), ctx)
+    }
+
+    /// [`TokenStream::push_whole`]'s body, of the text's bytes. Private, with that one caller:
+    /// `text` is always a whole `str`'s bytes, which [`TokenStream::text_of`] relies on.
+    fn push_bytes(
         &mut self,
         kind: TokenKind,
         text: &[u8],
@@ -525,6 +623,11 @@ impl<'a> TokenStream<'a> {
     pub(crate) fn bytes_at(&self, at: usize) -> &[u8] {
         let text = self.tokens[at].text;
         &self.text[text.at as usize..text.at as usize + text.len as usize]
+    }
+
+    /// The text of the token at `at` as a [`WholeText`], for a copy ([`TokenStream::push_whole`]).
+    pub(crate) fn whole_at(&self, at: usize) -> WholeText<'_> {
+        WholeText::of(self.text_at(at))
     }
 
     /// Room for `tokens` more tokens and `text` more bytes of text.
@@ -628,7 +731,7 @@ impl<'a> TokenStream<'a> {
     ) -> Result<(), StreamError> {
         let token = from.tokens[at];
         let ctx = self.import_ctx(from, token.ctx)?;
-        self.push(token.kind, from.text_of(&token), ctx)
+        self.push_whole(token.kind, from.whole_at(at), ctx)
     }
 
     /// The tokens `range` of this stream, as a stream of their own in `alloc`.
@@ -684,6 +787,13 @@ impl<'a> TokenStream<'a> {
         if mark.tokens >= self.tokens.len() {
             return;
         }
+        // The table stays one whole `str` ([`TokenStream::text_of`] reads it unchecked): it is
+        // cut only at a character's start or past its end. A mark of this stream, taken between
+        // pushes, always is; a byte of 0b10xx_xxxx is inside a character.
+        assert!(
+            self.text.get(mark.text).is_none_or(|&byte| byte & 0xC0 != 0x80),
+            "a token stream is cut back only to a mark of its own (`TokenStream::mark`), taken between pushes"
+        );
         self.tokens.truncate(mark.tokens);
         self.text.truncate(mark.text);
         self.contexts.truncate(mark.contexts);
@@ -976,6 +1086,73 @@ pub fn lex_inside<'a>(
     Ok(whole.copy_in(1..whole.len() - 1, alloc)?)
 }
 
+/// [`lex`] of a text an expansion wrote, its tokens given back their hygiene: each token whose
+/// byte offset in `text` has a mark in `mark_at` (the text's origin column, blaze-scope
+/// `TextMarks` or a lowered body's marks) is in a context of that mark
+/// ([`crate::origin_column::TextMark::as_outer_mark`]), and a marked `$` touching `crate` is one
+/// `$crate` identifier, as the expansion made it (the column starts a `$crate` row at its `$`:
+/// blaze-lower `mark_site::column_of_copy`). A token with no mark is as [`lex`] makes it: written
+/// at the call, its `$` and `crate` stay two tokens, as rustc lexes a `$crate` written outside a
+/// macro.
+///
+/// The Reference, "Macros By Example", "Hygiene": `$crate` "refers to the crate defining the
+/// macro" the token came from, wherever the token is passed on. The one reader of an item
+/// text's tokens as a macro's input: a call written in the text of an item a macro wrote
+/// (tracing 0.1.44's `event!` writes `static __CALLSITE: $crate::callsite::DefaultCallsite =
+/// $crate::callsite2! { .., kind: $crate::metadata::Kind::EVENT, level: $crate::Level::DEBUG,
+/// .. }` inside a fn body; lexed without its marks, `kind: $kind:expr` met `$` and the call
+/// failed with "Binding: `expected expression`": tempo t1500, tempo-payload-types
+/// `ValidationLatencyEstimator::observe`).
+pub fn lex_marked<'a>(
+    text: &str,
+    edition: Edition,
+    mark_at: &dyn Fn(u32) -> Option<crate::origin_column::TextMark>,
+    alloc: Alloc<'a>,
+) -> Result<TokenStream<'a>, LexError> {
+    let mut places: AVec<'a, (u32, u32)> = AVec::new_in(alloc);
+    let lexed = lex_placed(text, edition, alloc, Some(&mut places))?;
+    let tokens = lexed.tokens();
+    // One place per token, always (`place_new`): fewer is a lexer this function does not know.
+    if places.len() != tokens.len() {
+        return Err(LexError::Refused { edition });
+    }
+    let mut out = TokenStream::new_in(alloc);
+    out.reserve(tokens.len(), lexed.text_table().len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        let (start, end) = places[i];
+        let mark = mark_at(start);
+        let ctx = match mark {
+            None => token.ctx,
+            Some(mark) => out.context(CtxNode { parent: token.ctx, mark: mark.as_outer_mark() })?,
+        };
+        // A marked `$` whose next token is a plain `crate` starting where it ends.
+        let crate_after = match (token.kind, mark, tokens.get(i + 1), places.get(i + 1)) {
+            (TokenKind::Punct { char: '$', .. }, Some(_), Some(next), Some(&(next_start, _)))
+                if next_start == end && lexed.text_of(next) == "crate" =>
+            {
+                match next.kind {
+                    TokenKind::Ident { raw: Raw::No, spacing } => Some(spacing),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match crate_after {
+            Some(spacing) => {
+                out.push(TokenKind::Ident { raw: Raw::No, spacing }, "$crate", ctx)?;
+                i += 2;
+            }
+            None => {
+                out.push_whole(token.kind, lexed.whole_at(i), ctx)?;
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The last identifier or literal pushed, and where its text ends: it is joint with the next
 /// token if that one starts there.
 type Pending = Option<(usize, usize)>;
@@ -1026,4 +1203,287 @@ fn fields_are_portable() {
     portable::<char>();
     portable::<u32>();
     portable::<[u8]>();
+}
+
+#[cfg(test)]
+mod text_tests {
+    extern crate std;
+
+    use blaze_ids::{ContentId, Hasher};
+    use blaze_sim::{Config, Tape};
+
+    use super::*;
+
+    /// Texts of one to four bytes a character, a long one past a [`Buffered`] feed among them.
+    const PIECES: [&str; 6] = ["a", "é", "日本", "🦀", "r#x", ""];
+
+    /// A drawn stream: idents, punctuation, groups and literals whose texts are drawn pieces
+    /// (some longer than a feed), each pushed text kept beside it, then copied token by token
+    /// ([`TokenStream::push_from`]) into a second stream.
+    fn drawn<'a>(tape: &Tape, alloc: Alloc<'a>, texts: &mut AVec<'a, AVec<'a, u8>>) -> TokenStream<'a> {
+        let ctx = Ctx::root(Edition::ALL[tape.index(Edition::ALL.len(), "edition")]);
+        let mut stream = TokenStream::new_in(alloc);
+        let count = tape.index(if cfg!(miri) { 12 } else { 300 }, "tokens");
+        for _ in 0..count {
+            let mut text = AVec::new_in(alloc);
+            let pieces = match tape.one_in(40, "long") {
+                true => BUFFERED / 2 + tape.index(BUFFERED, "long pieces"),
+                false => tape.index(6, "pieces"),
+            };
+            for _ in 0..pieces {
+                text.extend_from_slice(PIECES[tape.index(PIECES.len(), "piece")].as_bytes());
+            }
+            let as_str = core::str::from_utf8(&text).expect("pieces are whole `str`s");
+            let pushed = match tape.below(4, "kind") {
+                0 => stream.push(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, as_str, ctx).map(|()| as_str),
+                1 => stream.punct('+', Spacing::Joint, ctx).map(|()| ""),
+                2 => stream.literal(LitKind::Str, as_str, 0, ctx).map(|()| as_str),
+                _ => stream.open(Delim::Paren, ctx).map(|()| ""),
+            }
+            .expect("a drawn stream is small");
+            texts.push(AVec::from_slice_in(pushed.as_bytes(), alloc));
+        }
+        stream
+    }
+
+    /// A drawn text of up to five pieces.
+    fn piece_text<'a>(tape: &Tape, alloc: Alloc<'a>) -> AVec<'a, u8> {
+        let mut text = AVec::new_in(alloc);
+        for _ in 0..tape.index(6, "pieces") {
+            text.extend_from_slice(PIECES[tape.index(PIECES.len(), "piece")].as_bytes());
+        }
+        text
+    }
+
+    /// The whole text table is one `str`, and every token reads back the text it was pushed
+    /// with.
+    fn reads_back(stream: &TokenStream<'_>, want: &[AVec<'_, u8>], step: &str) {
+        assert!(core::str::from_utf8(stream.text_table()).is_ok(), "after {step}: the text table is not one `str`");
+        assert_eq!(stream.len(), want.len(), "after {step}: the token count");
+        for (at, text) in want.iter().enumerate() {
+            assert_eq!(stream.text_at(at).as_bytes(), &text[..], "after {step}: token {at}");
+        }
+    }
+
+    /// The ways a token's text enters a table, as [`every_push_path_keeps_the_table_one_str`]
+    /// draws them; it also cuts back to marks and clears.
+    const PATHS: [&str; 12] = [
+        "push", "ident", "punct", "literal", "open or close", "push_whole of a &str",
+        "push_whole of whole_at", "push_joined", "push_from", "mark", "truncate", "clear",
+    ];
+
+    /// No way in puts anything but UTF-8 into a stream's text table, so
+    /// [`TokenStream::text_of`] reads it unchecked. Drawn steps through every push path
+    /// ([`PATHS`]: the public `push`, `ident`, `punct`, `literal`, `open`, `close` and
+    /// `push_from`, and the crate's `push_whole` of a `&str` and of another stream's
+    /// `whole_at`, and `push_joined`), with cuts back to marks and clears between them; then the
+    /// stream copied ([`TokenStream::copy_in`], [`TokenStream::clone_in`]) and written to an
+    /// atom table and read back ([`TokenStream::from_rows`], and [`Atoms::extend_rows`] of a
+    /// table regained through [`crate::atoms::Checked::atoms`]). After each, the whole table is
+    /// UTF-8 and every token reads back its text.
+    ///
+    /// The other half, that nothing else writes a table, is the code's shape, not a test: this
+    /// crate runs no doctests (`doctest = false`), so no `compile_fail` example shows it. The
+    /// table is a private field of [`TokenStream`]; `push_bytes` is private to this module with
+    /// the one caller `push_whole`; and a [`WholeText`] holds a `&str`, made only by
+    /// [`WholeText::of`].
+    #[test]
+    fn every_push_path_keeps_the_table_one_str() {
+        use crate::atoms::{Atoms, AtomsBuilder};
+
+        blaze_sim::check(Config::cases(if cfg!(miri) { 4 } else { 128 }), |tape| {
+            let alloc = blaze_own::testing::heap().alloc();
+            let ctx = Ctx::root(Edition::ALL[tape.index(Edition::ALL.len(), "edition")]);
+            // A second stream, to copy tokens from.
+            let mut other_texts = AVec::new_in(alloc);
+            let other = drawn(tape, alloc, &mut other_texts);
+            let mut stream = TokenStream::new_in(alloc);
+            // What each token of `stream` reads back, kept beside it.
+            let mut want: AVec<'_, AVec<'_, u8>> = AVec::new_in(alloc);
+            // Marks taken and not yet cut below, each with the token count then.
+            let mut marks: AVec<'_, (StreamMark, usize)> = AVec::new_in(alloc);
+            let ident = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
+            for _ in 0..tape.index(if cfg!(miri) { 16 } else { 120 }, "steps") {
+                let drawn_text = piece_text(tape, alloc);
+                let text = core::str::from_utf8(&drawn_text).expect("pieces are whole `str`s");
+                let path = tape.index(PATHS.len(), "path");
+                let small = "a drawn stream is small";
+                match path {
+                    0 => {
+                        stream.push(ident, text, ctx).expect(small);
+                        want.push(AVec::from_slice_in(text.as_bytes(), alloc));
+                    }
+                    1 => {
+                        stream.ident(text, ctx).expect(small);
+                        want.push(AVec::from_slice_in(text.strip_prefix("r#").unwrap_or(text).as_bytes(), alloc));
+                    }
+                    2 => {
+                        stream.punct('+', Spacing::Joint, ctx).expect(small);
+                        want.push(AVec::new_in(alloc));
+                    }
+                    3 => {
+                        stream.literal(LitKind::Str, text, 0, ctx).expect(small);
+                        want.push(AVec::from_slice_in(text.as_bytes(), alloc));
+                    }
+                    4 => {
+                        let pushed = match tape.coin("open") {
+                            true => stream.open(Delim::Paren, ctx),
+                            false => stream.close(Delim::Paren, ctx),
+                        };
+                        pushed.expect(small);
+                        want.push(AVec::new_in(alloc));
+                    }
+                    5 => {
+                        stream.push_whole(ident, WholeText::of(text), ctx).expect(small);
+                        want.push(AVec::from_slice_in(text.as_bytes(), alloc));
+                    }
+                    6 | 8 if other.is_empty() => continue,
+                    6 => {
+                        let at = tape.index(other.len(), "copied");
+                        stream.push_whole(other.tokens()[at].kind, other.whole_at(at), ctx).expect(small);
+                        want.push(AVec::from_slice_in(&other_texts[at][..], alloc));
+                    }
+                    7 => {
+                        let tail_text = piece_text(tape, alloc);
+                        let tail = core::str::from_utf8(&tail_text).expect("pieces are whole `str`s");
+                        let suffix_len = u32::try_from(tail.len()).expect("a drawn suffix is small");
+                        let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len, spacing: Spacing::Alone };
+                        stream.push_joined(kind, text, tail, ctx).expect(small);
+                        let mut joined = AVec::from_slice_in(text.as_bytes(), alloc);
+                        joined.extend_from_slice(tail.as_bytes());
+                        want.push(joined);
+                    }
+                    8 => {
+                        let at = tape.index(other.len(), "copied");
+                        stream.push_from(&other, at).expect(small);
+                        want.push(AVec::from_slice_in(&other_texts[at][..], alloc));
+                    }
+                    9 => marks.push((stream.mark(), want.len())),
+                    10 if marks.is_empty() => continue,
+                    10 => {
+                        let back = tape.index(marks.len(), "mark");
+                        let (mark, len) = marks[back];
+                        stream.truncate(mark);
+                        want.truncate(len);
+                        // The marks taken after it are past the end now: dropped, as a caller's are.
+                        marks.truncate(back + 1);
+                    }
+                    _ => {
+                        stream.clear();
+                        want.clear();
+                        marks.clear();
+                    }
+                }
+                reads_back(&stream, &want, PATHS[path]);
+            }
+
+            let copy = stream.copy_in(0..stream.len(), alloc).expect("a drawn stream is small");
+            reads_back(&copy, &want, "copy_in");
+            reads_back(&stream.clone_in(alloc), &want, "clone_in");
+
+            let mut builder = AtomsBuilder::new_in(alloc, tape.below(u64::MAX, "seed"));
+            let mut interned = AVec::new_in(alloc);
+            builder.intern_stream(&stream, &mut interned).expect("a drawn stream is small");
+            let built = builder.finish();
+            let mut rows = AVec::new_in(alloc);
+            built.rows(&interned, &mut rows);
+            let atoms = Atoms::of(&built.atoms, &built.text).expect("a written atom table is one");
+            let back = TokenStream::from_rows(&atoms, &rows, ctx, alloc).expect("a table's own rows");
+            reads_back(&back, &want, "from_rows");
+            let proof = atoms.checked();
+            // SAFETY: `built.atoms` and `built.text` are the very bytes `Atoms::of` proved just
+            // above, and nothing has written them since (`built` is not borrowed mutably).
+            let again = unsafe { proof.atoms(&built.atoms, &built.text) }.expect("the proved lengths");
+            let mut grown = stream.clone_in(alloc);
+            again.extend_rows(&mut grown, &rows, |_| ctx).expect("a table's own rows");
+            let mut twice: AVec<'_, AVec<'_, u8>> = AVec::new_in(alloc);
+            for text in want.iter().chain(want.iter()) {
+                twice.push(AVec::from_slice_in(&text[..], alloc));
+            }
+            reads_back(&grown, &twice, "extend_rows of a regained table");
+        });
+    }
+
+    /// A cut inside a character is refused: the table stays one `str`. A mark is only ever
+    /// taken between pushes, so this one is made by hand, its text cut one byte into `é`.
+    #[test]
+    #[should_panic(expected = "a token stream is cut back only to a mark of its own")]
+    fn a_cut_inside_a_character_is_refused() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let ctx = Ctx::root(Edition::E2021);
+        let mut stream = TokenStream::new_in(alloc);
+        stream.push(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, "é", ctx).expect("one token");
+        stream.truncate(StreamMark { tokens: 0, text: 1, contexts: 0 });
+    }
+
+    /// Every token's text reads back as the `str` pushed; a stream copied token by
+    /// token is equal and reads back the same; and its canonical bytes hash to one digest fed
+    /// to a hasher directly, through a [`Buffered`], or written out first.
+    #[test]
+    fn buffered_encode_is_encode() {
+        blaze_sim::check(Config::cases(if cfg!(miri) { 4 } else { 128 }), |tape| {
+            let alloc = blaze_own::testing::heap().alloc();
+            let mut texts = AVec::new_in(alloc);
+            let stream = drawn(tape, alloc, &mut texts);
+            for (at, text) in texts.iter().enumerate() {
+                assert_eq!(stream.text_at(at).as_bytes(), &text[..], "token {at}");
+            }
+            let copy = stream.copy_in(0..stream.len(), alloc).expect("a drawn stream is small");
+            assert!(copy == stream, "a copy token by token is the stream");
+            for at in 0..stream.len() {
+                assert_eq!(copy.text_at(at), stream.text_at(at), "copied token {at}");
+            }
+            let mut direct = Hasher::new("blaze v2 expand test 1");
+            stream.encode(&mut direct);
+            let mut buffered = Hasher::new("blaze v2 expand test 1");
+            stream.encode(&mut Buffered::new(&mut buffered));
+            let mut bytes = AVec::new_in(alloc);
+            stream.encode(&mut bytes);
+            let written = ContentId::of("blaze v2 expand test 1", &bytes);
+            assert_eq!(buffered.finish(), direct.finish(), "through a Buffered");
+            assert_eq!(written, direct.finish(), "written out first");
+        });
+    }
+
+    /// Totals a byte either side of 1, 2, 4, 8 and 16 chunks (and on them) put through a
+    /// [`Buffered`] in drawn pieces (a token's few bytes, a block or so, a feed's edges, longer
+    /// than a feed): its digest is the plain streamed one and the one-shot digest of the same
+    /// bytes (blaze-blake3's tree, another path than the hasher's lazily merged stack).
+    #[test]
+    fn buffered_across_chunk_edges_is_one_shot() {
+        let chunk = blaze_ids::b3::CHUNK_LEN;
+        let data: std::vec::Vec<u8> = (0..16 * chunk + 1).map(|n: usize| n.wrapping_mul(131).to_le_bytes()[0]).collect();
+        let mut totals = std::vec::Vec::new();
+        for chunks in [1, 2, 4, 8, 16] {
+            totals.extend([chunks * chunk - 1, chunks * chunk, chunks * chunk + 1]);
+        }
+        if cfg!(miri) {
+            totals.retain(|&total| total <= 3 * chunk);
+        }
+        blaze_sim::check(Config::cases(if cfg!(miri) { 4 } else { 64 }), |tape| {
+            let total = totals[tape.index(totals.len(), "total")];
+            let mut direct = Hasher::new("blaze v2 expand test 1");
+            let mut buffered = Hasher::new("blaze v2 expand test 1");
+            {
+                let mut sink = Buffered::new(&mut buffered);
+                let mut at = 0;
+                while at < total {
+                    let take = match tape.below(4, "piece kind") {
+                        0 => tape.index(9, "a token's"),
+                        1 => tape.index(200, "a block or so"),
+                        2 => BUFFERED - 1 + tape.index(3, "a feed's edge"),
+                        _ => tape.index(3 * BUFFERED, "any"),
+                    }
+                    .min(total - at);
+                    direct.update(&data[at..at + take]);
+                    sink.put(&data[at..at + take]);
+                    at += take;
+                }
+                // Dropped here: the held bytes are fed.
+            }
+            let want = ContentId::of("blaze v2 expand test 1", &data[..total]);
+            assert_eq!(direct.finish(), want, "{total} B, streamed against one shot");
+            assert_eq!(buffered.finish(), want, "{total} B, through a Buffered against one shot");
+        });
+    }
 }

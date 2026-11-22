@@ -14,7 +14,14 @@ use super::*;
 /// The agent view of `check` (plain lines, the same bytes for the same tree), and its output.
 fn agent(io: &Io) -> (Checked, std::string::String) {
     let before = stdout(io).len();
-    let checked = ask_view::<fix::Atomic>(io, (Command::Check, "check"), work::Sizes::USUAL, View::Agent, None).expect("the request answers");
+    let checked = check_view::<fix::Atomic>(io, View::Agent, None);
+    (checked, stdout(io)[before..].to_owned())
+}
+
+/// [`agent`] with `--each`: every body not checked drawn on a line of its own.
+fn agent_each(io: &Io) -> (Checked, std::string::String) {
+    let before = stdout(io).len();
+    let checked = check_each(io, View::Agent);
     (checked, stdout(io)[before..].to_owned())
 }
 
@@ -39,15 +46,20 @@ fn workspace(seed: u64) -> Io {
     io
 }
 
-/// Each root is printed once, after the real error, which keeps its place (`d/src/lib.rs:1:12`):
-/// the file that is not UTF-8, an ERROR of the user's at that file (work.rs `FILE_NOT_TEXT`,
-/// never a failure: a file blaze cannot read as text is the user's to fix), and `a`'s names,
-/// which could not read it, a failure; under `a`'s: "2 crates .. not checked because of it ..:
-/// `b`, `c`", the crates that waited on it (through its fork's base: blaze-drive
-/// `Request::base_of`); no "which failed" line; the closing line counts one failure beside the
-/// two errors; the status is 1. A no-op repeat prints the same bytes.
+/// Each root is printed once, and the real error keeps its place (`d/src/lib.rs:1:12`): the
+/// file that is not UTF-8, an ERROR of the user's at that file (work.rs `FILE_NOT_TEXT`, never
+/// a failure: a file blaze cannot read as text is the user's to fix), its subject the FILE
+/// (`a/src/lib.rs`, said once, never its task's name), and `a`'s names, which could not read it,
+/// a failure. The bodies of `b` and `c`, whose check scopes hold `a`, are not checked under that
+/// one cause: ONE line counts them and names them ("4 bodies not checked because its member's
+/// check scope holds `a` ..: `g` (b/src/lib.rs), .., `h` (c/src/lib.rs)"), never a note a body
+/// (engine_lines.rs `grouped_lines`, as a refused call's bodies are). AS RECORDS (D164): four
+/// noted findings, the plan's refusal, their subjects the four bodies, one group of four; `--each`
+/// prints each one's words. No "which failed" line; no other error; the closing line counts one
+/// failure beside the two errors, and the summary the 4 items; the status is 1. A no-op repeat
+/// prints the same bytes.
 ///
-/// Prints `roots: <the output>`.
+/// Prints `roots: <the output>` and `roots, each: <the output>`.
 #[test]
 fn a_failed_task_is_one_failure_with_its_crates_counted() {
     let io = workspace(71);
@@ -58,41 +70,67 @@ fn a_failed_task_is_one_failure_with_its_crates_counted() {
     // Two roots, each once: the file's items, and `a`'s names, which read that file.
     let roots: std::vec::Vec<usize> = (0..lines.len()).filter(|&at| lines[at].contains("error[task-failed]") || lines[at].contains("error[file-not-text]")).collect();
     assert_eq!(roots.len(), 2, "each root once:\n{out}");
-    let not_text = lines.iter().filter(|line| line.contains("error[file-not-text]")).count();
-    assert_eq!(not_text, 1, "the file that is not UTF-8 is an error of its own, once:\n{out}");
+    let not_text: std::vec::Vec<&&str> = lines.iter().filter(|line| line.contains("error[file-not-text]")).collect();
+    assert_eq!(not_text.len(), 1, "the file that is not UTF-8 is an error of its own, once:\n{out}");
+    // Its subject is the file, said once; never its task's name.
+    assert!(not_text[0].contains("a/src/lib.rs") && not_text[0].matches("a/src/lib.rs").count() == 1, "the file named once as the finding's subject:\n{out}");
+    assert!(!not_text[0].contains("FileItems("), "the subject is the file, not its task's name:\n{out}");
     assert!(!out.contains("` failed: "), "every cause is a root printed:\n{out}");
-    let scope = roots.iter().copied().find(|&at| lines[at].contains("crate `a`")).unwrap_or_else(|| panic!("`a`'s names failed:\n{out}"));
-    let under = lines.get(scope + 1).copied().unwrap_or("");
-    assert!(under.contains("2 crates") && under.contains("not checked because of it") && under.ends_with(": `b`, `c`"), "the crates under `a`'s failure:\n{out}");
-    let real = lines.iter().position(|line| line.contains("error[unresolved]") && line.contains("d/src/lib.rs:1:12")).unwrap_or_else(|| panic!("the real error with its place:\n{out}"));
-    assert!(roots.iter().all(|&at| real < at), "the failures last:\n{out}");
+    assert!(roots.iter().any(|&at| lines[at].contains("error[task-failed]") && lines[at].contains("crate `a`")), "`a`'s names failed:\n{out}");
+    // No other error: the two roots and the real one, which keeps its place.
+    assert!(lines.iter().any(|line| line.contains("error[unresolved]") && line.contains("d/src/lib.rs:1:12")), "the real error with its place:\n{out}");
+    assert_eq!(lines.iter().filter(|line| line.contains("error[")).count(), 3, "no error but the two roots and the real one:\n{out}");
+    // The bodies under `a`'s failure: one line, counting and naming them, with the crates
+    // they are of (`b`, `c`), never a note a body.
+    assert!(!out.contains("the body of `"), "no note a body under one cause:\n{out}");
+    let under: std::vec::Vec<&&str> = lines.iter().filter(|line| line.contains("not checked because") && line.contains("holds `a`")).collect();
+    assert_eq!(under.len(), 1, "one line for the bodies under `a`'s failure:\n{out}");
+    assert!(under[0].contains("4 bodies"), "the line counts the bodies:\n{out}");
+    for body in ["`g` (b/src/lib.rs)", "`h` (b/src/lib.rs)", "`g` (c/src/lib.rs)", "`h` (c/src/lib.rs)"] {
+        assert!(under[0].contains(body), "{body} named under `a`'s failure:\n{out}");
+    }
     assert_eq!((first.errors, first.failures), (2, 1), "a waited task is no error, a file not text an error, a failed task a failure:\n{out}");
-    // The closing line, then only the summary, which counts the items under the failure's line
-    // (not_checked/items.rs `summary`): it never reads better than the lines above it.
+    // The closing line, then only the summary, which counts the items not checked.
     let closing = lines.iter().position(|line| line.starts_with("1 failure, 2 errors")).unwrap_or_else(|| panic!("the closing line:\n{out}"));
-    let items_of = |line: &str| {
-        let words: std::vec::Vec<&str> = line.split([' ', ',']).collect();
-        words.windows(2).find(|pair| pair[1] == "items" || pair[1] == "item").map_or(0, |pair| pair[0].parse::<u32>().expect("a count"))
-    };
-    let counted: std::vec::Vec<u32> = lines.iter().filter(|line| line.contains("not checked because of it")).map(|line| items_of(line)).filter(|n| *n > 0).collect();
-    let (n, failures) = (counted.iter().sum::<u32>(), counted.len());
-    match (n, &lines[closing + 1..]) {
-        (0, after) => assert!(after.is_empty(), "no item under a failure, no summary:\n{out}"),
-        (n, [summary]) => {
-            let plural = if failures == 1 { "failure" } else { "failures" };
-            assert!(summary.contains("the check is incomplete") && summary.contains(&format!(": {n} behind {failures} {plural}")), "the summary counts the {n} items under the failures:\n{out}");
-        }
-        (_, _) => panic!("one summary line after the closing line:\n{out}"),
+    match &lines[closing + 1..] {
+        [summary] => assert!(summary.contains("the check is incomplete") && summary.contains("blaze could not check 4 items"), "the summary counts the 4 bodies:\n{out}"),
+        _ => panic!("one summary line after the closing line:\n{out}"),
     }
     assert_eq!(first.status, Some(1), "{out}");
     let (again, repeat) = agent(&io);
     assert_eq!(repeat, out, "a no-op check prints the same bytes as the first:\n{}", again.profile);
+    // The records (D164): a noted finding a body, each the plan's refusal under `a`'s failure,
+    // a grouped kind, its subject the body (its file and item), never a task; the default
+    // view's one line is the query's one group, of the four.
+    let noted = super::world_run::noted(&io);
+    let under_a: std::vec::Vec<&super::world_run::Noted> = noted.iter().filter(|one| one.of.contains("holds `a`")).collect();
+    assert!(
+        under_a.iter().all(|one| one.cause == blaze_report::finding::CauseKind::PlanRefused && one.kind == blaze_report::frame::words::Kind::Grouped),
+        "each body under `a`'s failure is the plan's refusal, grouped: {under_a:?}"
+    );
+    let mut bodies: std::vec::Vec<(&str, &str)> = under_a.iter().map(|one| (one.file.as_str(), one.item.as_str())).collect();
+    bodies.sort_unstable();
+    bodies.dedup();
+    assert_eq!(bodies, [("b/src/lib.rs", "g"), ("b/src/lib.rs", "h"), ("c/src/lib.rs", "g"), ("c/src/lib.rs", "h")], "the four bodies are the subjects: {noted:?}");
+    let groups: std::vec::Vec<usize> = super::world_run::groups(&noted).into_iter().filter(|(of, _)| of.contains("holds `a`")).map(|(_, count)| count).collect();
+    assert_eq!(groups, [4], "one group of four under `a`'s failure: {noted:?}");
+    // `--each` is a query too: a line a finding, each its own words (one of them as a
+    // snapshot of the renderer).
+    let (_, each) = agent_each(&io);
+    println!("roots, each: {each}");
+    for one in &under_a {
+        assert!(each.lines().any(|line| line.contains(one.words.as_str())), "{one:?} under --each:\n{each}");
+    }
+    assert!(each.lines().any(|line| line.contains("`b/src/lib.rs`: body `g`: not checked because ")), "the --each form:\n{each}");
 }
 
 /// A name a refused macro call may have made is no error: the call's own error is printed, and
 /// the item that names it is not checked, counted under one line that names the call and why it
 /// was refused ("not checked because the call of `make` failed: no rule of the macro's 1
-/// matched; ..: `here` (..), `there` (..)"), never an error that the name is unknown.
+/// matched; ..: `here` (..), `there` (..)"), never an error that the name is unknown. The call's
+/// failure is said ONCE on that line (the engine said it twice a body before 2026-11-19: once as
+/// the cause and again after the unknown name). AS RECORDS (D164): a noted finding a body, its
+/// cause the refused call, the call's failure once in its key, one group of the two.
 ///
 /// Prints `refused: <the output>`.
 #[test]
@@ -109,8 +147,23 @@ fn a_name_after_a_refused_macro_call_is_counted_under_the_call() {
     let cause = out.lines().find(|line| line.contains("not checked because the call of `make` (function-like) in src/lib.rs failed: ")).unwrap_or_else(|| panic!("the cause line names the call:\n{out}"));
     assert!(cause.contains("matched") && cause.contains("`here`") && cause.contains("`there`"), "the reason and both items under the call:\n{out}");
     assert_eq!(out.lines().filter(|line| line.contains("not checked because")).count(), 1, "one cause line:\n{out}");
+    assert_eq!(cause.matches("no rule of the macro's 1 matched").count(), 1, "the call's failure said once:\n{out}");
+    assert!(out.contains("blaze could not check 2 items"), "both bodies counted, once each:\n{out}");
     let (_, repeat) = agent(&io);
     assert_eq!(repeat, out, "the same bytes again");
+    // The records (D164): a noted finding a body under the call, its cause the refused call
+    // (the call's failure once, in its key), its subject the body; one group of the two.
+    let noted = super::world_run::noted(&io);
+    let under: std::vec::Vec<&super::world_run::Noted> = noted.iter().filter(|one| one.cause == blaze_report::finding::CauseKind::RefusedCall).collect();
+    let mut items: std::vec::Vec<&str> = under.iter().map(|one| one.item.as_str()).collect();
+    items.sort_unstable();
+    items.dedup();
+    assert_eq!(items, ["here", "there"], "both bodies are under the call: {noted:?}");
+    assert!(
+        under.iter().all(|one| one.of.starts_with("the call of `make` (function-like) in src/lib.rs failed: ") && one.of.matches("no rule of the macro's 1 matched").count() == 1),
+        "each cause is the call and its failure, once: {under:?}"
+    );
+    assert_eq!(super::world_run::groups(&noted).into_iter().map(|(_, count)| count).collect::<std::vec::Vec<usize>>(), [2], "one group, of the two: {noted:?}");
 }
 
 /// MR (2026-11-17): a call refused for a reason other than a failed match (here an `include!`
@@ -140,6 +193,13 @@ fn a_refused_include_is_named_once_with_its_reason() {
     let causes: std::vec::Vec<&str> = out.lines().filter(|line| line.contains("not checked because the call of `include` (function-like) in src/lib.rs failed: ")).collect();
     assert_eq!(causes.len(), 1, "the call's reason once:\n{out}");
     assert!(causes[0].contains("env!(\"NOPE\")") && causes[0].contains("`here`") && causes[0].contains("`there`"), "the variable named, both items under the call:\n{out}");
+    assert_eq!(causes[0].matches("the variable is not set").count(), 1, "the call's reason said once:\n{out}");
     let (_, repeat) = agent(&io);
     assert_eq!(repeat, out, "the same bytes again");
+    // `--each`: a line a body, each with the call's reason once.
+    let (_, each) = agent_each(&io);
+    println!("refused include, each: {each}");
+    let bodies: std::vec::Vec<&str> = each.lines().filter(|line| line.contains("not checked because the call of `include` (function-like) in src/lib.rs failed: ")).collect();
+    assert_eq!(bodies.len(), 2, "one line a body under --each:\n{each}");
+    assert!(bodies.iter().all(|line| line.matches("the variable is not set").count() == 1 && !line.contains("hold no")), "each with the reason once:\n{each}");
 }

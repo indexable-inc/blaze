@@ -35,6 +35,7 @@ use blaze_own::Alloc;
 use blaze_surface::Range;
 use blaze_typeck::{ItemKey, List, PNode, PTy, PortableTys};
 
+use super::heads_regions::Scope;
 use super::keys::opaque_key;
 use super::preds::Preds;
 use super::source::NamesSource;
@@ -104,7 +105,9 @@ pub(super) struct AliasOpaque {
 /// The bounds of each of `opaques` ([`alias_opaques`]) of alias `alias`, read in the alias's
 /// `env` (whose `anon` is `opaques`, so a bound naming another of the alias's `impl`s reads it
 /// as that opaque), with `sized` the program's `Sized` (the implied bound). The one reading of
-/// an opaque's bounds (preds.rs `impl_bounds`), as a fn's return opaques' are read.
+/// an opaque's bounds (preds.rs `impl_bounds`), as a fn's return opaques' are read. `scope`
+/// names the alias's lifetimes (heads_regions.rs `Scope::item` over the alias's text).
+#[expect(clippy::too_many_arguments, reason = "the alias's parts, each read once by the caller")]
 pub(super) fn alias_opaque_preds<'n, 'a, H: Heads, S: NamesSource<'n>>(
     b: &Builder<'_, H, S>,
     tys: &mut PortableTys<'_>,
@@ -113,13 +116,14 @@ pub(super) fn alias_opaque_preds<'n, 'a, H: Heads, S: NamesSource<'n>>(
     alias: ItemKey,
     opaques: &[(lf::TypeId, PTy)],
     sized: Option<LibKey>,
+    scope: &Scope,
     alloc: Alloc<'a>,
 ) -> Result<Vec<AliasOpaque, Alloc<'a>>, Why> {
     let mut out: Vec<AliasOpaque, Alloc<'a>> = Vec::with_capacity_in(opaques.len(), alloc);
     for (j, &entry) in opaques.iter().enumerate() {
         // `alias_opaques` numbered them below `ALIAS_OPAQUE`.
         let j = j as u32;
-        let mut preds = Preds::new();
+        let mut preds = Preds::new_in(scope.clone());
         b.impl_bounds(tys, env, v, &[entry], sized, &mut preds)?;
         out.push(AliasOpaque { key: opaque_key(alias, j), index: ALIAS_OPAQUE | j, preds });
     }

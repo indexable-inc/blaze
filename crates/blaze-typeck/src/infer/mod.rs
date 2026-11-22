@@ -16,15 +16,18 @@
 //! solver's task cache carries proofs across calls.
 //!
 //! A solver question the cache lacks is pulled (`Pull`, blaze-solve `Source`): the cache reads
-//! it through `Reads` at the step that asked, and the step goes on. Only `ConstHolds` still
-//! stops the solve, filled here and asked again ([`InferCtx::need_rounds`] counts these). A
-//! question the world lacks stops the body with typeck's `Need`, as every read does.
+//! it through `Reads` at the step that asked, and the step goes on, `ConstHolds` too (its
+//! arguments exported through an `Exporter`, the parts of the context the solver does not
+//! hold). No evaluation is asked again from its root for a fact: [`InferCtx::need_rounds`] is 0
+//! but under the test strategy that fills nothing (`stop_for_facts`). A question the world
+//! lacks stops the body with typeck's `Need`, as every read does.
 
 mod facts;
 mod terms;
 
 pub use facts::{FactCache, assoc_def};
 pub use terms::{Terms, def_of, item_key, var_index, var_of_index};
+pub use crate::ty::TyFlags;
 
 use blaze_hash::HashMap;
 use blaze_own::{Alloc, Vec};
@@ -40,7 +43,8 @@ use crate::ty::{FulfillError, FulfillErrorKind, Goal, Normalized, Obligation, Ty
 use crate::world::{Reads, World};
 
 /// The most fact-fill rounds one solver call may take (rule 18): each round fills one question
-/// no earlier round filled, so a world never comes near it.
+/// no earlier round filled, so a world never comes near it. Only the test strategy that fills
+/// nothing mid-step (`stop_for_facts`) takes a round; the pull answers every question in place.
 const MAX_FILLS: u32 = 1 << 16;
 
 /// The real type context of one body's check.
@@ -60,13 +64,8 @@ pub struct InferCtx<'a> {
     errors: Vec<FulfillError, Alloc<'a>>,
     /// The next error `next_error` hands out.
     error_at: usize,
-    closures: HashMap<u128, ClosureRow, Alloc<'a>>,
-    /// Each closure of another body this context made, in the order made (a body names few).
-    foreign: Vec<ForeignClosure, Alloc<'a>>,
-    /// Each async block's future this body made, by its def: its expression.
-    futures: HashMap<u128, ExprId, Alloc<'a>>,
-    /// Each future of another body this context made (`TyView::CoroutineOf`).
-    foreign_coroutines: Vec<ForeignCoroutine, Alloc<'a>>,
+    /// What `view` reads besides the terms and the facts: the body terms' own rows.
+    rows: BodyRows<'a>,
     /// Solver reads (the solver's own log; the body's read list is `Reads`): emptied after each
     /// call, as nothing here reads it (it grew for the whole body before).
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
@@ -75,10 +74,10 @@ pub struct InferCtx<'a> {
     /// How many `Specializes` questions this context is answering for the contexts above it
     /// (each is answered in a context of its own, one deeper): bounded by `MAX_SPEC_DEPTH`.
     spec_depth: u8,
-    /// The first handle a read could not read (`Malformed::Unreadable`): the `TypeCtx` reads
-    /// return no error, so they give the error type and leave this, and the check of the body
-    /// fails with it when it ends (lib.rs `run`, `TypeCtx::take_malformed`; rule 20).
-    malformed: core::cell::Cell<Option<crate::error::Malformed>>,
+    /// The typing mode every solver call of this context runs in, fixed by its constructor
+    /// ([`InferCtx::analysis_in`], [`InferCtx::post_analysis_in`]): what an opaque type is to
+    /// normalization (blaze-solve alias.rs `normalize_opaque_type`).
+    mode: TypingMode,
     /// A planted bug of the body suite; `InferPlant::None` in every other test.
     #[cfg(test)]
     pub(crate) plant: InferPlant,
@@ -113,12 +112,13 @@ pub(crate) enum InferPlant {
 }
 
 /// A closure this body made, by its def: its expression, its signature as typeck made it
-/// (`fn(inputs.., output)`), and its kind variable.
+/// (`fn(inputs.., output)`), its kind variable and its capture-tuple variable.
 #[derive(Clone, Copy, Debug)]
 struct ClosureRow {
     expr: ExprId,
     sig: Ty,
     kind: blaze_ty::Const,
+    upvars: blaze_ty::Ty,
 }
 
 /// A closure of another body as typeck sees it (`TyView::ClosureOf`), by the solver type `mk`
@@ -135,8 +135,8 @@ struct ForeignClosure {
 }
 
 /// An async block's future of another body as typeck sees it (`TyView::CoroutineOf`), by the
-/// solver type `mk` made for it: `view` gives it back (the identity's `args` are not in the
-/// solver's list, so the made term finds them, as `ForeignClosure` does).
+/// solver type `mk` made for it: `view` gives it back. Its solver list is the output,
+/// the interior, then every argument of the owner, including parameters absent from both.
 #[derive(Clone, Copy, Debug)]
 struct ForeignCoroutine {
     /// The solver's term `mk` made for it.
@@ -148,6 +148,57 @@ struct ForeignCoroutine {
     interior: Ty,
 }
 
+/// The body terms' own rows: what typeck's `view` of a solver term reads besides the term
+/// arena (`Terms`) and the facts (`FactCache`: alias names, hidden bodies). One home, apart from
+/// the solver, so a fact the solver asks for mid-step can be read through [`Exporter`] while
+/// the solver holds the rest of the context borrowed (`Pull::fill`, a `where const` condition).
+pub(crate) struct BodyRows<'a> {
+    closures: HashMap<u128, ClosureRow, Alloc<'a>>,
+    /// Each closure of another body this context made, in the order made (a body names few).
+    foreign: Vec<ForeignClosure, Alloc<'a>>,
+    /// Each async block's future this body made, by its def: its expression.
+    futures: HashMap<u128, ExprId, Alloc<'a>>,
+    /// Each future of another body this context made (`TyView::CoroutineOf`).
+    foreign_coroutines: Vec<ForeignCoroutine, Alloc<'a>>,
+    /// The first handle a read could not read (`Malformed::Unreadable`): the `TypeCtx` reads
+    /// return no error, so they give the error type and leave this, and the check of the body
+    /// fails with it when it ends (lib.rs `run`, `TypeCtx::take_malformed`; rule 20).
+    malformed: core::cell::Cell<Option<crate::error::Malformed>>,
+}
+
+impl<'a> BodyRows<'a> {
+    fn new_in(alloc: Alloc<'a>) -> BodyRows<'a> {
+        BodyRows {
+            closures: HashMap::new_in(alloc),
+            foreign: Vec::new_in(alloc),
+            futures: HashMap::new_in(alloc),
+            foreign_coroutines: Vec::new_in(alloc),
+            malformed: core::cell::Cell::new(None),
+        }
+    }
+}
+
+/// A shared view of a body's terms: the reads `TypeCtx::view` makes, written once, for the
+/// context ([`InferCtx`]) and for [`Exporter`] alike (rule 30).
+#[derive(Clone, Copy)]
+pub(crate) struct Seen<'x, 'a> {
+    terms: &'x Terms<'a>,
+    facts: &'x FactCache<'a>,
+    rows: &'x BodyRows<'a>,
+}
+
+/// The reads and the one write (`adopt`) a ground export of a term makes (instance.rs
+/// `export`), over the parts of the context it needs and nothing else: the terms, the facts
+/// read only, the body rows. Built by `InferCtx::exporter`, or in `Pull::fill` from the terms
+/// the solver hands it and the pull's own borrows, so a `where const` condition is answered
+/// where the solver meets it (no evaluation asked again from its root, D161 loop 3).
+pub(crate) struct Exporter<'x, 'a> {
+    terms: &'x mut Terms<'a>,
+    facts: &'x FactCache<'a>,
+    rows: &'x mut BodyRows<'a>,
+    alloc: Alloc<'a>,
+}
+
 /// A snapshot of the context: the arena's tables and the obligation columns.
 #[derive(Clone, Copy, Debug)]
 pub struct InferSnapshot {
@@ -155,6 +206,7 @@ pub struct InferSnapshot {
     obs: usize,
     undo: usize,
     errors: usize,
+    error_at: usize,
     env_clauses: usize,
     env: Option<EnvId>,
 }
@@ -171,12 +223,14 @@ fn solve_err(e: blaze_solve::Stop) -> Result<(), CheckError> {
 /// made, so the body's read list is the same set) the moment a solver step meets it, and the
 /// step goes on; no evaluation is asked again from its root for a fact.
 ///
-/// Not pulled: `ConstHolds`, whose arguments are terms of this context that `InferCtx::fill`
-/// exports through the whole context (`instance::export`), which the solver holds borrowed
-/// while it runs; that question still stops the evaluation and is filled by the caller's loop
-/// (`blaze`'s `where const` extension only, no Rust goal asks it).
+/// Every question is pulled, `ConstHolds` too (D161 loop 3): its arguments are terms of this
+/// context, exported to a ground table through an [`Exporter`] over the terms the solver hands
+/// `fill` and this pull's borrows of the facts and the body rows ([`fill_const_holds`]). So the
+/// caller's fill loops (`InferCtx::env`, `evaluate`, `select`) meet `Stop::Need` only under
+/// the test strategy that fills nothing (`stop_for_facts`); `Solve::refills` is 0 otherwise.
 struct Pull<'x, 'a, 'w, 'r, W: World> {
     facts: &'x mut FactCache<'a>,
+    rows: &'x mut BodyRows<'a>,
     reads: &'x mut Reads<'w, 'r, W>,
     alloc: Alloc<'a>,
     spec_depth: u8,
@@ -193,9 +247,10 @@ struct Pull<'x, 'a, 'w, 'r, W: World> {
 }
 
 impl<'x, 'a, 'w, 'r, W: World> Pull<'x, 'a, 'w, 'r, W> {
-    fn new(facts: &'x mut FactCache<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
+    fn new(facts: &'x mut FactCache<'a>, rows: &'x mut BodyRows<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
         Pull {
             facts,
+            rows,
             reads,
             alloc,
             spec_depth,
@@ -220,7 +275,7 @@ impl<'a, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, '_, '_, W> {
         self.reads.goal_share()
     }
 
-    fn fill(&mut self, _tys: &mut Terms<'a>, q: blaze_solve::facts::Question) -> bool {
+    fn fill(&mut self, tys: &mut Terms<'a>, q: blaze_solve::facts::Question) -> bool {
         if self.err.is_some() {
             return false;
         }
@@ -230,7 +285,9 @@ impl<'a, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, '_, '_, W> {
         }
         let at = self.reads.stamp();
         let r = match q {
-            blaze_solve::facts::Question::ConstHolds(..) => return false,
+            blaze_solve::facts::Question::ConstHolds(cond, list) => {
+                fill_const_holds(tys, self.facts, self.rows, self.reads, self.alloc, cond, list)
+            }
             blaze_solve::facts::Question::Specializes(a, b) => {
                 fill_specializes(self.facts, self.reads, self.alloc, self.spec_depth, &mut self.need_rounds, a, b)
             }
@@ -274,7 +331,8 @@ fn fill_specializes<W: World>(
     let Some(trait_) = ha.trait_ else {
         return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
     };
-    let mut inner = InferCtx::new_in(alloc);
+    // A fact of two impls, asked of their headers alone (no body's opaque in it).
+    let mut inner = InferCtx::analysis_in(alloc);
     inner.spec_depth = spec_depth + 1;
     let got = crate::specialize::specializes(&mut inner, reads, ka, kb, trait_);
     *need_rounds += inner.need_rounds;
@@ -295,14 +353,243 @@ fn fill_specializes<W: World>(
     Ok(())
 }
 
+/// Answers the solver's `ConstHolds(cond, list)` (a `where const` condition, blaze's
+/// extension): the arguments, terms of this context, exported as a ground table through an
+/// [`Exporter`] over `terms`, `facts` and `rows`, which names the condition's record; the answer
+/// kept in `facts`. The one body of the answer, for the pull (`Pull::fill`, mid-step) and the
+/// test strategy's stop (`InferCtx::fill`).
+fn fill_const_holds<'a, W: World>(
+    terms: &mut Terms<'a>,
+    facts: &mut FactCache<'a>,
+    rows: &mut BodyRows<'a>,
+    reads: &mut Reads<'_, '_, W>,
+    alloc: Alloc<'a>,
+    cond: SDef,
+    list: SList,
+) -> Result<(), Stop> {
+    let mut args: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(list.len as usize, alloc);
+    for i in 0..list.len {
+        args.push(terms.list_get(list, i));
+    }
+    if facts.const_holds_known(cond, &args) {
+        return Ok(());
+    }
+    let mut ground = crate::portable::PortableTys::new_in(alloc);
+    let mut out: Vec<crate::portable::PTy, Alloc<'a>> = Vec::with_capacity_in(args.len(), alloc);
+    {
+        let mut ex = Exporter { terms, facts: &*facts, rows, alloc };
+        for &s in args.iter() {
+            match crate::instance::export(&mut ex, Ty(s.0), &mut ground, 0)? {
+                Some(p) => out.push(p),
+                None => return Err(CheckError::Malformed(crate::error::Malformed::NotGround { cond: ItemKey(cond.0) }).into()),
+            }
+        }
+    }
+    let got = reads.const_holds(ItemKey(cond.0), &out, ground.view())?;
+    facts.keep_const_holds(cond, &args, got)?;
+    Ok(())
+}
+
+/// Owner-qualified closure and coroutine nodes in dependency order, including nodes
+/// reached through another body's checked signature, output, or stored state. A caller
+/// converts each returned node before converting its parent and retains its read digest.
+pub(super) fn hidden_body_nodes<'w, 'a, W: World>(
+    question: crate::world::Question, hidden: crate::world::Hidden<'w>, reads: &mut Reads<'w, '_, W>, alloc: Alloc<'a>,
+) -> Result<Vec<(crate::world::Question, crate::world::Hidden<'w>), Alloc<'a>>, Stop> {
+    use crate::error::{Limit, Malformed};
+    use crate::portable::{PNode, PTy};
+    use crate::world::{Hidden, Question};
+
+    const MAX_NODES: usize = 65_536;
+    let mut ordered = Vec::new_in(alloc);
+    let mut work = Vec::new_in(alloc);
+    let mut finished = HashMap::new_in(alloc);
+    let mut children = Vec::new_in(alloc);
+    work.push((question, hidden, false));
+    while let Some((q, h, leave)) = work.pop() {
+        let key = (q, h.ty);
+        let node = h.types.node(h.ty)?;
+        if leave {
+            finished.insert(key, true);
+            if matches!(node, PNode::Closure { .. } | PNode::Coroutine { .. }) {
+                ordered.push((q, h));
+            }
+            continue;
+        }
+        match finished.get(&key) {
+            Some(true) => continue,
+            Some(false) => return Err(CheckError::Malformed(Malformed::BodyRecordCycle { record: q, node: h.ty.0 }).into()),
+            None => {}
+        }
+        if finished.len() >= MAX_NODES || work.len() >= MAX_NODES {
+            return Err(CheckError::Limit(Limit::HiddenBodyNodes { record: q, node: h.ty, limit: MAX_NODES }).into());
+        }
+        finished.insert(key, false);
+        work.push((q, h, true));
+        children.clear();
+        crate::portable::node_children(h.types, node, &mut children)?;
+        for &child in children.iter() {
+            if child >= h.ty.0 {
+                return Err(CheckError::Malformed(Malformed::TypeOrder { node: h.ty.0, child }).into());
+            }
+            work.push((q, Hidden { ty: PTy(child), types: h.types }, false));
+        }
+        match node {
+            PNode::Coroutine { owner, ordinal, .. } => {
+                let key = Question::Coroutine(owner, ordinal);
+                let facts = reads.coroutine(owner, ordinal)?.ok_or(CheckError::Malformed(Malformed::NoRecord(key)))?;
+                for ty in [facts.output, facts.interior] {
+                    work.push((key, Hidden { ty, types: facts.types }, false));
+                }
+            }
+            PNode::Closure { owner, ordinal, .. } => {
+                let key = Question::Closure(owner, ordinal);
+                let (facts, env) = reads.closure(owner, ordinal)?.ok_or(CheckError::Malformed(Malformed::NoRecord(key)))?;
+                work.push((key, Hidden { ty: facts.sig, types: facts.types }, false));
+                if let Some(ty) = env {
+                    work.push((key, Hidden { ty, types: facts.types }, false));
+                }
+            }
+            PNode::Future(block, ..) => {
+                let why = match q {
+                    Question::Coroutine(owner, ordinal) => Malformed::NestedFutureIdentity { owner, ordinal, block, reader: None },
+                    _ => Malformed::FutureOutsideOwner { block, reader: None },
+                };
+                return Err(CheckError::Malformed(why).into());
+            }
+            _ => {}
+        }
+    }
+    Ok(ordered)
+}
+
+impl<W: World> crate::instance::Asked<'_, '_, '_, W> {
+    /// A nominal coroutine carries the defining item's arguments. Its output and
+    /// stored types come from the same read used to lower that type in a body.
+    pub(crate) fn import_coroutine(
+        &mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: TyList, depth: u32,
+    ) -> Result<Ty, Stop> {
+        let q = crate::world::Question::Coroutine(owner, ordinal);
+        let facts = self.reads.coroutine(owner, ordinal)?
+            .ok_or(CheckError::Malformed(crate::error::Malformed::NoRecord(q)))?;
+        let mut subst = Vec::with_capacity_in(cx.list_len(args) as usize, cx.alloc());
+        for i in 0..cx.list_len(args) {
+            subst.push(cx.list_get(args, i));
+        }
+        let mut import_field = |p| {
+            crate::instance::import(cx, self, facts.types, p, &subst, depth).map_err(|e| match e {
+                Stop::Error(CheckError::Malformed(crate::error::Malformed::FutureOutsideOwner { block, reader })) => {
+                    CheckError::Malformed(crate::error::Malformed::NestedFutureIdentity { owner, ordinal, block, reader }).into()
+                }
+                other => other,
+            })
+        };
+        let output = import_field(facts.output)?;
+        let interior = import_field(facts.interior)?;
+        Ok(cx.imported_coroutine(owner, ordinal, args, output, interior)?)
+    }
+}
+
 impl<'a> InferCtx<'a> {
     /// The allocator the check's caller handed in (D102): what this check's scratch lives in.
     pub(crate) fn alloc(&self) -> Alloc<'a> {
         self.alloc
     }
 
+    /// A block imported at the root of writeback uses the owner's identity arguments.
+    /// Inside a signature the enclosing import supplies its substitution.
+    pub(crate) fn instance_owner_args(
+        &mut self, owner: ItemKey, count: u32, consts: &[(u32, crate::portable::PTy)], subst: &[Ty],
+    ) -> Result<TyList, CheckError> {
+        if subst.len() == count as usize {
+            return self.mk_list(subst);
+        }
+        if !subst.is_empty() {
+            return Err(CheckError::Malformed(crate::error::Malformed::CoroutineSubstitution {
+                owner, expected: count, given: subst.len(),
+            }));
+        }
+        let mut args = Vec::with_capacity_in(count as usize, self.alloc);
+        for i in 0..count {
+            let is_const = consts.binary_search_by_key(&i, |&(index, _)| index).is_ok();
+            args.push(self.mk(if is_const { TyView::ConstParam(i) } else { TyView::Param(i) })?);
+        }
+        self.mk_list(&args)
+    }
+
+    /// Imports a future from the body currently being written back. Use its nominal
+    /// identity here so exporting the selected impl's arguments never exports a local
+    /// expression id. The output and interior are types of this same body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_instance_future<S: crate::instance::ClosureSource>(
+        &mut self, source: &mut S,
+        body: &crate::body::BodyView<'_>, block: ExprId, owner_args: TyList,
+        types: crate::portable::PTys<'_>, output: crate::portable::PTy, interior: crate::portable::PTy,
+        subst: &[Ty], depth: u32,
+    ) -> Result<Ty, S::Error> {
+        let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(body, block) else {
+            let at = if (block.0 as usize) < body.exprs.len() { block } else { body.root };
+            return Err(CheckError::Malformed(crate::error::Malformed::FutureIdentity {
+                owner: body.owner, block, at: body.expr_range(at),
+            }).into());
+        };
+        let output = crate::instance::import(self, source, types, output, subst, depth)?;
+        let interior = crate::instance::import(self, source, types, interior, subst, depth)?;
+        Ok(self.imported_coroutine(body.owner, ordinal, owner_args, output, interior)?)
+    }
+
+    /// The solver term for a portable coroutine instance. Its bounds use the first
+    /// two elements. Unification includes every owner argument, even when absent
+    /// from the stored state and output. (`pub(crate)`: stalled.rs imports another fn's
+    /// coroutine record through it.)
+    pub(crate) fn imported_coroutine(&mut self, owner: ItemKey, ordinal: u32, args: TyList, output: Ty, interior: Ty) -> Result<Ty, CheckError> {
+        let def = self.terms.bdef(SDef(crate::coroutine_id::coroutine_def(owner, ordinal)));
+        let list = self.blist(args);
+        let n = self.terms.cx.tys.list_len(list);
+        let mut all = Vec::with_capacity_in(n as usize + 2, self.alloc);
+        all.push(self.bty(output).arg());
+        all.push(self.bty(interior).arg());
+        for i in 0..n {
+            let arg = self.terms.cx.tys.list_get(list, i).ok_or(CheckError::Malformed(
+                crate::error::Malformed::Unreadable { node: args.0, what: crate::error::Unreadable::PastEnd { index: i } },
+            ))?;
+            all.push(arg);
+        }
+        let all = self.terms.cx.tys.mk_list(&all);
+        let made = self.terms.cx.tys.coroutine(def, all);
+        self.rows.foreign_coroutines.push(ForeignCoroutine { made, owner, ordinal, args, output, interior });
+        Ok(Ty(made.node().bits()))
+    }
+
+    /// A context that checks a body, or answers a question asked while bodies are checked
+    /// (`TypingMode::Analysis`): an opaque type outside its defining body is rigid, only its
+    /// item bounds usable (the Reference, "Impl trait", "Abstract return types"); an auto
+    /// trait still sees its hidden type (blaze-solve structural.rs).
+    pub fn analysis_in(alloc: Alloc<'a>) -> InferCtx<'a> {
+        InferCtx::in_mode(alloc, TypingMode::Analysis)
+    }
+
+    /// A context that answers a question AFTER type checking, at an instance's ground
+    /// arguments (instance.rs `resolve_instance`, `select_impl`, `normalize_projection`,
+    /// `holds`: instance resolution, layout, drop glue, a constant's evaluation):
+    /// `TypingMode::PostAnalysis`, every opaque type with a hidden type normalizes to it, one
+    /// layer per normalization (blaze-solve alias.rs `normalize_opaque_type`). A where-clause
+    /// `<F as FnOnce<()>>::Output == U` with `F` a fn returning `impl Trait` and `U` that
+    /// opaque's hidden type holds only so (suite/opaque_hidden_closure.rs).
+    pub fn post_analysis_in(alloc: Alloc<'a>) -> InferCtx<'a> {
+        InferCtx::in_mode(alloc, TypingMode::PostAnalysis)
+    }
+
+    /// [`InferCtx::analysis_in`] under its old name, for the callers outside this crate's
+    /// writer's files until the one rewrite of every site (`InferCtx::new_in($A)` to
+    /// `InferCtx::analysis_in($A)`) removes it: a new caller names its mode.
     pub fn new_in(alloc: Alloc<'a>) -> InferCtx<'a> {
+        InferCtx::in_mode(alloc, TypingMode::Analysis)
+    }
+
+    fn in_mode(alloc: Alloc<'a>, mode: TypingMode) -> InferCtx<'a> {
         InferCtx {
+            mode,
             alloc,
             terms: Terms::new_in(alloc),
             facts: FactCache::new_in(alloc),
@@ -315,14 +602,10 @@ impl<'a> InferCtx<'a> {
             undo: Vec::new_in(alloc),
             errors: Vec::new_in(alloc),
             error_at: 0,
-            closures: HashMap::new_in(alloc),
-            foreign: Vec::new_in(alloc),
-            futures: HashMap::new_in(alloc),
-            foreign_coroutines: Vec::new_in(alloc),
+            rows: BodyRows::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
             need_rounds: 0,
             spec_depth: 0,
-            malformed: core::cell::Cell::new(None),
             #[cfg(test)]
             plant: InferPlant::None,
             #[cfg(test)]
@@ -334,9 +617,17 @@ impl<'a> InferCtx<'a> {
     /// gives `stand_in` (the error type, an empty list) for the read to go on with: the body's
     /// check fails with the note when it ends (`TypeCtx::take_malformed`).
     fn unreadable<T>(&self, node: u32, what: crate::error::Unreadable, stand_in: T) -> T {
-        let first = self.malformed.take();
-        self.malformed.set(Some(first.unwrap_or(crate::error::Malformed::Unreadable { node, what })));
-        stand_in
+        self.seen().unreadable(node, what, stand_in)
+    }
+
+    /// The shared view of this context's terms ([`Seen`]).
+    fn seen(&self) -> Seen<'_, 'a> {
+        Seen { terms: &self.terms, facts: &self.facts, rows: &self.rows }
+    }
+
+    /// The parts of this context a ground export reads and adopts into ([`Exporter`]).
+    pub(crate) fn exporter(&mut self) -> Exporter<'_, 'a> {
+        Exporter { terms: &mut self.terms, facts: &self.facts, rows: &mut self.rows, alloc: self.alloc }
     }
 
     /// The `AmbiguityByOrder` plant: each pending trait obligation whose self type has a shape
@@ -406,17 +697,90 @@ impl<'a> InferCtx<'a> {
         self.solver.take_trace()
     }
 
+    pub(crate) fn imported_closure(
+        &mut self, owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: crate::ty::ClosureKind, upvars: Option<Ty>,
+    ) -> Result<Ty, CheckError> {
+        use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
+        let def = self.terms.bdef(SDef(crate::coroutine_id::closure_of_def(owner, ordinal)));
+        let k = match kind {
+            crate::ty::ClosureKind::Fn => CLOSURE_FN,
+            crate::ty::ClosureKind::FnMut => CLOSURE_FN_MUT,
+            crate::ty::ClosureKind::FnOnce => CLOSURE_FN_ONCE,
+        };
+        let k = self.terms.cx.tys.const_value(blaze_ty::Ty::uint(blaze_ty::UintTy::Usize), u128::from(k));
+        let solver_sig = self.rust_call_sig(sig)?;
+        let env = match upvars {
+            Some(t) => self.bty(t),
+            None => self.terms.cx.tys.foreign(def),
+        };
+        let bl = self.blist(args);
+        let n = self.terms.cx.tys.list_len(bl);
+        let mut all = Vec::with_capacity_in(n as usize + 3, self.alloc);
+        for i in 0..n {
+            let a = self.terms.cx.tys.list_get(bl, i).ok_or(CheckError::Malformed(crate::error::Malformed::Unreadable {
+                node: args.0, what: crate::error::Unreadable::PastEnd { index: i },
+            }))?;
+            all.push(a);
+        }
+        all.extend([k.arg(), solver_sig.arg(), env.arg()]);
+        let l = self.terms.cx.tys.mk_list(&all);
+        let made = self.terms.cx.tys.closure(def, l);
+        self.rows.foreign.push(ForeignClosure { made, owner, ordinal, args, sig, kind });
+        Ok(Ty(made.node().bits()))
+    }
+
     fn node(&self, bits: u32) -> Node {
+        self.seen().node(bits)
+    }
+
+    fn bty(&self, t: Ty) -> blaze_ty::Ty {
+        self.seen().bty(t)
+    }
+
+    /// Files `t` when it is a closure or async block term the SOLVER made ([`Exporter::adopt`]).
+    pub(crate) fn adopt(&mut self, t: Ty) -> Result<(), CheckError> {
+        self.exporter().adopt(t)
+    }
+}
+
+impl<'x, 'a> Seen<'x, 'a> {
+    /// Notes that handle `node` could not be read (`what`), keeping the first such note, and
+    /// gives `stand_in` (`InferCtx::unreadable`).
+    fn unreadable<T>(self, node: u32, what: crate::error::Unreadable, stand_in: T) -> T {
+        let first = self.rows.malformed.take();
+        self.rows.malformed.set(Some(first.unwrap_or(crate::error::Malformed::Unreadable { node, what })));
+        stand_in
+    }
+
+    fn node(self, bits: u32) -> Node {
         match self.terms.cx.tys.node_at(bits) {
             Some(n) => n,
             None => self.unreadable(bits, crate::error::Unreadable::NotInArena, blaze_ty::Ty::ERROR.node()),
         }
     }
 
-    fn bty(&self, t: Ty) -> blaze_ty::Ty {
+    fn bty(self, t: Ty) -> blaze_ty::Ty {
         match self.node(t.0).as_ty() {
             Some(t) => t,
             None => self.unreadable(t.0, crate::error::Unreadable::NotAType, blaze_ty::Ty::ERROR),
+        }
+    }
+
+    fn blist(self, l: TyList) -> blaze_ty::List {
+        match self.node(l.0).as_list() {
+            Some(l) => l,
+            None => self.unreadable(l.0, crate::error::Unreadable::NotAList, blaze_ty::List::EMPTY),
+        }
+    }
+
+    fn list_len(self, l: TyList) -> u32 {
+        self.terms.cx.tys.list_len(self.blist(l))
+    }
+
+    fn list_get(self, l: TyList, i: u32) -> Ty {
+        match self.terms.cx.tys.list_get(self.blist(l), i) {
+            Some(a) => Ty(a.bits()),
+            None => self.unreadable(l.0, crate::error::Unreadable::PastEnd { index: i }, Ty(blaze_ty::Ty::ERROR.node().bits())),
         }
     }
 
@@ -425,14 +789,14 @@ impl<'a> InferCtx<'a> {
     /// as `{closure#0 of gen<u8>}` once `?T = u8`, a new term of the same closure. Each
     /// argument is compared after a shallow probe: a variable nested inside an argument
     /// (`gen::<Vec<?T>>`) is not seen through, and its closure stays unviewable (a panic).
-    fn foreign_resolved(&self, d: blaze_ty::Def, l: blaze_ty::List) -> Option<&ForeignClosure> {
+    fn foreign_resolved(self, d: blaze_ty::Def, l: blaze_ty::List) -> Option<&'x ForeignClosure> {
         let tys = &self.terms.cx.tys;
         let n = tys.list_len(l);
         let same = |a: blaze_ty::Arg, b: blaze_ty::Arg| match (a.ty(), b.ty()) {
             (Some(x), Some(y)) => self.terms.cx.probe(x) == self.terms.cx.probe(y),
             _ => a == b,
         };
-        self.foreign.iter().find(|f| {
+        self.rows.foreign.iter().find(|f| {
             let TyKind::Closure(d2, l2) = tys.ty_kind(f.made) else { return false };
             d2 == d
                 && tys.list_len(l2) == n
@@ -443,24 +807,155 @@ impl<'a> InferCtx<'a> {
         })
     }
 
+    /// One level of `t`. A handle it cannot view is noted (`unreadable`) and viewed as the error
+    /// type: the body's check then fails with it by name (rule 20), never the process.
+    fn view(self, t: Ty) -> TyView {
+        use crate::error::Unreadable as U;
+        let tys = &self.terms.cx.tys;
+        let ty = |x: blaze_ty::Ty| Ty(x.node().bits());
+        let list = |l: blaze_ty::List| TyList(l.node().bits());
+        let key = |d: blaze_ty::Def| ItemKey(def_of(tys.item_key(d)));
+        let bad = |what: U| self.unreadable(t.0, what, TyView::Error);
+        if let Some(c) = self.node(t.0).as_const() {
+            return match tys.const_kind(c) {
+                ConstKind::Value(vt, bits) => TyView::ConstValue { ty: ty(vt), bits },
+                ConstKind::Param(i) => TyView::ConstParam(i),
+                ConstKind::Var(v) => TyView::ConstInfer(Var { kind: VarKind::Const, index: v }),
+                ConstKind::Error => TyView::Error,
+                _ => bad(U::NoView),
+            };
+        }
+        match tys.ty_kind(self.bty(t)) {
+            TyKind::Bool => TyView::Bool,
+            TyKind::Char => TyView::Char,
+            TyKind::Int(i) => TyView::Int(typeck_int(i)),
+            TyKind::Uint(u) => TyView::Uint(typeck_uint(u)),
+            TyKind::Float(f) => TyView::Float(typeck_float(f)),
+            TyKind::Str => TyView::Str,
+            TyKind::Never => TyView::Never,
+            TyKind::Tuple(l) => TyView::Tuple(list(l)),
+            TyKind::Ref(_, p, m) => TyView::Ref(mutbl(m), ty(p)),
+            TyKind::RawPtr(p, m) => TyView::Ptr(mutbl(m), ty(p)),
+            TyKind::Array(e, n) => TyView::Array(ty(e), Ty(n.node().bits())),
+            TyKind::Slice(e) => TyView::Slice(ty(e)),
+            TyKind::Pat(b, l) => TyView::Pat(ty(b), list(l)),
+            TyKind::Adt(d, l) => TyView::Adt(key(d), list(l)),
+            TyKind::FnDef(d, l) => TyView::FnDef(key(d), list(l)),
+            TyKind::FnPtr(l, h) => TyView::FnPtr(list(l), terms::s_header(h)),
+            TyKind::Closure(d, l) => {
+                let k = def_of(tys.item_key(d));
+                // Typeck's view keeps the signature untupled, as the closure was made; the
+                // solver's tupled form (`mk`) shares its variables.
+                if tys.list_len(l) < 3 {
+                    return bad(U::ClosureArgs);
+                }
+                if let Some(r) = self.rows.closures.get(&k) {
+                    return TyView::Closure(r.expr, r.sig);
+                }
+                let made = self.bty(t);
+                let exact = self.rows.foreign.iter().find(|f| f.made == made);
+                let Some(f) = exact.or_else(|| self.foreign_resolved(d, l)) else {
+                    return bad(U::ClosureUnmade);
+                };
+                let Some(env) = tys.list_get(l, tys.list_len(l) - 1).and_then(blaze_ty::Arg::ty) else {
+                    return bad(U::ClosureArgs);
+                };
+                let upvars = (tys.ty_kind(env) != TyKind::Foreign(d)).then(|| ty(env));
+                TyView::ClosureOf { owner: f.owner, ordinal: f.ordinal, args: f.args, sig: f.sig, kind: f.kind, upvars }
+            }
+            TyKind::Coroutine(d, l) => {
+                let k = def_of(tys.item_key(d));
+                let made = self.bty(t);
+                if let Some(f) = self.rows.foreign_coroutines.iter().find(|f| f.made == made) {
+                    return TyView::CoroutineOf { owner: f.owner, ordinal: f.ordinal, args: f.args, output: f.output, interior: f.interior };
+                }
+                let Some(&e) = self.rows.futures.get(&k) else { return bad(U::FutureUnmade) };
+                let at = |i: u32| tys.list_get(l, i).and_then(blaze_ty::Arg::ty).map(ty);
+                match (tys.list_len(l), at(0), at(1)) {
+                    (2, Some(o), Some(i)) => TyView::Future(e, o, i),
+                    _ => bad(U::FutureArgs),
+                }
+            }
+            TyKind::Param(i) => TyView::Param(i),
+            TyKind::Alias { kind: AliasKind::Opaque, def, args, .. } => TyView::Opaque(key(def), list(args)),
+            TyKind::Alias { def, args, .. } => {
+                let d = def_of(tys.item_key(def));
+                match self.facts.names.get(&d) {
+                    Some(&(trait_, name)) => TyView::Alias { trait_, name, args: list(args) },
+                    None => bad(U::AliasUnnamed),
+                }
+            }
+            TyKind::TyVar(v) => TyView::Infer(Var { kind: VarKind::Ty, index: v }),
+            TyKind::IntVar(v) => TyView::Infer(Var { kind: VarKind::Int, index: v }),
+            TyKind::FloatVar(v) => TyView::Infer(Var { kind: VarKind::Float, index: v }),
+            TyKind::Error => TyView::Error,
+            TyKind::Dynamic(preds, _) => TyView::Dynamic(list(preds)),
+            TyKind::NotAType => {
+                let Some(p) = tys.as_pred(self.bty(t)) else { return bad(U::NeitherTypeNorPred) };
+                match tys.pred_kind(p) {
+                    blaze_ty::PredKind::ExTrait(d, l) => TyView::ExTrait(key(d), list(l)),
+                    blaze_ty::PredKind::ExAuto(d) => TyView::ExAuto(key(d)),
+                    blaze_ty::PredKind::ExProjection(d, l) => {
+                        let Some(&(trait_, name)) = self.facts.names.get(&def_of(tys.item_key(d))) else {
+                            return bad(U::AliasUnnamed);
+                        };
+                        TyView::ExProj { trait_, name, args_term: list(l) }
+                    }
+                    _ => bad(U::NoView),
+                }
+            }
+            _ => bad(U::NoView),
+        }
+    }
+}
+
+impl<'x, 'a> Exporter<'x, 'a> {
+    fn seen(&self) -> Seen<'_, 'a> {
+        Seen { terms: &*self.terms, facts: self.facts, rows: &*self.rows }
+    }
+
+    /// The allocator the check's caller handed in (D102).
+    pub(crate) fn alloc(&self) -> Alloc<'a> {
+        self.alloc
+    }
+
+    /// One level of `t` (`TypeCtx::view`, the same body: [`Seen::view`]).
+    pub(crate) fn view(&self, t: Ty) -> TyView {
+        self.seen().view(t)
+    }
+
+    pub(crate) fn list_len(&self, l: TyList) -> u32 {
+        self.seen().list_len(l)
+    }
+
+    pub(crate) fn list_get(&self, l: TyList, i: u32) -> Ty {
+        self.seen().list_get(l, i)
+    }
+
+    /// `t` with every bound variable replaced (`TypeCtx::resolve`, the same body).
+    pub(crate) fn resolve(&mut self, t: Ty) -> Result<Ty, CheckError> {
+        let n = self.seen().node(t.0);
+        Ok(Ty(self.terms.cx.resolve(n).bits()))
+    }
+
     /// Files `t` when it is a closure or async block term the SOLVER made: an opaque's hidden
     /// type holds it (facts.rs `body_terms`), and revealing the opaque (blaze-solve alias.rs
     /// `normalize_opaque_type`, a ground resolution's post-analysis mode) instantiates its term
     /// at the opaque's arguments without passing `mk`, so `view` had no row for it ("a closure
     /// this context did not make", census g083729). Its row is read off the term by its def:
     /// owner arguments, then `[kind, rust-call sig, upvars]` for a closure (`closure_term`),
-    /// `[output, interior]` for an async block (`coroutine_term`). Any other term is left as it
+    /// `[output, interior, owner arguments..]` for an async block (`coroutine_term`). Any other term is left as it
     /// is. A walk of a resolved type it did not build calls this before `view` (instance.rs
     /// `export`); a closure or async block term it can name by nothing is refused by its handle.
     pub(crate) fn adopt(&mut self, t: Ty) -> Result<(), CheckError> {
         use crate::error::Malformed;
         let unseen = || CheckError::Malformed(Malformed::UnseenBodyType { node: t.0 });
         // A const (an array's length, a const argument) is no body type.
-        let Some(made) = self.node(t.0).as_ty() else { return Ok(()) };
+        let Some(made) = self.seen().node(t.0).as_ty() else { return Ok(()) };
         match self.terms.cx.tys.ty_kind(made) {
             TyKind::Closure(d, l) => {
                 let k = def_of(self.terms.cx.tys.item_key(d));
-                if self.closures.contains_key(&k) || self.foreign.iter().any(|f| f.made == made) || self.foreign_resolved(d, l).is_some() {
+                if self.rows.closures.contains_key(&k) || self.rows.foreign.iter().any(|f| f.made == made) || self.seen().foreign_resolved(d, l).is_some() {
                     return Ok(());
                 }
                 let Some(&facts::HiddenBody { owner, ordinal, args: n }) = self.facts.hidden_bodies.get(&k) else {
@@ -499,36 +994,45 @@ impl<'a> InferCtx<'a> {
                 flat.push(out.arg());
                 let io = tys.mk_list(&flat);
                 let sig = Ty(tys.fn_ptr(io, h).node().bits());
-                self.foreign.push(ForeignClosure { made, owner, ordinal, args, sig, kind });
+                self.rows.foreign.push(ForeignClosure { made, owner, ordinal, args, sig, kind });
             }
             TyKind::Coroutine(d, l) => {
                 let k = def_of(self.terms.cx.tys.item_key(d));
-                if self.futures.contains_key(&k) || self.foreign_coroutines.iter().any(|f| f.made == made) {
+                if self.rows.futures.contains_key(&k) || self.rows.foreign_coroutines.iter().any(|f| f.made == made) {
                     return Ok(());
                 }
-                let Some(&facts::HiddenBody { owner, ordinal, args: n }) = self.facts.hidden_bodies.get(&k) else {
-                    return Err(unseen());
-                };
-                // The term is `[output, interior]` alone: the owner's arguments, which the
-                // identity `PNode::Coroutine` carries, are not in it.
-                if n != 0 {
-                    return Err(CheckError::Unported(
-                        "an async block of a generic owner revealed from its opaque: the solver's term holds no owner arguments",
-                    ));
-                }
+                // A newly resolved instance of a term we imported has the same
+                // definition even when one of its arguments has since been bound.
+                let seen = self.seen();
+                let identity = self.facts.hidden_bodies.get(&k).map(|f| (f.owner, f.ordinal, f.args))
+                    .or_else(|| seen.rows.foreign_coroutines.iter().find_map(|f| {
+                        matches!(seen.terms.cx.tys.ty_kind(f.made), TyKind::Coroutine(original, _) if original == d)
+                            .then(|| (f.owner, f.ordinal, seen.list_len(f.args)))
+                    }));
+                let (owner, ordinal, n) = identity.ok_or_else(unseen)?;
                 let tys = &mut self.terms.cx.tys;
+                if tys.list_len(l).checked_sub(2) != Some(n) {
+                    let given = tys.list_len(l).checked_sub(2).ok_or_else(unseen)?;
+                    return Err(CheckError::Malformed(Malformed::CoroutineSubstitution { owner, expected: n, given: given as usize }));
+                }
                 let (Some(o), Some(i)) = (tys.list_get(l, 0).and_then(blaze_ty::Arg::ty), tys.list_get(l, 1).and_then(blaze_ty::Arg::ty)) else {
                     return Err(unseen());
                 };
-                let args = TyList(tys.mk_list(&[]).node().bits());
+                let mut owner_args = Vec::with_capacity_in(n as usize, self.alloc);
+                for index in 2..tys.list_len(l) {
+                    owner_args.push(tys.list_get(l, index).ok_or_else(unseen)?);
+                }
+                let args = TyList(tys.mk_list(&owner_args).node().bits());
                 let (output, interior) = (Ty(o.node().bits()), Ty(i.node().bits()));
-                self.foreign_coroutines.push(ForeignCoroutine { made, owner, ordinal, args, output, interior });
+                self.rows.foreign_coroutines.push(ForeignCoroutine { made, owner, ordinal, args, output, interior });
             }
             _ => {}
         }
         Ok(())
     }
+}
 
+impl<'a> InferCtx<'a> {
     /// A closure's signature (a `FnPtr`, inputs then output) in the solver's "rust-call" form:
     /// its one input the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
     fn rust_call_sig(&mut self, sig: Ty) -> Result<blaze_ty::Ty, CheckError> {
@@ -548,10 +1052,7 @@ impl<'a> InferCtx<'a> {
     }
 
     fn blist(&self, l: TyList) -> blaze_ty::List {
-        match self.node(l.0).as_list() {
-            Some(l) => l,
-            None => self.unreadable(l.0, crate::error::Unreadable::NotAList, blaze_ty::List::EMPTY),
-        }
+        self.seen().blist(l)
     }
 
     fn slist(&self, l: TyList) -> SList {
@@ -589,24 +1090,7 @@ impl<'a> InferCtx<'a> {
             return self.fill_specializes(a, b, reads);
         }
         let blaze_solve::facts::Question::ConstHolds(cond, list) = q else { return self.facts.fill(q, reads) };
-        let mut args: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(list.len as usize, self.alloc);
-        for i in 0..list.len {
-            args.push(self.terms.list_get(list, i));
-        }
-        if self.facts.const_holds_known(cond, &args) {
-            return Ok(());
-        }
-        let mut ground = crate::portable::PortableTys::new_in(self.alloc);
-        let mut out: Vec<crate::portable::PTy, Alloc<'a>> = Vec::with_capacity_in(args.len(), self.alloc);
-        for &s in args.iter() {
-            match crate::instance::export(self, Ty(s.0), &mut ground, 0)? {
-                Some(p) => out.push(p),
-                None => return Err(CheckError::Malformed(crate::error::Malformed::NotGround { cond: ItemKey(cond.0) }).into()),
-            }
-        }
-        let got = reads.const_holds(ItemKey(cond.0), &out, ground.view())?;
-        self.facts.keep_const_holds(cond, &args, got)?;
-        Ok(())
+        fill_const_holds(&mut self.terms, &mut self.facts, &mut self.rows, reads, self.alloc, cond, list)
     }
 
     /// Answers the solver's `Specializes(a, b)` (the free [`fill_specializes`]).
@@ -623,7 +1107,7 @@ impl<'a> InferCtx<'a> {
         solve: impl FnOnce(&mut Solver<'a>, &mut Terms<'a>, &mut Pull<'_, 'a, '_, '_, W>, &mut Vec<blaze_solve::Read, Alloc<'a>>) -> Result<R, blaze_solve::Stop>,
     ) -> Result<Result<R, blaze_solve::Stop>, Stop> {
         let at = reads.stamp();
-        let mut src = Pull::new(&mut self.facts, reads, self.alloc, self.spec_depth);
+        let mut src = Pull::new(&mut self.facts, &mut self.rows, reads, self.alloc, self.spec_depth);
         #[cfg(test)]
         {
             src.stop = self.stop_for_facts;
@@ -711,9 +1195,10 @@ impl<'a> InferCtx<'a> {
     /// Evaluates one goal now, filling facts until it answers.
     fn evaluate<W: World>(&mut self, pred: Pred, reads: &mut Reads<'_, '_, W>) -> Result<Answer, Stop> {
         let env = self.env(reads)?;
+        let mode = self.mode;
         for _ in 0..MAX_FILLS {
             let g = SGoal { env, pred, bound: 0 };
-            let r = self.pulled(reads, |solver, terms, src, sr| solver.evaluate_from(terms, src, TypingMode::Analysis, g, sr));
+            let r = self.pulled(reads, |solver, terms, src, sr| solver.evaluate_from(terms, src, mode, g, sr));
             match r? {
                 Ok(a) => return Ok(a),
                 Err(blaze_solve::Stop::Need(q)) => {
@@ -726,8 +1211,336 @@ impl<'a> InferCtx<'a> {
         Err(CheckError::Limit(crate::error::Limit::Solver).into())
     }
 
+    /// [`TypeCtx::why_chain`]: `Solver::why_no` on `goal`, filling facts until it answers, and
+    /// each step's goal decoded (`Solver::why_goal`) in the same probe; every binding and
+    /// variable the walk made is rolled back after its terms are read.
+    fn why_walk<W: World>(
+        &mut self,
+        goal: Goal,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop> {
+        let env = self.env(reads)?;
+        let pred = self.pred(goal);
+        let s = self.snapshot();
+        let r = self.why_walk_in(env, pred, steps, reads);
+        self.rollback_to(s);
+        r
+    }
+
+    /// [`InferCtx::why_walk`] inside its probe: a step's goal naming a variable made since the
+    /// probe began (an erased region or type the canonical input gave back fresh) is not kept,
+    /// as it cannot outlive the rollback (the same guard as `list_has_infer_since`'s callers).
+    fn why_walk_in<W: World>(
+        &mut self,
+        env: EnvId,
+        pred: Pred,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop> {
+        use blaze_solve::why_no::Leaf;
+        use crate::diag::WhyLeaf;
+        let mark = self.var_mark();
+        let alloc = self.alloc;
+        let mode = self.mode;
+        for _ in 0..MAX_FILLS {
+            let g = SGoal { env, pred, bound: 0 };
+            let r = self.pulled(reads, |solver, terms, src, sr| {
+                let why = solver.why_no(&mut *terms, src, mode, g, sr)?;
+                let mut rows: Vec<(blaze_solve::why_no::Reached, Option<(SDef, SList)>), Alloc<'a>> = Vec::with_capacity_in(why.steps.len(), alloc);
+                for st in why.steps.iter() {
+                    let goal = match solver.why_goal(&mut *terms, st.input)? {
+                        Some((_, SGoal { pred: Pred::Trait { trait_, args, polarity: Polarity::Positive }, .. })) => Some((trait_, args)),
+                        _ => None,
+                    };
+                    rows.push((st.reached, goal));
+                }
+                Ok((why.leaf, rows))
+            });
+            match r? {
+                Ok((leaf, rows)) => {
+                    let leaf = match leaf {
+                        Leaf::NotNo => return Ok(None),
+                        Leaf::NoImpl => WhyLeaf::NoImpl,
+                        Leaf::NegativeImpl { impl_ } => WhyLeaf::NegativeImpl { impl_: ItemKey(impl_.0) },
+                        Leaf::Refused { first, count, .. } => WhyLeaf::Refused {
+                            first_impl: match first.source {
+                                blaze_solve::assembly::Source::Impl(d) => Some(ItemKey(d.0)),
+                                _ => None,
+                            },
+                            count,
+                        },
+                        Leaf::BuiltinNo { .. } => WhyLeaf::BuiltinNo,
+                        Leaf::Cycle => WhyLeaf::Cycle,
+                        Leaf::NotKept => WhyLeaf::NotKept,
+                    };
+                    let whole = self.why_rows_into(&rows, Some(mark), steps)?;
+                    return Ok(Some(if whole { leaf } else { WhyLeaf::NotKept }));
+                }
+                Err(blaze_solve::Stop::Need(q)) => {
+                    self.fill(q, reads)?;
+                    self.need_rounds += 1;
+                }
+                Err(e) => solve_err(e)?,
+            }
+        }
+        Err(CheckError::Limit(crate::error::Limit::Solver).into())
+    }
+
+    /// The solver's chain `rows` as the record's steps, appended to `steps`. A step's goal is
+    /// kept only where its arguments name no variable made since `since` (`None`: no variable
+    /// at all, for an undecided goal's chain, whose open variables are the body's own and are
+    /// never written to a record). `false` when a step names a closure or async block this
+    /// context did not make (`WhyDefUnmade`), or whose kept goal holds a closure or async block
+    /// term no row names (`why_adopt`): the chain stops before that step, and its leaf is
+    /// `NotKept`; a chain that cannot be built never turns the finding into a refusal.
+    fn why_rows_into(
+        &mut self,
+        rows: &[(blaze_solve::why_no::Reached, Option<(SDef, SList)>)],
+        since: Option<crate::ty::VarMark>,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+    ) -> Result<bool, Stop> {
+        for &(reached, goal) in rows {
+            let reached = match self.why_reached(reached) {
+                Ok(r) => r,
+                Err(CheckError::Malformed(crate::error::Malformed::WhyDefUnmade { .. })) => return Ok(false),
+                Err(e) => return Err(e.into()),
+            };
+            let goal = match goal {
+                Some((trait_, args)) => {
+                    let args = TyList(self.terms.blist(args).map_err(CheckError::Solve)?.node().bits());
+                    let open = match since {
+                        Some(mark) => self.list_has_infer_since(args, mark),
+                        None => self.list_has_infer(args),
+                    };
+                    if open {
+                        None
+                    } else {
+                        // The step's goal is written to the record through `view`: a closure or
+                        // async block in it that the solver made revealing an opaque (another
+                        // fn's future, reached by its hidden type) is filed first, as an
+                        // instance export files it (instance.rs `export_as`). One no row can
+                        // name ends the chain here; noting it unreadable would refuse the
+                        // whole body (`Malformed::Unreadable { what: FutureUnmade }`).
+                        if !self.why_adopt(args) {
+                            return Ok(false);
+                        }
+                        Some((ItemKey(trait_.0), args))
+                    }
+                }
+                None => None,
+            };
+            steps.push(crate::diag::PendingWhyStep { goal, reached });
+        }
+        Ok(true)
+    }
+
+    /// Files every closure and async block term under `args` ([`Exporter::adopt`]), so each
+    /// reads through `view`; `false` when one is named by nothing (`UnseenBodyType`), or the
+    /// walk passes its limit.
+    fn why_adopt(&mut self, args: TyList) -> bool {
+        let l = self.slist(args);
+        let mut work = Vec::new_in(self.alloc);
+        let mut made: Vec<STy, Alloc<'a>> = Vec::new_in(self.alloc);
+        for i in 0..l.len {
+            let t = self.terms.list_get(l, i);
+            let walked = blaze_solve::fold::visit(&self.terms, &mut work, t, |t, k| {
+                if matches!(k, blaze_solve::term::TyKind::Closure(..) | blaze_solve::term::TyKind::Coroutine(..)) {
+                    made.push(t);
+                }
+                true
+            });
+            if walked.is_err() {
+                return false;
+            }
+        }
+        // Outermost first: an async block's interior holds the futures it awaits.
+        made.iter().all(|&t| self.adopt(Ty(t.0)).is_ok())
+    }
+
+    /// [`TypeCtx::hidden_unknown`]: one ordinary evaluation of `goal` in a probe (its answer
+    /// from the global cache when it was asked before), and, when undecided, the opaque its
+    /// read list met with no hidden type (blaze-solve `Ask::first_hidden_unknown`).
+    fn hidden_unknown_in<W: World>(
+        &mut self,
+        goal: Goal,
+        skip: &dyn Fn(ItemKey) -> bool,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<ItemKey>, Stop> {
+        let env = self.env(reads)?;
+        let pred = self.pred(goal);
+        let s = self.snapshot();
+        let mut r = Err(CheckError::Limit(crate::error::Limit::Solver).into());
+        let mode = self.mode;
+        for _ in 0..MAX_FILLS {
+            let g = SGoal { env, pred, bound: 0 };
+            let got = self.pulled(reads, |solver, terms, src, sr| {
+                let answer = solver.evaluate_from(&mut *terms, &mut *src, mode, g, &mut *sr)?;
+                if !matches!(answer, Answer::Maybe(_)) {
+                    return Ok(None);
+                }
+                let facts = blaze_solve::Source::facts(&*src);
+                Ok(blaze_solve::facts::Ask::new(facts).first_hidden_unknown(&sr[..], |d| skip(ItemKey(d.0))))
+            });
+            match got {
+                Err(e) => {
+                    r = Err(e);
+                    break;
+                }
+                Ok(Ok(found)) => {
+                    r = Ok(found.map(|d| ItemKey(d.0)));
+                    break;
+                }
+                Ok(Err(blaze_solve::Stop::Need(q))) => {
+                    if let Err(e) = self.fill(q, reads) {
+                        r = Err(e);
+                        break;
+                    }
+                    self.need_rounds += 1;
+                }
+                Ok(Err(e)) => {
+                    r = solve_err(e).map(|()| None).map_err(Stop::from);
+                    break;
+                }
+            }
+        }
+        self.rollback_to(s);
+        r
+    }
+
+    /// [`TypeCtx::why_maybe_chain`]: `Solver::why_maybe` on `goal` in a probe, as
+    /// [`InferCtx::why_walk`] is `why_no`'s.
+    fn why_maybe_walk<W: World>(
+        &mut self,
+        goal: Goal,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop> {
+        let env = self.env(reads)?;
+        let pred = self.pred(goal);
+        let s = self.snapshot();
+        let r = self.why_maybe_in(env, pred, steps, reads);
+        self.rollback_to(s);
+        r
+    }
+
+    fn why_maybe_in<W: World>(
+        &mut self,
+        env: EnvId,
+        pred: Pred,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop> {
+        use blaze_solve::why_maybe::{Leaf, LimitHit, Unopened};
+        use crate::diag::{WhyLeaf, WhyLimit};
+        let alloc = self.alloc;
+        let mode = self.mode;
+        for _ in 0..MAX_FILLS {
+            let g = SGoal { env, pred, bound: 0 };
+            let r = self.pulled(reads, |solver, terms, src, sr| {
+                let why = solver.why_maybe(&mut *terms, src, mode, g, sr)?;
+                let mut rows: Vec<(blaze_solve::why_no::Reached, Option<(SDef, SList)>), Alloc<'a>> = Vec::with_capacity_in(why.steps.len(), alloc);
+                for st in why.steps.iter() {
+                    let goal = match solver.why_goal(&mut *terms, st.input)? {
+                        Some((_, SGoal { pred: Pred::Trait { trait_, args, polarity: Polarity::Positive }, .. })) => Some((trait_, args)),
+                        _ => None,
+                    };
+                    rows.push((st.reached, goal));
+                }
+                Ok((why.leaf, rows))
+            });
+            match r? {
+                Ok((leaf, rows)) => {
+                    let leaf = match leaf {
+                        Leaf::NotMaybe => return Ok(None),
+                        Leaf::Unresolved { term, .. } => Some(WhyLeaf::Unresolved { term }),
+                        Leaf::Candidates { first, second, count } => Some(WhyLeaf::Ambiguous { first: why_cand(first), second: why_cand(second), count }),
+                        Leaf::Limit(hit) => Some(WhyLeaf::Limit {
+                            hit: match hit {
+                                LimitHit::Depth { depth, limit } => WhyLimit::Depth { depth, limit },
+                                LimitHit::Fixpoint { reruns } => WhyLimit::Fixpoint { reruns },
+                                LimitHit::Rounds { rounds } => WhyLimit::Rounds { rounds },
+                            },
+                        }),
+                        Leaf::Unopened(Unopened::Hidden { opaque }) => Some(WhyLeaf::HiddenUnknown { opaque: ItemKey(opaque.0) }),
+                        Leaf::Unopened(Unopened::Interior { coroutine }) => self.why_coroutine(coroutine).ok().map(|coroutine| WhyLeaf::InteriorUnknown { coroutine }),
+                        Leaf::Unopened(Unopened::Captures { closure }) => self.why_closure(closure).ok().map(|closure| WhyLeaf::CapturesUnknown { closure }),
+                        Leaf::Normalize { alias, .. } => Some(WhyLeaf::Unnormalized { alias: ItemKey(alias.0) }),
+                        Leaf::Rule { cand } => Some(WhyLeaf::RuleUndecided { cand: why_cand(cand) }),
+                        Leaf::Cycle => Some(WhyLeaf::Cycle),
+                        Leaf::NotKept => Some(WhyLeaf::NotKept),
+                    };
+                    // A closure or async block this context did not make: the chain says so
+                    // (`why_rows_into`), never a refusal.
+                    let whole = self.why_rows_into(&rows, None, steps)?;
+                    return Ok(Some(match leaf {
+                        Some(leaf) if whole => leaf,
+                        _ => WhyLeaf::NotKept,
+                    }));
+                }
+                Err(blaze_solve::Stop::Need(q)) => {
+                    self.fill(q, reads)?;
+                    self.need_rounds += 1;
+                }
+                Err(e) => solve_err(e)?,
+            }
+        }
+        Err(CheckError::Limit(crate::error::Limit::Solver).into())
+    }
+
+    /// A solver step's [`blaze_solve::why_no::Reached`] in the record's terms: an item's def is
+    /// its key; a closure's or async block's is this body's expression, or another body's
+    /// ordinal, as this context made it.
+    fn why_reached(&self, r: blaze_solve::why_no::Reached) -> Result<crate::diag::WhyReached, CheckError> {
+        use blaze_solve::why_no::Reached as R;
+        use crate::diag::WhyReached as W;
+        let item = |d: SDef| ItemKey(d.0);
+        Ok(match r {
+            R::Root => W::Root,
+            R::ImplClause { impl_, clause } => W::ImplClause { impl_: item(impl_), clause },
+            R::Field { adt, field } => W::Field { adt: item(adt), field },
+            R::AdtArg { adt, arg } => W::AdtArg { adt: item(adt), arg },
+            R::RefTarget => W::RefTarget,
+            R::PtrTarget => W::PtrTarget,
+            R::Element => W::Element,
+            R::TupleElement { index } => W::TupleElement { index },
+            R::Capture { closure, capture } => W::Capture { closure: self.why_closure(closure)?, capture },
+            R::CoroutineSlot { coroutine, slot } => W::CoroutineSlot { coroutine: self.why_coroutine(coroutine)?, slot },
+            R::Captures { closure } => W::Captures { closure: self.why_closure(closure)? },
+            R::Interior { coroutine } => W::Interior { coroutine: self.why_coroutine(coroutine)? },
+            R::Phantom => W::Phantom,
+            R::Hidden { opaque } => W::Hidden { opaque: item(opaque) },
+            R::Other { nth, .. } => W::Other { nth },
+        })
+    }
+
+    /// The closure the solver's def `d` is: this body's (`TyView::Closure`) or another's
+    /// (`TyView::ClosureOf`, src/coroutine_id.rs `closure_of_def`).
+    fn why_closure(&self, d: SDef) -> Result<crate::diag::WhyDef, CheckError> {
+        if let Some(r) = self.rows.closures.get(&d.0) {
+            return Ok(crate::diag::WhyDef::Expr(r.expr));
+        }
+        match self.rows.foreign.iter().find(|f| crate::coroutine_id::closure_of_def(f.owner, f.ordinal) == d.0) {
+            Some(f) => Ok(crate::diag::WhyDef::Of { owner: f.owner, ordinal: f.ordinal }),
+            None => Err(CheckError::Malformed(crate::error::Malformed::WhyDefUnmade { def: d.0 })),
+        }
+    }
+
+    /// The async block's future the solver's def `d` is: this body's (`TyView::Future`) or
+    /// another's (`TyView::CoroutineOf`, src/coroutine_id.rs `coroutine_def`).
+    fn why_coroutine(&self, d: SDef) -> Result<crate::diag::WhyDef, CheckError> {
+        if let Some(&e) = self.rows.futures.get(&d.0) {
+            return Ok(crate::diag::WhyDef::Expr(e));
+        }
+        match self.rows.foreign_coroutines.iter().find(|f| crate::coroutine_id::coroutine_def(f.owner, f.ordinal) == d.0) {
+            Some(f) => Ok(crate::diag::WhyDef::Of { owner: f.owner, ordinal: f.ordinal }),
+            None => Err(CheckError::Malformed(crate::error::Malformed::WhyDefUnmade { def: d.0 })),
+        }
+    }
+
     fn select<W: World>(&mut self, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
         let env = self.env(reads)?;
+        let mode = self.mode;
         for _ in 0..MAX_FILLS {
             let mut f: Fulfill<'a, Wake> = Fulfill::new_in(self.alloc);
             let mut ids: Vec<usize, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -741,8 +1554,8 @@ impl<'a> InferCtx<'a> {
                 return Ok(());
             }
             // A fact a goal lacks is pulled where it is met (`Pull`): the obligations are
-            // registered once, and registered again only after a `ConstHolds` stop.
-            let r = self.pulled(reads, |solver, terms, src, sr| f.select_from(solver, terms, src, TypingMode::Analysis, sr))?;
+            // registered once, and again only under the test strategy's stop.
+            let r = self.pulled(reads, |solver, terms, src, sr| f.select_from(solver, terms, src, mode, sr))?;
             for (j, &i) in ids.iter().enumerate() {
                 let s = f.state[j];
                 if s == State::Fails && self.state[i] == State::Pending {
@@ -775,10 +1588,32 @@ impl<'a> InferCtx<'a> {
     /// place whose check related the types: [`TypeCtx::unify_at`]).
     fn defer(&mut self, pairs: &[(STy, STy)], cause: crate::ty::Cause) {
         for &(alias, term) in pairs {
-            self.obs.push(Obligation { goal: Goal::WellFormed(Ty(alias.0)), cause });
+            let ty = Ty(alias.0);
+            let goal = if self.node(alias.0).as_ty().is_some()
+                && let TyView::Alias { trait_, name, args } = self.view(ty)
+            {
+                Goal::Projection { trait_, name, args, term: Ty(term.0) }
+            } else {
+                // Const and opaque aliases have no associated-type name in a typeck goal.
+                Goal::WellFormed(ty)
+            };
+            self.obs.push(Obligation { goal, cause });
             self.preds.push(Pred::Projection { alias, term });
             self.state.push(State::Pending);
         }
+    }
+}
+
+/// A candidate of the solver's (`Choice`) as an undecided goal's chain names it.
+fn why_cand(c: blaze_solve::witness::Choice) -> crate::diag::WhyCand {
+    use blaze_solve::assembly::Source;
+    use crate::diag::WhyCand;
+    match c.source {
+        Source::Impl(d) => WhyCand::Impl { impl_: ItemKey(d.0) },
+        Source::ParamEnv { .. } => WhyCand::WhereClause { nth: c.n },
+        Source::AliasBound { .. } => WhyCand::AliasBound,
+        Source::Builtin(_) => WhyCand::Builtin,
+        Source::CoherenceUnknowable => WhyCand::Unknowable,
     }
 }
 
@@ -841,57 +1676,23 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 let mut h = crate::hash::StableHasher::new("blaze-typeck closure def");
                 h.u32(e.0);
                 let d = u128::from(h.finish());
-                // The closure kind (`Fn`, `FnMut`, `FnOnce`): a const variable, one per closure,
-                // set by `settle_closure_kind` once its captures are known.
-                let kind = match self.closures.get(&d) {
-                    Some(r) => r.kind,
-                    None => self.terms.cx.next_const_var(),
+                // Both call-kind and structural obligations wait on capture analysis.
+                let (kind, upvars) = match self.rows.closures.get(&d) {
+                    Some(r) => (r.kind, r.upvars),
+                    None => (self.terms.cx.next_const_var(), self.terms.cx.next_ty_var()),
                 };
-                self.closures.insert(d, ClosureRow { expr: e, sig, kind });
+                self.rows.closures.insert(d, ClosureRow { expr: e, sig, kind, upvars });
                 let def = self.terms.bdef(SDef(d));
                 let sig = self.rust_call_sig(sig)?;
-                let args = self.terms.cx.tys.mk_list(&[kind.arg(), sig.arg(), B::UNIT.arg()]);
+                let args = self.terms.cx.tys.mk_list(&[kind.arg(), sig.arg(), upvars.arg()]);
                 self.terms.cx.tys.closure(def, args)
             }
-            // A closure of another body: its def from its identity, its arguments the owner's
-            // then rustc's `[kind, sig, upvars]` (upvars `()`: the captures are the owner's).
-            TyView::ClosureOf { owner, ordinal, args, sig, kind } => {
-                use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
-                let def = self.terms.bdef(SDef(crate::coroutine_id::closure_of_def(owner, ordinal)));
-                let k = match kind {
-                    crate::ty::ClosureKind::Fn => CLOSURE_FN,
-                    crate::ty::ClosureKind::FnMut => CLOSURE_FN_MUT,
-                    crate::ty::ClosureKind::FnOnce => CLOSURE_FN_ONCE,
-                };
-                let k = self.terms.cx.tys.const_value(blaze_ty::Ty::uint(blaze_ty::UintTy::Usize), u128::from(k));
-                let solver_sig = self.rust_call_sig(sig)?;
-                let bl = self.blist(args);
-                let n = self.terms.cx.tys.list_len(bl);
-                let mut all: Vec<blaze_ty::Arg, Alloc<'a>> = Vec::with_capacity_in(n as usize + 3, self.alloc);
-                for i in 0..n {
-                    let Some(a) = self.terms.cx.tys.list_get(bl, i) else {
-                        return Err(CheckError::Malformed(crate::error::Malformed::Unreadable { node: args.0, what: crate::error::Unreadable::PastEnd { index: i } }));
-                    };
-                    all.push(a);
-                }
-                all.push(k.arg());
-                all.push(solver_sig.arg());
-                all.push(B::UNIT.arg());
-                let l = self.terms.cx.tys.mk_list(&all);
-                let t = self.terms.cx.tys.closure(def, l);
-                self.foreign.push(ForeignClosure { made: t, owner, ordinal, args, sig, kind });
-                t
+            TyView::ClosureOf { owner, ordinal, args, sig, kind, upvars } => {
+                return self.imported_closure(owner, ordinal, args, sig, kind, upvars);
             }
-            // A future of another body: its def from its identity alone ("blaze-typeck
-            // coroutine def", coroutine_id.rs), so the owner's record and a caller reading it
-            // name one coroutine; its arguments `[output, interior]` as the body's own form.
+            // The owner's record and a caller reading it use the same nominal instance.
             TyView::CoroutineOf { owner, ordinal, args, output, interior } => {
-                let def = self.terms.bdef(SDef(crate::coroutine_id::coroutine_def(owner, ordinal)));
-                let (o, i) = (self.bty(output), self.bty(interior));
-                let l = self.terms.cx.tys.mk_list(&[o.arg(), i.arg()]);
-                let t = self.terms.cx.tys.coroutine(def, l);
-                self.foreign_coroutines.push(ForeignCoroutine { made: t, owner, ordinal, args, output, interior });
-                t
+                return self.imported_coroutine(owner, ordinal, args, output, interior);
             }
             // `Coroutine(def, [output, interior])`; its def a hash of the block's expression, as
             // a closure's (one per block of this body; the owner's key separates bodies).
@@ -899,7 +1700,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 let mut h = crate::hash::StableHasher::new("blaze-typeck future def");
                 h.u32(e.0);
                 let d = u128::from(h.finish());
-                self.futures.insert(d, e);
+                self.rows.futures.insert(d, e);
                 let def = self.terms.bdef(SDef(d));
                 let (o, i) = (self.bty(output), self.bty(interior));
                 let args = self.terms.cx.tys.mk_list(&[o.arg(), i.arg()]);
@@ -920,7 +1721,23 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 // opaque "equalled" any type until the deferred pair failed. Its auto traits
                 // are still read from its hidden type (blaze-solve structural.rs matches the
                 // alias rigid or not).
-                self.terms.cx.tys.rigid_alias(AliasKind::Opaque, d, l)
+                //
+                // After type checking (`TypingMode::PostAnalysis`) an opaque is NEVER rigid: it
+                // is its hidden type (the Reference, "Impl trait"; rustc's `Reveal::All`), a
+                // non-rigid alias the solver replaces by that type, one layer, wherever it meets
+                // it (a trait goal's self type: blaze-solve alias.rs `needs_normalizing`; a
+                // relation: a deferred `Projection` goal). It is then also the SAME term as the
+                // solver's own reading of a record (infer/facts.rs makes every opaque
+                // `Rigid::No`): a rigid `O` in an instance's arguments (a recursive future's
+                // interior `(Pin<Box<O>>,)`) met the revealed hidden type's non-rigid `O`, the
+                // deferred `Projection { O, O_rigid }` related `O_rigid` with the hidden
+                // coroutine as a constructor, and the impl was `NoImpl`
+                // (suite/opaque_post_analysis_recursive.rs). Equal handles end the reveal: the
+                // hidden coroutine's `O` against the instance's `O` is one term.
+                match self.mode {
+                    TypingMode::PostAnalysis => self.terms.cx.tys.alias(AliasKind::Opaque, d, l),
+                    TypingMode::Analysis | TypingMode::Coherence => self.terms.cx.tys.rigid_alias(AliasKind::Opaque, d, l),
+                }
             }
             TyView::Infer(v) | TyView::ConstInfer(v) => {
                 let kind = match v.kind {
@@ -972,104 +1789,27 @@ impl<'a> TypeCtx for InferCtx<'a> {
     }
 
     fn take_malformed(&mut self) -> Option<crate::error::Malformed> {
-        self.malformed.take()
+        self.rows.malformed.take()
+    }
+
+    #[inline]
+    fn ty_flags(&self, t: Ty) -> TyFlags {
+        let node = self.node(t.0);
+        if node.as_ty().is_none() && node.as_const().is_none() {
+            return self.unreadable(t.0, crate::error::Unreadable::NotAType, TyFlags::default());
+        }
+        TyFlags::from_interned(self.terms.cx.tys.node_flags(node))
+    }
+
+    #[inline]
+    fn list_flags(&self, l: TyList) -> TyFlags {
+        TyFlags::from_interned(self.terms.cx.tys.node_flags(self.blist(l).node()))
     }
 
     /// One level of `t`. A handle it cannot view is noted (`unreadable`) and viewed as the error
     /// type: the body's check then fails with it by name (rule 20), never the process.
     fn view(&self, t: Ty) -> TyView {
-        use crate::error::Unreadable as U;
-        let tys = &self.terms.cx.tys;
-        let ty = |x: blaze_ty::Ty| Ty(x.node().bits());
-        let list = |l: blaze_ty::List| TyList(l.node().bits());
-        let key = |d: blaze_ty::Def| ItemKey(def_of(tys.item_key(d)));
-        let bad = |what: U| self.unreadable(t.0, what, TyView::Error);
-        if let Some(c) = self.node(t.0).as_const() {
-            return match tys.const_kind(c) {
-                ConstKind::Value(vt, bits) => TyView::ConstValue { ty: ty(vt), bits },
-                ConstKind::Param(i) => TyView::ConstParam(i),
-                ConstKind::Var(v) => TyView::ConstInfer(Var { kind: VarKind::Const, index: v }),
-                ConstKind::Error => TyView::Error,
-                _ => bad(U::NoView),
-            };
-        }
-        match tys.ty_kind(self.bty(t)) {
-            TyKind::Bool => TyView::Bool,
-            TyKind::Char => TyView::Char,
-            TyKind::Int(i) => TyView::Int(typeck_int(i)),
-            TyKind::Uint(u) => TyView::Uint(typeck_uint(u)),
-            TyKind::Float(f) => TyView::Float(typeck_float(f)),
-            TyKind::Str => TyView::Str,
-            TyKind::Never => TyView::Never,
-            TyKind::Tuple(l) => TyView::Tuple(list(l)),
-            TyKind::Ref(_, p, m) => TyView::Ref(mutbl(m), ty(p)),
-            TyKind::RawPtr(p, m) => TyView::Ptr(mutbl(m), ty(p)),
-            TyKind::Array(e, n) => TyView::Array(ty(e), Ty(n.node().bits())),
-            TyKind::Slice(e) => TyView::Slice(ty(e)),
-            TyKind::Pat(b, l) => TyView::Pat(ty(b), list(l)),
-            TyKind::Adt(d, l) => TyView::Adt(key(d), list(l)),
-            TyKind::FnDef(d, l) => TyView::FnDef(key(d), list(l)),
-            TyKind::FnPtr(l, h) => TyView::FnPtr(list(l), terms::s_header(h)),
-            TyKind::Closure(d, l) => {
-                let k = def_of(tys.item_key(d));
-                // Typeck's view keeps the signature untupled, as the closure was made; the
-                // solver's tupled form (`mk`) shares its variables.
-                if tys.list_len(l) < 3 {
-                    return bad(U::ClosureArgs);
-                }
-                if let Some(r) = self.closures.get(&k) {
-                    return TyView::Closure(r.expr, r.sig);
-                }
-                let made = self.bty(t);
-                let exact = self.foreign.iter().find(|f| f.made == made);
-                let Some(f) = exact.or_else(|| self.foreign_resolved(d, l)) else {
-                    return bad(U::ClosureUnmade);
-                };
-                TyView::ClosureOf { owner: f.owner, ordinal: f.ordinal, args: f.args, sig: f.sig, kind: f.kind }
-            }
-            TyKind::Coroutine(d, l) => {
-                let k = def_of(tys.item_key(d));
-                let made = self.bty(t);
-                if let Some(f) = self.foreign_coroutines.iter().find(|f| f.made == made) {
-                    return TyView::CoroutineOf { owner: f.owner, ordinal: f.ordinal, args: f.args, output: f.output, interior: f.interior };
-                }
-                let Some(&e) = self.futures.get(&k) else { return bad(U::FutureUnmade) };
-                let at = |i: u32| tys.list_get(l, i).and_then(blaze_ty::Arg::ty).map(ty);
-                match (tys.list_len(l), at(0), at(1)) {
-                    (2, Some(o), Some(i)) => TyView::Future(e, o, i),
-                    _ => bad(U::FutureArgs),
-                }
-            }
-            TyKind::Param(i) => TyView::Param(i),
-            TyKind::Alias { kind: AliasKind::Opaque, def, args, .. } => TyView::Opaque(key(def), list(args)),
-            TyKind::Alias { def, args, .. } => {
-                let d = def_of(tys.item_key(def));
-                match self.facts.names.get(&d) {
-                    Some(&(trait_, name)) => TyView::Alias { trait_, name, args: list(args) },
-                    None => bad(U::AliasUnnamed),
-                }
-            }
-            TyKind::TyVar(v) => TyView::Infer(Var { kind: VarKind::Ty, index: v }),
-            TyKind::IntVar(v) => TyView::Infer(Var { kind: VarKind::Int, index: v }),
-            TyKind::FloatVar(v) => TyView::Infer(Var { kind: VarKind::Float, index: v }),
-            TyKind::Error => TyView::Error,
-            TyKind::Dynamic(preds, _) => TyView::Dynamic(list(preds)),
-            TyKind::NotAType => {
-                let Some(p) = tys.as_pred(self.bty(t)) else { return bad(U::NeitherTypeNorPred) };
-                match tys.pred_kind(p) {
-                    blaze_ty::PredKind::ExTrait(d, l) => TyView::ExTrait(key(d), list(l)),
-                    blaze_ty::PredKind::ExAuto(d) => TyView::ExAuto(key(d)),
-                    blaze_ty::PredKind::ExProjection(d, l) => {
-                        let Some(&(trait_, name)) = self.facts.names.get(&def_of(tys.item_key(d))) else {
-                            return bad(U::AliasUnnamed);
-                        };
-                        TyView::ExProj { trait_, name, args_term: list(l) }
-                    }
-                    _ => bad(U::NoView),
-                }
-            }
-            _ => bad(U::NoView),
-        }
+        self.seen().view(t)
     }
 
     fn mk_list(&mut self, tys: &[Ty]) -> Result<TyList, CheckError> {
@@ -1085,14 +1825,11 @@ impl<'a> TypeCtx for InferCtx<'a> {
     }
 
     fn list_len(&self, l: TyList) -> u32 {
-        self.terms.cx.tys.list_len(self.blist(l))
+        self.seen().list_len(l)
     }
 
     fn list_get(&self, l: TyList, i: u32) -> Ty {
-        match self.terms.cx.tys.list_get(self.blist(l), i) {
-            Some(a) => Ty(a.bits()),
-            None => self.unreadable(l.0, crate::error::Unreadable::PastEnd { index: i }, Ty(blaze_ty::Ty::ERROR.node().bits())),
-        }
+        self.seen().list_get(l, i)
     }
 
     fn fresh(&mut self, kind: VarKind) -> Result<Ty, CheckError> {
@@ -1114,8 +1851,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
     }
 
     fn resolve(&mut self, t: Ty) -> Result<Ty, CheckError> {
-        let n = self.node(t.0);
-        Ok(Ty(self.terms.cx.resolve(n).bits()))
+        self.exporter().resolve(t)
     }
 
     fn list_has_infer(&mut self, args: TyList) -> bool {
@@ -1209,6 +1945,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
             obs: self.obs.len(),
             undo: self.undo.len(),
             errors: self.errors.len(),
+            error_at: self.error_at,
             env_clauses: self.env_clauses.len(),
             env: self.env,
         }
@@ -1226,7 +1963,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
         self.preds.truncate(s.obs);
         self.state.truncate(s.obs);
         self.errors.truncate(s.errors);
-        self.error_at = self.error_at.min(s.errors);
+        self.error_at = s.error_at;
         self.env_clauses.truncate(s.env_clauses);
         self.env = s.env;
     }
@@ -1276,12 +2013,55 @@ impl<'a> TypeCtx for InferCtx<'a> {
         Some(e)
     }
 
+    fn pending_goals(&self, out: &mut blaze_own::Vec<Goal, blaze_own::Alloc<'_>>) {
+        for i in 0..self.obs.len() {
+            if self.state[i] == State::Pending {
+                out.push(self.obs[i].goal);
+            }
+        }
+    }
+
     fn may_hold<W: World>(&mut self, goal: Goal, reads: &mut Reads<'_, '_, W>) -> Result<bool, Stop> {
         let s = self.snapshot();
         let pred = self.pred(goal);
         let r = self.evaluate(pred, reads);
         self.rollback_to(s);
         Ok(!matches!(r?, Answer::No))
+    }
+
+    fn why_chain<W: World>(
+        &mut self,
+        goal: Goal,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop> {
+        self.why_walk(goal, steps, reads)
+    }
+
+    fn why_maybe_chain<W: World>(
+        &mut self,
+        goal: Goal,
+        steps: &mut Vec<crate::diag::PendingWhyStep, Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop> {
+        self.why_maybe_walk(goal, steps, reads)
+    }
+
+    fn hidden_unknown<W: World>(
+        &mut self,
+        goal: Goal,
+        skip: &dyn Fn(ItemKey) -> bool,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<ItemKey>, Stop> {
+        self.hidden_unknown_in(goal, skip, reads)
+    }
+
+    fn why_leaf<W: World>(&mut self, goal: Goal, reads: &mut Reads<'_, '_, W>) -> Result<Option<(ItemKey, TyList)>, Stop> {
+        let mut steps: Vec<crate::diag::PendingWhyStep, Alloc<'a>> = Vec::new_in(self.alloc);
+        if self.why_walk(goal, &mut steps, reads)?.is_none() || steps.len() < 2 {
+            return Ok(None);
+        }
+        Ok(steps.last().and_then(|s| s.goal))
     }
 
     fn normalize<W: World>(
@@ -1325,9 +2105,9 @@ impl<'a> TypeCtx for InferCtx<'a> {
         }
     }
 
-    fn settle_closure_kind(&mut self, closure: ExprId, kind: crate::ty::ClosureKind) -> Result<bool, CheckError> {
+    fn settle_closure(&mut self, closure: ExprId, kind: crate::ty::ClosureKind, upvars: Option<Ty>) -> Result<(), CheckError> {
         use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
-        let Some(row) = self.closures.values().find(|r| r.expr == closure).copied() else {
+        let Some((&id, &row)) = self.rows.closures.iter().find(|(_, r)| r.expr == closure) else {
             return Err(CheckError::Malformed(crate::error::Malformed::ClosureNotMade(closure)));
         };
         let v = match kind {
@@ -1343,36 +2123,74 @@ impl<'a> TypeCtx for InferCtx<'a> {
             blaze_solve::tys::Relate::Lazy,
             &mut pairs,
         )?;
-        Ok(ok)
+        let env = match upvars {
+            Some(t) => t,
+            None => {
+                let def = self.terms.bdef(SDef(id));
+                Ty(self.terms.cx.tys.foreign(def).node().bits())
+            }
+        };
+        if !ok || !self.unify(Ty(row.upvars.node().bits()), env)? {
+            return Err(CheckError::Malformed(crate::error::Malformed::ClosureCaptureConflict(closure)));
+        }
+        Ok(())
     }
 
-    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Option<(TyList, Option<Ty>)> {
+    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, crate::ty::Cause), Option<(Ty, crate::ty::Cause)>)>, CheckError> {
         let v = self.shallow_resolve(var);
-        let mut inputs = None;
-        let mut out = None;
+        let mut found = None;
         for i in 0..self.obs.len() {
-            if self.state[i] != State::Pending {
-                continue;
-            }
-            match self.obs[i].goal {
-                Goal::Trait { trait_, args } if inputs.is_none() && fn_traits.contains(&trait_) => {
-                    if self.list_len(args) == 2 && self.shallow_resolve(self.list_get(args, 0)) == v {
-                        let tuple = self.shallow_resolve(self.list_get(args, 1));
-                        if let TyView::Tuple(l) = self.view(tuple) {
-                            inputs = Some(l);
-                        }
-                    }
+            if self.state[i] == State::Pending
+                && let Goal::Trait { trait_, args } = self.obs[i].goal
+                && fn_traits.contains(&trait_)
+                && self.list_len(args) == 2
+                && self.shallow_resolve(self.list_get(args, 0)) == v
+            {
+                let tuple = self.shallow_resolve(self.list_get(args, 1));
+                if let TyView::Tuple(l) = self.view(tuple) {
+                    // Where the expectation came from (D148): the obligation's cause, a
+                    // clause of a use (`Cause::Clause`) when a declared bound filed it.
+                    found = Some((l, self.obs[i].cause));
+                    break;
                 }
-                Goal::Projection { trait_, args, name, term } if out.is_none() && name == output => {
-                    let _ = trait_;
-                    if self.list_len(args) >= 1 && self.shallow_resolve(self.list_get(args, 0)) == v {
-                        out = Some(term);
-                    }
-                }
-                _ => {}
             }
         }
-        inputs.map(|l| (l, out))
+        let Some((inputs, cause)) = found else { return Ok(None) };
+        // Output belongs to the Once supertrait at these same arguments. Another bound on
+        // this variable may project a different Output, and may precede the callable bound:
+        // a projection whose `Args` cannot equal the inputs is another bound's. "Can equal",
+        // a rolled-back unification (rustc's `can_eq`), never the same list: each clause of a
+        // bound is lowered on its own (machine.rs `register_predicates`), so an alias in `Args`
+        // (reth's `F: FnOnce(RpcContext<'_, NodeAdapter<T, CB::Components>, AO::EthApi>) ->
+        // eyre::Result<()>`) is one fresh normalization variable in the trait goal and another
+        // in the projection. Compared as lists, the output was lost there and the closure's
+        // return type was left to its body: tempo's crates/zones/node/tests/it/utils.rs:2658.
+        let inputs_tuple = self.mk(TyView::Tuple(inputs))?;
+        for i in 0..self.obs.len() {
+            if self.state[i] == State::Pending
+                && let Goal::Projection { trait_, args, name, term } = self.obs[i].goal
+                && trait_ == fn_traits[2] && name == output && self.list_len(args) == 2
+                && self.shallow_resolve(self.list_get(args, 0)) == v
+            {
+                let tuple = self.shallow_resolve(self.list_get(args, 1));
+                let TyView::Tuple(l) = self.view(tuple) else { continue };
+                let same = if l == inputs {
+                    true
+                } else if self.list_len(l) != self.list_len(inputs) {
+                    false
+                } else {
+                    let s = self.snapshot();
+                    let can = self.unify(tuple, inputs_tuple);
+                    self.rollback_to(s);
+                    can?
+                };
+                if same {
+                    let ob_cause = self.obs[i].cause;
+                    return Ok(Some(((inputs, cause), Some((term, ob_cause)))));
+                }
+            }
+        }
+        Ok(Some(((inputs, cause), None)))
     }
 }
 

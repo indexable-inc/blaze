@@ -7,13 +7,30 @@
 //!
 //! Under `--cfg blaze_check` each round is a schedule point of the model checker, so a wait that
 //! never ends is a finding there, not a hang.
+//!
+//! The waits bounded by time read the caller's clock, handed in as `now` (rule 75): a
+//! monotonic reading as a length since any fixed start, the shape of blaze-core's
+//! `wait::Clock::now`. [`SpinWait::within`] and [`busy`] read std's clock themselves and are
+//! deprecated for [`SpinWait::within_on`] and [`busy_on`].
+//!
+//! Not yet `#![no_std]`: yielding the thread is a system call (`sched_yield`, or blaze-check's
+//! schedule point), and blaze-sys has no public call for it yet (wave-1124-sansio, W1 group a's
+//! report). With it, `std` here is only the two deprecated wrappers.
 
-use std::time::{Duration, Instant};
+#![feature(register_tool)]
+#![register_tool(blaze)]
+// Not `blaze::std_use`: `std::thread::yield_now` and the deprecated wrappers' `Instant`, above.
+#![deny(blaze::implicit_allocator, blaze::process_static)]
+
+use core::time::Duration;
+use std::time::Instant;
 
 #[cfg(blaze_check)]
 use blaze_check::{hint, thread};
 #[cfg(not(blaze_check))]
-use std::{hint, thread};
+use core::hint;
+#[cfg(not(blaze_check))]
+use std::thread;
 
 /// Rounds that spin, the `n`th `2^n` times, before rounds yield.
 const SPINS: u32 = 6;
@@ -96,35 +113,58 @@ impl SpinWait {
         }
     }
 
-    /// Waits until `done`, as [`SpinWait::until`] does, for at most `long` of the wall clock: for
-    /// a test or a tool waiting on another thread's progress, which may take longer than a step.
-    /// Past `long` it panics naming `what`.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "a test's or a tool's limit on the wall clock, which no core reads"
-    )]
-    pub fn within(what: &str, long: Duration, mut done: impl FnMut() -> bool) {
-        let until = Instant::now() + long;
+    /// Waits until `done`, as [`SpinWait::until`] does, until `until` on the caller's clock
+    /// `now`: for a test or a tool waiting on another thread's progress, which may take longer
+    /// than a step. Past `until` it panics naming `what`.
+    pub fn within_on(
+        what: &str,
+        until: Duration,
+        mut now: impl FnMut() -> Duration,
+        mut done: impl FnMut() -> bool,
+    ) {
         let mut spin = SpinWait::new();
         while !done() {
-            assert!(Instant::now() < until, "timed out after {long:?} waiting for {what}");
+            assert!(now() < until, "timed out at {until:?} on the caller's clock waiting for {what}");
             if !spin.spin() {
                 thread::yield_now();
             }
         }
     }
+
+    /// Waits until `done` for at most `long` of std's clock.
+    ///
+    /// Deprecated: reads the clock itself (rule 75); use [`SpinWait::within_on`] with the
+    /// caller's clock. Goes with its last caller (blaze-core's uring and kqueue tests,
+    /// blaze-inproc's and blaze-malloc's tests).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's or a tool's limit on the wall clock, which no core reads; deprecated"
+    )]
+    pub fn within(what: &str, long: Duration, done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        SpinWait::within_on(what, long, || start.elapsed(), done);
+    }
 }
 
-/// Keeps this thread busy for `long`, as a job computing that long would: for a test or a
-/// bench that needs a run under way on its thread for a while, which a sleep would fake by
-/// holding the thread idle.
+/// Keeps this thread busy until `until` on the caller's clock `now`, as a job computing that
+/// long would: for a test or a bench that needs a run under way on its thread for a while,
+/// which a sleep would fake by holding the thread idle.
+pub fn busy_on(until: Duration, mut now: impl FnMut() -> Duration) {
+    while now() < until {
+        core::hint::black_box(());
+    }
+}
+
+/// Keeps this thread busy for `long` of std's clock.
+///
+/// Deprecated: reads the clock itself (rule 75); use [`busy_on`] with the caller's clock. Goes
+/// with its last caller (blaze-core's iocp.rs and process spawn tests, syntax-tree's flat.rs,
+/// blaze-graph's re-export).
 #[allow(
     clippy::disallowed_methods,
-    reason = "a test's or a bench's wall-clock work, which no core reads"
+    reason = "a test's or a bench's wall-clock work, which no core reads; deprecated"
 )]
 pub fn busy(long: Duration) {
-    let until = Instant::now() + long;
-    while Instant::now() < until {
-        std::hint::black_box(());
-    }
+    let start = Instant::now();
+    busy_on(long, || start.elapsed());
 }

@@ -47,7 +47,11 @@ const UNCHECKED: &str = "#[cfg(blaze_unknown(form))]\nfn g() {}\n";
 
 const SUMMARY: &str = "the check is incomplete: blaze could not check";
 const CAUSE: &str = "not checked because a `cfg` predicate on it or on an item it is written in does not read: `g` (";
-const E0308: &str = "type error E0308";
+/// The type error's code as the agent view prints it. D70: "`agent` is one or two plain lines
+/// per finding with nothing decorative: the id, the code, `file:line:col`, the message", the
+/// view a file is given; the message ends "(E0308 Mismatch)". The person view's "type error
+/// E0308" frame label is drawn on a terminal alone.
+const E0308: &str = "(E0308 Mismatch)";
 
 /// `blaze check` of a package whose `src/main.rs` is `main`: its status and everything it said.
 fn check(base: &Path, name: &str, main: &str) -> (Option<i32>, String) {

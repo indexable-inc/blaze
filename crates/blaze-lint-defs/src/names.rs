@@ -165,6 +165,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::many_bools",
             "blaze::default_policy",
             "blaze::sans_io_core",
+            "blaze::lock_without_reason",
             "blaze::key_ignores_field",
             "blaze::wildcard_arm",
             "blaze::large_move",

@@ -100,7 +100,7 @@ fn a_missing_record_and_a_self_pointer_are_refused_by_name() {
     println!("refused: no record for {:#x}; A points into itself", B.0);
 }
 
-unsafe extern "C" fn no_op_ender(_table: *mut libc::c_void) {}
+unsafe extern "C" fn no_op_ender(_table: *mut core::ffi::c_void) {}
 
 /// `create_key` makes the key in the descriptor's first word and writes `root`: macOS the key's
 /// TSD slot offset `key * 8` with `ROOT_OWN` clear (D2: "macOS `key * 8` from
@@ -123,5 +123,8 @@ fn create_key_writes_the_key_and_the_root() {
     }
     println!("create_key: key {key}, root {root:#x}");
     // SAFETY: the key was made above; no thread holds a value under it.
-    unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) };
+    #[cfg(target_os = "macos")]
+    { blaze_sys::posix::thread::key_delete(key as blaze_sys::posix::thread::pthread_key_t).unwrap(); }
+    #[cfg(not(target_os = "macos"))]
+    { unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) }; }
 }

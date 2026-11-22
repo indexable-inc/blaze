@@ -34,6 +34,8 @@ pub const FLOOR_BYTES_PER_EDGE: usize = size_of::<(CellId, Name)>();
 /// the profile (read edges held, bytes an edge, allocations a phase).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct IndexCost {
+    /// Membership writes issued, including entries later merged or cancelled.
+    pub writes: u64,
     /// Read edges held: `(cell, reader)` writes kept (a pair written again after its run was
     /// sealed is held twice until a merge meets the two).
     pub edges: u64,
@@ -108,8 +110,8 @@ pub trait ReaderIndex<'a> {
     where
         Self: Sized;
 
-    /// Room for `writes` more writes, made once before a merge writes its results' reads, so a
-    /// phase grows its column once and not by doubling.
+    /// Room for a batch of known membership changes. A replacement with an unknown
+    /// difference grows the column only as it emits changes.
     fn reserve(&mut self, writes: usize);
 
     /// `reader`'s row reads `id` from now on (`true`) or no longer (`false`): the newest write of
@@ -137,12 +139,13 @@ pub struct Paired<'a> {
     scratch: SVec<'a, (Name, u64, bool)>,
     /// Growths of the scratch: allocations too.
     scratch_grown: u64,
+    writes: u64,
     plant: Plant,
 }
 
 impl<'a> ReaderIndex<'a> for Paired<'a> {
     fn new_in(alloc: SharedAlloc<'a>, plant: Plant) -> Paired<'a> {
-        Paired { pairs: Runs::new_in(alloc), scratch: Vec::new_in(alloc), scratch_grown: 0, plant }
+        Paired { pairs: Runs::new_in(alloc), scratch: Vec::new_in(alloc), scratch_grown: 0, writes: 0, plant }
     }
 
     fn reserve(&mut self, writes: usize) {
@@ -151,12 +154,13 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
 
     fn write(&mut self, id: CellId, reader: Name, reads: bool) {
         self.pairs.write((id, reader), reads);
+        self.writes += 1;
     }
 
     fn edits_of(&mut self, id: CellId, out: &mut SVec<'a, (Name, bool)>) {
         out.clear();
         self.pairs.seal();
-        let Paired { pairs, scratch, scratch_grown, plant } = self;
+        let Paired { pairs, scratch, scratch_grown, plant, .. } = self;
         scratch.clear();
         let had = scratch.capacity();
         pairs.each_in(|key| key.0.cmp(&id), |key, reads, age| scratch.push((key.1, age, *reads)));
@@ -182,6 +186,7 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
     fn cost(&self) -> IndexCost {
         let runs = self.pairs.cost();
         IndexCost {
+            writes: self.writes,
             edges: runs.entries,
             bytes: runs.bytes + (self.scratch.capacity() * size_of::<(Name, u64, bool)>()) as u64,
             allocations: runs.allocations + self.scratch_grown,
@@ -197,6 +202,7 @@ impl<'a> ReaderIndex<'a> for Paired<'a> {
 /// added (`true`) or dropped (`false`), a map a cell.
 pub struct Mapped<'a> {
     alloc: SharedAlloc<'a>,
+    writes: u64,
     readers: SMap<'a, CellId, SMap<'a, Name, bool>>,
 }
 
@@ -206,7 +212,7 @@ const NODE: u64 = 15;
 
 impl<'a> ReaderIndex<'a> for Mapped<'a> {
     fn new_in(alloc: SharedAlloc<'a>, _plant: Plant) -> Mapped<'a> {
-        Mapped { alloc, readers: BTreeMap::new_in(alloc) }
+        Mapped { alloc, writes: 0, readers: BTreeMap::new_in(alloc) }
     }
 
     fn reserve(&mut self, _writes: usize) {}
@@ -214,6 +220,7 @@ impl<'a> ReaderIndex<'a> for Mapped<'a> {
     fn write(&mut self, id: CellId, reader: Name, reads: bool) {
         let alloc = self.alloc;
         self.readers.entry(id).or_insert_with(|| BTreeMap::new_in(alloc)).insert(reader, reads);
+        self.writes += 1;
     }
 
     fn edits_of(&mut self, id: CellId, out: &mut SVec<'a, (Name, bool)>) {
@@ -246,6 +253,6 @@ impl<'a> ReaderIndex<'a> for Mapped<'a> {
             nodes += n.div_ceil(NODE).max(1);
         }
         let bytes = edges * size_of::<(Name, bool)>() as u64 + cells * size_of::<(CellId, SMap<'a, Name, bool>)>() as u64;
-        IndexCost { edges, bytes, allocations: nodes, phase_allocations_max: 0, runs: 0, seals: 0, exact: false }
+        IndexCost { writes: self.writes, edges, bytes, allocations: nodes, phase_allocations_max: 0, runs: 0, seals: 0, exact: false }
     }
 }

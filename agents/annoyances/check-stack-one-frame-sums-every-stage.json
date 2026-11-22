@@ -1,0 +1,15 @@
+{
+ "id": "check-stack-one-frame-sums-every-stage",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane on the check's stack",
+ "where": "crates/blaze-cli/src/engine_check.rs `checking` and its drive closure; tests/engine_body_reads_memory_tests.rs a_changed_archive_checksum_enters_the_body_through_the_graph",
+ "what": "the archive test overflowed the 2 MiB test stack (2,109,888 bytes, 109 frames). `checking` was one 523 KB frame and its drive closure 172 KB: at O0 every local, `?` temporary and struct literal of a 1,500-line function gets its own slot for the whole call, so the stack held every stage's temporaries at once. Boxing header slots one at a time did not fix it.",
+ "cost": "two passes: one boxing round that moved the number, then the stage split",
+ "cause": "a command written as one function: every stage's temporaries summed in one frame, live under every callee",
+ "whys": "nothing states the stack a check needs; nothing fails when a frame grows; the one-worker path runs the bodies inline on that same stack",
+ "class": "a frame that sums its stages: any long function holding stage temporaries for its whole call, under deep callees",
+ "prevention": "stages are #[inline(never)] functions over one Drive state allocated once in the command's frame (drive, one_phase, run_stage, bodies_phase, heads_phase, put_phase, lines_of, print_answer); a const size assert on Drive; test a_whole_check_fits_its_stated_stack on a 1 MiB thread; proposed: clippy large_stack_frames deny at 64 KiB",
+ "annoyance": "frame sizes are known only from a backtrace with frame addresses; the write-only lane cannot measure size_of::<CliError>() or a frame",
+ "workaround": "read frame sizes off the overflow backtrace's stack pointers",
+ "state": "fix written, not compiled"
+}

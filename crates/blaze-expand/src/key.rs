@@ -12,7 +12,7 @@ use crate::{
     call::Call,
     def::{MacroContent, MacroDefinition},
     expansion::Reads,
-    tokens::Sink,
+    tokens::{Buffered, Sink},
 };
 
 /// A call's key ([`call_key`]): the expander's code, the definition's identity and the call's
@@ -79,7 +79,9 @@ pub fn call_key_of(content: MacroContent, site: DefSite, call: &Call<'_>) -> Cal
             hasher.id(&module.0);
         }
     }
-    call.encode(&mut hasher);
+    // Through a buffer: the call's tokens are a few tiny puts each (tokens.rs `Buffered`); the
+    // temporary is dropped, so its held bytes fed, at the end of this statement.
+    call.encode(&mut Buffered::new(&mut hasher));
     CallKey(hasher.finish())
 }
 
@@ -91,6 +93,6 @@ pub fn expansion_key(
 ) -> ExpansionKey {
     let mut hasher = Hasher::new("blaze v2 expand expansion 1");
     hasher.id(&call_key(def, call).0);
-    reads.encode(&mut hasher);
+    reads.encode(&mut Buffered::new(&mut hasher));
     ExpansionKey(hasher.finish())
 }

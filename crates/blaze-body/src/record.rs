@@ -6,7 +6,7 @@
 //! slice in bounds and aligned) and the version; what the rows say is [`crate::verify`]'s.
 #![blaze::sans_io]
 
-use blaze_format_core::{FormatError, Own, Placed, Record, Slice, Unfit, Writer, open_as};
+use blaze_format_core::{FormatError, Own, Placed, Record, Slice, Unfit, Writer, WriterOpts, open_as};
 use blaze_own::Vec;
 use core::alloc::Allocator;
 use core::mem::offset_of;
@@ -92,26 +92,35 @@ pub fn encode<A: Allocator>(body: &BodyRef<'_>, alloc: A) -> Vec<u8, A> {
 /// Equal bodies give equal bytes (rule 25): the buffer is the tables in a fixed order, nothing
 /// else.
 pub fn try_encode<A: Allocator>(body: &BodyRef<'_>, alloc: A) -> Result<Vec<u8, A>, EncodeError> {
-    let mut out = Writer::new_in(<BodyRoot as Record>::SCHEMA, Own(alloc));
-    let locals = Placed::push(&mut out, body.locals);
-    let local_places = Placed::push(&mut out, body.local_places);
-    let places = Placed::push(&mut out, body.places);
-    let consts = Placed::push(&mut out, body.consts);
-    let data = Placed::push(&mut out, body.data);
-    let callees = Placed::push(&mut out, body.callees);
-    let stmts = Placed::push(&mut out, body.stmts);
-    let spans = Placed::push(&mut out, body.spans);
-    let stmt_block = Placed::push(&mut out, body.stmt_block);
-    let blocks = Placed::push(&mut out, body.blocks);
-    let operands = Placed::push(&mut out, body.operands);
-    let cases = Placed::push(&mut out, body.cases);
-    let loans = Placed::push(&mut out, body.loans);
-    let subsets = Placed::push(&mut out, body.subsets);
-    let placeholder = Placed::push(&mut out, body.placeholder);
-    let local_origins = Placed::push(&mut out, body.local_origins);
-    let known = Placed::push(&mut out, body.known);
-    let tys = Placed::push(&mut out, body.tys);
-    let ty_lists = Placed::push(&mut out, body.ty_lists);
+    let mut out = Writer::new(WriterOpts { schema: <BodyRoot as Record>::SCHEMA, alloc: Own(alloc), capacity: None });
+    let at = write_root(&mut out, body)?;
+    Ok(out.finish(at))
+}
+
+/// Writes `body`'s tables and then its root into `out`, and says where the root is: the
+/// body record's own buffer ([`try_encode`]) or a record that holds a body (kept.rs's
+/// `KeptRoot`, whose `body` slice is this root). The bytes from the first table to the root's
+/// end depend on `body` and on where `out` stood, nothing else (rule 25).
+pub(crate) fn write_root<A: Allocator>(out: &mut Writer<Own<A>>, body: &BodyRef<'_>) -> Result<u64, EncodeError> {
+    let locals = Placed::push(out,body.locals);
+    let local_places = Placed::push(out,body.local_places);
+    let places = Placed::push(out,body.places);
+    let consts = Placed::push(out,body.consts);
+    let data = Placed::push(out,body.data);
+    let callees = Placed::push(out,body.callees);
+    let stmts = Placed::push(out,body.stmts);
+    let spans = Placed::push(out,body.spans);
+    let stmt_block = Placed::push(out,body.stmt_block);
+    let blocks = Placed::push(out,body.blocks);
+    let operands = Placed::push(out,body.operands);
+    let cases = Placed::push(out,body.cases);
+    let loans = Placed::push(out,body.loans);
+    let subsets = Placed::push(out,body.subsets);
+    let placeholder = Placed::push(out,body.placeholder);
+    let local_origins = Placed::push(out,body.local_origins);
+    let known = Placed::push(out,body.known);
+    let tys = Placed::push(out,body.tys);
+    let ty_lists = Placed::push(out,body.ty_lists);
     let at = out.next::<BodyRoot>();
     let root = BodyRoot {
         version: VERSION,
@@ -140,7 +149,7 @@ pub fn try_encode<A: Allocator>(body: &BodyRef<'_>, alloc: A) -> Result<Vec<u8, 
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at);
-    Ok(out.finish(at))
+    Ok(at)
 }
 
 /// The root's slice of column `p` for the field at `offset` in the root written at `at`.
@@ -152,6 +161,13 @@ fn reach<T>(p: Placed, at: u64, offset: usize, table: Table) -> Result<Slice<T>,
 /// Run [`crate::verify::verify_ref`] on the result before reading it as a body.
 pub fn open(buffer: &[u8]) -> Result<BodyRef<'_>, OpenError> {
     let root = open_as::<BodyRoot>(buffer, <BodyRoot as Record>::SCHEMA)?;
+    body_of(root, buffer)
+}
+
+/// The body whose root is `root`, a record of `buffer` already checked by blaze-format (its
+/// own buffer's root, or the `body` slice of a kept record): the version, then each table a
+/// slice of `buffer`.
+pub(crate) fn body_of<'b>(root: &'b BodyRoot, buffer: &'b [u8]) -> Result<BodyRef<'b>, OpenError> {
     if root.version != VERSION {
         return Err(OpenError::Version { found: root.version, want: VERSION });
     }

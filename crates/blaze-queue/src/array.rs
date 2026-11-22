@@ -12,13 +12,24 @@
 //! slots made at start and never used costs the address space, not 4,096 stamp writes and the
 //! faults under them. [`Slot::turn`] and [`Slot::set_turn`] are the only reads and writes.
 
-use alloc::{alloc::Global, boxed::Box, vec::Vec};
-use core::{cell::UnsafeCell, fmt, mem::MaybeUninit};
+#[allow(blaze::std_use, reason = "the deprecated `ArrayQueue::new` alone (the crate's doc)")]
+use alloc::alloc::Global;
+use core::{
+    alloc::{Allocator, Layout},
+    cell::UnsafeCell,
+    fmt,
+    mem::MaybeUninit,
+    ptr::NonNull,
+};
 
+use blaze_own::{
+    AllocFailure, Box,
+    planted::{NoPlant, Planted},
+};
 use blaze_spin::SpinWait;
 
 use crate::{
-    Padded, Plant,
+    Padded, QueuePlant,
     sync::{
         self,
         atomic::{self, AtomicUsize, Ordering},
@@ -46,66 +57,105 @@ impl<T> Slot<T> {
     }
 }
 
-/// A bounded queue of `T` that any number of threads push to and pop from.
-pub struct ArrayQueue<T> {
+/// A bounded queue of `T` that any number of threads push to and pop from, its ring in `A`
+/// (no default: D170 C1). Shared between threads, `A` is `Send + Sync` (a `SharedAlloc`).
+pub struct ArrayQueue<T, A: Allocator> {
     head: Padded<AtomicUsize>,
     tail: Padded<AtomicUsize>,
-    buffer: Box<[Slot<T>], Global>,
+    buffer: Box<[Slot<T>], A>,
     cap: usize,
     one_lap: usize,
 }
 
 // SAFETY: a value moves from the thread that pushed it to the thread that pops it (`T: Send`),
-// and a slot is reached by one thread at a time, as its stamp hands it over.
-unsafe impl<T: Send> Send for ArrayQueue<T> {}
-// SAFETY: as above.
-unsafe impl<T: Send> Sync for ArrayQueue<T> {}
+// and a slot is reached by one thread at a time, as its stamp hands it over; the ring is freed
+// in `A`, which moves with it (`A: Send`).
+unsafe impl<T: Send, A: Allocator + Send> Send for ArrayQueue<T, A> {}
+// SAFETY: as above; a `&ArrayQueue` reaches `A` only to drop the ring, under `&mut`.
+unsafe impl<T: Send, A: Allocator + Sync> Sync for ArrayQueue<T, A> {}
 
-impl<T> ArrayQueue<T> {
-    /// A ring of `cap` slots, allocated now from `Global`, zeroed and untouched (the module's
-    /// doc).
+impl<T> ArrayQueue<T, Global> {
+    /// A ring of `cap` slots from the global heap.
+    ///
+    /// Deprecated: the global heap is an ambient allocator (D170 C1). Use
+    /// [`ArrayQueue::new_in`] with the caller's allocator. Kept for this wave's callers alone
+    /// (blaze-core cgroup.rs and chan.rs, ix-prof alloc.rs).
+    ///
+    /// # Panics
+    ///
+    /// When `cap` is 0, or the heap refuses the ring.
+    pub fn new(cap: usize) -> ArrayQueue<T, Global> {
+        ArrayQueue::new_in(cap, Global)
+    }
+}
+
+impl<T, A: Allocator> ArrayQueue<T, A> {
+    /// A ring of `cap` slots, allocated now in `alloc`, zeroed and untouched (the module's doc).
+    ///
+    /// # Panics
+    ///
+    /// When `cap` is 0, or `alloc` refuses the ring (blaze-own's rule for a method without
+    /// `try_`: a panic that fails one job); [`ArrayQueue::try_new_in`] returns the refusal.
+    pub fn new_in(cap: usize, alloc: A) -> ArrayQueue<T, A> {
+        match ArrayQueue::try_new_in(cap, alloc) {
+            Ok(queue) => queue,
+            Err(failure) => panic!("blaze_queue: {failure}"),
+        }
+    }
+
+    /// [`ArrayQueue::new_in`], with a refusal of the ring's memory returned.
     ///
     /// # Panics
     ///
     /// When `cap` is 0.
-    pub fn new(cap: usize) -> ArrayQueue<T> {
+    pub fn try_new_in(cap: usize, alloc: A) -> Result<ArrayQueue<T, A>, AllocFailure> {
         assert!(cap > 0, "an ArrayQueue of no slots");
         let one_lap = (cap + 1).next_power_of_two();
-        ArrayQueue {
+        Ok(ArrayQueue {
             head: Padded(AtomicUsize::new(0)),
             tail: Padded(AtomicUsize::new(0)),
-            buffer: Self::slots(cap),
+            buffer: Self::slots(cap, alloc)?,
             cap,
             one_lap,
+        })
+    }
+
+    /// `cap` slots each at its first turn: zero bytes, from `alloc`'s zeroed allocation.
+    fn slots(cap: usize, alloc: A) -> Result<Box<[Slot<T>], A>, AllocFailure> {
+        const WHAT: &str = "an ArrayQueue's ring";
+        let layout = Layout::array::<Slot<T>>(cap)
+            .map_err(|_| AllocFailure::CapacityOverflow { what: WHAT, len: 0, additional: cap })?;
+        // A slot holds an `AtomicUsize`, so the layout has a size (`cap > 0`).
+        let block = alloc
+            .allocate_zeroed(layout)
+            .map_err(|_| AllocFailure::Refused { what: WHAT, layout })?;
+        let first: NonNull<Slot<T>> = block.cast();
+        // Under the model checker the atomics are not plain bytes: each is made in place.
+        #[cfg(blaze_check)]
+        for at in 0..cap {
+            // SAFETY: `at < cap`, inside the block just allocated for `cap` slots, written once.
+            unsafe {
+                first.add(at).write(Slot {
+                    stamp: AtomicUsize::new(0),
+                    value: UnsafeCell::new(MaybeUninit::uninit()),
+                });
+            }
         }
-    }
-
-    /// `cap` slots each at its first turn: zero bytes, from `Global`'s zeroed allocation.
-    #[cfg(not(blaze_check))]
-    fn slots(cap: usize) -> Box<[Slot<T>], Global> {
-        let zeroed = Box::<[Slot<T>], Global>::new_zeroed_slice_in(cap, Global);
-        // SAFETY: a slot of zero bytes is valid: its stamp is an `AtomicUsize` (any bits are
-        // one), 0, slot `i`'s first turn less `i`; its value is a `MaybeUninit` (any bytes).
-        unsafe { zeroed.assume_init() }
-    }
-
-    /// The same under the model checker, whose atomics are not plain bytes: each made.
-    #[cfg(blaze_check)]
-    fn slots(cap: usize) -> Box<[Slot<T>], Global> {
-        let mut buffer = Vec::with_capacity_in(cap, Global);
-        buffer.extend(
-            (0..cap)
-                .map(|_| Slot { stamp: AtomicUsize::new(0), value: UnsafeCell::new(MaybeUninit::uninit()) }),
-        );
-        buffer.into_boxed_slice()
+        // SAFETY: the block is `alloc`'s, for `Layout::array::<Slot<T>>(cap)`, which is the
+        // layout of the slice of `cap` slots; each slot is valid: outside the model a slot of
+        // zero bytes is one (its stamp an `AtomicUsize`, any bits one, 0 being slot `i`'s
+        // first turn less `i`; its value a `MaybeUninit`, any bytes), and under it each was
+        // written above. Nothing else owns the block.
+        Ok(unsafe { Box::from_non_null_in(NonNull::slice_from_raw_parts(first, cap), alloc) })
     }
 
     /// Pushes `value`, or hands it back when the ring is full.
     pub fn push(&self, value: T) -> Result<(), T> {
-        self.push_with(value, Plant::None)
+        self.push_with(value, NoPlant)
     }
 
-    pub(crate) fn push_with(&self, value: T, plant: Plant) -> Result<(), T> {
+    /// [`ArrayQueue::push`] with a plant (`NoPlant` outside the model tests).
+    pub(crate) fn push_with(&self, value: T, plant: impl Planted<QueuePlant>) -> Result<(), T> {
         let mut tail = self.tail.load(Ordering::Relaxed);
         loop {
             let index = tail & (self.one_lap - 1);
@@ -129,14 +179,9 @@ impl<T> ArrayQueue<T> {
                         // was free at it: no other thread reaches the value until the stamp
                         // below says it holds one.
                         unsafe { at.write(MaybeUninit::new(value)) };
-                        #[cfg(test)]
-                        let publish = match plant {
-                            Plant::RelaxedPublish => Ordering::Relaxed,
-                            Plant::None | Plant::FreeUnasked => Ordering::Release,
-                        };
-                        #[cfg(not(test))]
-                        let publish = {
-                            _ = plant;
+                        let publish = if plant.has(QueuePlant::RelaxedPublish) {
+                            Ordering::Relaxed
+                        } else {
                             Ordering::Release
                         };
                         slot.set_turn(index, tail + 1, publish);
@@ -265,7 +310,7 @@ impl<T> ArrayQueue<T> {
     }
 }
 
-impl<T> Drop for ArrayQueue<T> {
+impl<T, A: Allocator> Drop for ArrayQueue<T, A> {
     fn drop(&mut self) {
         let head = self.head.load(Ordering::Relaxed);
         let first = head & (self.one_lap - 1);
@@ -280,25 +325,25 @@ impl<T> Drop for ArrayQueue<T> {
     }
 }
 
-impl<T> fmt::Debug for ArrayQueue<T> {
+impl<T, A: Allocator> fmt::Debug for ArrayQueue<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ArrayQueue").field("len", &self.len()).field("cap", &self.cap).finish()
     }
 }
 
 /// The values of an [`ArrayQueue`] taken by value, in order.
-pub struct IntoIter<T>(ArrayQueue<T>);
+pub struct IntoIter<T, A: Allocator>(ArrayQueue<T, A>);
 
-impl<T> IntoIterator for ArrayQueue<T> {
+impl<T, A: Allocator> IntoIterator for ArrayQueue<T, A> {
     type Item = T;
-    type IntoIter = IntoIter<T>;
+    type IntoIter = IntoIter<T, A>;
 
-    fn into_iter(self) -> IntoIter<T> {
+    fn into_iter(self) -> IntoIter<T, A> {
         IntoIter(self)
     }
 }
 
-impl<T> Iterator for IntoIter<T> {
+impl<T, A: Allocator> Iterator for IntoIter<T, A> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
@@ -311,9 +356,9 @@ impl<T> Iterator for IntoIter<T> {
     }
 }
 
-impl<T> ExactSizeIterator for IntoIter<T> {}
+impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
 
-impl<T> fmt::Debug for IntoIter<T> {
+impl<T, A: Allocator> fmt::Debug for IntoIter<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("IntoIter").field(&self.0).finish()
     }

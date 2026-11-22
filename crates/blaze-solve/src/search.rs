@@ -98,11 +98,16 @@ pub type Ans = Option<RespId>;
 pub struct Entry {
     pub ans: Ans,
     pub required_depth: u32,
-    /// The nested goals (input ids) below this one: the entry does not apply while one of them
-    /// is on the stack (`candidate_is_applicable`). `u32::MAX` length: too many to keep, the
-    /// entry applies only with an empty stack.
+    /// The nested goals (input ids) below this one whose answer may change if they are moved
+    /// onto the stack: the entry does not apply while one of them is on the stack
+    /// (`candidate_is_applicable`). As the reference's `NestedGoals`, only the goals that met a
+    /// cycle (the heads met, and every goal between) or overflow are kept, never a cycle-free
+    /// subtree's (eval.rs `finish`, "WHICH NESTED GOALS"). `u32::MAX` length: too many to keep,
+    /// the entry applies only with an empty stack.
     pub nested: (u32, u32),
     pub reads: (u32, u32),
+    /// Computed with overflow (an [`OverflowEntry`]'s): its parent keeps it as a nested goal.
+    pub overflow: bool,
 }
 
 /// A global cache entry computed with overflow, valid only at the depth it was computed at
@@ -124,6 +129,9 @@ pub struct Prov {
     pub highest: u32,
     pub path: PathKind,
     pub ans: Ans,
+    /// Whether its answer met overflow (rustc `ProvisionalCacheEntry::encountered_overflow`):
+    /// a hit marks the goal that took it, as a global cache hit does.
+    pub overflow: bool,
 }
 
 /// The most nested-goal ids a cache entry keeps (rule 18); past it, see `Entry::nested`.
@@ -251,7 +259,7 @@ impl<'a> Inputs<'a> {
         };
         let rs = crate::error::row(self.reads_pool.len())?;
         self.reads_pool.extend_from_slice(reads);
-        let entry = Entry { ans, required_depth, nested: nested_range, reads: (rs, reads.len() as u32) };
+        let entry = Entry { ans, required_depth, nested: nested_range, reads: (rs, reads.len() as u32), overflow };
         if overflow {
             self.overflow.push(OverflowEntry { input, depth, entry });
         } else {

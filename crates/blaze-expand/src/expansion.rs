@@ -143,7 +143,9 @@ pub struct Hole {
 pub enum ReadKind {
     /// An env var by name.
     Env,
-    /// A cfg predicate, its subject the predicate's tokens as text.
+    /// One atom of a cfg predicate (`unix`, `feature = "x"`), its subject the atom's text: a
+    /// predicate records one read per atom it evaluated, in evaluation order, never its whole
+    /// text (cx.rs `Recorder::cfg`; D152 and D158 read these as cfg cells).
     Cfg,
     /// An included file by the path written, as text.
     IncludeStr,

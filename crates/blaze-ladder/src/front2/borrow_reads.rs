@@ -3,9 +3,8 @@
 //!
 //! The borrow verdict of a body reads facts the type check's list may not hold: whether each
 //! ADT the body's types name is `Copy` and implements `Drop`, its fields and whether its head
-//! declares lifetimes, and each callee's (and the owner's) signature as its TEXT says it (the
-//! lifetime part `read_signature` reads, whether it writes a lifetime, whether it takes
-//! `&self`). The type check asks none of that for a body that only moves a value: an ADT that
+//! declares lifetimes, and each callee's (and the owner's) signature regions as its head
+//! record holds them (D148), whether it writes a lifetime, whether it takes `&self`. The type check asks none of that for a body that only moves a value: an ADT that
 //! gains `impl Copy` (or a callee whose head gains `<'a>`) left the body's list, and so its
 //! digest, unchanged, while its borrow notes changed. Each such fact is now a row:
 //!
@@ -13,8 +12,8 @@
 //!   (made or not; `Copy` and `Drop` as answered, unknown included; the flags; each variant's
 //!   field names in order);
 //! - [`FactKind::BorrowHead`] about the fn: its answer the digest of the head as the borrow check
-//!   read it (made or not; the two callee flags; the lifetime part read, or why it was refused;
-//!   each ADT the reading asked about and whether its head declares lifetimes).
+//!   read it (made or not; the two callee flags; the head record's signature column, or why it
+//!   was not read: D148).
 //!
 //! The answer is a digest of the borrow check's OWN derived facts, not of the text they came
 //! from, so an edit inside a callee's body (which its item text holds) moves no caller's list.
@@ -22,10 +21,8 @@
 //! filed by [`file_borrow_reads`] into the verdict of [`super::project::ProjectWorld::check_borrows`];
 //! a body whose types were not checked clean was not borrow checked and lists none.
 
-use core::cell::RefCell;
-
-use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, FieldLead, FieldRegion, Region, SigLife, SigRefusal, Variance};
-use blaze_own::{AVec, Alloc};
+use blaze_flow_lower::{AdtFacts, BodyOut, CalleeFacts, FieldLead, FieldRegion, Region, RegionsUnread, SigLife, UnreadWhy, Variance};
+use blaze_own::Alloc;
 use blaze_typeck as tc;
 use blaze_typeck::StableHasher;
 
@@ -38,15 +35,20 @@ use super::reads::{Fact, FactKind, Read, ReadsError};
 /// v4 (lane B13): and its lifetime parameters' variances (`Facts::adt_variances`).
 /// v5 (lane B15): a fn-pointer field now has positions, and a lifetime its binder binds is a
 /// field region of its own (`FieldRegion::Bound`, tag 3); its variances read the pointer.
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v5";
+/// v6 (D148, piece L6): the fields' regions are the head record's field columns; no written
+/// type is read, so the asked ADT counts and path answers are no longer in the row.
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v6";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 /// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
 /// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
-/// v3 (lane B11): the head's text is read through the front end's world (borrow_sig_world.rs):
-/// each path answer it took is in the row.
+/// v3 (lane B11): the head's text was read through the front end's world (deleted by L6):
+/// each path answer it took was in the row.
 /// v4 (lane B15): a fn-pointer type in the head now has positions, and a lifetime its binder
 /// binds is read as `Region::Bound` (tag 5), so the regions of such a head changed.
-const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v4";
+/// v5 (D148, piece LJ2): a head's regions are its head record's column (blaze-typeck
+/// `Region::{Static, Param, Late}`, each child's slots, the params' late flags and bounds), or
+/// the typed `RegionsUnread`; no text is read, so no ADT or path answer is in the row.
+const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v5";
 
 /// What the borrow check took about one ADT.
 pub enum AdtAnswer<'f> {
@@ -75,10 +77,6 @@ pub enum AdtAnswer<'f> {
         /// Its lifetime parameters' variances, in head order (`None`: not read; borrows.rs
         /// `adt_variances_of`).
         variances: Option<&'f [Variance]>,
-        /// What reading its fields' written types asked: each ADT's lifetime count, sorted,
-        /// and each path answer's digest, sorted (borrow_sig_world.rs).
-        asked_adts: &'f [(u128, u32)],
-        asked_paths: &'f [u64],
     },
 }
 
@@ -88,12 +86,9 @@ pub enum HeadAnswer<'s> {
     NotMade,
     Made {
         callee: CalleeFacts,
-        /// The lifetime part `read_signature` read, or why it refused the text.
-        sig: Result<SigLife<'s>, SigRefusal>,
-        /// Each ADT the reading asked about, sorted, with how many lifetimes its head declares.
-        adts: &'s [(u128, u32)],
-        /// Each path answer the reading took, as its digest, sorted (borrow_sig_world.rs).
-        paths: &'s [u64],
+        /// The head record's signature regions as the lowering reads them (D148), or why they
+        /// were not read (the item and the typed cause).
+        sig: Result<SigLife<'s>, RegionsUnread>,
     },
 }
 
@@ -109,37 +104,48 @@ fn flag(h: &mut StableHasher, v: bool) {
     h.tag(u8::from(v));
 }
 
+/// One slot of a head record's column (blaze-typeck regions.rs `Region`).
 fn region(h: &mut StableHasher, r: Region) {
-    let (tag, n) = match r {
-        Region::Static => (0, 0),
-        Region::Named(n) => (1, n),
-        Region::Anon(n) => (2, n),
-        Region::SelfTy(n) => (3, n),
-        Region::Hidden(n) => (4, n),
-        Region::Bound(n) => (5, n),
+    let (tag, a, b) = match r {
+        Region::Static => (0, 0, 0),
+        Region::Param(i) => (1, i, 0),
+        Region::Late { binder, var } => (2, binder, var),
+    };
+    h.tag(tag);
+    h.u32(a);
+    h.u32(b);
+}
+
+fn slots(h: &mut StableHasher, rs: &[Region]) {
+    h.u32(rs.len() as u32);
+    for &r in rs {
+        region(h, r);
+    }
+}
+
+/// Why a head's regions were not read (blaze-typeck region_facts.rs `UnreadWhy`).
+fn unread(h: &mut StableHasher, why: UnreadWhy) {
+    let (tag, n) = match why {
+        UnreadWhy::NoHead => (0, 0),
+        UnreadWhy::HeadRefused => (1, 0),
+        UnreadWhy::RecordForm { found } => (2, found),
+        UnreadWhy::Refused { what } => {
+            h.tag(3);
+            hash_text(h, what);
+            return;
+        }
     };
     h.tag(tag);
     h.u32(n);
 }
 
-fn refusal(h: &mut StableHasher, why: SigRefusal) {
-    let (tag, a, b) = match why {
-        SigRefusal::Token { at } => (0, at, 0),
-        SigRefusal::NoFn => (1, 0, 0),
-        SigRefusal::ParamCount { text, head } => (2, text, head),
-        SigRefusal::Unaligned { at } => (3, at, 0),
-        SigRefusal::ElisionUndecided { at } => (5, at, 0),
-        SigRefusal::ObjectDefault { at } => (6, at, 0),
-        SigRefusal::Unknown => (7, 0, 0),
-        SigRefusal::TypeNode => (8, 0, 0),
-        SigRefusal::Bound => (9, 0, 0),
-        SigRefusal::Assoc { at, why } => (10, at, why as u32),
-        SigRefusal::AsyncOutputNotGiven => (11, 0, 0),
-        SigRefusal::Path { at, why } => (12, at, why as u32),
-    };
-    h.tag(tag);
-    h.u32(a);
-    h.u32(b);
+/// A refusal's name into a read's answer: its length, then its bytes (deterministic: the
+/// text is a `&'static str` of the producer).
+pub(super) fn hash_text(h: &mut StableHasher, text: &str) {
+    h.u32(u32::try_from(text.len()).unwrap_or(u32::MAX));
+    for b in text.bytes() {
+        h.tag(b);
+    }
 }
 
 /// The row of what the borrow check took about the ADT `adt`.
@@ -147,7 +153,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, variances, asked_adts, asked_paths } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, variances } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -231,15 +237,6 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                     }
                 }
             }
-            h.u32(asked_adts.len() as u32);
-            for &(a, lifetimes) in asked_adts {
-                h.u128(a);
-                h.u32(lifetimes);
-            }
-            h.u32(asked_paths.len() as u32);
-            for &p in asked_paths {
-                h.u64(p);
-            }
         }
     }
     Read { fact: Fact { kind: FactKind::BorrowAdt, key: adt, detail: 0 }, answer: Some(h.finish()) }
@@ -250,7 +247,7 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
     let mut h = StableHasher::new(HEAD_DOMAIN);
     match answer {
         HeadAnswer::NotMade => h.tag(0),
-        HeadAnswer::Made { callee, sig, adts, paths } => {
+        HeadAnswer::Made { callee, sig } => {
             h.tag(1);
             let CalleeFacts { writes_lifetimes, self_ref } = callee;
             flag(&mut h, writes_lifetimes);
@@ -258,78 +255,119 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
             match sig {
                 Ok(life) => {
                     h.tag(1);
-                    h.u32(life.regions.len() as u32);
-                    for &r in life.regions {
-                        region(&mut h, r);
+                    // The column as the lowering reads it: the root's own slots, then each
+                    // child's (every input in order, the output last), so a slot moved from one
+                    // input to another moves the row even where the flat slots are equal.
+                    let col = life.regions().col;
+                    slots(&mut h, col.own());
+                    h.u32(col.children());
+                    for k in 0..col.children() {
+                        match col.child(k) {
+                            Some(rs) => {
+                                h.tag(1);
+                                slots(&mut h, rs);
+                            }
+                            None => h.tag(0),
+                        }
                     }
-                    h.u32(life.ends.len() as u32);
-                    for &e in life.ends {
-                        h.u32(e);
+                    // The lifetime parameters: their count, which are late-bound, their bounds.
+                    let params = life.params();
+                    h.u32(params.count());
+                    for i in 0..params.count() {
+                        option_bool(&mut h, params.is_late(i).ok());
                     }
-                    h.u32(life.bounds.len() as u32);
-                    for &(a, b) in life.bounds {
+                    let bounds = life.bounds();
+                    h.u32(bounds.len() as u32);
+                    for &(a, b) in bounds {
                         region(&mut h, a);
                         region(&mut h, b);
                     }
                     // The body's value's regions (an `async fn`'s written return type).
-                    match life.body {
+                    match life.body() {
                         BodyOut::Output => h.tag(0),
                         BodyOut::Async(body) => {
                             h.tag(1);
-                            h.u32(body.len() as u32);
-                            for &r in body {
-                                region(&mut h, r);
-                            }
-                        }
-                        BodyOut::AsyncUnread(why) => {
-                            h.tag(2);
-                            refusal(&mut h, why);
+                            slots(&mut h, body);
                         }
                     }
                 }
-                Err(why) => {
+                Err(RegionsUnread { item, why }) => {
                     h.tag(2);
-                    refusal(&mut h, why);
+                    h.u128(item.0);
+                    unread(&mut h, why);
                 }
-            }
-            h.u32(adts.len() as u32);
-            for &(adt, lifetimes) in adts {
-                h.u128(adt);
-                h.u32(lifetimes);
-            }
-            h.u32(paths.len() as u32);
-            for &p in paths {
-                h.u64(p);
             }
         }
     }
     Read { fact: Fact { kind: FactKind::BorrowHead, key: item, detail: 0 }, answer: Some(h.finish()) }
 }
 
-/// A recorder of the ADTs `read_signature` asks about (its `adt_lifetimes` is a `&dyn Fn`):
-/// each asked ADT with the answer given.
-pub struct AskedAdts<'a> {
-    asked: RefCell<AVec<'a, (u128, u32)>>,
-    alloc: Alloc<'a>,
-}
+/// The `detail` of an impl's row ([`impl_read`]): `BorrowHead` rows are 0 (a head),
+/// call_generics.rs 1, borrows_ties.rs 4 and 5.
+pub const IMPL_DETAIL: u64 = 6;
 
-impl<'a> AskedAdts<'a> {
-    pub fn new_in(alloc: Alloc<'a>) -> AskedAdts<'a> {
-        AskedAdts { asked: RefCell::new(AVec::new_in(alloc)), alloc }
+/// The row of what the borrow check took about impl `imp`'s REGIONS, which the type check's
+/// reads do not hold (they cover the impl's types: `type A = Inner<'i>` and `type A =
+/// Inner<'static>` erase to one type): its header columns (self type, trait reference), its
+/// lifetime count and bounds, and the value column of each associated type `names` the body's
+/// projections selected it for (`names` sorted, deduplicated). Each is the head record's, or
+/// why it was not read. A lifetime-only edit of the impl then moves the reading body's list
+/// (rule 21); an edit of another impl moves nothing.
+pub fn impl_read(imp: u128, names: &[tc::Name], regions: &dyn blaze_flow_lower::RegionFacts) -> Read {
+    let mut h = StableHasher::new(HEAD_DOMAIN);
+    h.tag(b'i');
+    let key = tc::ItemKey(imp);
+    match regions.impl_header(key) {
+        Ok((self_col, trait_col)) => {
+            h.tag(1);
+            slots(&mut h, self_col.as_slice());
+            match trait_col {
+                Some(t) => {
+                    h.tag(1);
+                    slots(&mut h, t.as_slice());
+                }
+                None => h.tag(0),
+            }
+        }
+        Err(RegionsUnread { item, why }) => {
+            h.tag(2);
+            h.u128(item.0);
+            unread(&mut h, why);
+        }
     }
-
-    /// Notes that the reading asked about `adt` and was told `lifetimes`.
-    pub fn note(&self, adt: tc::ItemKey, lifetimes: u32) {
-        self.asked.borrow_mut().push((adt.0, lifetimes));
+    match regions.lifetime_params(key) {
+        Ok(p) => {
+            h.tag(1);
+            h.u32(p.count());
+            let bounds = p.outlives();
+            h.u32(bounds.len() as u32);
+            for &(a, b) in bounds {
+                region(&mut h, a);
+                region(&mut h, b);
+            }
+        }
+        Err(RegionsUnread { item, why }) => {
+            h.tag(2);
+            h.u128(item.0);
+            unread(&mut h, why);
+        }
     }
-
-    /// Every ADT asked, sorted, each once; the recorder is left empty for the next head.
-    pub fn take_sorted(&self) -> AVec<'a, (u128, u32)> {
-        let mut out = core::mem::replace(&mut *self.asked.borrow_mut(), AVec::new_in(self.alloc));
-        out.sort_unstable();
-        out.dedup();
-        out
+    h.u32(names.len() as u32);
+    for &n in names {
+        h.u64(n.0);
+        match regions.impl_assoc(key, n) {
+            Ok(v) => {
+                h.tag(1);
+                slots(&mut h, v.as_slice());
+            }
+            Err(RegionsUnread { item, why }) => {
+                h.tag(2);
+                h.u128(item.0);
+                unread(&mut h, why);
+            }
+        }
     }
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: imp, detail: IMPL_DETAIL }, answer: Some(h.finish()) }
 }
 
 /// Files the borrow check's `rows` into the body's read list in `verdict` (sorted by fact, one

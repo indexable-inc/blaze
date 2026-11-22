@@ -34,9 +34,9 @@ fn tests_examples_and_benches_are_checked_with_their_modules() {
     write(&io, "a/tests/common/mod.rs", "use a::in_common;\npub fn helper() -> u8 {\n    a::f()\n}\n");
     write(&io, "a/examples/e.rs", "use a::in_example;\nfn main() {\n    a::f();\n}\n");
     write(&io, "a/benches/x.rs", "use a::in_bench;\nfn main() {\n    a::f();\n}\n");
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
-    assert!(checked.failed.is_empty(), "{:?}\n{out}", checked.failed);
+    assert_eq!(checked.failures, 0, "{out}\n{}", checked.profile);
     assert!(!out.contains("NoPart"), "every root the graph makes a unit of is a part:\n{out}");
     assert!(!out.contains("error[module-file-missing]"), "`mod common;` in `tests/a.rs` is `tests/common/mod.rs`:\n{out}");
     assert_eq!(out.matches("error[unresolved]").count(), 3, "{out}\n{}", checked.profile);

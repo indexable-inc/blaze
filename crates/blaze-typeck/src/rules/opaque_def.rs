@@ -177,6 +177,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             while let Some(k) = kids.pop() {
                 work.push(k);
             }
+            if let Some((_, Some(env))) = self.closure_witness(v) {
+                // The undecided requirement may belong to a captured opaque.
+                // The signature alone never mentions a discarded capture.
+                work.push(env);
+            }
         }
         Ok(None)
     }
@@ -192,6 +197,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Goal::Projection { trait_, args, name, term }
                 }
                 PClause::Const { cond, args } => Goal::ConstHolds { cond, args: self.lower_list_for(preds.types, args, cause)? },
+                // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
+                PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };
             self.ty.register(crate::ty::Obligation { goal, cause })?;
         }

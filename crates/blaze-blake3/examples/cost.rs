@@ -10,7 +10,7 @@
 
 use std::{hint::black_box, time::Instant};
 
-const SIZES: &[usize] = &[16, 64, 256, 1024, 4096, 65536, 16 << 20];
+const SIZES: &[usize] = &[16, 64, 256, 1024, 2048, 3072, 4096, 8192, 65536, 16 << 20];
 
 /// Seconds a call of `f`, best of seven runs of about 20 ms.
 fn seconds_a_call(mut f: impl FnMut()) -> f64 {
@@ -139,6 +139,208 @@ fn main() {
             rate(many),
             sha256.as_deref().unwrap_or("not on this CPU"),
             sha256_x4.as_deref().unwrap_or("unequal lengths"),
+        );
+    }
+
+    engines::tables();
+}
+
+/// The strategies at the crate's one seam ([`blaze_blake3::Engine`]), measured one against
+/// another and against the official crate, so the default per CPU is a measured choice:
+///
+/// - by degree: MB/s of one input a call at 1, 2, 4, 8 and 16 lanes (the scalar lone-block
+///   form), and at the default degree with the row lone-block form, beside the official crate
+///   and the default engine (`hash`);
+/// - one block: ns of a chain of dependent compressions, scalar against rows (the latency a
+///   lone block pays), and of the lanes kernel a block a lane at each width;
+/// - streaming: MB/s of a hasher fed small pieces, ours against the official crate's;
+/// - many: M inputs a second of `many_checked_on` at each degree.
+mod engines {
+    use std::hint::black_box;
+
+    use blaze_blake3::{Degree, Engine, EngineOpts, Hasher, Isa, Mode, Pair, Single};
+
+    use super::{input, seconds_a_call, tapes};
+
+    fn isas() -> Vec<Isa> {
+        let mut isas = vec![Isa::BASELINE];
+        let detected = Isa::detected();
+        if detected != Isa::BASELINE {
+            isas.push(detected);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if detected.name() == "avx512f" {
+            // SAFETY: `Isa::detected` gave AVX-512F, which it gives only when it saw AVX2 too.
+            isas.push(unsafe { Isa::avx2_unchecked() });
+        }
+        isas
+    }
+
+    fn mbs(len: usize, seconds: f64) -> String {
+        format!("{:>8.0}", len as f64 / seconds / 1e6)
+    }
+
+    pub(super) fn tables() {
+        let sizes = [64, 1024, 2048, 3072, 4096, 8192, 65536, 16 << 20];
+        for isa in isas() {
+            let default = isa.default_degree();
+            println!();
+            println!(
+                "# by degree on {} (MB/s, one input a call; default x{} scalar; rows = the row lone-block form at the default degree; pair = the default degree with batches two wide interleaved in general registers)",
+                isa.name(),
+                default.lanes()
+            );
+            println!(
+                "{:>9} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8}",
+                "bytes", "official", "hash", "x1", "x2", "x4", "x8", "x16", "rows", "pair", "best/off"
+            );
+            for len in sizes {
+                let data = input(len, 11);
+                let official = seconds_a_call(|| {
+                    black_box(blake3::hash(black_box(&data)));
+                });
+                let ours = seconds_a_call(|| {
+                    black_box(blaze_blake3::hash(black_box(&data)));
+                });
+                let by_degree: Vec<f64> = Degree::ALL
+                    .iter()
+                    .map(|&degree| {
+                        let engine = Engine::new(EngineOpts { single: Single::Scalar, degree, pair: Pair::Lanes, isa });
+                        seconds_a_call(|| {
+                            black_box(blaze_blake3::digest_on(engine, Mode::Hash, black_box(&data)));
+                        })
+                    })
+                    .collect();
+                let rows_engine =
+                    Engine::new(EngineOpts { single: Single::Rows, degree: default, pair: Pair::Lanes, isa });
+                let rows = seconds_a_call(|| {
+                    black_box(blaze_blake3::digest_on(rows_engine, Mode::Hash, black_box(&data)));
+                });
+                let pair_engine =
+                    Engine::new(EngineOpts { single: Single::Scalar, degree: default, pair: Pair::Interleaved, isa });
+                let pair = seconds_a_call(|| {
+                    black_box(blaze_blake3::digest_on(pair_engine, Mode::Hash, black_box(&data)));
+                });
+                let best = by_degree.iter().copied().chain([rows, pair, ours]).fold(f64::MAX, f64::min);
+                println!(
+                    "{len:>9} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:>8.2}",
+                    mbs(len, official),
+                    mbs(len, ours),
+                    mbs(len, by_degree[0]),
+                    mbs(len, by_degree[1]),
+                    mbs(len, by_degree[2]),
+                    mbs(len, by_degree[3]),
+                    mbs(len, by_degree[4]),
+                    mbs(len, rows),
+                    mbs(len, pair),
+                    official / best,
+                );
+            }
+
+            println!();
+            println!("# one block on {} (ns a compression, a chain of dependent ones)", isa.name());
+            let scalar = Engine::new(EngineOpts { single: Single::Scalar, degree: Degree::One, pair: Pair::Lanes, isa });
+            let rows = Engine::new(EngineOpts { single: Single::Rows, degree: Degree::One, pair: Pair::Lanes, isa });
+            let block: [u32; 16] = core::array::from_fn(|at| (at as u32).wrapping_mul(0x9E37_79B9));
+            for (label, engine) in [("scalar", scalar), ("rows", rows)] {
+                let mut cv = blaze_blake3::IV;
+                let chain = 64;
+                let seconds = seconds_a_call(|| {
+                    for _ in 0..chain {
+                        let out = blaze_blake3::compress_by(engine, &cv, black_box(&block), 0, 64, 0);
+                        cv = core::array::from_fn(|word| out[word]);
+                    }
+                    black_box(&cv);
+                });
+                println!("{label:>9} | {:>8.1} ns", seconds * 1e9 / f64::from(chain));
+            }
+
+            println!();
+            println!("# streaming on {} (MB/s, 64 KiB fed in pieces of each size)", isa.name());
+            println!("{:>9} | {:>8} | {:>8} | {:>8}", "piece", "official", "ours", "ours/off");
+            let data = input(64 * 1024, 5);
+            for piece in [1, 8, 13, 32, 64, 100, 1024, 4096] {
+                let official = seconds_a_call(|| {
+                    let mut hasher = blake3::Hasher::new();
+                    for part in data.chunks(piece) {
+                        hasher.update(black_box(part));
+                    }
+                    black_box(hasher.finalize());
+                });
+                let engine = Engine::new(EngineOpts { single: Single::Scalar, degree: default, pair: Pair::Lanes, isa });
+                let ours = seconds_a_call(|| {
+                    let mut hasher = Hasher::on(engine, Mode::Hash);
+                    for part in data.chunks(piece) {
+                        hasher.update(black_box(part));
+                    }
+                    black_box(hasher.finalize());
+                });
+                println!(
+                    "{piece:>9} | {} | {} | {:>8.2}",
+                    mbs(data.len(), official),
+                    mbs(data.len(), ours),
+                    official / ours
+                );
+            }
+
+            println!();
+            println!("# many at a time on {} (M inputs a second, by degree)", isa.name());
+            println!(
+                "{:>14} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8}",
+                "input bytes", "x1", "x2", "x4", "x8", "x16"
+            );
+            for (name, lens) in tapes() {
+                let datas: Vec<Vec<u8>> =
+                    lens.iter().enumerate().map(|(at, &len)| input(len, at as u32)).collect();
+                let inputs: Vec<&[u8]> = datas.iter().map(Vec::as_slice).collect();
+                let mut out = vec![[0u8; 32]; inputs.len()];
+                let rates: Vec<String> = Degree::ALL
+                    .iter()
+                    .map(|&degree| {
+                        let engine = Engine::new(EngineOpts { single: Single::Scalar, degree, pair: Pair::Lanes, isa });
+                        let seconds = seconds_a_call(|| {
+                            blaze_blake3::many_checked_on(engine, Mode::Hash, black_box(&inputs), &mut out)
+                                .expect("a slot for each input");
+                            black_box(&out);
+                        });
+                        format!("{:>8.2}", inputs.len() as f64 / seconds / 1e6)
+                    })
+                    .collect();
+                println!("{name:>14} | {}", rates.join(" | "));
+            }
+        }
+        lanes_kernel();
+    }
+
+    /// The lanes kernel alone, a chain of dependent compressions at each width: ns a block a
+    /// lane, the floor the wide tree is held to (rule 67).
+    fn lanes_kernel() {
+        println!();
+        println!("# the lanes kernel at the baseline (ns a block a lane, a chain of dependent ones)");
+        fn at<const L: usize>() -> f64 {
+            let rows: [[u32; 16]; L] =
+                core::array::from_fn(|lane| core::array::from_fn(|word| (lane * 16 + word) as u32));
+            let message = blaze_blake3::lanes::columns(&rows);
+            let mut cv: [[u32; L]; 8] = blaze_blake3::IV.map(|word| [word; L]);
+            let chain = 64;
+            let seconds = seconds_a_call(|| {
+                for _ in 0..chain {
+                    cv = blaze_blake3::lanes::compress(&cv, black_box(&message), [0; L], [0; L], [64; L], 0);
+                }
+                black_box(&cv);
+            });
+            seconds * 1e9 / f64::from(chain) / L as f64
+        }
+        println!(
+            "{:>8} | {:>8} | {:>8} | {:>8}\n{:>8.1} | {:>8.1} | {:>8.1} | {:>8.1}",
+            "x2",
+            "x4",
+            "x8",
+            "x16",
+            at::<2>(),
+            at::<4>(),
+            at::<8>(),
+            at::<16>()
         );
     }
 }

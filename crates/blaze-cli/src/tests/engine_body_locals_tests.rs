@@ -34,7 +34,7 @@ fn run(io: &Io, workers: u32, locals: BodyLocals) -> (std::string::String, engin
 
 /// THE RULE: a body that declares items, written by a macro or by hand, checks with the heads of
 /// its own items lowered in its own store: every body checked, no note, none of them "not
-/// checked", nothing "holds no text", the status and error lines `check`'s; the one wrong local
+/// checked", nothing "holds no text"; the one wrong local
 /// fn is the one error, as `check` prints it. 1 and 4 workers answer the same.
 #[test]
 fn engine_check_makes_a_bodys_own_items_in_its_own_store() {
@@ -43,9 +43,6 @@ fn engine_check_makes_a_bodys_own_items_in_its_own_store() {
             let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
             write(&io, "Cargo.toml", MANIFEST);
             write(&io, "src/lib.rs", text);
-            let before = stdout(&io).len();
-            let old = ask(&io, (Command::Check, "check"), work::Sizes::USUAL).expect("check answers");
-            let old_said = stdout(&io).split_off(before);
             let (said, checked) = run(&io, workers, BodyLocals::Lowered);
             let (notes, clean) = &checked.bodies;
             println!("a body's own items (wrong {wrong}, {workers} worker(s)): {clean} clean, notes {notes:?}\n{said}");
@@ -57,9 +54,8 @@ fn engine_check_makes_a_bodys_own_items_in_its_own_store() {
             let refused: std::vec::Vec<&std::string::String> = notes.iter().filter(|note| !note.contains("borrows not checked: ")).collect();
             assert!(refused.is_empty(), "every body checked (wrong {wrong}, {workers} worker(s)): {refused:?}");
             // What is right, not what the old path printed (it answered status 4, incomplete, for
-            // the wrong variant where the engine finds the one error: status 1): the old path is
-            // no oracle (rule 7) and goes at the switch.
-            let _ = (&old, &old_said);
+            // the wrong variant where the engine finds the one error: status 1): the old path was
+            // no oracle (rule 7) and went on 2026-11-19.
             if wrong {
                 assert_eq!(checked.status.0, 1, "the wrong local fn's error fails the check (wrong {wrong}, {workers} worker(s)):\n{said}");
             }

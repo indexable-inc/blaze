@@ -6,7 +6,7 @@ use core::fmt;
 use core::hash::BuildHasher;
 use core::mem::offset_of;
 
-use blaze_format_core::{Own, Placed, Writer};
+use blaze_format_core::{Own, Placed, Writer, WriterOpts};
 use blaze_hash::{FixedState, HashMap};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -216,7 +216,7 @@ impl<'b> TokensBuilder<'b> {
         for _ in 0..PAD {
             self.words.push(parser::Tokens::EOF_WORD);
         }
-        let mut out = Writer::new_in(TOKENS_SCHEMA, Own(self.alloc));
+        let mut out = Writer::new(WriterOpts { schema: TOKENS_SCHEMA, alloc: Own(self.alloc), capacity: None });
         let words = Placed::push(&mut out, &self.words);
         let lexeme_of = Placed::push(&mut out, &self.lexeme_of);
         let ctxs = Placed::push(&mut out, &self.ctxs);

@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_hash::{FixedState, Map};
 use std::alloc::Global;
 use syntax_tree::TextRange;
 

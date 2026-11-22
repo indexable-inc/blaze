@@ -21,7 +21,6 @@
 //! Every number varies by run and machine: it is in the profile alone, never in a key or a
 //! record (rule 25).
 
-use core::fmt::Write as _;
 
 use blaze_drive::Name;
 use blaze_engine::{STAGES, Stage};

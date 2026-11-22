@@ -1,7 +1,7 @@
 //! Head records (front2/head_record.rs; docs/v2/plan/design/drive.md, "End state", piece 10):
 //! every head the store makes for a small crate, and for every rung's crate, is encoded,
 //! decoded and compared equal to the one lowered, then encoded again byte for byte. Needs the
-//! installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_lifetimes.rs does.
+//! installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_region_rules.rs does.
 //!
 //! How equality is taken: the head is decoded into the store's own type table, which is
 //! hash-consed (equal structure is an equal `PTy`), and `head_record::same` compares it with
@@ -27,7 +27,8 @@ use blaze_id::ItemKey as LibKey;
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::head_record::{
-    HeadAt, HeadRecordError, HeadRef, copy_fn_life, decode, digest, encode, from_store, heads_in, same,
+    HeadAt, HeadRecordError, HeadRef, decode_retaining as decode, digest, encode, encode_with_origins, from_store, heads_in, reader_digest, regions_digest,
+    same,
 };
 use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::keys::checker_of;
@@ -119,11 +120,13 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
     let user = UserCrate { name: "krate", dir: "/krate/", root: "/krate/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("{what}: the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("{what}: resolve_crates: {e}"));
+    // The test's one heap handle, named once (the ambient-heap ratchet counts each line naming it).
+    let g = Alloc::global();
+    let names = inputs.resolve(&crates, g).unwrap_or_else(|e| panic!("{what}: resolve_crates: {e}"));
     let sources: Vec<SourceFile<'_>> = rel.iter().map(|(path, text)| SourceFile { path, text }).collect();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("{what}: front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+    let mut front = Front2::new(&names, &frame, &sources, g).unwrap_or_else(|e| panic!("{what}: front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, g);
     let mut seen = Seen::default();
 
     // Every item of the crate, asked for by its kind.
@@ -146,13 +149,14 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
     }
 
     // The lifetime parts of every fn and ADT, made (or refused) in the store: a record holds them.
-    let ats: Vec<HeadAt> = heads_in(&store, Alloc::global()).iter().copied().collect();
+    let ats: Vec<HeadAt> = heads_in(&store, g).iter().copied().collect();
     let parts: Vec<HeadAt> = ats.iter().copied().filter(|at| matches!(at, HeadAt::Fn(_) | HeadAt::Adt(_))).collect();
     store.make_lives(&names, &front.keys, &parts);
 
+    let origin = |key| blaze_ladder::front2::project::head_digest::opaque_origin(&names, &front.keys, &store, key);
     for at in ats {
         let made_life = matches!(store.lives_of(at), Some(LifeOf::Fn(Ok(_)) | LifeOf::Adt(Ok(_))));
-        let made = from_store(&store, at).and_then(|h| Ok((encode(h, store.tys.view(), Alloc::global())?, h.text())));
+        let made = from_store(&store, at).and_then(|h| Ok((encode_with_origins(h, store.tys.view(), g, &origin)?, h.text())));
         let (bytes, text) = match made {
             Ok(made) => made,
             Err(e @ HeadRecordError::Unencoded { .. }) => {
@@ -161,21 +165,21 @@ fn round_trip_all(what: &str, rel: &[(String, String)], edition: &str, cuts: boo
             }
             Err(e) => panic!("{what}: {at:?}: not encoded: {e}"),
         };
-        let decoded = decode(&bytes, text, &store.tys, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded: {e}"));
+        let decoded = decode(&bytes, text, &store.tys, g).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded: {e}"));
         let lowered = from_store(&store, at).expect("encoded above");
         if let Some(part) = same(lowered, decoded.as_ref(), store.tys.view()) {
             panic!("{what}: {at:?}: the decoded head differs from the lowered one in {part}");
         }
-        let again = encode(decoded.as_ref(), store.tys.view(), Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: decoded, not encoded again: {e}"));
+        let again = decoded.encode(store.tys.view(), g).unwrap_or_else(|e| panic!("{what}: {at:?}: decoded, not encoded again: {e}"));
         assert!(bytes[..] == again[..], "{what}: {at:?}: encoded again, the bytes differ");
-        let fresh = stable_tys(Alloc::global()).expect("a fresh stable table");
-        let elsewhere = decode(&bytes, text, &fresh, Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded into a fresh table: {e}"));
-        let from_fresh = encode(elsewhere.as_ref(), fresh.view(), Alloc::global()).unwrap_or_else(|e| panic!("{what}: {at:?}: not encoded from a fresh table: {e}"));
+        let fresh = stable_tys(g).expect("a fresh stable table");
+        let elsewhere = decode(&bytes, text, &fresh, g).unwrap_or_else(|e| panic!("{what}: {at:?}: not decoded into a fresh table: {e}"));
+        let from_fresh = elsewhere.encode(fresh.view(), g).unwrap_or_else(|e| panic!("{what}: {at:?}: not encoded from a fresh table: {e}"));
         assert!(bytes[..] == from_fresh[..], "{what}: {at:?}: encoded from a fresh table, the bytes differ");
         if cuts {
             for cut in 0..bytes.len() {
-                let scratch = stable_tys(Alloc::global()).expect("a fresh stable table");
-                match decode(&bytes[..cut], text, &scratch, Alloc::global()) {
+                let scratch = stable_tys(g).expect("a fresh stable table");
+                match decode(&bytes[..cut], text, &scratch, g) {
                     Err(HeadRecordError::Short { .. }) => {}
                     Ok(_) => panic!("{what}: {at:?}: cut at {cut} of {} bytes, decoded", bytes.len()),
                     Err(e) => panic!("{what}: {at:?}: cut at {cut} of {} bytes, refused but not as short: {e}", bytes.len()),
@@ -221,10 +225,11 @@ fn every_head_round_trips_equal() {
 }
 
 /// The planted difference: `pick_x` and `pick_y` have the same erased types (`&u8, &u8 ->
-/// &u8`); only their lifetime parts differ (the Reference, "Lifetime elision" does not apply:
-/// both name their output's lifetime, `'x` is `Named(0)` and `'y` is `Named(1)`). `pick_x`'s
-/// head with its own lifetime part and with `pick_y`'s must have different digests, and the
-/// same head encoded twice the same digest. A record that leaves the lifetime part out fails.
+/// &u8`); only their regions differ (the Reference, "Lifetime elision" does not apply: both
+/// name their output's lifetime, `'x` and `'y` are other parameters). `pick_x`'s head with its
+/// own regions (head_record.rs form 22, D148) and with `pick_y`'s must have different record
+/// digests and regions digests but ONE erased digest, and the same head encoded twice the same
+/// digests. A record or a regions digest that leaves the regions out fails.
 #[test]
 fn one_lifetime_moves_the_digest() {
     let tc = toolchain();
@@ -246,19 +251,26 @@ fn one_lifetime_moves_the_digest() {
         checker_of(lib)
     };
     let (kx, ky) = (key("pick_x"), key("pick_y"));
-    let life_x = copy_fn_life(store.fn_life(&names, &front.keys, kx).unwrap_or_else(|e| panic!("`pick_x`: {e}")), Alloc::global());
-    let life_y = copy_fn_life(store.fn_life(&names, &front.keys, ky).unwrap_or_else(|e| panic!("`pick_y`: {e}")), Alloc::global());
+    let regions_x = store.regions.made(kx).expect("`pick_x`: its regions filed with its head");
+    let regions_y = store.regions.made(ky).expect("`pick_y`: its regions filed with its head");
     let (hx, hy) = (&store.fns[&kx], &store.fns[&ky]);
     assert!(hx.inputs[..] == hy.inputs[..] && hx.output == hy.output, "the two fns' erased types are equal: only a lifetime differs");
-    assert!(life_x.regions[..] != life_y.regions[..], "the two fns' lifetime parts differ");
-    let Ok(HeadRef::Fn { key, head, preds, static_, .. }) = from_store(&store, HeadAt::Fn(kx)) else {
+    assert!(!regions_x.regions().same(regions_y.regions()), "the two fns' regions differ");
+    let Ok(HeadRef::Fn { key, head, preds, static_, misses, .. }) = from_store(&store, HeadAt::Fn(kx)) else {
         panic!("`pick_x`: a fn head")
     };
-    let own = HeadRef::Fn { key, head, preds, static_, life: Some(Ok(&life_x)) };
-    let planted = HeadRef::Fn { key, head, preds, static_, life: Some(Ok(&life_y)) };
-    let d = |h| digest(&encode(h, store.tys.view(), Alloc::global()).unwrap_or_else(|e| panic!("`pick_x`: not encoded: {e}")));
+    // `pick_y`'s regions lie over `pick_x`'s signature: the erased types are one `PTy`.
+    let own = HeadRef::Fn { key, head, preds, static_, regions: Some(regions_x), misses };
+    let planted = HeadRef::Fn { key, head, preds, static_, regions: Some(regions_y), misses };
+    let tys = store.tys.view();
+    let d = |h| digest(&encode(h, tys, Alloc::global()).unwrap_or_else(|e| panic!("`pick_x`: not encoded: {e}")));
+    let erased = |h| reader_digest(h, tys, Alloc::global()).unwrap_or_else(|e| panic!("`pick_x`: no erased digest: {e}"));
+    let regions = |h| regions_digest(h, tys, Alloc::global()).unwrap_or_else(|e| panic!("`pick_x`: no regions digest: {e}"));
     assert_eq!(d(own), d(own), "one head, two encodings, one digest");
-    assert_ne!(d(own), d(planted), "a head whose lifetime part differs has another digest");
+    assert_eq!(regions(own), regions(own), "one head, two regions digests");
+    assert_ne!(d(own), d(planted), "a head whose regions differ has another record digest");
+    assert_ne!(regions(own), regions(planted), "a head whose regions differ has another regions digest");
+    assert_eq!(erased(own), erased(planted), "a lifetime-only difference moved the erased digest");
     println!("front2_head_records: two heads differing in one lifetime have different digests");
 }
 

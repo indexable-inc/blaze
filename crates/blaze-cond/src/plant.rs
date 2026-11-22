@@ -1,16 +1,18 @@
-//! Planted bugs for the oracles' controls (rule 53): a test sets one for the length of a closure
-//! on its own thread, and the code it names misbehaves on purpose. The crate's code reads it
-//! through [`on`], which is `false` outside tests and folds away.
+//! The bugs a control can plant in the arena (D165, rule 78: a strategy is a type parameter at
+//! one seam). A [`PlantedBdd`](crate::PlantedBdd) holds its plant as its type parameter
+//! `P: Planted<CondPlant>`; [`Bdd`](crate::Bdd), the arena that ships, is `PlantedBdd<'_,
+//! NoPlant>`, whose every `has` is `false`, so each check compiles away. The truth-table oracle's
+//! controls (tests/mod.rs) make an arena with a value of this enum.
 
-#[cfg(test)]
-use core::cell::Cell;
+#![blaze::sans_io]
 
-/// A bug a control plants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
+use blaze_own::planted::Plants;
+
+/// A bug a control plants in the arena.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CondPlant {
     /// Nothing planted: the code as it is.
-    #[cfg(test)]
-    Clean,
+    None,
     /// The unique table interns a node whose high edge is complemented as it is, instead of
     /// complementing both edges and the result: a function and its negation stop sharing nodes,
     /// and one function can get two ids.
@@ -22,29 +24,4 @@ pub(crate) enum Plant {
     RestrictWrongBranch,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static PLANTED: Cell<Plant> = const { Cell::new(Plant::Clean) };
-}
-
-/// Whether `plant` is planted on this thread.
-#[cfg(test)]
-pub(crate) fn on(plant: Plant) -> bool {
-    PLANTED.with(Cell::get) == plant
-}
-
-/// Nothing is planted outside tests.
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) fn on(_plant: Plant) -> bool {
-    false
-}
-
-/// Runs `body` with `plant` planted on this thread, and puts the clean code back after, a panic
-/// out of `body` among the ways.
-#[cfg(test)]
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for CondPlant {}

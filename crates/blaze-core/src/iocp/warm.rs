@@ -10,19 +10,12 @@
 //! Windows can't nest a job with UI limits (the run's, which the launcher sets) under a job the
 //! launcher is in, so the launcher is in none of the driver's.
 
-use std::{
-    io,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
-    path::Path,
-    sync::Arc,
-};
+use std::{ffi::c_void, io, os::windows::io::OwnedHandle, path::Path, sync::Arc};
 
-use windows_sys::Win32::{
-    Foundation::{
-        DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
-        INVALID_HANDLE_VALUE,
-    },
-    System::Threading::{
+use blaze_sys::windows::{
+    Bool, Handle,
+    foundation::{DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle},
+    threading::{
         CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
         GetCurrentProcess, GetProcessId,
     },
@@ -31,7 +24,7 @@ use windows_sys::Win32::{
 use super::{
     process::{self, Finish, Launch, Standard},
     rundirs::RunDirs,
-    sys,
+    sys::{self, handle_of},
 };
 use crate::{Answer, Command, Confine, Confined, Handed};
 
@@ -50,11 +43,10 @@ pub(super) fn launch(warm: &Confined, n: u64) -> io::Result<Launched> {
     let (control, child_control) = process::pipe(false, n, "warm-in")?;
     let (answers, child_answers) = process::pipe(true, n, "warm-out")?;
     let stderr = driver_stderr()?;
-    let mut inherited =
-        [child_control.as_raw_handle(), child_answers.as_raw_handle(), std::ptr::null_mut()];
+    let mut inherited = [handle_of(&child_control), handle_of(&child_answers), Handle::NULL];
     let count = match &stderr {
         Some(stderr) => {
-            inherited[2] = stderr.as_raw_handle();
+            inherited[2] = handle_of(stderr);
             3
         }
         None => 2,
@@ -67,18 +59,18 @@ pub(super) fn launch(warm: &Confined, n: u64) -> io::Result<Launched> {
     // Its ends are its own now.
     drop((child_control, child_answers, stderr));
     // SAFETY: the process just made, open.
-    let pid = unsafe { GetProcessId(process.as_raw_handle()) };
+    let pid = unsafe { GetProcessId(handle_of(&process)) };
     Ok(Launched { process, pid, control, answers })
 }
 
 /// The driver's standard error duplicated, inheritable, for the launcher: none where the
 /// driver has none.
 fn driver_stderr() -> io::Result<Option<OwnedHandle>> {
-    let own = std::io::stderr().as_raw_handle();
-    if own.is_null() || own == INVALID_HANDLE_VALUE {
+    let own = handle_of(&std::io::stderr());
+    if own.is_null() || own.is_invalid() {
         return Ok(None);
     }
-    let mut copy = std::ptr::null_mut();
+    let mut copy = Handle::NULL;
     // SAFETY: this process's own handle of its standard error, which std keeps open for the
     // process's life, copied into this process.
     sys::check(unsafe {
@@ -88,7 +80,7 @@ fn driver_stderr() -> io::Result<Option<OwnedHandle>> {
             GetCurrentProcess(),
             &mut copy,
             0,
-            1,
+            Bool::TRUE,
             DUPLICATE_SAME_ACCESS,
         )
     })?;
@@ -100,7 +92,7 @@ pub(super) fn ended(process: &OwnedHandle) -> bool {
     let clock = crate::wait::Monotonic::new();
     let looked = crate::wait::signaled(
         "the warm launcher's process to have ended",
-        process.as_raw_handle(),
+        handle_of(process),
         Some(crate::wait::Deadline::PASSED),
         &clock,
     );
@@ -114,7 +106,7 @@ pub(super) struct Remote {
     /// The launcher's process. Open while this lives: the driver keeps it in the launcher's
     /// entry, which it lets go of only after the `Remote` of every run it handed is gone (each
     /// lives within one handing, `Iocp::hand_spawn`).
-    launcher: HANDLE,
+    launcher: Handle,
     pub(super) handed: Handed,
 }
 
@@ -122,21 +114,21 @@ impl Remote {
     /// `handle`, of this process, duplicated into the launcher with its access: the value it
     /// has there.
     fn give(&self, handle: &OwnedHandle, inherit: bool) -> io::Result<u64> {
-        let mut remote = std::ptr::null_mut();
+        let mut remote = Handle::NULL;
         // SAFETY: an open handle of this process; the launcher's process handle is open (see
         // `launcher`) and has `PROCESS_DUP_HANDLE` (`CreateProcessW` gives all access).
         sys::check(unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                handle.as_raw_handle(),
+                handle_of(handle),
                 self.launcher,
                 &mut remote,
                 0,
-                i32::from(inherit),
+                Bool::from(inherit),
                 DUPLICATE_SAME_ACCESS,
             )
         })?;
-        Ok(remote as usize as u64)
+        Ok(remote.raw() as usize as u64)
     }
 
     /// The handles are the launcher's from here: the frame naming them is queued.
@@ -159,11 +151,11 @@ impl Drop for Remote {
             unsafe {
                 DuplicateHandle(
                     self.launcher,
-                    value as usize as HANDLE,
-                    std::ptr::null_mut(),
+                    Handle::from_raw(value as usize as *mut c_void),
+                    Handle::NULL,
                     std::ptr::null_mut(),
                     0,
-                    0,
+                    Bool::FALSE,
                     DUPLICATE_CLOSE_SOURCE,
                 )
             };
@@ -213,7 +205,7 @@ pub(super) fn hand(
     let Standard { stdin, stdout, stderr, theirs } =
         process::standard(&command, n).map_err(handing)?;
     let mut remote = Remote {
-        launcher: launcher.as_raw_handle(),
+        launcher: handle_of(launcher),
         handed: Handed { run, stdin: 0, stdout: 0, stderr: 0, job: 0 },
     };
     let [child_stdin, child_stdout, child_stderr] = &theirs;

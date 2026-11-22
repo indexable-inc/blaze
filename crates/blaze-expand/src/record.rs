@@ -18,7 +18,7 @@ use core::mem::size_of;
 
 use blaze_own::{AVec, Alloc, Vec};
 
-use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, leb};
+use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, WriterOpts, leb};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_tokens::{OpenError, Tokens};
 
@@ -458,7 +458,7 @@ fn finish_slots<'b, const N: usize>(
 where
     [Slice<u8>; N]: Record,
 {
-    let mut out = Writer::new_in(schema, alloc);
+    let mut out = Writer::new(WriterOpts { schema: schema, alloc: alloc, capacity: None });
     let mut places = [(0u64, 0usize); N];
     for (i, (place, bytes)) in places.iter_mut().zip(slots.iter()).enumerate() {
         if !bytes.is_empty() {

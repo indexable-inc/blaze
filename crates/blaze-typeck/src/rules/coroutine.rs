@@ -13,29 +13,59 @@
 //!   walk, so an auto-trait goal on the future waits for it. It is never `Unpin` (the solver's
 //!   builtin: an async coroutine is immovable).
 //!
-//! The interior built now is a superset of the Reference's, so it can only refuse more, never
-//! accept what the rule refuses. Liveness across an `.await` is not computed. The superset:
+//! An async block with no suspension stores only its captures. A direct forwarding
+//! await can also prove its complete state from the checked operand. For other
+//! suspensions flow's saved-local analysis decides what is live (blaze-flow-lower
+//! `interior_parts`). Until then the type check uses a provisional superset:
 //! - the type of every expression and every pattern in the body, nested closures and blocks
 //!   included, which covers every local, every temporary, and every value moved in;
 //! - the future each `.await` holds while suspended (`<T as IntoFuture>::IntoFuture`);
 //! - for a block that is not `move`, `&T` for every local it names but does not bind: a capture
-//!   by reference. Capture kinds are not computed, so `T` is kept too: a capture is held as `T`,
+//!   by reference. When the capture mode is unknown, `T` is kept too: a capture is held as `T`,
 //!   `&T` or `&mut T`, and `T` and `&T` together require at least what each of them does.
 //!
-//! Owed: the exact interior. It is the types of the locals and temporaries whose storage is live
-//! at some `.await` (a local from its binding to its scope's end, less what was moved out; a
-//! temporary to its enclosing statement's end, longer when extended by a `let`), plus the
-//! captures by their computed kind.
+//! A failed auto-trait obligation on that superset can be decided only on the saved locals
+//! and captures, including the pending `IntoFuture` at the suspend point.
 
 use blaze_own::{Alloc, Vec};
+use core::ops::Range;
 
 use crate::body::{Capture, Expr, Pat, Stmt};
+use crate::columns::CaptureKind;
 use crate::diag::At;
-use crate::error::{CheckError, Limit, Stop};
-use crate::ids::{ExprId, Mutbl, PatId};
+use crate::error::{CheckError, Limit, Malformed, Stop};
+use crate::ids::{ExprId, ItemKey, LangItem, Mutbl, Name, PatId};
 use crate::machine::{Expectation, Flow, Frame, Machine, PendingFuture, Then};
-use crate::ty::{Ty, TyView, TypeCtx};
+use crate::ty::{Goal, Ty, TyView, TypeCtx};
 use crate::world::World;
+
+impl crate::columns::Checked<'_> {
+    /// Returns the output and stored types named by the local coroutine at `e`.
+    /// An async closure's expression is the closure. Its call signature returns
+    /// the future, while a block's expression already has the future type.
+    pub fn coroutine_at(
+        &self, body: &crate::body::BodyView<'_>, e: ExprId,
+    ) -> Result<Option<(u32, crate::portable::PTy, crate::portable::PTy)>, CheckError> {
+        use crate::portable::PNode;
+        let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(body, e) else { return Ok(None) };
+        let refused = CheckError::Malformed(Malformed::CoroutineFactsMissing {
+            reader: body.owner, at: body.expr_range(e), owner: body.owner, ordinal,
+        });
+        let types = self.types.view();
+        let ty = if ordinal < crate::coroutine_id::CLOSURE_BASE {
+            *self.expr_ty.get(e.0 as usize).ok_or(refused)?
+        } else {
+            let row = (ordinal - crate::coroutine_id::CLOSURE_BASE) as usize;
+            let sig = *self.closures.column::<2>().get(row).ok_or(refused)?;
+            let PNode::FnPtr(io, _) = types.node(sig)? else { return Err(refused) };
+            *types.list(io)?.last().ok_or(refused)?
+        };
+        match types.node(ty)? {
+            PNode::Future(block, output, interior) if block == e => Ok(Some((ordinal, output, interior))),
+            _ => Err(refused),
+        }
+    }
+}
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `async { body }`: `f.t` is the future, `f.u` its output, `f.a` the body's return site,
@@ -44,9 +74,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if f.state == 0 {
             // The root block of an `async fn` returns the fn's written type (the Reference,
             // "Async functions"; rules/opaque_def.rs `async_fn_output`).
-            let output = match self.async_fn_output(e)? {
-                Some(written) => written,
-                None => self.fresh()?,
+            let written = self.async_fn_output(e)?;
+            let (output, body_expect) = match written {
+                Some(t) => (t, Expectation::HasType(t)),
+                None => {
+                    let hint = self.expected_future_output(f.expect)?;
+                    // Keep the body's output inference independent. The destination's
+                    // associated-type equality is checked by the enclosing coercion.
+                    // This is a non-reporting hint even when the output is sized, so a mismatch
+                    // is diagnosed by the future's `Output` projection at the coercion site.
+                    let expect = hint.map_or(Expectation::None, Expectation::RvalueLikeUnsized);
+                    (self.fresh()?, expect)
+                }
             };
             #[cfg(test)]
             let fut_out = match self.plant {
@@ -61,7 +100,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             f.b = u32::from(self.diverges);
             self.ret_sites.push(f.a);
             self.resume(f, 1)?;
-            self.push_expr(body, Expectation::HasType(output), Then::CoerceMany(f.a))?;
+            self.push_expr(body, body_expect, Then::CoerceMany(f.a))?;
             return Ok(Flow::Wait);
         }
         self.ret_sites.pop();
@@ -81,13 +120,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(Flow::Done(f.t))
     }
 
+    /// A pointer constructor can supply its unsized pointee as the argument's hint.
+    /// For an async block, the object's equality on Future::Output types its return
+    /// site. The block itself keeps its concrete future type for the pointer coercion.
+    fn expected_future_output(&mut self, expect: Expectation) -> Result<Option<Ty>, Stop> {
+        let Some(target) = expect.to_option() else { return Ok(None) };
+        let TyView::Dynamic(bounds) = self.view(target) else { return Ok(None) };
+        let Some(future) = self.lang(LangItem::Future)? else { return Ok(None) };
+        for i in 0..self.ty.list_len(bounds) {
+            let predicate = self.ty.list_get(bounds, i);
+            if let TyView::ExProj { trait_, name, args_term } = self.view(predicate)
+                && trait_ == future && name == Name::of("Output")
+            {
+                if self.ty.list_len(args_term) != 1 {
+                    return Err(CheckError::Malformed(crate::error::Malformed::ObjectPreds { node: predicate.0 }).into());
+                }
+                return Ok(Some(self.ty.list_get(args_term, 0)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Makes the future of the async block or async closure `e` with `body` and `output`, opens
     /// its async site (the caller pops it), and queues its interior for `analyze_futures`.
     pub(crate) fn open_future(&mut self, e: ExprId, body: ExprId, output: Ty, capture: Capture) -> Result<Ty, Stop> {
         let interior = self.fresh()?;
         let fut = self.mk(TyView::Future(e, output, interior))?;
         self.async_sites.push(true);
-        self.futures.push(PendingFuture { expr: e, body, interior, capture });
+        self.futures.push(PendingFuture {
+            expr: e, body, interior, capture, initial: None, witness: crate::CoroutineWitness::NeedsCapturePlaces,
+        });
         Ok(fut)
     }
 
@@ -103,7 +165,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         })
     }
 
-    /// Fixes each future's interior (the module doc's superset), after the walk and selection,
+    /// Fixes each future's interior after the walk and selection,
     /// so the auto-trait goals on the futures can be decided by `select_all`.
     pub(crate) fn analyze_futures(&mut self) -> Result<(), Stop> {
         if self.futures.is_empty() {
@@ -117,13 +179,34 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut held: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
         let bound_steps = self.body.exprs.len() + self.body.pats.len() + self.body.stmts.len() + 1;
         for fi in 0..self.futures.len() {
-            let PendingFuture { expr: _, body, interior, capture } = self.futures[fi];
+            let future = self.futures[fi];
+            let PendingFuture { expr, body, interior, capture, .. } = future;
+            if future.witness == crate::CoroutineWitness::Complete {
+                continue;
+            }
+            held.clear();
+            if let Some(initial) = future.initial {
+                let TyView::Tuple(fields) = self.view(initial) else {
+                    return Err(CheckError::Malformed(Malformed::Expr(expr)).into());
+                };
+                for i in 0..self.ty.list_len(fields) {
+                    held.push(self.ty.list_get(fields, i));
+                }
+            }
+            if future.witness == crate::CoroutineWitness::NeedsSavedLocals
+                && let Some(pending) = self.forwarded_await(expr, body)?
+            {
+                held.push(pending);
+                let state = self.witness_tuple(&mut held)?;
+                self.demand_eq(At::Expr(expr), interior, state)?;
+                self.futures[fi].witness = crate::CoroutineWitness::Complete;
+                continue;
+            }
             seen_expr.clear();
             seen_expr.resize(self.body.exprs.len(), false);
             bound.clear();
             bound.resize(self.body.pats.len(), false);
             locals.clear();
-            held.clear();
             exprs.clear();
             exprs.push(body);
             let mut steps = 0usize;
@@ -169,20 +252,336 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     held.push(t);
                 }
             }
-            // The error type stands for a type already reported; it adds nothing to decide.
-            // Resolved first, so a variable already bound to `u32` and `u32` are one entry.
-            for t in held.iter_mut() {
-                *t = self.ty.resolve(*t)?;
-            }
-            let err = self.common.err;
-            held.retain(|&t| t != err);
-            held.sort_unstable_by_key(|t| t.0);
-            held.dedup();
-            let list = self.mk_list(&held)?;
-            let tuple = self.mk(TyView::Tuple(list))?;
-            self.unify(interior, tuple)?;
+            let witness = self.witness_tuple(&mut held)?;
+            self.demand_eq(At::Expr(expr), interior, witness)?;
         }
         Ok(())
+    }
+
+    /// A block that forwards directly to a single await has two states holding
+    /// user values: its captures before polling and the IntoFuture result while
+    /// pending. Only accept operands whose evaluation cannot introduce another
+    /// temporary borrowed across that await. All other bodies need flow's
+    /// saved-local analysis.
+    fn forwarded_await(&mut self, owner: ExprId, body: ExprId) -> Result<Option<Ty>, Stop> {
+        if matches!(self.body.expr(owner)?, Expr::Closure { .. }) {
+            // Destructuring a call parameter can leave an independently owned
+            // field to drop after the await.
+            return Ok(None);
+        }
+        let mut at = body;
+        for _ in 0..=self.body.exprs.len() {
+            match self.body.expr(at)? {
+                Expr::Paren(inner) => at = inner,
+                Expr::Block { stmts, tail: Some(tail), .. } => {
+                    if stmts.len != 0 {
+                        // The lowering of an async fn starts with `let x = x`
+                        // for each simple parameter. Both bindings have the
+                        // type already present in the initial, by-value state.
+                        if owner != self.body.root || self.body.coroutine.is_none() || at != body {
+                            return Ok(None);
+                        }
+                        for &s in self.body.stmt_list(stmts)? {
+                            let Stmt::Let { pat, init: Some(init), ty: None, else_: None } = self.body.stmt(s)? else { return Ok(None) };
+                            let Expr::Local(arg) = self.body.expr(init)? else { return Ok(None) };
+                            if !self.body.params.contains(&arg)
+                                || !matches!(self.body.pat(pat)?, Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none())
+                                || self.adjust.column::<0>().contains(&init)
+                            {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    at = tail;
+                }
+                Expr::Await(operand) => {
+                    let args = match self.body.expr(operand)? {
+                        Expr::Local(_) | Expr::AsyncBlock { .. } => &[][..],
+                        Expr::Call { callee, args } => {
+                            let callee_ty = self.ty.shallow_resolve(self.expr_ty[callee.ix()]);
+                            if !matches!(self.body.expr(callee)?, Expr::Path(_)) || !matches!(self.view(callee_ty), TyView::FnDef(..)) {
+                                return Ok(None);
+                            }
+                            self.body.expr_list(args)?
+                        }
+                        Expr::MethodCall { receiver, args, .. } if matches!(self.body.expr(receiver)?, Expr::Local(_)) => {
+                            // Borrowing a local receiver needs no backing temporary.
+                            // An arbitrary receiver adjustment can create one.
+                            let mut adjustments = self.adjust.column::<0>().iter().zip(self.adjust.column::<1>())
+                                .filter_map(|(&e, &kind)| (e == receiver).then_some(kind));
+                            if !matches!(adjustments.next(), None | Some(crate::columns::AdjustKind::Borrow { raw: false, .. }))
+                                || adjustments.next().is_some()
+                            {
+                                return Ok(None);
+                            }
+                            self.body.expr_list(args)?
+                        }
+                        _ => return Ok(None),
+                    };
+                    for &arg in args {
+                        if self.adjust.column::<0>().contains(&arg) {
+                            return Ok(None);
+                        }
+                        match self.body.expr(arg)? {
+                            Expr::Local(_) | Expr::Lit(_) | Expr::Path(_) => {}
+                            Expr::Ref { operand, .. }
+                                if matches!(self.body.expr(operand)?, Expr::Local(_)) && !self.adjust.column::<0>().contains(&operand) => {}
+                            _ => return Ok(None),
+                        }
+                    }
+                    return Ok(self.awaited.iter().find_map(|&(e, ty)| (e == at).then_some(ty)));
+                }
+                _ => return Ok(None),
+            }
+        }
+        Err(CheckError::Limit(Limit::Steps).into())
+    }
+
+    pub(super) fn capture_rows(&self, owner: ExprId) -> Range<usize> {
+        let start = self.captures.partition_point(|&(c, _, _)| c < owner);
+        let end = self.captures.partition_point(|&(c, _, _)| c <= owner);
+        start..end
+    }
+
+    pub(super) fn stored_capture(&mut self, row: usize) -> Result<Ty, Stop> {
+        let (_, p, kind) = self.captures[row];
+        let t = self.local_ty[p.ix()];
+        match kind {
+            CaptureKind::ByValue => Ok(t),
+            CaptureKind::ByRef => self.mk(TyView::Ref(Mutbl::Not, t)),
+            CaptureKind::ByMutRef => self.mk(TyView::Ref(Mutbl::Mut, t)),
+        }
+    }
+
+    /// Whether this body can suspend, if the rows prove its captured places.
+    /// The rows name bindings. A direct use of a whole binding in the recorded mode
+    /// proves the capture; a field use alone cannot establish that the whole value is stored.
+    pub(super) fn whole_capture_witness(
+        &mut self,
+        body: ExprId,
+        capture: Capture,
+        rows: &Range<usize>,
+        inherited: &[(PatId, CaptureKind)],
+        exprs: &mut Vec<ExprId, Alloc<'a>>,
+        pats: &mut Vec<PatId, Alloc<'a>>,
+        whole: &mut Vec<bool, Alloc<'a>>,
+    ) -> Result<Option<bool>, Stop> {
+        exprs.clear();
+        pats.clear();
+        if !rows.is_empty() {
+            whole.clear();
+            whole.resize(self.body.pats.len(), false);
+            for &(p, mode) in inherited {
+                if let Ok(i) = self.captures[rows.clone()].binary_search_by_key(&p, |&(_, pat, _)| pat)
+                    && self.captures[rows.start + i].2 == mode
+                {
+                    whole[p.ix()] = true;
+                }
+            }
+            self.mark_whole_capture(capture, rows, body, None, whole)?;
+        }
+        let needs_places = self.captures[rows.clone()].iter().any(|&(_, p, _)| !whole[p.ix()]);
+        exprs.push(body);
+        let mut steps = 0;
+        let mut suspends = false;
+        while let Some(e) = exprs.pop() {
+            steps += 1;
+            if steps > self.body.exprs.len() {
+                return Err(CheckError::Limit(Limit::Steps).into());
+            }
+            let node = self.body.expr(e)?;
+            match node {
+                Expr::Await(_) => suspends = true,
+                Expr::Missing => return Ok(None),
+                // Creating a nested coroutine or closure does not poll or call it.
+                Expr::AsyncBlock { .. } | Expr::Closure { .. } | Expr::ConstBlock { .. } => continue,
+                _ => {}
+            }
+            if needs_places {
+                if let Expr::Block { stmts, .. } = node {
+                    for &s in self.body.stmt_list(stmts)? {
+                        match self.body.stmt(s)? {
+                            Stmt::Expr { expr, .. } => self.mark_whole_capture(capture, rows, expr, None, whole)?,
+                            // An async fn moves each argument into its root block with a
+                            // plain binding. A wildcard or a destructure need not move it.
+                            Stmt::Let { init: Some(init), pat, .. }
+                                if matches!(self.body.pat(pat)?, Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none()) =>
+                            {
+                                self.mark_whole_capture(capture, rows, init, None, whole)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let values = match node {
+                    Expr::Tuple { elems } | Expr::Array { elems } => self.body.expr_list(elems)?,
+                    Expr::Call { callee, args } => {
+                        if let Some(usage) = self.callee_capture_use(e, callee) {
+                            let borrow = match usage {
+                                0 => Some(Mutbl::Not),
+                                1 => Some(Mutbl::Mut),
+                                _ => None,
+                            };
+                            self.mark_whole_capture(capture, rows, callee, borrow, whole)?;
+                        }
+                        self.body.expr_list(args)?
+                    }
+                    Expr::Binary { op, lhs, rhs } => {
+                        use crate::body::BinOp;
+                        let borrow = matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+                            .then_some(Mutbl::Not);
+                        self.mark_whole_capture(capture, rows, lhs, borrow, whole)?;
+                        self.mark_whole_capture(capture, rows, rhs, borrow, whole)?;
+                        &[]
+                    }
+                    Expr::Assign { lhs, rhs }
+                        if matches!(self.body.expr(lhs)?, Expr::Underscore) && self.discarded_local(rhs)? => &[],
+                    Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
+                        self.mark_whole_capture(capture, rows, lhs, Some(Mutbl::Mut), whole)?;
+                        self.mark_whole_capture(capture, rows, rhs, None, whole)?;
+                        &[]
+                    }
+                    Expr::MethodCall { receiver, args, .. } => {
+                        self.mark_whole_capture(capture, rows, receiver, None, whole)?;
+                        self.body.expr_list(args)?
+                    }
+                    Expr::Ref { mutbl, operand } => {
+                        self.mark_whole_capture(capture, rows, operand, Some(mutbl), whole)?;
+                        &[]
+                    }
+                    Expr::FormatArgs { args, .. } => {
+                        for &arg in self.body.expr_list(args)? {
+                            // The implicit formatting borrow is an adjustment on the argument.
+                            self.mark_whole_capture(capture, rows, arg, None, whole)?;
+                        }
+                        &[]
+                    }
+                    Expr::Struct { fields, .. } => {
+                        for field in self.body.field_init_list(fields)? {
+                            self.mark_whole_capture(capture, rows, field.expr, None, whole)?;
+                        }
+                        &[]
+                    }
+                    Expr::If { ref cond, .. } => core::slice::from_ref(cond),
+                    Expr::Unary { op, ref operand } if op != crate::body::UnOp::Deref => core::slice::from_ref(operand),
+                    Expr::Block { tail: Some(ref value), .. } | Expr::Return { value: Some(ref value) } | Expr::Await(ref value) => core::slice::from_ref(value),
+                    _ => &[],
+                };
+                for &value in values {
+                    self.mark_whole_capture(capture, rows, value, None, whole)?;
+                }
+            }
+            pats.clear();
+            self.expr_children(e, exprs, pats)?;
+        }
+        for i in rows.clone() {
+            let p = self.captures[i].1;
+            if !whole[p.ix()] {
+                return Ok(None);
+            }
+        }
+        Ok(Some(suspends))
+    }
+
+    fn mark_whole_capture(
+        &mut self,
+        capture: Capture,
+        rows: &Range<usize>,
+        value: ExprId,
+        mut borrow: Option<Mutbl>,
+        whole: &mut [bool],
+    ) -> Result<(), Stop> {
+        let mut place = value;
+        if capture == Capture::Move {
+            // The use may be written through parentheses or explicit dereferences.
+            // A field reached without dereferencing its base can be disjoint.
+            for _ in 0..=self.body.exprs.len() {
+                place = match self.body.expr(place)? {
+                    Expr::Paren(inner) | Expr::Unary { op: crate::body::UnOp::Deref, operand: inner } => inner,
+                    Expr::Field { base, .. } | Expr::TupleField { base, .. }
+                        if self.adjust.column::<0>().iter().zip(self.adjust.column::<1>()).any(|(&at, kind)| {
+                            at == base && matches!(kind, crate::columns::AdjustKind::Deref { .. })
+                        }) => base,
+                    _ => break,
+                };
+            }
+        }
+        let Expr::Local(p) = self.body.expr(place)? else { return Ok(()) };
+        let Ok(i) = self.captures[rows.clone()].binary_search_by_key(&p, |&(_, pat, _)| pat) else { return Ok(()) };
+        // A move capture ends before the first dereference. The receiver of
+        // `move || shared.lock()` is the owned smart pointer, even though the
+        // method expects a reference to its target. The same holds for a
+        // by-value argument that undergoes a coercion.
+        if capture == Capture::Move {
+            if self.captures[rows.start + i].2 == CaptureKind::ByValue {
+                whole[p.ix()] = true;
+            }
+            return Ok(());
+        }
+        // Calling Deref on a smart pointer borrows the pointer itself. Box
+        // has a special place projection in the Reference and needs its own
+        // precision proof. Builtin reborrows through references do too.
+        let mut steps = self.adjust.column::<0>().iter().zip(self.adjust.column::<1>())
+            .filter_map(|(&at, &kind)| (at == value).then_some(kind));
+        if matches!(steps.next(), Some(crate::columns::AdjustKind::Deref { overloaded: Some(Mutbl::Not) }))
+            && matches!(steps.last(), Some(crate::columns::AdjustKind::Borrow { raw: false, mutbl: Mutbl::Not, .. }))
+            && borrow.is_none()
+        {
+            let ty = self.ty.shallow_resolve(self.local_ty[p.ix()]);
+            if let TyView::Adt(adt, _) = self.view(ty)
+                && self.lang(LangItem::OwnedBox)? != Some(adt)
+                && self.captures[rows.start + i].2 == CaptureKind::ByRef
+            {
+                whole[p.ix()] = true;
+            }
+            return Ok(());
+        }
+        for (&at, &adjustment) in self.adjust.column::<0>().iter().zip(self.adjust.column::<1>()) {
+            if at != value {
+                continue;
+            }
+            // Borrowing the unprojected receiver still uses the entire binding. An
+            // autoderef, unsizing, or other coercion needs the adjusted place instead.
+            match adjustment {
+                crate::columns::AdjustKind::Borrow { mutbl, raw: false, .. }
+                    if borrow.is_none() || borrow == Some(mutbl) => borrow = Some(mutbl),
+                _ => return Ok(()),
+            }
+        }
+        let mode = match (capture, borrow) {
+            (Capture::Move, _) => CaptureKind::ByValue,
+            (Capture::Ref, Some(Mutbl::Mut)) => CaptureKind::ByMutRef,
+            (Capture::Ref, Some(Mutbl::Not)) => CaptureKind::ByRef,
+            (Capture::Ref, None) if self.block_moved_out(value)? => CaptureKind::ByValue,
+            (Capture::Ref, None) => CaptureKind::ByRef,
+        };
+        if self.captures[rows.start + i].2 == mode {
+            *whole.get_mut(p.ix()).ok_or(CheckError::Malformed(Malformed::Pat(p)))? = true;
+        }
+        Ok(())
+    }
+
+    /// Sending or sharing the unpolled future already requires its initial state to
+    /// satisfy the trait. Losing a local at a later suspension cannot change this.
+    pub(super) fn initial_state_fails(&mut self, block: ExprId, trait_: ItemKey) -> Result<bool, Stop> {
+        let Some(initial) = self.futures.iter().find(|f| f.expr == block).and_then(|f| f.initial) else { return Ok(false) };
+        if self.witness_source(initial)? != super::async_fn::Witness::Fixed {
+            return Ok(false);
+        }
+        let args = self.mk_list(&[initial])?;
+        Ok(!self.ty.may_hold(Goal::Trait { trait_, args }, &mut self.reads)?)
+    }
+
+    pub(super) fn witness_tuple(&mut self, held: &mut Vec<Ty, Alloc<'a>>) -> Result<Ty, Stop> {
+        for t in held.iter_mut() {
+            *t = self.ty.resolve(*t)?;
+        }
+        let err = self.common.err;
+        held.retain(|&t| t != err);
+        held.sort_unstable_by_key(|t| t.0);
+        held.dedup();
+        let list = self.mk_list(held)?;
+        self.mk(TyView::Tuple(list))
     }
 
     /// The direct child expressions of `x` into `exprs`, and the patterns it binds into `pats`.
@@ -198,7 +597,6 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             | Expr::OffsetOf { .. } => {}
             Expr::Paren(i) | Expr::Loop { body: i } | Expr::Await(i) => exprs.push(i),
             Expr::Block { stmts, tail, .. } | Expr::ConstBlock { stmts, tail, .. } => {
-                exprs.extend(tail);
                 for &s in b.stmt_list(stmts)? {
                     match b.stmt(s)? {
                         Stmt::Let { pat, init, else_, .. } => {
@@ -210,6 +608,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         Stmt::Item => {}
                     }
                 }
+                exprs.extend(tail);
             }
             Expr::If { cond, then, else_ } => {
                 exprs.push(cond);

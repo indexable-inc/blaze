@@ -23,7 +23,6 @@
 
 use core::alloc::Allocator;
 
-use crate::draw::Any;
 use crate::tape::Tape;
 
 /// The most elements of a list, and characters of a text, drawn here: `Any`'s bound

@@ -47,6 +47,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 // The body's own `where const` condition is assumed, as its other clauses are.
                 PClause::Const { cond, args } => Goal::ConstHolds { cond, args: self.lower_body_list(preds.types, args)? },
+                // Outlives clauses are the borrow checker's (D148); the checker takes them as true.
+                PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
             };
             #[cfg(test)]
             if self.plant == crate::machine::Plant::IgnoreWhereClauses {
@@ -98,6 +100,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.ty.register(crate::ty::Obligation { goal: Goal::WellFormed(w), cause })?;
                 }
                 let mut inputs: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
+                // The signature's projections are rows at the body's root while it is lowered
+                // (machine.rs `sig_rows`); an early return stops the whole check.
+                self.sig_rows = true;
                 for (k, &t) in sig.inputs.iter().enumerate() {
                     let cause = self.sig_place(k, n_inputs);
                     inputs.push(self.lower_sig_ty(sig.types, t, cause)?);
@@ -120,6 +125,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 } else {
                     self.lower_sig_ty(sig.types, sig.output, out_cause)?
                 };
+                self.sig_rows = false;
                 (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }
             None => (blaze_own::Vec::new_in(self.alloc), self.fresh()?, false),

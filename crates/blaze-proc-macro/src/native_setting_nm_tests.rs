@@ -3,7 +3,8 @@
 //! member's path, before anything runs; with the member there the shelf passes and the next
 //! check (the SDK) is what refuses.
 
-use blaze_build_script::toolchain::{self, PIN, SHELF_MEMBERS};
+use blaze_build_script::toolchain::{self, SHELF_MEMBERS};
+use blaze_pins::CLANG_JSON as PIN;
 
 use crate::native_setting::{NativeSettingError, native_setting};
 

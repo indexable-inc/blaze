@@ -146,7 +146,7 @@ hooks.
     requires.
 18. **The trait solver and `rustc_type_ir` come from the pinned nightly.** They are taken from
     `compiler/rustc_next_trait_solver` and `compiler/rustc_type_ir` at the rustc commit of
-    `harness/toolchain`, not rust-analyzer's crates.io release with backports. Our changes
+    `pins/toolchain`, not rust-analyzer's crates.io release with backports. Our changes
     (`u32`-indexed tables, SoA) are a patch series on top. `tools/v2/solver_sync.py` replays
     them on every daily toolchain bump, so trait resolution is rustc's at the pinned nightly
     by construction.

@@ -40,7 +40,7 @@ fn command(io: &Io, nonce: u64) -> u32 {
     let root = fs.open_dir(&cx, &Path::new("one").expect("a path")).expect("the checkout");
     let lent = home.open_store(&Settings::default(), Facts { boot: Some(1), nonce }, blaze_own::testing::heap().alloc()).expect("the store opens");
     let found = old_home(&cx, &home, &root, "/one", &lent, &err).expect("the look");
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&cx, &lent, 0).expect("the commit after the answer");
     found
 }
 

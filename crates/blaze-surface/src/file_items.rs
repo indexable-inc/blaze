@@ -28,7 +28,7 @@ use core::fmt;
 use core::mem::offset_of;
 use core::ops::Deref;
 
-use blaze_format::{FormatError, Slice, Writer};
+use blaze_format::{FormatError, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, Portable};
 use blaze_own::{Alloc, Vec};
 
@@ -520,9 +520,16 @@ blaze_format::record! {
 
 blaze_format::record! {
     /// One [`Attr`].
+    ///
+    /// 2: `literal` of a `#[cfg]` or `#[cfg_attr]` is the attribute's own bytes, as written, in
+    /// the record's names table ([`FileItemsView::cfgs`]: what plan time evaluates a unit's
+    /// `test` against, D191), in what version 1 left zero: no byte more a row, and a file with no
+    /// such attribute writes no byte more at all ([`FileItems::write`]).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct AttrRow: 1 {
+    pub(crate) struct AttrRow: 2 {
         pub(crate) range: Range,
+        /// A `#[path]`'s literal, relative to its entry; a cfg attribute's text in the names
+        /// table; zero for every other kind.
         pub(crate) literal: Range,
         pub(crate) inner: bool,
         pub(crate) kind: AttrTag,
@@ -543,8 +550,12 @@ blaze_format::record! {
 
 blaze_format::record! {
     /// The root of a [`FileItems`] buffer.
+    ///
+    /// 4: its attributes are [`AttrRow`] 2 (a cfg attribute's text kept). A home's outline
+    /// records of form 3 are read as no record of this form: every outline is remade once, by
+    /// the moved tools as well (blaze-cli home.rs `tools`).
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct FileItemsRoot: 3 {
+    pub(crate) struct FileItemsRoot: 4 {
         pub(crate) file: ContentId,
         pub(crate) items: Slice<ItemRow>,
         pub(crate) attrs: Slice<AttrRow>,
@@ -617,16 +628,31 @@ fn item_of(row: &ItemRow) -> Item {
     }
 }
 
-fn attr_row_of(attr: &Attr) -> AttrRow {
+/// Whether an attribute of kind `kind` keeps its text in the record ([`AttrRow`] 2).
+const fn keeps_text(kind: AttrKind) -> bool {
+    matches!(kind, AttrKind::Cfg | AttrKind::CfgAttr)
+}
+
+/// `attr`'s row; `text`: a cfg attribute's text in the names table ([`keeps_text`]), ignored
+/// for any other kind.
+fn attr_row_of(attr: &Attr, text: Range) -> AttrRow {
     let (kind, literal) = match attr.kind {
         AttrKind::Doc => (AttrTag::Doc, Range::default()),
-        AttrKind::Cfg => (AttrTag::Cfg, Range::default()),
-        AttrKind::CfgAttr => (AttrTag::CfgAttr, Range::default()),
+        AttrKind::Cfg => (AttrTag::Cfg, text),
+        AttrKind::CfgAttr => (AttrTag::CfgAttr, text),
         AttrKind::Path { literal } => (AttrTag::Path, literal),
         AttrKind::MacroExport => (AttrTag::MacroExport, Range::default()),
         AttrKind::Other => (AttrTag::Other, Range::default()),
     };
     AttrRow { range: attr.range, literal, inner: attr.inner, kind, pad: [0; 2] }
+}
+
+/// The text `row` keeps ([`keeps_text`]), as its row holds it; zero for any other kind.
+fn kept_text(row: &AttrRow) -> Range {
+    match row.kind {
+        AttrTag::Cfg | AttrTag::CfgAttr => row.literal,
+        _ => Range::default(),
+    }
 }
 
 fn attr_of(row: &AttrRow) -> Attr {
@@ -777,15 +803,37 @@ impl FileItems<'_> {
             };
             rows.push(row_of(item, names.push(name, "FileItems names")?));
         }
-        let mut attrs = Vec::with_capacity_in(self.attrs.len(), alloc);
-        for (at, attr) in self.attrs.iter().enumerate() {
-            if !attr_is_sound(attr) {
-                return Err(BuildError::BadIndex { table: "FileItems attrs", index: count(at, "FileItems attrs")? });
-            }
-            attrs.push(attr_row_of(attr));
-        }
         if self.file_attrs.start > self.file_attrs.end || wide(self.file_attrs.end) > self.attrs.len() {
             return Err(BuildError::BadIndex { table: "FileItems attrs", index: self.file_attrs.end });
+        }
+        // Where each attribute's range counts from (its entry's start, the file's for the file's
+        // own): asked only of a cfg attribute, whose own bytes go into the names table after
+        // every name, in the attributes' order (rule 25). A file with none makes no list.
+        let mut bases: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+        if self.attrs.iter().any(|attr| keeps_text(attr.kind)) {
+            bases.resize(self.attrs.len(), u32::MAX);
+            for item in self.items.iter() {
+                bases[item.attrs.to_usize()].fill(item.range.start);
+            }
+            bases[self.file_attrs.to_usize()].fill(0);
+        }
+        let mut attrs = Vec::with_capacity_in(self.attrs.len(), alloc);
+        for (at, attr) in self.attrs.iter().enumerate() {
+            let index = count(at, "FileItems attrs")?;
+            if !attr_is_sound(attr) {
+                return Err(BuildError::BadIndex { table: "FileItems attrs", index });
+            }
+            let text = match keeps_text(attr.kind) {
+                false => Range::default(),
+                true => {
+                    // An attribute of no entry, or whose bytes are not the text's, is refused.
+                    let base = bases.get(at).copied().filter(|base| *base != u32::MAX).ok_or(BuildError::BadIndex { table: "FileItems attrs", index })?;
+                    let written = attr.range.checked_shifted(base).and_then(|range| range.get(self.text)).ok_or(BuildError::BadIndex { table: "FileItems attrs", index })?;
+                    let kept = names.push(written, "FileItems names")?;
+                    Range::new(kept.at, kept.at + kept.len)
+                }
+            };
+            attrs.push(attr_row_of(attr, text));
         }
         let messages = core::str::from_utf8(self.messages)
             .map_err(|_| BuildError::BadIndex { table: "FileItems messages", index: 0 })?;
@@ -796,7 +844,7 @@ impl FileItems<'_> {
             }
             errors.push(error_row_of(error));
         }
-        let mut out = Writer::new_in(<FileItemsRoot as blaze_format::Record>::SCHEMA, alloc);
+        let mut out = Writer::new(WriterOpts { schema: <FileItemsRoot as blaze_format::Record>::SCHEMA, alloc: alloc, capacity: None });
         let names = Column::push(&mut out, names.bytes());
         let messages = Column::push(&mut out, messages.as_bytes());
         let items = Column::push(&mut out, &rows);
@@ -893,8 +941,13 @@ impl<'a> FileItemsView<'a> {
         }
         for row in view.attrs {
             let attr = attr_of(row);
-            if attr_row_of(&attr) != *row || !attr_is_sound(&attr) {
+            let text = kept_text(row);
+            if attr_row_of(&attr, text) != *row || !attr_is_sound(&attr) {
                 return Err(invalid(at_of_record(row, buffer), "an attribute that is not its value's one sound encoding"));
+            }
+            // A cfg attribute's text is its own bytes: in the names table, as long as its range.
+            if keeps_text(attr.kind) && (!forwards(text) || text.get(view.names).is_none() || text.len() != attr.range.len()) {
+                return Err(invalid(at_of_record(row, buffer), "a cfg attribute whose text is not in the names table at its range's length"));
             }
         }
         let span = view.file_attrs;
@@ -999,6 +1052,28 @@ impl<'a> FileItemsView<'a> {
     /// The file's own inner attributes and doc comments (`#![..]`, `//!`).
     pub fn file_attrs(&self) -> impl ExactSizeIterator<Item = Attr> + use<'a> {
         self.span(self.file_attrs)
+    }
+
+    /// Each `#[cfg(..)]` and `#[cfg_attr(..)]` of `item` (of the file itself, its `#![..]`, for
+    /// `None`), in order: its kind and its own bytes as written, `#[` to `]`. What plan time
+    /// reads a unit's `test` against (blaze-cli engine_plan_cfg.rs), with no text of the file.
+    pub fn cfgs(&self, item: Option<&Item>) -> impl Iterator<Item = (AttrKind, &'a str)> + use<'a> {
+        let span = item.map_or(self.file_attrs, |item| item.attrs);
+        let names = self.names;
+        let attrs: &'a [AttrRow] = self.attrs;
+        attrs[span.to_usize()].iter().filter_map(move |row| {
+            let attr = attr_of(row);
+            match keeps_text(attr.kind) {
+                true => Some((attr.kind, kept_text(row).get(names).expect("a cfg attribute's text is checked when its view is read"))),
+                false => None,
+            }
+        })
+    }
+
+    /// How many bytes the names table holds: what a test of [`AttrRow`] 2's cost reads.
+    #[cfg(test)]
+    pub(crate) fn names_len(&self) -> usize {
+        self.names.len()
     }
 
     /// The syntax errors: the parser's, in the order it found them, then the lexer's.

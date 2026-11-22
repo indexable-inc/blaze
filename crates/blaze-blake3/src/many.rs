@@ -25,7 +25,7 @@
 
 use core::fmt;
 
-use crate::{DERIVE_KEY_MATERIAL, IV, KEYED_HASH, OUT_LEN, many, words_of};
+use crate::{DERIVE_KEY_MATERIAL, Engine, IV, KEYED_HASH, OUT_LEN, many, many_on, words_of};
 
 /// The BLAKE3 mode a batch hashes in, its key with it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,7 +42,7 @@ pub enum Mode {
 impl Mode {
     /// The key words and the mode's flag a compression of this mode starts from (the BLAKE3
     /// paper, section 2.3 "Modes": the IV for the plain mode, the key's words otherwise).
-    fn key_and_flags(self) -> ([u32; 8], u32) {
+    pub(crate) fn key_and_flags(self) -> ([u32; 8], u32) {
         match self {
             Mode::Hash => (IV, 0),
             Mode::Keyed(key) => (words_of(&key), KEYED_HASH),
@@ -82,6 +82,22 @@ pub fn many_checked(mode: Mode, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) -> 
     }
     let (key, flags) = mode.key_and_flags();
     many(&key, flags, inputs, out);
+    Ok(())
+}
+
+/// [`many_checked`] by `engine`: its degree's lanes (one at a time at [`crate::Degree::One`])
+/// on its instructions, the same digests.
+pub fn many_checked_on(
+    engine: Engine,
+    mode: Mode,
+    inputs: &[&[u8]],
+    out: &mut [[u8; OUT_LEN]],
+) -> Result<(), CountMismatch> {
+    if inputs.len() != out.len() {
+        return Err(CountMismatch { inputs: inputs.len(), digests: out.len() });
+    }
+    let (key, flags) = mode.key_and_flags();
+    many_on(engine, &key, flags, inputs, out);
     Ok(())
 }
 

@@ -16,7 +16,7 @@ Everything blaze downloads from blaze's own releases comes from one place, the R
 edge: a pinned release's archive and sums, the channels'
 pointers, the standard library's source (`crates/blaze-cargo/src/toolchain/library.rs`), install.sh's
 download (CI's stage 0 too, `.github/actions/blaze`) and the pinned LLVM
-(`crates/blaze-toolchain/pins/llvm.json`'s `release`, which blaze's native inputs and `llvm.py fetch`
+(`pins/llvm.json`'s `release`, which blaze's native inputs and `llvm.py fetch`
 read). GitHub's release CDN ran at 0.3 to 0.55 MB/s per download from a
 developer's Mac on 2026-11-05, minutes for a 155 MB archive. GitHub is no fallback: a key R2
 lacks is an error naming it (`BLAZE_RELEASES` names another place laid out the same). Every

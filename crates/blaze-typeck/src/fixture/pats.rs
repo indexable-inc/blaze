@@ -5,7 +5,7 @@
 
 use super::Bb;
 use crate::body::{Arm, BindAnn, BodyPath, Expr, Pat, Segment};
-use crate::ids::{ExprId, List, Name, PatId, PathIdx, Range, ScopeId};
+use crate::ids::{ExprId, List, Mutbl, Name, PatId, PathIdx, Range, ScopeId};
 
 impl Bb {
     fn push_pat(&mut self, p: Pat) -> PatId {
@@ -55,6 +55,16 @@ impl Bb {
     /// A `mut name` binding.
     pub fn bind_mut(&mut self, name: &str) -> PatId {
         self.push_pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None })
+    }
+
+    /// `&inner` (`m` is `Not`) or `&mut inner` (`Mut`).
+    pub fn ref_pat(&mut self, m: Mutbl, inner: PatId) -> PatId {
+        self.push_pat(Pat::Ref { mutbl: m, inner })
+    }
+
+    /// A `ref name` (`m` is `Not`) or `ref mut name` (`Mut`) binding.
+    pub fn bind_ref(&mut self, name: &str, m: Mutbl) -> PatId {
+        self.push_pat(Pat::Bind { ann: BindAnn { by_ref: Some(m), mutable: false }, name: Name::of(name), sub: None })
     }
 
     /// `match scrutinee { pat if guard => body, .. }`: each arm's guard, if any.

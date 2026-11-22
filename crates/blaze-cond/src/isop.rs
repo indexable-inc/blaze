@@ -13,10 +13,11 @@
 use core::fmt;
 
 use blaze_int::{Int, idx};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, planted::Planted};
 
-use crate::bdd::{Bdd, Cond, Var};
+use crate::bdd::{Cond, PlantedBdd, Var};
 use crate::error::CondError;
+use crate::plant::CondPlant;
 use crate::space::{Space, VarKind};
 
 const NONE: u32 = u32::MAX;
@@ -92,7 +93,13 @@ impl<'a> Cover<'a> {
 
     /// Finds an irredundant cover between `lower` and `upper` (cleared first), in at most `most`
     /// steps and cubes; returns the cover's function.
-    pub fn compute(&mut self, bdd: &mut Bdd<'_>, lower: Cond, upper: Cond, most: u32) -> Result<Cond, CondError> {
+    pub fn compute(
+        &mut self,
+        bdd: &mut PlantedBdd<'_, impl Planted<CondPlant>>,
+        lower: Cond,
+        upper: Cond,
+        most: u32,
+    ) -> Result<Cond, CondError> {
         self.cubes.clear();
         self.lits.clear();
         self.frames.clear();

@@ -2386,3 +2386,345 @@ read with them in scope): NEVER COMPILED, the rerun is queued in BUILD-STATUS-FR
 14:30". Still refused: "a bound on an associated type's own parameter (`type Out<T: Bound>`)". Gap:
 the implied `Sized` of a generic associated type's own parameters is not filed. The tempo census for
 the three classes has not been run.
+
+## Head making waits (D161 loops 2 and 4; 2026-11-20, spec; first step WRITTEN, NEVER COMPILED)
+
+Today a head's making restarts from the top in two places. In front2 heads.rs
+`Store::ensure_seeded`, each `Step::Need(k)` drops the step's work. The need is made, and the same
+want is stepped again from the top. Before 2026-11-20 that meant even lowering its text again. In
+check.rs `make`, each `Why::NeedConst(c)` drops the whole fill: `c` is evaluated, and `make_once`
+runs again, up to `MOST_CONSTS` (64). The end state is one wait: a head that meets a need parks,
+and when the need is made it goes on from where it stopped.
+
+**The frame.** A parked want is a `HeadFrame` (heads.rs) holding:
+
+- the `Want`;
+- `FrameLowering`: the item's detail, text and names module, and the text's `Lowered`, made on
+  the frame's first step that reaches the text;
+- (step 2) a `HeadCursor`: how far the head's own builder got. For an ADT, it is the generics
+  filed and the index of the next field. For a trait, the supertraits, the members done and the
+  next member. For an impl, the header done and the next member. For a fn, the inputs done. The
+  cursor holds only indices into the lowering and ids of rows already filed in the store. It
+  holds no borrowed view, so a frame can move between stack slots;
+- (step 3) the pending need: a `LibKey` head, or a constant `c` with its place.
+
+**Where it yields.** Every `Why::Need(k)` and `Why::NeedConst(c, at)` a builder raises, and
+`Step::First(w)` (an impl before its member fn). Each is a point where everything before it is
+already filed in the store, so resuming means "skip what the cursor says is filed". The members'
+extra needs (`more_needs`) are made before the frame resumes, as today.
+
+**What `Maker::step` returns** (blaze-ask, when the store is driven by the asker):
+
+- `Step::Needs(Need::head(k))` at a head need;
+- `Step::Needs(Need::constant(c))` at a constant need. The evaluator is another maker on the same
+  asker, so `MOST_CONSTS` and `ConstFail::Nested` go away. A constant met inside an evaluation
+  parks like any need, and a constant cycle is the asker's `AskError::Cycle`;
+- `Step::Made(ordinal)` when the want is filed;
+- `Step::Failed(code)` for a refusal (`HeadError::Item`'s `Why`).
+
+The frame is the asker's `Frame` type, and `start` is a frame with nothing lowered.
+
+**Cutting `Store::step` into steps.**
+
+1. Lower once per frame. This is BUILT (2026-11-20, this lane): `ensure_seeded`'s stack is
+   `Vec<HeadFrame, Alloc>` on the store's allocator, and `step` takes the frame's
+   `&mut Option<FrameLowering>`. A step after a need re-runs the builder, but never the parse.
+   The lowering is a function of the text, the crate's cfg and its edition, and no step changes
+   any of them. The names reads repeated by a re-run land in the recorder's sorted set, so the
+   read list is unchanged.
+2. Give each builder (`adt_head`, `adt`, `trait_head`, `trait_members`, `impl_`, `member_fn`,
+   `fn_head`, `alias`, `trait_alias`) a cursor argument. Each loop over fields, members or inputs
+   starts at the cursor and bumps it after each filed row, so a resume skips the rows before it.
+   Done one builder at a time. `Cost`'s `census.made_again` (tables/cost.rs) is the meter: it
+   counts steps that stopped and were stepped again, and `stopped_ns` counts their time. Each
+   switched builder should drive `stopped_ns` to the cost of the one row that stopped.
+3. Turn `NeedConst` into a yield. `ensure_seeded` gains the evaluator as a second maker, which
+   parks the frame instead of returning the `HeadError`. check.rs `make`'s loop and `MOST_CONSTS`
+   are deleted with it. Then the check.rs rounds that restart on a world miss (`callee_target`,
+   `reach_capture_copy`, `MOST_ROUNDS`) become one ask of the missing head, once a resumable
+   `ensure` answers it in place.
+4. Move the store onto blaze-ask's `Asker`. `ensure_seeded`'s own stack is deleted, and so is the
+   `just_made`/`NeedMade` probe: a need that is published and still not found is the asker's
+   `AskError::Word`.
+
+**Memory per parked frame.** A `Want` (two keys at most), one `ItemDetail`, two keys, and one
+signature's `Lowered`. That is the item's head form: about a hundred bytes of rows per field,
+member or input, plus the text's lowering arena. It is held only while the frame is parked: each
+frame drops when its want is made. The cursor adds a few `u32`s.
+
+**How deep the stack gets.**
+
+- **The bound.** `ensure_seeded` pushes at most one frame per step and stops at `MOST_STEPS`
+  (65,536). Under blaze-ask the bound is the asker's `MOST_DEPTH` (256), and `StackFull` names the
+  need.
+- **Tempo's deepest head chain: NOT MEASURED.** Nothing was run. A chain is a sequence of heads,
+  each needing the next before it can be filed: a supertrait, a bound's trait, an alias's target,
+  a field's ADT. Over a seeded store most needs are `Seeded::Filed` and push no frame, so the
+  depth is the chain of heads lowered in that one store. To measure it: record `stack.len()`'s
+  maximum in `Cost` (beside `census`) and read it on tempo's Bodies stage.
+- **Expected.** Tens. Whether 256 is enough is unknown until that measure exists, and it gates
+  step 4.
+
+## The gate fetches, the recorder records (D161 (a), D168; 2026-11-20, spec)
+
+The gate is blaze-ask gate.rs's `GateSet`. Its rule: prefetching never changes a read list. The
+gate fetches. The recorder records only what the check asks.
+
+- **The set.** On a body's first check, it is the syntactic prefetch: the paths, traits in scope
+  and lang paths the text names (blaze-typeck world.rs `prefetch_syntactic`, collected by front2
+  asks.rs `Gate::note`). On an edit, it is the body's LAST read list's head cells (33 cells for a
+  small tempo body, D168).
+- **The fetch.** One entry: front2 tables/seeds.rs `fetch_cells(store, keys, seeds, cells,
+  scratch) -> Result<Fetched<'c>, FetchError>`. The gate and the engine's writer both call it. It
+  files each cell from its frozen record before the body is entered. `seeds` reads names through
+  `Tables::reading_into(&FetchReads)`, a sink that keeps nothing, so no fetched cell reaches the
+  recorder. A cell the check asks is recorded by the check's own fact (task.rs `fact_read`), as
+  without a fetch.
+- **The proof.** `Fetched` can be made only by `fetch_cells`. The body's entry takes it, and takes
+  blaze-ask's `Settled` from `GateSet::settle` with `published = Store::made` over the same cells.
+  A cell left to the body's store (`Seeded::Lower`: an item of the body) is the one exception, and
+  it is counted (`Fetched::left`).
+- **The oracle.** One body checked fetched and unfetched gives equal findings, equal record
+  bytes and an equal read list. The planted control fetches through the body's own recorder
+  instead of `FetchReads`, and the lists differ.
+
+Not wired yet: `record_body_as` taking `Fetched`. Its callers are the engine's (blaze-cli), so the
+signature change is one batch with them.
+
+## A read is offered once (the recorder piece)
+
+tempo's profile: `bodies: reads offered 757804987, kept 22834789`. That is 33 offers per kept read,
+about 8,800 per body over 85,828 bodies.
+
+**Who offers the same cell again (counts from the code, not measured).** A one-segment plain path at
+module `M` goes through blaze-scope names.rs `walk`, `lexical` and `in_source`, under
+names_cells.rs `Logged`. It offers these:
+
+- `Module{M}` four times: `chain`, `scope`, `chain` again on a miss, and `no_implicit_prelude`.
+- `Root` twice.
+- `Module{prelude}` twice or three times.
+- `Module{G}` for each glob the walk goes through.
+- One `Binding` for each module asked.
+
+That is 10 to 16 offers for one name. Only the bindings are new to the body: the module, root and
+prelude cells are the same for every path in it.
+
+The repeat that removes most is the question, not the cell:
+
+- `Reads::prefetch_syntactic` answers every path, lang path and trait-in-scope through the world.
+  The checker then asks each one again.
+- Every ask reached `BodyWorld` again (`again(|| x_once(..))`), and `x_once` walked the names again.
+- The recorder only noticed a repeat after the offer: a compare with `last`, then a probe of a
+  hash set.
+
+**1. Record at the first answer.** `blaze_typeck::Reads::heard` is the run's memo: every question
+the world answered with `Ok` in this run, the prefetch's answers included. Each ask tells the world
+`World::asking(Some(Asking { kind, repeat }))` before it asks, and `asking(None)` once the answer is
+in. `BodyWorld` passes this to its names source, the `Tables` view passes it to its `ReadSink`, and
+the `Recorder` keeps it. Under `Repeats::Quiet`, a repeat's offers return at the first instruction.
+They are counted as `memo`: no hash, no placement, no push.
+
+A hole is not in `heard`, because the next ask may be answered by reads the hole did not make. The
+typeck read list is unchanged: its rows, the digests of its answers, and the sort and dedup at the
+end. This removes every repeated question's offers. The answers are still computed again. A
+question → answer table would also remove that compute, and it is the next step: one typed column
+per kind in `Reads`, keyed like `heard`.
+
+**2. The recorder's structure.** A 64-slot direct-mapped filter (`recent`, chosen by `slot_of`: one
+byte of the key, folded with a tag for the variant) replaces `last`. A recent repeat costs one load
+and one compare (`filtered`). A miss probes `seen` as before. The sort at the end is unchanged, and
+it sorts only distinct reads.
+
+**3. Coarse covers fine.** This is counted, not applied (`covered`). blaze-cli names.rs gives
+`Section::Names` the bytes of the names record. A `Binding`, `Module` or `Textual` cell of a crate
+whose `Whole{Names}` the body already kept is therefore covered by that whole read. Dropping those
+cells changes the read list, which is a list change with its own oracle, so it is not part of this
+piece. Items cells are not counted: their digests read file text too (names_cells.rs
+`members_digest`).
+
+**Floor (rule 67).** 1.0 offer per kept read, when every question is distinct and each answer
+offers each of its cells once. On tempo the expected ratio, not measured, is about 4 to 8. It comes
+from the walk's own repeats inside one distinct question (the 10 to 16 offers above for 2 or 3 new
+bindings), and the filter answers most of those without a probe.
+
+**Counters.** `ReadTally` now carries `memo`, `filtered`, `covered` and `by_kind`. `by_kind` has one
+slot per `QUESTION_KINDS` entry, then `outside` (setup, lowering, and the verdict's fact reads).
+blaze-cli engine_bodies.rs prints a second `bodies: reads` line with these and with offered-per-kept
+against the floor, then the ten question kinds that offer most.
+
+**Oracle (rule 78).** tables/task.rs `compare_repeats` runs one body twice, with a fresh recorder
+under `Repeats::Offer` and one under `Repeats::Quiet`. It requires equal verdicts and byte-equal
+sorted read lists. It runs on every body that any test checks under `--features asks-oracle`.
+tests/front2_alias_opaques.rs runs it on three seeded bodies and asserts:
+
+- `quiet.offered + quiet.memo == offer.offered`;
+- that some question repeats;
+- the control: `RepeatsPlant::DropFirst` makes the Quiet side drop its first names read, and the
+  oracle must see it.
+
+recorder.rs tests the same seam on a tape. Its control is a repeat that reads a cell its first
+answer did not read.
+
+**Expansion demands (337,918 for 26,744 keys).** On this side, a `Records` demands each call's
+expansion record once:
+
+- the items memo (`ItemsRecord::whole`, `seen`) checks each text once;
+- `OriginParts` keeps the origins that came with the same read;
+- `Records::text_marks` keeps the marks.
+
+blaze-cli engine_bodies.rs opens one `Records` per stretch (`names_records_with_snapshot` in
+`run_bodies`). It opens another after a body's frame refusal. So the demand is once per stretch
+that lowers a head or body written by that call: 12.6 stretches per key on average.
+
+What removes the repeat is a request-wide table of verified expansion texts, verified once (rule 74)
+and lent to every stretch's items memo, the way `use_solved_texts` fills `seen`. It is half on this
+side (a `Records` that takes the lent table) and half on the store side (the table itself, filled
+from the snapshot).
+
+One bypass is left: front2 program/lazy/seam_rules.rs `recorded_call_origin` calls
+`Load::expansion` directly. It has no callers today.
+
+## Witness records: an async body's auto traits (2026-11-20, spec; tempo's 156)
+
+tempo's check on 2026-11-20 left 156 bodies unchecked over async futures' auto traits
+(blaze-int notes reports/tempo-correct-1120 not-checked-by-cause.txt, the first six rows). They
+are one gap. This section is its end state. The machinery it finishes already exists:
+`Checked::stalled`, front2 stalled_goals.rs, exact_interior.rs, opaque_auto.rs, and the
+coroutine row's `InteriorIs`.
+
+### What the witness is (the rule)
+
+- An async block's future, and an `async fn`'s root block, is `Send`, `Sync` or `Unpin` exactly
+  when it holds for everything the state stores.
+  - The Reference, "Async blocks": the future is "roughly equivalent to an enum with one variant
+    per await point, where each variant stores the data needed to resume from its corresponding
+    point".
+  - "Auto traits": an auto trait holds for a type when it holds for everything the type holds.
+- What the state stores is the block's WITNESS. rustc computes it from MIR after borrowck, with
+  regions erased (`mir_coroutine_witnesses`). It has three parts:
+  1. Each capture, typed by its mode: a by-value capture is its place's type, and a by-ref or
+     by-mut capture is `&T` or `&mut T` of its place.
+  2. Each local saved at some suspension: maybe storage-live there, and either live by use or
+     maybe borrowed since its `StorageLive`. This is blaze-flow suspend.rs `saved`, D-A1, with
+     the same rule as rustc's `MaybeBorrowedLocals` and `MaybeRequiresStorage`.
+  3. Each awaitee, which is held across its own `.await`.
+- The witness's types are region-ERASED. No part of the rule reads a region. "Maybe borrowed" is
+  a fact of where a `&` was taken, not of how long a region lives.
+
+### The cause of the 156
+
+The witness is computed today only by the borrow check's lowering (`lower_async` over
+`NestedFacts`). That lowering relates every call's regions, and it refuses whatever it cannot
+relate:
+- `CallHiddenInput { why: NotLaid }`
+- `CallOutlivesUnread`
+- `CountUnknown { what: OpaqueCaptures }` at a call of an `async fn(self)`
+- `RegionsUnread` of a callee head that is not laid
+
+A refused block then has no witness:
+- In its own body, this is the 45 "no lowered async block supplied its captures and saved
+  locals" (stalled_goals.rs). Every note quotes one of the refusals above under "borrows not
+  checked".
+- Filed as a superset (`FiledInterior::Superset`), it is the 65 "the auto trait of another fn's
+  future needs its witness record" in every body that asks.
+- The 6 `INTERIOR_GAP` rows and the 4 "checked output and stored types of coroutine" rows are
+  the same superset, reached through an unsizing or a revealed opaque.
+
+So 120 of the 156 wait on a REGION refusal for a REGION-FREE fact. (This is from the notes'
+quoted refusals. Each refused block's form has not been counted.)
+
+### The design
+
+**W1. A witness lowering with regions erased, at the existing seam.**
+- blaze-flow-lower's call rule is a type parameter at one seam already: one_call.rs `CallRule`,
+  with `OldPaths` and `OneRule` (rule 78, D156).
+- Add a third instantiation, `Erased`. It makes each call's statements (operands moved or
+  copied, destination written, the call's unwind edge) and relates NO region.
+- Under `Erased`:
+  - `npos` counts no position for any type. So the counting refusals (`TypeNode`, `UnknownAdt`,
+    the opaque and alias counts) cannot arise, and no origin vector is laid.
+  - `Facts::sig` is not read (coroutine.rs, await_call.rs and lib.rs read it only to relate).
+- The flow's locals, statements, `StorageLive`/`StorageDead`, borrows (`Rvalue::Ref` keeps its
+  place, with no origin) and `Suspend` points are the same as under `OldPaths`.
+- The oracle is the existing one (oracle.rs): on every fixture body both lower to equal
+  statements once origins are dropped, and `saved` gives equal bits.
+- Planted control: an `Erased` that drops one `StorageDead` gives a different `saved`.
+- `lower_async::<Erased>` is what exact_interior.rs and stalled_goals.rs call for the witness.
+  The borrow check keeps `Production`.
+- The same lowering cannot serve both, by design: the borrow check must refuse what it cannot
+  relate (rule 3), and the witness has nothing to relate.
+- The one remaining refusal of the witness lowering is a FORM it does not lower (`InlineAsm`,
+  `StaticMut` and the like). Each stays named.
+
+**W2. The witness is a record of the body that owns it, made by that body's own check.**
+- It is the coroutine row `opaque_auto.rs` files (`Store::hidden`), keyed like the body: owner
+  plus the coroutine's ordinal (rule 65). Its content is `CoroutineFacts`: output, interior
+  tuple, and `is`.
+- With W1, `is` is `Exact` for every block whose forms lower.
+  - `Superset` remains only for a block with a form the witness lowering does not take.
+  - `CapturesUnknown` remains only until W4.
+- A reader records `Question::Coroutine` with the answer's content (`CoroutineFacts:
+  ContentHash`, as today). Its read list covers the witness it was checked against.
+- Made once per body (rule 77). The flow that gives the witness is lowered once, under `Erased`,
+  where the owner's clean check is filed. A later borrow check lowers under `Production` for its
+  own purpose.
+
+**W3. Cycles: records are types, evaluation is coinductive, and a Need never deadlocks.**
+- A witness is TYPES. Making it needs the owner's typing and its flow, never an auto-trait
+  answer. So the owner's check files its witness BEFORE it decides its own stalled auto-trait
+  goals: `check_deferring` stalls them (`Checked::stalled`) and `decide_stalled_goals` decides
+  them after the file.
+- The cycle case, `async fn a() { spawn(b()) }` and `async fn b() { spawn(a()) }`, runs as
+  follows:
+  1. a's check types a, stalls `b-future: Send`, and files a's witness.
+  2. Deciding the stalled goal is a `Need` on b's witness (D161: a Need parks, never stops).
+  3. b's check types b, stalls `a-future: Send`, and files b's witness.
+  4. Deciding b's goal reads a's witness, already filed.
+  5. a's decision resumes.
+  No record waits on a decision.
+- The EVALUATION over witnesses may cycle: `Send(a-fut)` needs `Send(b-fut)`, which needs
+  `Send(a-fut)`. That cycle is coinductive, as rustc's auto traits are. The solver's existing
+  coinductive auto-trait cycle answer holds it (blaze-solve, as for a recursive ADT). This is
+  bounded by the solver's depth cap (rule 18).
+- opaque_auto.rs's `HiddenFail::Cycle` stays for the one real cycle: an auto trait of a fn's OWN
+  opaque asked in its own body before its witness exists (rustc E0391's class). With W3's order
+  that is only a goal the typing itself needs, never a stalled one.
+
+**W4. Closures and captured places, the same way.**
+- The 17 `ClosureCaptureWitness` rows: `TyKind::Foreign(def)` is a closure environment whose
+  capture tuple is another body's (blaze-solve builtin.rs `closure_upvars`).
+- The 19 `NeedsCapturePlaces` rows: an async block whose captures are places (`self.eth.api`
+  through `&self`, RFC 2229 disjoint fields), not whole bindings.
+- Both are the CAPTURE part of the witness. Its home is the closure rule's walk (blaze-typeck
+  rules/closure.rs `visit_for_captures`), extended to places by the Reference, "Closure
+  expressions", "Capture modes", "Capture precision":
+  - a place is a binding and its field and deref projections;
+  - it is truncated at a raw-pointer deref, at a union field, and at a `move` closure's deref of
+    a reference;
+  - its mode is the strongest use.
+- It is filed with the closure's or block's coroutine row as the row's capture column, and read
+  by `closure_upvars` through `Facts` as the coroutine row is (one record, one key: owner plus
+  ordinal).
+
+**W5. Hidden types across functions: no new mechanism.**
+- The 6 "hidden type of the `impl Trait` type of fn `recv`/`fetch_l1_blocks`/`handle_ws_session`"
+  rows are already that record: opaque_auto.rs files `Checked::hidden` from the defining body's
+  clean check. What failed is that body's own check:
+  - `fetch_l1_blocks`: `ClosureCaptureWitness`, which is W4.
+  - `recv`: one gap.
+  - `handle_ws_session`: a lowering refusal of `tokio::select!`'s `mod` in a block, which belongs
+    to the lowering lane.
+- They fall when their causes do.
+
+### Pieces, in order, with the expected fall
+
+| piece | files | rows it should clear | check |
+|---|---|---|---|
+| W1 `CallRule` `Erased` + `lower_async::<Erased>` at the two witness sites | blaze-flow-lower one_call.rs, lib.rs `npos`, coroutine.rs, await_call.rs; front2 exact_interior.rs, stalled_goals.rs | 45 + 65 + 6 + 4, where the refused form is a region form | tests/front2_witness_records.rs `async_futures_are_send_by_their_witnesses` (`spawn_worker`, `local_block`); the oracle's equal-shape test |
+| W2/W3 order: file the witness before deciding stalled goals | front2 check.rs `check_rounds_as`, opaque_auto.rs `file` | the cycle cases among the 65 | the same test (`ping`, `pong`) |
+| W4 capture places and the closure capture column | blaze-typeck rules/closure.rs, rules/async_fn.rs; blaze-solve builtin.rs `closure_upvars` | 19 + 17 | the same test (`boxed_field`, `returned_closure`) |
+| W5 | none | 6, as their causes fall | the same tests |
+
+Written 2026-11-20: this spec, and the acceptance tests (tests/front2_witness_records.rs; they
+fail until W1 and W4 are built). W1 touches blaze-flow-lower, which is not this lane's crate.
+Its edits are listed for its owner, or this lane builds it once granted.

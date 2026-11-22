@@ -14,10 +14,10 @@
 //!
 //! WHAT `build_from` DOES FOR THE WHOLE PROGRAM, AND ITS ONE-INSTANCE FORM HERE:
 //! - `check_all` (every body): [`MakerState::ensure`], one `check_one` per fn key, asked once a
-//!   run: the instance's tabled fn, and each fn its NAME holds (`body_ids::each_item`: a
-//!   closure's or coroutine's owner, whose facts the layouts read), and each async block's owner
-//!   a coroutine demand names. Over-counts by design: a fn ITEM type in the arguments is checked
-//!   too (one name cannot tell a fn item's key from a closure owner's).
+//!   run: the instance's tabled fn, and each owner its ground ARGUMENTS hold (`held_owners`: a
+//!   closure's or coroutine's owner, whose facts the layouts read, and an opaque type's
+//!   defining fn), and each async block's owner a coroutine demand names. A fn ITEM type in the
+//!   arguments is not checked: this instance reads none of its body.
 //! - `eval_consts` (every `const` and `static` of the program): not run. The record walk takes a
 //!   front end that evaluates each constant at its arguments (`evaluates_at_args`): the per-item
 //!   pull `const_at::needs_of` + `const_at::pull` for THIS instance. The old front is refused by
@@ -25,9 +25,8 @@
 //! - `static_image` (every static's bytes): not run. A record names a static, thread-local or
 //!   vtable by symbol; each one's data is its own record (D106 item 6, bzcode03's kinds 1-3).
 //! - `ClosureTable::of` (every checked body): each newly checked body adds its own closures'
-//!   rows (`ClosureTable::add`, [`MakerState::ensure`]). `CoroutineTable::of`: re-made over the
-//!   bodies checked SO FAR, only when a newly checked body has a closure or an async block; its
-//!   end form is one row added per body as the closures' table, with piece Y.
+//!   rows (`ClosureTable::add`, [`MakerState::ensure`]); `CoroutineTable::of` likewise: each
+//!   newly checked body with an async block adds its own blocks' rows (`CoroutineTable::add`).
 //! - coroutine states: run/lay_states.rs `lay_and_build`, the one path (build_from's too): laid
 //!   out from types before the instance is built, each coroutine then built into its state; an
 //!   owner fn the lay needs that is not checked yet is checked ([`Step::Check`]) and the
@@ -48,10 +47,10 @@ use super::*;
 use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_own::AVec;
 
-use crate::body_ids::{BodyIds, Counts, EntryForm, Make, Walk, WalkError, each_item};
+use crate::body_ids::{BodyIds, Counts, EntryForm, Fixture, Grant, Make, Walk, WalkError};
 use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, InstanceNames, VtableDatum, make_entry_with_vtables};
 use crate::front2::const_at::{ConstTable, Needs};
-use crate::front2::coroutines::{CoroutineTable, Coroutines};
+use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
@@ -68,6 +67,10 @@ pub struct CheckCount {
     pub by_construction: usize,
     /// Programs constructed: 0 in a run that found every record.
     pub constructed: usize,
+    /// Checked bodies walked to table their async blocks ([`MakerState::ensure`]): each body
+    /// with a closure or an async block is walked once, when its check hands it over
+    /// (`CoroutineTable::add`), so this is at most `check_one` (the d106_records test asserts it).
+    pub coroutine_walks: usize,
 }
 
 /// Work at the lazy program's body boundary for this run. An initial lowering counts
@@ -90,6 +93,41 @@ impl CheckCount {
     /// Every check the makes cost.
     pub fn all(&self) -> usize {
         self.check_one + self.by_construction
+    }
+}
+
+/// THE TYPING SEAM (D163 part 2, rule 78): where the make takes a body's checked columns from.
+/// [`SecondCheck`] checks the body here (today's production: the check `blaze check` made is
+/// done a second time); [`FromRecord`] reads what the check kept and never checks (D159 "one
+/// body record"; a gap is a typed refusal naming the body, never a second check). Both lower
+/// the body here and table it the same way (lazy fill.rs `check_one_key_by`), so the oracle
+/// ([`Twin`]) holds them to byte-equal entries.
+///
+/// THE FLIP: production's typing is the one line in blaze-cli run_parent.rs `maker` that hands
+/// `SecondCheck` to `Maker::of_roots` (and the `Front::Maker` type naming it), which becomes
+/// `FromRecord(<the check's typed records>)` once the check keeps them.
+pub trait Typing<P: FrontEnd> {
+    /// Fn `key`'s row and checked body, as the seam's [`FrontEnd::check_one`] answers.
+    fn check_one(&mut self, program: &mut P, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError>;
+}
+
+/// The body checked in the make, a second time (the seam's own `check_one`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SecondCheck;
+
+impl<P: FrontEnd> Typing<P> for SecondCheck {
+    fn check_one(&mut self, program: &mut P, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+        program.check_one(key)
+    }
+}
+
+/// The body's checked columns read from the check's record `R` (lazy typed.rs), never checked
+/// in the make. Only the lazy program answers it: the one program the record walk makes.
+pub struct FromRecord<R>(pub R);
+
+impl<'n, S: crate::front2::program::lazy::PositionSource<'n>, R: crate::front2::program::lazy::typed::TypedRecords> Typing<crate::front2::program::lazy::LazyProgram<'n, S>> for FromRecord<R> {
+    fn check_one(&mut self, program: &mut crate::front2::program::lazy::LazyProgram<'n, S>, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+        program.check_one_typed(key, &mut self.0)
     }
 }
 
@@ -150,6 +188,35 @@ fn tables_gone(key: ItemKey) -> RunError {
 }
 
 impl MakerState {
+    /// Build a static datum or TLS template using the same ground names as code entries.
+    pub fn static_entry<P: FrontEnd>(
+        &mut self,
+        program: &P,
+        value: &crate::seam::SeamData,
+        kind: StaticItem,
+        template: bool,
+    ) -> Result<AVec<'static, u8>, crate::code_records::statics::StaticRecordError> {
+        use crate::code_records::statics::{make_static_entry_with_targets, make_template_entry_with_targets};
+
+        let alloc = self.work.alloc;
+        let ground = &mut self.work.ground;
+        let fn_target = |key| {
+            let Some(instance) = program.const_fn_instance(key, ground, alloc) else {
+                return Ok(None);
+            };
+            let view = ground.view();
+            let tabled = static_fn_tabled(program, instance, view);
+            let mut name = blaze_own::Vec::new_in(alloc);
+            encode_instance(instance.item, instance.args, view, alloc, &mut name)?;
+            Ok(Some((tabled, name)))
+        };
+        if template {
+            make_template_entry_with_targets(value, kind, fn_target, alloc)
+        } else {
+            make_static_entry_with_targets(value, kind, fn_target, alloc)
+        }
+    }
+
     /// The state for `program`, before its first instance. Refuses a front end that evaluates
     /// constants for the whole program only (`evaluates_at_args` false), naming `first`.
     pub fn new<P: FrontEnd>(program: &P, first: ItemKey, isa: Isa, overflow: OverflowChecks, ub: blaze_build::UbChecks, panic: blaze_build::Panic, alloc: Alloc<'static>) -> Result<MakerState, RunError> {
@@ -193,10 +260,10 @@ impl MakerState {
     /// tables over the bodies checked so far. Every OTHER fn whose closure a checked body's
     /// types hold is checked too, before this returns (its closure's facts are in its body):
     /// by a work list, each owner once.
-    fn ensure<P: FrontEnd>(&mut self, program: &mut P, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+    fn ensure<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
         /// The most closure owners one ensure follows (rule 18).
         const MOST_OWNERS: usize = 4096;
-        let first = self.ensure_one(program, key, checks)?;
+        let first = self.ensure_one(program, typing, key, checks)?;
         let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
         self.owners_named(&*program, key, &mut todo);
         let mut steps = 0;
@@ -208,7 +275,7 @@ impl MakerState {
             if steps > MOST_OWNERS {
                 return Err(RunError::OneBody { key, why: "more closure owners named than the most one ensure follows" });
             }
-            self.ensure_one(program, owner, checks)?;
+            self.ensure_one(program, typing, owner, checks)?;
             self.owners_named(&*program, owner, &mut todo);
         }
         Ok(first)
@@ -239,7 +306,7 @@ impl MakerState {
     }
 
     /// [`MakerState::ensure`] of one key, owners not followed.
-    fn ensure_one<P: FrontEnd>(&mut self, program: &mut P, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+    fn ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
         let slot = match self.asked.binary_search_by_key(&key, |r| r.0) {
             Ok(n) => return Ok(self.asked[n].1),
             Err(n) => n,
@@ -251,7 +318,8 @@ impl MakerState {
             self.asked.insert_shift(slot, (key, at));
             return Ok(at);
         }
-        let got = program.check_one(key)?;
+        // The body's checked columns by the typing seam: checked again, or read (`Typing`).
+        let got = typing.check_one(program, key)?;
         let at = match got {
             None => None,
             Some((i, done)) => {
@@ -273,7 +341,13 @@ impl MakerState {
                         let sig = program.sig(i);
                         tables.closures.add(&body.view(program.body_types(i)), done, sig.parent_count + sig.own_count, self.work.alloc);
                     }
-                    tables.coroutines.table = CoroutineTable::of(&*program, &self.checked, self.work.alloc);
+                    // This body's async blocks, one row each (front2/coroutines.rs
+                    // `CoroutineTable::add`): the table is never re-made over the bodies checked
+                    // before, so each checked body is walked once (counted).
+                    if let Some(done) = self.checked[i].as_ref() {
+                        checks.coroutine_walks += 1;
+                        tables.coroutines.table.add(&*program, i, done, self.work.alloc);
+                    }
                     // The library's async items, read again with the rows made so far: before the
                     // first check a lazy front end has no `Poll` row yet, so `MakerState::new`'s
                     // reading is `None` (front2/coroutines.rs `async_items`).
@@ -288,11 +362,27 @@ impl MakerState {
     }
 }
 
+/// Reification records a selected fn item. Closure coercion records `call_once` at the
+/// closure type, whose body belongs to the item that contains the closure expression.
+pub(super) fn static_fn_tabled<P: FrontEnd>(program: &P, instance: Instance, ground: blaze_typeck::PTys<'_>) -> ItemKey {
+    if let Ok([first, _]) = ground.list(instance.args)
+        && let Some(closure) = blaze_build::closure_of(ground, *first)
+    {
+        let (lang, name) = crate::front2::langs::fn_trait_method(blaze_build::FnTrait::FnOnce);
+        if program.lang_trait_fn(lang, name) == Some(instance.item) {
+            return closure.owner;
+        }
+    }
+    instance.item
+}
+
 /// Makes ONE instance: `name` (symbols.rs `encode_instance` bytes), tabled as fn `tabled`;
 /// appends its entry (code_records.rs `make_entry`) to `entry`. The one generic step of D106:
-/// every front end behind the seam is made through it (rule 78).
-pub fn make_instance<P: FrontEnd>(
+/// every front end behind the seam is made through it (rule 78). `typing`: where each body's
+/// checked columns come from ([`Typing`]).
+pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     program: &mut P,
+    typing: &mut T,
     state: &mut MakerState,
     checks: &mut CheckCount,
     tabled: ItemKey,
@@ -301,18 +391,22 @@ pub fn make_instance<P: FrontEnd>(
 ) -> Result<(), RunError> {
     let alloc = state.work.alloc;
     // The bodies this ONE instance reads: its fn's, and each owner its name holds.
-    let Some(i) = state.ensure(program, tabled, checks)? else {
+    let Some(i) = state.ensure(program, typing, tabled, checks)? else {
         return Err(RunError::OneBody { key: tabled, why: "the record walk reached an instance of a fn the front end holds no checked body for" });
     };
-    let mut items: AVec<'_, ItemKey> = blaze_own::Vec::new_in(alloc);
-    each_item(name, |item| items.push(item)).map_err(|_| RunError::OneBody { key: tabled, why: "an instance name that does not list its items (body_ids.rs `each_item`)" })?;
-    for &item in items.iter() {
-        if item != tabled && program.fn_index(item).is_some_and(|c| program.function(c).body.is_some()) {
-            state.ensure(program, item, checks)?;
-        }
-    }
     let (item, args) = decode_instance(name, &mut state.work.ground, alloc).map_err(|e| RunError::CodeRecord { function: program.function(i).named(), error: CodeRecordError::Symbol(e) })?;
     let instance = Instance { item, args };
+    // Each fn whose check another fact of this instance's ARGUMENTS is in: a closure's or an
+    // async block's owner (its capture facts are in its body: `LayoutFacts::closure`, which
+    // lay_states.rs `roots_of_instance` reads before the build), and an `impl Trait`'s
+    // defining fn (its hidden type), as [`MakerState::owners_named`] follows them for a
+    // checked body's types. Read from the ground tree, not by the program's rows: a lazy front
+    // end has no row for an owner until it is checked (front2/program/lazy `fn_index`), so a
+    // filter by row skipped `rand::rngs::thread::rng` for `LocalKey::try_with` at its closure.
+    let owners = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    for &owner in owners.iter() {
+        state.ensure(program, typing, owner, checks)?;
+    }
     // The constants this instance reads at its ground arguments, pulled before the build
     // (front2/const_at.rs): a plain instance's own body only, as in build_from.
     pull_constants(program, state, i, instance)?;
@@ -348,7 +442,7 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
                     let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 owner fns checked" };
                     return Err(RunError::Build { function: program.function(i).named(), error, range: None });
                 }
-                if state.ensure(program, owner, checks)?.is_none() {
+                if state.ensure(program, typing, owner, checks)?.is_none() {
                     return Err(unchecked_owner(&*program, i, owner));
                 }
             }
@@ -359,7 +453,7 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
                     if owners > MOST_HELD_COROUTINES || state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
                         return Err(refusal);
                     }
-                    state.ensure(program, key, checks)?;
+                    state.ensure(program, typing, key, checks)?;
                 }
             }
         }
@@ -369,6 +463,42 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
     // body is checked once a run (the lazy program refuses a second `check_one`). The body is
     // held for the run beside its checked result (`MakerState::checked`, held for the run too).
     Ok(())
+}
+
+/// The owners the ground arguments `args` of an instance of `tabled` hold, each once, in the
+/// order first met: a closure's or a coroutine's owner, and an opaque type's defining fn; never
+/// `tabled` itself (checked first). Each distinct node is visited once (ground types are
+/// interned: one id per type), so the walk is linear in the arguments' distinct nodes; bounded
+/// (rule 18).
+fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, args: blaze_typeck::List, tabled: ItemKey, alloc: Alloc<'a>) -> Result<AVec<'a, ItemKey>, RunError> {
+    /// The most distinct type nodes one instance's arguments are walked through (rule 18).
+    const MOST_NODES: usize = 1 << 20;
+    let malformed = |_| RunError::OneBody { key: tabled, why: "an instance's ground arguments refer past their table (make_one.rs `held_owners`)" };
+    let mut owners: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
+    let mut seen: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
+    let mut todo: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
+    todo.extend_from_slice(ground.list(args).map_err(malformed)?);
+    while let Some(t) = todo.pop() {
+        let Err(slot) = seen.binary_search(&t) else { continue };
+        if seen.len() >= MOST_NODES {
+            return Err(RunError::OneBody { key: tabled, why: "an instance whose ground arguments hold more distinct types than the most one make walks (2^20)" });
+        }
+        seen.insert_shift(slot, t);
+        let node = ground.node(t).map_err(malformed)?;
+        let owner = match node {
+            blaze_typeck::PNode::Closure { owner, .. } | blaze_typeck::PNode::Coroutine { owner, .. } => Some(owner),
+            blaze_typeck::PNode::Opaque(opaque, _) => program.opaque_of(opaque).map(|(owner, _)| owner),
+            _ => None,
+        };
+        if let Some(owner) = owner
+            && owner != tabled
+            && !owners.contains(&owner)
+        {
+            owners.push(owner);
+        }
+        ground.children_of(node, &mut todo).map_err(malformed)?;
+    }
+    Ok(owners)
 }
 
 /// The per-item constant pull of build_from's step (`const_at::needs_of`, `const_at::pull`).
@@ -558,7 +688,7 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     for (symbol, datum) in vtable_data.iter() {
         carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
     }
-    let made = make_entry_with_vtables(&built.func, &names, &mut carried, routines, &mut declared, &crate::code_records::reads::ReadList::empty(), &built.traps, work.isa, work.alloc)
+    let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &crate::code_records::reads::ReadList::empty(), &built.traps, work.isa, work.alloc)
         .map_err(|error| RunError::CodeRecord { function: name(), error })?;
     entry.extend_from_slice(&made);
     // The coroutine's part leaves the stash with its entry made, not before.
@@ -669,8 +799,16 @@ fn name_ref<'p, P: FrontEnd>(
             return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
         }
     };
+    // A callee whose name passes its cap (rustc's type-length limit) is this instance's
+    // refusal, the callee shown by its head path and arguments (rule 19); the test's NOT RUN.
+    let named = |e: crate::symbols::SymbolError, callee: Instance, ground: &PortableTys<'static>| match e {
+        crate::symbols::SymbolError::TooLarge { nodes, bytes } => {
+            callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NameTooLarge { nodes, bytes }, ground.view())
+        }
+        e => sym(e),
+    };
     if let Some(c) = language_owner(program, adts, called, ground, i) {
-        return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(sym);
+        return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
     }
     // A fn item's (or a closure's) `Fn*` method whose item no row tables yet: the fn item was
     // passed as a zero-sized value, named by no body's callees (fn_shim.rs `untabled_owner`).
@@ -707,7 +845,7 @@ fn name_ref<'p, P: FrontEnd>(
         return Ok(Named1::C(target.symbol));
     }
     if bodied(program, adts.4.checked, c) {
-        return reach.declare(target.key, callee, ground, alloc).map(Named1::Instance).map_err(sym);
+        return reach.declare(target.key, callee, ground, alloc).map(Named1::Instance).map_err(|e| named(e, callee, &*ground));
     }
     Err(callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NoBody, ground.view()))
 }
@@ -753,6 +891,14 @@ fn vtable_rows<P: FrontEnd>(
     let fail = |why| RunError::Vtable { function: name(), principal: want.principal, why };
     let full = || fail(VtableFail::Build(BuildError::Malformed { what: "the ground table is full" }));
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
+    // A method word's instance whose name passes its cap: this instance's refusal, as a
+    // call's is (`name_ref`).
+    let named = |e: crate::symbols::SymbolError, callee: Instance, ground: &PortableTys<'static>| match e {
+        crate::symbols::SymbolError::TooLarge { nodes, bytes } => {
+            callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NameTooLarge { nodes, bytes }, ground.view())
+        }
+        e => sym(e),
+    };
     let mut todo: AVec<'_, VtableRef> = blaze_own::Vec::new_in(alloc);
     let mut seen: AVec<'_, VtableRef> = blaze_own::Vec::new_in(alloc);
     todo.push(want);
@@ -814,7 +960,7 @@ fn vtable_rows<P: FrontEnd>(
                 }
             };
             if let Some(c) = language_owner(program, adts, f, ground, i) {
-                word(reach.declare(program.function(c).key, f, ground, alloc).map_err(sym)?);
+                word(reach.declare(program.function(c).key, f, ground, alloc).map_err(|e| named(e, f, &*ground))?);
                 continue;
             }
             // A `dyn Fn*` made from a fn item (or a closure) whose item no row tables yet: as
@@ -845,7 +991,7 @@ fn vtable_rows<P: FrontEnd>(
             if !bodied(program, adts.4.checked, c) {
                 return Err(refusal());
             }
-            word(reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(sym)?);
+            word(reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(|e| named(e, Instance { item, args }, &*ground))?);
         }
         if whole {
             let symbol = vtable_symbol(t, ground.view(), alloc).map_err(sym)?;
@@ -887,15 +1033,6 @@ pub struct NamesRecords<'n> {
 /// The one lazy program the maker makes: over the names records.
 pub type RecordsProgram<'n> = crate::front2::program::lazy::LazyProgram<'n, &'n crate::front2::source::Records<'n>>;
 
-/// THE RECORD WALK'S MAKER, held by the parent for the whole program (D124): one owned session
-/// over the names READ FROM RECORDS. [`Maker::new`] resolves, reads and checks nothing; the
-/// first [`Make::make`] constructs the lazy program over the records (no `resolve_crates`
-/// anywhere under it), and every make after it checks only the bodies its instance needs
-/// (`check_one`). A run that finds every record constructs no program and reads no record.
-///
-/// What the records could not answer is in their log (front2 source.rs): after each make the
-/// log is read, and a make over a log that is not empty is refused
-/// ([`LazyRefusal::RecordsVoid`]), as is every make after it (the session is void).
 /// An instance for a person ([`Maker::instance_shown`]): its item by the one printer, and its
 /// ground arguments as Rust spells them (`None`: it has none).
 pub struct InstanceShown {
@@ -903,7 +1040,24 @@ pub struct InstanceShown {
     pub args: Option<Box<str>>,
 }
 
-pub struct Maker<'n> {
+/// THE RECORD WALK'S MAKER, held by the parent for the whole program (D124): one owned session
+/// over the names READ FROM RECORDS. [`Maker::new`] resolves, reads and checks nothing; the
+/// first [`Make::make`] constructs the lazy program over the records (no `resolve_crates`
+/// anywhere under it), and every make after it types only the bodies its instance needs
+/// (`check_one`). A run that finds every record constructs no program and reads no record.
+///
+/// What the records could not answer is in their log (front2 source.rs): after each make the
+/// log is read, and a make over a log that is not empty is refused
+/// ([`LazyRefusal::RecordsVoid`]), as is every make after it (the session is void).
+///
+/// Two type parameters, each a seam chosen by type (rule 78): `G`, the proof a make is handed
+/// (body_ids.rs `Grant`: blaze-cli's run gate's `Runnable` in production, `Fixture` in this
+/// crate's walks), and `T`, where a body's checked columns come from ([`Typing`]).
+pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondCheck> {
+    /// Where each body's checked columns come from.
+    typing: T,
+    /// The proof the maker's makes are handed: a type only.
+    grant: core::marker::PhantomData<fn(&G)>,
     names: NamesRecords<'n>,
     entry: Option<ItemKey>,
     /// Where its program starts: the front's roots' say (run/special.rs `MakerStart`).
@@ -917,28 +1071,43 @@ pub struct Maker<'n> {
     checks: CheckCount,
 }
 
-impl<'n> Maker<'n> {
+impl<'n> Maker<'n, Fixture, SecondCheck> {
     /// The maker over `names`. `entry`: the checker key of the fn the process starts at, as
     /// `LazyProgram::from_records` takes it (nothing lowers it until a make asks). `builder`:
     /// the records' builder; its ISA, overflow setting and panic strategy are the makes' (rule
     /// 21: one source, nothing to compare). `alloc`: the `'static` heap the lazy program's
     /// tables live in (`Store::new`, `MakerState`). Cheap: reads, resolves and checks nothing.
     ///
-    /// Its program starts by THE start rule (`MakerStart::ByRule`): a program's run. A parent
-    /// whose roots name another start takes [`Maker::of_roots`].
+    /// Its program starts by THE start rule (`MakerStart::ByRule`): a program's run, for this
+    /// crate's walks (`Fixture`), each body checked in the make. A parent whose roots name
+    /// another start takes [`Maker::of_roots`]; a walk reading another typing,
+    /// [`Maker::typed`].
     pub fn new(names: NamesRecords<'n>, entry: Option<ItemKey>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
-        Self::starting(names, entry, crate::run::special::MakerStart::ByRule, builder, alloc)
+        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, SecondCheck, builder, alloc)
     }
+}
 
+impl<'n, T: Typing<RecordsProgram<'n>>> Maker<'n, Fixture, T> {
+    /// [`Maker::new`] with the body's checked columns from `typing`: the oracle's two sides.
+    pub fn typed(names: NamesRecords<'n>, entry: Option<ItemKey>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, Fixture, T> {
+        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, typing, builder, alloc)
+    }
+}
+
+impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// The maker for the roots a front handed (run/special.rs `Roots`): `entry` as [`Maker::new`]
     /// takes it, and the program's start the roots' own (`Roots::maker_start`): `blaze run`'s
     /// roots start by the rule, a test's at its fn. The one way the lazy parent makes a maker.
-    pub fn of_roots(names: NamesRecords<'n>, entry: Option<ItemKey>, roots: &crate::run::special::Roots<'_>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
-        Self::starting(names, entry, roots.maker_start, builder, alloc)
+    /// `typing`: where each body's checked columns come from (production: [`SecondCheck`]
+    /// until the check keeps its typed record; then [`FromRecord`]).
+    pub fn of_roots(names: NamesRecords<'n>, entry: Option<ItemKey>, roots: &crate::run::special::Roots<'_>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
+        Self::starting(names, entry, roots.maker_start, typing, builder, alloc)
     }
 
-    fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
+    fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
         Maker {
+            typing,
+            grant: core::marker::PhantomData,
             names,
             entry,
             start,
@@ -1022,23 +1191,19 @@ impl<'n> Maker<'n> {
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
         };
-        make_instance(program, state, &mut self.checks, tabled, name, entry)
+        make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry)
     }
 
     /// The program made on the first call, then static `item`'s value made its entry
     /// (code_records.rs `statics`): a static's datum, or (`template`) a thread-local's template.
     fn static_over(&mut self, item: ItemKey, template: bool, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.construct(item)?;
-        let alloc = self.alloc;
-        let Some((program, _)) = self.made.as_mut() else {
+        let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: item, why: "the maker's program was not made (make_one.rs `Maker::make_static`)" });
         };
-        let (value, kind) = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        let made = match template {
-            false => crate::code_records::statics::make_static_entry(value, kind, alloc),
-            true => crate::code_records::statics::make_template_entry(value, kind, alloc),
-        };
-        let made = match made {
+        let kind = program.make_static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let made = match state.static_entry(program, value, kind, template) {
             Ok(made) => made,
             Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
         };
@@ -1050,15 +1215,7 @@ impl<'n> Maker<'n> {
     /// item that make is of).
     fn construct(&mut self, tabled: ItemKey) -> Result<(), RunError> {
         if self.made.is_none() {
-            let NamesRecords { records, frame, lang_crates, body_sources } = self.names;
-            let mut program = RecordsProgram::from_records(records, frame, lang_crates, self.entry, self.alloc).map_err(RunError::Front2)?;
-            if let Some(sources) = body_sources {
-                program.set_body_sources(sources);
-            }
-            // The start the front's roots named (run/special.rs `MakerStart`): by the one rule
-            // run/special.rs `roots` takes (the seam's `rust_start`), a refusal here the parent's
-            // own roots refusal met again, never passed over; or a test fn, called directly.
-            program.decide_start(self.start).map_err(RunError::Roots)?;
+            let program = program_of(self.names, self.entry, self.start, self.alloc)?;
             self.checks.constructed += 1;
             // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();
@@ -1069,10 +1226,99 @@ impl<'n> Maker<'n> {
     }
 }
 
-impl Make for Maker<'_> {
-    type Error = RunError;
+/// The lazy program over `names`, its body sources set and its start decided: the one way a
+/// maker's program is made ([`Maker`]'s first make, and the test double [`FromRecord::rechecked`]).
+fn program_of<'n>(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, alloc: Alloc<'static>) -> Result<RecordsProgram<'n>, RunError> {
+    let NamesRecords { records, frame, lang_crates, body_sources } = names;
+    let mut program = RecordsProgram::from_records(records, frame, lang_crates, entry, alloc).map_err(RunError::Front2)?;
+    if let Some(sources) = body_sources {
+        program.set_body_sources(sources);
+    }
+    // The start the front's roots named (run/special.rs `MakerStart`): by the one rule
+    // run/special.rs `roots` takes (the seam's `rust_start`), a refusal here the parent's own
+    // roots refusal met again, never passed over; or a test fn, called directly.
+    program.decide_start(start).map_err(RunError::Roots)?;
+    Ok(program)
+}
 
-    fn make(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+/// The typed records' test double over a maker's names (lazy typed.rs `Rechecked`).
+pub type RecheckedRecords<'n> = crate::front2::program::lazy::typed::Rechecked<'n, &'n crate::front2::source::Records<'n>>;
+
+impl<'n> FromRecord<RecheckedRecords<'n>> {
+    /// THE TEST DOUBLE as a typing: each body's checked columns made by today's second check in
+    /// a lazy program of its own over `names` (the same records, start and entry as the maker
+    /// it serves; [`Maker::new`]'s start rule), handed over as a typed record would hand them.
+    pub fn rechecked(names: NamesRecords<'n>, entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<FromRecord<RecheckedRecords<'n>>, RunError> {
+        let program = program_of(names, entry, crate::run::special::MakerStart::ByRule, alloc)?;
+        Ok(FromRecord(crate::front2::program::lazy::typed::Rechecked::new(program, alloc)))
+    }
+}
+
+/// THE ORACLE of the typing seam (D163 part 2): every make made twice, by `checking` (the body
+/// checked in the make, [`SecondCheck`]) and by `reading` (its checked columns from the typed
+/// record, [`FromRecord`]), and the two entries compared byte for byte: an entry is the
+/// instance's code, its declared names and its vtables (code_records.rs `make_entry`), so equal
+/// entries are equal LIR emitted the same way. The first difference refuses the make by its
+/// fn's key; `compared` counts the entries held equal. The walk keeps `checking`'s entry.
+pub struct Twin<A, B> {
+    pub checking: A,
+    pub reading: B,
+    /// Entries compared and found equal.
+    pub compared: usize,
+    scratch: AVec<'static, u8>,
+}
+
+impl<A, B> Twin<A, B> {
+    pub fn new(checking: A, reading: B, alloc: Alloc<'static>) -> Twin<A, B> {
+        Twin { checking, reading, compared: 0, scratch: blaze_own::Vec::new_in(alloc) }
+    }
+
+    /// `checking`'s entry is in `entry` from `at`; `reading`'s in the scratch.
+    fn same(&mut self, key: ItemKey, entry: &AVec<'_, u8>, at: usize) -> Result<(), RunError> {
+        if entry[at..] != self.scratch[..] {
+            return Err(RunError::OneBody { key, why: "the typing oracle: the entry made from the typed record differs from the entry made by checking the body again (make_one.rs `Twin`)" });
+        }
+        self.compared += 1;
+        Ok(())
+    }
+}
+
+impl<A: Make<Error = RunError, Grant = Fixture>, B: Make<Error = RunError, Grant = Fixture>> Make for Twin<A, B> {
+    type Error = RunError;
+    type Grant = Fixture;
+
+    fn make(&mut self, grant: &Fixture, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        let at = entry.len();
+        self.checking.make(grant, tabled, name, entry)?;
+        self.scratch.clear();
+        self.reading.make(grant, tabled, name, &mut self.scratch)?;
+        self.same(tabled, entry, at)
+    }
+
+    fn make_static(&mut self, grant: &Fixture, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        let at = entry.len();
+        self.checking.make_static(grant, item, entry)?;
+        self.scratch.clear();
+        self.reading.make_static(grant, item, &mut self.scratch)?;
+        self.same(item, entry, at)
+    }
+
+    fn make_thread_local(&mut self, grant: &Fixture, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        let at = entry.len();
+        self.checking.make_thread_local(grant, item, entry)?;
+        self.scratch.clear();
+        self.reading.make_thread_local(grant, item, &mut self.scratch)?;
+        self.same(item, entry, at)
+    }
+}
+
+/// A make is handed the proof `G` (body_ids.rs `Make`): the maker reads nothing of it, its
+/// presence at the call is the obligation (rule 76).
+impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Make for Maker<'n, G, T> {
+    type Error = RunError;
+    type Grant = G;
+
+    fn make(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         if let Some(void) = self.void(tabled) {
             return Err(void);
         }
@@ -1085,7 +1331,7 @@ impl Make for Maker<'_> {
         made
     }
 
-    fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make_static(&mut self, _grant: &G, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         if let Some(void) = self.void(item) {
             return Err(void);
         }
@@ -1097,7 +1343,7 @@ impl Make for Maker<'_> {
         made
     }
 
-    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make_thread_local(&mut self, _grant: &G, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         if let Some(void) = self.void(item) {
             return Err(void);
         }
@@ -1141,7 +1387,7 @@ mod lazy_lowering;
 /// the command reads it from crate 0's names record) every instance reached is FOUND in `store`
 /// by its key from text (`ids`) or made by `maker` and put. Returns the walk (its rows: symbol,
 /// key, tabled fn, name, how) for the launcher, and the counts line.
-pub fn walk_records<M: Make<Error = RunError>>(
+pub fn walk_records<M: Make<Error = RunError, Grant = Fixture>>(
     entry: ItemKey,
     ids: &dyn BodyIds,
     store: &mut dyn CodeStore,

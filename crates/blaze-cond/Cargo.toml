@@ -20,7 +20,7 @@ blaze-int.workspace = true
 blaze-own.workspace = true
 
 [dev-dependencies]
-# `Alloc::global()`, for the tests and the cost example's `main`.
+# `blaze_own::testing::heap()` for the tests and `Heap::process()` for the cost example's `main`.
 blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-sim.workspace = true
 

@@ -149,6 +149,13 @@ use reach::ReachUse;
 mod producers;
 use producers::ProducerUse;
 
+/// The sans-IO gate (D170, C7): per crate, `std` and `alloc` paths, `Global`, `Alloc::global()`,
+/// implicit allocations, statics with state, ambient reads, direct IO, the root's `#![no_std]`
+/// and its `#![blaze::sans_io]` or `#![blaze::driver]`, and blocking calls in sans-IO code, read
+/// from the tree's tokens (blaze-lex) over the same walk.
+#[path = "ambient/sansio.rs"]
+mod sansio;
+
 const SCRIPT: &str = "ambient";
 /// The list, from the root.
 const LIST: &str = "tools/ratchets/std-alloc.txt";
@@ -226,6 +233,10 @@ impl Input for Args {
                     "producers-check",
                     "producers-write",
                     "producers-sites",
+                    "sansio-check",
+                    "sansio-write",
+                    "sansio-report",
+                    "sansio-sites",
                 ],
                 None,
             )?,
@@ -1538,6 +1549,10 @@ fn main_with(it: &Args) {
         producers::main_with(&it.command, it.base.as_deref(), &root);
         return;
     }
+    if it.command.starts_with("sansio-") {
+        sansio::main_with(&it.command, it.base.as_deref(), &root);
+        return;
+    }
     let counts = count(&root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     if it.command == "findings" {
         let found = counts.iter().flat_map(|(krate, sites)| {
@@ -1919,6 +1934,7 @@ fn selftest() {
     heap::selftest();
     reach::selftest();
     producers::selftest();
+    sansio::selftest();
     println!("{SCRIPT} selftest: ok");
 }
 
@@ -1929,11 +1945,12 @@ fn main() {
         [one] => main_with(&input::parse::<Args>(one, SCRIPT)),
         _ => {
             eprintln!(
-                "usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}{}{}{}",
+                "usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}{}{}{}{}",
                 in_tests::TESTS_DOC,
                 heap::HEAP_DOC,
                 reach::REACH_DOC,
-                producers::PRODUCERS_DOC
+                producers::PRODUCERS_DOC,
+                sansio::SANS_DOC
             );
             std::process::exit(1);
         }

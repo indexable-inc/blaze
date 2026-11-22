@@ -119,7 +119,7 @@ edition = { path = "crates/edition", version = "0.0.0" }
 ra-ap-rustc_lexer = { version = "0.166", default-features = false }
 ra-ap-rustc_parse_format = { version = "0.166", default-features = false }
 ra-ap-rustc_index = { version = "0.166", default-features = false }
-# rustc's layout code, from the tag of the stable in `harness/toolchain`.
+# rustc's layout code, from the tag of the stable in `pins/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }

@@ -37,13 +37,57 @@ pub fn pack(files: &[(&str, &str)], alloc: Alloc<'_>) -> StdVec<u8> {
 /// reads it must quote (the same file).
 pub const CORE: &str = "#![no_core]\n#![feature(rustc_attrs)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\npub const FIXTURE_BAD: usize = 0 - 1;\npub struct FixtureBad {\n    pub x: [u8; FIXTURE_BAD],\n}\n";
 
+// Some refusal tests need a core without Sized. Both shelves use the same borrow-checking items.
+macro_rules! core_with_langs {
+    ($features:literal, $markers:literal, $items:literal) => {
+        concat!(
+            $features,
+            "#![no_core]\n#![feature(rustc_attrs, lang_items)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub mod marker {\n    #[lang = \"copy\"]\n    pub trait Copy {}\n",
+            $markers,
+            "}\npub mod ops {\n    #[lang = \"drop\"]\n    pub trait Drop {\n        fn drop(&mut self);\n    }\n}\npub mod boxed {\n    #[lang = \"owned_box\"]\n    pub struct Box<T>(*mut T);\n}\n",
+            $items,
+            "pub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\npub const FIXTURE_BAD: usize = 0 - 1;\npub struct FixtureBad {\n    pub x: [u8; FIXTURE_BAD],\n}\n",
+        )
+    };
+}
+
 /// [`CORE`] with the three lang items the borrow check's facts ask for (blaze-ladder front2
 /// borrows.rs `BorrowLangs::of`: `copy`, `drop`, `owned_box`), declared as the real core and
 /// alloc declare them (`core::marker::Copy`, `core::ops::Drop`, `alloc::boxed::Box`; the
 /// fixture's `Box` is in core so every program links it). Without `copy`, a body naming an ADT
 /// is not borrow-checked (`FactUnknown { fact: "Copy", why: NoLangItem }`); [`CORE`] keeps that
 /// state for the tests that show the refusal (blaze-cli engine_check_tests.rs).
-pub const CORE_WITH_LANGS: &str = "#![no_core]\n#![feature(rustc_attrs, lang_items)]\n#![rustc_coherence_is_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }\npub mod marker {\n    #[lang = \"copy\"]\n    pub trait Copy {}\n}\npub mod ops {\n    #[lang = \"drop\"]\n    pub trait Drop {\n        fn drop(&mut self);\n    }\n}\npub mod boxed {\n    #[lang = \"owned_box\"]\n    pub struct Box<T>(*mut T);\n}\npub fn fixture_one() -> u8 {\n    1\n}\npub struct FixtureCell(pub u8);\nimpl FixtureCell {\n    pub fn get(&self) -> u8 {\n        self.0\n    }\n}\nimpl u32 {\n    pub const fn wrapping_add(self, rhs: u32) -> u32 {\n        self + rhs\n    }\n}\npub const FIXTURE_LEN: usize = 2;\npub fn fixture_len(_x: [u8; FIXTURE_LEN]) -> u8 {\n    1\n}\npub const FIXTURE_BAD: usize = 0 - 1;\npub struct FixtureBad {\n    pub x: [u8; FIXTURE_BAD],\n}\n";
+pub const CORE_WITH_LANGS: &str = core_with_langs!("", "", "");
+
+const CORE_WITH_ASYNC_LANGS: &str = core_with_langs!(
+    "#![feature(auto_traits, negative_impls)]\n",
+    r#"    #[lang = "sized"]
+    pub trait Sized {}
+    pub unsafe auto trait Send {}
+    impl<T: ?Sized> !Send for *const T {}
+    #[lang = "sync"]
+    pub unsafe auto trait Sync {}
+"#,
+    r#"pub mod future {
+    #[lang = "future_trait"]
+    pub trait Future {
+        #[lang = "future_output"]
+        type Output;
+    }
+    pub trait IntoFuture {
+        type Output;
+        type IntoFuture: Future<Output = Self::Output>;
+        #[lang = "into_future"]
+        fn into_future(self) -> Self::IntoFuture;
+    }
+    impl<F: Future> IntoFuture for F {
+        type Output = F::Output;
+        type IntoFuture = F;
+        fn into_future(self) -> F { self }
+    }
+}
+"#
+);
 
 /// The text of the fixture's std when a test does not give its own.
 pub const STD: &str = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
@@ -68,6 +112,16 @@ pub fn shelf_with_langs(
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
     shelf_of(&[(triple, cfg)], CORE_WITH_LANGS, std, Shape::Plain, alloc)
+}
+
+/// The lang shelf with the core definitions an async fn and its callers use.
+pub fn shelf_with_async_langs(
+    triple: &'static str,
+    std: &str,
+    cfg: &'static [(&'static str, Option<&'static str>)],
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    shelf_of(&[(triple, cfg)], CORE_WITH_ASYNC_LANGS, std, Shape::Plain, alloc)
 }
 
 /// [`shelf_with_std_dep`] where bstd also depends on `blaze_ids` (`Role::Blaze`), a crate that

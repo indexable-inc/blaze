@@ -84,13 +84,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use blaze_answer::{CellDigest, Flags, Serial};
 use blaze_drive::cells::Cell;
-use blaze_drive::key::{ABSENT, Key, Name};
+use blaze_drive::key::{ABSENT, Key, Kind, Name};
 use blaze_id::ContentId;
 use blaze_own::{Alloc, BTreeMap, BTreeSet, SharedAlloc, Vec};
 
 use crate::cell_table::CellTable;
-use crate::engine::{Answer, Cause, CellId, EngineError, Gen, Phase, Plant, Planned, Row, SMap, SSet, SVec};
-use crate::last::{Found, LastAnswer, LastRow, Touched};
+use crate::engine::{Answer, Cause, CellId, EngineError, Gen, Phase, Plant, Planned, Row, SMap, SSet, SVec, Stage};
+use crate::last::{Found, LastAnswer, LastError, LastRow, Touched};
 use crate::readers::ReaderEdits;
 
 /// A row's fixed fields as the engine asks for them, from this request's row or the last
@@ -112,7 +112,7 @@ pub struct RowFacts {
 }
 
 impl RowFacts {
-    fn of(row: &Row<'_>) -> RowFacts {
+    pub(crate) fn of(row: &Row<'_>) -> RowFacts {
         RowFacts {
             key: row.key,
             phase: row.phase,
@@ -161,6 +161,273 @@ pub struct Taken<'a> {
     pub defines: SVec<'a, (Cell, CellDigest)>,
 }
 
+/// A membership is undefined iff both its cell and its defining row are absent.
+/// Ordinary failures are indexed by reader so removing an example promotes the next
+/// one in the driver's (reader, observation order). Signature failures need only a count.
+pub struct ReadAudit<'a> {
+    missing: SSet<'a, (Name, CellId)>,
+    signatures: u64,
+    heads: usize,
+    examples: [Option<(Name, CellId)>; 8],
+    examples_changed: bool,
+}
+
+/// Fields for the answer writer's verified record. The base is the answer root it
+/// describes. All ordinary failures are needed to promote examples after a later edit.
+pub struct ReadAuditRecord<M> {
+    pub base: Key,
+    pub heads: u64,
+    pub signatures: u64,
+    /// Strictly ascending (reader, cell).
+    pub missing: M,
+}
+
+impl<'a> ReadAudit<'a> {
+    pub(crate) fn from_pages(answer: &Answer<'_>, alloc: SharedAlloc<'a>) -> Result<Self, LastError> {
+        let mut audit = Self { missing: BTreeSet::new_in(alloc), signatures: 0, heads: 0, examples: [None; 8], examples_changed: false };
+        answer.visit_rows(|reader| {
+            if answer.row_facts(reader)?.is_some_and(|row| row.phase.stage == Stage::Heads) {
+                audit.heads += 1;
+            }
+            for (cell, _) in answer.observations(reader)?.into_iter().flatten() {
+                if answer.row_facts(cell.of)?.is_none() && !answer.has_cell(&cell)? {
+                    audit.membership(reader, cell, true);
+                }
+            }
+            Ok(())
+        })?;
+        audit.refresh_examples(answer);
+        Ok(audit)
+    }
+
+    pub fn record(&self, base: Key) -> ReadAuditRecord<impl Iterator<Item = (Name, CellId)> + '_> {
+        ReadAuditRecord { base, heads: self.heads as u64, signatures: self.signatures, missing: self.missing.iter().copied() }
+    }
+
+    pub(crate) fn from_answer(answer: &Answer<'_>, alloc: SharedAlloc<'a>) -> Self {
+        let heads = answer.rows.values().filter(|row| row.phase.stage == Stage::Heads).count();
+        let mut audit = Self { missing: BTreeSet::new_in(alloc), signatures: 0, heads, examples: [None; 8], examples_changed: false };
+        // A decoded page has already established its reverse index. Classify a selector
+        // once for all its readers, walking individual edges only for ordinary failures.
+        for (&id, readers) in answer.readers.iter() {
+            if answer.rows.contains_key(&id.of) || answer.cells.contains_key(&id) {
+                continue;
+            }
+            if id.of.kind == Kind::Signature {
+                audit.signatures += readers.len() as u64;
+            } else {
+                for &reader in readers.iter() {
+                    audit.membership(reader, id, true);
+                }
+            }
+        }
+        audit.refresh_examples(answer);
+        audit
+    }
+
+    pub fn heads(&self) -> u32 {
+        u32::try_from(self.heads).unwrap_or(u32::MAX)
+    }
+
+    /// Missing memberships, excluding signatures, followed by missing signature memberships.
+    pub fn undefined_counts(&self) -> (u32, u32) {
+        (u32::try_from(self.missing.len()).unwrap_or(u32::MAX), u32::try_from(self.signatures).unwrap_or(u32::MAX))
+    }
+
+    /// The first eight ordinary missing memberships in the exhaustive audit's order.
+    pub fn examples(&self) -> impl Iterator<Item = (Name, CellId)> + '_ {
+        self.examples.iter().flatten().copied()
+    }
+
+    fn refresh_examples(&mut self, answer: &Answer<'_>) {
+        if !self.examples_changed {
+            return;
+        }
+        self.examples = [None; 8];
+        let mut slots = self.examples.iter_mut();
+        let mut previous = None;
+        // The first eight pairs by reader cover all readers that can supply an example.
+        // Within each selected row the task's observation order breaks ties.
+        for &(reader, _) in self.missing.iter().take(8) {
+            if previous == Some(reader) {
+                continue;
+            }
+            previous = Some(reader);
+            for (id, _) in answer.seen(reader).into_iter().flatten() {
+                if self.missing.contains(&(reader, id)) {
+                    let Some(slot) = slots.next() else { break };
+                    *slot = Some((reader, id));
+                    if slots.len() == 0 {
+                        break;
+                    }
+                }
+            }
+            if slots.len() == 0 {
+                break;
+            }
+        }
+        self.examples_changed = false;
+    }
+
+    fn membership(&mut self, reader: Name, id: CellId, missing: bool) {
+        if id.of.kind == Kind::Signature {
+            if missing {
+                self.signatures += 1;
+            } else {
+                self.signatures -= 1;
+            }
+        } else {
+            let changed = if missing { self.missing.insert((reader, id)) } else { self.missing.remove(&(reader, id)) };
+            // A failure after all eight reported readers cannot change their examples.
+            self.examples_changed |= changed && self.examples[7].is_none_or(|(last, _)| reader <= last);
+        }
+    }
+
+    /// First reclassify standing memberships whose definer or cell changed presence.
+    /// Then the net membership delta is valued entirely at the final availability.
+    fn advance(&mut self, before: &Answer<'_>, work: &Work<'_>) {
+        let row_exists = |name: &Name| work.rows.get(name).map_or_else(|| before.rows.contains_key(name), Option::is_some);
+        let has_cell = |id: &CellId| work.cells.get(id).map_or_else(|| before.cells.contains_key(id), Option::is_some);
+        self.examples_changed |= self.examples.iter().flatten().any(|(reader, _)| work.rows.contains_key(reader));
+        for (&name, row) in work.rows.iter() {
+            let old = before.rows.get(&name);
+            self.heads -= usize::from(old.is_some_and(|r| r.phase.stage == Stage::Heads));
+            self.heads += usize::from(row.as_ref().is_some_and(|r| r.phase.stage == Stage::Heads));
+            if old.is_some() == row.is_some() || work.plant == Plant::SkipDefinerReaders {
+                continue;
+            }
+            let first = CellId { of: name, cell: Cell([0; 16]) };
+            let last = CellId { of: name, cell: Cell([u8::MAX; 16]) };
+            for (id, readers) in before.readers.range(first..=last) {
+                let was_missing = old.is_none() && !before.cells.contains_key(id);
+                let missing = row.is_none() && !has_cell(id);
+                if missing != was_missing {
+                    for &reader in readers.iter() {
+                        self.membership(reader, *id, missing);
+                    }
+                }
+            }
+        }
+        for (id, cell) in work.cells.iter() {
+            // A row presence transition covered every selector above. If the row stood
+            // throughout, even a selector it never defined is valid.
+            if row_exists(&id.of) || before.rows.contains_key(&id.of) {
+                continue;
+            }
+            if cell.is_some() != before.cells.contains_key(id)
+                && let Some(readers) = before.readers.get(id)
+            {
+                for &reader in readers.iter() {
+                    self.membership(reader, *id, cell.is_none());
+                }
+            }
+        }
+        for (id, edits) in work.readers.iter() {
+            if !row_exists(&id.of) && !has_cell(id) {
+                for (&reader, &added) in edits.iter() {
+                    self.membership(reader, *id, added);
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Answer<'a> {
+    /// Retain writes above immutable pages. If the caller drives a second request from
+    /// the folded view before saving it, keep both requests relative to the same root.
+    fn keep_work(&mut self, mut next: Work<'a>) {
+        self.serial = next.serial;
+        for (&name, &with) in next.findings.iter() {
+            if with {
+                self.with_findings.insert(name);
+            } else {
+                self.with_findings.remove(&name);
+            }
+        }
+        let Some(mut prior) = self.work.take() else {
+            self.work = Some(next);
+            return;
+        };
+        prior.serial = next.serial;
+        prior.rows.append(&mut next.rows);
+        prior.by_file.append(&mut next.by_file);
+        prior.findings.append(&mut next.findings);
+        prior.owed_tasks = next.owed_tasks;
+        prior.owed_cells = next.owed_cells;
+        for (&id, &cell) in next.cells.iter() {
+            prior.cells.insert(id, cell);
+        }
+        prior.cells.finish_order();
+        // Keep the newest membership for an edge across requests. Each column is
+        // sorted and contains each (cell,reader) at most once.
+        let mut edges = ReaderEdits::new_in(next.alloc);
+        let mut left = prior.readers.edits.iter().copied().peekable();
+        let mut right = next.readers.edits.iter().copied().peekable();
+        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+            match a.0.cmp(&b.0) {
+                core::cmp::Ordering::Less => edges.edits.extend(left.next()),
+                core::cmp::Ordering::Greater => edges.edits.extend(right.next()),
+                core::cmp::Ordering::Equal => {
+                    left.next();
+                    edges.edits.extend(right.next());
+                }
+            }
+        }
+        edges.edits.extend(left);
+        edges.edits.extend(right);
+        prior.readers = edges;
+        self.work = Some(prior);
+    }
+
+    /// Attach the proof from the writer's authenticated record to the decoded answer
+    /// whose root is `base`. A materialized answer supplies its row count directly.
+    /// An explicit restore on a page view counts its rows to validate the proof's bounds.
+    pub fn restore_read_audit(
+        &mut self,
+        base: Key,
+        record: ReadAuditRecord<impl IntoIterator<Item = (Name, CellId)>>,
+        alloc: SharedAlloc<'a>,
+    ) -> Result<(), EngineError> {
+        if record.base != base {
+            return Err(EngineError::AuditBase { expected: base, recorded: record.base });
+        }
+        let rows = if self.stored.is_some() {
+            let mut count = 0u64;
+            self.visit_rows(|_| { count += 1; Ok(()) })?;
+            count
+        } else {
+            self.rows.len() as u64
+        };
+        let edges = rows.saturating_mul(crate::READS_CAP as u64);
+        for (field, count, limit) in [("heads", record.heads, rows), ("undefined signature reads", record.signatures, edges)] {
+            if count > limit {
+                return Err(EngineError::AuditCount { base, field, count, limit });
+            }
+        }
+        let mut audit = ReadAudit {
+            heads: record.heads as usize, signatures: record.signatures,
+            missing: BTreeSet::new_in(alloc), examples: [None; 8], examples_changed: false,
+        };
+        let mut last = None;
+        for (reader, id) in record.missing {
+            if last.is_some_and(|pair| pair >= (reader, id))
+                || id.of.kind == Kind::Signature || self.row_facts(id.of)?.is_some() || self.has_cell(&id)?
+                || !matches!(self.read_of(reader, id)?.found, Found::Saw(_))
+            {
+                return Err(EngineError::AuditWitness { base, reader, cell: id });
+            }
+            last = Some((reader, id));
+            audit.membership(reader, id, true);
+        }
+        audit.refresh_examples(self);
+        if let Some(error) = self.refusal() {
+            return Err(error.into());
+        }
+        self.read_audit = Some(Ok(audit));
+        Ok(())
+    }
+}
+
 /// What this request wrote (the module's "The working set"). Its tables are open to a form's
 /// [`Fold`], which reads them once at the end; nothing else writes them but the overlay.
 pub struct Work<'a> {
@@ -172,8 +439,8 @@ pub struct Work<'a> {
     pub rows: SMap<'a, Name, Option<Row<'a>>>,
     /// The cells this request moved: their digest and this request's serial, or `None`: absent.
     pub cells: CellTable<'a, Option<(ContentId, Gen)>>,
-    /// Each cell's readers this request added (`true`) or dropped (`false`), sorted by cell then
-    /// reader: put by the engine's finish (readers.rs `ReaderIndex::finish`), empty before.
+    /// The net additions and removals since the base, sorted by cell then reader.
+    /// Filled by the engine at finish. Changes reversed in a later wave are absent.
     pub readers: ReaderEdits<'a>,
     /// The file plans this request replaced (`Some`, sorted) or took (`None`).
     pub by_file: SMap<'a, Name, Option<SVec<'a, Name>>>,
@@ -268,6 +535,15 @@ impl<'a> Work<'a> {
     /// by this request's writes, table by table; the owed sets are replaced whole.
     pub fn apply_to(self, answer: &mut Answer<'a>) {
         let alloc = self.alloc;
+        // A cold request starts with the empty proof. Legacy page readers populate
+        // the public tables directly and can certify that base once decoding is complete.
+        if answer.rows.is_empty() && answer.readers.is_empty() {
+            answer.certify_reads(alloc);
+        }
+        let mut read_audit = answer.read_audit.take();
+        if let Some(Ok(audit)) = read_audit.as_mut() {
+            audit.advance(answer, &self);
+        }
         answer.serial = self.serial;
         for (name, row) in self.rows.into_iter() {
             match row {
@@ -328,6 +604,10 @@ impl<'a> Work<'a> {
         }
         answer.owed_tasks = self.owed_tasks;
         answer.owed_cells = self.owed_cells;
+        if let Some(Ok(audit)) = read_audit.as_mut() {
+            audit.refresh_examples(answer);
+        }
+        answer.read_audit = read_audit;
     }
 }
 
@@ -342,6 +622,15 @@ impl<'a> Fold<'a> for Answer<'a> {
     type Out = Answer<'a>;
 
     fn fold(mut self, work: Work<'a>) -> Result<Answer<'a>, EngineError> {
+        if self.stored.is_some() {
+            let audited = self.read_audit.take().transpose()?.is_some();
+            let alloc = work.alloc;
+            self.keep_work(work);
+            if audited {
+                self.read_audit = Some(Ok(ReadAudit::from_pages(&self, alloc)?));
+            }
+            return Ok(self);
+        }
         work.apply_to(&mut self);
         Ok(self)
     }
@@ -371,6 +660,8 @@ pub struct Overlay<'a, L> {
     refused: AtomicBool,
     /// Each visited cell's stale readers (the module's "Stale counts").
     stale: SMap<'a, CellId, u32>,
+    /// Only these readers can have reversed a membership change in this request.
+    replaced_again: SSet<'a, Name>,
     /// The `saw` questions `take_row` asked and the reads they compared, for the engine's report.
     saw_calls: u64,
     compared: u64,
@@ -401,7 +692,10 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
             owed_tasks,
             owed_cells,
         };
-        Ok(Overlay { last, work, plant, refused: AtomicBool::new(false), stale: BTreeMap::new_in(alloc), saw_calls: 0, compared: 0 })
+        Ok(Overlay {
+            last, work, plant, refused: AtomicBool::new(false), stale: BTreeMap::new_in(alloc),
+            replaced_again: BTreeSet::new_in(alloc), saw_calls: 0, compared: 0,
+        })
     }
 
     /// The last answer and this request's writes, for the form's [`Fold`].
@@ -423,6 +717,10 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
     /// Whether a worker's question was refused since the request opened.
     pub fn refused(&self) -> bool {
         self.refused.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn check_last(&self) -> Result<(), EngineError> {
+        self.last.refusal().map_or(Ok(()), |error| Err(error.into()))
     }
 
     fn id_of(&self, cell: L::Cell, by: Name) -> Result<CellId, EngineError> {
@@ -485,10 +783,34 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
         Ok(out)
     }
 
+    /// The rows `name`'s row read a cell of, each once, sorted by name, into `out` (cleared
+    /// first); none for no row. The ready driver's same-stage finality walks these (ready.rs R1).
+    pub fn producers_into(&self, name: Name, out: &mut SVec<'a, Name>) -> Result<(), EngineError> {
+        out.clear();
+        if let Some(slot) = self.work.rows.get(&name) {
+            if let Some(row) = slot {
+                for (id, _) in row.reads.iter() {
+                    out.push(id.of);
+                }
+            }
+        } else if let Some(task) = self.last.task(&name)
+            && self.last_facts(task)?.is_some()
+            && let Some(cells) = self.last.reads(task)
+        {
+            for cell in cells {
+                out.push(self.id_of(cell, name)?.of);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(())
+    }
+
     /// Takes `name`'s row out of the tables, giving its facts and lists; `None`: no row.
     pub fn take_row(&mut self, name: Name) -> Result<Option<Taken<'a>>, EngineError> {
         let alloc = self.work.alloc;
         if let Some(slot) = self.work.rows.get_mut(&name) {
+            self.replaced_again.insert(name);
             let Some(row) = slot.take() else { return Ok(None) };
             let mut reads = Vec::with_capacity_in(row.reads.len(), alloc);
             for (id, seen) in row.reads.iter() {
@@ -518,6 +840,10 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
                 defines.push((self.id_of(cell, name)?.cell, digest));
             }
         }
+        // By selector, as the engine's merge compares them (engine.rs `apply`): the last
+        // answer lists a task's definitions by dense cell id, and a selector interned later can
+        // sort before an older one while holding the larger id (lane A1).
+        defines.sort_unstable_by_key(|(cell, _)| *cell);
         // Its stale reads of counted cells leave the counts, asked while the row is still the
         // last answer's (the module's "Stale counts").
         for id in reads.iter() {
@@ -746,11 +1072,49 @@ impl<'a, L: LastAnswer> Overlay<'a, L> {
     }
 
     /// The request's writes to the reverse index, at its end (the engine's finish).
-    pub fn put_readers(&mut self, edits: ReaderEdits<'a>) {
+    pub fn put_readers(&mut self, mut edits: ReaderEdits<'a>) -> Result<(), EngineError> {
+        // Within a phase and across waves the live index always answers with the latest
+        // write. At the fold, omit writes that restored a reader's original membership.
+        // A row changed only once emitted a symmetric difference already.
+        if !self.replaced_again.is_empty() {
+            let mut kept = 0;
+            for at in 0..edits.edits.len() {
+                let ((id, reader), added) = edits.edits[at];
+                if self.replaced_again.contains(&reader) {
+                    let had = match (self.last.task(&reader), self.last.cell(&id)) {
+                        (Some(task), Some(cell)) => self.last.read_of(task, cell)?.found != Found::NotRead,
+                        _ => false,
+                    };
+                    if added == had {
+                        continue;
+                    }
+                }
+                edits.edits[kept] = edits.edits[at];
+                kept += 1;
+            }
+            edits.edits.truncate(kept);
+        }
+        if self.plant == Plant::LostReaderTombstone {
+            edits.edits.retain(|(_, added)| *added);
+        }
         self.work.readers = edits;
+        Ok(())
     }
 
     // File plans (rule 4).
+
+    /// Compare a planned member's key from the file's proof column. Rows changed or
+    /// retired in this request shadow every proof in the last root. A task newly
+    /// listed by this file can still have a row elsewhere in the last answer.
+    pub(crate) fn member_stands(&self, file: Name, name: Name, key: Key) -> Result<bool, EngineError> {
+        if let Some(slot) = self.work.rows.get(&name) {
+            return Ok(slot.as_ref().is_some_and(|row| row.key == key));
+        }
+        if self.last.planned_key(file, name)? == Some(key) {
+            return Ok(true);
+        }
+        Ok(self.row(name)?.is_some_and(|row| row.key == key))
+    }
 
     /// Takes `file`'s planned tasks out, sorted by name: this request's, or the last answer's.
     pub fn take_file(&mut self, file: Name) -> Result<SVec<'a, Name>, EngineError> {

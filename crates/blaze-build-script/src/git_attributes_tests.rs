@@ -154,7 +154,7 @@ impl GitFiles for Served<'_> {
 
 fn porcelain(nodes: [Node; 3], alloc: Alloc<'_>) -> Result<std::string::String, Refused> {
     let mut served = Served::new(nodes, alloc);
-    status(".git", ".git", "", false, TREE, &mut served, alloc).map(|out| out.as_str().to_owned())
+    status(".git", ".git", "", false, false, TREE, &mut served, alloc).map(|out| out.as_str().to_owned())
 }
 
 /// header.png holds CRs and NULs; under `text=auto` it is binary (a NUL, and a lone CR), so its

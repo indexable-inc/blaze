@@ -38,7 +38,7 @@ blaze-id.workspace = true
 edition.workspace = true
 # `lower_body`, `typeck::to_typeck`: every body lowered and converted, as the ladder does.
 # By path, as blaze-ladder takes it.
-blaze-lower = { path = "../blaze-lower" }
+blaze-lower.workspace = true
 # `PortableTys`, `ItemKey`: what `to_typeck` writes into.
 blaze-typeck.workspace = true
 # Stage h's body calls resolved through the workspace's names (`Names::item_at`,
@@ -56,7 +56,7 @@ blaze-world = { workspace = true, features = ["procs-run"] }
 blaze-build-script.workspace = true
 # `run::refusals`: names, check, build and emit of one small program, for the `extensions`
 # example's probe of each language extension. By path, as blaze-lower.
-blaze-ladder = { path = "../blaze-ladder" }
+blaze-ladder.workspace = true
 # The frame `Front2::new` keeps a body's local items in (tempo_front).
 blaze-mem.workspace = true
 

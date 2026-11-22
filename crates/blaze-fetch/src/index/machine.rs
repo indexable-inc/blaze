@@ -18,10 +18,10 @@
 //!    (`If-None-Match` or `If-Modified-Since`), a byte limit and a deadline.
 //! 4. A 200 is parsed ([`super::line::parse_in`]) into a new record, which the driver keeps
 //!    by [`IndexEffect::Write`] and answers [`Index::written`]; a 304 keeps the record read,
-//!    never parsed again; a 404, 410 or 451 is "no such crate", an answer. A transient failure
-//!    (no connection, a reset, a timeout, 429, 5xx) is tried again after a backoff, at most
-//!    [`Limits::tries_most`] tries in all, as the fetch machine tries; anything else fails its
-//!    file with a typed [`IndexWhy`] at once.
+//!    never parsed again; a 404, 410 or 451 is "no such crate", an answer. Any other answer or
+//!    failure (no connection, a reset, a timeout, 429, 5xx included) fails its file with a
+//!    typed [`IndexWhy`] at once: one try, as the fetch machine tries (D172, rule 3); the
+//!    caller's next command asks again.
 //! 5. [`Index::is_done`]: each ask's files ([`Index::files_of`]) and how each ended
 //!    ([`Index::end`]): the record read ([`FileEnd::Cached`]), the record written
 //!    ([`FileEnd::Fetched`]), no such crate ([`FileEnd::Absent`]) or why not
@@ -114,9 +114,10 @@ pub enum IndexReply<'b> {
 /// Why a file has no record.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum IndexWhy {
-    /// The registry answered `status` (after `tries` tries).
-    Status { status: u16, tries: u32 },
-    Net { failure: NetFailure, tries: u32 },
+    /// The registry answered `status` to the one try (D172).
+    Status { status: u16 },
+    /// The one try had no answer (D172).
+    Net { failure: NetFailure },
     /// A 401: the registry wants credentials, which blaze sends none of yet.
     Unauthorized,
     /// A body longer than its limit came anyway.
@@ -134,8 +135,8 @@ pub enum IndexWhy {
 impl Show for IndexWhy {
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
         match self {
-            IndexWhy::Status { status, tries } => out.str("the registry answered ").int(*status).str(" (").int(*tries).str(" tries)"),
-            IndexWhy::Net { failure, tries } => out.str(failure.name()).str(" (").int(*tries).str(" tries)"),
+            IndexWhy::Status { status } => out.str("the registry answered ").int(*status),
+            IndexWhy::Net { failure } => out.str(failure.name()),
             IndexWhy::Unauthorized => out.str("the registry wants credentials (401), and blaze sends none"),
             IndexWhy::TooBig { most, got } => out.str("an index file of ").byte_count(*got).str(", past its limit of ").byte_count(*most),
             IndexWhy::NotModifiedUnasked => out.str("the registry answered 304 to a request with no validator"),
@@ -213,7 +214,6 @@ enum Phase {
     Reading,
     Ready,
     Asked { seq: u32, deadline: u64 },
-    Backoff { until: u64 },
     /// Its new record handed to the driver to keep.
     Writing,
     Done,
@@ -235,7 +235,6 @@ struct File<'a> {
     /// A cache record opened for it.
     cached: bool,
     phase: Phase,
-    tries: u32,
     seq: u32,
     end: FileEnd,
 }
@@ -266,7 +265,6 @@ pub struct Index<'a> {
     ready: VecDeque<u32, Alloc<'a>>,
     writes: VecDeque<(u32, Vec<u8, Alloc<'a>>), Alloc<'a>>,
     asked: Vec<u32, Alloc<'a>>,
-    waiting: Vec<u32, Alloc<'a>>,
     reads_left: usize,
     left: usize,
     stale: u64,
@@ -303,7 +301,6 @@ impl<'a> Index<'a> {
             ready: VecDeque::new_in(alloc),
             writes: VecDeque::new_in(alloc),
             asked: Vec::new_in(alloc),
-            waiting: Vec::new_in(alloc),
             reads_left: 0,
             left: 0,
             stale: 0,
@@ -361,7 +358,6 @@ impl<'a> Index<'a> {
             held: Held::None,
             cached: false,
             phase: Phase::Reading,
-            tries: 0,
             seq: 0,
             end: FileEnd::Pending,
         });
@@ -443,15 +439,15 @@ impl<'a> Index<'a> {
         let deadline = now.saturating_add(self.limits.ask_ns);
         let state = &mut self.files[file as usize];
         state.seq += 1;
-        state.tries += 1;
         state.phase = Phase::Asked { seq: state.seq, deadline };
         let ask = FileAsk { file, seq: state.seq };
         self.asked.push(file);
         IndexEffect::Http { ask, url, headers: &INDEX_HEADERS, condition, most: self.file_limits.most_bytes, deadline_ns: deadline }
     }
 
-    /// The answer to `ask`, at `now`.
-    pub fn answered(&mut self, ask: FileAsk, now: u64, reply: IndexReply<'_>) {
+    /// The answer to `ask`. No time is taken: nothing waits on an answer (no backoff, D172), and
+    /// a deadline is checked at the next [`Index::poll`].
+    pub fn answered(&mut self, ask: FileAsk, reply: IndexReply<'_>) {
         let Some(state) = self.files.get(ask.file as usize) else { return };
         let Phase::Asked { seq, .. } = state.phase else {
             self.stale += 1;
@@ -461,11 +457,11 @@ impl<'a> Index<'a> {
             self.stale += 1;
             return;
         }
-        let (file, tries, cached) = (ask.file, state.tries, state.cached);
+        let (file, cached) = (ask.file, state.cached);
         self.asked.retain(|it| *it != file);
         let (status, etag, last_modified, bytes) = match reply {
-            IndexReply::Failed(failure) if failure.transient() => return self.again(file, now, IndexWhy::Net { failure, tries }),
-            IndexReply::Failed(failure) => return self.fail(file, IndexWhy::Net { failure, tries }),
+            // One try (D172): the network's failure is the file's end now.
+            IndexReply::Failed(failure) => return self.fail(file, IndexWhy::Net { failure }),
             IndexReply::Body { status, etag, last_modified, bytes } => (status, etag, last_modified, bytes),
         };
         match request::answer_kind(status) {
@@ -489,9 +485,9 @@ impl<'a> Index<'a> {
             AnswerKind::NotModified if cached => self.finish(file, FileEnd::Cached),
             AnswerKind::NotModified => self.fail(file, IndexWhy::NotModifiedUnasked),
             AnswerKind::NoSuchCrate => self.finish(file, FileEnd::Absent),
-            AnswerKind::Transient => self.again(file, now, IndexWhy::Status { status, tries }),
             AnswerKind::Unauthorized => self.fail(file, IndexWhy::Unauthorized),
-            AnswerKind::Other => self.fail(file, IndexWhy::Status { status, tries }),
+            // A 429 or 5xx is the registry's word now, as any other status (one try, D172).
+            AnswerKind::Transient | AnswerKind::Other => self.fail(file, IndexWhy::Status { status }),
         }
     }
 
@@ -508,18 +504,16 @@ impl<'a> Index<'a> {
         }
     }
 
-    /// The earliest time something is due without a completion: a request's deadline or a
-    /// backoff's end.
+    /// The earliest time something is due without a completion: a request's deadline (there is
+    /// no backoff: one try, D172).
     pub fn next_deadline(&self) -> Option<u64> {
-        let asked = self.asked.iter().filter_map(|file| match self.files[*file as usize].phase {
-            Phase::Asked { deadline, .. } => Some(deadline),
-            _ => None,
-        });
-        let waiting = self.waiting.iter().filter_map(|file| match self.files[*file as usize].phase {
-            Phase::Backoff { until } => Some(until),
-            _ => None,
-        });
-        asked.chain(waiting).min()
+        self.asked
+            .iter()
+            .filter_map(|file| match self.files[*file as usize].phase {
+                Phase::Asked { deadline, .. } => Some(deadline),
+                _ => None,
+            })
+            .min()
     }
 
     /// Every file of every ask has ended.
@@ -586,46 +580,19 @@ impl<'a> Index<'a> {
         self.stale
     }
 
-    /// Requests past their deadline failed as timeouts; backoffs ended made ready.
+    /// Requests past their deadline failed as timeouts, at once (one try, D172).
     fn expire(&mut self, now: u64) {
         let mut at = 0;
         while at < self.asked.len() {
             let file = self.asked[at];
-            let state = &self.files[file as usize];
-            match state.phase {
-                Phase::Asked { deadline, .. } if deadline <= now => {
-                    let tries = state.tries;
-                    self.asked.swap_remove(at);
-                    self.again(file, now, IndexWhy::Net { failure: NetFailure::Timeout, tries });
-                }
-                _ => at += 1,
-            }
-        }
-        let mut at = 0;
-        while at < self.waiting.len() {
-            let file = self.waiting[at];
             match self.files[file as usize].phase {
-                Phase::Backoff { until } if until <= now => {
-                    self.waiting.swap_remove(at);
-                    self.files[file as usize].phase = Phase::Ready;
-                    self.ready.push_back(file);
+                Phase::Asked { deadline, .. } if deadline <= now => {
+                    self.asked.swap_remove(at);
+                    self.fail(file, IndexWhy::Net { failure: NetFailure::Timeout });
                 }
                 _ => at += 1,
             }
         }
-    }
-
-    /// A transient failure: tried again after a backoff (the fetch machine's), or failed once
-    /// the tries are spent.
-    fn again(&mut self, file: u32, now: u64, why: IndexWhy) {
-        let tries = self.files[file as usize].tries;
-        if tries >= self.limits.tries_most {
-            self.fail(file, why);
-            return;
-        }
-        let wait = self.limits.backoff_ns.saturating_mul(1 << tries.saturating_sub(1).min(16));
-        self.files[file as usize].phase = Phase::Backoff { until: now.saturating_add(wait) };
-        self.waiting.push(file);
     }
 
     fn fail(&mut self, file: u32, why: IndexWhy) {

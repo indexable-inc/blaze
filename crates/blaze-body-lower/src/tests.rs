@@ -23,6 +23,67 @@ fn heap() -> Alloc<'static> {
 struct Plain;
 
 impl Facts for Plain {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts {
+        &blaze_flow_lower::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, blaze_flow_lower::Region)], &[(blaze_flow_lower::Region, blaze_flow_lower::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[blaze_flow_lower::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<blaze_flow_lower::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[blaze_flow_lower::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
@@ -315,4 +376,53 @@ fn an_unlowered_construct_is_refused_by_name() {
         }
     }
     let _ = Mutbl::Not;
+}
+
+/// `fn f() -> u8 { bits }` in a world of its own, checked clean, and its view's parts.
+fn returns_u8(bits: u128) -> (Fx, Bb, ItemKey, ExprId) {
+    let mut fx = Fx::new();
+    let u8_ = fx.u8();
+    let owner = fx.func("f", 0, &[], u8_, std::vec::Vec::new());
+    fx.finish();
+    let mut b = Bb::new();
+    let lit = b.int_valued(None, bits);
+    let root = b.block(&[], Some(lit));
+    (fx, b, owner, root)
+}
+
+/// R4 (run.md): the kept record of a checked body opens to the body the lowering gave, row for
+/// row, over the checked record's own table, and writes the same bytes again: a restored body
+/// hands `build` the inputs a fresh lowering would (the instance's bytes follow, as `build` is a
+/// function of them; the code record's equality is the consumer's test).
+#[test]
+fn a_kept_body_restores_to_the_fresh_lowering() {
+    let (fx, b, owner, root) = returns_u8(1);
+    let c = checked(&fx, &b, owner, root);
+    let view = b.view(owner, root);
+    let bytes = crate::keep(&view, &c, &Plain, heap()).expect("kept");
+    let fresh = lower(&view, &c, &Plain, heap()).expect("lowered");
+    let kept = blaze_body::kept::open(&bytes, heap()).expect("opens");
+    let restored = blaze_body::encode(&kept.verified().body(), heap());
+    let original = blaze_body::encode(&fresh.view(), heap());
+    assert!(restored[..] == original[..], "the restored body is the fresh lowering's");
+    assert_eq!(kept.table(), blaze_body::TableId::of(c.types.view()), "over the checked record's table");
+    let again = blaze_body::kept::encode_ref(&kept, heap()).expect("re-kept");
+    assert!(again[..] == bytes[..], "a restore writes the bytes it was read from (rule 26)");
+}
+
+/// Planted control (RV3 job 4): `-> u8 { 1 }` and `-> u8 { 2 }` check to one clean verdict (no
+/// diagnostic, one table of types) but keep two records: an identity taken from the verdict
+/// alone would build one body's instance for the other.
+#[test]
+fn one_verdict_two_bodies_keep_two_records() {
+    let (fx1, b1, o1, r1) = returns_u8(1);
+    let (fx2, b2, o2, r2) = returns_u8(2);
+    let (c1, c2) = (checked(&fx1, &b1, o1, r1), checked(&fx2, &b2, o2, r2));
+    assert!(c1.diags.is_empty() && c2.diags.is_empty(), "both clean");
+    assert_eq!(blaze_body::TableId::of(c1.types.view()), blaze_body::TableId::of(c2.types.view()), "one table of types");
+    let one = crate::keep(&b1.view(o1, r1), &c1, &Plain, heap()).expect("kept");
+    let two = crate::keep(&b2.view(o2, r2), &c2, &Plain, heap()).expect("kept");
+    let one_again = crate::keep(&b1.view(o1, r1), &c1, &Plain, heap()).expect("kept");
+    assert!(one[..] == one_again[..], "control: one body keeps one record (rule 25)");
+    assert!(one[..] != two[..], "`1` and `2` keep two records");
 }

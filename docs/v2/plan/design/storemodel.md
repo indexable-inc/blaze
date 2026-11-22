@@ -1,6 +1,7 @@
 ---
-status: plan
-summary: lane storemodel's model checker of the store and kernel protocol (crate blaze-storemodel): the real blaze-cas Store, Writers and Kernel driven through every schedule of a few actors, a crash after every IO step on a file system that models what a crash keeps, and a restore checked against six properties.
+status: superseded
+superseded_by: end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
+summary: (crate deleted 2026-11-20) lane storemodel's model checker of the store and kernel protocol (crate blaze-storemodel): the real blaze-cas Store, Writers and Kernel driven through every schedule of a few actors, a crash after every IO step on a file system that models what a crash keeps, and a restore checked against six properties.
 date: 2026-11-02
 ---
 # A model checker of the store and kernel protocol

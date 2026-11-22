@@ -10,7 +10,8 @@
 //!
 //! Every run is made as `blaze check`'s `Script` task makes it, through the same two shared
 //! functions (rule 30), so the census's records never drift from the command's:
-//! - the setting: blaze-world `script_setting::ScriptSetup::open` over the world of the graph
+//! - the setting: blaze-world `script_setting::ScriptSetup::open_recorded` over the world of
+//!   the graph, its library-features records held for this process alone ([`ONE_RUN_TOOL`])
 //!   (the toolchain from `$HOME/.blaze/v2/toolchain`, `blaze_toolchain::PINNED`): each side's
 //!   probe table (pinned rows, ships facts, the toolchain's library-feature listings), the spawn
 //!   setting and the native runner;
@@ -50,6 +51,11 @@ use blaze_world::script_setting::{ScriptSetup, ScriptSetupOpts};
 const TARGET: &str = "aarch64-apple-darwin";
 /// The macro side's triple (D89 (a)), as blaze-cli's scripts.rs names it.
 const MACRO_TARGET: &str = "wasm32-wasip1";
+
+/// The tool in the library-features records' keys: they live in a `FeatureMemory` made for this
+/// process and dropped with it, which holds no record of another build of the walk, so one
+/// fixed value tells nothing apart that needs telling (blaze-world lib_features_record.rs).
+const ONE_RUN_TOOL: blaze_ids::ContentId = blaze_ids::ContentId([0; 32]);
 
 /// The runtime over the folder `store` (its compiled modules).
 fn script_runtime(store: &Path) -> ScriptRuntime {
@@ -216,6 +222,8 @@ fn main() {
         _ => (None, wanted),
     };
     let (root, store) = (PathBuf::from(checkout), PathBuf::from(store));
+    // The served root, resolved once (the argument may be relative: made absolute here).
+    let real_root = blaze_proc_macro::script_sandbox::RealRoot::resolve(&std::path::absolute(&root).expect("the checkout's absolute path")).expect("the checkout resolves");
     // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
     // taken from the OS here, kept for the process's life since the lock and the resolution
     // below are `'static`, and handed down.
@@ -259,6 +267,7 @@ fn main() {
         assert!(passes <= 64, "no graph after 64 passes");
         match res.pass().unwrap_or_else(|e| panic!("{e}")) {
             Pass::Done(graph) => break graph,
+            Pass::Partial(partial) => panic!("no unit graph: the manifests of {:?} are missing", partial.missing()),
             Pass::Need(needs) => {
                 for id in needs.iter() {
                     let facts = sources.package(*id).unwrap_or_else(|e| panic!("{e}"));
@@ -298,7 +307,8 @@ fn main() {
             Ok(NativeRunOpts { setting: owned, shim, workers })
         }
     };
-    let setup = ScriptSetup::open(ScriptSetupOpts { world, target: TARGET, macro_target: MACRO_TARGET, native, alloc }).unwrap_or_else(|e| panic!("the scripts' setting: {e}"));
+    let mut features = blaze_world::lib_features_record::FeatureMemory::new(alloc);
+    let setup = ScriptSetup::open_recorded(ScriptSetupOpts { world, target: TARGET, macro_target: MACRO_TARGET, native, alloc }, ONE_RUN_TOOL, &mut features).unwrap_or_else(|e| panic!("the scripts' setting: {e}"));
     println!("probe table: {} rows for {TARGET}, {} for {MACRO_TARGET}", setup.table.len(), setup.macro_table.len());
     match &setup.native {
         Ok(run) => println!("native: fact shim {}", run.shim),
@@ -369,7 +379,7 @@ fn main() {
         let (tree, folder) = trees
             .entry(unit.package)
             .or_insert_with(|| match member_dirs.get(&unit.package) {
-                Some(dir) => (dir_tree(&root), ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{package}: {e}"))),
+                Some(dir) => (dir_tree(&real_root), ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{package}: {e}"))),
                 None => {
                     let (view, dir) = sources.files(unit.package).unwrap_or_else(|e| panic!("{e}"));
                     // A fetched git source answers `git` from the lock's commit (D54).
@@ -432,7 +442,7 @@ fn main() {
             println!("    stored file {} ({} bytes)", file.name.as_str(), file.len);
         }
         for request in o.c_requests.iter() {
-            println!("    c request {:?}", request.as_str().replace('\0', " "));
+            println!("    c request {:?} (OUT_DIR state {})", request.argv.as_str().replace('\0', " "), request.state);
         }
         for warning in o.warnings.iter() {
             println!("    warning {:?}", warning.as_str());

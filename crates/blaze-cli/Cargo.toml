@@ -29,15 +29,18 @@ required-features = ["sandbox"]
 blaze-drive.workspace = true
 # The execution engine (engine.md, D131): `blaze engine-check` drives a request through it
 # (engine_check.rs, engine_pool.rs, engine_tasks.rs) beside the old machine until the switch.
-blaze-engine = { path = "../blaze-engine" }
+blaze-engine.workspace = true
 # The answer's stored form read in place (engine_answer_rows.rs), beside the page form until
 # the switch (runtime.md D5).
-blaze-answer = { path = "../blaze-answer" }
+blaze-answer.workspace = true
 # The store under the command (D114 (b), store/plain_place.rs): blaze-cas's plain store, its
 # vocabulary (blaze-keyed's `Namespace`, `Tag`, `StoreError`), and the arena's index by key.
 blaze-cas.workspace = true
 blaze-keyed.workspace = true
 blaze-hash.workspace = true
+# The checkout's journal helper (journal_ask.rs, journal_helper.rs): its session, its wire and
+# its places (blaze-watch helper.rs, since.rs).
+blaze-watch.workspace = true
 # The system, reached only through bstd: the files, the output, the host's core count, frames.
 # `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
 blaze-std = { workspace = true, features = ["requests"] }
@@ -55,24 +58,32 @@ blaze-typeck.workspace = true
 # `BlazeEdition`: the one home of the blaze editions' spellings (std.md, "The blaze edition").
 edition.workspace = true
 # `ContentId`: file and item digests. By path: the workspace entry turns on serde adapters.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # The macOS SDK, resolved once at the command's edge (`SDKROOT`, else xcrun): the native
 # build-script runner takes its folder, and the scripts' keys its identity (sdk.rs, scripts.rs).
 blaze-apple-sdk.workspace = true
 # Vec, SortedMap, VecDeque in the command's frame.
 blaze-own.workspace = true
+# R4 (run.md): the kept body record's reader (engine_body_record.rs, `blaze_body::kept`).
+blaze-body.workspace = true
 # `syscalls::snapshot`: the memory layer's own system calls, counted and timed, for the profile's
 # `memory` line (rule 17).
 blaze-mem.workspace = true
+# D169's meter: what each phase, stage, task and body used (phases.rs, engine_pool.rs), and the
+# store's asks and puts (engine_records.rs, engine_store.rs).
+blaze-meter.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
 # The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
 # the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
 blaze-launch.workspace = true
+# engine_native.rs `send_of`: the image's descriptor (its words' names, one home) and the
+# platform's symbol spelling (`resolve::mangle`), to pair each word with its Rust export.
+blaze-native.workspace = true
 # `record::Symbol`: the entry line's symbol (blaze-ladder run/special.rs `EntryLine`), kept in
 # the start list's head (start_list.rs) and rebuilt from it.
-blaze-code = { path = "../blaze-code" }
+blaze-code.workspace = true
 blaze-emit.workspace = true
 blaze-blake3.workspace = true
 # The shared cache's read path (remote-read.md): a named origin folder read by range, checked
@@ -139,8 +150,16 @@ sandbox = ["blaze-proc-macro/runtime"]
 # set to a folder, and the command's store writes the toolchain's public records `PUBLIC`. Off by
 # default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
 publish = ["blaze-remote/sign"]
+# The call census (D190 step 2): `check` checks each body a second time under both call rules
+# and prints the comparison at the end of the bodies' profile lines. A measuring build only:
+# the census's own type check doubles the bodies' time.
+call-census = []
 
 [dev-dependencies]
+# `blaze_meter::testing::stop`: the meter's readers off, for the on/off byte-equality test.
+blaze-meter = { workspace = true, features = ["testing"] }
+# The names fixture runs a real worker pool over its simulated filesystem.
+blaze-std = { workspace = true, features = ["testing"] }
 # `check` and `control`: the sweep's simulation and its planted-bug control.
 blaze-sim.workspace = true
 # proc_callers.rs: a member's macro served as the command serves it, asked as the shim asks.
@@ -154,6 +173,12 @@ blaze-sha256.workspace = true
 # The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
 # sealed by blaze-cas.
 blaze-remote = { workspace = true, default-features = false, features = ["sign"] }
+# world_run.rs: a program's LIR run on the reference evaluator, with fuel.
+blaze-lir = { workspace = true, features = ["eval"] }
+# world_comptime.rs: the D175 rung compared by `first_difference`.
+blaze-comptime.workspace = true
+# engine_check_tests.rs: a check's stack high water (`posix::thread::stack_high_water`, macOS).
+blaze-sys.workspace = true
 
 [lints]
 workspace = true

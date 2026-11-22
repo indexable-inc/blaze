@@ -33,6 +33,8 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 # units (blaze-unit-graph), the layouts and lockfiles it resolves (blaze-manifest), and editions.
 blaze-toolchain.workspace = true
 blaze-unit-graph.workspace = true
+# toolchain_cut, proc_macro_modules: the paths of the pins in a checkout (pins/README.md).
+blaze-pins.workspace = true
 # proc_macro_modules' native build-script builds (D65): the one deny-by-default Seatbelt
 # profile (`native::seatbelt_with`), so the builder is confined as the scripts it builds are.
 blaze-build-script.workspace = true

@@ -12,13 +12,18 @@
 //! it walks the other slots, and the first it finds unread is marked `DESTROY` and left to
 //! finish the free when its reader sets `READ`.
 
-use alloc::{alloc::Global, boxed::Box};
-use core::{cell::UnsafeCell, fmt, marker::PhantomData, mem::MaybeUninit, ptr};
+#[allow(blaze::std_use, reason = "the deprecated `SegQueue::new` and `Default` alone (the crate's doc)")]
+use alloc::alloc::Global;
+use core::{alloc::Allocator, cell::UnsafeCell, fmt, marker::PhantomData, mem::MaybeUninit, ptr};
 
+use blaze_own::{
+    Box,
+    planted::{NoPlant, Planted},
+};
 use blaze_spin::SpinWait;
 
 use crate::{
-    Padded, Plant,
+    Padded, QueuePlant,
     sync::{
         self,
         atomic::{self, AtomicPtr, AtomicUsize, Ordering},
@@ -56,10 +61,10 @@ struct Block<T, const CAP: usize> {
 }
 
 impl<T, const CAP: usize> Block<T, CAP> {
-    /// A block of empty slots, from `Global`.
-    fn new() -> Box<Block<T, CAP>, Global> {
+    /// A block of empty slots, in `alloc`.
+    fn new_in<A: Allocator>(alloc: A) -> Box<Block<T, CAP>, A> {
         let block = Block { next: AtomicPtr::new(ptr::null_mut()), slots: [Slot::EMPTY; CAP] };
-        Box::new_in(block, Global)
+        Box::new_in(block, alloc)
     }
 
     /// The next block, which the push that filled this one's last slot is installing.
@@ -78,15 +83,15 @@ impl<T, const CAP: usize> Block<T, CAP> {
     /// # Safety
     ///
     /// `this` is a block every slot below `start` of which has been read, its last slot's
-    /// pop has started its free, and no push reaches it again.
-    unsafe fn destroy(this: *mut Block<T, CAP>, start: usize, plant: Plant) {
-        #[cfg(test)]
-        let ask = plant != Plant::FreeUnasked;
-        #[cfg(not(test))]
-        let ask = {
-            _ = plant;
-            true
-        };
+    /// pop has started its free, and no push reaches it again; it was allocated in `alloc`
+    /// (the queue's allocator).
+    unsafe fn destroy<A: Allocator>(
+        this: *mut Block<T, CAP>,
+        start: usize,
+        alloc: A,
+        plant: impl Planted<QueuePlant>,
+    ) {
+        let ask = !plant.has(QueuePlant::FreeUnasked);
         // The last slot is the one whose pop started this: it is read.
         if ask {
             for at in start..CAP - 1 {
@@ -101,13 +106,12 @@ impl<T, const CAP: usize> Block<T, CAP> {
             }
         }
         // SAFETY: as the contract says, and every slot is read: this is the block's one free.
-        let block = unsafe { Box::from_raw_in(this, Global) };
+        let block = unsafe { Box::from_raw_in(this, alloc) };
         for slot in &block.slots {
             sync::freed(slot.value.get());
         }
         // The plant's free is the model's alone: the bytes stay, so what the model reports is
-        // the read after it, not a crash of the test.
-        #[cfg(test)]
+        // the read after it, not a crash of the test. (`ask` is always true under `NoPlant`.)
         if !ask {
             core::mem::forget(block);
             return;
@@ -123,24 +127,38 @@ struct Position<T, const CAP: usize> {
 }
 
 /// An unbounded queue of `T` that any number of threads push to and pop from, in blocks of
-/// `CAP` slots (a test's model uses a small one, so its executions reach a block's end).
-pub struct SegQueue<T, const CAP: usize = 31> {
+/// `CAP` slots (a test's model uses a small one, so its executions reach a block's end), each
+/// block in `A` (no default: D170 C1). Shared between threads, `A` is `Send + Sync` (a
+/// `SharedAlloc`).
+pub struct SegQueue<T, A: Allocator, const CAP: usize = 31> {
     head: Padded<Position<T, CAP>>,
     tail: Padded<Position<T, CAP>>,
+    alloc: A,
     _values: PhantomData<T>,
 }
 
 // SAFETY: a value moves from the thread that pushed it to the thread that pops it (`T: Send`),
-// and each slot is reached by its one push and then its one pop, as its state orders.
-unsafe impl<T: Send, const CAP: usize> Send for SegQueue<T, CAP> {}
-// SAFETY: as above.
-unsafe impl<T: Send, const CAP: usize> Sync for SegQueue<T, CAP> {}
+// and each slot is reached by its one push and then its one pop, as its state orders; blocks
+// are made and freed in `A` by any thread that pushes or pops (`A: Send + Sync`).
+unsafe impl<T: Send, A: Allocator + Send, const CAP: usize> Send for SegQueue<T, A, CAP> {}
+// SAFETY: as above: a `&SegQueue` allocates and frees blocks through `&A` from any thread.
+unsafe impl<T: Send, A: Allocator + Sync, const CAP: usize> Sync for SegQueue<T, A, CAP> {}
 
-impl<T, const CAP: usize> SegQueue<T, CAP> {
-    const LAP: usize = CAP + 1;
+impl<T, const CAP: usize> SegQueue<T, Global, CAP> {
+    /// An empty queue on the global heap.
+    ///
+    /// Deprecated: the global heap is an ambient allocator (D170 C1). Use
+    /// [`SegQueue::new_in`] with the caller's allocator. Kept for this wave's callers alone
+    /// (the module doc of the crate lists them).
+    pub const fn new() -> SegQueue<T, Global, CAP> {
+        SegQueue::new_in(Global)
+    }
+}
 
-    /// An empty queue. Its first block is allocated by its first push.
-    pub const fn new() -> SegQueue<T, CAP> {
+impl<T, A: Allocator, const CAP: usize> SegQueue<T, A, CAP> {
+    /// An empty queue whose blocks come from `alloc`. Its first block is allocated by its
+    /// first push.
+    pub const fn new_in(alloc: A) -> SegQueue<T, A, CAP> {
         SegQueue {
             head: Padded(Position {
                 index: AtomicUsize::new(0),
@@ -150,10 +168,22 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
                 index: AtomicUsize::new(0),
                 block: AtomicPtr::new(ptr::null_mut()),
             }),
+            alloc,
             _values: PhantomData,
         }
     }
+}
 
+// Every block is made and freed through `&A` (the queue's own allocator, borrowed), so nothing
+// here asks `A: Clone`, and `Drop` frees the same way.
+impl<T, A: Allocator, const CAP: usize> SegQueue<T, A, CAP> {
+    const LAP: usize = CAP + 1;
+
+    /// Pushes `value`, allocating a block in the queue's allocator when the last is full.
+    ///
+    /// # Panics
+    ///
+    /// When the allocator refuses a block (blaze-own's rule for a method without `try_`).
     pub fn push(&self, value: T) {
         let mut tail = self.tail.index.load(Ordering::Acquire);
         let mut block = self.tail.block.load(Ordering::Acquire);
@@ -172,11 +202,12 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
             // This push may fill the block: have the next one ready before taking the slot,
             // so the others wait for a store and not an allocation.
             if offset + 1 == CAP && next_block.is_none() {
-                next_block = Some(Block::<T, CAP>::new());
+                next_block = Some(Block::<T, CAP>::new_in(&self.alloc));
             }
             if block.is_null() {
                 // The first push: install the first block.
-                let new = Box::into_raw(Block::<T, CAP>::new());
+                let (new, _) =
+                    Box::into_raw_with_allocator(Block::<T, CAP>::new_in(&self.alloc));
                 if self
                     .tail
                     .block
@@ -187,7 +218,7 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
                     block = new;
                 } else {
                     // SAFETY: `new` is this push's, published nowhere: keep it for the next.
-                    next_block = Some(unsafe { Box::from_raw_in(new, Global) });
+                    next_block = Some(unsafe { Box::from_raw_in(new, &self.alloc) });
                     tail = self.tail.index.load(Ordering::Acquire);
                     block = self.tail.block.load(Ordering::Acquire);
                     continue;
@@ -203,7 +234,8 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
                 Ok(_) => {
                     if offset + 1 == CAP {
                         // The block is full: install the next and skip the lap's last step.
-                        let next = Box::into_raw(next_block.take().expect("made above"));
+                        let (next, _) =
+                            Box::into_raw_with_allocator(next_block.take().expect("made above"));
                         self.tail.block.store(next, Ordering::Release);
                         self.tail.index.store(new_tail.wrapping_add(1 << SHIFT), Ordering::Release);
                         // SAFETY: `block` is not freed before its last slot is read, which
@@ -229,10 +261,11 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        self.pop_with(Plant::None)
+        self.pop_with(NoPlant)
     }
 
-    pub(crate) fn pop_with(&self, plant: Plant) -> Option<T> {
+    /// [`SegQueue::pop`] with a plant (`NoPlant` outside the model tests).
+    pub(crate) fn pop_with(&self, plant: impl Planted<QueuePlant>) -> Option<T> {
         let mut head = self.head.index.load(Ordering::Acquire);
         let mut block = self.head.block.load(Ordering::Acquire);
         loop {
@@ -297,11 +330,11 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
                     let value = unsafe { at.read().assume_init() };
                     if offset + 1 == CAP {
                         // SAFETY: the last slot read: the block's free starts here.
-                        unsafe { Block::destroy(block, 0, plant) };
+                        unsafe { Block::destroy(block, 0, &self.alloc, plant) };
                     } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
                         // The free reached this slot while it was read: go on with it.
                         // SAFETY: every slot below has been read (the free passed them).
-                        unsafe { Block::destroy(block, offset + 1, plant) };
+                        unsafe { Block::destroy(block, offset + 1, &self.alloc, plant) };
                     }
                     return Some(value);
                 }
@@ -351,13 +384,14 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
     }
 }
 
-impl<T, const CAP: usize> Default for SegQueue<T, CAP> {
-    fn default() -> SegQueue<T, CAP> {
+/// Deprecated with [`SegQueue::new`] (the global heap is ambient): kept for this wave's callers.
+impl<T, const CAP: usize> Default for SegQueue<T, Global, CAP> {
+    fn default() -> SegQueue<T, Global, CAP> {
         SegQueue::new()
     }
 }
 
-impl<T, const CAP: usize> Drop for SegQueue<T, CAP> {
+impl<T, A: Allocator, const CAP: usize> Drop for SegQueue<T, A, CAP> {
     fn drop(&mut self) {
         let mut head = self.head.index.load(Ordering::Relaxed) & !((1 << SHIFT) - 1);
         let tail = self.tail.index.load(Ordering::Relaxed) & !((1 << SHIFT) - 1);
@@ -375,38 +409,38 @@ impl<T, const CAP: usize> Drop for SegQueue<T, CAP> {
             } else {
                 // SAFETY: as above.
                 let next = unsafe { (*block).next.load(Ordering::Relaxed) };
-                // SAFETY: as above.
-                drop(unsafe { Box::from_raw_in(block, Global) });
+                // SAFETY: as above; the block was made through `&self.alloc`.
+                drop(unsafe { Box::from_raw_in(block, &self.alloc) });
                 block = next;
             }
             head = head.wrapping_add(1 << SHIFT);
         }
         if !block.is_null() {
             // SAFETY: as above.
-            drop(unsafe { Box::from_raw_in(block, Global) });
+            drop(unsafe { Box::from_raw_in(block, &self.alloc) });
         }
     }
 }
 
-impl<T, const CAP: usize> fmt::Debug for SegQueue<T, CAP> {
+impl<T, A: Allocator, const CAP: usize> fmt::Debug for SegQueue<T, A, CAP> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SegQueue").field("len", &self.len()).finish()
     }
 }
 
 /// The values of a [`SegQueue`] taken by value, in order: what is left of it when it ends.
-pub struct IntoIter<T, const CAP: usize = 31>(SegQueue<T, CAP>);
+pub struct IntoIter<T, A: Allocator, const CAP: usize = 31>(SegQueue<T, A, CAP>);
 
-impl<T, const CAP: usize> IntoIterator for SegQueue<T, CAP> {
+impl<T, A: Allocator, const CAP: usize> IntoIterator for SegQueue<T, A, CAP> {
     type Item = T;
-    type IntoIter = IntoIter<T, CAP>;
+    type IntoIter = IntoIter<T, A, CAP>;
 
-    fn into_iter(self) -> IntoIter<T, CAP> {
+    fn into_iter(self) -> IntoIter<T, A, CAP> {
         IntoIter(self)
     }
 }
 
-impl<T, const CAP: usize> Iterator for IntoIter<T, CAP> {
+impl<T, A: Allocator, const CAP: usize> Iterator for IntoIter<T, A, CAP> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
@@ -419,9 +453,9 @@ impl<T, const CAP: usize> Iterator for IntoIter<T, CAP> {
     }
 }
 
-impl<T, const CAP: usize> ExactSizeIterator for IntoIter<T, CAP> {}
+impl<T, A: Allocator, const CAP: usize> ExactSizeIterator for IntoIter<T, A, CAP> {}
 
-impl<T, const CAP: usize> fmt::Debug for IntoIter<T, CAP> {
+impl<T, A: Allocator, const CAP: usize> fmt::Debug for IntoIter<T, A, CAP> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("IntoIter").field(&self.0).finish()
     }

@@ -835,6 +835,42 @@ impl Tape {
         });
     }
 
+    /// Notes that the case got to the typed reach point `point` (limits.rs): `reached` of its
+    /// id's path, so [`Config::must_reach_points`] can require it by type.
+    ///
+    /// [`Config::must_reach_points`]: crate::search::Config::must_reach_points
+    pub fn reach(&self, point: impl crate::limits::Point) {
+        self.reached(point.id().path());
+    }
+
+    /// A limit between `smallest` (the least legal value) and `shipped`, drawn for a simulation
+    /// (D165; limits.rs): seven draws in sixteen give `smallest` (calm is `smallest`, so a
+    /// shrunk failure is at the tightest cap), four `smallest + 1`, two `smallest + 2`, one a
+    /// uniform value of the whole range and two `shipped`; never past `shipped`. When `smallest`
+    /// equals `shipped` the limit is fixed and nothing is drawn. A `smallest` above `shipped`
+    /// panics naming `label`.
+    pub fn limit<T: Int>(&self, shipped: T, smallest: T, label: &'static str) -> T {
+        let (low, high) = (smallest.to_ordered(), shipped.to_ordered());
+        assert!(
+            low <= high,
+            "the limit `{label}`: its smallest legal value is above the value it ships with"
+        );
+        if low == high {
+            return shipped;
+        }
+        let kind = self.below(crate::limits::LIMIT_KINDS, label);
+        let value = match crate::limits::limit_of_kind(kind, low, high) {
+            Some(value) => value,
+            None => self.ordered_in(low, high, label),
+        };
+        T::from_ordered(value)
+    }
+
+    /// A component's limits drawn as one span (`Limits::draw`, limits.rs).
+    pub fn limits<L: crate::limits::Limits>(&self) -> L {
+        self.span("limits", L::draw)
+    }
+
     /// Ends the case as not counted: sets `discarded` and panics.
     #[blaze::noalloc]
     pub fn discard(&self) -> ! {

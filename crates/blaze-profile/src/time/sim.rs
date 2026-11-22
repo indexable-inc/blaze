@@ -22,7 +22,7 @@ use std::{alloc::Global, collections::VecDeque};
 
 use blaze_kit::Heap4;
 
-use super::{Model, State, Totals, Waker};
+use super::{Model, Totals, Waker};
 use crate::flight::WaitedOn;
 
 /// Which runnable job a free core takes.

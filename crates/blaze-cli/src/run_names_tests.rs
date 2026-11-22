@@ -1,11 +1,11 @@
-//! The record of a program's names rows (run_names.rs FORM): written on a walk, read in place
-//! on a hit, refused whole when its bytes are not of the form.
+//! The form of a program's names rows (run_names.rs FORM): encoded from the answer's rows, read
+//! in place, refused whole when its bytes are not of the form.
 
 use blaze_drive::{Input, Key, Kind, Name};
 use blaze_ids::ContentId;
 use blaze_own::AVec;
 
-use super::{Answered, FormError, MAGIC, RunNamesError, Stood, encode, inputs_key};
+use super::{Answered, FormError, MAGIC, RunNamesError, Stood, encode};
 
 fn input(n: u8) -> Input {
     Input { name: Name::new(Kind::CrateScope, ContentId([n; 32])), at: Key(ContentId([n.wrapping_add(100); 32])), out: ContentId([n.wrapping_add(200); 32]) }
@@ -36,8 +36,6 @@ fn the_rows_a_walk_writes_a_hit_reads_by_index() {
     }
     assert_eq!(stood.crate_input(3, input(3).name), None);
     assert_eq!(stood.crate_input(13, input(13).name), None);
-    // The key is the certificate's alone, and another certificate's is another.
-    assert_ne!(inputs_key(Key(ContentId([1; 32]))), inputs_key(Key(ContentId([2; 32]))));
 }
 
 /// Bytes not of the form are refused whole, by what is wrong: never read as rows.

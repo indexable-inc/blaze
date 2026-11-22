@@ -12,6 +12,9 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use blaze_sys::posix::{io, net, thread, types};
+use blaze_sys::{Errno as SysErrno, Fd, Timespec};
+
 use crate::{Access, Error};
 
 /// The most descriptors one message carries.
@@ -31,21 +34,11 @@ impl Stream {
     fn new(fd: OwnedFd) -> Result<Stream, Error> {
         #[cfg(target_os = "macos")]
         {
-            let on: c_int = 1;
-            // SAFETY: `fd` is an open socket; the option value is a live `c_int` of the size
-            // passed.
-            let set = unsafe {
-                libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    (&raw const on).cast(),
-                    size_of::<c_int>() as libc::socklen_t,
-                )
-            };
-            if set != 0 {
-                return Err(os("setting SO_NOSIGPIPE on the channel"));
-            }
+            net::setsockopt_int(Fd::new(fd.as_raw_fd()), net::SOL_SOCKET, net::SO_NOSIGPIPE, 1)
+                .map_err(|errno| {
+                    let error = std::io::Error::from_raw_os_error(errno.raw().into());
+                    Error::new(format!("setting SO_NOSIGPIPE on the channel: {error}"))
+                })?;
         }
         Ok(Stream { fd, fds: VecDeque::new() })
     }
@@ -58,13 +51,15 @@ impl Stream {
     #[cfg(all(test, unix))]
     pub fn from_raw(raw: i64) -> Result<Stream, Error> {
         let fd = RawFd::try_from(raw).map_err(|_| Error::new(format!("a channel fd of {raw}")))?;
-        // SAFETY: a zeroed `stat` is a valid one: plain integers.
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `stat` is a live, writable `libc::stat`; a closed `fd` fails with EBADF.
-        if fd < 0 || unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
+        use blaze_sys::posix::proc;
+        if fd < 0 {
             return Err(os(&format!("the channel fd {fd}")));
         }
-        if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        let stat = proc::stat_fd(Fd::new(fd)).map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("the channel fd {fd}: {error}"))
+        })?;
+        if stat.st_mode & proc::S_IFMT != proc::S_IFSOCK {
             return Err(Error::new(format!("the channel fd {fd} is not a socket")));
         }
         // SAFETY: a test hands over a socket of a `socketpair` it made and owns nothing else
@@ -73,28 +68,21 @@ impl Stream {
     }
 
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
-        let value = match timeout {
-            Some(timeout) => libc::timeval {
-                tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
-                tv_usec: timeout.subsec_micros().max(u32::from(timeout.is_zero()))
-                    as libc::suseconds_t,
-            },
-            None => libc::timeval { tv_sec: 0, tv_usec: 0 },
-        };
-        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
-            // SAFETY: `fd` is an open socket; `value` is a live `timeval` of the size passed.
-            let set = unsafe {
-                libc::setsockopt(
-                    self.fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    option,
-                    (&raw const value).cast(),
-                    size_of::<libc::timeval>() as libc::socklen_t,
-                )
-            };
-            if set != 0 {
-                return Err(os("setting the channel's timeout"));
+        let mut value = io::Timeval::default();
+        if let Some(timeout) = timeout {
+            value.sec = timeout.as_secs().min(i32::MAX as u64) as types::time_t;
+            value.usec =
+                timeout.subsec_micros().max(u32::from(timeout.is_zero())) as types::suseconds_t;
+        }
+        for option in [net::SO_RCVTIMEO, net::SO_SNDTIMEO] {
+            // SAFETY: both options take this C timeval, including its initialized pad on macOS.
+            unsafe {
+                net::setsockopt_value(Fd::new(self.fd.as_raw_fd()), net::SOL_SOCKET, option, &value)
             }
+            .map_err(|errno| {
+                let error = std::io::Error::from_raw_os_error(errno.raw().into());
+                Error::new(format!("setting the channel's timeout: {error}"))
+            })?;
         }
         Ok(())
     }
@@ -103,44 +91,41 @@ impl Stream {
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let mut control = [0u64; 2 + MOST_FDS];
         loop {
-            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-            // SAFETY: a zeroed `msghdr` is a valid empty one; its fields are set below.
-            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-            message.msg_iov = &raw mut iov;
+            let mut iov = io::IoSliceMut::new(buf);
+            let mut message = net::msghdr::ZERO;
+            message.msg_iov = (&raw mut iov).cast();
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
             message.msg_controllen = size_of_val(&control) as _;
             #[cfg(target_os = "linux")]
-            let flags = libc::MSG_CMSG_CLOEXEC;
+            let flags = net::MsgFlags::CMSG_CLOSE_ON_EXEC;
             #[cfg(not(target_os = "linux"))]
-            let flags = 0;
+            let flags = net::MsgFlags::NONE;
             // SAFETY: `message` points at `iov` (into `buf`, writable for its length) and at
             // `control`, both live for the call.
-            let read = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &raw mut message, flags) };
-            if read < 0 {
-                let error = std::io::Error::last_os_error();
-                match error.kind() {
-                    std::io::ErrorKind::Interrupted => continue,
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                        return Err(Error::new("reading the channel timed out"));
-                    }
-                    _ => return Err(Error::new(format!("reading the channel: {error}"))),
+            let read = match unsafe { net::recvmsg(Fd::new(self.fd.as_raw_fd()), &mut message, flags) } {
+                Ok(count) => count,
+                Err(SysErrno::Intr) => continue,
+                Err(SysErrno::Again | SysErrno::TimedOut) => {
+                    return Err(Error::new("reading the channel timed out"));
                 }
-            }
+                Err(errno) => {
+                    let error = std::io::Error::from_raw_os_error(errno.raw().into());
+                    return Err(Error::new(format!("reading the channel: {error}")));
+                }
+            };
             self.take_rights(&message)?;
-            if message.msg_flags & libc::MSG_CTRUNC != 0 {
+            if message.msg_flags & net::MSG_CTRUNC != 0 {
                 return Err(Error::new(format!(
                     "more than {MOST_FDS} descriptors came in one message"
                 )));
             }
-            return Ok(read as usize);
+            return Ok(read);
         }
     }
 
-    fn take_rights(&mut self, message: &libc::msghdr) -> Result<(), Error> {
-        // SAFETY: `message` was filled by `recvmsg`, whose control buffer is still live; the
-        // CMSG macros walk only within `msg_controllen` of it.
-        let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    fn take_rights(&mut self, message: &net::msghdr) -> Result<(), Error> {
+        let mut header = net::CMSG_FIRSTHDR(message);
         while !header.is_null() {
             // SAFETY: `header` is a control message header within the buffer (CMSG_FIRSTHDR,
             // CMSG_NXTHDR never return one outside it).
@@ -149,12 +134,10 @@ impl Stream {
             let kind = unsafe { (*header).cmsg_type };
             // SAFETY: `header` is a control message header within the buffer.
             let len = unsafe { (*header).cmsg_len as usize };
-            if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-                // SAFETY: `CMSG_LEN(0)` is the header's own length, a constant.
-                let data_len = len.saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
+            if level == net::SOL_SOCKET && kind == net::SCM_RIGHTS {
+                let data_len = len.saturating_sub(net::CMSG_LEN(0) as usize);
                 let count = data_len / size_of::<c_int>();
-                // SAFETY: the data of an SCM_RIGHTS message is `count` descriptors, in the buffer.
-                let data = unsafe { libc::CMSG_DATA(header) }.cast::<c_int>();
+                let data = net::CMSG_DATA(header).cast::<c_int>();
                 for index in 0..count {
                     // SAFETY: `index < count`, in the message's data; unaligned reads, since
                     // the data is only as aligned as the header puts it.
@@ -166,14 +149,13 @@ impl Stream {
                     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
                     #[cfg(not(target_os = "linux"))]
                     {
-                        // SAFETY: `fd` is open; FD_CLOEXEC only marks it.
-                        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+                        let _ = io::set_close_on_exec(Fd::new(fd.as_raw_fd()), true);
                     }
                     self.fds.push_back(fd);
                 }
             }
-            // SAFETY: as for CMSG_FIRSTHDR.
-            header = unsafe { libc::CMSG_NXTHDR(message, header) };
+            // SAFETY: recvmsg filled this header inside the still-live control buffer.
+            header = unsafe { net::CMSG_NXTHDR(message, header) };
         }
         Ok(())
     }
@@ -190,32 +172,25 @@ impl Stream {
         let mut control = [0u64; 2 + MOST_FDS];
         let mut fds = fds;
         while !bytes.is_empty() {
-            let mut iov =
-                libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() };
-            // SAFETY: a zeroed `msghdr` is a valid empty one; its fields are set below.
-            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-            message.msg_iov = &raw mut iov;
+            let mut iov = io::IoSlice::new(bytes);
+            let mut message = net::msghdr::ZERO;
+            message.msg_iov = (&raw mut iov).cast();
             message.msg_iovlen = 1;
             if !fds.is_empty() {
                 let data_len = size_of_val(fds) as u32;
-                // SAFETY: CMSG_SPACE computes a length from a length.
-                let space = unsafe { libc::CMSG_SPACE(data_len) } as usize;
+                let space = net::CMSG_SPACE(data_len) as usize;
                 message.msg_control = control.as_mut_ptr().cast();
                 message.msg_controllen = space as _;
-                // SAFETY: the control buffer is `space` bytes (at most its size: `MOST_FDS`
-                // descriptors), so its first header is in it.
-                let header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
+                let header = net::CMSG_FIRSTHDR(&message);
                 // SAFETY: `header` is the first header of the buffer, writable; its data is
                 // `data_len` bytes inside `space`.
-                unsafe { (*header).cmsg_level = libc::SOL_SOCKET };
+                unsafe { (*header).cmsg_level = net::SOL_SOCKET };
                 // SAFETY: `header` is the first writable header of the buffer.
-                unsafe { (*header).cmsg_type = libc::SCM_RIGHTS };
-                // SAFETY: CMSG_LEN computes a length from a length.
-                let len = unsafe { libc::CMSG_LEN(data_len) };
+                unsafe { (*header).cmsg_type = net::SCM_RIGHTS };
+                let len = net::CMSG_LEN(data_len);
                 // SAFETY: `header` is the first writable header of the buffer.
                 unsafe { (*header).cmsg_len = len as _ };
-                // SAFETY: `header` is the first header; its data is `data_len` bytes inside `space`.
-                let data = unsafe { libc::CMSG_DATA(header) };
+                let data = net::CMSG_DATA(header);
                 // SAFETY: the header data is `data_len` bytes inside the writable buffer.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -226,20 +201,20 @@ impl Stream {
                 };
             }
             #[cfg(target_os = "linux")]
-            let flags = libc::MSG_NOSIGNAL;
+            let flags = net::MsgFlags::NO_SIGNAL;
             #[cfg(not(target_os = "linux"))]
-            let flags = 0;
+            let flags = net::MsgFlags::NONE;
             // SAFETY: `message` points at `iov` (into `bytes`) and at `control`, live for the call.
-            let sent = unsafe { libc::sendmsg(self.fd.as_raw_fd(), &raw const message, flags) };
-            if sent < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+            let sent = match unsafe { net::sendmsg(Fd::new(self.fd.as_raw_fd()), &message, flags) } {
+                Ok(count) => count,
+                Err(SysErrno::Intr) => continue,
+                Err(errno) => {
+                    let error = std::io::Error::from_raw_os_error(errno.raw().into());
+                    return Err(Error::new(format!("writing the channel: {error}")));
                 }
-                return Err(Error::new(format!("writing the channel: {error}")));
-            }
+            };
             fds = &[];
-            bytes = &bytes[sent as usize..];
+            bytes = &bytes[sent..];
         }
         Ok(())
     }
@@ -253,29 +228,39 @@ impl Stream {
     /// to interleave.
     fn ring(&self) -> Result<(), Error> {
         #[cfg(target_os = "linux")]
-        let flags = libc::MSG_NOSIGNAL;
-        #[cfg(not(target_os = "linux"))]
-        let flags = 0;
-        let byte = [1u8];
         loop {
-            // SAFETY: one byte of a live array, to the open socket this stream owns.
-            let sent = unsafe { libc::send(self.fd.as_raw_fd(), byte.as_ptr().cast(), 1, flags) };
-            if sent == 1 {
-                return Ok(());
+            match net::send(Fd::new(self.fd.as_raw_fd()), &[1], net::MsgFlags::NO_SIGNAL) {
+                Ok(1) => return Ok(()),
+                Ok(_) => return Err(os("ringing the daemon")),
+                Err(SysErrno::Intr) => continue,
+                Err(errno) => {
+                    let error = std::io::Error::from_raw_os_error(errno.raw().into());
+                    return Err(Error::new(format!("ringing the daemon: {error}")));
+                }
             }
-            if sent < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let flags = 0;
+            let byte = [1u8];
+            loop {
+                // SAFETY: one byte of a live array, to the open socket this stream owns.
+                let sent = unsafe { libc::send(self.fd.as_raw_fd(), byte.as_ptr().cast(), 1, flags) };
+                if sent == 1 {
+                    return Ok(());
+                }
+                if sent < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(os("ringing the daemon"));
             }
-            return Err(os("ringing the daemon"));
         }
     }
 
     /// Whether the other end wrote or hung up.
     fn spoke(&self) -> bool {
-        let mut poll = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: one live `pollfd`; a zero timeout returns at once.
-        unsafe { libc::poll(&raw mut poll, 1, 0) != 0 }
+        let mut poll = [io::PollFd::new(Fd::new(self.fd.as_raw_fd()), io::PollEvents::IN)];
+        io::poll(&mut poll, Some(Timespec::ZERO)) != Ok(0)
     }
 }
 
@@ -330,7 +315,7 @@ impl Drop for Errno {
         #[cfg(target_os = "macos")]
         {
             // SAFETY: the calling thread's `errno`, a live thread-local `int`.
-            let errno = unsafe { libc::__error() };
+            let errno = unsafe { (io::real().errno)() };
             // SAFETY: `errno` points to the calling thread's live thread-local `int`.
             unsafe { *errno = self.0 };
         }
@@ -355,8 +340,7 @@ impl Listener {
         let fail = |it: std::io::Error| Error::new(format!("{}: {it}", dir.display()));
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(fail)?;
         let meta = std::fs::metadata(dir).map_err(fail)?;
-        // SAFETY: geteuid has no preconditions.
-        let uid = unsafe { libc::geteuid() };
+        let uid = thread::geteuid();
         if meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
             return Err(Error::new(format!(
                 "{} is reachable by others (owner {}, mode {:o}): the host listens only where this user alone can",
@@ -398,26 +382,24 @@ impl Listener {
 
 /// The process at the other end of `fd`, when it is this user's.
 fn peer(fd: &OwnedFd) -> Result<u32, Error> {
-    // SAFETY: geteuid has no preconditions.
-    let me = unsafe { libc::geteuid() };
+    let me = thread::geteuid();
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: a zeroed `ucred` is a valid one.
-        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut len = size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: `fd` is a connected socket; `cred` and `len` are live and writable.
-        let got = unsafe {
-            libc::getsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
+        let mut cred = net::ucred::default();
+        // SAFETY: cred is the kernel's three-integer ucred, exclusively writable for its size.
+        unsafe {
+            blaze_sys::linux::sock::getsockopt_raw(
+                Fd::new(fd.as_raw_fd()),
+                net::SOL_SOCKET,
+                net::SO_PEERCRED,
                 (&raw mut cred).cast(),
-                &raw mut len,
+                size_of::<net::ucred>() as types::socklen_t,
             )
-        };
-        if got != 0 {
-            return Err(os("reading a run process's credentials"));
         }
+        .map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("reading a run process's credentials: {error}"))
+        })?;
         if cred.uid != me {
             return Err(Error::new(format!(
                 "a connection from process {} of user {}, refused",
@@ -428,24 +410,21 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
     }
     #[cfg(target_os = "macos")]
     {
-        const SOL_LOCAL: c_int = 0;
-        const LOCAL_PEERPID: c_int = 2;
-        let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
-        // SAFETY: `fd` is a connected Unix socket; `uid` and `gid` are live and writable.
-        if unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) } != 0 {
-            return Err(os("reading a run process's user"));
-        }
+        let (uid, _) = net::peer_ids(Fd::new(fd.as_raw_fd())).map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("reading a run process's user: {error}"))
+        })?;
         if uid != me {
             return Err(Error::new(format!("a connection from user {uid}, refused")));
         }
-        let mut pid: libc::pid_t = 0;
-        let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
-        // SAFETY: as above; `pid` and `len` are live and writable.
+        let mut pid: types::pid_t = 0;
+        let mut len = size_of::<types::pid_t>() as types::socklen_t;
+        // SAFETY: pid and len are writable, and len is the size of the pid the option returns.
         let got = unsafe {
-            libc::getsockopt(
+            net::c::getsockopt(
                 fd.as_raw_fd(),
-                SOL_LOCAL,
-                LOCAL_PEERPID,
+                net::SOL_LOCAL,
+                net::LOCAL_PEERPID,
                 (&raw mut pid).cast(),
                 &raw mut len,
             )
@@ -464,11 +443,19 @@ pub fn connect(address: &str) -> Result<Stream, Error> {
 }
 
 pub fn random(out: &mut [u8; 16]) -> Result<(), Error> {
-    // SAFETY: `out` is 16 writable bytes, within getentropy's limit of 256.
-    if unsafe { libc::getentropy(out.as_mut_ptr().cast(), out.len()) } != 0 {
-        return Err(os("getentropy"));
+    #[cfg(target_os = "macos")]
+    return io::getentropy(out).map_err(|errno| {
+        let error = std::io::Error::from_raw_os_error(errno.raw().into());
+        Error::new(format!("getentropy: {error}"))
+    });
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `out` is 16 writable bytes, within getentropy's limit of 256.
+        if unsafe { libc::getentropy(out.as_mut_ptr().cast(), out.len()) } != 0 {
+            return Err(os("getentropy"));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The process's global scope: what `dlsym(RTLD_DEFAULT, ..)` searches, the executable and
@@ -497,6 +484,10 @@ impl Scope {
         self.name.reserve(name.len() + 1);
         self.name.extend_from_slice(name.as_bytes());
         self.name.push(0);
+        #[cfg(target_os = "macos")]
+        // SAFETY: the loader's global scope is valid and name is NUL-terminated for the call.
+        let found = unsafe { thread::dlsym(thread::RTLD_DEFAULT, self.name.as_ptr().cast()) };
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: `self.name` is NUL-terminated with no NUL before its end (checked above) and
         // lives for the call; RTLD_DEFAULT asks the loader's global scope, which it only reads.
         let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, self.name.as_ptr().cast()) };
@@ -505,11 +496,11 @@ impl Scope {
 }
 
 pub(crate) fn protection(access: Access) -> c_int {
-    match access {
-        Access::Execute => libc::PROT_READ | libc::PROT_EXEC,
-        Access::Read => libc::PROT_READ,
-        Access::Copy | Access::Shared => libc::PROT_READ | libc::PROT_WRITE,
-    }
+    (match access {
+        Access::Execute => io::Prot::READ | io::Prot::EXEC,
+        Access::Read => io::Prot::READ,
+        Access::Copy | Access::Shared => io::Prot::READ | io::Prot::WRITE,
+    }).bits() as c_int
 }
 
 pub fn serialize() {

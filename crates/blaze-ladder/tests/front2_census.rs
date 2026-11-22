@@ -123,6 +123,10 @@ fn body_class(e: &BodyError) -> String {
             Some(BodyFinding::CfgOut) => "lower Lowered: CfgOut".into(),
             None => "lower Lowered: (no finding)".into(),
         },
+        BodyError::Calls { errors, .. } => match errors.first() {
+            Some(e) => format!("lower Calls: `{}`", e.path),
+            None => "lower Calls: (no call)".into(),
+        },
         BodyError::Convert { refused, why, .. } => {
             format!("lower Convert: {}{}", cls(&format!("{refused:?}")), why.as_ref().map_or(String::new(), |w| format!(" / {}", why_class(w))))
         }

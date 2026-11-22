@@ -174,3 +174,57 @@ fn a_cast_across_sign_and_width_is_two_steps() {
         assert_eq!(v.cast_unsigned().widen_to::<u64>(), u64::from(v as u32));
     }
 }
+
+/// Time as a number: the units saturate, a duration round-trips where it fits and clamps where
+/// it does not, and a deadline's edges (`PASSED`, `NEVER`, one past the clock's end) hold.
+#[test]
+fn nanos_and_deadlines_saturate_at_their_edges() {
+    use core::time::Duration;
+
+    use crate::time::{Clock, Deadline, Nanos};
+
+    assert_eq!(Nanos::from_secs(2), Nanos(2_000_000_000));
+    assert_eq!(Nanos::from_millis(3), Nanos(3_000_000));
+    assert_eq!(Nanos::from_micros(4), Nanos(4_000));
+    assert_eq!(Nanos::from_secs(u64::MAX), Nanos::MAX);
+    for d in [Duration::ZERO, Duration::from_nanos(1), Duration::from_secs(7), Duration::from_nanos(u64::MAX)] {
+        assert_eq!(Nanos::from_duration(d).to_duration(), d);
+    }
+    assert_eq!(Nanos::from_duration(Duration::MAX), Nanos::MAX);
+    assert_eq!(Nanos(5).since(Nanos(7)), Nanos::ZERO);
+    assert_eq!(Nanos(7).since(Nanos(5)), Nanos(2));
+    assert_eq!(Nanos::MAX.checked_add(Nanos(1)), None);
+    assert_eq!(Nanos::MAX.saturating_add(Nanos(1)), Nanos::MAX);
+
+    let now = Nanos(100);
+    assert!(Deadline::PASSED.passed(now));
+    assert!(Deadline::PASSED.passed(Nanos::ZERO));
+    assert!(!Deadline::NEVER.passed(now));
+    assert_eq!(Deadline::NEVER.finite(), None);
+    assert_eq!(Deadline::after(Nanos::MAX, Nanos(1)), Deadline::NEVER);
+    let d = Deadline::after(now, Nanos(50));
+    assert_eq!(d.get(), Nanos(150));
+    assert_eq!(d.finite(), Some(d));
+    assert_eq!(d.left(now), Nanos(50));
+    assert_eq!(d.left(Nanos(200)), Nanos::ZERO);
+    assert!(!d.passed(Nanos(149)));
+    assert!(d.passed(Nanos(150)));
+    assert_eq!(d.min(Deadline::NEVER), d);
+    assert_eq!(Deadline::NEVER.min(d), d);
+    assert_eq!(Deadline::at(Nanos(9)), Deadline::after(Nanos(4), Nanos(5)));
+
+    /// A test's clock: each read one tick after the last.
+    struct Ticks(core::cell::Cell<u64>);
+    impl Clock for Ticks {
+        fn now(&self) -> Nanos {
+            self.0.set(self.0.get() + 1);
+            Nanos(self.0.get())
+        }
+    }
+    fn first_two(clock: &impl Clock) -> (Nanos, Nanos) {
+        (clock.now(), clock.now())
+    }
+    let ticks = Ticks(core::cell::Cell::new(0));
+    assert_eq!(first_two(&ticks), (Nanos(1), Nanos(2)));
+    assert_eq!(first_two(&&ticks), (Nanos(3), Nanos(4)), "a reference to a clock is the clock");
+}

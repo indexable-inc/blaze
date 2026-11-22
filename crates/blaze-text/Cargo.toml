@@ -21,6 +21,8 @@ blaze-own.workspace = true
 blaze-int.workspace = true
 
 [dev-dependencies]
+# `blaze_own::testing::heap()` for the tests and `Heap::process()` for the cost example's `main`.
+blaze-own = { workspace = true, features = ["testing"] }
 # Properties: every writer against `core::fmt`, float round trips, parse offsets; with a
 # planted-bug control.
 blaze-sim.workspace = true

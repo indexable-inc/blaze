@@ -85,7 +85,7 @@ fn record_of(texts: &'static Texts) -> (ItemsRecord<'static>, &'static [u8], Cra
     let names = solved[0].names;
     let bytes = encode(names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let bytes: &'static [u8] = aligned(&bytes, g);
-    (ItemsRecord::open(bytes, g).unwrap_or_else(|e| panic!("open: {e:?}")), bytes, names.key)
+    (super::items_record::one_file(bytes, names.files[0].text, g), bytes, names.key)
 }
 
 /// The record's facts (module docs), in row order.
@@ -192,7 +192,7 @@ fn a_type_only_edit_is_fresh_through_the_old_record() {
             let key = (0..base.items())
                 .find_map(|i| base.item_at(i).ok().flatten().filter(|row| row.name == Some(*name)).map(|row| row.key))
                 .unwrap_or_else(|| panic!("no item row named `{name}`"));
-            match read.item_now(key) {
+            match read.item_now_since(key, &base) {
                 Ok(Some(ItemNow::Fresh { row, text: today, body_changed: true })) => {
                     let span = row.text.unwrap_or_else(|| panic!("{what}: `{name}` fresh with no place"));
                     let seen = &today[span.start as usize..(span.start + span.len) as usize];

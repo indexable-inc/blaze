@@ -35,7 +35,7 @@ the standard library is part of a compiler.
 ## What it is today
 
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`).
+  from (`pins/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`).
   `blaze toolchain` prints it and where it is, downloading it first when it is not there;
   `blaze toolchain --json` prints one object (`name`, `nightly`, `rustc`, `release`, `commit`,
   the host's tuple as `host`, and `sysroot`), which a harness reads instead of running
@@ -43,7 +43,8 @@ the standard library is part of a compiler.
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, the host's `rust-std` and
   wasm32-wasip1's (for wasi-libc, which blaze's linker links every proc macro's module with), unchanged,
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  (`pins/rust.txt`, written by `harness/toolchain_pins.py` and read at compile time by
+  `crates/blaze-pins`, the one Rust reader of `pins/`; [pins/README.md](../pins/README.md)). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
   this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain).
@@ -87,7 +88,7 @@ the standard library is part of a compiler.
 
 ## The LLVM blaze is built with
 
-Building blaze itself takes one more pinned piece, LLVM: `crates/blaze-toolchain/pins/llvm.json` names
+Building blaze itself takes one more pinned piece, LLVM: `pins/llvm.json` names
 its commit and version (23.1.4, our fork's `ix/23.x`) and the sha256 of each target's release
 archive. blaze fetches it itself, by that sha256, and hands it to the build scripts that link
 it: the root `Cargo.toml` declares it a pinned native input
@@ -109,13 +110,13 @@ toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/design/toolchai
 The daily bump workflow was deleted on 2026-11-15; the pin moves by hand.
 `uv run --frozen python harness/toolchain_bump.py '{}'` (or `'{"date": "YYYY-MM-DD"}'`) picks
 the newest nightly whose manifest has every component blaze needs on every host it ships for,
-writes `harness/toolchain` and `crates/blaze-cargo/src/toolchain/pins.txt`
+writes `pins/toolchain` and `pins/rust.txt`
 (`harness/toolchain_pins.py`), re-vendors the crates blaze takes from rust-lang/rust at the new
 commit, merges the new nightly's standard library into `library/` ([The standard
 library](#the-standard-library-library)) and writes blaze's registry of rustc's lints again
 (`crates/blaze-lint-defs/src/rustc.rs`, `scripts/src/bin/lint_table.rs`); each step names
 itself when it fails, and stops there (the script's docstring lists them). After it,
-`harness/answers.py --write` on each host writes `crates/blaze-units/src/stdlib/rustc.json`,
+`harness/answers.py --write` on each host writes `pins/answers/rustc.json`,
 and `harness/nightly_features.py '{}'` moves the tree of nightly features (#967) to the new pin.
 The gate's `lint_table check` fails a tree whose registry was written from another commit than
 `library/UPSTREAM`'s, or was edited.

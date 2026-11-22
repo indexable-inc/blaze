@@ -19,7 +19,7 @@ use blaze_ids::ContentId;
 use blaze_http::driver::{Fetched, Handle};
 use blaze_http::{Client, Config, Kind, Request, Step, mailbox};
 use blaze_manifest::lock::Lock;
-use blaze_own::{Alloc, String as OwnString};
+use blaze_own::String as OwnString;
 use blaze_text::Writes as _;
 
 const USER_AGENT: &str = concat!("blaze/", env!("CARGO_PKG_VERSION"));
@@ -471,7 +471,6 @@ impl FetchIo for Io<'_> {
                     footprint::HELD.fetch_add(body.len(), std::sync::atomic::Ordering::Relaxed);
                 }
                 let ask = Ask { unit: (key >> 32) as u32, seq: key as u32 };
-                let at = self.now();
                 footprint::phase(match self.git.get(ask.unit as usize) {
                     Some(false) | None => footprint::CRATE,
                     // An advertisement is a few hundred bytes; a pack's answer is never under 64 KiB
@@ -487,7 +486,7 @@ impl FetchIo for Io<'_> {
                     Fetched::Failed(error) => Reply::Failed(failure(&error.kind)),
                     Fetched::TimedOut => Reply::Failed(NetFailure::Timeout),
                 };
-                Woke::Answer { ask, at, reply }
+                Woke::Answer { ask, reply }
             }
             Ok(None) => fail("blaze-http's driver stopped"),
             // The deadline the machine named: its next poll fails or releases what is due.

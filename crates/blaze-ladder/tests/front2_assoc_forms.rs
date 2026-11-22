@@ -17,12 +17,15 @@
 //!    Without the fix `g` has no head ("an associated item constraint": heads.rs `anon_params`
 //!    walked the bound's path as a type; front2/bound_kids.rs).
 //! 3. `impl Gat<Out<u8>: Clone>`, an associated type bound with type arguments on the
-//!    associated type, a form not built: refused by name, "an associated type bound with type
-//!    or const arguments (`Item<T>: Bound`)" (const_args_in_bounds.rs), never taken as `Out:
-//!    Clone`.
+//!    associated type. Once a form not built (refused "an associated type bound with type or
+//!    const arguments (`Item<T>: Bound`)", const_args_in_bounds.rs); built since
+//!    front2/gat_bounds.rs (preds.rs `Builder::one_bound` -> `gat_bounds`): the clause
+//!    `<P as Gat>::Out<u8>: Clone`. `h` clones the `Out<u8>` its argument gives: clean only when
+//!    that clause is on record with its own argument. The control `h0` is `h` without the
+//!    bound: refused, so `h`'s clean check is the clause's doing (rule 23), never `Out: Clone`
+//!    taken for every `Out<T>` or no clause asked.
 //!
-//! The line it prints: "assoc forms: clean 2 (f, g), refused 1 (h: an associated type bound with
-//! type or const arguments)".
+//! The line it prints: "assoc forms: clean 3 (f, g, h), refused 1 (h0: no `Out<u8>: Clone`)".
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
@@ -41,12 +44,10 @@ impl Tr for u8 { type Out<T> = (T, u8); }
 fn f<A: Tr>(x: A::Out<u16>) -> <A as Tr>::Out<u16> { x }
 trait Src { type Error; fn err(&self) -> Self::Error; }
 fn g(s: impl Src<Error: Clone>) { let e = s.err(); let _d = e.clone(); }
-trait Gat { type Out<T>; }
-fn h(s: impl Gat<Out<u8>: Clone>) { let _v = s; }
+trait Gat { type Out<T>; fn out(&self) -> Self::Out<u8>; }
+fn h(s: impl Gat<Out<u8>: Clone>) { let o = s.out(); let _c = o.clone(); }
+fn h0(s: impl Gat) { let o = s.out(); let _c = o.clone(); }
 ";
-
-/// The refusal of form 3, as const_args_in_bounds.rs names it.
-const REFUSED: &str = "an associated type bound with type or const arguments (`Item<T>: Bound`)";
 
 #[test]
 fn assoc_forms_in_heads() {
@@ -75,7 +76,7 @@ fn assoc_forms_in_heads() {
     let prepared = Prepares::new_in(heap.alloc());
     let mut buckets = None;
     let mut outcome: Vec<(&str, Result<(), String>)> = Vec::new();
-    for name in ["f", "g", "h"] {
+    for name in ["f", "g", "h", "h0"] {
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {
             outcome.push((name, Err(format!("no head: {e:?}"))));
             continue;
@@ -101,11 +102,11 @@ fn assoc_forms_in_heads() {
         };
         outcome.push((name, got));
     }
-    let [("f", f), ("g", g), ("h", h)] = outcome.as_slice() else { panic!("three bodies, `f`, `g`, `h`: {outcome:?}") };
+    let [("f", f), ("g", g), ("h", h), ("h0", h0)] = outcome.as_slice() else { panic!("four bodies, `f`, `g`, `h`, `h0`: {outcome:?}") };
     assert!(f.is_ok(), "`fn f<A: Tr>(x: A::Out<u16>) -> <A as Tr>::Out<u16> {{ x }}` checks clean (one projection, own argument kept): {f:?}");
     assert!(g.is_ok(), "`fn g(s: impl Src<Error: Clone>)` checks clean (`<P as Src>::Error: Clone` on record): {g:?}");
-    let Err(text) = h else { panic!("`fn h(s: impl Gat<Out<u8>: Clone>)` checked clean: a form not built was taken") };
-    assert!(text.starts_with("no head: "), "`h` is refused at its head, not by {text}");
-    assert!(text.contains(REFUSED), "`h`'s head is refused by name ({REFUSED}): {text}");
-    println!("assoc forms: clean 2 (f, g), refused 1 (h: an associated type bound with type or const arguments)");
+    assert!(h.is_ok(), "`fn h(s: impl Gat<Out<u8>: Clone>)` checks clean (`<P as Gat>::Out<u8>: Clone` on record, gat_bounds.rs): {h:?}");
+    let Err(text) = h0 else { panic!("`fn h0(s: impl Gat)` cloned its `Out<u8>` with no bound and checked clean: the clause `h` checks by is not what made it clean") };
+    assert!(text.starts_with("diagnostics: "), "`h0` is refused by its body's check (no `Out<u8>: Clone`), not by {text}");
+    println!("assoc forms: clean 3 (f, g, h), refused 1 (h0: no `Out<u8>: Clone`)");
 }

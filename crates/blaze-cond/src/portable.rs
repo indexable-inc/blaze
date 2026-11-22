@@ -17,10 +17,11 @@
 #![blaze::sans_io]
 
 use blaze_int::{Int, idx};
-use blaze_own::AVec;
+use blaze_own::{AVec, planted::Planted};
 
-use crate::bdd::{Bdd, Cond, Var};
+use crate::bdd::{Bdd, Cond, PlantedBdd, Var};
 use crate::error::{CondError, ImportError};
+use crate::plant::CondPlant;
 use crate::space::{Space, VarKey};
 
 /// Bytes of the header.
@@ -29,7 +30,12 @@ pub const HEADER: usize = 8;
 pub const ROW: usize = 16;
 
 /// Writes `cond`'s portable form into `out` (cleared first).
-pub fn export(bdd: &mut Bdd<'_>, space: &Space<'_>, cond: Cond, out: &mut AVec<'_, u8>) -> Result<(), CondError> {
+pub fn export(
+    bdd: &mut PlantedBdd<'_, impl Planted<CondPlant>>,
+    space: &Space<'_>,
+    cond: Cond,
+    out: &mut AVec<'_, u8>,
+) -> Result<(), CondError> {
     out.clear();
     bdd.post_order(cond)?;
     let rows = bdd.order.len();
@@ -58,7 +64,11 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 }
 
 /// Takes a portable form back into `bdd`, whose variables are `space`'s.
-pub fn import(bdd: &mut Bdd<'_>, space: &Space<'_>, bytes: &[u8]) -> Result<Cond, ImportError> {
+pub fn import(
+    bdd: &mut PlantedBdd<'_, impl Planted<CondPlant>>,
+    space: &Space<'_>,
+    bytes: &[u8],
+) -> Result<Cond, ImportError> {
     let len = bytes.len();
     if len < HEADER || (len - HEADER) % ROW != 0 {
         return Err(ImportError::Length { len });

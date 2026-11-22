@@ -12,7 +12,7 @@ use std::vec::Vec as StdVec;
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_lower::form::{
-    Attr, ExprId as LExprId, Field as LField, Param, SegKind, Segment, SelfKind, Shape, TypeId, TypeRef, Variant as LVariant,
+    ExprId as LExprId, Field as LField, Param, SegKind, Segment, SelfKind, Shape, TypeId, TypeRef, Variant as LVariant,
 };
 use blaze_lower::typeck::{Refused, TypeckBody, Types, to_typeck};
 use blaze_lower::{Cfg, CfgAnswer, Edition, View, lower_body};
@@ -172,7 +172,7 @@ impl LitTable {
     /// expansion's (`View::text_at`), never at the body's site ranges.
     fn of(view: &View<'_>, body: &TypeckBody<'_>) -> Result<LitTable, Skip> {
         let mut t = LitTable::default();
-        let mut put = |text: &mut String, s: &str| {
+        let put = |text: &mut String, s: &str| {
             let start = text.len() as u32;
             text.push_str(s);
             Range { start, end: text.len() as u32 }

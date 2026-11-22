@@ -34,6 +34,7 @@ mod drawn;
 
 // libc's door to the operating system's randomness (POSIX 2024; macOS 10.12, glibc 2.25, musl,
 // wasi-libc): fills `len` bytes, at most 256, and returns 0, or -1 with `errno` set.
+#[allow(blaze::sans_io_core, reason = "`SipKey::random`'s draw, kept until intern takes a handed key")]
 unsafe extern "C" {
     fn getentropy(buf: *mut u8, len: usize) -> i32;
 }
@@ -60,6 +61,11 @@ impl SipKey {
     /// call, so no simulation repeats a table keyed by it. The capability form is bstd's
     /// `Io::sip_key` (one `Effect::Random` through the world's driver), its key handed to the
     /// table's maker. Deleted by batch P4-random once its callers take a key from their maker.
+    ///
+    /// Deprecated: take the key from bstd's `Io::sip_key` and hand it to [`SipKey::new`] (or
+    /// [`LazyKey::get_or`]). Callers: intern/src/table.rs:48, and through [`LazyKey::get`]
+    /// intern/src/intern.rs:62 and intern/src/intern_slice.rs:60.
+    #[allow(blaze::sans_io_core, reason = "the ambient draw kept until intern takes a handed key")]
     pub fn random() -> SipKey {
         let mut bytes = [0_u8; 16];
         // SAFETY: `bytes` is 16 writable bytes, within `getentropy`'s limit of 256, and it

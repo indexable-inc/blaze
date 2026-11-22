@@ -53,7 +53,15 @@ fn child() {
         Err(e) => format!("spawn failed: {e}"),
     };
     std::fs::write(format!("{out_dir}/answer"), said).expect("OUT_DIR/answer");
+    // What the confined script was shown of cargo's variables (the hermetic spec's env is exact
+    // pairs: one dropped is a script that cannot find its output folder or its target).
+    let seen: std::vec::Vec<std::string::String> =
+        SEEN_VARS.iter().map(|name| format!("{name}={}", std::env::var(name).unwrap_or_else(|_| "unset".to_owned()))).collect();
+    std::fs::write(format!("{out_dir}/env"), seen.join("\n")).expect("OUT_DIR/env");
 }
+
+/// The variables the script reports back, as cargo sets them for a build script.
+const SEEN_VARS: [&str; 6] = ["OUT_DIR", "CARGO_MANIFEST_DIR", "TARGET", "HOST", "PROFILE", "NUM_JOBS"];
 
 struct Run {
     answer: std::string::String,
@@ -85,6 +93,12 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
     vars.push(pair("CARGO_MANIFEST_DIR", "/package"));
     vars.push(pair("OUT_DIR", "/target/debug/build/n7-0/out"));
     vars.push(pair(CHILD, "1"));
+    vars.push(pair("TARGET", "aarch64-apple-darwin"));
+    vars.push(pair("HOST", "aarch64-apple-darwin"));
+    vars.push(pair("PROFILE", "debug"));
+    // `Env` is sorted by name (its `get` searches it): unsorted, `BLAZE_N7_CHILD` after
+    // `OUT_DIR` hid `OUT_DIR` from the search, and the run was refused as `MissingVar`.
+    vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
     let env = Env { vars };
     let c = CInputs {
         shelf: Shelf { dir: &shelf, clang_major: "23" },
@@ -95,6 +109,8 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
         macos_min: "11.0",
     };
     let script = NativeScript {
+        // A test's run: no record is kept, so any key names its trees.
+        key: blaze_ids::ContentId([7; 32]),
         program: &exe,
         c,
         env: &env,
@@ -112,6 +128,12 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
     let stored = ran.outputs.stored_file("answer").expect("the script's OUT_DIR/answer");
     let name: std::string::String = stored.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
     let answer = std::string::String::from_utf8_lossy(&std::fs::read(format!("{files}/{name}")).expect("the stored answer in the area")).into_owned();
+    let stored = ran.outputs.stored_file("env").expect("the script's OUT_DIR/env");
+    let name: std::string::String = stored.sha256.iter().map(|byte| format!("{byte:02x}")).collect();
+    let seen = std::string::String::from_utf8_lossy(&std::fs::read(format!("{files}/{name}")).expect("the stored env in the area")).into_owned();
+    // The folders are the real ones (the script writes there); cargo's others as given; one job.
+    let expected = format!("OUT_DIR={out}\nCARGO_MANIFEST_DIR={package}\nTARGET=aarch64-apple-darwin\nHOST=aarch64-apple-darwin\nPROFILE=debug\nNUM_JOBS=1");
+    assert_eq!(seen, expected, "what the confined script saw of cargo's variables");
     let asked = native_facts::reads(&facts, pins, alloc).unwrap_or_else(|e| panic!("{e}"));
     let reads = asked.reads.iter().map(|r| (r.subject.clone(), r.digest.is_some())).collect();
     _ = std::fs::remove_dir_all(&root);

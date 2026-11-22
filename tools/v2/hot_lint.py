@@ -21,9 +21,9 @@ from typed_input import parse
 
 SCRIPT = "hot_lint.py"
 HOT = (
-    "blaze-query", "blaze-ids", "intern", "blaze-graph", "blaze-cas", "blaze-vfs", "blaze-core",
+    "blaze-query", "blaze-ids", "intern", "blaze-graph", "blaze-cas", "blaze-core",
     "blaze-link", "blaze-codegen", "blaze-stencil", "blaze-lazy", "blaze-items",
-    "parser", "syntax-tree", "span", "tt", "mbe", "hir-def", "hir-expand", "hir-ty",
+    "parser", "syntax-tree", "tt", "mbe", "hir-def", "hir-expand", "hir-ty",
     "hir-ty-mir", "hir-ty-codegen", "base-db", "blaze-diagnostics",
     "fuzz",
 )

@@ -87,7 +87,24 @@ pub(crate) fn timed<R>(kind: Kind, call: impl FnOnce() -> R) -> R {
     counter.calls.fetch_add(1, Ordering::Relaxed);
     counter.ns.fetch_add(ns, Ordering::Relaxed);
     counter.max_ns.fetch_max(ns, Ordering::Relaxed);
+    // The thread's meter (D169): the same call, by the meter's kind, on the thread that made it.
+    let metered = kind.metered();
+    blaze_meter::call(metered);
+    blaze_meter::call_took(metered, ns);
     got
+}
+
+impl Kind {
+    /// The meter's kind of this call: the maps, unmaps and protects by name, the advice as
+    /// [`blaze_meter::Call::Other`].
+    pub const fn metered(self) -> blaze_meter::Call {
+        match self {
+            Kind::Reserve | Kind::MapFixed => blaze_meter::Call::Mmap,
+            Kind::Munmap => blaze_meter::Call::Munmap,
+            Kind::Mprotect => blaze_meter::Call::Mprotect,
+            Kind::Purge | Kind::Populate | Kind::Advise => blaze_meter::Call::Other,
+        }
+    }
 }
 
 /// The counts so far, one per [`KINDS`] entry.

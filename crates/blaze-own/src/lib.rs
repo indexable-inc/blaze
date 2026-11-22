@@ -18,6 +18,7 @@
 //! | [`VecDeque`] | a ring buffer |
 //! | [`SortedMap`], [`SortedSet`] | ordered by key, a sorted vector searched by halving: for small or read-mostly maps |
 //! | [`BTreeMap`], [`BTreeSet`] | ordered by key, a B-tree of 15-entry nodes, keys and values in separate columns: for large or insert-heavy maps |
+//! | [`Heap4`] | a 4-ary min-heap in one vector, the priority queue; its plant on the [`planted`] seam |
 //! | [`CloneIn`], [`Share`], [`DefaultIn`], [`FromIn`], [`IntoIn`], [`FromStrIn`] | std's `Clone`, `Default`, `From`, `Into` and `FromStr` with the allocator named; `Share` the copy that is another handle ([`make`]) |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
@@ -114,10 +115,13 @@ pub mod cow;
 pub mod deque;
 mod error;
 pub mod fixed;
+pub mod heap4;
 pub mod lists;
 pub mod make;
 pub mod packed;
 pub mod paths;
+// The plant seam shipped code takes a planted bug through (D165): `Planted`, `NoPlant`.
+pub mod planted;
 pub mod raw;
 pub mod rc;
 pub mod segs;
@@ -152,6 +156,7 @@ pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};
+pub use heap4::{Heap4, Heap4Plant};
 pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use raw::RawBuf;

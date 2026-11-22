@@ -143,8 +143,14 @@ impl Table {
     /// The table's atoms: what a dense answer's token rows name.
     fn atoms(&self) -> Atoms<'_> {
         let text_at = self.atoms_at + self.atoms * ATOM;
-        self.proved
-            .atoms(&self.body[self.atoms_at..text_at], &self.body[text_at..text_at + self.text_len])
+        let (atoms, text) = (&self.body[self.atoms_at..text_at], &self.body[text_at..text_at + self.text_len]);
+        // SAFETY: `proved` is set only where a `Table` is made: in `Table::of`, from
+        // `Atoms::of(&body[atoms_at..text_at], &body[text_at..data_at])`, with `text_len` =
+        // `data_at - text_at` and these same `atoms_at`, `atoms` and `body` stored beside it; or
+        // `Checked::EMPTY` in `Table::empty`, whose sections are both empty. `body` is private to
+        // `Table` and no method writes it after it is made (every use takes `&self`), so these are
+        // the very bytes the proof was taken of, unchanged.
+        unsafe { self.proved.atoms(atoms, text) }
             .expect("`Table::of` proved these two sections of the body, which nothing writes after")
     }
 

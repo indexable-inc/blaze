@@ -1,3 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["macros", "state", "calls", "panics", "once", "settles", "sessions"]

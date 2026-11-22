@@ -137,9 +137,12 @@
               its type's reflection gave (`debug`)"
 )]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 
-// The tests compare against `core::fmt` through std's `format!`, and plant bugs in a
-// thread-local.
+// The tests compare against `core::fmt` through std's `format!`.
 #[cfg(test)]
 extern crate std;
 
@@ -172,12 +175,12 @@ pub mod twins {
     }
 }
 
-#[cfg(test)]
 mod plant;
 #[cfg(test)]
 mod tests;
 
 pub use adapt::{PutDisplay, Shown};
+pub use plant::TextPlant;
 pub use debug::DebugForm;
 pub use float::Float;
 pub use int::Integer;

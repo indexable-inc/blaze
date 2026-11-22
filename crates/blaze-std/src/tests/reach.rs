@@ -43,6 +43,16 @@ const REACHES: &[&str] = &[
 /// the root of real-OS authority, and the places that take that root: the `main!` macro's
 /// process main (entry.rs) and, until batch B1 deletes it, `Io::native` (io.rs), which reaches
 /// it itself.
+///
+/// And the hermetic runner's native port (D177; procs/hermetic.rs): its core (`machine.rs`,
+/// `plan.rs`, `execution.rs`, `report.rs`) is a sans-IO state machine that reaches nothing and
+/// asks its [`Port`](crate::procs::hermetic) for each effect; `sim.rs` is the simulated port
+/// and `native.rs` with its per-OS confiners `seatbelt.rs` (macOS: the host clock's timebase,
+/// `proc_pid_rusage`, `killpg`) and `landlock.rs` (Linux: the ruleset's `openat`s, the group
+/// kill) is the native port: the thin driver that IS the seam's other side, as `rt/` is for
+/// the program. Moving those calls into `rt/` would add a second seam between a driver and
+/// its own system calls, not keep one out of a core. So these three files may name blaze-sys,
+/// and only blaze-sys: any other reach in them is still found.
 fn allowed(file: &str, reach: &str) -> bool {
     file == "rt.rs"
         || file.starts_with("rt/")
@@ -50,11 +60,20 @@ fn allowed(file: &str, reach: &str) -> bool {
         || (file == "io/native_in.rs" && reach == "blaze_core::native_in(")
         || (file == "io.rs" && reach == "Os::process()")
         || (file == "entry.rs" && reach == "Os::process()")
+        || (matches!(file, "procs/hermetic/native.rs" | "procs/hermetic/seatbelt.rs" | "procs/hermetic/landlock.rs") && reach == "blaze_sys::")
+        // The sampler (D178): `sampler/mac.rs` and `sampler/linux.rs` are its two drivers (they
+        // stop a thread and read its registers through blaze-sys); `sampler.rs` re-exports the
+        // pure ring, slot and walk, which live in blaze-sys because every `unsafe` of the
+        // sampler is kept there (its line 85): a type path, not a call into the system.
+        || (matches!(file, "telemetry/sampler/mac.rs" | "telemetry/sampler/linux.rs" | "telemetry/sampler.rs") && reach == "blaze_sys::")
 }
 
-/// Files that are tests, which run on the host's std and are not the program.
+/// Files that are tests, which run on the host's std and are not the program: `tests.rs`,
+/// `tests/`, and a test module of its own file (`x_tests.rs`, declared under `#[cfg(test)]`:
+/// procs/hermetic/process_tests.rs, io/lend_tests.rs, sync/once_tests.rs,
+/// task/threads/find_tests.rs).
 fn is_test(file: &str) -> bool {
-    file == "tests.rs" || file.starts_with("tests/") || file.ends_with("/tests.rs")
+    file == "tests.rs" || file.starts_with("tests/") || file.ends_with("/tests.rs") || file.ends_with("_tests.rs")
 }
 
 /// Each `(file, line, reach)` of `text` outside comments.
@@ -112,4 +131,9 @@ fn a_bypass_put_back_is_found() {
     assert_eq!(bypasses("rt.rs", planted), vec![], "the runtime is a backend");
     assert_eq!(bypasses("io.rs", "use bstd::net::Net; // std::fs::read\n"), vec![]);
     assert_eq!(bypasses("guest.rs", "let seed = std::random::random(..);\n"), vec![("guest.rs".to_owned(), 1, "std::random")]);
+    // The hermetic native port may name blaze-sys and nothing else; its sans-IO core may not.
+    let sys = "let t = blaze_sys::macos::timebase();\n";
+    assert_eq!(bypasses("procs/hermetic/seatbelt.rs", sys), vec![]);
+    assert_eq!(bypasses("procs/hermetic/machine.rs", sys), vec![("procs/hermetic/machine.rs".to_owned(), 1, "blaze_sys::")]);
+    assert_eq!(bypasses("procs/hermetic/seatbelt.rs", "let _ = std::fs::read(p);\n"), vec![("procs/hermetic/seatbelt.rs".to_owned(), 1, "std::fs::")]);
 }

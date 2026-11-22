@@ -10,7 +10,7 @@
 //! ```text
 //! pub enum SoError<'a> {
 //!     NotLinux,                                           // image.platform is not LinuxArm64
-//!     Library(blaze_native::libraries::LibraryError<'a>), // a library with no soname
+//!     Library { name: &'a str },                          // a library resolved for another platform
 //!     Alloc,                                              // the output could not be reserved
 //!     Soname { len: usize },                              // empty, or holds a NUL byte
 //!     TooLarge { what: &'static str, len: u64 },          // a field of the format too narrow
@@ -71,7 +71,6 @@
 use blaze_native::Platform;
 use blaze_native::image::{FixTo, Image, Placed, Region, TlsReloc};
 use blaze_native::layout::Layout;
-use blaze_native::libraries::{self, LibraryError};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
 use crate::bytes;
@@ -85,8 +84,9 @@ use crate::elf::{
 pub enum SoError<'a> {
     /// The image is not for arm64 Linux (NATIVE.md 3.1: ELF on Linux; macOS is W4's).
     NotLinux,
-    /// A library the program declares has no soname (NATIVE.md 3.5).
-    Library(LibraryError<'a>),
+    /// A library of the image resolved for another platform than Linux: its install name is no
+    /// `DT_NEEDED` soname (NATIVE.md 3.5).
+    Library { name: &'a str },
     /// The output's room could not be reserved.
     Alloc,
     /// The soname is empty or holds a NUL byte: `DT_SONAME` is a C string (gABI).
@@ -351,10 +351,14 @@ pub fn write<'a, 'b>(image: &Image<'a>, soname: &str, out: &mut AVec<'_, u8>, al
     let mut libc: AString<'b> = String::new_in(alloc);
     libc.push_str(elf::LIBC);
     needed.push(libc);
-    for &library in image.libraries.iter() {
-        let mut name: AString<'b> = String::new_in(alloc);
-        libraries::write_install_name(Platform::LinuxArm64, library, &mut name).map_err(SoError::Library)?;
-        if !needed.iter().any(|n| n.as_str() == name.as_str()) {
+    for library in image.libraries.iter() {
+        if library.platform() != Platform::LinuxArm64 {
+            return Err(SoError::Library { name: library.library().name });
+        }
+        let soname = library.install();
+        if !needed.iter().any(|n| n.as_str() == soname) {
+            let mut name: AString<'b> = String::new_in(alloc);
+            name.push_str(soname);
             needed.push(name);
         }
     }

@@ -7,17 +7,20 @@
 //! it or stops the script.
 //!
 //! The executor's answer is a function of the request's key, so the script's read list holds
-//! `spawn:<request key hex>` with the answer's digest; the files the answer wrote land in the
-//! in-memory `OUT_DIR` through the same limits a script's own writes take.
+//! `spawn:<request key hex>` with the answer's digest. A matching `spawn-grant:<request key hex>`
+//! names the command's grant when its immutable tree is covered by the package pin or by checkout
+//! file and listing cells. Written files land in the in-memory `OUT_DIR` through the script's
+//! ordinary write limits.
 
 use std::sync::Arc;
 
+use blaze_build_script::c_tasks_probe;
 use blaze_build_script::facts::{self, Fact};
 use blaze_build_script::key::CMode;
 use blaze_build_script::probe;
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
-use blaze_spawn::{Executor, Files, Input, MACHINE_V1, NoSandbox, Personality, SpawnAnswer, SpawnRefused, SpawnRequest, Status, Tool, Written};
+use blaze_spawn::{Files, Input, MACHINE_V1, NoSandbox, Personality, SpawnAnswer, SpawnRefused, SpawnRequest, Status, Tool, Written};
 use blaze_wasi::Stop;
 
 use blaze_expand::seen::SeenRoot;
@@ -128,7 +131,7 @@ pub(crate) fn child_env(script_env: &[(String, String)], d: &Decoded) -> Vec<(St
 pub(crate) enum Route<'s> {
     /// `rustc`: the probe table.
     Rustc,
-    /// `cargo -V` (`--version`, `version`): the pinned cargo's line, `probe::CARGO_VERSION`,
+    /// `cargo -V` (`--version`, `version`): the pinned cargo's line, `blaze_pins::CARGO_V`,
     /// held in the base key with rustc's version text (`probe::answers_id`), so no read.
     CargoVersion,
     /// `git ...`, or a shell's `-c "git ..."`: a derived fact (D54), or a refusal naming the
@@ -201,6 +204,41 @@ pub struct SpawnSetting {
 }
 
 impl SpawnSetting {
+    /// Everything the command can change about the executor's grant without changing the
+    /// script or its served tree. Guest paths identify immutable program images. A host
+    /// checkout, deployment folder or search path never enters this identity.
+    pub fn executor_id(&self, alloc: Alloc<'_>) -> Option<ContentId> {
+        const MAX_TOOLS: usize = 1 << 16;
+        let userland = self.userland?;
+        if !self.hvbox_allowed || self.tools.is_empty() || self.tools.len() > MAX_TOOLS {
+            return None;
+        }
+        let mut tools = blaze_own::Vec::with_capacity_in(self.tools.len(), alloc);
+        tools.extend(self.tools.iter());
+        tools.sort_unstable_by(|a, b| a.guest_path.cmp(&b.guest_path));
+        if tools.windows(2).any(|pair| pair[0].guest_path == pair[1].guest_path) {
+            return None;
+        }
+        tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        if tools.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return None;
+        }
+        let mut hash = blaze_ids::Hasher::new("blaze build-script executor grant 1");
+        hash.update(&[u8::from(self.hvbox_allowed)]).id(&userland);
+        hash.update(&[u8::from(self.pins.is_some())]);
+        if let Some(pins) = &self.pins {
+            hash.part(pins.clang_version_text.as_bytes()).part(pins.macos_product_version.as_bytes()).part(pins.macos_build_version.as_bytes());
+        }
+        for tool in tools {
+            let path = tool.guest_path.strip_prefix('/')?;
+            if tool.name.is_empty() || tool.name.contains('/') || path.contains('\0') || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                return None;
+            }
+            hash.part(tool.name.as_bytes()).part(tool.guest_path.as_bytes()).update(&tool.digest);
+        }
+        Some(hash.finish())
+    }
+
     /// The sandbox off: hvbox not allowed, no tool pinned, no userland, no pins.
     pub fn off() -> SpawnSetting {
         SpawnSetting { hvbox_allowed: false, tools: Vec::new(), userland: None, pins: None }
@@ -239,13 +277,30 @@ impl core::fmt::Debug for Script {
 
 /// The digest of a reply (code, stdout, stderr), for a fact's read.
 pub(crate) fn reply_digest(code: i32, stdout: &[u8], stderr: &[u8]) -> ContentId {
-    let mut bytes = Vec::with_capacity(12 + stdout.len() + stderr.len());
-    bytes.extend_from_slice(&code.to_le_bytes());
+    let mut hash = blaze_ids::Hasher::new("blaze build-script spawn reply 1");
+    hash.update(&code.to_le_bytes());
     for part in [stdout, stderr] {
-        bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(part);
+        hash.update(&(part.len() as u32).to_le_bytes()).update(part);
     }
-    ContentId::of("blaze build-script spawn reply 1", &bytes)
+    hash.finish()
+}
+
+/// Whether `subject` is a derived fact's reply (`pkg-config`, `sw_vers`, `cc-version`: the
+/// subjects fact_pins.rs `fact_now` answers): a function of the command's pins, kept as a reply
+/// file under the fact mount and followed under the next command's pins.
+pub fn is_fact_reply(subject: &str, alloc: Alloc<'_>) -> bool {
+    crate::fact_pins::fact_now(subject, None, alloc) != crate::fact_pins::FactNow::NotAFact
+}
+
+/// Checks the observed digest of a derived fact's reply against what the pins answer now
+/// (the deterministic pkg-config database with its nonzero "not found" reply, the pinned
+/// `sw_vers`, the pinned clang's version text). A native caller also has to identify the image
+/// that ran.
+pub fn fact_reply_matches(subject: &str, observed: Option<ContentId>, pins: Option<&FactPins>, alloc: Alloc<'_>) -> bool {
+    if observed.is_none() || !is_fact_reply(subject, alloc) {
+        return false;
+    }
+    crate::fact_pins::fact_now(subject, pins, alloc) == crate::fact_pins::FactNow::Answer(observed)
 }
 
 /// A file's digest in a spawn request (`present`).
@@ -336,6 +391,9 @@ impl ScriptSandbox {
 
     /// A derived fact's answer (W5), recorded as its subject with the reply's digest.
     pub(crate) fn spawn_fact(&mut self, fact: &Fact<'_>, program: &str, args: &[String], spawned: &Decoded) -> Result<(), Stop> {
+        if let Fact::CcProbe { .. } = fact {
+            return self.spawn_probe(program, args, spawned);
+        }
         let alloc = Alloc::global();
         let script = Arc::clone(&self.script);
         let refused = |why: String| SpawnRefusal::Fact { program: program.to_owned(), args: args.to_vec(), why };
@@ -355,6 +413,40 @@ impl ScriptSandbox {
         let digest = reply_digest(answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes());
         self.record(subject.as_str().to_owned(), Some(digest));
         self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes())
+    }
+
+    /// A compiler probe, answered from pins/answers/clang.json (`c_tasks_probe`) by the host's
+    /// clang pin, in every `CMode` (a check and a run see one answer): nothing runs and nothing
+    /// is recorded (the table's digest is in the base key), and a probe the table does not
+    /// answer stops the script with the row to add (rule 3).
+    fn spawn_probe(&mut self, program: &str, args: &[String], spawned: &Decoded) -> Result<(), Stop> {
+        let script = Arc::clone(&self.script);
+        let refused = |why: String| SpawnRefusal::Fact { program: program.to_owned(), args: args.to_vec(), why };
+        let frame = match blaze_mem::Frame::new(blaze_mem::Tag::Other) {
+            Ok(frame) => frame,
+            Err(e) => return Err(self.refuse(Refusal::Spawn(refused(format!("no frame for the probe's answer: {e}"))))),
+        };
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let clang = match blaze_build_script::toolchain::clang_pin(blaze_pins::CLANG_JSON, &script.host) {
+            Ok(pin) => pin.sha256,
+            Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+        };
+        let table = match c_tasks_probe::Table::parse(blaze_pins::CLANG_ANSWERS_JSON.as_bytes(), alloc) {
+            Ok(table) => table,
+            Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+        };
+        let owned_env = child_env(&script.env, spawned);
+        let env: Vec<(&str, &str)> = owned_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let probe = c_tasks_probe::Spawn { program, args: &arg_refs, env: &env, out_dir: script.out_dir(), sdk, stdin: &spawned.stdin };
+        let out = &self.out;
+        let held = |name: &str| out.get(name).and_then(|held| held.as_deref()).map(blaze_sha256::digest);
+        match table.answer(&clang, &probe, held, alloc) {
+            Ok(answer) => self.deliver(program, spawned.modes, answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes()),
+            Err(why) => Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
+        }
     }
 
     /// The spawn sent to the executor as a request record; its written files applied to
@@ -443,8 +535,74 @@ impl ScriptSandbox {
             }
         };
         self.apply_written(program, out_dir, answer.written.as_slice())?;
-        self.record(format!("spawn:{}", hex(&key.0)), Some(answer.digest(alloc)));
+        use blaze_build_script::host_tools::{SPAWN_ANSWER, SPAWN_GRANT};
+        let key = hex(&key.0);
+        let subject = |prefix: &str| blaze_own::format_in!(alloc, "{prefix}{key}").as_str().to_owned();
+        self.record(subject(SPAWN_ANSWER), Some(answer.digest(alloc)));
+        if let Some(grant) = setting.executor_id(alloc) {
+            // The package pin covers a fetched tree. A member's tree is mutable between
+            // commands, so reproduce the request's whole read grant with checkout cells.
+            if script.root.seen() == SeenRoot::Package || self.record_executor_tree(tree, alloc) {
+                self.record(subject(SPAWN_GRANT), Some(grant));
+            }
+        }
         self.deliver(program, spawned.modes, code, answer.stdout.as_slice(), answer.stderr.as_slice())
+    }
+
+    /// Project the immutable tree actually supplied to the executor into the same file and
+    /// listing observations followed by the checkout sweep. Listings cover negative lookups
+    /// (including an empty root); file digests cover edits under an unchanged directory.
+    /// A noncanonical or too-large grant keeps the ordinary opaque spawn observation.
+    fn record_executor_tree(&mut self, tree: &[(String, Vec<u8>)], alloc: Alloc<'_>) -> bool {
+        use crate::script_sandbox::{READS_CAP, file_answer, listing_answer};
+        let room = READS_CAP.saturating_sub(self.reads.len());
+        if room < 2 || tree.len() > room - 2 || tree.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return false;
+        }
+        // Every edge is one immediate directory entry. A well-formed tree with N edges
+        // needs N + 1 observations (one per file or directory, including the root).
+        let mut entries = blaze_own::BTreeMap::new_in(alloc);
+        for (path, _) in tree {
+            if path.contains('\0') || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                return false;
+            }
+            let mut at = path.as_str();
+            let mut folder = false;
+            loop {
+                let (parent, child) = at.rsplit_once('/').unwrap_or(("", at));
+                if let Some(previous) = entries.get(&(parent, child)) {
+                    if *previous != folder {
+                        return false;
+                    }
+                    break;
+                }
+                if entries.len() == room - 2 {
+                    return false;
+                }
+                entries.insert((parent, child), folder);
+                if parent.is_empty() {
+                    break;
+                }
+                at = parent;
+                folder = true;
+            }
+        }
+        let tagged = |tag: &str, path: &str| blaze_own::format_in!(alloc, "{tag}{path}").as_str().to_owned();
+        for (path, bytes) in tree {
+            self.record(tagged("file:", path), Some(file_answer(bytes)));
+        }
+        if entries.is_empty() {
+            self.record("dir:".to_owned(), Some(listing_answer(core::iter::empty())));
+        }
+        let mut entries = entries.iter().peekable();
+        while let Some((&(parent, _), _)) = entries.peek().copied() {
+            let children = core::iter::from_fn(|| {
+                let (&(_, child), &is_dir) = entries.next_if(|((dir, _), _)| *dir == parent)?;
+                Some((child.as_bytes(), is_dir))
+            });
+            self.record(tagged("dir:", parent), Some(listing_answer(children)));
+        }
+        true
     }
 
     /// The files an answer wrote or removed, applied to `OUT_DIR` through its limits: a path
@@ -469,7 +627,7 @@ impl ScriptSandbox {
                             }
                             None => {
                                 self.count_file(folder)?;
-                                self.out.insert(folder.to_owned(), None);
+                                self.out.edit().insert(folder.to_owned(), None);
                             }
                         }
                         at += slash + 1;
@@ -486,20 +644,20 @@ impl ScriptSandbox {
                     if old.is_none() {
                         self.count_file(rel)?;
                     }
-                    self.out.insert(rel.to_owned(), Some(bytes.as_slice().to_vec()));
+                    self.out.edit().insert(rel.to_owned(), Some(bytes.as_slice().to_vec()));
                     self.out_bytes = self.out_bytes - old.unwrap_or(0) + new;
                 }
                 None => match self.out.get(rel) {
                     Some(Some(old)) => {
                         let len = old.len() as u64;
-                        self.out.remove(rel);
+                        self.out.edit().remove(rel);
                         self.out_bytes -= len;
                     }
                     Some(None) if self.out.keys().any(|key| key.len() > rel.len() && key.starts_with(rel) && key.as_bytes()[rel.len()] == b'/') => {
                         return Err(self.refuse(Refusal::Path(format!("the spawned `{program}` removed {path}, a folder of OUT_DIR that is not empty"))));
                     }
                     Some(None) => {
-                        self.out.remove(rel);
+                        self.out.edit().remove(rel);
                     }
                     None => {
                         return Err(self.refuse(Refusal::Path(format!("the spawned `{program}` removed {path}, which OUT_DIR does not hold"))));

@@ -60,6 +60,10 @@
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use blaze_sys::Errno;
+#[cfg(target_os = "macos")]
+use blaze_sys::posix::thread;
+
 #[cfg(test)]
 mod tests;
 
@@ -84,6 +88,7 @@ impl core::fmt::Display for SysError {
 impl core::error::Error for SysError {}
 
 /// The error of `call`, from `errno`.
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "aarch64")))]
 fn failed(call: &'static str, at: usize, len: usize) -> SysError {
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     SysError { call, errno, at, len }
@@ -91,7 +96,10 @@ fn failed(call: &'static str, at: usize, len: usize) -> SysError {
 
 /// The page size.
 pub fn page() -> Result<usize, SysError> {
+    #[cfg(target_os = "macos")]
+    let size = thread::sysconf(thread::_SC_PAGESIZE);
     // SAFETY: `sysconf` reads a constant of the system.
+    #[cfg(target_os = "linux")]
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(size).ok().filter(|it| it.is_power_of_two()).ok_or(SysError {
         call: "sysconf(_SC_PAGESIZE)",
@@ -121,7 +129,7 @@ pub struct Code {
     write: NonNull<u8>,
     /// The memfd, open for the life of the process, as its mappings are.
     #[cfg(target_os = "linux")]
-    fd: std::os::fd::OwnedFd,
+    fd: blaze_sys::linux::OwnedFd,
     /// The code's bytes, a whole number of pages.
     len: usize,
     /// The data's bytes, from `exec + len`.
@@ -170,7 +178,7 @@ impl Code {
         let whole = len.checked_add(data);
         match whole {
             Some(whole) if len != 0 && len % page == 0 && data % page == 0 => Ok(whole),
-            _ => Err(SysError { call: "mapping code", errno: libc::EINVAL, at: 0, len }),
+            _ => Err(SysError { call: "mapping code", errno: Errno::Inval.raw().into(), at: 0, len }),
         }
     }
 
@@ -179,7 +187,7 @@ impl Code {
         match at.checked_add(len) {
             Some(end) if end <= self.len => Ok(()),
             // EFAULT, as the kernel would say of an address outside a mapping.
-            _ => Err(SysError { call, errno: libc::EFAULT, at, len }),
+            _ => Err(SysError { call, errno: Errno::Fault.raw().into(), at, len }),
         }
     }
 
@@ -188,7 +196,7 @@ impl Code {
     pub fn store(&mut self, at: usize, word: u64) -> Result<(), SysError> {
         self.within("store", at, 8)?;
         if at % 8 != 0 {
-            return Err(SysError { call: "store", errno: libc::EINVAL, at, len: 8 });
+            return Err(SysError { call: "store", errno: Errno::Inval.raw().into(), at, len: 8 });
         }
         // SAFETY: `write + at` is in the write view (`within`), aligned for a `u64` (the view
         // is page aligned and `at` a multiple of 8), writable, and lives as long as `self`
@@ -217,7 +225,7 @@ impl Code {
 mod macos {
     use core::ffi::{c_int, c_void};
 
-    use super::SysError;
+    use super::{Errno, SysError, thread};
 
     /// A Mach port name (`mach_port_t`).
     pub(super) type Port = u32;
@@ -296,9 +304,9 @@ mod macos {
         /// (`dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb`; nothing on x86-64).
         pub(super) fn sys_icache_invalidate(start: *mut c_void, len: usize);
         /// `<pthread.h>`: the high end of a thread's stack.
-        pub(super) fn pthread_get_stackaddr_np(thread: libc::pthread_t) -> *mut c_void;
+        pub(super) fn pthread_get_stackaddr_np(thread: thread::pthread_t) -> *mut c_void;
         /// `<pthread.h>`: the length of a thread's stack.
-        pub(super) fn pthread_get_stacksize_np(thread: libc::pthread_t) -> usize;
+        pub(super) fn pthread_get_stacksize_np(thread: thread::pthread_t) -> usize;
     }
 
     pub(super) fn task() -> Port {
@@ -336,7 +344,7 @@ mod macos {
         };
         kern(call, code, at, len)?;
         if placed != address {
-            return Err(SysError { call, errno: libc::EFAULT, at, len });
+            return Err(SysError { call, errno: Errno::Fault.raw().into(), at, len });
         }
         Ok(())
     }
@@ -346,8 +354,7 @@ mod macos {
     /// rather than the kernel killing the process at the first instruction it fetches.
     pub(super) fn unsigned_code_runs(len: usize) -> Result<(), SysError> {
         let mut flags: u32 = 0;
-        // SAFETY: no preconditions.
-        let pid = unsafe { libc::getpid() };
+        let pid = thread::getpid();
         // SAFETY: `CS_OPS_STATUS` writes this process's 4-byte status to `flags`, which is a
         // live local of that size.
         let asked = unsafe { csops(pid, CS_OPS_STATUS, (&raw mut flags).cast(), size_of::<u32>()) };
@@ -361,7 +368,7 @@ mod macos {
                        without the hardened runtime, or with \
                        com.apple.security.cs.allow-unsigned-executable-memory (allow-jit admits only \
                        MAP_JIT memory)",
-                errno: libc::EPERM,
+                errno: Errno::Perm.raw().into(),
                 at: 0,
                 len,
             });
@@ -461,7 +468,7 @@ impl Code {
             };
             kern("mach_vm_remap(the run view)", code, 0, len)?;
             if run != base {
-                return Err(SysError { call: "mach_vm_remap(the run view)", errno: libc::EFAULT, at: 0, len });
+                return Err(SysError { call: "mach_vm_remap(the run view)", errno: Errno::Fault.raw().into(), at: 0, len });
             }
             let protect = |address: u64, ceiling: bool, protection: core::ffi::c_int, call: &'static str| {
                 // SAFETY: a view made above, of `len` bytes, that nothing runs or names yet;
@@ -483,7 +490,7 @@ impl Code {
         let made = views().and_then(|()| {
             match (NonNull::new(base as *mut u8), NonNull::new(write as *mut u8)) {
                 (Some(exec), Some(write)) => Ok(Code { exec, write, len, data }),
-                _ => Err(SysError { call: "mach_vm_allocate", errno: libc::EFAULT, at: 0, len }),
+                _ => Err(SysError { call: "mach_vm_allocate", errno: Errno::Fault.raw().into(), at: 0, len }),
             }
         });
         if made.is_err() {
@@ -533,7 +540,7 @@ impl Code {
         self.within("decommit", at, len)?;
         let page = page()?;
         if at % page != 0 || len % page != 0 {
-            return Err(SysError { call: "decommit", errno: libc::EINVAL, at, len });
+            return Err(SysError { call: "decommit", errno: Errno::Inval.raw().into(), at, len });
         }
         if len == 0 {
             return Ok(());
@@ -549,16 +556,19 @@ impl Code {
 /// in no cache that needs telling, and a word is data).
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod linux {
+    use blaze_sys::linux::nr::MEMBARRIER;
+    use core::ffi::c_long;
+
     /// `membarrier(2)`: every thread of the process has run a core-serializing instruction
     /// when the call returns, so none runs instructions it fetched before a write.
-    pub(super) const PRIVATE_EXPEDITED_SYNC_CORE: libc::c_long = 1 << 5;
-    pub(super) const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: libc::c_long = 1 << 6;
+    pub(super) const PRIVATE_EXPEDITED_SYNC_CORE: c_long = 1 << 5;
+    pub(super) const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: c_long = 1 << 6;
 
     /// `membarrier(command, 0, 0)`.
-    pub(super) fn membarrier(command: libc::c_long) -> bool {
-        let zero: libc::c_long = 0;
+    pub(super) fn membarrier(command: c_long) -> bool {
+        let zero: c_long = 0;
         // SAFETY: a system call that takes three integers and touches no memory of ours.
-        unsafe { libc::syscall(libc::SYS_membarrier, command, zero, zero) == 0 }
+        unsafe { libc::syscall(MEMBARRIER as c_long, command, zero, zero) == 0 }
     }
 
     /// The instruction cache of every core sees `start..start + len` as it is in memory.
@@ -601,68 +611,54 @@ impl Code {
     ///    view; the memfd read and write anywhere, the write view, which a fork does not give
     ///    the child (`MADV_DONTFORK`).
     pub fn map_with_data(len: usize, data: usize) -> Result<Code, SysError> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use blaze_sys::Path;
+        use blaze_sys::linux::{Advice, MapFlags, Prot, ftruncate, madvise, mmap, munmap};
+        use blaze_sys::linux::fdctl::{MemfdFlags, memfd_create};
+        use blaze_sys::posix::types::off_t;
 
         let whole = Code::layout(len, data)?;
-        // SAFETY: a name that is a C string; the result is checked.
-        let fd = unsafe { libc::memfd_create(c"blaze-launch".as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(failed("memfd_create", 0, len));
-        }
-        // SAFETY: a descriptor just made, owned by nothing else.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let Ok(length) = libc::off_t::try_from(len) else {
-            return Err(SysError { call: "ftruncate", errno: libc::EFBIG, at: 0, len });
+        let fd = memfd_create(Path::new(c"blaze-launch"), MemfdFlags::CLOSE_ON_EXEC)
+            .map_err(|err| SysError { call: "memfd_create", errno: err.raw().into(), at: 0, len })?;
+        let Ok(length) = off_t::try_from(len) else {
+            return Err(SysError { call: "ftruncate", errno: Errno::FBig.raw().into(), at: 0, len });
         };
-        // SAFETY: the memfd above; a sparse length, nothing is committed.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), length) } != 0 {
-            return Err(failed("ftruncate", 0, len));
-        }
-        let reservation = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-        let protection = libc::PROT_READ | libc::PROT_WRITE;
+        ftruncate(fd.fd(), length as u64)
+            .map_err(|err| SysError { call: "ftruncate", errno: err.raw().into(), at: 0, len })?;
+        let reservation = MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NO_RESERVE;
+        let protection = Prot::READ | Prot::WRITE;
         // SAFETY: an anonymous mapping at no fixed address: nothing of this process is
-        // replaced; the result is checked.
-        let base = unsafe { libc::mmap(ptr::null_mut(), whole, protection, reservation, -1, 0) };
-        if base == libc::MAP_FAILED {
-            return Err(failed("mmap(code and data)", 0, whole));
-        }
+        // replaced.
+        let base = unsafe { mmap(None, whole, protection, reservation, None, 0) }
+            .map_err(|err| SysError { call: "mmap(code and data)", errno: err.raw().into(), at: 0, len: whole })?;
         let views = || -> Result<(NonNull<u8>, NonNull<u8>), SysError> {
             let call = "mmap(memfd, read and execute)";
-            let flags = libc::MAP_SHARED | libc::MAP_FIXED;
-            let protection = libc::PROT_READ | libc::PROT_EXEC;
+            let flags = MapFlags::SHARED | MapFlags::FIXED;
+            let protection = Prot::READ | Prot::EXEC;
             // SAFETY: a shared mapping of the memfd over the reservation's code part, made
-            // above and named by nothing, so `MAP_FIXED` replaces nothing live.
-            let exec = unsafe { libc::mmap(base, len, protection, flags, fd.as_raw_fd(), 0) };
-            if exec != base {
-                return Err(failed(call, 0, len));
-            }
+            // above and named by nothing, so `MAP_FIXED` replaces nothing live. Only the
+            // owner writes the memfd through its write view, as the module invariant states.
+            let exec = unsafe { mmap(Some(base), len, protection, flags, Some(fd.fd()), 0) }
+                .map_err(|err| SysError { call, errno: err.raw().into(), at: 0, len })?;
             let call = "mmap(memfd, read and write)";
-            let protection = libc::PROT_READ | libc::PROT_WRITE;
-            // SAFETY: a shared mapping of the memfd at no fixed address; the result is checked.
-            let write = unsafe {
-                libc::mmap(ptr::null_mut(), len, protection, libc::MAP_SHARED, fd.as_raw_fd(), 0)
-            };
-            if write == libc::MAP_FAILED {
-                return Err(failed(call, 0, len));
-            }
+            let protection = Prot::READ | Prot::WRITE;
+            // SAFETY: a new mapping at no fixed address. Only the owner writes this memfd.
+            let write = unsafe { mmap(None, len, protection, MapFlags::SHARED, Some(fd.fd()), 0) }
+                .map_err(|err| SysError { call, errno: err.raw().into(), at: 0, len })?;
             // SAFETY: the write view just made; changes only what a fork gives the child.
-            if unsafe { libc::madvise(write, len, libc::MADV_DONTFORK) } != 0 {
-                let why = failed("madvise(MADV_DONTFORK)", 0, len);
+            if let Err(err) = unsafe { madvise(write, len, Advice::DontFork) } {
+                let why = SysError { call: "madvise(MADV_DONTFORK)", errno: err.raw().into(), at: 0, len };
                 // SAFETY: the write view just made, which nothing has written or named.
-                unsafe { libc::munmap(write, len) };
+                let _ = unsafe { munmap(write, len) };
                 return Err(why);
             }
-            match (NonNull::new(base.cast::<u8>()), NonNull::new(write.cast::<u8>())) {
-                (Some(exec), Some(write)) => Ok((exec, write)),
-                _ => Err(SysError { call, errno: libc::EFAULT, at: 0, len }),
-            }
+            Ok((exec, write))
         };
         let (exec, write) = match views() {
             Ok(views) => views,
             Err(why) => {
                 // SAFETY: the reservation made above, which nothing has run or named (the run
                 // view, if made, is inside it).
-                unsafe { libc::munmap(base, whole) };
+                let _ = unsafe { munmap(base, whole) };
                 return Err(why);
             }
         };
@@ -708,32 +704,24 @@ impl Code {
     /// the pages out of both mappings. (`MADV_DONTNEED` would not: the pages of a shared
     /// mapping belong to the file.) Their addresses stay reserved and are never used again.
     pub fn decommit(&mut self, at: usize, len: usize) -> Result<(), SysError> {
-        use std::os::fd::AsRawFd;
+        use blaze_sys::linux::fdctl::{FallocateFlags, fallocate};
 
         self.within("fallocate(PUNCH_HOLE)", at, len)?;
         // Whole pages only: a hole in part of a page would zero bytes of a body still live.
         let page = page()?;
         if at % page != 0 || len % page != 0 {
-            return Err(SysError { call: "fallocate(PUNCH_HOLE)", errno: libc::EINVAL, at, len });
+            return Err(SysError { call: "fallocate(PUNCH_HOLE)", errno: Errno::Inval.raw().into(), at, len });
         }
-        let (Ok(from), Ok(length)) = (libc::off_t::try_from(at), libc::off_t::try_from(len)) else {
-            return Err(SysError { call: "fallocate(PUNCH_HOLE)", errno: libc::EFBIG, at, len });
-        };
-        let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-        // SAFETY: whole pages of the memfd in which nothing is live: no thread is in them, and
-        // no one will read them.
-        if unsafe { libc::fallocate(self.fd.as_raw_fd(), mode, from, length) } != 0 {
-            return Err(failed("fallocate(PUNCH_HOLE)", at, len));
-        }
-        Ok(())
+        let mode = FallocateFlags::PUNCH_HOLE | FallocateFlags::KEEP_SIZE;
+        fallocate(self.fd.fd(), mode, at as u64, len as u64)
+            .map_err(|err| SysError { call: "fallocate(PUNCH_HOLE)", errno: err.raw().into(), at, len })
     }
 }
 
 /// The calling thread's stack: its low and its high end.
 #[cfg(target_os = "macos")]
 pub fn stack() -> Result<(usize, usize), SysError> {
-    // SAFETY: the calling thread's own handle.
-    let me = unsafe { libc::pthread_self() };
+    let me = thread::pthread_self();
     // SAFETY: a live thread's handle; reads its stack's high end.
     let high = unsafe { macos::pthread_get_stackaddr_np(me) } as usize;
     // SAFETY: a live thread's handle; reads its stack's length.
@@ -809,20 +797,17 @@ unsafe impl Send for Data {}
 impl Data {
     /// Reserves `len` bytes. Nothing is committed until written.
     pub fn map(len: usize) -> Result<Data, SysError> {
+        use blaze_sys::posix::io::{MapFlags, Prot, mmap};
+
         #[cfg(target_os = "linux")]
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
+        let flags = MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NO_RESERVE;
         #[cfg(target_os = "macos")]
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
-        let protection = libc::PROT_READ | libc::PROT_WRITE;
-        // SAFETY: an anonymous mapping at no fixed address; the result is checked.
-        let at = unsafe { libc::mmap(ptr::null_mut(), len, protection, flags, -1, 0) };
-        if at == libc::MAP_FAILED {
-            return Err(failed("mmap(the program's data)", 0, len));
-        }
-        match NonNull::new(at.cast::<u8>()) {
-            Some(base) => Ok(Data { base, len, end: 0 }),
-            None => Err(SysError { call: "mmap(the program's data)", errno: 0, at: 0, len }),
-        }
+        let flags = MapFlags::PRIVATE | MapFlags::ANONYMOUS;
+        let protection = Prot::READ | Prot::WRITE;
+        // SAFETY: an anonymous private mapping at no fixed address replaces nothing live.
+        let base = unsafe { mmap(None, len, protection, flags, None, 0) }
+            .map_err(|err| SysError { call: "mmap(the program's data)", errno: err.raw().into(), at: 0, len })?;
+        Ok(Data { base, len, end: 0 })
     }
 
     /// The address of the mapping's first byte.
@@ -838,7 +823,7 @@ impl Data {
     /// Hands out `size` bytes aligned to `align` (a power of two), zeroed, and gives their
     /// address. ENOMEM when the reservation has no room: the program is started again.
     pub fn reserve(&mut self, size: usize, align: usize) -> Result<usize, SysError> {
-        let full = SysError { call: "reserving the program's data", errno: libc::ENOMEM, at: self.end, len: size };
+        let full = SysError { call: "reserving the program's data", errno: Errno::NoMem.raw().into(), at: self.end, len: size };
         // The base is page aligned, so an aligned offset is an aligned address up to a page;
         // a larger alignment is taken of the address itself.
         let base = self.base.as_ptr() as usize;
@@ -857,7 +842,7 @@ impl Data {
             .and_then(|at| at.checked_add(bytes.len()))
             .is_some_and(|end| end <= self.end);
         if !inside {
-            return Err(SysError { call: "filling the program's data", errno: libc::EFAULT, at: address, len: bytes.len() });
+            return Err(SysError { call: "filling the program's data", errno: Errno::Fault.raw().into(), at: address, len: bytes.len() });
         }
         // SAFETY: `address..address + bytes.len()` is inside what `reserve` handed out
         // (checked above), in a mapping that is readable, writable and never unmapped;
@@ -879,7 +864,13 @@ impl Data {
 /// first called while a thread was ending aborted the program). pthread's primitives need
 /// no thread-local.
 pub struct Handoff<T> {
+    #[cfg(target_os = "macos")]
+    lock: core::cell::UnsafeCell<thread::pthread_mutex_t>,
+    #[cfg(target_os = "linux")]
     lock: core::cell::UnsafeCell<libc::pthread_mutex_t>,
+    #[cfg(target_os = "macos")]
+    cond: core::cell::UnsafeCell<thread::pthread_cond_t>,
+    #[cfg(target_os = "linux")]
     cond: core::cell::UnsafeCell<libc::pthread_cond_t>,
     /// Read and written only with `lock` held.
     value: core::cell::UnsafeCell<Option<T>>,
@@ -896,7 +887,13 @@ impl<T> Handoff<T> {
     /// tied to their address): every user keeps it behind an `Arc` or in a value that stays.
     pub const fn new() -> Handoff<T> {
         Handoff {
+            #[cfg(target_os = "macos")]
+            lock: core::cell::UnsafeCell::new(thread::PTHREAD_MUTEX_INITIALIZER),
+            #[cfg(target_os = "linux")]
             lock: core::cell::UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            #[cfg(target_os = "macos")]
+            cond: core::cell::UnsafeCell::new(thread::PTHREAD_COND_INITIALIZER),
+            #[cfg(target_os = "linux")]
             cond: core::cell::UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
             value: core::cell::UnsafeCell::new(None),
         }
@@ -906,10 +903,18 @@ impl<T> Handoff<T> {
     fn locked<R>(&self, with: impl FnOnce(&mut Option<T>) -> R) -> R {
         // SAFETY: the mutex was statically initialized and is at a fixed address (`new`'s
         // contract); locking it is sound from any thread.
+        #[cfg(target_os = "macos")]
+        unsafe { thread::pthread_mutex_lock(self.lock.get()) };
+        // SAFETY: the same initialized mutex at a fixed address.
+        #[cfg(target_os = "linux")]
         unsafe { libc::pthread_mutex_lock(self.lock.get()) };
         // SAFETY: the mutex is held, so this thread alone touches `value`.
         let result = with(unsafe { &mut *self.value.get() });
         // SAFETY: held by this thread, locked above.
+        #[cfg(target_os = "macos")]
+        unsafe { thread::pthread_mutex_unlock(self.lock.get()) };
+        // SAFETY: held by this thread, locked above.
+        #[cfg(target_os = "linux")]
         unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
         result
     }
@@ -918,6 +923,10 @@ impl<T> Handoff<T> {
     pub fn put(&self, value: T) {
         self.locked(|held| *held = Some(value));
         // SAFETY: a statically initialized condition variable at a fixed address.
+        #[cfg(target_os = "macos")]
+        unsafe { thread::pthread_cond_signal(self.cond.get()) };
+        // SAFETY: the same initialized condition variable at a fixed address.
+        #[cfg(target_os = "linux")]
         unsafe { libc::pthread_cond_signal(self.cond.get()) };
     }
 
@@ -926,16 +935,28 @@ impl<T> Handoff<T> {
     /// stub, with code or with why none can come).
     pub fn take(&self) -> T {
         // SAFETY: as `locked`.
+        #[cfg(target_os = "macos")]
+        unsafe { thread::pthread_mutex_lock(self.lock.get()) };
+        // SAFETY: as `locked`.
+        #[cfg(target_os = "linux")]
         unsafe { libc::pthread_mutex_lock(self.lock.get()) };
         loop {
             // SAFETY: the mutex is held.
             if let Some(value) = unsafe { (*self.value.get()).take() } {
                 // SAFETY: held by this thread.
+                #[cfg(target_os = "macos")]
+                unsafe { thread::pthread_mutex_unlock(self.lock.get()) };
+                // SAFETY: held by this thread.
+                #[cfg(target_os = "linux")]
                 unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
                 return value;
             }
             // SAFETY: the mutex is held by this thread, as `pthread_cond_wait` asks; it
             // comes back with it held. A spurious return loops.
+            #[cfg(target_os = "macos")]
+            unsafe { thread::pthread_cond_wait(self.cond.get(), self.lock.get()) };
+            // SAFETY: the mutex is held by this thread with the same live condition variable.
+            #[cfg(target_os = "linux")]
             unsafe { libc::pthread_cond_wait(self.cond.get(), self.lock.get()) };
         }
     }

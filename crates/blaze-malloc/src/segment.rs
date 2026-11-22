@@ -20,7 +20,7 @@
 
 use core::{alloc::Layout, cell::UnsafeCell, ptr};
 
-use blaze_mem::{MemError, huge::Pages};
+use blaze_mem::huge::Pages;
 
 use crate::{
     MallocError,

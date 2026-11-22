@@ -18,7 +18,7 @@ doctest = false
 blaze-own.workspace = true
 # `PlainKey`: `==` is byte equality, the condition of the vector `position`, `==` and `cmp`.
 # By path, without the workspace entry's `serde` and `shared` features (as blaze-kit takes it).
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 # `u8` search for one-byte plain keys.
 blaze-memchr.workspace = true
 

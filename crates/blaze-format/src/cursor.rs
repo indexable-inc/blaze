@@ -95,10 +95,11 @@ impl fmt::Display for Error {
 impl core::error::Error for Error {}
 
 // to remove: a `String` error is rule 7's `Result<_, String>`; its callers take the typed
-// `Error` (bstd move).
-impl From<Error> for String {
-    fn from(error: Error) -> String {
-        error.to_string() // alloc: error path
+// `Error` (bstd move). The `std` feature's, deprecated.
+#[cfg(feature = "std")]
+impl From<Error> for std::string::String {
+    fn from(error: Error) -> std::string::String {
+        std::string::ToString::to_string(&error) // alloc: error path
     }
 }
 
@@ -482,7 +483,10 @@ pub trait Put {
     fn patch_u64(&mut self, at: usize, value: u64);
 }
 
-impl Put for Vec<u8> {
+/// DEPRECATED (the `std` feature): [`Put`] for `std`'s `Vec<u8>`, on the global heap, until its
+/// callers hold a `blaze_own::Vec<u8, A>` (cursor/own.rs, the same bytes).
+#[cfg(feature = "std")]
+impl Put for std::vec::Vec<u8> {
     #[inline]
     fn put_u8(&mut self, value: u8) {
         self.push(value);

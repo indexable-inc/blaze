@@ -1,0 +1,15 @@
+{
+ "id": "turso-failed-fetch-replayed",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), turso bugs lane",
+ "where": "crates/blaze-cli/src/engine_units.rs (discover), engine_check.rs Units phase and certificate; crates/blaze-manifest/src/layout/extra.rs (written); crates/blaze-cli/src/units.rs (member_units)",
+ "what": "turso check3: 152 fetches that failed for want of a network were replayed from the stored answer after their sources were put in cargo's cache; core_tester's explicit `[[test]] path = \"integration/mod.rs\"` was refused 'no file'; a bench-only member was refused 'no library and no binary'.",
+ "cost": "most of a lane; the fetch replay was hidden behind the bounded retry, which made a failure look rare and transient",
+ "cause": "a Fetch Hole went into the Units phase as a finished task, never owed, so facts.owed stayed 0 and the certificate stood; the explicit-path check looked the path up in a listing the sweep filters to lib.rs, main.rs and build.rs",
+ "whys": "no rule said what a failure outside the checkout owes the next command; the listing filter (sweep.rs `wanted`) is not visible from the layout, which trusted it as a full listing",
+ "class": "a record of a failure whose cause is outside every key standing by the certificate; a layout question answered by a filtered listing",
+ "prevention": "done, uncompiled: Discovered::owed pushes such tasks OwedNextRequest (fetch.md 'THE RULE FOR A FAILURE OUTSIDE THE CHECKOUT'), retries removed (D172), explicit paths joined not looked up; fixtures in engine_body_reads_memory_tests.rs and refused_targets_tests.rs",
+ "annoyance": "the D164 grouping lives in blaze-report, outside the lane's files, so the one grouped 'N packages not fetched' line could not be written",
+ "workaround": "none",
+ "state": "open: grouping (e) needs a blaze-report change"
+}

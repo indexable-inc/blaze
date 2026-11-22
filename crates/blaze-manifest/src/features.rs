@@ -1,5 +1,5 @@
 //! Editions, resolver versions and `cargo-features`, as the cargo of the pinned nightly
-//! (`harness/toolchain`) knows them (`src/workspace/features.rs` and `src/resolver/types.rs`
+//! (`pins/toolchain`) knows them (`src/workspace/features.rs` and `src/resolver/types.rs`
 //! there). blaze builds with that nightly only, so its channel is `nightly`: a listed unstable
 //! feature is activated, as nightly cargo activates it.
 
@@ -85,7 +85,8 @@ impl fmt::Display for FeatureError {
                     f,
                     "feature `{name}` is required\n\n\
                      The package requires the Cargo feature called `{name}`, but that feature is \
-                     not stabilized in this version of Cargo ({CARGO_VERSION}).\n"
+                     not stabilized in this version of Cargo ({}).\n",
+                    blaze_pins::CARGO_VERSION
                 )?;
                 if *is_local {
                     write!(
@@ -115,10 +116,6 @@ impl core::error::Error for FeatureError {}
 fn see_docs(docs: &str) -> String {
     format!("See {} for more information about using this feature.", cargo_docs_link(docs))
 }
-
-/// The cargo whose behaviour this crate has, the pinned nightly's, in the form cargo prints
-/// itself (`cargo -vV`; commit cad07cf8e597397fff5d0f6cb79c9f870c0b1dd2).
-pub const CARGO_VERSION: &str = "1.101.0-nightly (cad07cf8e 2026-10-23)";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Edition {

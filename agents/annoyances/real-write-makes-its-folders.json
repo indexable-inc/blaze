@@ -1,0 +1,14 @@
+{
+ "id": "real-write-makes-its-folders",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5, writer lane on D167 part c (the file system's conformance suite)",
+ "where": "crates/blaze-core/src/fs.rs `make_parent`/`making_parent` (and `make_parent_durably`, new), crates/blaze-core/src/uring/files.rs `make_parents`, crates/blaze-core/src/lib.rs `Effect::Write`/`Effect::Rename` docs, crates/blaze-core/src/conform/fs.rs",
+ "what": "The brief for the suite said a real write into a missing folder fails and the model was more permissive for making it. Every native driver makes the folders (create_dir_all after an ENOENT, or the ring's MKDIRAT chain), and Effect::Write's doc says so. Taken at its word, the suite would have asserted the opposite of the real disk.",
+ "cost": "a lane's first case would have been written against the wrong reference; a model 'fixed' to refuse would have broken every caller that writes into a new folder",
+ "cause": "the folder-making lives in a helper (`making_parent`) called from nine sites, and the effect docs say 'its directories are made' in one clause nobody quotes; the model's own doc described folders as implied by files, which reads like 'not made'",
+ "class": "a premise about the real service taken from the model's or a brief's description instead of from the real driver",
+ "prevention": "every claim about the real service is a case in its conformance suite (docs/v2/plan/design/sim.md, 'A model is held against what it models'); read the native driver's call before stating what the disk does",
+ "workaround": "none needed",
+ "fix": "the suite asserts the real behaviour (`a_write_into_a_missing_folder`: done, folders made); the hunt for it found that the folders were made unsynced, so a durable write into a new folder was not durable: `make_parent_durably` syncs each into its parent",
+ "state": "fixed in the tree, not compiled"
+}

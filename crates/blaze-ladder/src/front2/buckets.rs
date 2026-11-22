@@ -33,7 +33,8 @@ use blaze_scope::resolve::Names;
 use blaze_surface::ImplFlags;
 use blaze_typeck::{AssocItem, AssocKind, ItemKey, Mutbl, Name, PNode, PTy, PTys, Shape};
 
-use super::heads::{Store, lower};
+use super::heads::{CoherenceMarks, HeadError, Store, Want, lower};
+use super::tables::view::BodyHeadFacts;
 use super::index::Index;
 use super::keys::{Keys, checker_of};
 use super::linked::{Linked, RootsError};
@@ -48,7 +49,8 @@ mod records;
 
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
 pub use records::{
-    BucketSource, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, cells_of, framed,
+    BucketReadUnion,
+    BucketSource, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, framed,
     impl_tables_name, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
 };
 
@@ -399,7 +401,7 @@ fn alias_shape<'n, S: NamesSource<'n>>(names: S, mut alias: LibKey) -> Result<Op
 
 /// What the type alias `alias` stands for, one step.
 fn alias_step<'n, S: NamesSource<'n>>(names: S, alias: LibKey) -> Option<Written> {
-    let text = names.text_of(alias)?.text;
+    let text = names.signature_text_of(alias)?.text;
     let module = names.home_of(alias)?;
     let low = lower(names, alias, text).ok()?;
     let v = low.view();
@@ -457,7 +459,7 @@ fn shape_step<'n, S: NamesSource<'n>>(names: S, module: LibKey, params: &[(Name,
 /// Files an impl by its header's text, with what bounds it when its self type is a path that
 /// was read to no constructor ([`PathSelf`]; `None` for any other impl).
 fn file<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> (Filed, Option<PathSelf>) {
-    let Some(it) = names.text_of(key) else { return (Filed::Unread(Unread::NoText, None), None) };
+    let Some(it) = names.signature_text_of(key) else { return (Filed::Unread(Unread::NoText, None), None) };
     let Ok(low) = lower(names, key, it.text) else { return (Filed::Unread(Unread::Unlowered, None), None) };
     let v = low.view();
     let mut params = Vec::new_in(Global);
@@ -978,23 +980,22 @@ impl Homes {
 }
 
 /// The crate of the nominal type, extern type or trait `k` names, `None` where it is not read.
-fn crate_of_checker<'n, S: NamesSource<'n>>(names: S, keys: &Keys, k: ItemKey) -> Option<usize> {
-    names.crate_of(keys.library_in(names, k)?)
+fn crate_of_checker<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, k: ItemKey) -> Option<usize> {
+    facts.crate_of(facts.library(keys, k)?)
 }
 
 /// [`Homes::local`] of a trait question at `shape`: a local type is a nominal type (or a trait
 /// object) of a crate, or `&T`, `&mut T`, `Box<T>`, `Pin<T>` of one (the Reference, "Orphan
 /// rules", fundamental types), so a reference or a `#[fundamental]` type may be any crate's.
-fn trait_local<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Local {
+fn trait_local<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, shape: Shape, marks: Option<CoherenceMarks>) -> Local {
     match shape {
         Shape::Adt(k) => {
-            let Some(lib) = keys.library_in(names, k) else { return Local::Any };
-            match (adt_marks(names, lib), names.crate_of(lib)) {
+            match (marks, crate_of_checker(facts, keys, k)) {
                 (Some(m), Some(c)) if !m.fundamental => Local::In(c),
                 _ => Local::Any,
             }
         }
-        Shape::Foreign(k) | Shape::Dynamic(Some(k)) => crate_of_checker(names, keys, k).map_or(Local::Any, Local::In),
+        Shape::Foreign(k) | Shape::Dynamic(Some(k)) => crate_of_checker(facts, keys, k).map_or(Local::Any, Local::In),
         Shape::Ref(_) => Local::Any,
         Shape::Bool
         | Shape::Char
@@ -1022,9 +1023,9 @@ fn trait_local<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> L
 /// [`Homes::local`] of an inherent question at `shape`: an inherent impl outside the crates that
 /// may write incoherent ones is of a type its crate defines, never of a reference or a
 /// primitive (E0116, E0390), and `Box<T>` is alloc's type whatever `T` is.
-fn inherent_local<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Local {
+fn inherent_local<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, shape: Shape) -> Local {
     match shape {
-        Shape::Adt(k) | Shape::Foreign(k) | Shape::Dynamic(Some(k)) => crate_of_checker(names, keys, k).map_or(Local::Any, Local::In),
+        Shape::Adt(k) | Shape::Foreign(k) | Shape::Dynamic(Some(k)) => crate_of_checker(facts, keys, k).map_or(Local::Any, Local::In),
         Shape::Bool
         | Shape::Char
         | Shape::Int(_)
@@ -1049,29 +1050,52 @@ fn inherent_local<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -
     }
 }
 
-/// The marks on a nominal type that widen where its impls may be written.
-struct Marks {
-    /// `#[fundamental]` (`Box`, `Pin`): `Box<Local>` is a local type, so its crate decides
-    /// nothing.
-    fundamental: bool,
-    /// `#[rustc_has_incoherent_inherent_impls]`: the standard library's crates may write its
-    /// inherent impls (each fn marked `#[rustc_allow_incoherent_impl]`).
-    incoherent: bool,
+/// Which declarations supply the orphan-rule inputs of a question. An inherent
+/// question about a trait object reads the principal trait's own coherence marks.
+fn coherence_wants<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, ask: Ask) -> [Option<Want>; 2] {
+    let (trait_, shape) = match ask {
+        Ask::Trait(t, shape) => (facts.library(keys, t).map(Want::Head), shape),
+        Ask::Inherent(shape) => (None, shape),
+    };
+    let nominal = match shape {
+        // An ADT's field length can itself name one of its inherent constants.
+        // The declaration already supplies its marks before those fields have types.
+        Shape::Adt(k) if matches!(ask, Ask::Inherent(_)) => facts.library(keys, k).map(Want::Head),
+        Shape::Adt(k) => facts.library(keys, k).map(Want::Adt),
+        Shape::Dynamic(Some(k)) if matches!(ask, Ask::Inherent(_)) => facts.library(keys, k).map(Want::Head),
+        _ => None,
+    };
+    [trait_, nominal]
 }
 
-/// The marks of the nominal type `lib`, read from its attributes as written; `None` where they
-/// could not be read (the caller then does not narrow).
-fn adt_marks<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<Marks> {
-    let text = names.text_of(lib)?.text;
-    let low = lower(names, lib, text).ok()?;
-    let v = low.view();
-    let mut m = Marks { fundamental: false, incoherent: false };
-    for &n in v.rows(v.list(head::ATTRS)).ok()? {
-        let path = v.text_at(v.attr(n).ok()?.path).ok()?.trim();
-        m.fundamental |= path == "fundamental";
-        m.incoherent |= path == "rustc_has_incoherent_inherent_impls";
+pub(super) fn prepare_coherence<'n, S: NamesSource<'n>, H: super::check::ImplHeads<'n>>(
+    names: S, heads: &mut H, ask: Ask,
+) -> Result<super::check::Made<H::Later>, HeadError> {
+    use super::check::Made;
+    let wants = coherence_wants(BodyHeadFacts::new(heads.store(), names), heads.keys(), ask);
+    for want in wants.into_iter().flatten() {
+        if let Made::Later(why) = heads.make(want)? {
+            return Ok(Made::Later(why));
+        }
     }
-    Some(m)
+    Ok(Made::Made)
+}
+
+/// Prepare a standalone index question over its chosen store. A body uses the same
+/// wants through its head importer before asking for the home.
+pub fn prepare_home<'n, S: NamesSource<'n>>(names: S, keys: &mut Keys, store: &mut Store<'n>, ask: Ask) -> Result<(), HeadError> {
+    let mut heads = super::check::Lowering { names, keys, store };
+    match prepare_coherence(names, &mut heads, ask)? {
+        super::check::Made::Made => Ok(()),
+        super::check::Made::Later(never) => match never {},
+    }
+}
+
+fn adt_marks<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, want: Want, shape: Shape) -> Result<CoherenceMarks, HeadError> {
+    use super::head_record::HeadAt;
+    let lib = want.key();
+    let at = if matches!(shape, Shape::Adt(_)) { HeadAt::Adt(lib) } else { HeadAt::Trait(lib) };
+    facts.marks(lib).ok_or(HeadError::Filed { want, at, what: "the coherence marks are missing" })
 }
 
 /// Where an impl answering `trait_` at `shape` can be written. The Reference, "Trait
@@ -1087,29 +1111,28 @@ fn adt_marks<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<Marks> {
 /// Anything else read here (a trait with parameters an impl writes, a reference, a fundamental
 /// wrapper, an opaque type, a closure) is `Any`: the conservative side.
 /// [`Homes::local`] is the shape's alone ([`trait_local`]), whatever the trait's crates are.
-pub fn trait_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, trait_: ItemKey, shape: Shape) -> Homes {
-    Homes { local: trait_local(names, keys, shape), ..trait_crates(names, keys, store, trait_, shape) }
+pub fn trait_home<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'s>, trait_: ItemKey, shape: Shape) -> Result<Homes, HeadError> {
+    let facts = BodyHeadFacts::new(store, names);
+    let [trait_want, nominal] = coherence_wants(facts, keys, Ask::Trait(trait_, shape));
+    let marks = nominal.map(|w| adt_marks(facts, w, shape)).transpose()?;
+    let local = trait_local(facts, keys, shape, marks);
+    let Some(want) = trait_want else { return Ok(Homes { local, ..Homes::ANY }) };
+    let lib = want.key();
+    let parameters = facts.trait_parameters(lib).ok_or(HeadError::Filed {
+        want, at: super::head_record::HeadAt::Trait(lib), what: "the trait's generic parameters are missing",
+    })?;
+    Ok(Homes { local, ..trait_crates(facts.crate_of(lib), shape, local, parameters) })
 }
 
 /// [`trait_home`]'s crates (`all`, `bare`, `blanket`).
-fn trait_crates<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, trait_: ItemKey, shape: Shape) -> Homes {
-    let Some(lib) = keys.library_in(names, trait_) else { return Homes::ANY };
-    let Some(home) = names.crate_of(lib) else { return Homes::ANY };
+fn trait_crates(home: Option<usize>, shape: Shape, local_type: Local, parameters: (u32, bool)) -> Homes {
+    let Some(home) = home else { return Homes::ANY };
     // A blanket impl is written in its trait's crate whatever the goal's self type is
     // ([`Homes::blanket`]): the one narrowing that needs nothing but the trait's crate.
     let wide = Homes { blanket: Home::In(home, None), ..Homes::ANY };
     let local = match shape {
-        Shape::Adt(k) => {
-            let Some(adt) = keys.library_in(names, k) else { return wide };
-            match adt_marks(names, adt) {
-                Some(m) if !m.fundamental => {}
-                _ => return wide,
-            }
-            let Some(c) = names.crate_of(adt) else { return wide };
-            Some(c)
-        }
-        Shape::Dynamic(Some(t)) => {
-            let Some(c) = keys.library_in(names, t).and_then(|l| names.crate_of(l)) else { return wide };
+        Shape::Adt(_) | Shape::Dynamic(Some(_)) => {
+            let Local::In(c) = local_type else { return wide };
             Some(c)
         }
         // Never a local type of any crate (no fundamental type is built in but references).
@@ -1117,31 +1140,9 @@ fn trait_crates<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>
         _ => return wide,
     };
     let by_self = Home::In(home, local);
-    // Its type and const parameters, `Self` included, and whether each after `Self` defaults
-    // to `Self`: from its head, else (the count only) as written.
-    let (generics, self_defaults) = match store.maps.traits.get(&lib) {
-        Some(t) => {
-            let view = store.tys.view();
-            let all_self = t.defaults.iter().all(|d| d.is_some_and(|p| matches!(view.get(p), Some(PNode::Param(0)))));
-            (Some(t.generics), all_self)
-        }
-        None => {
-            let n = names.text_of(lib).and_then(|it| lower(names, lib, it.text).ok()).and_then(|low| {
-                let mut ps = Vec::new_in(Global);
-                super::heads::param_names(&low.view(), 1, &mut ps, super::heads::Consts::Keep).ok()
-            });
-            // `param_names` counts the WRITTEN parameters (from index 1: `Self` is 0 and is
-            // not written); `generics` counts `Self` too, as the head's `t.generics` does.
-            // Without the `+ 1` a trait with no parameter but `Self` (`Clone`) read 0 here,
-            // fell to `wide` below, and its question admitted EVERY crate whenever the store
-            // did not hold the trait's head yet (measured 2026-11-16, front2_records: `bool:
-            // Clone` alone over a fresh reader opened 70 crates and filed 28,719 impls).
-            (n.map(|written| written + 1), false)
-        }
-    };
-    match generics {
-        Some(1) => Homes { all: by_self, bare: by_self, ..wide },
-        Some(_) if self_defaults => Homes { bare: by_self, ..wide },
+    match parameters {
+        (1, _) => Homes { all: by_self, bare: by_self, ..wide },
+        (_, true) => Homes { bare: by_self, ..wide },
         _ => wide,
     }
 }
@@ -1155,12 +1156,15 @@ fn trait_crates<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>
 /// marked `#[rustc_has_incoherent_inherent_impls]`): each is an internal attribute a crate can
 /// write only with `#![feature(rustc_attrs)]` at its root ([`Home::Incoherent`]).
 /// [`Homes::local`] is the shape's alone ([`inherent_local`]).
-pub fn inherent_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Homes {
-    Homes { local: inherent_local(names, keys, shape), ..inherent_crates(names, keys, shape) }
+pub fn inherent_home<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'s>, shape: Shape) -> Result<Homes, HeadError> {
+    let facts = BodyHeadFacts::new(store, names);
+    let [_, nominal] = coherence_wants(facts, keys, Ask::Inherent(shape));
+    let marks = nominal.map(|w| adt_marks(facts, w, shape)).transpose()?;
+    Ok(Homes { local: inherent_local(facts, keys, shape), ..inherent_crates(facts, keys, shape, marks) })
 }
 
 /// [`inherent_home`]'s crates.
-fn inherent_crates<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Homes {
+fn inherent_crates<'s, 'n, S: NamesSource<'n>>(facts: BodyHeadFacts<'_, 's, S>, keys: &Keys, shape: Shape, marks: Option<CoherenceMarks>) -> Homes {
     let nominal = match shape {
         Shape::Adt(k) | Shape::Dynamic(Some(k)) => k,
         Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::Ref(_) | Shape::FnPtr(_) => {
@@ -1168,13 +1172,13 @@ fn inherent_crates<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) 
         }
         _ => return Homes::ANY,
     };
-    let Some(lib) = keys.library_in(names, nominal) else { return Homes::ANY };
-    match adt_marks(names, lib) {
+    let Some(lib) = facts.library(keys, nominal) else { return Homes::ANY };
+    match marks {
         Some(m) if !m.incoherent => {}
         Some(_) => return Homes::one(Home::Incoherent),
         None => return Homes::ANY,
     }
-    match names.crate_of(lib) {
+    match facts.crate_of(lib) {
         Some(c) => Homes::one(Home::In(c, None)),
         None => Homes::ANY,
     }
@@ -1312,6 +1316,8 @@ pub struct BucketIndex {
     /// Over a source with a bucket index: which buckets are filed and what each question read
     /// ([`Buckets::admit_asked`]).
     indexed: asked::Indexed,
+    /// The cells already offered to this body, allocated by its caller on the first lookup.
+    table_reads: Option<BucketReadUnion<blaze_own::Alloc<'static>>>,
 }
 
 impl Buckets {
@@ -1345,7 +1351,7 @@ impl Buckets {
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
-        b.incoherent.extend(names.crates().iter().map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"))));
+        b.incoherent.extend(names.crates().iter().map(|c| blaze_scope::items_record::root_may_write_incoherent(c)));
         b.file_all(names, &index.impls);
         Buckets::of(b)
     }
@@ -1404,8 +1410,8 @@ impl Buckets {
     }
 
     /// [`BucketIndex::admit_tables`], through `&mut self`.
-    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>) -> Result<usize, TablesReadError> {
-        self.index_get_mut().admit_tables(names, keys, home, ask, tables)
+    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>, alloc: blaze_own::Alloc<'static>) -> Result<usize, TablesReadError> {
+        self.index_get_mut().admit_tables(names, keys, home, ask, tables, alloc)
     }
 
     /// Files what `ask` at `home` is answered from, through `&self` (the on-the-spot path and
@@ -1414,10 +1420,10 @@ impl Buckets {
     /// records' bucket section. One borrow of the index ([`Buckets::index_mut`]) over the
     /// admit: inside it only the names source and the tables are called. The bucket cells read
     /// are recorded inside `admit_tables` (`names.impls_read`), on either path.
-    pub fn admit_shared<'n, S: NamesSource<'n>>(&self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
+    pub fn admit_shared<'n, S: NamesSource<'n>>(&self, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: blaze_own::Alloc<'static>) -> Result<usize, TablesReadError> {
         let mut ix = self.index_mut();
         match names.impl_tables() {
-            Some(tables) => ix.admit_tables(names, keys, home, ask, tables),
+            Some(tables) => ix.admit_tables(names, keys, home, ask, tables, alloc),
             None => {
                 let whole = ix.admit(names, home);
                 Ok(whole + ix.admit_asked(names, keys, home, ask))
@@ -1566,6 +1572,7 @@ impl BucketIndex {
             filed_from_text: 0,
             row_misses: [0; 6],
             no_rows: false,
+            table_reads: None,
             indexed: asked::Indexed::new(),
         }
     }

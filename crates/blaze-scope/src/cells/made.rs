@@ -14,7 +14,7 @@
 //!
 //! One binding a cell, as the record writer keeps it (write.rs `written`): an item or `mod` of
 //! the name stands, and an import beside it is the solve's `Duplicate`, not a row; of two imports
-//! of one name the first by index is the row.
+//! of one name each namespace's row is the import that binds it there (`Cells::row_import`).
 
 use blaze_id::ItemKey;
 use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
@@ -22,7 +22,7 @@ use blaze_surface::{BuildError, DECLARED_VIS, ImportsBuilder, LinksBuilder, Scop
 
 use super::{Cells, FragId, ItemId, ModId, NAMESPACES, Outcome, ns_at};
 use crate::cell_key::{cell_key, textual_cut_key};
-use crate::{Def, DefKind, Namespace, Origin};
+use crate::{Def, DefKind, Namespace, Origin, PathKind};
 
 /// One module's tables as builders, its names borrowed from the cell core or its written
 /// scope (`'n`).
@@ -94,6 +94,57 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             &[Namespace::Types, Namespace::Values]
         } else {
             &NAMESPACES
+        }
+    }
+
+    /// Of `ids`, the imports of one name in one module (in index order), the one whose row holds
+    /// the name's cell in `ns`: the import the core decided binds the name in `ns`, else the first
+    /// not decided to lack it (the lookup follows its path), else the first. The Reference,
+    /// "Use declarations" and "Namespaces": a `use` binds its name in each namespace its target
+    /// has, and two names in different namespaces may overlap; two imports of one name bind one
+    /// namespace only in error (E0252), so at most one is decided to bind it. Writing the first
+    /// import's path in every namespace lost the second (core's `slice` `use crate::{range};` then
+    /// `pub use index::{range};`; der's `pub use crate::ord::ValueOrd;` then `pub use
+    /// der_derive::ValueOrd;`: the derive answered absent; tempo, 21 Nov 05:33).
+    fn row_import(&self, ids: &[ItemId], ns: Namespace) -> Option<ItemId> {
+        let can = || ids.iter().copied().filter(move |&j| self.import_namespaces(j).contains(&ns));
+        let binds = |j: ItemId| match &self.items[j as usize].outcome {
+            Some(Outcome::Named(b)) => Some(b[ns_at(ns)].is_some()),
+            _ => None,
+        };
+        can().find(|&j| binds(j) == Some(true)).or_else(|| can().find(|&j| binds(j).is_none())).or_else(|| can().next())
+    }
+
+    /// The path kind a row holds for import `j`: as written, except in a block's module, where a
+    /// written `self` or `super` passes over the blocks around it ([`Cells::up`]) and the row
+    /// holds its steps up the module's own chain, which the lookup (links.rs `walk`) takes as
+    /// they stand. The Reference, `paths.qualifiers.mod-self` ("`self` resolves the path relative
+    /// to the current module") and `paths.qualifiers.super` ("`super` in a path resolves to the
+    /// parent module"); a block is an anonymous scope, no module (tests/super_in_block.rs). The
+    /// block's own lexical `use super::*;` keeps its one step ([`Cells::lexical_glob`]). Without
+    /// it the lookup took `super` from a block as the body's module (h2's `use
+    /// super::stream::ContentLength;` in `fn send_request`, tokio's `use super::block::Read;`,
+    /// alloy's derive-written `const _: () = { use super::*; .. }`: absent; tempo, 21 Nov).
+    fn table_kind(&self, j: ItemId) -> PathKind {
+        let it = &self.items[j as usize];
+        let n = match it.kind {
+            PathKind::SelfMod => 0,
+            PathKind::Super(n) => n,
+            kind => return kind,
+        };
+        if !self.anonymous(it.module) || self.lexical_glob(j) {
+            return it.kind;
+        }
+        let chain = &self.modules[it.module as usize].chain;
+        // Past the root: a step count past the chain, which the lookup answers as nowhere.
+        let past = PathKind::Super(u8::try_from(chain.len()).unwrap_or(u8::MAX));
+        let Some(to) = self.up(it.module, n) else { return past };
+        let to = self.modules[to as usize].key;
+        match chain.iter().position(|&k| k == to) {
+            Some(0) => PathKind::SelfMod,
+            Some(steps) => u8::try_from(steps).map_or(past, PathKind::Super),
+            // `up` walks parents, each on the chain: never.
+            None => past,
         }
     }
 
@@ -175,12 +226,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 let it = &self.items[j as usize];
                 let depth = self.depth(it.at);
                 for &ns in self.import_namespaces(j) {
+                    // Each namespace's row is its own import's ([`Cells::row_import`]).
+                    if self.row_import(ids, ns) != Some(j) {
+                        continue;
+                    }
                     let cell = cell_key(ns, name).0;
                     if !taken.insert(cell) {
                         continue;
                     }
                     let table = if depth == 0 { &mut outline } else { made.get_or_insert_with(|| LinksBuilder::new_in(md.key, Table::Made, alloc)) };
-                    table.path(cell, ns, name, it.kind, it.segments.iter().map(|s| s.as_ref()), it.vis, Origin::Import, depth);
+                    table.path(cell, ns, name, self.table_kind(j), it.segments.iter().map(|s| s.as_ref()), it.vis, Origin::Import, depth);
                 }
                 match it.outcome {
                     Some(Outcome::Named(b)) => {
@@ -206,7 +261,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let it = &self.items[j as usize];
             let depth = self.depth(it.at);
             let table = if depth == 0 { &mut outline } else { made.get_or_insert_with(|| LinksBuilder::new_in(md.key, Table::Made, alloc)) };
-            table.glob_path(it.kind, it.segments.iter().map(|s| s.as_ref()), it.vis, depth);
+            table.glob_path(self.table_kind(j), it.segments.iter().map(|s| s.as_ref()), it.vis, depth);
             match (md.edges.get(&it.index), it.outcome) {
                 (Some(&(source, _)), _) => imports.glob_source(self.modules[source as usize].key),
                 (None, Some(Outcome::Failed(why))) => imports.finding(it.index, it.seg, why),

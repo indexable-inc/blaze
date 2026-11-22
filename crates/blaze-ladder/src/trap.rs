@@ -380,7 +380,7 @@ impl Watch {
         }
         install()?;
         // SAFETY: `pthread_self` has no precondition.
-        let me = unsafe { libc::pthread_self() } as usize;
+        let me = thread_token();
         let mine = (self as *const Watch).cast_mut();
         for index in 0..MOST_RUNS {
             if WATCHES[index].compare_exchange(core::ptr::null_mut(), mine, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -551,15 +551,9 @@ fn name_slot(out: &mut String<SharedAlloc<'static>>, paths: &[Box<str>], slot: u
 fn this_stack() -> Result<Bounds, TrapError> {
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: `pthread_self` has no precondition; the two `_np` calls read the calling
-        // thread's own descriptor, which lives as long as the thread.
-        let (top, size) = unsafe {
-            let me = libc::pthread_self();
-            (libc::pthread_get_stackaddr_np(me) as usize, libc::pthread_get_stacksize_np(me))
-        };
-        match top.checked_sub(size) {
-            Some(lo) if size > 0 => Ok(Bounds { lo, hi: top }),
-            _ => Err(TrapError::StackBounds { call: "pthread_get_stacksize_np", code: 0 }),
+        match blaze_sys::posix::thread::this_thread_stack() {
+            Ok(stack) => Ok(Bounds { lo: stack.low, hi: stack.high }),
+            Err(_error) => Err(TrapError::StackBounds { call: "pthread_get_stacksize_np", code: 0 }),
         }
     }
     #[cfg(target_os = "linux")]
@@ -574,7 +568,7 @@ fn this_stack() -> Result<Bounds, TrapError> {
                 return Err(TrapError::StackBounds { call: "pthread_getattr_np", code: got });
             }
             let mut addr: *mut c_void = core::ptr::null_mut();
-            let mut size: libc::size_t = 0;
+            let mut size: usize = 0;
             let got = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
             libc::pthread_attr_destroy(&mut attr);
             if got != 0 || size == 0 {
@@ -598,7 +592,7 @@ struct Regs {
 
 /// The action SIGTRAP had before this module's: written once, before the handler is installed,
 /// and read only by the handler after.
-struct Previous(UnsafeCell<core::mem::MaybeUninit<libc::sigaction>>);
+struct Previous(UnsafeCell<core::mem::MaybeUninit<blaze_sys::posix::signal::sigaction>>);
 
 // SAFETY: written by the one thread that wins `INSTALLED` before the handler that reads it can
 // run (the handler is installed after the write); never written again.
@@ -639,17 +633,17 @@ fn install_now() -> Result<(), TrapError> {
     // field used is set below; `PREVIOUS` is written here only, by the thread that won
     // `INSTALLED`, before the handler that reads it is installed.
     unsafe {
-        let mut previous: libc::sigaction = core::mem::zeroed();
-        if libc::sigaction(libc::SIGTRAP, core::ptr::null(), &mut previous) != 0 {
-            return Err(TrapError::Sigaction { errno: errno() });
-        }
+        let previous = match blaze_sys::posix::signal::get_action(blaze_sys::posix::signal::SIGTRAP) {
+            Ok(previous) => previous,
+            Err(error) => return Err(TrapError::Sigaction { errno: i32::from(error.raw()) }),
+        };
         (*PREVIOUS.0.get()).write(previous);
-        let mut action: libc::sigaction = core::mem::zeroed();
+        let mut action = blaze_sys::posix::signal::sigaction::DEFAULT;
         action.sa_sigaction = on_trap as usize;
-        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut action.sa_mask);
-        if libc::sigaction(libc::SIGTRAP, &action, core::ptr::null_mut()) != 0 {
-            return Err(TrapError::Sigaction { errno: errno() });
+        action.sa_flags = blaze_sys::posix::signal::SA_SIGINFO | blaze_sys::posix::signal::SA_ONSTACK;
+        action.sa_mask = blaze_sys::posix::signal::SIGSET_EMPTY;
+        if let Err(error) = blaze_sys::posix::signal::set_action(blaze_sys::posix::signal::SIGTRAP, &action) {
+            return Err(TrapError::Sigaction { errno: i32::from(error.raw()) });
         }
     }
     Ok(())
@@ -660,21 +654,20 @@ fn install_now() -> Result<(), TrapError> {
     Err(TrapError::NotThisSystem)
 }
 
-#[cfg(target_os = "macos")]
-fn errno() -> i32 {
-    // SAFETY: `__error` returns the calling thread's errno cell, always valid.
-    unsafe { *libc::__error() }
-}
-
-#[cfg(target_os = "linux")]
-fn errno() -> i32 {
-    // SAFETY: `__errno_location` returns the calling thread's errno cell, always valid.
-    unsafe { *libc::__errno_location() }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn errno() -> i32 {
-    0
+fn thread_token() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        blaze_sys::posix::thread::pthread_self() as usize
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux has no kernel replacement for libc's pthread handle. Keep the existing handle.
+        unsafe { libc::pthread_self() as usize }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
 }
 
 /// The interrupted thread's `pc`, `x29` and `sp`.
@@ -687,14 +680,14 @@ fn errno() -> i32 {
 unsafe fn regs(context: *mut c_void) -> Regs {
     // SAFETY: the caller's contract; on macOS `uc_mcontext` points at the thread state the
     // kernel saved for this signal (`__darwin_mcontext64`), valid as long as the context.
-    let ss = unsafe { &(*(*context.cast::<libc::ucontext_t>()).uc_mcontext).__ss };
+    let ss = unsafe { &(*(*context.cast::<blaze_sys::posix::signal::ucontext_t>()).uc_mcontext).__ss };
     Regs { pc: ss.__pc as usize, fp: ss.__fp as usize, sp: ss.__sp as usize }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 unsafe fn regs(context: *mut c_void) -> Regs {
     // SAFETY: the caller's contract; Linux's `ucontext_t` holds the saved registers inline.
-    let mc = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext };
+    let mc = unsafe { &(*context.cast::<blaze_sys::posix::signal::ucontext_t>()).uc_mcontext };
     Regs { pc: mc.pc as usize, fp: mc.regs[29] as usize, sp: mc.sp as usize }
 }
 
@@ -706,7 +699,7 @@ unsafe fn regs(context: *mut c_void) -> Regs {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 unsafe fn resume_at(context: *mut c_void, pc: usize, x0: usize, x1: usize) {
     // SAFETY: the caller's contract; sigreturn loads the thread state from this context.
-    let ss = unsafe { &mut (*(*context.cast::<libc::ucontext_t>()).uc_mcontext).__ss };
+    let ss = unsafe { &mut (*(*context.cast::<blaze_sys::posix::signal::ucontext_t>()).uc_mcontext).__ss };
     ss.__x[0] = x0 as u64;
     ss.__x[1] = x1 as u64;
     ss.__pc = pc as u64;
@@ -715,7 +708,7 @@ unsafe fn resume_at(context: *mut c_void, pc: usize, x0: usize, x1: usize) {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 unsafe fn resume_at(context: *mut c_void, pc: usize, x0: usize, x1: usize) {
     // SAFETY: the caller's contract; rt_sigreturn loads the registers from this context.
-    let mc = unsafe { &mut (*context.cast::<libc::ucontext_t>()).uc_mcontext };
+    let mc = unsafe { &mut (*context.cast::<blaze_sys::posix::signal::ucontext_t>()).uc_mcontext };
     mc.regs[0] = x0 as u64;
     mc.regs[1] = x1 as u64;
     mc.pc = pc as u64;
@@ -723,11 +716,11 @@ unsafe fn resume_at(context: *mut c_void, pc: usize, x0: usize, x1: usize) {
 
 /// The SIGTRAP handler (the module doc says what it may do and why).
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
-extern "C" fn on_trap(_signal: c_int, _info: *mut libc::siginfo_t, context: *mut c_void) {
+extern "C" fn on_trap(_signal: c_int, _info: *mut blaze_sys::posix::signal::siginfo_t, context: *mut c_void) {
     // SAFETY: `context` is this `SA_SIGINFO` handler's third argument.
     let regs = unsafe { regs(context) };
     // SAFETY: `pthread_self` reads the thread register (module doc).
-    let me = unsafe { libc::pthread_self() } as usize;
+    let me = thread_token();
     for index in 0..MOST_RUNS {
         if THREADS[index].load(Ordering::Acquire) != me {
             continue;
@@ -767,13 +760,15 @@ extern "C" fn on_trap(_signal: c_int, _info: *mut libc::siginfo_t, context: *mut
             say_other_thread(TrapCode::of(brk), (regs.pc - lo) as u64);
             // SAFETY: the process's end, as stub.rs `stopped` ends it from another thread:
             // other threads may hold any lock, so nothing is flushed or unwound.
-            unsafe { libc::_exit(c_int::from(PROGRAM_TRAPPED)) }
+            blaze_sys::posix::signal::exit_now(c_int::from(PROGRAM_TRAPPED))
         }
     }
     // Not the program's trap: SIGTRAP goes back to the action it had, and the instruction runs
     // again under it.
     // SAFETY: `PREVIOUS` was written before this handler was installed (`install_now`).
-    unsafe { libc::sigaction(libc::SIGTRAP, (*PREVIOUS.0.get()).as_ptr(), core::ptr::null_mut()) };
+    let _ = unsafe {
+        blaze_sys::posix::signal::set_action(blaze_sys::posix::signal::SIGTRAP, &*(*PREVIOUS.0.get()).as_ptr())
+    };
 }
 
 /// The other-thread line, by `write` only.
@@ -800,7 +795,7 @@ fn say_other_thread(code: TrapCode, area_offset: u64) {
     for part in parts {
         // SAFETY: a write of live bytes to descriptor 2; the process ends after it whether or
         // not the words could be written.
-        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
+        let _ = blaze_sys::posix::io::write(blaze_sys::Fd::STDERR, part);
     }
 }
 

@@ -17,11 +17,12 @@
 
 use blaze_own::{Alloc, Vec};
 
-use crate::error::{SolveError, Stop};
+use crate::error::{ParamHead, SolveError, Stop};
 use crate::facts::{AdtDef, Ask, AssocDef, FnSigDef, ImplHeader, ImplSet, OpaqueDef, Portable, Read, TraitDef, Facts};
 use crate::fold::{self, Inst, Scratch};
 use crate::term::{Certainty, Def, GoalSource, Lang, List, Pred, Shape, Ty, TyKind, TypingMode, VarKind};
 use crate::tys::Tys;
+use crate::why_no::Reach;
 
 /// A clause of a param env: a predicate under `bound` bound type variables (`Bound(0, i)`,
 /// `for<T> ..`; regions are not bound: they are erased).
@@ -156,6 +157,9 @@ pub struct Added {
     /// Evaluated only to learn how it was proven (`Cx::via`): its response is not applied and
     /// its certainty not counted, as the reference's `probe(compute_trait_goal)`.
     pub via_only: bool,
+    /// What the goal is of the goal its rule ran for (a where-clause's index, a field's): read
+    /// only by `Solver::why_no` (why_no.rs).
+    pub reach: Reach,
 }
 
 /// The lang items, looked up once per solver (the read is recorded on every use).
@@ -267,7 +271,7 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
     /// variable for the rest, so a const position can only ever unify with a const
     /// (`fresh_args_for_item`).
     pub fn fresh_impl_args(&mut self, h: &ImplHeader<'_>) -> Result<List, Stop> {
-        let v = crate::coherence::fresh_for(self.tys, h, self.alloc)?;
+        let v = crate::coherence::fresh_for(self.tys, self.scratch, h, self.alloc)?;
         self.mk_list(&v)
     }
 
@@ -290,18 +294,10 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         self.mk_list(&v)
     }
 
-    /// `t` with `Bound(0, i)` replaced by `with[i]` (and deeper binders' indices kept).
+    /// Opens the binder immediately outside `t`, leaving nested binders' variables in scope.
+    #[track_caller]
     pub fn instantiate_bound(&mut self, t: Ty, with: List) -> Result<Ty, Stop> {
-        if !self.tys.flags(t).has(crate::term::Flags::HAS_BOUND) {
-            return Ok(t);
-        }
-        Ok(fold::fold(self.tys, self.scratch, t, |tys, x| {
-            Ok(match tys.kind(x) {
-                TyKind::Bound(0, i) if i < with.len => Some(tys.list_get(with, i)),
-                _ if !tys.flags(x).has(crate::term::Flags::HAS_BOUND) => Some(x),
-                _ => None,
-            })
-        })?)
+        Ok(fold::instantiate_bound(self.tys, self.scratch, t, with)?)
     }
 
     /// `p` with every term mapped by `f`.
@@ -347,6 +343,22 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         let at = core::panic::Location::caller();
         let v = self.list(args);
         Ok(fold::import_at(self.tys, self.scratch, p, t, Inst { args: &v, bound: &[] }, at)?)
+    }
+
+    /// A type from a declaration, at that declaration's generic arguments.
+    #[track_caller]
+    pub(crate) fn import_head(&mut self, head: ParamHead, p: Portable<'_>, t: Ty, args: List) -> Result<Ty, Stop> {
+        #[cfg(test)]
+        let args = crate::tests::plant::head_args(args);
+        self.import(p, t, args).map_err(|e| e.in_head(head))
+    }
+
+    /// A bound of an instantiated alias. Its arguments include the associated item's own.
+    #[track_caller]
+    pub(crate) fn import_alias_bound(&mut self, alias: Def, bound: u32, p: Portable<'_>, pred: Pred, args: List) -> Result<Pred, Stop> {
+        #[cfg(test)]
+        let args = crate::tests::plant::head_args(args);
+        self.import_pred(p, pred, args).map_err(|e| e.in_head(ParamHead::AliasBound { alias, bound }))
     }
 
     /// The portable list `l` of `p`, imported as `import` does each element.
@@ -410,11 +422,13 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
                 _ => VarKind::Ty,
             };
             let fresh = self.tys.fresh(kind)?;
+            let reach = Reach::Nth(self.added.len() as u32);
             self.added.push(Added {
                 source: GoalSource::TypeRelating,
                 pred: Pred::Projection { alias, term: fresh },
                 bound: 0,
                 via_only: false,
+                reach,
             });
             if !self.tys.unify(fresh, other, crate::tys::Relate::Lazy, self.deferred)? {
                 self.deferred.truncate(base);
@@ -449,19 +463,28 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     /// Adds a nested goal of the frame's param env.
     pub fn add(&mut self, source: GoalSource, pred: Pred) {
-        self.added.push(Added { source, pred, bound: 0, via_only: false });
+        let reach = Reach::Nth(self.added.len() as u32);
+        self.added.push(Added { source, pred, bound: 0, via_only: false, reach });
+    }
+
+    /// [`Cx::add`] saying what the goal is of the goal the rule runs for (`reach`): a
+    /// where-clause's index, a field's (why_no.rs).
+    pub fn add_from(&mut self, source: GoalSource, pred: Pred, reach: Reach) {
+        self.added.push(Added { source, pred, bound: 0, via_only: false, reach });
     }
 
     /// Adds a nested goal under `bound` bound variables.
     pub fn add_bound(&mut self, source: GoalSource, pred: Pred, bound: u32) {
-        self.added.push(Added { source, pred, bound, via_only: false });
+        let reach = Reach::Nth(self.added.len() as u32);
+        self.added.push(Added { source, pred, bound, via_only: false, reach });
     }
 
     /// Adds a trait goal evaluated only to learn how it is proven: after `Step::Then`,
     /// [`Cx::via`] says (the reference computes the trait goal in a probe for its
     /// `TraitGoalProvenVia`).
     pub fn add_via(&mut self, pred: Pred) {
-        self.added.push(Added { source: GoalSource::Misc, pred, bound: 0, via_only: true });
+        let reach = Reach::Nth(self.added.len() as u32);
+        self.added.push(Added { source: GoalSource::Misc, pred, bound: 0, via_only: true, reach });
     }
 
     /// How the last `add_via` goal was proven.
@@ -502,6 +525,12 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     pub fn opaque(&mut self, d: Def) -> Result<OpaqueDef<'c>, Stop> {
         self.ask.opaque(self.reads, d)
+    }
+
+    /// [`Cx::opaque`] read for its hidden type: noted as `Question::OpaqueHidden`, what a
+    /// stall is named by (facts.rs `Ask::first_hidden_unknown`).
+    pub fn opaque_hidden(&mut self, d: Def) -> Result<OpaqueDef<'c>, Stop> {
+        self.ask.opaque_hidden(self.reads, d)
     }
 
     pub fn is_local(&mut self, d: Def) -> Result<bool, Stop> {
@@ -555,8 +584,15 @@ pub enum InferenceConstraints {
 /// dropped when another impl candidate's impl specializes its impl (RFC 1210: of the impls
 /// that apply, the most specific is used). Under `NotAllowed` only a specializing candidate
 /// whose response binds no variable drops one, so an undecided goal does not pick the
-/// specializing impl by guessing. The question is asked only of two impl candidates of one
-/// goal, so a goal with one impl candidate asks nothing.
+/// specializing impl by guessing; or one whose response EQUALS the victim's (the pinned
+/// rustc_next_trait_solver assembly/mod.rs: "If both impls have the same response, dropping
+/// victim doesn't change the result. We need to do so here as we don't merge distinct impl
+/// candidates", `|| c.result == candidates[i].result`): alloc's `vector.spec_extend(iter)`
+/// in `SpecFromIterNested::from_iter` under `I: TrustedLen<Item = T>` asks
+/// `Vec<T>: SpecExtend<?X, I>`, which the `I: TrustedLen` impl and the `I: Iterator` impl it
+/// specializes both answer `?X := T`; without the clause `try_merge_impl` refuses the two (E0283).
+/// The question is asked only of two impl candidates of one goal, so a goal with one impl
+/// candidate asks nothing.
 pub fn filter_specialized_impls(
     m: &Merger<'_, '_>,
     mode: TypingMode,
@@ -578,7 +614,10 @@ pub fn filter_specialized_impls(
                 continue;
             }
             let Source::Impl(other) = cands[j].cand.source else { continue };
-            if (allow == InferenceConstraints::Allowed || m.vars_identity(cands[j].resp)) && specializes(other, victim)? {
+            let may_drop = allow == InferenceConstraints::Allowed
+                || m.vars_identity(cands[j].resp)
+                || m.equal(cands[j].resp, cands[i].resp);
+            if may_drop && specializes(other, victim)? {
                 cands.remove(i);
                 continue 'outer;
             }
@@ -594,6 +633,9 @@ pub struct Merger<'m, 'a> {
     pub(crate) resps: &'m mut crate::canon::Responses<'a>,
     /// The canonical input's variable count: the identity response's width.
     pub(crate) vars: u32,
+    /// The candidates [`Merger::bail_with_ambiguity`] could not choose between, for
+    /// `Solver::why_maybe` (why_maybe.rs `Leaf::Candidates`); `None` until it bails.
+    pub(crate) bail: Option<crate::why_maybe::Bail>,
 }
 
 /// `try_merge_candidates`'s second answer.
@@ -643,6 +685,7 @@ impl Merger<'_, '_> {
     /// `bail_with_ambiguity` (solve/mod.rs): the `or` of the candidates' maybe-causes, from
     /// ambiguity, with no constraints.
     pub fn bail_with_ambiguity(&mut self, cands: &[Done]) -> Result<crate::canon::RespId, SolveError> {
+        self.bail = crate::why_maybe::Bail::of(cands.iter().map(|d| &d.cand));
         let mut c = Certainty::Ambiguous;
         for d in cands {
             let x = self.certainty(d.resp);

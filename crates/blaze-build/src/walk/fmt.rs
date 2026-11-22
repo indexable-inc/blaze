@@ -30,7 +30,7 @@
 //!   `+`, 22 `-`, 23 `#`, 24 `0`, 25 `x?`, 26 `X?`, 27 a width is set, 28 a precision is set,
 //!   29..31 the alignment (0 `<`, 1 `>`, 2 `^`, 3 not set); `FormattingOptions::new()` is
 //!   `' ' as u32 | 3 << 29` (read from nightly-2026-10-27's rust-src, library/core/src/fmt/
-//!   mod.rs, the `harness/toolchain` pin).
+//!   mod.rs, the `pins/toolchain` pin).
 //! - rt.rs: `#[lang = "format_argument"] #[repr(align(2))] pub struct Argument<'a> { ty:
 //!   ArgumentType<'a> }`, and in `impl Argument<'_>`:
 //!   `pub const fn new_display<T: Display>(x: &T) -> Argument<'_>`, likewise `new_debug`

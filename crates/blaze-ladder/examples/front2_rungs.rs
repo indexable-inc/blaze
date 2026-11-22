@@ -110,7 +110,7 @@ fn write_all(fd: i32, bytes: &[u8]) -> bool {
     while at < bytes.len() {
         // SAFETY: `fd` is the open write end of this child's pipe; the pointer and length are
         // of the live slice `bytes[at..]`.
-        let n = unsafe { libc::write(fd, bytes[at..].as_ptr().cast(), bytes.len() - at) };
+        let n = blaze_sys::posix::io::write(blaze_sys::Fd::new(fd), &bytes[at..]).map_or(-1, |n| n as isize);
         if n <= 0 {
             return false;
         }
@@ -124,7 +124,7 @@ fn drain(fd: i32, text: &mut Vec<u8>) -> bool {
     let mut buf = [0u8; 4096];
     loop {
         // SAFETY: `fd` is the open read end of the pipe; `buf` is a live array of that length.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = blaze_sys::posix::io::read(blaze_sys::Fd::new(fd), &mut buf).map_or(-1, |n| n as isize);
         if n > 0 {
             text.extend_from_slice(&buf[..n as usize]);
         } else {
@@ -144,10 +144,8 @@ fn drain(fd: i32, text: &mut Vec<u8>) -> bool {
 /// and `_exit`: all async-signal-safe, and no allocation, so the loop itself is sound even
 /// forked from a threaded process (the unit test's harness) when `rung` is.
 fn in_child(name: &str, deadline: Duration, rung: &mut dyn FnMut(&str) -> (&'static str, String)) -> Ended {
-    let mut fds = [0i32; 2];
-    // SAFETY: `pipe` fills the two-element array it is given.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "a pipe for the rung's verdict");
-    let (read_end, write_end) = (fds[0], fds[1]);
+    let (read_owned, write_owned) = blaze_sys::posix::io::pipe().expect("a pipe for the rung's verdict");
+    let (read_end, write_end) = (read_owned.into_raw(), write_owned.into_raw());
     // What the parent buffered for standard output is written before the fork (the child never
     // writes it again: it leaves by `_exit`, which flushes nothing).
     std::io::stdout().flush().expect("flushing standard output");
@@ -160,7 +158,7 @@ fn in_child(name: &str, deadline: Duration, rung: &mut dyn FnMut(&str) -> (&'sta
         // a panic of `rung` included (caught here; where panics abort, the abort's signal is
         // the parent's CRASHED line).
         // SAFETY: `read_end` is this process's copy of an open fd, not used again here.
-        unsafe { libc::close(read_end) };
+        let _ = unsafe { blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(read_end)) };
         let said = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rung(name)));
         let code = match said {
             Ok((word, rest)) => {
@@ -172,61 +170,60 @@ fn in_child(name: &str, deadline: Duration, rung: &mut dyn FnMut(&str) -> (&'sta
         };
         // SAFETY: `_exit` ends this process at once: no destructor, no `atexit`, no flush of
         // buffers copied from the parent.
-        unsafe { libc::_exit(code) }
+        blaze_sys::posix::signal::exit_now(code)
     }
     // THE PARENT.
     // SAFETY: `write_end` is the parent's copy (the child keeps its own); `read_end` is open:
     // `fcntl` only sets its non-blocking flag, so no read below can block past the deadline.
-    unsafe {
-        libc::close(write_end);
-        let flags = libc::fcntl(read_end, libc::F_GETFL);
-        assert!(flags >= 0 && libc::fcntl(read_end, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0, "the pipe's non-blocking flag");
-    }
+    let _ = unsafe { blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(write_end)) };
+    blaze_sys::posix::io::set_nonblocking(blaze_sys::Fd::new(read_end), true).expect("the pipe's non-blocking flag");
     let started = Instant::now();
     let mut text = Vec::new();
     let mut eof = false;
     let ended = loop {
         let mut status = 0i32;
         // SAFETY: `pid` is this process's child, not yet reaped; `status` is a live i32.
-        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if reaped == pid {
+        let reaped = blaze_sys::posix::proc::wait_pid(pid, blaze_sys::posix::proc::WaitFlags::NO_HANG).expect("waitpid for the rung's child");
+        if let Some((_, waited)) = reaped {
+            status = waited.0;
             // Everything it wrote is in the pipe: its write end closed when it ended.
             drain(read_end, &mut text);
-            break if libc::WIFSIGNALED(status) {
-                Ended::Signal(libc::WTERMSIG(status))
+            break if blaze_sys::posix::proc::WIFSIGNALED(status) {
+                Ended::Signal(blaze_sys::posix::proc::WTERMSIG(status))
             } else {
                 match text.iter().position(|&b| b == b'\n') {
-                    Some(end) if libc::WEXITSTATUS(status) == 0 => Ended::Said(String::from_utf8_lossy(&text[..end]).into_owned()),
-                    _ => Ended::Silent(libc::WEXITSTATUS(status)),
+                    Some(end) if blaze_sys::posix::proc::WEXITSTATUS(status) == 0 => Ended::Said(String::from_utf8_lossy(&text[..end]).into_owned()),
+                    _ => Ended::Silent(blaze_sys::posix::proc::WEXITSTATUS(status)),
                 }
             };
         }
-        assert!(reaped == 0, "waitpid for the rung's child: {}", std::io::Error::last_os_error());
         let left = deadline.saturating_sub(started.elapsed());
         if left.is_zero() {
             // SAFETY: `pid` is this process's own unreaped child, so the id cannot have been
             // reused; after SIGKILL the blocking `waitpid` returns once the kernel has ended it.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
-            }
+            blaze_sys::posix::signal::kill(pid, blaze_sys::posix::signal::SIGKILL).expect("kill the rung's child");
+            let _ = blaze_sys::posix::proc::wait_pid(pid, blaze_sys::posix::proc::WaitFlags::NONE).expect("waitpid after kill");
             break Ended::Hung;
         }
         // Wait for the pipe (or, once it is at its end, only for time), 50 ms at most, so the
         // child's end and the deadline are both seen promptly.
         let wait = left.min(Duration::from_millis(50)).as_millis().max(1) as i32;
-        let mut poll = libc::pollfd { fd: read_end, events: libc::POLLIN, revents: 0 };
-        // SAFETY: one live `pollfd` is passed with the count 1, or none with the count 0 (a
-        // sleep of `wait` ms); `poll` returns by `wait` at the latest.
-        unsafe {
-            if eof { libc::poll(core::ptr::null_mut(), 0, wait) } else { libc::poll(&mut poll, 1, wait) };
+        let timeout = blaze_sys::Timespec::from_duration(Duration::from_millis(wait as u64));
+        if eof {
+            let _ = blaze_sys::posix::io::poll(&mut [], Some(timeout));
+        } else {
+            let mut poll = [blaze_sys::posix::io::PollFd::new(
+                blaze_sys::Fd::new(read_end),
+                blaze_sys::posix::io::PollEvents::IN,
+            )];
+            let _ = blaze_sys::posix::io::poll(&mut poll, Some(timeout));
         }
         if !eof {
             eof = drain(read_end, &mut text);
         }
     };
     // SAFETY: the parent's read end, not used again.
-    unsafe { libc::close(read_end) };
+    let _ = unsafe { blaze_sys::posix::io::close(blaze_sys::posix::io::OwnedFd::from_raw(read_end)) };
     ended
 }
 

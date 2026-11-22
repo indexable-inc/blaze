@@ -223,10 +223,12 @@ fn the_plan_refuses_zero_and_counts_ticks() {
 #[cfg(target_os = "macos")]
 #[test]
 fn every_sampler_symbol_resolves() {
+    use blaze_sys::posix::thread::{RTLD_DEFAULT, symbol};
+
     for (name, why) in super::macos::SYMBOLS {
-        // SAFETY: a lookup, by a C string's name, among the images this process has loaded.
-        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-        assert!(!found.is_null(), "{name:?} is gone from this macOS; the sampler uses it for: {why}");
+        // SAFETY: RTLD_DEFAULT searches the images this process has loaded.
+        let found = unsafe { symbol(RTLD_DEFAULT, name) };
+        assert!(found.is_some(), "{name:?} is gone from this macOS; the sampler uses it for: {why}");
     }
 }
 
@@ -302,20 +304,20 @@ fn macos_sampler_samples_a_running_thread_and_resumes_it() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_timer_samples_its_own_thread() {
+    use blaze_sys::linux::{ClockId, clock_gettime};
+    use blaze_sys::posix::signal::SIGPROF;
     use super::linux::Table;
 
     let plan = Plan { period_ns: 1_000_000, deadline_ns: 10_000_000_000, max_samples: 20 };
-    let table = Table::try_new_in(4, 256, CodeRange::default(), plan, libc::SIGPROF, Global).expect("a table");
+    let table = Table::try_new_in(4, 256, CodeRange::default(), plan, SIGPROF, Global).expect("a table");
     let table: &'static Table<Global> = std::boxed::Box::leak(std::boxed::Box::new(table));
     table.start().expect("the sampler starts");
     let bounds = std::thread::spawn(move || {
         let (low, high) = crate::sys::stack().expect("the worker's stack");
         let ticket = table.register_current(5).expect("the worker registers");
-        let mut spent = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         for _ in 0..1_000_000_000u64 {
-            // SAFETY: fills one live local.
-            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spent) };
-            if spent.tv_sec > 0 || spent.tv_nsec >= 60_000_000 {
+            let Ok(spent) = clock_gettime(ClockId::ThreadCpu) else { continue };
+            if spent.sec > 0 || spent.nsec >= 60_000_000 {
                 break;
             }
         }

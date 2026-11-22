@@ -723,7 +723,10 @@ pub(crate) mod native {
         path::Path,
     };
 
-    use libc::c_int;
+    use blaze_sys::{
+        Fd,
+        posix::{net, types::{c_int, c_void, socklen_t}},
+    };
 
     use super::{
         Buffers, Bytes, FastOpen, KeepAlive, Linger, Opt, Platform, Pmtu, Side, Skipped, Tcp, TcpOptions,
@@ -782,55 +785,55 @@ pub(crate) mod native {
     /// host has no such call. The one home of every option's encoding.
     #[cfg(target_os = "linux")]
     pub fn knob(call: Call, v6: bool) -> Option<Knob> {
-        use libc::{IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, SOL_SOCKET};
+        use net::{IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, SOL_SOCKET};
         match (call, v6) {
-            (Call::NoDelay, _) => k(IPPROTO_TCP, libc::TCP_NODELAY, "TCP_NODELAY"),
-            (Call::RecvBuffer, _) => k(SOL_SOCKET, libc::SO_RCVBUF, "SO_RCVBUF"),
-            (Call::SendBuffer, _) => k(SOL_SOCKET, libc::SO_SNDBUF, "SO_SNDBUF"),
-            (Call::KeepAliveOn, _) => k(SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE"),
-            (Call::KeepIdle, _) => k(IPPROTO_TCP, libc::TCP_KEEPIDLE, "TCP_KEEPIDLE"),
-            (Call::KeepInterval, _) => k(IPPROTO_TCP, libc::TCP_KEEPINTVL, "TCP_KEEPINTVL"),
-            (Call::KeepCount, _) => k(IPPROTO_TCP, libc::TCP_KEEPCNT, "TCP_KEEPCNT"),
-            (Call::Linger, _) => k(SOL_SOCKET, libc::SO_LINGER, "SO_LINGER"),
-            (Call::ReuseAddress, _) => k(SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR"),
-            (Call::ReusePort, _) => k(SOL_SOCKET, libc::SO_REUSEPORT, "SO_REUSEPORT"),
-            (Call::NotSentLowWater, _) => k(IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT, "TCP_NOTSENT_LOWAT"),
-            (Call::QuickAck, _) => k(IPPROTO_TCP, libc::TCP_QUICKACK, "TCP_QUICKACK"),
-            (Call::FastOpenConnect, _) => k(IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT, "TCP_FASTOPEN_CONNECT"),
-            (Call::FastOpenListen, _) => k(IPPROTO_TCP, libc::TCP_FASTOPEN, "TCP_FASTOPEN"),
-            (Call::Congestion, _) => k(IPPROTO_TCP, libc::TCP_CONGESTION, "TCP_CONGESTION"),
-            (Call::Tos, false) => k(IPPROTO_IP, libc::IP_TOS, "IP_TOS"),
-            (Call::Tos, true) => k(IPPROTO_IPV6, libc::IPV6_TCLASS, "IPV6_TCLASS"),
+            (Call::NoDelay, _) => k(IPPROTO_TCP, net::TCP_NODELAY, "TCP_NODELAY"),
+            (Call::RecvBuffer, _) => k(SOL_SOCKET, net::SO_RCVBUF, "SO_RCVBUF"),
+            (Call::SendBuffer, _) => k(SOL_SOCKET, net::SO_SNDBUF, "SO_SNDBUF"),
+            (Call::KeepAliveOn, _) => k(SOL_SOCKET, net::SO_KEEPALIVE, "SO_KEEPALIVE"),
+            (Call::KeepIdle, _) => k(IPPROTO_TCP, net::TCP_KEEPIDLE, "TCP_KEEPIDLE"),
+            (Call::KeepInterval, _) => k(IPPROTO_TCP, net::TCP_KEEPINTVL, "TCP_KEEPINTVL"),
+            (Call::KeepCount, _) => k(IPPROTO_TCP, net::TCP_KEEPCNT, "TCP_KEEPCNT"),
+            (Call::Linger, _) => k(SOL_SOCKET, net::SO_LINGER, "SO_LINGER"),
+            (Call::ReuseAddress, _) => k(SOL_SOCKET, net::SO_REUSEADDR, "SO_REUSEADDR"),
+            (Call::ReusePort, _) => k(SOL_SOCKET, net::SO_REUSEPORT, "SO_REUSEPORT"),
+            (Call::NotSentLowWater, _) => k(IPPROTO_TCP, net::TCP_NOTSENT_LOWAT, "TCP_NOTSENT_LOWAT"),
+            (Call::QuickAck, _) => k(IPPROTO_TCP, net::TCP_QUICKACK, "TCP_QUICKACK"),
+            (Call::FastOpenConnect, _) => k(IPPROTO_TCP, net::TCP_FASTOPEN_CONNECT, "TCP_FASTOPEN_CONNECT"),
+            (Call::FastOpenListen, _) => k(IPPROTO_TCP, net::TCP_FASTOPEN, "TCP_FASTOPEN"),
+            (Call::Congestion, _) => k(IPPROTO_TCP, net::TCP_CONGESTION, "TCP_CONGESTION"),
+            (Call::Tos, false) => k(IPPROTO_IP, net::IP_TOS, "IP_TOS"),
+            (Call::Tos, true) => k(IPPROTO_IPV6, net::IPV6_TCLASS, "IPV6_TCLASS"),
             (Call::TcpEcn, _) => None,
-            (Call::PathMtu, false) => k(IPPROTO_IP, libc::IP_MTU_DISCOVER, "IP_MTU_DISCOVER"),
-            (Call::PathMtu, true) => k(IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, "IPV6_MTU_DISCOVER"),
+            (Call::PathMtu, false) => k(IPPROTO_IP, net::IP_MTU_DISCOVER, "IP_MTU_DISCOVER"),
+            (Call::PathMtu, true) => k(IPPROTO_IPV6, net::IPV6_MTU_DISCOVER, "IPV6_MTU_DISCOVER"),
         }
     }
 
     /// As Linux's [`knob`], for macOS.
     #[cfg(target_os = "macos")]
     pub fn knob(call: Call, v6: bool) -> Option<Knob> {
-        use libc::{IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, SOL_SOCKET};
+        use net::{IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, SOL_SOCKET};
         match (call, v6) {
-            (Call::NoDelay, _) => k(IPPROTO_TCP, libc::TCP_NODELAY, "TCP_NODELAY"),
-            (Call::RecvBuffer, _) => k(SOL_SOCKET, libc::SO_RCVBUF, "SO_RCVBUF"),
-            (Call::SendBuffer, _) => k(SOL_SOCKET, libc::SO_SNDBUF, "SO_SNDBUF"),
-            (Call::KeepAliveOn, _) => k(SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE"),
-            (Call::KeepIdle, _) => k(IPPROTO_TCP, libc::TCP_KEEPALIVE, "TCP_KEEPALIVE"),
-            (Call::KeepInterval, _) => k(IPPROTO_TCP, libc::TCP_KEEPINTVL, "TCP_KEEPINTVL"),
-            (Call::KeepCount, _) => k(IPPROTO_TCP, libc::TCP_KEEPCNT, "TCP_KEEPCNT"),
+            (Call::NoDelay, _) => k(IPPROTO_TCP, net::TCP_NODELAY, "TCP_NODELAY"),
+            (Call::RecvBuffer, _) => k(SOL_SOCKET, net::SO_RCVBUF, "SO_RCVBUF"),
+            (Call::SendBuffer, _) => k(SOL_SOCKET, net::SO_SNDBUF, "SO_SNDBUF"),
+            (Call::KeepAliveOn, _) => k(SOL_SOCKET, net::SO_KEEPALIVE, "SO_KEEPALIVE"),
+            (Call::KeepIdle, _) => k(IPPROTO_TCP, net::TCP_KEEPALIVE, "TCP_KEEPALIVE"),
+            (Call::KeepInterval, _) => k(IPPROTO_TCP, net::TCP_KEEPINTVL, "TCP_KEEPINTVL"),
+            (Call::KeepCount, _) => k(IPPROTO_TCP, net::TCP_KEEPCNT, "TCP_KEEPCNT"),
             // SO_LINGER's time is in ticks on macOS; SO_LINGER_SEC's in seconds.
-            (Call::Linger, _) => k(SOL_SOCKET, libc::SO_LINGER_SEC, "SO_LINGER_SEC"),
-            (Call::ReuseAddress, _) => k(SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR"),
-            (Call::ReusePort, _) => k(SOL_SOCKET, libc::SO_REUSEPORT, "SO_REUSEPORT"),
+            (Call::Linger, _) => k(SOL_SOCKET, net::SO_LINGER_SEC, "SO_LINGER_SEC"),
+            (Call::ReuseAddress, _) => k(SOL_SOCKET, net::SO_REUSEADDR, "SO_REUSEADDR"),
+            (Call::ReusePort, _) => k(SOL_SOCKET, net::SO_REUSEPORT, "SO_REUSEPORT"),
             (Call::NotSentLowWater, _) => k(IPPROTO_TCP, MACOS_TCP_NOTSENT_LOWAT, "TCP_NOTSENT_LOWAT"),
             (Call::QuickAck | Call::FastOpenConnect | Call::Congestion, _) => None,
-            (Call::FastOpenListen, _) => k(IPPROTO_TCP, libc::TCP_FASTOPEN, "TCP_FASTOPEN"),
-            (Call::Tos, false) => k(IPPROTO_IP, libc::IP_TOS, "IP_TOS"),
-            (Call::Tos, true) => k(IPPROTO_IPV6, libc::IPV6_TCLASS, "IPV6_TCLASS"),
+            (Call::FastOpenListen, _) => k(IPPROTO_TCP, net::TCP_FASTOPEN, "TCP_FASTOPEN"),
+            (Call::Tos, false) => k(IPPROTO_IP, net::IP_TOS, "IP_TOS"),
+            (Call::Tos, true) => k(IPPROTO_IPV6, net::IPV6_TCLASS, "IPV6_TCLASS"),
             (Call::TcpEcn, _) => k(IPPROTO_TCP, MACOS_TCP_ENABLE_ECN, "TCP_ENABLE_ECN"),
-            (Call::PathMtu, false) => k(IPPROTO_IP, libc::IP_DONTFRAG, "IP_DONTFRAG"),
-            (Call::PathMtu, true) => k(IPPROTO_IPV6, libc::IPV6_DONTFRAG, "IPV6_DONTFRAG"),
+            (Call::PathMtu, false) => k(IPPROTO_IP, net::IP_DONTFRAG, "IP_DONTFRAG"),
+            (Call::PathMtu, true) => k(IPPROTO_IPV6, net::IPV6_DONTFRAG, "IPV6_DONTFRAG"),
         }
     }
 
@@ -848,26 +851,23 @@ pub(crate) mod native {
     }
 
     /// `value` written as `knob` of `fd`.
-    fn set_raw(fd: RawFd, knob: Knob, value: *const libc::c_void, len: usize) -> io::Result<()> {
-        // SAFETY: `fd` is a socket the caller holds open; `value` points at `len` bytes on the
-        // caller's stack for the call (rule: the module's doc).
-        let done = unsafe { libc::setsockopt(fd, knob.level, knob.name, value, len as libc::socklen_t) };
-        match done {
-            0 => Ok(()),
-            _ => {
-                let error = io::Error::last_os_error();
-                // alloc: an error path.
-                Err(io::Error::new(error.kind(), format!("setting socket option {}: {error}", knob.text)))
-            }
-        }
+    fn set_raw(fd: RawFd, knob: Knob, value: *const c_void, len: usize) -> io::Result<()> {
+        // SAFETY: the callers supply an initialized int, two consecutive ints (linger), or a
+        // byte slice, all live for this call. Casting to socklen_t can only shorten the slice.
+        let bytes = unsafe { core::slice::from_raw_parts(value.cast(), len as socklen_t as usize) };
+        net::setsockopt_bytes(Fd::new(fd), knob.level, knob.name, bytes).map_err(|errno| {
+            let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("setting socket option {}: {error}", knob.text))
+        })
     }
 
     pub(crate) fn set_int(fd: RawFd, knob: Knob, value: c_int) -> io::Result<()> {
         set_raw(fd, knob, (&raw const value).cast(), size_of::<c_int>())
     }
 
-    fn set_linger(fd: RawFd, knob: Knob, value: libc::linger) -> io::Result<()> {
-        set_raw(fd, knob, (&raw const value).cast(), size_of::<libc::linger>())
+    fn set_linger(fd: RawFd, knob: Knob, value: net::linger) -> io::Result<()> {
+        set_raw(fd, knob, (&raw const value).cast(), size_of::<net::linger>())
     }
 
     fn set_bytes(fd: RawFd, knob: Knob, value: &[u8]) -> io::Result<()> {
@@ -875,19 +875,15 @@ pub(crate) mod native {
     }
 
     /// `knob` of `fd` read back into `into`: how many bytes the kernel wrote.
-    fn get_raw(fd: RawFd, knob: Knob, into: *mut libc::c_void, len: usize) -> io::Result<usize> {
-        let mut got = len as libc::socklen_t;
-        // SAFETY: `fd` is a socket the caller holds open; `into` points at `len` writable bytes
-        // on the caller's stack, and `got` says so.
-        let done = unsafe { libc::getsockopt(fd, knob.level, knob.name, into, &mut got) };
-        match done {
-            0 => Ok(got as usize),
-            _ => {
-                let error = io::Error::last_os_error();
-                // alloc: an error path.
-                Err(io::Error::new(error.kind(), format!("reading socket option {}: {error}", knob.text)))
-            }
-        }
+    fn get_raw(fd: RawFd, knob: Knob, into: *mut c_void, len: usize) -> io::Result<usize> {
+        // SAFETY: the callers lend an initialized int, two consecutive ints (linger), or a
+        // byte array exclusively for this call. Every bit pattern is valid in each.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(into.cast(), len as socklen_t as usize) };
+        net::getsockopt_bytes(Fd::new(fd), knob.level, knob.name, bytes).map_err(|errno| {
+            let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("reading socket option {}: {error}", knob.text))
+        })
     }
 
     pub(crate) fn get_int(fd: RawFd, knob: Knob) -> io::Result<c_int> {
@@ -897,9 +893,9 @@ pub(crate) mod native {
     }
 
     #[cfg(test)]
-    pub(crate) fn get_linger(fd: RawFd, knob: Knob) -> io::Result<libc::linger> {
-        let mut value = libc::linger { l_onoff: 0, l_linger: 0 };
-        get_raw(fd, knob, (&raw mut value).cast(), size_of::<libc::linger>())?;
+    pub(crate) fn get_linger(fd: RawFd, knob: Knob) -> io::Result<net::linger> {
+        let mut value = net::linger { l_onoff: 0, l_linger: 0 };
+        get_raw(fd, knob, (&raw mut value).cast(), size_of::<net::linger>())?;
         Ok(value)
     }
 
@@ -960,9 +956,9 @@ pub(crate) mod native {
         }
         if let (Some(linger), true) = (o.linger.value(), wanted(Opt::Linger)) {
             let value = match linger {
-                Linger::Off => libc::linger { l_onoff: 0, l_linger: 0 },
-                Linger::Reset => libc::linger { l_onoff: 1, l_linger: 0 },
-                Linger::Seconds(n) => libc::linger { l_onoff: 1, l_linger: c_int::from(n) },
+                Linger::Off => net::linger { l_onoff: 0, l_linger: 0 },
+                Linger::Reset => net::linger { l_onoff: 1, l_linger: 0 },
+                Linger::Seconds(n) => net::linger { l_onoff: 1, l_linger: c_int::from(n) },
             };
             set_linger(fd, knob_in(table, Call::Linger, v6)?, value)?;
         }
@@ -1030,8 +1026,8 @@ pub(crate) mod native {
     /// as [`unix_refused`] says.
     pub(crate) fn for_stream(fd: RawFd, domain: c_int, options: &Tcp, side: Side) -> io::Result<()> {
         match domain {
-            libc::AF_UNIX => unix_refused(options),
-            _ => apply_tcp(fd, domain == libc::AF_INET6, options.get(), side).map(drop),
+            net::AF_UNIX => unix_refused(options),
+            _ => apply_tcp(fd, domain == net::AF_INET6, options.get(), side).map(drop),
         }
     }
 
@@ -1049,8 +1045,7 @@ pub(crate) mod native {
         crate::net::sockaddr(Path::new(""), &crate::Address::Tcp(at))
     }
 
-    fn os(what: &'static str) -> io::Error {
-        let error = io::Error::last_os_error();
+    fn os(what: &'static str, error: io::Error) -> io::Error {
         // alloc: an error path.
         io::Error::new(error.kind(), format!("{what}: {error}"))
     }
@@ -1061,14 +1056,20 @@ pub(crate) mod native {
         let address = sockaddr(at)?;
         let fd = crate::net::stream_socket(address.domain)?;
         let skipped = apply_tcp(fd.as_raw_fd(), at.is_ipv6(), options, Side::Listen)?;
+        #[cfg(target_os = "macos")]
+        net::bind(Fd::new(fd.as_raw_fd()), &address.storage, address.len)
+            .map_err(|errno| os("bind", io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: an address of `len` bytes, of the socket's domain (`crate::net::sockaddr`).
         if unsafe { libc::bind(fd.as_raw_fd(), (&raw const address.storage).cast(), address.len) } != 0 {
-            return Err(os("bind"));
+            return Err(os("bind", io::Error::last_os_error()));
         }
-        // SAFETY: no pointers.
-        if unsafe { libc::listen(fd.as_raw_fd(), libc::SOMAXCONN) } != 0 {
-            return Err(os("listen"));
-        }
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        let backlog = net::SOMAXCONN;
+        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+        let backlog = libc::SOMAXCONN;
+        net::listen(Fd::new(fd.as_raw_fd()), backlog)
+            .map_err(|errno| os("listen", io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
         fast_open_in(knob, fd.as_raw_fd(), at.is_ipv6(), options, skipped)?;
         Ok(TcpListener::from(fd))
     }
@@ -1080,9 +1081,13 @@ pub(crate) mod native {
         let address = sockaddr(at)?;
         let fd = crate::net::stream_socket(address.domain)?;
         apply_tcp(fd.as_raw_fd(), at.is_ipv6(), options.get(), Side::Connect)?;
+        #[cfg(target_os = "macos")]
+        net::connect(Fd::new(fd.as_raw_fd()), &address.storage, address.len)
+            .map_err(|errno| os("connect", io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: an address of `len` bytes, of the socket's domain.
         if unsafe { libc::connect(fd.as_raw_fd(), (&raw const address.storage).cast(), address.len) } != 0 {
-            return Err(os("connect"));
+            return Err(os("connect", io::Error::last_os_error()));
         }
         Ok(TcpStream::from(fd))
     }
@@ -1097,13 +1102,10 @@ pub(crate) mod native {
     ) -> Result<UdpSocket, (&'static str, io::Error)> {
         let skipped = check_udp(options, Platform::HOST).map_err(|refusal| ("its options", refused(refusal)))?;
         let address = sockaddr(at).map_err(|error| ("its address", error))?;
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let raw = unsafe { libc::socket(address.domain, libc::SOCK_DGRAM, 0) };
-        if raw < 0 {
-            return Err(("socket", io::Error::last_os_error()));
-        }
+        let raw = net::socket(address.domain, net::SOCK_DGRAM, 0)
+            .map_err(|errno| ("socket", io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
         // SAFETY: the call returned a descriptor of its own.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let fd = unsafe { OwnedFd::from_raw_fd(raw.raw()) };
         crate::net::set_cloexec(fd.as_raw_fd()).map_err(|error| ("FD_CLOEXEC", error))?;
         let (raw, v6, t) = (fd.as_raw_fd(), at.is_ipv6(), &options.tuning);
         let wanted = |opt: Opt| !skipped.contains(opt);
@@ -1127,6 +1129,10 @@ pub(crate) mod native {
         if let (Some(mode), true) = (t.pmtu.value(), wanted(Opt::PathMtu)) {
             set(Call::PathMtu, pmtu(mode)).map_err(named)?;
         }
+        #[cfg(target_os = "macos")]
+        net::bind(Fd::new(raw), &address.storage, address.len)
+            .map_err(|errno| ("the bind", io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: an address of `len` bytes, of the socket's domain.
         if unsafe { libc::bind(raw, (&raw const address.storage).cast(), address.len) } != 0 {
             return Err(("the bind", io::Error::last_os_error()));
@@ -1138,12 +1144,12 @@ pub(crate) mod native {
     #[cfg(target_os = "linux")]
     fn pmtu(mode: Pmtu) -> c_int {
         match mode {
-            Pmtu::Dont => libc::IP_PMTUDISC_DONT,
-            Pmtu::Want => libc::IP_PMTUDISC_WANT,
-            Pmtu::Do => libc::IP_PMTUDISC_DO,
-            Pmtu::Probe => libc::IP_PMTUDISC_PROBE,
-            Pmtu::Interface => libc::IP_PMTUDISC_INTERFACE,
-            Pmtu::Omit => libc::IP_PMTUDISC_OMIT,
+            Pmtu::Dont => net::IP_PMTUDISC_DONT,
+            Pmtu::Want => net::IP_PMTUDISC_WANT,
+            Pmtu::Do => net::IP_PMTUDISC_DO,
+            Pmtu::Probe => net::IP_PMTUDISC_PROBE,
+            Pmtu::Interface => net::IP_PMTUDISC_INTERFACE,
+            Pmtu::Omit => net::IP_PMTUDISC_OMIT,
         }
     }
 

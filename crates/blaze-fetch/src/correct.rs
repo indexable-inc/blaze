@@ -198,7 +198,7 @@ impl<A: Allocator + Clone> Row<A> {
             }
         }
         let mut hasher = blaze_sha256::Sha256::new();
-        let mut field = |tag: &str, text: &str, h: &mut blaze_sha256::Sha256| {
+        let field = |tag: &str, text: &str, h: &mut blaze_sha256::Sha256| {
             h.update(tag.as_bytes()).update(&[0xfe]).update(text.as_bytes()).update(&[0xff]);
         };
         field("source-correction-v1", "", &mut hasher);

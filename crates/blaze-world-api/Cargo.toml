@@ -19,7 +19,7 @@ blaze-cbor.workspace = true
 # The JSON rendering is a `Value` (blaze-json writes and reads its text).
 blaze-data.workspace = true
 # `ItemKey`: the item a read, a target, a finding or an edit names.
-blaze-id = { path = "../blaze-id" }
+blaze-id.workspace = true
 # `Vec` and `String` in the caller's allocator.
 blaze-own.workspace = true
 

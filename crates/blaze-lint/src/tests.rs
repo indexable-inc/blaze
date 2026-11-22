@@ -16,8 +16,8 @@ use blaze_surface::Edition;
 use crate::matcher::{LIVE, Live, NO_SEQ, Pattern, Trie, nodes_for};
 use crate::sequences::{OTHER, PATTERNS, TRIE};
 use crate::{
-    FixError, Findings, Rule, RuleSet, Scope, Span, Step, Template, TestBits, Unit, Units, Variants, apply, apply_all, lint,
-    lint_in, show_message,
+    ALLOWED_STATICS, FixError, Findings, Level, OwnHeads, RootMarks, Rule, RuleSet, Scope, Span, Step, Template, TestBits, Unit, Units, Variants, apply,
+    apply_all, lint, lint_in, show_message, statics_of_path,
 };
 
 const FILE: Scope = Scope::file(TestBits::NONE, false, false);
@@ -634,7 +634,17 @@ fn the_rule_trie_has_the_nodes_its_doc_says() {
 
 #[test]
 fn new_rules_are_off_until_named() {
-    for rule in [Rule::AmbientHeap, Rule::NoAsync, Rule::AmbientRead, Rule::LeftUndone, Rule::UnboundedWait, Rule::AmbientHasher] {
+    for rule in [
+        Rule::AmbientHeap,
+        Rule::NoAsync,
+        Rule::AmbientRead,
+        Rule::LeftUndone,
+        Rule::UnboundedWait,
+        Rule::AmbientHasher,
+        Rule::ProcessStatic,
+        Rule::SansIoCore,
+        Rule::LockWithoutReason,
+    ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
         assert_eq!(Rule::from_name(rule.name()), Some(rule));
@@ -644,6 +654,320 @@ fn new_rules_are_off_until_named() {
     assert_eq!(Rule::from_name("no_async"), None);
     assert_eq!(Rule::ALL.len(), Rule::COUNT);
     assert!(Rule::ALL.iter().enumerate().all(|(at, rule)| rule.id() as usize == at + 1));
+}
+
+#[test]
+fn process_static() {
+    let rule = Rule::ProcessStatic;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(found(&only, "thread_local! { static K: u8 = 0; }", FILE), [("thread-local", "thread_local!")]);
+    assert_eq!(found(&only, "static mut N: u32 = 0;", FILE), [("static-mut", "static mut")]);
+    assert_eq!(found(&only, "static N: AtomicU64 = AtomicU64::new(0);", FILE), [("static-state", "static N: AtomicU64")]);
+    assert_eq!(found(&only, "pub static T: std::sync::Mutex<u8> = Mutex::new(0);", FILE), [(
+        "static-state",
+        "static T: std::sync::Mutex"
+    )]);
+    assert_eq!(kinds(rule, "static S: OnceLock<u8> = OnceLock::new();"), ["static-state"]);
+    assert_eq!(kinds(rule, "static C: [RefCell<u8>; 2] = [RefCell::new(0), RefCell::new(0)];"), ["static-state"]);
+    none(rule, &[
+        "static NAME: &str = \"x\";",
+        "fn f(x: &'static str) -> &'static str { x }",
+        "const C: AtomicU8 = AtomicU8::new(0);",
+        "static N: u64 = AtomicU64::new(0).into_inner();",
+        // A type of the crate's own: text cannot see its state (the rule says less).
+        "#[global_allocator]\nstatic A: SpinLock = SpinLock::new();",
+        "fn f() { let s = \"static mut x; thread_local!\"; }",
+        "fn f() {\n    // static mut N: u8 = 0;\n}",
+        "#[test]\nfn t() { static N: AtomicU8 = AtomicU8::new(0); }",
+        "#[cfg(test)]\nmod t {\n    thread_local! { static K: u8 = 0; }\n}",
+    ]);
+    // The message names the type that holds the state.
+    let alloc = blaze_own::testing::heap().alloc();
+    let text = "static N: AtomicU64 = AtomicU64::new(0);";
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes: &[], scope: FILE };
+    assert!(lint(&only, &unit, alloc, &mut out).is_ok());
+    let mut said = StdVec::new();
+    for finding in out.list.iter() {
+        let mut line = OwnString::new_in(alloc);
+        show_message(&only, text, &out, finding, &mut line);
+        said.push(line.as_str().to_string());
+    }
+    assert!(said.len() == 1 && said[0].contains("holds `AtomicU64`") && said[0].contains("C3"), "{said:?}");
+}
+
+/// Expected: "test tests::allowed_statics_by_crate_and_name ... ok".
+#[test]
+fn allowed_statics_by_crate_and_name() {
+    let only = RuleSet::only(&[Rule::ProcessStatic]);
+    // The table is sorted by crate then name, one row per (crate, name).
+    assert!(ALLOWED_STATICS.windows(2).all(|w| (w[0].krate, w[0].name) < (w[1].krate, w[1].name)));
+    let core = FILE.with_file_facts(OwnHeads::NONE, statics_of_path("crates/blaze-core/src/run_signals.rs"));
+    let trace = FILE.with_file_facts(OwnHeads::NONE, statics_of_path("crates/blaze-trace/src/record.rs"));
+    let cli = FILE.with_file_facts(OwnHeads::NONE, statics_of_path("crates/blaze-cli/src/main.rs"));
+    let none = StdVec::<(&str, &str)>::new();
+    // One of the three, in its crate: no finding.
+    assert_eq!(found(&only, "static ASKED: Requests = Requests::new();\nstatic HELD: AtomicBool = AtomicBool::new(false);", core), none);
+    assert_eq!(found(&only, "pub static PROFILE: Profile = Profile::new();", trace), none);
+    assert_eq!(found(&only, "#[global_allocator]\nstatic HEAP: Counted<AtomicU64> = Counted::new();", cli), none);
+    // A `thread_local!` whose every static is a row is none either (the rule reads names).
+    assert_eq!(found(&only, "std::thread_local! {\n    static HEAP: Cell<u8> = const { Cell::new(0) };\n}", cli), none);
+    // A fourth in the same crate, or a row's name in another crate, is refused.
+    assert_eq!(found(&only, "static SPARE: AtomicU64 = AtomicU64::new(0);", core), [("static-state", "static SPARE: AtomicU64")]);
+    assert_eq!(found(&only, "static HELD: AtomicBool = AtomicBool::new(false);", trace), [("static-state", "static HELD: AtomicBool")]);
+    assert_eq!(
+        found(&only, "thread_local! {\n    static HEAP: Cell<u8> = Cell::new(0);\n    static MORE: Cell<u8> = Cell::new(0);\n}", cli),
+        [("thread-local", "thread_local!"), ("static-state", "static MORE: Cell")]
+    );
+    // The allocator's attribute alone allows nothing: the table decides (the foreign heap is
+    // blaze-cli's alone, D173).
+    assert_eq!(found(&only, "#[global_allocator]\nstatic HEAP: Counted<AtomicU64> = Counted::new();", FILE).len(), 1);
+    // A path outside `crates/`, or a crate whose name only starts like a row's, has no rows.
+    assert_eq!(statics_of_path("scripts/src/x.rs"), 0);
+    assert_eq!(statics_of_path("crates/blaze-core-x/src/lib.rs"), 0);
+    // The rows are in the key: a file of a crate with rows is not one without.
+    assert_ne!(core.key(), FILE.key());
+}
+
+/// Expected: "test tests::own_module_heads_are_not_std ... ok".
+#[test]
+fn own_module_heads_are_not_std() {
+    let only = RuleSet::only(&[Rule::SansIoCore]);
+    let in_file = |text: &'static str| found(&only, text, CORE.with_file_facts(OwnHeads::read(text), 0));
+    let none = StdVec::<(&str, &str)>::new();
+    // Declared or imported from the crate: the head is the crate's module.
+    assert_eq!(in_file("mod io;\nfn f() { let p = io::Plan::new(); }"), none);
+    assert_eq!(in_file("use crate::machine::{fs, other};\nfn f() { fs::step(); }"), none);
+    assert_eq!(in_file("use super::process as process;\nfn f() { process::next(); }"), none);
+    // Imported from std, or not named at all: std's, reported.
+    assert_eq!(in_file("use std::io;\nfn f() { io::stdout(); }"), [("io", "io"), ("io", "io")]);
+    assert_eq!(in_file("fn f() { io::stdout(); }"), [("io", "io")]);
+    // Making `io` its own does not make `fs` its own, nor `std::io` the crate's.
+    assert_eq!(in_file("mod io;\nfn f() { fs::read(p); std::io::stdout(); }"), [("io", "fs"), ("io", "io")]);
+    assert_eq!(OwnHeads::read("mod io;\nuse crate::fs;\nuse std::env;\n").0, 0b1001);
+    // The heads are in the key.
+    assert_ne!(CORE.with_file_facts(OwnHeads(1), 0).key(), CORE.key());
+}
+
+/// A file of a sans-IO core: what the driver gives it when its crate root says
+/// `#![blaze::sans_io]`.
+const CORE: Scope = FILE.in_core();
+
+#[test]
+fn sans_io_core() {
+    let rule = Rule::SansIoCore;
+    let only = RuleSet::only(&[rule]);
+    let core = |text| found(&only, text, CORE);
+    assert_eq!(core("use std::fs;"), [("io", "fs")]);
+    assert_eq!(core("fn f(p: &P) { let b = fs::read(p); }"), [("io", "fs")]);
+    assert_eq!(core("fn f() { std::thread::sleep(d); }"), [("io", "thread")]);
+    assert_eq!(core("fn f() { process::exit(1) }"), [("io", "process")]);
+    assert_eq!(core("fn f() { let v = env::var(\"X\"); }"), [("io", "env")]);
+    assert_eq!(core("fn f(p: &P) { let f = File::open(p); }"), [("io", "File::open")]);
+    assert_eq!(core("fn f() { unsafe { libc::write(1, p, n) }; }"), [("io", "libc")]);
+    assert_eq!(core("fn f() { let s = TcpStream::connect(a); }"), [("io", "TcpStream")]);
+    assert_eq!(core("fn f() { let t = Instant::now(); let w = SystemTime::now(); }"), [
+        ("clock", "Instant::now"),
+        ("clock", "SystemTime::now")
+    ]);
+    assert_eq!(core("fn f() { rx.recv(); h.join(); m.lock(); c.wait(g); block_on(fut); }"), [
+        ("blocking", "recv"),
+        ("blocking", "join"),
+        ("blocking", "lock"),
+        ("blocking", "wait"),
+        ("blocking", "block_on")
+    ]);
+    assert_eq!(core("fn f() { println!(\"x\"); dbg!(y); }"), [("print", "println!"), ("print", "dbg!")]);
+    // Look-alikes in a core: none is IO.
+    for text in [
+        "fn f() { let s = parts.join(\",\"); }",
+        "fn f() { let p = crate::io::Plan::new(); }",
+        "fn f() { let p = blaze_fs::Path::new(); }",
+        "fn recv(&mut self) {}",
+        "fn f(file: File) -> u8 { file.len() }",
+        "fn f() { let n = self.io.len(); }",
+        "fn f() { let s = \"fs::read(p) Instant::now()\"; }",
+        "fn f() {\n    // println!(\"x\");\n}",
+        "fn f(clock: &C) { let t = clock.now(); }",
+        "#[test]\nfn t() { std::fs::read(p); }",
+        "#[cfg(test)]\nmod t {\n    fn t() { println!(\"x\"); }\n}",
+    ] {
+        assert_eq!(core(text), StdVec::<(&str, &str)>::new(), "sans-io-core fired on {text:?}");
+    }
+    // Outside a core the same code is no finding: the rule reads the scope's mark.
+    for text in ["use std::fs;", "fn f() { rx.recv(); println!(\"x\"); let t = Instant::now(); }"] {
+        assert_eq!(found(&only, text, FILE), StdVec::<(&str, &str)>::new(), "fired outside a core on {text:?}");
+    }
+    // A child item of a core is in the core too.
+    let text = "mod m {\n    fn g() {}\n}";
+    let start = text.find("fn g").map_or(0, |at| at as u32);
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let holes = [Span::new(start, start + "fn g() {}".len() as u32)];
+    let unit = Unit { text, holes: &holes, scope: CORE };
+    match lint(&only, &unit, alloc, &mut out) {
+        Ok(linted) => {
+            assert_eq!(linted.children.len(), 1);
+            assert!(linted.children.iter().all(|child| child.sans_io), "a child left the core");
+        }
+        Err(error) => panic!("lint refused {text:?}: {error:?}"),
+    }
+    assert_ne!(CORE.key(), FILE.key());
+}
+
+#[test]
+fn root_marks_and_lint_names() {
+    let text = "//! A core.\n#![no_std]\n#![blaze::sans_io]\n// a comment between\n#![deny(blaze::std_use, blaze::process_static, unused, reason = \"C7\")]\n#![forbid(blaze::implicit_allocator)]\n\nuse a::b;\n#![blaze::driver]\n";
+    let marks = RootMarks::read(text);
+    assert!(marks.no_std && marks.sans_io && !marks.driver, "{marks:?}");
+    for rule in [Rule::Ambient, Rule::ProcessStatic, Rule::AmbientHeap] {
+        assert!(marks.denies(rule), "{} not denied", rule.name());
+    }
+    assert!(!marks.denies(Rule::SansIoCore) && !marks.denies(Rule::Casts));
+    let rules = marks.rules(Step::Strict.rules());
+    for rule in [Rule::Ambient, Rule::ProcessStatic, Rule::AmbientHeap, Rule::SansIoCore] {
+        assert!(rules.runs(rule), "{} does not run", rule.name());
+    }
+    assert!(!rules.runs(Rule::NoAsync));
+    let levels = marks.levels(Step::Strict.levels());
+    assert_eq!(levels.of(Rule::Ambient), Level::Error);
+    assert_eq!(levels.of(Rule::Casts), Level::Advice);
+    assert!(marks.scope(FILE).sans_io && !RootMarks::NONE.scope(FILE).sans_io);
+    let driver = RootMarks::read("#![blaze::driver]\nfn main() {}");
+    assert!(driver.driver && !driver.sans_io);
+    // Only the top: a mark after an item is none.
+    assert_eq!(RootMarks::read("fn f() {}\n#![no_std]"), RootMarks::NONE);
+    // An attribute this does not know, or a bare `blaze`, marks nothing and stops nothing.
+    assert!(RootMarks::read("#![feature(x)]\n#![blaze]\n#![no_std]").no_std);
+    assert!(!RootMarks::read("#![blaze::sans_io_extra]").sans_io);
+    // A module file's own mark joins its crate's.
+    assert!(RootMarks::NONE.join(RootMarks::read("#![blaze::sans_io]")).sans_io);
+    assert!(!RootMarks::NONE.join(RootMarks::read("#![no_std]")).no_std);
+    for (lint, rule) in [
+        ("std_use", Rule::Ambient),
+        ("implicit_allocator", Rule::AmbientHeap),
+        ("process_static", Rule::ProcessStatic),
+        ("sans_io_core", Rule::SansIoCore),
+        ("lock_without_reason", Rule::LockWithoutReason),
+    ] {
+        assert_eq!(Rule::from_lint(lint), Some(rule));
+        assert_eq!(rule.lint(), Some(lint));
+    }
+    assert_eq!(Rule::from_lint("sans-io-core"), None);
+    assert_eq!(Rule::from_name("sans-io-core"), Some(Rule::SansIoCore));
+    assert_eq!(Template::SansIoPrint.rule(), Rule::SansIoCore);
+    assert_eq!(Template::StaticState.rule(), Rule::ProcessStatic);
+    assert_eq!(Template::VariantCountMany.rule(), Rule::VariantCount);
+    assert_eq!(Template::LockNoReason.rule(), Rule::LockWithoutReason);
+    assert_eq!(Template::LockBadReason.rule(), Rule::LockWithoutReason);
+    assert_eq!(Rule::from_name("lock-without-reason"), Some(Rule::LockWithoutReason));
+    let denies = RootMarks::read("#![deny(blaze::lock_without_reason)]\n");
+    assert!(denies.denies(Rule::LockWithoutReason) && denies.rules(Step::Rust.rules()).runs(Rule::LockWithoutReason));
+}
+
+/// Expected: "test tests::lock_without_reason ... ok".
+#[test]
+fn lock_without_reason() {
+    let rule = Rule::LockWithoutReason;
+    let only = RuleSet::only(&[rule]);
+    let nothing = StdVec::<(&str, &str)>::new();
+    // Each of D179's constructors, with no reason, is one finding over its path.
+    assert_eq!(found(&only, "fn f() { let l = Lock::new(\"jobs\", 0); }", FILE), [("no-reason", "Lock::new")]);
+    assert_eq!(kinds(rule, "fn f() { let a = Lock::unrecorded(0); let b = Lock::probed(p, 0); }"), ["no-reason", "no-reason"]);
+    assert_eq!(kinds(rule, "fn f() { let a = ReadLock::new(n, 0); let b = ReadLock::unrecorded(0); }"), ["no-reason", "no-reason"]);
+    assert_eq!(kinds(rule, "fn f() { let a = RwLock::new(0); let b = RankedLock::new(r, 0); }"), ["no-reason", "no-reason"]);
+    assert_eq!(found(&only, "fn f(a: A) { let m = SharedMap::new_in(a); }", FILE), [("no-reason", "SharedMap::new_in")]);
+    assert_eq!(found(&only, "fn f() { let l = bstd::sync::Lock::<u8>::new(0); }", FILE), [("no-reason", "Lock::<u8>::new")]);
+    assert_eq!(found(&only, "static L: Lock<u8> = Lock::new(\"l\", 0);", FILE), [("no-reason", "Lock::new")]);
+    assert_eq!(kinds(rule, "fn f() { let v = xs.map(RwLock::new); }"), ["no-reason"]);
+    // Not a constructor of D179's list, not the type, a method, a `use`, a type's own path, a
+    // string, a comment, test code: none.
+    none(rule, &[
+        "fn f() { let l = Lock::default(); let m = SharedMap::new(); let r = ReadLock::probed(p); }",
+        "fn f() { let l = Mutex::new(0); let o = OnceLock::new(); }",
+        "fn f() { let g = l.lock(); let n = x.Lock::new(); }",
+        "use bstd::sync::Lock::new;",
+        "fn f() { let l = Outer::Lock::new(0); }",
+        "fn f(l: &Lock<u8>) -> &Lock<u8> { l }",
+        "fn f() { let s = \"Lock::new(0)\"; }",
+        "fn f() {\n    // Lock::new(0)\n}",
+        "#[test]\nfn t() { let l = Lock::new(\"t\", 0); }",
+        "#[cfg(test)]\nmod t {\n    fn t() { let l = RwLock::new(0); }\n}",
+    ]);
+    // The reason on the statement, the `static`, a struct literal's field, or the expression
+    // statement: that construction has it, and the next one does not.
+    let reason = "#[blaze::lock_exception(tried = \"published\", why = \"the queue is written by every worker\")]";
+    let stmt = format!("fn f() {{\n    {reason}\n    let l = Lock::new(\"q\", 0);\n    let m = Lock::new(\"m\", 0);\n}}");
+    assert_eq!(found(&only, &stmt, FILE), [("no-reason", "Lock::new")]);
+    assert_eq!(found(&only, &stmt, FILE).len(), 1);
+    let stat = format!("{reason}\nstatic L: Lock<u8> = Lock::new(\"l\", 0);");
+    assert_eq!(found(&only, &stat, FILE), nothing);
+    let field = format!("fn f() -> S {{\n    S {{\n        {reason}\n        jobs: RwLock::new(0),\n        done: RwLock::new(0),\n    }}\n}}");
+    assert_eq!(kinds(rule, &field), ["no-reason"]);
+    let branch = format!("fn f() {{\n    {reason}\n    if c {{ a = Lock::new(\"a\", 0); }} else {{ a = Lock::new(\"b\", 0); }}\n    b = Lock::new(\"c\", 0);\n}}");
+    assert_eq!(kinds(rule, &branch), ["no-reason"]);
+    // Each shape, either order, a trailing comma, a raw string: well formed.
+    for attr in [
+        "#[blaze::lock_exception(tried = \"gathered\", why = \"x\")]",
+        "#[blaze::lock_exception(why = \"x\", tried = \"claimed\",)]",
+        "#[blaze::lock_exception(tried = \"published\", why = r#\"the \"why\"\"#)]",
+    ] {
+        let text = format!("fn f() {{\n    {attr}\n    let l = Lock::new(\"l\", 0);\n}}");
+        assert_eq!(found(&only, &text, FILE), nothing, "{attr}");
+    }
+    // A shape that is not one of the three, a `why` missing or empty, a key twice or another
+    // key, no arguments: one finding over the attribute, and the construction is covered.
+    for attr in [
+        "#[blaze::lock_exception(tried = \"locked\", why = \"x\")]",
+        "#[blaze::lock_exception(tried = \"published\")]",
+        "#[blaze::lock_exception(tried = \"published\", why = \"  \")]",
+        "#[blaze::lock_exception(tried = \"published\", tried = \"claimed\", why = \"x\")]",
+        "#[blaze::lock_exception(tried = \"published\", why = \"x\", owner = \"me\")]",
+        "#[blaze::lock_exception(tried = published, why = \"x\")]",
+        "#[blaze::lock_exception]",
+    ] {
+        let text = format!("fn f() {{\n    {attr}\n    let l = Lock::new(\"l\", 0);\n}}");
+        assert_eq!(found(&only, &text, FILE), [("bad-reason", attr)], "{attr}");
+    }
+    // Another `blaze::` attribute, or the same name under another tool, is no reason.
+    let other = "fn f() {\n    #[blaze::lock_checked]\n    let l = Lock::new(\"l\", 0);\n}";
+    assert_eq!(kinds(rule, other), ["no-reason"]);
+    // On an item: its child items have the reason too (the scope's `lock_reason`, in the key),
+    // and a sibling after it does not.
+    let text = format!("{reason}\nfn new() {{}}\nfn other() {{}}");
+    let first = text.find("fn new").map_or(0, |at| at as u32);
+    let second = text.find("fn other").map_or(0, |at| at as u32);
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let holes = [Span::new(first, first + "fn new() {}".len() as u32), Span::new(second, second + "fn other() {}".len() as u32)];
+    let unit = Unit { text: &text, holes: &holes, scope: FILE };
+    match lint(&only, &unit, alloc, &mut out) {
+        Ok(linted) => {
+            assert_eq!(linted.children.len(), 2);
+            assert!(linted.children[0].lock_reason && !linted.children[1].lock_reason, "the reason's reach");
+        }
+        Err(error) => panic!("lint refused {text:?}: {error:?}"),
+    }
+    let covered = Scope { lock_reason: true, ..FILE };
+    assert_eq!(found(&only, "fn new() { let l = Lock::new(\"l\", 0); }", covered), nothing);
+    assert_ne!(covered.key(), FILE.key());
+    // The message names the lock by its first argument's string, else by the path, and D179.
+    let text = "fn f() { let l = Lock::new(\"jobs\", 0); let m = RwLock::new(0); }";
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes: &[], scope: FILE };
+    assert!(lint(&only, &unit, alloc, &mut out).is_ok());
+    let mut said = StdVec::new();
+    for finding in out.list.iter() {
+        let mut line = OwnString::new_in(alloc);
+        show_message(&only, text, &out, finding, &mut line);
+        said.push(line.as_str().to_string());
+    }
+    assert!(
+        said.len() == 2
+            && said[0].starts_with("`jobs`: a lock with no reason: say which D179 shape it could not be")
+            && said[1].starts_with("`RwLock::new`: a lock with no reason"),
+        "{said:?}"
+    );
 }
 
 /// What `rules` finds in `text` with `holes` left out, as kinds and range texts.
@@ -851,6 +1175,11 @@ fn rule_set_identity() {
     let key = scope.key();
     scope.context.recursion_above = 2;
     assert_ne!(scope.key(), key);
+    // The core bit is its own: no other field's bits reach it (recursion_above's top bit is 34).
+    let mut deep = FILE;
+    deep.context.recursion_above = u8::MAX;
+    assert_ne!(deep.in_core().key(), deep.key());
+    assert_eq!(deep.in_core().key() ^ deep.key(), 1 << 35);
 }
 
 #[test]

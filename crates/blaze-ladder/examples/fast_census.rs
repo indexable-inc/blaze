@@ -58,7 +58,7 @@ use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, RunError, build_records_new};
 use blaze_lir::body::{Bodies, BodyId};
 use blaze_lir::func::{RefId, RefKind};
-use blaze_lir::{Func, View};
+use blaze_lir::{Verified, VerifiedFunc, View};
 use blaze_own::Alloc;
 use blaze_tier::{ARM64, Machine, Table, TableError, Tier, TierError};
 
@@ -94,7 +94,8 @@ enum Owned {
 struct Body {
     function: Box<str>,
     symbol: Symbol,
-    func: Func<Global>,
+    /// The walk's function with the walk's proof (D163): copied, not checked again.
+    func: VerifiedFunc<Global>,
     funcs: Vec<Owned, Global>,
     statics: Vec<blaze_typeck::ItemKey, Global>,
     vtables: Vec<Symbol, Global>,
@@ -119,7 +120,7 @@ struct Collect {
 }
 
 impl LirSeen for Collect {
-    fn seen(&mut self, function: &str, symbol: Symbol, func: &Func<Global>, names: &InstanceNames<'_>) {
+    fn seen(&mut self, function: &str, symbol: Symbol, func: Verified<'_>, names: &InstanceNames<'_>) {
         let mut funcs = Vec::with_capacity_in(names.funcs.len(), Global);
         funcs.extend(names.funcs.iter().map(|c| match *c {
             Callee::Symbol(s) => Owned::Symbol(s),
@@ -133,7 +134,7 @@ impl LirSeen for Collect {
         self.bodies.push(Body {
             function: Box::from(function),
             symbol,
-            func: func.view().to_func_in(Global),
+            func: func.to_verified_in(Global),
             funcs,
             statics: {
                 let mut v = Vec::with_capacity_in(names.statics.len(), Global);
@@ -317,8 +318,19 @@ fn tally(bodies: &[Body], references: &[Reference], inline: bool, fast: &Fast<'_
         } else {
             None
         };
-        let view = simplified.as_ref().map_or_else(|| body.func.view(), Func::view);
-        let made = catch_unwind(AssertUnwindSafe(|| fast.emit(view, &names, machine, alloc).map(|e| e.code.len() as u64)));
+        // The simplified function is new LIR: its one verification is here, and a refusal is
+        // the simplify stage's class. The walk's own function carries the walk's proof.
+        let verified = match simplified.as_ref() {
+            Some(func) => match blaze_lir::verify(func.view()) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    t.simplify_refused.add(numbers_out(&error.to_string()), &body.function);
+                    continue;
+                }
+            },
+            None => body.func.verified(),
+        };
+        let made = catch_unwind(AssertUnwindSafe(|| fast.emit(verified, &names, machine, alloc).map(|e| e.code.len() as u64)));
         let bytes = match made {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
@@ -331,7 +343,7 @@ fn tally(bodies: &[Body], references: &[Reference], inline: bool, fast: &Fast<'_
             }
         };
         t.fast_emitted += 1;
-        t.lir += view.len() as u64;
+        t.lir += simplified.as_ref().map_or_else(|| body.func.view().len(), |func| func.view().len()) as u64;
         t.lir_walk += body.func.view().len() as u64;
         if let Ok((insts, code)) = reference {
             t.both += 1;
@@ -442,7 +454,7 @@ fn census(heap: &'static blaze_own::Heap) -> Result<i32, CensusError> {
         let callees = body.callees();
         let names = InstanceNames { funcs: &callees, statics: &body.statics, vtables: &body.vtables, tls: &body.tls };
         let made = catch_unwind(AssertUnwindSafe(|| {
-            emit_record_measured(body.func.view(), &names, &RoutinePlaces::NONE, isa, &[], alloc).map(|(record, insts, _called)| (u64::from(insts), record.code.len() as u64))
+            emit_record_measured(body.func.verified(), &names, &RoutinePlaces::NONE, isa, &[], alloc).map(|(record, insts, _called)| (u64::from(insts), record.code.len() as u64))
         }));
         let reference = match made {
             Ok(Ok(sizes)) => Ok(sizes),

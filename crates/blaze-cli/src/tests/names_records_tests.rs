@@ -19,7 +19,7 @@ impl LoadNames<'static> for OneNames {
     }
 }
 
-/// The one crate's items record, 16-aligned; no file's text is asked for (`item` reads the row
+/// The one crate's items record, 16-aligned; no file's text is asked for (`identity` reads the row
 /// only).
 struct OneItems(&'static [u8]);
 
@@ -71,7 +71,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     write(&io, "filed/src/lib.rs", "pub mod m { pub fn f() {} }\n");
     write(&io, "reader/Cargo.toml", "[package]\nname = \"reader\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nfiled = { path = \"../filed\" }\n");
     write(&io, "reader/src/lib.rs", "pub fn h() {\n    filed::m::f()\n}\n");
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
     let payload: std::vec::Vec<u8> = {
         let mut watched = WATCHED.lock();
@@ -80,7 +80,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
         watched.payload.clear();
         kept
     };
-    assert!(checked.failed.is_empty(), "{:?}\n{out}", checked.failed);
+    assert_eq!(checked.failures, 0, "{out}\n{}", checked.profile);
     assert!(!payload.is_empty(), "`reader`'s names step read no record of `filed`:\n{out}\n{}", checked.profile);
 
     // 1. The names section answers `crate::m::f` and `crate::m`.
@@ -104,7 +104,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     // 2. The items section gives `f`'s row.
     let items = RecordItems::new(&[key], OneItems(items_bytes), g);
     let row = items
-        .item(f.def.key)
+        .identity(f.def.key)
         .unwrap_or_else(|e| panic!("`f`'s row through the items section: {e:?}"))
         .unwrap_or_else(|| panic!("the items section has no row for `f` ({:?})", f.def.key));
     assert_eq!((row.name, row.kind, row.module), (Some("f"), ItemKind::Function, m.def.key), "`f`'s row: {row:?}");
@@ -176,7 +176,7 @@ fn a_test_units_payload_files_its_tests_record() {
         "tested/src/lib.rs",
         "pub fn helper() {}\n\n#[test]\n#[should_panic(expected = \"boom\")]\nfn boom() {\n    panic!(\"boom\")\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn fast() {}\n\n    #[test]\n    #[ignore = \"slow\"]\n    fn slow() {}\n}\n",
     );
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
     let payload: std::vec::Vec<u8> = {
         let mut watched = WATCHED_TESTS.lock();
@@ -185,7 +185,7 @@ fn a_test_units_payload_files_its_tests_record() {
         watched.payload.clear();
         kept
     };
-    assert!(checked.failed.is_empty(), "{:?}\n{out}", checked.failed);
+    assert_eq!(checked.failures, 0, "{out}\n{}", checked.profile);
     assert!(!payload.is_empty(), "no payload with a tests section was written for `tested`'s test unit:\n{out}\n{}", checked.profile);
 
     let parts = sections(&payload).unwrap_or_else(|e| panic!("the test unit's payload: {e}"));

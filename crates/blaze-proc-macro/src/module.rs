@@ -14,15 +14,14 @@
 //! `<store>/proc-macro/modules/<key>/` holds `identity`, `module.wasm`, `wasm-sha256`,
 //! `macros` (one line per macro: its index in the module, `derive`, `attr` or `bang`, its name,
 //! a derive's helpers joined by commas) and `decls` (the exported global holding the list).
-//! Beside them the runtime keeps the module's machine code, `compiled-<code key>` and its
-//! `compiled-<code key>.seal` (`host.rs`, "Compiled records").
+//! The runtime keeps the module's machine code apart, in the store's one compiled folder
+//! `<store>/proc-macro/compiled/<code key>` and its `.seal`, keyed by the wasm's digest and the
+//! runtime ([`COMPILED_DIR`]; `host.rs`, "Compiled records").
 
 use std::path::{Path, PathBuf};
 
 use blaze_expand::ProcKind;
 
-/// The pinned nightly: the bridge's sources and the std a module is built with.
-pub const TOOLCHAIN: &str = include_str!("../../../harness/toolchain");
 /// The target a module is built for.
 pub const TARGET_JSON: &[u8] = include_bytes!("../guest/wasm32-wasip1-macro.json");
 /// The shim linked into each module.
@@ -244,12 +243,28 @@ pub fn identity(id: &CrateId<'_>) -> String {
         Source::Path { files_sha256 } => format!("files {files_sha256}"),
     };
     format!(
-        "blaze proc-macro module 2\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nbuilder bootstrap\n",
+        // Form 3 (2026-11-18): the profile is an input of the module. A macro's own code reads
+        // `cfg(debug_assertions)` (tempo's `tempo-precompiles-macros` writes its `*_BYTES`
+        // constants only under it), and `check` models cargo's dev profile, where it is on.
+        // Form 2's modules were built without it and are another key.
+        // Form 4 (2026-11-20): the standard library's crates (core, alloc, std, proc_macro and
+        // the rest of std's own workspace) are built WITHOUT debug assertions, and no crate of
+        // the module emits UB checks (`-Zub-checks=no`); the macro crate and its dependencies
+        // keep `cfg(debug_assertions)`. Form 3's std carried both into every call. The builder
+        // (scripts proc_macro_modules.rs) writes the same text.
+        // History (2026-11-20): form 4 was first admitted at 21:20 before any module store held
+        // it, and every macro of tempo then had "no compiled module in the store" (5,688 errors
+        // on the acceptance project); the reader was held at form 3 until the store was rebuilt
+        // (81 modules, notes port27/tempo-deps/module-store-f4, 22:00) and measured on tempo at
+        // 22:55 (Names 28.3 s to 23.5 s wall, 69.5 s to 54.7 s cpu; the same 14,623 bodies
+        // checked). A form of this text moves only together with a store that holds it.
+        "blaze proc-macro module 4\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
         id.name,
         id.version,
         id.deps,
         features.join(","),
-        TOOLCHAIN.trim(),
+        // The pinned nightly: the bridge's sources and the std a module is built with.
+        blaze_pins::TOOLCHAIN,
         sha256_hex(TARGET_JSON),
         sha256_hex(SHIM),
     )
@@ -289,10 +304,16 @@ pub struct ModuleRecord {
     pub macros: Vec<Exported>,
     /// The name of the global holding the address of the harness's list.
     pub decls: String,
-    /// The record's folder in the module store, `<store>/proc-macro/modules/<key>`: the
-    /// runtime keeps the module's compiled records beside its wasm (`host.rs`).
+    /// The record's folder in the module store, `<store>/proc-macro/modules/<key>`.
     pub dir: PathBuf,
+    /// The store's folder of compiled code, `<store>/`[`COMPILED_DIR`]: where the runtime keeps
+    /// the module's machine code, keyed by what it is made from (host.rs `Runtime::code_key`),
+    /// not by this record's key.
+    pub compiled: PathBuf,
 }
+
+/// A store's folder of compiled module code, under the store (host.rs, "Compiled records").
+pub const COMPILED_DIR: &str = "proc-macro/compiled";
 
 impl ModuleRecord {
     /// The macro `name` of `kind`.
@@ -387,5 +408,5 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
         macros.push(Exported { index, kind, name, helpers });
     }
     let decls = text("decls")?.trim().to_owned();
-    Ok(ModuleRecord { key, name: id.name.to_owned(), version: id.version.to_owned(), wasm_sha256: held, macros, decls, dir })
+    Ok(ModuleRecord { key, name: id.name.to_owned(), version: id.version.to_owned(), wasm_sha256: held, macros, decls, dir, compiled: store.join(COMPILED_DIR) })
 }

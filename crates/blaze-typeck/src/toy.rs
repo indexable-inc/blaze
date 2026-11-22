@@ -54,6 +54,9 @@ pub(crate) struct ToyWorld {
     sig_output: PTy,
     sig_types: Owned,
     adts: Vec<(ItemKey, AdtAnswer), Global>,
+    /// The opaques this world reveals, each with its hidden type (node 0 of its own table);
+    /// every other opaque is seen as itself (`opaque_hidden` answers `None`).
+    revealed: Vec<(ItemKey, Owned), Global>,
     /// Questions answered `Missing`.
     pub missing: Vec<Question, Global>,
 }
@@ -112,8 +115,18 @@ impl ToyWorld {
             sig_output,
             sig_types: to_owned(sig),
             adts,
+            revealed: Vec::new_in(Global),
             missing: Vec::new_in(Global),
         })
+    }
+
+    /// Reveals `opaque` to this world's checks with hidden type `ty` (a scalar: one node).
+    pub(crate) fn reveal(&mut self, opaque: ItemKey, ty: FieldTy) -> Result<(), CheckError> {
+        let mut t = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        field_pty(&mut t, ty)?;
+        self.revealed.retain(|(k, _)| *k != opaque);
+        self.revealed.push((opaque, to_owned(t)));
+        Ok(())
     }
 
     fn held(&self, q: Question) -> Fetch<()> {
@@ -227,7 +240,7 @@ impl World for ToyWorld {
 
     fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         self.held(Question::Opaque(item))?;
-        Ok(None)
+        Ok(self.revealed.iter().find(|(k, _)| *k == item).map(|(_, t)| Hidden { ty: PTy(0), types: t.view() }))
     }
     fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<crate::world::ClosureFacts<'_>>> {
         self.held(Question::Closure(owner, ordinal))?;

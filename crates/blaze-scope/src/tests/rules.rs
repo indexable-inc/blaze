@@ -3,7 +3,7 @@
 use super::fixtures;
 use super::{Solved, solve};
 use crate::{
-    AmbiguityKind, BindingState, Def, NameAnswer, Namespace, Origin, Read, Saw, ScopeError, Site,
+    AmbiguityKind, BindingState, Def, Namespace, Origin, ScopeError, Site,
     Unresolved, Visibility,
 };
 

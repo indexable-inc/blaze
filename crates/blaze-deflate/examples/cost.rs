@@ -7,15 +7,20 @@
 
 #![feature(allocator_api)]
 
-use std::{alloc::Global, hint::black_box, path::Path, time::Instant};
+use std::{hint::black_box, path::Path, time::Instant};
 
 use blaze_deflate::{
     Inflate, InflateInto, Level, Limits, MAX_RATIO,
     simd::{adler_run, adler_run_scalar, match_len, match_len_scalar},
 };
-use blaze_own::Vec;
+use blaze_own::{Alloc, Vec};
 
 const RUNS: usize = 5;
+
+/// The benchmark's allocator (D102): the process heap's handle, never `Global`.
+fn heap() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
+}
 
 /// Every `.rs` file under `dir`, in path order, appended to `out` until it holds `most` bytes.
 fn gather(dir: &Path, most: usize, out: &mut std::vec::Vec<u8>) {
@@ -63,10 +68,10 @@ fn main() {
 
     let mut fast_size = 0;
     for (level, theirs_level) in [(Level::Fast, 1u8), (Level::Default, 6u8)] {
-        let mut ours = Vec::new_in(Global);
+        let mut ours = Vec::new_in(heap());
         let o = rate(text.len(), || {
             ours.clear();
-            blaze_deflate::deflate(&text, level, Global, &mut ours).expect("deflate");
+            blaze_deflate::deflate(&text, level, heap(), &mut ours).expect("deflate");
             black_box(&ours);
         });
         let mut theirs = std::vec::Vec::new();
@@ -98,10 +103,10 @@ fn main() {
     let theirs = rate(text.len(), || {
         black_box(miniz_oxide::inflate::decompress_to_vec(&stream).expect("inflate"));
     });
-    let mut out = Vec::new_in(Global);
+    let mut out = Vec::new_in(heap());
     let ours = rate(text.len(), || {
         out.clear();
-        let mut i = Inflate::new_in(limits, Global);
+        let mut i = Inflate::new_in(limits, heap());
         i.feed(&stream, &mut out).expect("inflate");
         i.finish().expect("ends");
         black_box(&out);
@@ -124,8 +129,8 @@ fn main() {
     });
     line("  its careful twin", careful, theirs);
     let ours_stream = {
-        let mut s = Vec::new_in(Global);
-        blaze_deflate::deflate(&text, Level::Default, Global, &mut s).expect("deflate");
+        let mut s = Vec::new_in(heap());
+        blaze_deflate::deflate(&text, Level::Default, heap(), &mut s).expect("deflate");
         s
     };
     let theirs_own = rate(text.len(), || {

@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "D177",
+  "area": "one hermetic run in bstd (crates/blaze-std/src/procs/hermetic*), over blaze-core's spawn and blaze-sys",
+  "annoyance": "The brief's list of existing mechanisms missed crates/blaze-proc-macro/src/native_sandbox.rs (a fourth sandbox) and zygote.rs's group kill; a grep for 'sandbox' finds them, a grep for 'hermetic' does not. blaze-core's linked start (clone(CLONE_VM|CLONE_VFORK), a child that only execve's) has no step in the child, so neither Seatbelt's sandbox_init nor Landlock/seccomp can be entered by the shipped spawn: macOS goes through /usr/bin/sandbox-exec and Linux prepares the confinement and refuses with NoChildStep. blaze-sys flag_set! types have no `without` or intersection, and nr.rs has no prlimit64.",
+  "workaround": "Grep for 'sandbox', 'seatbelt', 'landlock', 'seccomp' and 'killpg' before designing a confinement piece. The process tests enter the confinement through std's pre_exec (test code only) until blaze-core's start grows a confine step; flag arithmetic by `.bits()`; PRLIMIT64 is a local constant in linux/confine.rs."
+}

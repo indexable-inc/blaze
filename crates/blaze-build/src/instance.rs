@@ -11,7 +11,7 @@
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{BodyView, ExprId, ItemKey, List, PNode, PTy, PTys, PortableTys};
+use blaze_typeck::{BodyView, ItemKey, List, PNode, PTy, PTys, PortableTys};
 
 use crate::BuildError;
 use crate::layout::LayoutFacts;
@@ -31,7 +31,8 @@ pub struct Instance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceKey(pub ContentId);
 
-const INSTANCE_DOMAIN: &str = "blaze-build instance key 2";
+// Form 3: each argument by its Merkle digest ([`write_trees`]), not its tree's stream.
+const INSTANCE_DOMAIN: &str = "blaze-build instance key 3";
 
 /// The key of the instance `args` of the item whose code identity is `code`. `args` is a list
 /// of `ground`, which holds no parameter, hole or error ([`ground`] made it).
@@ -44,7 +45,7 @@ pub fn instance_key(code: ContentId, args: List, ground: PTys<'_>, scratch: Allo
     Ok(InstanceKey(h.finish()))
 }
 
-const TYPE_ID_DOMAIN: &str = "blaze-build type_id 1";
+const TYPE_ID_DOMAIN: &str = "blaze-build type_id 2";
 
 /// `core::intrinsics::reflection::type_id::<T>()`'s value: the 128 bits `TypeId` holds (its
 /// `data` words, little-endian, as `TypeId::as_u128` reads them back). The pinned core: "Gets an
@@ -71,84 +72,216 @@ pub fn type_id_hash(t: PTy, ground: PTys<'_>, scratch: Alloc<'_>) -> Result<u128
     Ok(h.finish().fingerprint().0)
 }
 
-/// Writes the ground types `top` as trees: their count, then each node pre-order, children in
-/// order (never table indices, which depend on what else the table holds). The one tree form of
-/// [`instance_key`] and [`type_id_hash`].
+/// Writes the ground types `top`: their count, then each one's DIGEST. A node's digest is the
+/// hash of its tag, its payload (and a closure's or a coroutine's ordinal), its count of
+/// children and each child's digest in order: a Merkle hash of its tree, computed once per
+/// DISTINCT type (memo by ground id), so linear in the distinct types `top` reaches, never in
+/// its tree. The tree of a type of shared parts is exponentially larger (`(T, T)` doubled 40
+/// times is 2^41 nodes; blaze-ladder symbols.rs, "WHY A FOREST"), and hashing it was the next
+/// stop after the instance names. Never a table index: two tables give one digest for one
+/// structure (rule 25). The one identity form of [`instance_key`] and [`type_id_hash`].
 fn write_trees(h: &mut Hasher, top: &[PTy], ground: PTys<'_>, scratch: Alloc<'_>) -> Result<(), BuildError> {
-    let malformed = |_| BuildError::Malformed { what: "an instance's arguments past the ground table" };
     h.update(&(top.len() as u64).to_le_bytes());
-    // Pre-order, children in order: a stack of what is left to write.
-    let mut left: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    left.extend_from_slice(top);
-    left.reverse();
-    let mut children: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    while let Some(t) = left.pop() {
-        let node = ground.node(t).map_err(malformed)?;
-        let (tag, payload): (u8, u128) = match node {
-            PNode::Bool => (0, 0),
-            PNode::Char => (1, 0),
-            PNode::Int(i) => (2, i as u128),
-            PNode::Uint(u) => (3, u as u128),
-            PNode::Float(f) => (4, f as u128),
-            PNode::Str => (5, 0),
-            PNode::Never => (6, 0),
-            PNode::Tuple(_) => (7, 0),
-            PNode::Ref(m, _) => (8, m as u128),
-            PNode::Ptr(m, _) => (9, m as u128),
-            // The length is the second child, a `ConstValue`.
-            PNode::Array(..) => (10, 0),
-            PNode::Slice(_) => (11, 0),
-            // A pattern type: its base, then its canonical ranges' values, are its children.
-            PNode::Pat(..) => (15, 0),
-            PNode::Adt(key, _) => (12, key.0),
-            PNode::FnDef(key, _) => (13, key.0),
-            // A const generic argument: its bits; its type is its one child.
-            PNode::ConstValue { bits, .. } => (14, bits),
-            // A trait object (a generic fn at `T = dyn Tr`, `drop_in_place::<dyn Tr>`): its
-            // predicates in their one order are its children; each names its trait by key.
-            PNode::Dynamic(_) => (16, 0),
-            PNode::ExTrait(key, _) => (17, key.0),
-            PNode::ExProj { trait_, name, .. } => (18, (u128::from(name.0) << 64) | u128::from(trait_.0)),
-            PNode::ExAuto(key) => (19, key.0),
-            // A closure (typeck.md, "A closure's identity"): its owner and its ORDINAL among the
-            // owner body's closures (never a body-local expression id); its children the
-            // owner's arguments. Its signature, kind and environment are facts of that identity.
-            PNode::Closure { owner, ordinal, .. } => {
-                h.update(&ordinal.to_le_bytes());
-                (20, owner.0)
-            }
-            // A fn pointer (`Fn::call` at `[fn(u64) -> u64, (u64,)]`, lib.rs `build_fn_shim`;
-            // a generic fn at `T = fn(..)`): its header (ABI and safety, one byte) is part of
-            // the type; its children the inputs, then the output.
-            PNode::FnPtr(_, header) => (21, u128::from(header.bits())),
-            // A coroutine (coroutine.rs, the module doc), by identity as a closure is: its owner
-            // and its ORDINAL among the owner body's async blocks; its children the owner's
-            // arguments. Its output and state are facts of that identity. A future still named by
-            // its expression never reaches a ground table (`ground` refuses it).
-            PNode::Coroutine { owner, ordinal, .. } => {
-                h.update(&ordinal.to_le_bytes());
-                (23, owner.0)
-            }
-            PNode::Future(..) => {
-                return Err(BuildError::UnsupportedSig {
-                    what: "an async block's future named by its expression in an instance's arguments (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
-                });
-            }
-            PNode::Alias { .. }
-            | PNode::Opaque(..)
-            | PNode::Param(_)
-            | PNode::ConstParam(_)
-            | PNode::Infer
-            | PNode::Error => {
-                return Err(BuildError::Malformed { what: "a type with no ground form in an instance's arguments" });
-            }
-        };
-        children.clear();
-        each_child(ground, node, &mut children)?;
-        h.update(&[tag]).update(&payload.to_le_bytes()).update(&(children.len() as u64).to_le_bytes());
-        left.extend(children.iter().rev().copied());
+    let mut digests = Digests::new_in(scratch);
+    for &t in top {
+        let d = digests.of(t, ground)?;
+        h.update(&d);
     }
     Ok(())
+}
+
+const NODE_DOMAIN: &str = "blaze-build type node 1";
+
+/// One open node of [`Digests::of`]'s walk: its type, its node, where its children are in
+/// `kids` and where their digests are in `done`.
+#[derive(Clone, Copy)]
+struct OpenNode {
+    ty: PTy,
+    node: PNode,
+    kids_at: u32,
+    kids_len: u32,
+    done_at: u32,
+}
+
+/// The digests of one [`write_trees`]: (type, digest) rows found by open addressing over the
+/// type's id (0 empty, else row + 1; a power of two long, at most half full), and the walk's
+/// stacks. All in the caller's scratch allocator; none outlives the call.
+struct Digests<'s> {
+    memo: Vec<(PTy, [u8; 32]), Alloc<'s>>,
+    slots: Vec<u32, Alloc<'s>>,
+    open: Vec<OpenNode, Alloc<'s>>,
+    kids: Vec<PTy, Alloc<'s>>,
+    done: Vec<[u8; 32], Alloc<'s>>,
+    /// Nodes hashed: one per distinct type (the linear claim's measure, read by its test).
+    #[cfg(test)]
+    hashed: u64,
+}
+
+impl<'s> Digests<'s> {
+    fn new_in(scratch: Alloc<'s>) -> Digests<'s> {
+        Digests {
+            memo: Vec::new_in(scratch),
+            slots: Vec::new_in(scratch),
+            open: Vec::new_in(scratch),
+            kids: Vec::new_in(scratch),
+            done: Vec::new_in(scratch),
+            #[cfg(test)]
+            hashed: 0,
+        }
+    }
+
+    fn slot(t: PTy, len: usize) -> usize {
+        let h = u64::from(t.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        ((h ^ (h >> 31)) as usize) & (len - 1)
+    }
+
+    fn get(&self, t: PTy) -> Option<[u8; 32]> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = Digests::slot(t, self.slots.len());
+        loop {
+            match self.slots[at] {
+                0 => return None,
+                n if self.memo[n as usize - 1].0 == t => return Some(self.memo[n as usize - 1].1),
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    fn put(&mut self, t: PTy, d: [u8; 32]) {
+        if (self.memo.len() + 1) * 2 > self.slots.len() {
+            let len = (self.slots.len() * 2).max(16);
+            self.slots.clear();
+            self.slots.resize(len, 0);
+            for row in 0..self.memo.len() {
+                let mut at = Digests::slot(self.memo[row].0, len);
+                while self.slots[at] != 0 {
+                    at = (at + 1) & (len - 1);
+                }
+                self.slots[at] = row as u32 + 1;
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = Digests::slot(t, self.slots.len());
+        while self.slots[at] != 0 {
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = self.memo.len() as u32 + 1;
+        self.memo.push((t, d));
+    }
+
+    /// `t`'s digest: post-order, children in order, by a stack of open nodes (no recursion);
+    /// a type met again is its memo.
+    fn of(&mut self, t: PTy, ground: PTys<'_>) -> Result<[u8; 32], BuildError> {
+        if let Some(d) = self.get(t) {
+            return Ok(d);
+        }
+        self.open_node(t, ground)?;
+        let mut last = [0u8; 32];
+        while let Some(&o) = self.open.last() {
+            let have = self.done.len() - o.done_at as usize;
+            if have < o.kids_len as usize {
+                let child = self.kids[o.kids_at as usize + have];
+                match self.get(child) {
+                    Some(d) => self.done.push(d),
+                    None => self.open_node(child, ground)?,
+                }
+                continue;
+            }
+            let (tag, payload, ordinal) = node_head(o.node)?;
+            let mut h = Hasher::new(NODE_DOMAIN);
+            h.update(&[tag]).update(&payload.to_le_bytes());
+            if let Some(ordinal) = ordinal {
+                h.update(&ordinal.to_le_bytes());
+            }
+            h.update(&u64::from(o.kids_len).to_le_bytes());
+            for i in o.done_at as usize..self.done.len() {
+                let child = self.done[i];
+                h.update(&child);
+            }
+            let d = h.finish().0;
+            #[cfg(test)]
+            {
+                self.hashed += 1;
+            }
+            self.put(o.ty, d);
+            self.kids.truncate(o.kids_at as usize);
+            self.done.truncate(o.done_at as usize);
+            self.open.pop();
+            if !self.open.is_empty() {
+                self.done.push(d);
+            }
+            last = d;
+        }
+        Ok(last)
+    }
+
+    /// `t` opened: its node read and checked to have a ground form, its children stacked.
+    fn open_node(&mut self, t: PTy, ground: PTys<'_>) -> Result<(), BuildError> {
+        let node = ground.node(t).map_err(|_| BuildError::Malformed { what: "an instance's arguments past the ground table" })?;
+        node_head(node)?;
+        let kids_at = self.kids.len();
+        each_child(ground, node, &mut self.kids)?;
+        let kids_len = self.kids.len() - kids_at;
+        self.open.push(OpenNode { ty: t, node, kids_at: kids_at as u32, kids_len: kids_len as u32, done_at: self.done.len() as u32 });
+        Ok(())
+    }
+}
+
+/// A node's tag, payload and (a closure's or a coroutine's) ordinal, as its digest holds them;
+/// a type with no ground form refused by name.
+fn node_head(node: PNode) -> Result<(u8, u128, Option<u32>), BuildError> {
+    let (tag, payload, ordinal): (u8, u128, Option<u32>) = match node {
+        PNode::Bool => (0, 0, None),
+        PNode::Char => (1, 0, None),
+        PNode::Int(i) => (2, i as u128, None),
+        PNode::Uint(u) => (3, u as u128, None),
+        PNode::Float(f) => (4, f as u128, None),
+        PNode::Str => (5, 0, None),
+        PNode::Never => (6, 0, None),
+        PNode::Tuple(_) => (7, 0, None),
+        PNode::Ref(m, _) => (8, m as u128, None),
+        PNode::Ptr(m, _) => (9, m as u128, None),
+        // The length is the second child, a `ConstValue`.
+        PNode::Array(..) => (10, 0, None),
+        PNode::Slice(_) => (11, 0, None),
+        // A pattern type: its base, then its canonical ranges' values, are its children.
+        PNode::Pat(..) => (15, 0, None),
+        PNode::Adt(key, _) => (12, key.0, None),
+        PNode::FnDef(key, _) => (13, key.0, None),
+        // A const generic argument: its bits; its type is its one child.
+        PNode::ConstValue { bits, .. } => (14, bits, None),
+        // A trait object (a generic fn at `T = dyn Tr`, `drop_in_place::<dyn Tr>`): its
+        // predicates in their one order are its children; each names its trait by key.
+        PNode::Dynamic(_) => (16, 0, None),
+        PNode::ExTrait(key, _) => (17, key.0, None),
+        PNode::ExProj { trait_, name, .. } => (18, (u128::from(name.0) << 64) | u128::from(trait_.0), None),
+        PNode::ExAuto(key) => (19, key.0, None),
+        // A closure (typeck.md, "A closure's identity"): its owner and its ORDINAL among the
+        // owner body's closures (never a body-local expression id); its children the owner's
+        // arguments. Its signature, kind and environment are facts of that identity.
+        PNode::Closure { owner, ordinal, .. } => (20, owner.0, Some(ordinal)),
+        // A fn pointer (`Fn::call` at `[fn(u64) -> u64, (u64,)]`, lib.rs `build_fn_shim`; a
+        // generic fn at `T = fn(..)`): its header (ABI and safety, one byte) is part of the type;
+        // its children the inputs, then the output.
+        PNode::FnPtr(_, header) => (21, u128::from(header.bits()), None),
+        // A coroutine (coroutine.rs, the module doc), by identity as a closure is: its owner and
+        // its ORDINAL among the owner body's async blocks; its children the owner's arguments.
+        // Its output and state are facts of that identity. A future still named by its
+        // expression never reaches a ground table (`ground` refuses it).
+        PNode::Coroutine { owner, ordinal, .. } => (23, owner.0, Some(ordinal)),
+        PNode::Future(..) => {
+            return Err(BuildError::UnsupportedSig {
+                what: "an async block's future named by its expression in an instance's arguments (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
+            });
+        }
+        PNode::Alias { .. } | PNode::Opaque(..) | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error => {
+            return Err(BuildError::Malformed { what: "a type with no ground form in an instance's arguments" });
+        }
+    };
+    Ok((tag, payload, ordinal))
 }
 
 /// The key of the instance of fn `code` at `args` (a list of `ground`), covering what each
@@ -436,4 +569,76 @@ pub fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) ->
         | PNode::Error => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod digest_tests {
+    //! [`write_trees`] is linear in DISTINCT types: one hash a distinct node, measured by the
+    //! count of nodes hashed (never wall time), with the tree walk it replaced as the control.
+
+    use super::*;
+    use blaze_typeck::UintTy;
+
+    /// `(t, t)` nested `depth` times over `u8`, after `noise` unrelated types.
+    fn doubling(ground: &mut PortableTys<'_>, depth: u32, noise: usize) -> PTy {
+        let others = [PNode::Bool, PNode::Char, PNode::Str, PNode::Never, PNode::Uint(UintTy::U16)];
+        for &other in others.iter().take(noise) {
+            ground.intern(other).expect("an unrelated type");
+        }
+        let mut t = ground.intern(PNode::Uint(UintTy::U8)).expect("u8");
+        for _ in 0..depth {
+            let pair = ground.intern_list(&[t, t]).expect("a pair");
+            t = ground.intern(PNode::Tuple(pair)).expect("a tuple");
+        }
+        t
+    }
+
+    /// The control: the nodes a tree walk visits (the old `write_trees`, pre-order, no memo).
+    fn tree_walk_visits(ground: PTys<'_>, top: PTy, scratch: Alloc<'_>) -> u64 {
+        let mut left: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+        left.push(top);
+        let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+        let mut visits = 0;
+        while let Some(t) = left.pop() {
+            visits += 1;
+            kids.clear();
+            each_child(ground, ground.node(t).expect("a ground type"), &mut kids).expect("its children");
+            left.extend_from_slice(&kids);
+        }
+        visits
+    }
+
+    /// The doubling chain at depth 40 hashes 41 nodes (u8 and 40 tuples), the count of its
+    /// distinct types; the key is equal from a table that gives the types other ids, and
+    /// differs at another depth. CONTROL: the tree walk at depth 10 visits 2^11 - 1 nodes (at
+    /// 40 it would visit 2^41 - 1, which is why it is not run).
+    #[test]
+    fn a_doubling_chain_hashes_each_distinct_type_once() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut a = PortableTys::new_in(alloc);
+        let t = doubling(&mut a, 40, 0);
+        let mut digests = Digests::new_in(alloc);
+        let d = digests.of(t, a.view()).expect("a digest");
+        assert_eq!(digests.hashed, 41, "one hash a distinct type");
+        assert_eq!(digests.memo.len(), 41);
+        let mut b = PortableTys::new_in(alloc);
+        let u = doubling(&mut b, 40, 5);
+        assert_ne!(t, u, "the two tables give the type other ids");
+        let mut again = Digests::new_in(alloc);
+        assert_eq!(again.of(u, b.view()).expect("a digest"), d, "content only (rule 25)");
+        let code = ContentId([3; 32]);
+        let key_a = instance_key(code, a.intern_list(&[t]).expect("args"), a.view(), alloc).expect("a key");
+        let key_b = instance_key(code, b.intern_list(&[u]).expect("args"), b.view(), alloc).expect("a key");
+        assert_eq!(key_a, key_b);
+        let shallower = doubling(&mut a, 39, 0);
+        let key_c = instance_key(code, a.intern_list(&[shallower]).expect("args"), a.view(), alloc).expect("a key");
+        assert_ne!(key_a, key_c, "another type, another key");
+        assert_eq!(type_id_hash(t, a.view(), alloc).expect("a type id"), type_id_hash(u, b.view(), alloc).expect("a type id"));
+        // Control: the tree walk it replaced.
+        let small = doubling(&mut a, 10, 0);
+        assert_eq!(tree_walk_visits(a.view(), small, alloc), (1 << 11) - 1, "control: the tree is exponential");
+        let mut small_digests = Digests::new_in(alloc);
+        small_digests.of(small, a.view()).expect("a digest");
+        assert_eq!(small_digests.hashed, 11, "and the digest linear at the same depth");
+    }
 }

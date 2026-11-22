@@ -270,6 +270,12 @@ impl Cursor {
 
     /// A kind byte and three words, little-endian, as an image keeps it.
     pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_bytes());
+    }
+
+    /// [`Cursor::encode`]'s bytes, with no allocation: the one encoder of the form (the
+    /// journal helper's wire carries them opaque, blaze-watch helper.rs `JournalAt`).
+    pub fn to_bytes(&self) -> [u8; Cursor::BYTES] {
         let (kind, words): (u8, [u64; 3]) = match *self {
             Cursor::None => (0, [0; 3]),
             Cursor::FsEvents { event, volume } => (
@@ -283,10 +289,12 @@ impl Cursor {
             Cursor::Usn { volume, journal, next } => (2, [volume, journal, next as u64]),
             Cursor::Sim { journal, next } => (3, [journal, next, 0]),
         };
-        out.push(kind);
-        for word in words {
-            out.extend_from_slice(&word.to_le_bytes());
+        let mut out = [0u8; Cursor::BYTES];
+        out[0] = kind;
+        for (n, word) in words.iter().enumerate() {
+            out[1 + n * 8..9 + n * 8].copy_from_slice(&word.to_le_bytes());
         }
+        out
     }
 
     /// Of [`Cursor::encode`]'s bytes; `None` for fewer than `BYTES` or an unknown kind.
@@ -354,12 +362,21 @@ impl fmt::Display for Lost {
 #[derive(Default, PartialEq, Eq, Debug)]
 #[cfg_attr(test, derive(Clone))] // clone: inside `Done`, which only tests copy
 pub struct Journaled {
-    /// Files and directories under the watched one the journal names as made, written,
-    /// removed or renamed (from or to), each once, sorted.
+    /// Files and directories strictly beneath the watched one the journal names as made,
+    /// written, removed or renamed (from or to), each once, sorted. Never the watched
+    /// directory itself: that is [`Journaled::itself`].
     pub files: Vec<FileName>,
-    /// Subtrees whose changes the journal could not name, each with why; the watched
-    /// directory itself for all of it.
+    /// Subtrees strictly beneath the watched directory whose changes the journal could not
+    /// name, each with why. All of the watched directory is [`Journaled::whole`].
     pub lost: Vec<(FileName, Lost)>,
+    /// All of the watched directory lost, and why (a reset, dropped events, a rescan of it, a
+    /// move of it): every name beneath it may have changed. One field for any directory, so
+    /// the driver's root ([`crate::DirName::Root`], which no [`FileName`] names) is said as a
+    /// named one is.
+    pub whole: Option<Lost>,
+    /// An event named the watched directory itself, not a loss (its own metadata: a mode, a
+    /// time). Each entry made, removed or renamed beneath it is a name of its own in `files`.
+    pub itself: bool,
     /// Where the journal is once these are taken: a watch from it is told only what is after.
     pub cursor: Cursor,
     /// Every change made before the watch started is in this batch or an earlier one; every
@@ -371,21 +388,33 @@ pub struct Journaled {
 /// a restart (Linux): whatever changed since a saved cursor is lost, and the watch is live
 /// from its start, with no cursor to save.
 #[cfg(target_os = "linux")]
-pub(crate) fn first_on_linux(dir: &FileName, since: &Cursor) -> crate::Done {
-    let lost = match since {
-        // alloc: none: the first batch, with nothing in it.
-        Cursor::None => Vec::new(),
-        // clone: once per watch, when a cursor was saved.
-        _ => vec![(dir.clone(), Lost::NoJournal)],
+pub(crate) fn first_on_linux(since: &Cursor) -> crate::Done {
+    let whole = match since {
+        Cursor::None => None,
+        _ => Some(Lost::NoJournal),
     };
     // alloc: once per batch the system told, handed to the asker.
     crate::Done::Journaled(Box::new(Journaled {
         // alloc: none: no files in the first batch.
         files: Vec::new(),
-        lost,
+        // alloc: none: an empty vector.
+        lost: Vec::new(),
+        whole,
+        itself: false,
         cursor: Cursor::None,
         caught_up: true,
     }))
+}
+
+/// The refusal of an [`crate::Effect::Journal`] of the driver's root by a driver that watches
+/// named directories only (io_uring's inotify walk; the threads driver and IOCP refuse as their
+/// own `io::Error`s): a typed failure naming the driver, never a narrower watch. bstd asks no
+/// journal where the system keeps none (Linux), so this is reached only by a direct caller; the
+/// native driver of macOS (kqueue.rs, through fsevents.rs) journals the root.
+#[cfg(target_os = "linux")]
+pub(crate) fn root_not_journaled(driver: &'static str) -> crate::Done {
+    // alloc: an error path.
+    crate::Done::Failed(crate::IoError(format!("a journal of the driver's root: the {driver} driver journals named directories only")))
 }
 
 /// A watch's batch as a journal's on a system with no journal (Linux): changes it dropped
@@ -394,13 +423,20 @@ pub(crate) fn first_on_linux(dir: &FileName, since: &Cursor) -> crate::Done {
 pub(crate) fn live(dir: &FileName, done: crate::Done) -> crate::Done {
     match done {
         // alloc: once per batch the system told, handed to the asker.
-        crate::Done::Changed { files, lost } => crate::Done::Journaled(Box::new(Journaled {
-            files,
-            // clone: only when the system dropped changes.
-            lost: if lost { vec![(dir.clone(), Lost::Dropped)] } else { Vec::new() },
-            cursor: Cursor::None,
-            caught_up: true,
-        })),
+        crate::Done::Changed { mut files, lost } => {
+            // The watched directory's own name is its event, not a name beneath it.
+            let itself = files.iter().any(|file| file == dir);
+            files.retain(|file| file != dir);
+            crate::Done::Journaled(Box::new(Journaled {
+                files,
+                // alloc: none: an empty vector.
+                lost: Vec::new(),
+                whole: lost.then_some(Lost::Dropped),
+                itself,
+                cursor: Cursor::None,
+                caught_up: true,
+            }))
+        }
         done => done,
     }
 }

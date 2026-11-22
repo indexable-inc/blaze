@@ -72,7 +72,7 @@ pub(super) const BLAZE: &[Lint] = &[
     l(
         "blaze::implicit_allocator",
         Allow,
-        "detects a type that leaves its allocator to the default `Global`, or a global-heap type that takes none",
+        "detects a heap reached for instead of handed down: `Alloc::global()` or `Heap::process()`, an allocating call that names no allocator (`Vec::new()`, `vec!`, `format!`, `.to_string()`), a type that leaves its allocator to the default `Global`, or a global-heap type that takes none",
     )
     .externally_loaded(),
     l("blaze::fixed_key_lookup", Allow, "detects a lookup of keys known at compile time made at run time instead of by a perfect hash")
@@ -85,7 +85,17 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::default_policy", Allow, "detects `impl Default`, `#[derive(Default)]` or a `new()` that takes nothing on a type with a field marked `#[blaze::policy]`, a cost or a guarantee its maker decides")
         .externally_loaded(),
-    l("blaze::sans_io_core", Allow, "detects a function of a `#![blaze::sans_io]` core that reaches the wall clock or IO")
+    // A core is a crate or module whose top says `#![blaze::sans_io]` (D170 C5): its logic, a
+    // state machine that returns what to do. Its driver says `#![blaze::driver]` at its top: the
+    // thin code that holds the handles and does the IO the core asks for, in straight-line
+    // calls; the driver is the one place a sans-IO crate's IO is. blaze-lint's `sans-io-core`
+    // rule finds what this names, in the files its driver marks as a core (`RootMarks`).
+    l("blaze::sans_io_core", Allow, "detects, in a `#![blaze::sans_io]` crate or module, a path to the file system, the network, a process, the OS, the environment or a thread, a print, a blocking wait (`recv`, `join`, `lock`, `wait`, `block_on`) or a wall-clock read: what a core returns as its machine's output for its `#![blaze::driver]` to do")
+        .externally_loaded(),
+    // D179: state shared between workers is published, gathered or claimed; a lock is the named
+    // exception, `#[blaze::lock_exception(tried = "..", why = "..")]` on what constructs it.
+    // blaze-lint's `lock-without-reason` rule finds a construction without one.
+    l("blaze::lock_without_reason", Allow, "detects a lock constructed in shipped code (`Lock::new`, `Lock::unrecorded`, `Lock::probed`, `ReadLock::new`, `ReadLock::unrecorded`, `RwLock::new`, `RankedLock::new`, `SharedMap::new_in`) where no `#[blaze::lock_exception(tried = \"published\"|\"gathered\"|\"claimed\", why = \"..\")]` says which D179 shape it could not be, and a `lock_exception` that does not say both")
         .externally_loaded(),
     l("blaze::key_ignores_field", Allow, "detects a hand-written key (`Hash`, `PartialEq`, `Ord` or a key builder) that leaves a field out unnamed")
         .externally_loaded(),
@@ -288,7 +298,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::narrowed_len", Allow, "detects a length narrowed to a smaller integer type by `try_from` or `try_into` with an `expect` or `unwrap`, which panics on a large input instead of refusing it with a typed error")
         .externally_loaded(),
-    l("blaze::process_static", Allow, "detects a `static` or `thread_local!` key holding a growable collection beneath a lock or a cell, or a concurrent collection: state that grows for the process's life with no owner to drop it")
+    l("blaze::process_static", Allow, "detects a `thread_local!`, a `static mut`, or a `static` whose type holds interior state (a cell, a lock, an atomic, a once or lazy value): state the process keeps with no owner (D170 C3); the three statics C3 and D173 allow (the foreign heap, the profile ring, the signal handler) are rows of blaze-lint's `ALLOWED_STATICS`, by crate and name, the one table the sansio gate reads too")
         .externally_loaded(),
     l("blaze::loop_turn_effects", Deny, "detects a `#[blaze::bounded_turn]` function, a loop thread's turn, that may block the thread, do IO, sync a file to the disk or take a lock, through any call")
         .externally_loaded(),

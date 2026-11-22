@@ -20,6 +20,8 @@ blaze-own.workspace = true
 [dev-dependencies]
 # Properties: decode(encode(x)) == x for every engine, and the planted-bug control.
 blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

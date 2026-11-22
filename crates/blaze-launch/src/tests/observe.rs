@@ -11,13 +11,58 @@
 //!   a stub or direct (the publish wrote the body word);
 //! - `lost:` while a slot is observed and quiescent, its word names its stub, so every call is
 //!   counted or marked (a publish does not move an observed slot off its stub).
+//!
+//! Each is a value of [`Broke`], and a control names the one its plant must break by that
+//! value (D165), never by the text.
 
 use std::collections::VecDeque;
+use std::fmt;
 
+use blaze_own::Alloc;
 use blaze_sim::Tape;
 
-use crate::observe::{Kind, Observe, ObserveWrite, Plant, Slotword};
-use crate::{KEPT, Kept, Slot};
+use crate::Slot;
+use crate::observe::{Kind, Observe, ObservePlant as Plant, ObserveWrite, Slotword};
+
+/// Which promise a run broke.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Broke {
+    Unset,
+    Wrong,
+    Stale,
+    Lost,
+}
+
+/// What the oracle found: the promise, and the machine's account of it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Found {
+    broke: Broke,
+    what: String,
+}
+
+impl fmt::Display for Found {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.broke {
+            Broke::Unset => "unset",
+            Broke::Wrong => "wrong",
+            Broke::Stale => "stale",
+            Broke::Lost => "lost",
+        };
+        write!(f, "{name}: {}", self.what)
+    }
+}
+
+fn found(broke: Broke, what: String) -> Found {
+    Found { broke, what }
+}
+
+/// Adds where in the run a finding was made.
+fn at(where_: String) -> impl FnOnce(Found) -> Found {
+    move |mut why| {
+        why.what.push_str(&where_);
+        why
+    }
+}
 
 const SLOTS: u32 = 3;
 const THREADS: usize = 3;
@@ -37,8 +82,8 @@ enum Thread {
 }
 
 struct Sim {
-    overlay: Observe,
-    out: Vec<ObserveWrite, Kept>,
+    overlay: Observe<Alloc<'static>, Plant>,
+    out: Vec<ObserveWrite, Alloc<'static>>,
     /// The slot-word memory, by slot.
     word: Vec<Slotword>,
     /// The body-word memory, by slot: `None` until the first publish stores it.
@@ -56,9 +101,11 @@ struct Sim {
 
 impl Sim {
     fn new(plant: Plant) -> Sim {
+        // The tests' root allocator (D170 C1), in place of the global heap.
+        let alloc = blaze_own::testing::heap().alloc();
         Sim {
-            overlay: Observe::planted(SLOTS, KEPT, plant),
-            out: Vec::new_in(KEPT),
+            overlay: Observe::planted(SLOTS, alloc, plant),
+            out: Vec::new_in(alloc),
             word: vec![Slotword::Lazy; SLOTS as usize],
             bodyword: vec![None; SLOTS as usize],
             pending: VecDeque::new(),
@@ -71,7 +118,10 @@ impl Sim {
     }
 
     fn queue(&mut self) {
-        self.pending.extend(self.out.drain(..));
+        // Not `drain`: std's `Vec::drain` needs `AllocatorNightly`, which `Alloc` lacks; the
+        // core's `Out` is std's `Vec`, and `ObserveWrite` is `Copy`.
+        self.pending.extend(self.out.iter().copied());
+        self.out.clear();
     }
 
     /// The control thread carries out one store.
@@ -124,7 +174,7 @@ impl Sim {
     }
 
     /// A thread finishes its call and reaches a body. The oracle checks where.
-    fn finish(&mut self, thread: usize) -> Result<(), String> {
+    fn finish(&mut self, thread: usize) -> Result<(), Found> {
         let Thread::InCall { slot, word, body } = self.threads[thread] else {
             return Ok(());
         };
@@ -142,22 +192,22 @@ impl Sim {
             },
         };
         if reached == 0 {
-            return Err(format!(
-                "unset: thread {thread} followed a stub of slot {} to an unset body word",
-                slot.0
+            return Err(found(
+                Broke::Unset,
+                format!("thread {thread} followed a stub of slot {} to an unset body word", slot.0),
             ));
         }
         if !published.contains(&reached) {
-            return Err(format!(
-                "wrong: thread {thread} reached {reached} in slot {}, never published for it",
-                slot.0
+            return Err(found(
+                Broke::Wrong,
+                format!("thread {thread} reached {reached} in slot {}, never published for it", slot.0),
             ));
         }
         Ok(())
     }
 
     /// Carries out every pending store, then checks what a quiescent memory promises.
-    fn settle(&mut self) -> Result<(), String> {
+    fn settle(&mut self) -> Result<(), Found> {
         while !self.pending.is_empty() {
             self.apply_one();
         }
@@ -168,27 +218,27 @@ impl Sim {
             };
             // The body word holds the latest published body: a publish wrote it.
             if self.bodyword[s] != Some(latest) {
-                return Err(format!(
-                    "stale: slot {slot}'s body word is {:?}, not the latest body {latest}",
-                    self.bodyword[s]
+                return Err(found(
+                    Broke::Stale,
+                    format!("slot {slot}'s body word is {:?}, not the latest body {latest}", self.bodyword[s]),
                 ));
             }
             match self.observed[s] {
                 // An observed, quiescent slot names its stub: every call is counted or marked.
                 Some(_) => {
                     if !matches!(self.word[s], Slotword::Stub { .. }) {
-                        return Err(format!(
-                            "lost: slot {slot} is observed but its word names {:?}, not a stub",
-                            self.word[s]
+                        return Err(found(
+                            Broke::Lost,
+                            format!("slot {slot} is observed but its word names {:?}, not a stub", self.word[s]),
                         ));
                     }
                 }
                 // A plain, quiescent slot names the latest body outright.
                 None => {
                     if self.word[s] != Slotword::Body(latest) {
-                        return Err(format!(
-                            "stale: slot {slot} is plain but its word names {:?}, not {latest}",
-                            self.word[s]
+                        return Err(found(
+                            Broke::Stale,
+                            format!("slot {slot} is plain but its word names {:?}, not {latest}", self.word[s]),
                         ));
                     }
                 }
@@ -236,7 +286,7 @@ fn op(tape: &Tape) -> Op {
     }
 }
 
-fn run(ops: &[Op], plant: Plant) -> Result<(), String> {
+fn run(ops: &[Op], plant: Plant) -> Result<(), Found> {
     let mut sim = Sim::new(plant);
     for (index, &the_op) in ops.iter().enumerate() {
         let step = match the_op {
@@ -267,29 +317,29 @@ fn run(ops: &[Op], plant: Plant) -> Result<(), String> {
             Op::Finish(thread) => sim.finish(thread),
             Op::Settle => sim.settle(),
         };
-        step.map_err(|why| format!("{why} (op {index}: {the_op:?})"))?;
+        step.map_err(at(format!(" (op {index}: {the_op:?})")))?;
     }
     // Finish every thread and settle: nothing left mid-call, every promise met.
     for thread in 0..THREADS {
-        sim.finish(thread).map_err(|why| format!("{why} (settling thread {thread})"))?;
+        sim.finish(thread).map_err(at(format!(" (settling thread {thread})")))?;
     }
-    sim.settle().map_err(|why| format!("{why} (settling)"))
+    sim.settle().map_err(at(String::from(" (settling)")))
 }
 
 #[test]
 fn no_schedule_breaks_what_observe_promises() {
     blaze_sim::check(blaze_sim::Config::cases(400), |tape| {
         let ops = tape.vec(1..=120, "ops", op);
-        run(&ops, Plant::None)
+        run(&ops, Plant::None).map_err(|why| why.to_string())
     });
 }
 
-/// A control: the schedule passes as the overlay is, and with `plant` the oracle names
-/// `finding`.
-fn the_oracle_catches(ops: &[Op], plant: Plant, finding: &str) {
+/// A control: the schedule passes as the overlay is, and with `plant` the oracle finds a
+/// break of `finding`.
+fn the_oracle_catches(ops: &[Op], plant: Plant, finding: Broke) {
     assert_eq!(run(ops, Plant::None), Ok(()), "the overlay as it is must pass");
     let why = run(ops, plant).expect_err("the oracle missed the planted bug");
-    assert!(why.starts_with(finding), "{why}");
+    assert_eq!(why.broke, finding, "{why}");
 }
 
 #[test]
@@ -303,7 +353,7 @@ fn the_oracle_catches_a_publish_that_moves_an_observed_slot_off_its_stub() {
         Op::Publish(0),
         Op::Settle,
     ];
-    the_oracle_catches(&ops, Plant::PublishDropsStub, "lost:");
+    the_oracle_catches(&ops, Plant::PublishDropsStub, Broke::Lost);
 }
 
 #[test]
@@ -317,7 +367,7 @@ fn the_oracle_catches_a_publish_that_skips_the_body_word() {
         Op::Publish(0),
         Op::Settle,
     ];
-    the_oracle_catches(&ops, Plant::PublishSkipsBody, "stale:");
+    the_oracle_catches(&ops, Plant::PublishSkipsBody, Broke::Stale);
 }
 
 /// A thread that loaded a stub before the body word was set reads it after: with the body word

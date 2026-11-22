@@ -1,0 +1,38 @@
+[package]
+name = "blaze-cad-picture"
+description = "Pictures of a CAD field (D183): a field tape seen from a view rendered to RGBA8 with each pixel's depth, by interval-segment ray marching that never steps past a wall however thin (sphere tracing's strides where the field is a distance, the interval's guarantee where it is not), normals from the field's gradient, fixed shading, the same bytes on every machine; PNG through blaze-cad-out; no_std, no alloc, no registry package"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Base crates only, each on workspace crates alone (D180: no package from a registry).
+[dependencies]
+# The tape and its interval, point and gradient evaluators.
+blaze-cad-field.workspace = true
+# `Image`, `png()` and `PngOpts`: the picture written as a file.
+blaze-cad-out.workspace = true
+# `Vec3`, `Aabb3`, `tan`.
+blaze-math.workspace = true
+# `Length` and `Angle` at the public boundary (the view).
+blaze-units.workspace = true
+# `Vec`, `Alloc`, `AllocFailure`, the plant seam.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Property tests and typed planted-bug controls (D165).
+blaze-sim.workspace = true
+# The PNG's compression level in the tests and the cost example.
+blaze-deflate.workspace = true
+# `testing::heap()`: a test's root allocator (D170 C1: no `Global` in tests either).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

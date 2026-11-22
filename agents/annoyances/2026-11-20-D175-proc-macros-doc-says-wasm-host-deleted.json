@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "wave-1124-sansio D175 step 1 (blaze-roots, blaze-comptime)",
+  "area": "docs/v2/plan/design/proc-macros.md, crates/blaze-proc-macro, crates/blaze-wasi",
+  "annoyance": "proc-macros.md line 39 says that on 2026-10-30 the wasm host and blaze-wasi were deleted and every proc macro runs on blaze-macro-eval; in this tree crates/blaze-wasi exists and crates/blaze-proc-macro links its 24 WASI calls for every macro (host.rs:346) and script (script.rs:323) on Wasmtime. A reader taking the doc's word looks for the live path in the wrong crate. Separately, two root [workspace.dependencies] entries this lane first appended after blaze-sim were counted into manifests.rs DESCENTS = 83; they now sit where they sort, so the table has 81.",
+  "workaround": "Read crates/blaze-proc-macro and crates/blaze-wasi directly; docs/v2/plan/design/comptime-native.md 'What exists' records the live path with file:line.",
+  "fix": "Mark the 2026-10-30 paragraph of proc-macros.md superseded, pointing at comptime-native.md; lower DESCENTS in scripts/src/bin/thirdparty/manifests.rs to 81.",
+  "state": "open"
+}

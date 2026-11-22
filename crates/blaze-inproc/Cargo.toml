@@ -25,6 +25,7 @@ blaze-inproc-rt = { workspace = true, features = ["testing"] }
 blaze-spin.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
 [lints]

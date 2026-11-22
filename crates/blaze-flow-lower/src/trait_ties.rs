@@ -38,15 +38,18 @@
 //!   again here (rule 77). The impl's trait reference `impl<'de> Visitor<'de> for
 //!   __Visitor<'de>` writes each trait lifetime in terms of the impl's own lifetime
 //!   parameters, and each of those that appears in the self type is a POSITION of the
-//!   argument (sig/impl_life.rs `read_impl_trait`, the one reader of impl headers): the trait
-//!   lifetime is that position's origin, both ways. `'static` is `'static`. An impl lifetime
-//!   the self type does not hold is FREE: constrained by nothing but the trait reference, so
-//!   what the call answers it with, a fresh origin per call related to what the header's
-//!   bounds relate it to (`'a: 'de`), and `T: 'a` holds over every position of the argument
-//!   (a superset of `T`'s when the self type writes `T`; a `T` only the trait reference names
-//!   is refused). A header
-//!   predicate that names a lifetime in another form (`T: Deserialize<'de>`, a `for<..>`) is
-//!   not related here: refused by name ([`TieMiss::ImplWhere`]).
+//!   argument. Since D148 both are read from the impl's region columns
+//!   (`RegionFacts::impl_header`: the self type's column, its slot `k` the argument's position
+//!   `k`, and the trait reference's, whose own slots are the trait's lifetime arguments; the
+//!   impl's lifetimes are `Param(0..)`), never from its text. The trait lifetime is that
+//!   position's origin, both ways; a `'static` slot of the self type makes its position
+//!   outlive `'static`; `'static` is `'static`. An impl lifetime the self type does not hold
+//!   is FREE: constrained by nothing but the trait reference, so what the call answers it
+//!   with, a fresh origin per call related to what the header's bounds relate it to
+//!   (`'a: 'de`, `RegionFacts::outlives`), and `T: 'a` holds over every position of the
+//!   argument (a superset of `T`'s). A header clause whose column writes a lifetime of the
+//!   impl (`T: Deserialize<'de>`), or a bound under a `for<..>`, is not related here: refused
+//!   by name ([`TieMiss::ImplWhere`]).
 //!
 //! A trait method's container bound is the implicit `Self: Trait<'params>` (the Reference,
 //! "Traits": a trait's items are generic over `Self: Trait`), a row of its own with `param` 0.
@@ -57,22 +60,28 @@
 //! ([`TieMiss`]) when the tied regions appear in the callee's signature; a tie whose regions the
 //! signature never writes relates nothing and is skipped.
 //!
+//! A region bound by a `for<..>` (`Region::Late`) on either side is the bound's own, not a
+//! trait lifetime the call fixes: that pair is not tied.
+//!
 //! CONTROL (rule 23): `Plant::TiesFresh` skips the tie: each test's negative is then accepted
 //! (trait_ties_tests.rs).
 
 use blaze_flow::Origin;
 use blaze_own::Vec;
+use blaze_typeck::region_facts::{Outlives, RegionFacts};
+use blaze_typeck::regions::Region;
 use blaze_typeck::{Checked, ExprId, ItemKey, PNode, PTy, Selected};
 use core::alloc::Allocator;
 
-use crate::sig::{ImplText, ImplTrait, ImplTraitWhy, Region, SigLife, read_impl_trait};
+use crate::SigLife;
 use crate::{Facts, Form, Lower, Plant, Refusal};
 
 /// One trait bound with lifetime arguments of a fn: the bounded generic parameter `param` (a
 /// trait method's `Self` is 0), the trait, and its lifetime arguments `Ties::regions[lo..hi]`
-/// in the trait's parameter order, as regions of the fn's own lifetime part. `read` false: the
-/// bound is known (the head's resolved bounds hold it) but not its lifetime arguments (its
-/// text is not the fn's: an impl's header).
+/// in the trait's parameter order, as regions of the fn's own numbering (D148: its clause's
+/// column's own slots, `RegionFacts::clauses`). `read` false: the bound is known (the head's
+/// clauses hold it) but its column is not (the head's regions were not read, or the column
+/// holds another count than the trait declares).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tie {
     pub param: u32,
@@ -102,13 +111,15 @@ pub enum TieMiss {
     /// no projection of it), or a row the type check did not decide (`Generic`, `NotImpl`,
     /// `Unanswered`), or two rows naming different impls.
     ImplAnswers,
-    /// The impl answering the bound has no text ([`Facts::impl_source`] gave `None`).
+    /// The impl answering the bound has no region facts (`RegionFacts::impl_header`,
+    /// `outlives` or `clauses` of it answered `RegionsUnread`).
     ImplUnread,
-    /// The impl's header or its self type was not read (sig/impl_life.rs `ImplTraitWhy::Header`),
-    /// or its self type's positions are not the argument's.
+    /// The impl is inherent (no trait reference column), or its self type's column does not
+    /// line up with the argument's positions (another count, or the argument holds a type
+    /// whose positions the column counts otherwise: a trait object, an alias, an opaque type).
     ImplHeader,
-    /// The impl's trait path is in a form not read (`Fn(..)` sugar), or writes another count of
-    /// lifetime arguments than the callee's row holds.
+    /// The impl's trait reference has another count of lifetime arguments than the callee's
+    /// row holds, or one bound by a `for<..>`.
     ImplTraitForm,
     /// A predicate of the impl's header names a lifetime in a form not related here (a trait
     /// bound's arguments: `T: Deserialize<'de>`; a `for<..>`; `T: 'a` over a `T` its self type
@@ -155,7 +166,7 @@ impl<A: Allocator + Clone> ImplTies<A> {
 /// (`Form::Bound`).
 const MOST_IMPL_TIES: usize = 1 << 14;
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
+impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Seeds `inst` (the call's instantiation of `callee`'s regions, before any is made) with
     /// the caller's placeholder for each trait lifetime the call's bounds fix (the module's
     /// rule), `args` the call's type arguments; what an impl's header answers goes to
@@ -169,35 +180,28 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         impl_ties: &mut ImplTies<A>,
         e: ExprId,
     ) -> Result<(), Refusal> {
-        self.tie_bounds_open(callee, life, args, &[], inst, impl_ties, e)
-    }
-
-    /// [`Self::tie_bounds`], where the rows `open` (`(param, trait)`: those whose regions are
-    /// inputs of an open projection of the output at this call, generic_call.rs [`crate::Mark::Open`])
-    /// matter too, whether or not the signature writes their regions.
-    #[expect(clippy::too_many_arguments, reason = "one call's frame and its two outputs")]
-    pub(crate) fn tie_bounds_open(
-        &mut self,
-        callee: ItemKey,
-        life: SigLife<'_>,
-        args: &[PTy],
-        open: &[(u32, ItemKey)],
-        inst: &mut Vec<(Region, Origin), A>,
-        impl_ties: &mut ImplTies<A>,
-        e: ExprId,
-    ) -> Result<(), Refusal> {
         if self.plant == Plant::TiesFresh {
             return Ok(());
         }
         let facts: &'b F = self.facts;
         let Some(ties) = facts.ties(callee) else { return Ok(()) };
         let own = facts.ties(self.body.owner);
-        let used = |r: Region| r != Region::Static && (life.regions.contains(&r) || life.bounds.iter().any(|&(a, b)| a == r || b == r));
-        // An unread row may tie any region the text names.
-        let names_any = life.regions.iter().chain(life.bounds.iter().flat_map(|(a, b)| [a, b])).any(|r| matches!(r, Region::Named(_) | Region::SelfTy(_)));
+        let demands = facts.call_bounds(callee).map_or(&[][..], |b| b.outlives);
+        // A region of the column a projection's trait lifetime argument stands at is one of
+        // the column (D148), so an output `V::Value` makes `V: Visitor<'de>`'s row matter.
+        let (slots, bounds) = (life.slots(), life.bounds());
+        let used = |r: Region| matches!(r, Region::Param(_)) && (
+            slots.contains(&r) || bounds.iter().any(|&(a, b)| a == r || b == r)
+                || demands.iter().any(|&(_, target)| target == r)
+        );
+        // An unread row may tie any region the head names.
+        let names_any = slots.iter()
+            .chain(bounds.iter().flat_map(|(a, b)| [a, b]))
+            .chain(demands.iter().map(|(_, target)| target))
+            .any(|r| matches!(r, Region::Param(_)));
         for t in ties.rows {
             let Some(theirs) = ties.regions.get(t.lo as usize..t.hi as usize) else { return self.refuse(Form::Malformed, e) };
-            let matters = open.contains(&(t.param, t.trait_)) || if t.read { theirs.iter().any(|&r| used(r)) } else { names_any };
+            let matters = if t.read { theirs.iter().any(|&r| used(r)) } else { names_any };
             if !matters {
                 continue;
             }
@@ -227,6 +231,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 return self.refuse(miss(TieMiss::Count), e);
             }
             for (&x, &y) in theirs.iter().zip(mine) {
+                // Bound by a `for<..>` on either side: the bound's own, fixed by nobody here.
+                if matches!(x, Region::Late { .. }) || matches!(y, Region::Late { .. }) {
+                    continue;
+                }
                 let caller = self.universal(y);
                 self.tie_one(inst, x, caller);
             }
@@ -237,8 +245,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// Rule (d): the bound of `callee`'s row `t` (its trait lifetimes `theirs`) over the
     /// argument `a`, which is no type parameter of the caller, holds through the impl the TYPE
     /// CHECK selected at this call (`Checked::selected`: a row of `t`'s trait whose self type is
-    /// `a`; rule 77, never selected again here); its header's trait reference, read once
-    /// (sig/impl_life.rs [`read_impl_trait`]), says what each trait lifetime is: one of `a`'s
+    /// `a`; rule 77, never selected again here); its header's region columns
+    /// (`RegionFacts::impl_header`, D148) say what each trait lifetime is: one of `a`'s
     /// positions, `'static`, or a free lifetime (fresh at the call); the header's lifetime
     /// bounds and its `T: 'x` (over every position of `a`, a superset of `T`'s) hold too.
     /// Anything not read is refused by name ([`TieMiss`]), never related by guess.
@@ -246,7 +254,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let miss = |why: TieMiss| Form::CallTieUnplaced { callee, param: t.param, why };
         let ck: &'c Checked<'c> = self.ck;
         let mut found: Option<ItemKey> = None;
-        for row in ck.selected_at(e) {
+        for row in ck.call_selections(e) {
             if row.trait_ != t.trait_ {
                 continue;
             }
@@ -261,54 +269,125 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         let Some(imp) = found else { return self.refuse(miss(TieMiss::ImplAnswers), e) };
         let facts: &'b F = self.facts;
-        let Some(src) = facts.impl_source(imp) else { return self.refuse(miss(TieMiss::ImplUnread), e) };
-        let adt_lifetimes = |k: ItemKey| facts.adt(k).map(|x| x.lifetimes);
-        let mut it: ImplTrait<A> = ImplTrait::new_in(self.alloc.clone());
-        let text = ImplText { text: src.text, self_ty: a, assoc: src.assoc };
-        if let Err(why) = read_impl_trait(text, self.tys, &adt_lifetimes, theirs.len() as u32, &mut it, self.alloc.clone()) {
-            let why = match why {
-                ImplTraitWhy::Header(_) | ImplTraitWhy::Inherent => TieMiss::ImplHeader,
-                ImplTraitWhy::TraitForm | ImplTraitWhy::Count { .. } => TieMiss::ImplTraitForm,
-                ImplTraitWhy::Predicates => TieMiss::ImplWhere,
-                ImplTraitWhy::Bound => return self.refuse(Form::Bound, e),
-            };
-            return self.refuse(miss(why), e);
-        }
-        if it.positions != self.npos(a, e)? || it.args.len() != theirs.len() {
+        let regions: &'b dyn RegionFacts = facts.regions();
+        let unread = |_: blaze_typeck::region_facts::RegionsUnread| miss(TieMiss::ImplUnread);
+        let (self_col, trait_col) = match regions.impl_header(imp) {
+            Ok(h) => h,
+            Err(u) => return self.refuse(unread(u), e),
+        };
+        let Some(trait_col) = trait_col else { return self.refuse(miss(TieMiss::ImplHeader), e) };
+        let header = match regions.outlives(imp) {
+            Ok(o) => o,
+            Err(u) => return self.refuse(unread(u), e),
+        };
+        let clauses = match regions.clauses(imp) {
+            Ok(c) => c,
+            Err(u) => return self.refuse(unread(u), e),
+        };
+        let count = match regions.lifetime_params(imp) {
+            Ok(p) => p.count(),
+            Err(u) => return self.refuse(unread(u), e),
+        };
+        // The self type's column lines up with `a`'s positions slot for slot only where both
+        // walks count alike: no node whose positions `npos` counts otherwise than the column
+        // (a trait object, an alias, an opaque type, a closure: `unplaced`), and no impl type
+        // parameter covering a position of `a` (then the column is shorter). `a`'s own type
+        // parameters (the caller's) hold no position.
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let positions = self.npos(a, e)?;
+        if self.unplaced(a, e, &mut held)? || self_col.len() != positions {
             return self.refuse(miss(TieMiss::ImplHeader), e);
         }
+        let own = trait_col.own();
+        if own.len() != theirs.len() || own.iter().any(|r| matches!(r, Region::Late { .. })) {
+            return self.refuse(miss(TieMiss::ImplTraitForm), e);
+        }
+        // A clause of the header whose column writes a lifetime of the impl relates it in a
+        // form not read here (`T: Deserialize<'de>`).
+        if clauses.iter().any(|c| c.col.as_slice().iter().any(|r| !matches!(r, Region::Static))) {
+            return self.refuse(miss(TieMiss::ImplWhere), e);
+        }
+        // `T: 'x` over an `a` holding the caller's type parameter: its placeholder is not
+        // related here (as before D148).
+        if !held.is_empty() && header.iter().any(|o| matches!(o, Outlives::Type { .. })) {
+            return self.refuse(miss(TieMiss::ImplWhere), e);
+        }
         let base = out.free;
-        out.free += it.free;
+        let Some(free) = out.free.checked_add(count) else { return self.refuse(Form::Bound, e) };
+        out.free = free;
         let param = t.param;
-        let end = |r: Region| match r {
-            Region::SelfTy(k) if k < it.positions => Some(TieEnd::Arg { param, k }),
-            Region::Static => Some(TieEnd::Callee(Region::Static)),
-            Region::Named(j) if j < it.free => Some(TieEnd::Free(base + j)),
-            _ => None,
+        let slots = self_col.as_slice();
+        // Every end impl region `r` is at the call: each position of `a` the self type writes
+        // it at, else (`Param(j)` written nowhere in it) the free lifetime `j`.
+        let ends = |r: Region, push: &mut dyn FnMut(TieEnd)| -> bool {
+            match r {
+                Region::Static => push(TieEnd::Callee(Region::Static)),
+                Region::Param(j) if j < count => {
+                    let mut any = false;
+                    for (k, &s) in slots.iter().enumerate() {
+                        if s == r {
+                            push(TieEnd::Arg { param, k: k as u32 });
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        push(TieEnd::Free(base + j));
+                    }
+                }
+                _ => return false,
+            }
+            true
         };
+        let mut xs: Vec<TieEnd, A> = Vec::new_in(self.alloc.clone());
+        let mut ys: Vec<TieEnd, A> = Vec::new_in(self.alloc.clone());
         // Each trait lifetime IS the impl's argument there: both ways (a trait's parameters
         // are invariant, the module's rule (a)).
-        for (&x, &r) in theirs.iter().zip(it.args.iter()) {
-            let Some(y) = end(r) else { return self.refuse(Form::Malformed, e) };
-            out.rel.push((TieEnd::Callee(x), y));
-            out.rel.push((y, TieEnd::Callee(x)));
-        }
-        for &(p, q) in it.bounds.iter() {
-            let (Some(p), Some(q)) = (end(p), end(q)) else { return self.refuse(Form::Malformed, e) };
-            out.rel.push((p, q));
-        }
-        if !it.outlived.is_empty() {
-            // `T: 'x` over every position of `a`: a superset of `T`'s own. A position the
-            // lowering does not hold (a caller's type parameter in `a`, a closure) is not read.
-            let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
-            if self.unplaced(a, e, &mut held)? || !held.is_empty() {
-                return self.refuse(miss(TieMiss::ImplWhere), e);
+        for (&x, &r) in theirs.iter().zip(own.iter()) {
+            ys.clear();
+            if !ends(r, &mut |y| ys.push(y)) {
+                return self.refuse(Form::Malformed, e);
             }
-            for &l in it.outlived.iter() {
-                let Some(y) = end(l) else { return self.refuse(Form::Malformed, e) };
-                for k in 0..it.positions {
-                    out.rel.push((TieEnd::Arg { param, k }, y));
+            for &y in ys.iter() {
+                out.rel.push((TieEnd::Callee(x), y));
+                out.rel.push((y, TieEnd::Callee(x)));
+            }
+        }
+        // A `'static` slot of the self type: that position of `a` outlives `'static`.
+        for (k, &s) in slots.iter().enumerate() {
+            if s == Region::Static {
+                out.rel.push((TieEnd::Arg { param, k: k as u32 }, TieEnd::Callee(Region::Static)));
+            }
+        }
+        for &o in header {
+            match o {
+                Outlives::Region { long, short } => {
+                    xs.clear();
+                    ys.clear();
+                    if !ends(long, &mut |x| xs.push(x)) || !ends(short, &mut |y| ys.push(y)) {
+                        return self.refuse(miss(TieMiss::ImplWhere), e);
+                    }
+                    for &p in xs.iter() {
+                        for &q in ys.iter() {
+                            out.rel.push((p, q));
+                        }
+                    }
                 }
+                // `T: 'x` over every position of `a`: a superset of `T`'s own (`a` holds no
+                // position the lowering does not, checked above).
+                Outlives::Type { region, .. } => {
+                    ys.clear();
+                    if !ends(region, &mut |y| ys.push(y)) {
+                        return self.refuse(miss(TieMiss::ImplWhere), e);
+                    }
+                    for k in 0..positions {
+                        for &y in ys.iter() {
+                            out.rel.push((TieEnd::Arg { param, k }, y));
+                        }
+                    }
+                }
+            }
+            if out.rel.len() > MOST_IMPL_TIES {
+                return self.refuse(Form::Bound, e);
             }
         }
         if out.rel.len() > MOST_IMPL_TIES {

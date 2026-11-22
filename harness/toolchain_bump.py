@@ -1,6 +1,6 @@
 # pyright: basic
 """toolchain_bump.py: move blaze to a newer Rust nightly. blaze supports one toolchain, the
-dated nightly in harness/toolchain; everything that mirrors that rustc moves with it.
+dated nightly in pins/toolchain (pins/README.md); everything that mirrors that rustc moves with it.
 
     uv run --frozen python harness/toolchain_bump.py '{}'
                                               the newest nightly that has every component blaze needs
@@ -13,7 +13,7 @@ A bump, in order (each step names itself when it fails, and stops there):
  1. picks the nightly: the given date, or the newest of the last two weeks whose manifest has
     rustc, cargo, rust-std, rust-src, llvm-tools, rustfmt, clippy, rust-analyzer and (but on
     Windows) rustc-codegen-cranelift-preview for every host blaze ships for;
- 2. writes harness/toolchain and runs toolchain_pins.py '{"write": true}' (pins.txt: the files' hashes,
+ 2. writes pins/toolchain and runs toolchain_pins.py '{"write": true}' (pins/rust.txt: the files' hashes,
     the nightly's `rustc -V` and its rust-lang/rust commit);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src and crates/rustc_lexer/src is compiler/rustc_lexer/src, copied as
@@ -30,7 +30,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     (`lint_table write`, scripts/src/bin/lint_table.rs): crates/blaze-lint-defs/src/rustc.rs.
     The gate refuses a registry written from another commit than library/UPSTREAM's;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
-    commit in site/install.sh, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
+    commit in crates/rustc_lexer/Cargo.toml, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
     docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
     update rust-overlay`, when nix is on PATH);
  6. installs the nightly with rustup.
@@ -59,12 +59,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import toolchain_pins
 from typed_input import fail, parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PIN = os.path.join(HERE, "toolchain")
-PINS = os.path.join(ROOT, "crates/blaze-cargo/src/toolchain/pins.txt")
+PIN = toolchain_pins.TOOLCHAIN
 DIST = "https://static.rust-lang.org/dist"
 RUST = "https://github.com/rust-lang/rust"
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")
@@ -87,8 +87,8 @@ COMPONENTS = [
     "rust-analyzer-preview",
     "rustc-codegen-cranelift-preview",
 ]
-# Where the old pin is written down besides harness/toolchain and pins.txt.
-MENTIONS = ["site/install.sh", "crates/rustc_lexer/Cargo.toml"]
+# Where the old pin is written down besides pins/ (site/install.sh names pins/toolchain, no copy).
+MENTIONS = ["crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
@@ -195,13 +195,9 @@ async def pick(date):
 
 
 def pinned():
-    """The pin as pins.txt has it: toolchain name, `rustc -V` after `rustc `, commit."""
-    lines = dict(
-        line.split(" ", 1)
-        for line in Path(PINS).read_text().splitlines()
-        if line and not line.startswith("#")
-    )
-    return lines["release"].split()[0], lines["rustc"], lines["commit"]
+    """The pin as pins/rust.txt has it: toolchain name, `rustc -V` after `rustc `, commit."""
+    rust = toolchain_pins.rust()
+    return rust["release"], rust["rustc"], rust["commit"]
 
 
 async def checkout(commit, paths):
@@ -365,7 +361,7 @@ async def bump(date):
     print(f"""
 blaze is pinned to {name} ({new[1]}). Left to do:
   - on x86-64 Linux, AArch64 Linux and arm64 macOS each: `python3 harness/answers.py --write`,
-    then commit crates/blaze-units/src/stdlib/rustc.json;
+    then commit pins/answers/rustc.json (blaze-pins refuses to build until its version is rust.txt's);
   - `cargo check --workspace --exclude blaze-std --all-targets` and the unit tests, fixing what
     the new rustc_abi and std ask for;
   - the full tier (the train and the crates' own test suites) re-measured at the new commit;

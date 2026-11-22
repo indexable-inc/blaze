@@ -16,6 +16,28 @@ pub struct Ty(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TyList(pub u32);
 
+/// The interned flags relevant to projection normalization, before inference bindings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TyFlags(u16);
+
+impl TyFlags {
+    pub const HAS_ALIAS: u16 = blaze_ty::Flags::ALIAS;
+    /// Type, integer, float and const variables. Typeck erases regions.
+    pub const HAS_INFER: u16 = blaze_ty::Flags::TY_INFER | blaze_ty::Flags::CT_INFER;
+
+    pub(crate) const fn from_interned(flags: blaze_ty::Flags) -> Self {
+        Self(flags.bits() & (Self::HAS_ALIAS | Self::HAS_INFER))
+    }
+
+    pub const fn has(self, mask: u16) -> bool {
+        self.0 & mask != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// What kind of inference variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VarKind {
@@ -66,8 +88,8 @@ pub enum TyView {
     /// A closure of another body (`PNode::Closure`): its identity (`owner`, `ordinal`, the
     /// owner's arguments `args`) and the facts the owner's check recorded (`Question::Closure`):
     /// its signature (a `FnPtr`, substituted by `args`) and its kind. The solver sees
-    /// `Closure(hash(owner, ordinal), [args.., kind, sig, ()])`.
-    ClosureOf { owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: ClosureKind },
+    /// `Closure(hash(owner, ordinal), [args.., kind, sig, environment])`.
+    ClosureOf { owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: ClosureKind, upvars: Option<Ty> },
     /// An async block's future of another body (`PNode::Coroutine`): its identity (`owner`,
     /// `ordinal`, the owner's arguments `args`) and the facts the owner's check recorded
     /// (`Question::Coroutine`): its output and interior, substituted by `args`. The solver sees
@@ -194,6 +216,8 @@ pub trait TypeCtx {
 
     /// The interned type of `v`.
     fn mk(&mut self, v: TyView) -> Result<Ty, CheckError>;
+    /// The flags of the interned node, including every child's flags.
+    fn ty_flags(&self, t: Ty) -> TyFlags;
     /// One level of `t`, unresolved: a variable is `Infer` even when bound (see
     /// `shallow_resolve`). A handle the context cannot view is `Error`, noted for
     /// [`TypeCtx::take_malformed`].
@@ -204,6 +228,8 @@ pub trait TypeCtx {
     fn take_malformed(&mut self) -> Option<crate::error::Malformed>;
     /// The interned list of `tys`.
     fn mk_list(&mut self, tys: &[Ty]) -> Result<TyList, CheckError>;
+    /// The union of the elements' flags, recorded when the list was interned.
+    fn list_flags(&self, l: TyList) -> TyFlags;
     /// The length of `l`.
     fn list_len(&self, l: TyList) -> u32;
     /// The `i`th type of `l`; `i < list_len(l)`.
@@ -258,12 +284,60 @@ pub trait TypeCtx {
     ) -> Result<(), Stop>;
     /// The next failed obligation, in the order they failed.
     fn next_error(&mut self) -> Option<FulfillError>;
+    /// Appends the goal of every obligation still pending (neither proved nor failed), in the
+    /// order registered: what an E0282 names as waiting on its variable (rules/writeback.rs
+    /// `undecided_of`).
+    fn pending_goals(&self, out: &mut blaze_own::Vec<Goal, blaze_own::Alloc<'_>>);
     /// Whether `goal` may hold, evaluated in a probe (`predicate_may_hold`): nothing is bound.
     fn may_hold<W: World>(
         &mut self,
         goal: Goal,
         reads: &mut Reads<'_, '_, W>,
     ) -> Result<bool, Stop>;
+    /// Why `goal` has no solution (blaze-solve `Solver::why_no`), in a probe: nothing is bound.
+    /// The steps from `goal` down to the first goal under it that fails by itself are appended
+    /// to `steps`, `goal` first ([`crate::diag::WhyReached::Root`]), and why that one fails is
+    /// the answer; `None` (and no step) when the goal holds or is ambiguous under the walk. A
+    /// step's goal is kept only when it is a positive trait goal naming no variable the walk
+    /// made (each dies with the probe).
+    fn why_chain<W: World>(
+        &mut self,
+        goal: Goal,
+        steps: &mut blaze_own::Vec<crate::diag::PendingWhyStep, blaze_own::Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop>;
+    /// Why `goal` is still undecided (blaze-solve `Solver::why_maybe`), in a probe: nothing is
+    /// bound. The steps from `goal` down to the first goal under it that is undecided by itself
+    /// are appended to `steps` as [`TypeCtx::why_chain`]'s, and why that one is undecided is
+    /// the answer (an undecided goal's [`crate::diag::WhyLeaf`]s); `None` (and no step) when the
+    /// goal is decided under the walk. A step's goal is kept only when it is a positive trait
+    /// goal naming no inference variable at all (the record holds none).
+    fn why_maybe_chain<W: World>(
+        &mut self,
+        goal: Goal,
+        steps: &mut blaze_own::Vec<crate::diag::PendingWhyStep, blaze_own::Alloc<'_>>,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<crate::diag::WhyLeaf>, Stop>;
+    /// The typed cause of an undecided `goal` that stalled on an opaque type: the first opaque
+    /// its evaluation read whose hidden type the world does not give this body, `skip`'s aside
+    /// (the body's own, defined here). One ordinary evaluation in a probe, nothing bound, never
+    /// the diagnostic walk; `None` when the goal is decided or read no such opaque. The asker
+    /// reveals it (front2 opaque_auto.rs `after_auto_gap`) and asks again: auto traits leak
+    /// through `impl Trait` at any depth (the Reference, "Auto trait leakage").
+    fn hidden_unknown<W: World>(
+        &mut self,
+        goal: Goal,
+        skip: &dyn Fn(ItemKey) -> bool,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<ItemKey>, Stop>;
+    /// The goal [`TypeCtx::why_chain`] ends at, where the chain has a step under `goal` and that
+    /// step's goal is kept: the where-clause a person fixes (`Rc<u8>: Send` under
+    /// `spawn(async { .. })`'s `F: Send`). `None` otherwise: the goal itself is what to fix.
+    fn why_leaf<W: World>(
+        &mut self,
+        goal: Goal,
+        reads: &mut Reads<'_, '_, W>,
+    ) -> Result<Option<(ItemKey, TyList)>, Stop>;
     /// `<args[0] as trait_<args[1..]>>::name` normalized now, if one impl or bound selects it
     /// ([`Normalized::Certain`]), or selects it with a nested goal still undecided and the type
     /// decided all the same ([`Normalized::Ambiguous`]); `None` when unsatisfied, when the
@@ -280,13 +354,16 @@ pub trait TypeCtx {
     /// (`deduce_closure_signature`): the inputs and output of the first pending
     /// `var: Fn*<(inputs..)>` obligation (`fn_traits` is `[Fn, FnMut, FnOnce]`): the inputs'
     /// tuple elements, and the term of a pending `<var as FnOnce<..>>::Output` projection
-    /// (`output` is its name) if there is one. `None` when no such obligation is pending.
-    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Option<(TyList, Option<Ty>)>;
+    /// (`output` is its name) whose `Args` can equal the inputs' tuple (a probe: each clause of
+    /// a bound is lowered on its own, so an alias in `Args` is a different normalization
+    /// variable in each), each with the cause of the obligation it came from (where the
+    /// expectation came from: D148, `columns::SigFrom`). `None` when no such obligation is
+    /// pending.
+    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, Cause), Option<(Ty, Cause)>)>, CheckError>;
 
-    /// Fixes closure `closure`'s kind once its captures are known (rustc's upvar analysis,
-    /// `closure_kind`), so its `Fn*` obligations select. `false` when the kind was already
-    /// fixed to another.
-    fn settle_closure_kind(&mut self, closure: ExprId, kind: ClosureKind) -> Result<bool, CheckError>;
+    /// Supply the inferred call kind and the stored capture types. A missing tuple
+    /// means the binding rows did not establish the precise captured places.
+    fn settle_closure(&mut self, closure: ExprId, kind: ClosureKind, upvars: Option<Ty>) -> Result<(), CheckError>;
 }
 
 /// A closure's kind (`rustc_type_ir::ClosureKind`), weakest trait first.
@@ -295,4 +372,52 @@ pub enum ClosureKind {
     Fn,
     FnMut,
     FnOnce,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InferCtx;
+    use blaze_own::Alloc;
+
+    #[test]
+    fn deep_concrete_type_has_empty_flags() {
+        let mut cx = InferCtx::new_in(Alloc::global());
+        let mut ty = cx.mk(TyView::Bool).unwrap();
+        for _ in 0..256 {
+            let pair = cx.mk_list(&[ty, ty]).unwrap();
+            ty = cx.mk(TyView::Tuple(pair)).unwrap();
+        }
+        let list = cx.mk_list(&[ty]).unwrap();
+        assert!(cx.list_flags(list).is_empty());
+        assert!(cx.ty_flags(ty).is_empty());
+    }
+
+    #[test]
+    fn projection_three_levels_deep_sets_alias_flag() {
+        let mut cx = InferCtx::new_in(Alloc::global());
+        let param = cx.mk(TyView::Param(0)).unwrap();
+        let args = cx.mk_list(&[param]).unwrap();
+        let projection = cx.mk(TyView::Alias { trait_: ItemKey(1), name: Name::of("Output"), args }).unwrap();
+        let slice = cx.mk(TyView::Slice(projection)).unwrap();
+        let reference = cx.mk(TyView::Ref(Mutbl::Not, slice)).unwrap();
+        let pair = cx.mk_list(&[param, reference]).unwrap();
+        let root = cx.mk(TyView::Tuple(pair)).unwrap();
+        assert!(cx.list_flags(pair).has(TyFlags::HAS_ALIAS));
+        assert!(cx.ty_flags(root).has(TyFlags::HAS_ALIAS));
+        assert!(!cx.ty_flags(root).has(TyFlags::HAS_INFER));
+    }
+
+    #[test]
+    fn type_and_const_variables_each_set_the_infer_flag() {
+        let mut cx = InferCtx::new_in(Alloc::global());
+        for kind in [VarKind::Ty, VarKind::Int, VarKind::Float, VarKind::Const] {
+            let var = cx.fresh(kind).unwrap();
+            let args = cx.mk_list(&[var]).unwrap();
+            let root = cx.mk(TyView::Adt(ItemKey(1), args)).unwrap();
+            assert!(cx.list_flags(args).has(TyFlags::HAS_INFER));
+            assert!(cx.ty_flags(root).has(TyFlags::HAS_INFER));
+            assert!(!cx.ty_flags(root).has(TyFlags::HAS_ALIAS));
+        }
+    }
 }

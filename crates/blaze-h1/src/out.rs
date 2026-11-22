@@ -25,6 +25,13 @@ impl<B: Allocator> Out for Vec<u8, B> {
     }
 }
 
+/// Deprecated (C1, no global heap): kept while blaze-http's client (client.rs, the body piece
+/// handed to its asker) appends to `alloc`'s `Vec`; it goes when that buffer is a blaze-own
+/// `Vec<u8, A>` in a named allocator.
+#[expect(
+    blaze::implicit_allocator,
+    reason = "`alloc`'s `Vec` is on the global heap: kept until blaze-http's client moves to blaze-own's `Vec` (W1 list)"
+)]
 impl Out for alloc::vec::Vec<u8> {
     fn try_reserve_more(&mut self, more: usize) -> Result<(), AllocFailure> {
         self.try_reserve(more).map_err(|_| AllocFailure::CapacityOverflow { what: "u8", len: self.len(), additional: more })

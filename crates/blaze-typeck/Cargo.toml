@@ -20,13 +20,13 @@ doctest = false
 blaze-own.workspace = true
 # `HashMap` and `ByHash`: the one hash table (rule 30). By path, not the workspace entry, which
 # turns on the `serde` and `shared` adapters and with them crates from outside the workspace.
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 # The real type context (`infer`): blaze-ty's arena and inference tables, blaze-solve's solver
 # over them, and `ItemKey`, the arena's item column.
-blaze-ty = { path = "../blaze-ty" }
-blaze-solve = { path = "../blaze-solve" }
-blaze-id = { path = "../blaze-id" }
-blaze-ids = { path = "../blaze-ids" }
+blaze-ty.workspace = true
+blaze-solve.workspace = true
+blaze-id.workspace = true
+blaze-ids.workspace = true
 
 [features]
 # `fixture` (a hand-written world and body builder, on `std`) for `examples/cost.rs`; always on
@@ -35,13 +35,13 @@ testing = ["blaze-own/std"]
 
 [dev-dependencies]
 # Itself with `testing`, so `examples/cost.rs` builds under a plain `--example cost`.
-blaze-typeck = { path = ".", features = ["testing"] }
+blaze-typeck = { workspace = true, features = ["testing"] }
 # `check`, `control`: the properties of typeck.md, "Proof".
 blaze-sim.workspace = true
 # `Alloc::global()`: the tests' handle; `testing::Counting`: the overlay's cost test.
 blaze-own = { workspace = true, features = ["std", "testing"] }
 # The solver's case files and runner (`testing::run`), run over `Terms` by `suite`.
-blaze-solve = { path = "../blaze-solve", features = ["testing"] }
+blaze-solve = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

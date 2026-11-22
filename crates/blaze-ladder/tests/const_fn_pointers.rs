@@ -28,7 +28,7 @@ use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, Read};
 use blaze_ladder::code_records::{Builder, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::{Maker, NamesRecords, walk_records};
 use blaze_own::Alloc;
@@ -45,7 +45,7 @@ const LANG_CRATES: [usize; 1] = [0];
 
 /// The lang items (core's marker.rs, ops/unsize.rs, ops/function.rs, as tests/d106_callables.rs
 /// declares them) and the fns the rows point to.
-const HEAD: &str = "#![feature(no_core, lang_items, unboxed_closures, fn_traits, rustc_attrs)]
+const HEAD: &str = "#![feature(no_core, lang_items, unboxed_closures, fn_traits, rustc_attrs, thread_local, intrinsics)]
 #![no_core]
 #![no_main]
 #![allow(internal_features)]
@@ -177,18 +177,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: LibKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 
@@ -365,7 +365,6 @@ pub extern \"C-unwind\" fn main() -> i32 {
 
 /// A STATIC holding a fn pointer: `seven()` = 7.
 #[test]
-#[ignore = "another piece: the lazy path's static entry refuses a fn word (crates/blaze-ladder/src/static_entry.rs:177 `StaticRecordError::Fn`, 'a static's record does not name yet ... step 2'); the static's record must declare the instance its word points to, as a code record declares a callee"]
 fn a_static_holding_a_fn_pointer() {
     row(
         "static",
@@ -378,6 +377,51 @@ pub extern \"C-unwind\" fn main() -> i32 {
 }
 ",
         7,
+    );
+}
+
+#[test]
+fn a_static_points_to_a_ground_generic_instance() {
+    row(
+        "generic static",
+        "
+#[rustc_intrinsic]
+#[rustc_nounwind]
+pub const fn size_of<T>() -> usize;
+
+fn width<T>() -> usize { size_of::<T>() }
+static BYTE: fn() -> usize = width::<u8>;
+static WORD: fn() -> usize = width::<u32>;
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (BYTE() * 10 + WORD()) as i32
+}
+",
+        14,
+    );
+}
+
+#[test]
+fn a_thread_local_holding_a_fn_pointer() {
+    row(
+        "thread-local fn word",
+        r#"
+unsafe extern "C" fn destroy(value: *mut u8) {
+    unsafe { *value = 42; }
+}
+
+#[thread_local]
+static DTOR: unsafe extern "C" fn(*mut u8) = destroy;
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let mut value = 0u8;
+    unsafe { DTOR(&raw mut value); }
+    value as i32
+}
+"#,
+        42,
     );
 }
 
@@ -415,6 +459,59 @@ pub extern \"C-unwind\" fn main() -> i32 {
 }
 ",
         7,
+    );
+}
+
+/// eyre's `&ErrorVTable { object_drop: object_drop::<E>, .. }` (tempo tests t0850, 3 NOT RUN:
+/// "fn .. in a promoted value has no instance key in the build's `Adts`"): a PROMOTED struct of
+/// fn pointers in a GENERIC fn, at two instances, its fn named only there (no body calls
+/// `id`, so the record walk has no row for it until the build names it: run/make_one.rs
+/// `Step::Table`). Each word is read back to its instance from the evaluator's record
+/// (`const_fn_instance`), so `id::<u8>` and `id::<u32>` are two: a word read at the other
+/// instance gives a wrong status. 5 + 30 = 35.
+#[test]
+fn a_promoted_fn_table_in_a_generic_fn_at_two_instances() {
+    row(
+        "promoted table at two instances",
+        "
+struct Ops<T> {
+    f: fn(T) -> T,
+}
+
+fn ops<T: 'static>() -> &'static Ops<T> {
+    &Ops { f: id::<T> }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (ops::<u8>().f)(5) as i32 + (ops::<u32>().f)(30) as i32
+}
+",
+        35,
+    );
+}
+
+/// The twin, not generic: a promoted struct literal whose field is a plain fn item coerced
+/// (not an `as` cast), in a fn other than `main`, and named nowhere else. `double(21)` = 42.
+#[test]
+fn a_promoted_fn_table_of_a_plain_fn() {
+    row(
+        "promoted table of a plain fn",
+        "
+struct Plain {
+    f: fn(u8) -> u8,
+}
+
+fn plain() -> &'static Plain {
+    &Plain { f: double }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (plain().f)(21) as i32
+}
+",
+        42,
     );
 }
 
@@ -495,7 +592,6 @@ fn the_thread_local_shape() {
 /// A closure in a STATIC initializer, coerced to a fn pointer: its owner is the static `S` (the
 /// body-owner rule). `40 + 2` = 42.
 #[test]
-#[ignore = "the static half's gap, not the owner's: the lazy path's static entry refuses a fn word (crates/blaze-ladder/src/static_entry.rs:177 `StaticRecordError::Fn`), as `a_static_holding_a_fn_pointer` shows"]
 fn a_closure_in_a_static_initializer() {
     row(
         "closure in a static",

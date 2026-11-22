@@ -149,6 +149,10 @@ impl fmt::Display for Fault {
 pub enum Death {
     /// Its expiry passed (rule 70).
     Expired,
+    /// Its binary was replaced: its file changed, or a blaze of another build asked
+    /// (helper.rs: the version is in every hello and every ask). What it holds is only what
+    /// the journal rebuilds, so the new build's helper starts from nothing.
+    Replaced,
     Fault(Fault),
 }
 
@@ -156,6 +160,7 @@ impl fmt::Display for Death {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Death::Expired => f.write_str("the change watcher expired"),
+            Death::Replaced => f.write_str("the change watcher's binary was replaced (its file changed, or a blaze of another build asked)"),
             Death::Fault(fault) => write!(f, "{fault}"),
         }
     }
@@ -401,6 +406,15 @@ impl<A: Allocator + Copy> Watcher<A> {
             return Ok(Step::default());
         }
         self.die(Death::Fault(fault))
+    }
+
+    /// The helper's binary was replaced ([`Death::Replaced`]): every ask waiting, and every
+    /// later one, is refused for it, and the helper exits.
+    pub fn replaced(&mut self) -> Result<Step, SinceError> {
+        if self.is_dead() {
+            return Ok(Step::default());
+        }
+        self.die(Death::Replaced)
     }
 
     /// A request asks what changed since `since` (`None`: it saved no place), at `now`.

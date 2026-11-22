@@ -15,6 +15,7 @@ use blaze_rng::SplitMix64;
 
 #[cfg(test)]
 use crate::shrink;
+use crate::limits::{Point, PointId};
 use crate::observe::{ObserveMode, Tally};
 use crate::shrink::Shrinker;
 use crate::tape::{Record, Tail, Tape};
@@ -37,8 +38,12 @@ pub struct Config {
     pub shrink_runs: u32,
     pub most_choices: u32,
     pub given: Given,
-    /// Points some case has to reach, or the check fails.
+    /// Points some case has to reach, or the check fails, as text. Deprecated (D165): a point is
+    /// a typed value now, required with `must_reach_points`.
     pub must_reach: &'static [&'static str],
+    /// Typed reach points (limits.rs, [`points!`](crate::points)) some passing case has to reach,
+    /// or the run ends `Verdict::Unreached` naming each missed point's path.
+    pub must_reach_points: &'static [PointId],
     /// What the search does with what it observed of its passing cases (observe.rs): print it
     /// (`ObserveMode::Observe`, the default) or, once built, fail on it.
     pub observe: ObserveMode,
@@ -53,6 +58,7 @@ impl Config {
         most_choices: Tape::MOST_CHOICES,
         given: Given::NOTHING,
         must_reach: &[],
+        must_reach_points: &[],
         observe: ObserveMode::Observe,
     };
 
@@ -107,13 +113,26 @@ impl Config {
         self
     }
 
-    /// Points some passing case has to reach.
+    /// Points some passing case has to reach, as text. Deprecated (D165): declare the points with
+    /// [`points!`](crate::points), note them with `Tape::reach` and require them with
+    /// [`Config::must_reach_points`].
     #[blaze::pure]
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub const fn must_reach(mut self, points: &'static [&'static str]) -> Config {
         self.must_reach = points;
+        self
+    }
+
+    /// Typed reach points some passing case has to reach: `&[LogPoint::Full.id()]`, or every
+    /// point of an enum with `<LogPoint as Point>::IDS`.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn must_reach_points(mut self, points: &'static [PointId]) -> Config {
+        self.must_reach_points = points;
         self
     }
 
@@ -266,6 +285,31 @@ impl core::fmt::Display for Broke {
 }
 
 impl std::error::Error for Broke {}
+
+/// What broke a case, typed (D165): the oracle's finding as a value of its own error type `E`
+/// (the component's typed error, or a small invariant enum the test defines), or the harness's
+/// own fault. A control names the invariant it must trip as a pattern over `E`
+/// ([`plants!`](crate::plants)), never as words of a message; `E`'s `Display` is only what a
+/// person reads. [`Broke`] is the untyped form, kept while callers move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Broken<E> {
+    /// The oracle saw the invariant `E` broken: a finding.
+    Oracle(E),
+    /// The test itself went wrong (a model out of step, a bound of the harness's own). The text is
+    /// for a person; nothing matches on it.
+    Harness(String),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Broken<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Broken::Oracle(broken) => write!(f, "the oracle: {broken}"),
+            Broken::Harness(why) => write!(f, "the harness: {why}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Display + core::fmt::Debug> std::error::Error for Broken<E> {}
 
 /// Where a failure came from: two failures are the same when their origins are equal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,11 +485,11 @@ pub struct Search {
 
 impl Search {
     /// A search of `config`. A `Given` with a tape and a seed or a count (which `Given::parse`
-    /// refuses) panics, naming both; so does `ObserveMode::Enforce`, which is not built yet.
+    /// refuses) panics, naming both. `ObserveMode::Enforce` is judged by the driver once the
+    /// search is done (check.rs `enforced`), from `tally`; the search itself observes either way.
     #[blaze::pure]
     #[blaze::nonblocking]
     pub fn new(config: Config) -> Search {
-        config.observe.in_force();
         let given = &config.given;
         if let Some(tape) = &given.tape {
             if let Some(seed) = given.seed {
@@ -552,6 +596,25 @@ impl Search {
     #[blaze::nonblocking]
     pub fn tally(&self) -> &Tally {
         &self.tally
+    }
+
+    /// The points the passing cases of the run reached so far, each once, in the order first
+    /// reached: typed points (`Tape::reach`) as their ids' paths, and the deprecated text points.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn reached(&self) -> &[&'static str] {
+        &self.reached
+    }
+
+    /// Whether some passing case of the run reached the typed point `point`.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn reached_point(&self, point: impl Point) -> bool {
+        self.reached.contains(&point.id().path())
     }
 
     /// The most cases this search proposes: its cases, its shrink runs and the final run.
@@ -828,15 +891,16 @@ impl Search {
         self.done(verdict);
     }
 
-    /// The points of `Config::must_reach` no passing case reached, each once, in their order;
-    /// none when `reach` waives them.
+    /// The points of `Config::must_reach`, then of `Config::must_reach_points` (as their paths),
+    /// no passing case reached, each once, in their order; none when `reach` waives them.
     fn missing(&self, reach: Reach) -> Vec<&'static str, Global> {
         let mut missing = Vec::new_in(Global);
         match reach {
             Reach::Asked => {
-                for point in self.config.must_reach {
-                    if !self.reached.contains(point) && !missing.contains(point) {
-                        missing.push(*point);
+                let typed = self.config.must_reach_points.iter().map(|point| point.path());
+                for point in self.config.must_reach.iter().copied().chain(typed) {
+                    if !self.reached.contains(&point) && !missing.contains(&point) {
+                        missing.push(point);
                     }
                 }
             }

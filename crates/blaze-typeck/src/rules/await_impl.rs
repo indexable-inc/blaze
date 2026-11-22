@@ -35,8 +35,8 @@ use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ItemKey, LangItem, Name};
 use crate::machine::{Lower, Machine};
-use crate::ty::{Cause, Goal, Ty, TyList, TypeCtx};
-use crate::world::{ImplPolarity, PClause, Shape, World};
+use crate::ty::{Cause, Obligation, TyList, TypeCtx};
+use crate::world::{ImplPolarity, Shape, World};
 
 /// The impls of `IntoFuture` that hold at one `.await`'s operand: the first, and how many.
 #[derive(Clone, Copy)]
@@ -79,6 +79,22 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                         // It matched in the probe: the same unification cannot fail outside it.
                         return Err(crate::error::CheckError::Malformed(crate::error::Malformed::Expr(e)).into());
                     };
+                    // The selected impl's where-clauses are owed here, as selection's nested
+                    // goals are (the probe only asked them, then rolled back). A parameter
+                    // neither the self type nor the trait names is decided by one of them
+                    // alone: reth's `impl<L, Target, N, AddOns, B> IntoFuture for
+                    // DebugNodeLauncherFuture<L, Target, N, B> where L: LaunchNode<Target,
+                    // Node = NodeHandle<N, AddOns>>` binds `AddOns` only by that projection.
+                    // Unregistered, the callee row kept `?AddOns` and writeback refused it
+                    // (E0282, tempo crates/zones/node/tests/it/utils.rs:2658). Filed at the
+                    // `.await` (`Cause::Expr`, not `Cause::Clause`: the row's item is
+                    // `into_future`, not the impl whose clause it is).
+                    let wc = self.reads.predicates(imp)?;
+                    for c in wc.clauses {
+                        if let Some(goal) = self.clause_goal(wc.types, *c, iargs, Cause::Body)? {
+                            self.ty.register(Obligation { goal, cause: Cause::Expr(e) })?;
+                        }
+                    }
                     // An impl that does not define `into_future` runs the trait's provided one
                     // (`resolve_instance`'s rule): the trait's callee stays.
                     if let Some(a) = self.reads.assoc_item(imp, Name::of("into_future"))? {
@@ -128,16 +144,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         let Some(iargs) = self.instantiate_impl_at(imp, tr, args)? else { return Ok(false) };
         let wc = self.reads.predicates(imp)?;
         for c in wc.clauses {
-            let goal = match *c {
-                PClause::Trait { trait_, args: ca } => Goal::Trait { trait_, args: self.lower_clause_list(wc.types, ca, iargs)? },
-                PClause::Projection { trait_, args: ca, name, term } => Goal::Projection {
-                    trait_,
-                    args: self.lower_clause_list(wc.types, ca, iargs)?,
-                    name,
-                    term: self.lower(wc.types, term, Lower::Args(iargs), Cause::Body)?,
-                },
-                PClause::Const { cond, args: ca } => Goal::ConstHolds { cond, args: self.lower_clause_list(wc.types, ca, iargs)? },
-            };
+            let Some(goal) = self.clause_goal(wc.types, *c, iargs, Cause::Body)? else { continue };
             if !self.ty.may_hold(goal, &mut self.reads)? {
                 return Ok(false);
             }
@@ -168,15 +175,5 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             }
         }
         Ok(Some(iargs))
-    }
-
-    /// A where-clause's argument list, `Param(i)` lowered to `iargs[i]`.
-    fn lower_clause_list(&mut self, types: crate::portable::PTys<'_>, l: crate::ids::List, iargs: TyList) -> Result<TyList, Stop> {
-        let parts = types.list(l)?;
-        let mut tys: blaze_own::Vec<Ty, blaze_own::Alloc<'_>> = blaze_own::Vec::with_capacity_in(parts.len(), self.alloc);
-        for &p in parts {
-            tys.push(self.lower(types, p, Lower::Args(iargs), Cause::Body)?);
-        }
-        self.mk_list(&tys)
     }
 }

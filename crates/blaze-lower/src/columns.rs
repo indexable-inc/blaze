@@ -4,7 +4,7 @@
 
 use core::mem::offset_of;
 
-use blaze_format_core::{FormatError, Own, Record, Slice, Writer, open_as};
+use blaze_format_core::{FormatError, Own, Record, Slice, Writer, WriterOpts, open_as};
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::Range;
@@ -226,7 +226,7 @@ impl<'a> Columns<'a> {
     }
 
     pub(crate) fn to_record<'b>(&self, alloc: Alloc<'b>) -> blaze_own::Vec<u8, Alloc<'b>> {
-        let mut out = Writer::new_in(<LoweredRoot as Record>::SCHEMA, Own(alloc));
+        let mut out = Writer::new(WriterOpts { schema: <LoweredRoot as Record>::SCHEMA, alloc: Own(alloc), capacity: None });
         let exprs = Column::push(&mut out, &self.exprs);
         let expr_ranges = Column::push(&mut out, &self.expr_ranges);
         let pats = Column::push(&mut out, &self.pats);
@@ -581,6 +581,13 @@ impl<'b> View<'b> {
         self.outermost(at, r)
     }
 
+    /// [`View::site`] of a body macro call's finding range (blaze-lower by_name.rs
+    /// `MacroFinding::at`: a range of this record's text, past the item's length when the call is
+    /// in an expansion lowered after it). The one door from a finding's plain range to its place.
+    pub fn call_site(&self, at: Range) -> Result<Range, TextAt> {
+        self.site(BodyRange::new(at, self.lens))
+    }
+
     /// `at`, or the range of the outermost macro call whose expansion holds it.
     fn outermost(&self, mut at: Range, r: BodyRange) -> Result<Range, TextAt> {
         let item = self.lens.item_len;
@@ -663,6 +670,33 @@ impl<'b> View<'b> {
         crate::mark_site::TextMark::from_bytes(bytes).map(Some).ok_or(bad)
     }
 
+    /// The mark of the word the expression `e` starts at, as [`View::mark_of_path`] for a
+    /// path: `None` for an expression of the item's own text or one whose first word no
+    /// expansion marked (a token as written at the call). A block's is the mark of its `{` (or
+    /// of the `unsafe`, `async`, `const` or label before it, written by the same macro), so the
+    /// edition its tail's temporaries follow (rustc region.rs `resolve_block`:
+    /// `blk.span.edition()`).
+    pub fn mark_of_expr(&self, e: ExprId) -> Result<Option<crate::mark_site::TextMark>, BadRow> {
+        self.mark_at(at("expr_ranges", self.expr_ranges, e.0)?.start)
+    }
+
+    /// The mark of the word the pattern `p` starts at, as [`View::mark_of_expr`]: the edition
+    /// its binding modes follow (rustc's pattern migration errors by the span of the `mut`,
+    /// `ref` or `&` they name).
+    pub fn mark_of_pat(&self, p: PatId) -> Result<Option<crate::mark_site::TextMark>, BadRow> {
+        self.mark_at(at("pat_ranges", self.pat_ranges, p.0)?.start)
+    }
+
+    /// The mark of the word starting at `start`, if a word starts there and an expansion
+    /// marked it.
+    fn mark_at(&self, start: u32) -> Result<Option<crate::mark_site::TextMark>, BadRow> {
+        use blaze_expand::origin_column::MARK;
+        let Ok(i) = self.mark_starts.binary_search(&start) else { return Ok(None) };
+        let bad = BadRow { column: "mark_bytes", tag: u16::MAX };
+        let bytes = self.mark_bytes.get(i * MARK..(i + 1) * MARK).ok_or(bad)?;
+        crate::mark_site::TextMark::from_bytes(bytes).map(Some).ok_or(bad)
+    }
+
     /// Each marked word that starts inside `r` (a range of this view): its start relative to
     /// `r`'s start, so a place in [`View::text_at`] of `r`, and its mark, ascending. What a copy
     /// of an expansion's text out of the record keeps its marks by (blaze-ladder front2
@@ -699,16 +733,6 @@ impl<'b> View<'b> {
     /// A name as written (`r#` kept).
     pub fn name_text(&self, n: NameIdx) -> Result<&'b str, TextAt> {
         self.text_at(self.name_range(n)?)
-    }
-
-    /// The `expr_ranges` column, for blaze-typeck's form (one range per expression).
-    pub(crate) fn raw_expr_ranges(&self) -> &'b [Range] {
-        self.expr_ranges
-    }
-
-    /// The `pat_ranges` column, as [`View::raw_expr_ranges`].
-    pub(crate) fn raw_pat_ranges(&self) -> &'b [Range] {
-        self.pat_ranges
     }
 
     pub fn attr(&self, n: Node) -> Result<Attr, BadRow> {
@@ -879,6 +903,12 @@ impl<'b> View<'b> {
             return None;
         }
         self.head_opt(head::TY).map(TypeId)
+    }
+
+    /// The item's visibility as written (`head::VIS`: a signature's; `Private` when none is
+    /// written, and for a record with no item).
+    pub fn vis(&self) -> Vis {
+        Vis::decode(self.head[head::VIS] as u16, self.head[head::VIS + 1])
     }
 
     /// Whether the item's own `cfg` turned it off.

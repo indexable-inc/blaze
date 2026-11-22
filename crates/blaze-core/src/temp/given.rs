@@ -34,11 +34,20 @@ pub fn base_in(tmpdir: Option<&Path>, platform: &Path) -> PathBuf {
 #[allow(unsafe_code, reason = "confstr into a stack buffer it is told the length of, then errno read")]
 pub fn platform() -> PathBuf {
     // PATH_MAX on macOS: the longest path `confstr` can answer.
-    let mut buffer = [0 as libc::c_char; 1024];
+    let mut buffer = [0 as core::ffi::c_char; 1024];
+    #[cfg(target_os = "macos")]
+    use blaze_sys::posix::thread::{_CS_DARWIN_USER_TEMP_DIR, confstr};
+    #[cfg(target_os = "macos")]
+    // SAFETY: the buffer is writable for the given byte count, including the terminating NUL.
+    let needed = unsafe { confstr(_CS_DARWIN_USER_TEMP_DIR, buffer.as_mut_ptr(), buffer.len()) };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: `buffer` is `buffer.len()` writable bytes; `confstr` writes at most that many,
     // NUL included, and returns the length it needed (NUL included) or 0 on a refusal.
     let needed = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buffer.as_mut_ptr(), buffer.len()) };
     if needed == 0 || needed > buffer.len() {
+        #[cfg(target_os = "macos")]
+        let errno = blaze_sys::posix::signal::errno().raw();
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: `__error` returns the calling thread's `errno` slot, valid for the thread's
         // life; it is read at once, before any other call can set it.
         let errno = unsafe { *libc::__error() };

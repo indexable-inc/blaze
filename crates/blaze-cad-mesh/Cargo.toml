@@ -1,0 +1,42 @@
+[package]
+name = "blaze-cad-mesh"
+description = "Triangle meshes for the CAD library (D183): the mesh in columns with typed ids, crease marks and material borders, a BLAKE3 digest over its canonical bytes (the cache key of every later stage), the verifier whose proof later stages take (closed, manifold, oriented, no degenerate or duplicate triangle), mass properties by exact polyhedral integrals, exact-position welding and crease-angle normals, quadric-error simplification that keeps creases and borders, level-of-detail chains, vertex-cache and fetch ordering, clusters with bounds and normal cones, quantization with stated bounds, a deterministic quickhull and a simple convex decomposition; no_std, no alloc, the allocator passed in, the same bytes on every machine"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Base crates only, each on workspace crates alone (D180: no package from a registry).
+[dependencies]
+# `Vec`, `Alloc`, `AllocFailure`, the plant seam: every column and scratch buffer, in the
+# allocator the caller names.
+blaze-own.workspace = true
+# The mesh digest: BLAKE3 in its key-derivation mode, the same bytes `blaze_ids::ContentId::of`
+# gives for the same domain. Taken directly, not through blaze-ids, whose workspace entry turns
+# on its serde forms (a registry package) and whose domain table is process state (rule 75).
+blaze-blake3.workspace = true
+# Integer conversions that say what they do, in place of `as`.
+blaze-int.workspace = true
+# Lengths, volumes and areas at the public boundary (D184): an error bound, a target, a
+# tolerance is a `Length`, never a bare f64.
+blaze-units.workspace = true
+# The mesher (`contour`): tapes, interval and gradient evaluation, region simplification.
+blaze-cad-field.workspace = true
+# `Vec3`, `Aabb3`, `Interval`: the field's own geometry types.
+blaze-math.workspace = true
+
+[dev-dependencies]
+# Property tests and typed planted-bug controls (D165).
+blaze-sim.workspace = true
+# `testing::heap()`: a test's root allocator (D170 C1: no `Global` in tests either).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

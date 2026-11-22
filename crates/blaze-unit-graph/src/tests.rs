@@ -99,7 +99,8 @@ struct P {
     member: bool,
     lib: bool,
     proc_macro: bool,
-    bins: StdVec<StdString>,
+    /// Each binary's name and its `required-features`.
+    bins: StdVec<(StdString, StdVec<StdString>)>,
     build: bool,
     edition: Edition,
     features: StdVec<(StdString, StdVec<StdString>)>,
@@ -138,7 +139,12 @@ impl P {
         self
     }
     fn bin(mut self, name: &str) -> P {
-        self.bins.push(name.to_owned());
+        self.bins.push((name.to_owned(), StdVec::new()));
+        self
+    }
+    /// A binary with `required-features = [..]`.
+    fn bin_requiring(mut self, name: &str, required: &[&str]) -> P {
+        self.bins.push((name.to_owned(), required.iter().map(|f| (*f).to_owned()).collect()));
         self
     }
     fn build(mut self) -> P {
@@ -197,8 +203,12 @@ impl P {
             });
         }
         let mut bins = Vec::new_in(a());
-        for b in self.bins.iter() {
-            bins.push(Bin { name: t(b), root: t(&format!("src/bin/{b}.rs")) });
+        for (b, required) in self.bins.iter() {
+            let mut required_features = Vec::new_in(a());
+            for f in required.iter() {
+                required_features.push(t(f));
+            }
+            bins.push(Bin { name: t(b), root: t(&format!("src/bin/{b}.rs")), required_features });
         }
         Package {
             name: t(&self.name),
@@ -284,6 +294,15 @@ fn opts(resolver: Resolver) -> Opts {
 }
 
 fn solve_by(world: &[P], o: &Opts, pick: &mut dyn FnMut(usize) -> usize) -> Result<UnitGraph<'static>, UnitError<'static>> {
+    match settle_by(world, o, pick)? {
+        Pass::Done(graph) => Ok(graph),
+        Pass::Partial(partial) => panic!("the fixture's manifests of {:?} are missing: no graph", partial.missing()),
+        Pass::Need(needs) => panic!("settle_by ended on a need of {needs:?}"),
+    }
+}
+
+/// The world resolved to its end: `Done` or `Partial`, never `Need`.
+fn settle_by(world: &[P], o: &Opts, pick: &mut dyn FnMut(usize) -> usize) -> Result<Pass<'static>, UnitError<'static>> {
     let text = lock_text(world);
     let lock = match Lock::read(text.as_bytes(), a()) {
         Ok(lock) => lock,
@@ -310,7 +329,6 @@ fn solve_by(world: &[P], o: &Opts, pick: &mut dyn FnMut(usize) -> usize) -> Resu
     }
     for _ in 0..64 {
         match res.run(pick)? {
-            Pass::Done(graph) => return Ok(graph),
             Pass::Need(needs) => {
                 for id in needs.iter() {
                     let locked = lock.package(*id);
@@ -318,6 +336,7 @@ fn solve_by(world: &[P], o: &Opts, pick: &mut dyn FnMut(usize) -> usize) -> Resu
                     res.package(*id, (!p.missing).then(|| p.facts()))?;
                 }
             }
+            settled => return Ok(settled),
         }
     }
     panic!("no fixpoint in 64 passes");
@@ -402,6 +421,52 @@ fn dep_colon_makes_no_implicit_feature() {
         pkg("x"),
     ];
     assert_eq!(features_of(&ok(&on, &opts(Resolver::V2)), "lib "), vec!["lib 1.0.0 lib target [tls] -> x=x".to_string()]);
+}
+
+/// A binary whose `required-features` are not all on is no unit (the Cargo Book, "Cargo
+/// Targets", "The `required-features` field": "If any of the required features are not
+/// enabled, the target will be skipped"). tempo's bin/tempo in miniature: `tempo-localnet`
+/// requires `localnet = ["dep:nix"]`, nix a `cfg(unix)` optional dependency; made with default
+/// features it was checked without `nix`: three false "cannot find `nix`". Controls: with the
+/// feature on, the binary is a unit and has `nix`; a required name the package lacks is the
+/// package's error, never a skip; `dep/feature` holds only when the dependency has it.
+#[test]
+fn required_features_skip_a_binary() {
+    let world = |required: &'static [&'static str]| {
+        [
+            pkg("app")
+                .member()
+                .bin("app")
+                .bin_requiring("app-localnet", required)
+                .feature("localnet", &["dep:nix"])
+                .dep(dep("nix").optional().on("cfg(unix)")),
+            pkg("nix").feature("signal", &[]),
+        ]
+    };
+    let bins = |o: &Opts, required: &'static [&'static str]| -> StdVec<StdString> {
+        ok(&world(required), o).into_iter().filter(|l| l.contains(" bin:")).collect()
+    };
+    let off = opts(Resolver::V2);
+    assert_eq!(bins(&off, &["localnet"]), vec!["app 1.0.0 bin:app target [] -> app=app".to_string()]);
+    let on = Opts { features: vec!["localnet".to_owned()], ..opts(Resolver::V2) };
+    assert_eq!(
+        bins(&on, &["localnet"]),
+        vec![
+            "app 1.0.0 bin:app target [localnet] -> app=app,nix=nix".to_string(),
+            "app 1.0.0 bin:app-localnet target [localnet] -> app=app,nix=nix".to_string(),
+        ]
+    );
+    let all = Opts { all_features: true, ..opts(Resolver::V2) };
+    assert_eq!(bins(&all, &["localnet"]).len(), 2, "--all-features turns the required feature on");
+    match solve(&world(&["no-such"]), &off) {
+        Err(UnitError::NoSuchFeature { package, feature, .. }) => assert_eq!((package.as_str(), feature.as_str()), ("app", "no-such")),
+        Err(e) => panic!("another error: {e}"),
+        Ok(g) => panic!("an unknown required feature was skipped quietly: {:?}", lines(&g)),
+    }
+    // `nix/signal`: nix on (by `localnet`) but without `signal` skips; with it, a unit.
+    assert_eq!(bins(&on, &["nix/signal"]).len(), 1, "nix lacks `signal`: the binary is skipped");
+    let signal = Opts { features: vec!["localnet".to_owned(), "nix/signal".to_owned()], ..opts(Resolver::V2) };
+    assert_eq!(bins(&signal, &["nix/signal"]).len(), 2, "nix has `signal`: the binary is a unit");
 }
 
 /// Rule 1: `x?/f` does not turn `x` on; when `x` is on for another reason, `f` follows.
@@ -549,6 +614,7 @@ fn integration_tests_examples_and_benches_are_units() {
                     let lines: StdVec<StdString> = lines(&graph).into_iter().filter(|line| line.starts_with("pkg ")).collect();
                     return lines.join(" | ");
                 }
+                Ok(Pass::Partial(partial)) => panic!("every manifest is answered, yet {:?} are missing", partial.missing()),
                 Ok(Pass::Need(needs)) => {
                     for id in needs.iter() {
                         assert_eq!(*id, rand, "only rand is asked for");
@@ -790,17 +856,35 @@ fn renamed_and_two_versions() {
     );
 }
 
-/// Binaries depend on their package's library; a missing manifest is listed, never guessed.
+/// Binaries depend on their package's library.
 #[test]
-fn bins_and_unavailable_manifests() {
-    let world = [pkg("app").member().bin("cli").dep(dep("gone")), pkg("gone").missing()];
+fn bins_depend_on_their_library() {
+    let world = [pkg("app").member().bin("cli").dep(dep("here")), pkg("here")];
     let graph = match solve(&world, &opts(Resolver::V2)) {
         Ok(g) => g,
         Err(e) => panic!("{e}"),
     };
-    assert_eq!(lines(&graph), vec!["app 1.0.0 lib target [] -> ".to_string(), "app 1.0.0 bin:cli target [] -> app=app".to_string()]);
-    assert_eq!(graph.unavailable.len(), 1);
-    assert!(graph.units[0].incomplete);
+    assert_eq!(
+        lines(&graph),
+        vec!["app 1.0.0 lib target [] -> here=here".to_string(), "app 1.0.0 bin:cli target [] -> app=app,here=here".to_string(), "here 1.0.0 lib target [] -> ".to_string()]
+    );
+}
+
+/// A missing manifest is never guessed and never a graph: the pass is `Partial`, naming the
+/// package, and has no units to compile (states.md 35). Its control: the same world with the
+/// manifest answered is `Done`.
+#[test]
+fn a_missing_manifest_is_partial_not_done() {
+    let world = [pkg("app").member().bin("cli").dep(dep("gone")), pkg("gone").missing()];
+    let partial = match settle_by(&world, &opts(Resolver::V2), &mut |n| n - 1) {
+        Ok(Pass::Partial(partial)) => partial,
+        Ok(Pass::Done(_)) => panic!("a graph missing a manifest answered Done"),
+        Ok(Pass::Need(needs)) => panic!("settled on a need of {needs:?}"),
+        Err(e) => panic!("{e}"),
+    };
+    assert_eq!(partial.missing().len(), 1);
+    let control = [pkg("app").member().bin("cli").dep(dep("gone")), pkg("gone")];
+    assert!(matches!(settle_by(&control, &opts(Resolver::V2), &mut |n| n - 1), Ok(Pass::Done(_))));
 }
 
 /// Rule 6's defaults.
@@ -1044,7 +1128,7 @@ fn the_record_round_trips_and_is_one_bytes() {
             return Err(Broke::Oracle("the decoded platforms are not the encoded ones".to_string()));
         }
         let back = back.graph;
-        if back.units != calm.units || back.unavailable != calm.unavailable || back.resolver != calm.resolver || back.meta != calm.meta {
+        if back.units != calm.units || back.resolver != calm.resolver || back.meta != calm.meta {
             return Err(Broke::Oracle("the decoded graph is not the encoded one".to_string()));
         }
         if encode(&back)? != bytes {
@@ -1139,7 +1223,7 @@ fn graph_record(files: &[(StdString, StdString)]) -> (StdVec<u8>, [u8; 32]) {
     }
     let graph = match res.pass().expect("pass") {
         Pass::Done(graph) => graph,
-        Pass::Need(_) => panic!("a workspace of members needs nothing"),
+        Pass::Need(_) | Pass::Partial(_) => panic!("a workspace of members needs nothing"),
     };
     (record::encode(&graph, &target, &target, a()).expect("its own cfg").iter().copied().collect(), source.finish().0)
 }

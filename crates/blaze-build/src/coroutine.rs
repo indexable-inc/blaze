@@ -32,9 +32,9 @@ use blaze_lir::Ty;
 use blaze_lir::coroutine::StateLayout;
 use blaze_own::Alloc;
 use blaze_flow_lower::identity::{Identity, Role};
-use blaze_typeck::{BodyView, CaptureKind, Checked, Expr, ExprId, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys};
+use blaze_typeck::{BodyView, CaptureKind, Checked, EnvField, Expr, ExprId, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys};
 
-use crate::BuildError;
+use crate::{BuildError, FnTrait};
 
 // The walk's own names (`Walk`, `Repr`, `V`, `Task`, `TyErr`...), as closure.rs takes them.
 use super::*;
@@ -155,8 +155,7 @@ pub fn coroutine_facts(
 //   its `poll` form; parameters `(result: ptr, state: ptr, cx: ptr)`. The pass needs the state
 //   pointer as an entry parameter (`blaze_lir::coroutine::Shape::state_param`).
 // - the ENTRY, instance `(Future::poll, [coroutine])`: `poll(self: Pin<&mut Self>, cx)` as
-//   every `Future::poll` crosses (a `Pin` is a struct, so it arrives by the address of the
-//   caller's copy): it reads the state pointer out of the `Pin` and calls RESUME.
+//   every `Future::poll` crosses. It adapts the public receiver and result to RESUME.
 // - DROP, instance `(drop_in_place, [coroutine])`: the pass's `drop`, taking the state pointer.
 // The state is made where the `async` block is evaluated (`coroutine_value`), which for an
 // `async fn` is its fn's whole body (the Reference, "Async functions": "roughly equivalent to
@@ -203,14 +202,7 @@ pub(super) fn own_block(types: PTys<'_>, t: PTy) -> Option<ExprId> {
     }
 }
 
-/// A type refusal with no expression to name: of a coroutine's own signature.
-fn co_err(error: TyErr) -> BuildError {
-    match error {
-        TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
-        TyErr::Malformed(what) => malformed(what),
-        TyErr::Other(error) => error,
-    }
-}
+use super::signature_error as co_err;
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// The ground type of `async` block `e` of this body: its identity at this instance's
@@ -390,8 +382,16 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let Repr::Agg(l) = repr else {
             return Err(malformed("a coroutine's state of no size"));
         };
+        // The environment's fields (blaze-typeck env_fields.rs, the active strategy): a field
+        // holding a place below its binding (`x.a`, `(*r).b`: RFC 2229, "Async blocks capture
+        // variables from their environment using the same capture modes as closures") is the
+        // place's address or value (walk/moves/env_places.rs `store_env_place`), as a closure's.
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
         let mut caps = Vec::new_in(self.alloc.clone());
-        self.captures_of(e, &mut caps);
+        for f in self.checked.env_fields(e) {
+            fields.push(f);
+            caps.push((f.base, f.how));
+        }
         self.uncaptured(e, &caps)?;
         let at = self.temp(repr);
         if !caps.is_empty() {
@@ -400,6 +400,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.env_holds(e, parts.env, caps.len())?;
             let base = self.field_offset(l, 0)?;
             for (j, &(p, by)) in caps.iter().enumerate() {
+                if !fields[j].is_whole() {
+                    let dst = (at.0, at.1 + (base + self.field_offset(le, j)?) as i32);
+                    self.store_env_place(e, fields[j], dst)?;
+                    continue;
+                }
                 let (home, prepr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a binding captured before its binding"))?;
                 let src = self.home(home);
                 let dst = (at.0, at.1 + (base + self.field_offset(le, j)?) as i32);
@@ -437,9 +442,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let Expr::AsyncBlock { .. } = self.expr(root)? else {
             return Err(unsupported(root, "an `async fn` whose body is not its `async move` block (the Reference, \"Async functions\")"));
         };
-        let mut caps = Vec::new_in(self.alloc.clone());
-        self.captures_of(root, &mut caps);
-        if caps.len() < self.body.params.len() {
+        // The root block's fields: each a parameter moved in whole (the place analysis files
+        // an `async fn`'s root so, capture_places.rs `places_of`); one holding a place below
+        // its binding is a record this build cannot read.
+        let mut caps = 0usize;
+        for f in self.checked.env_fields(root) {
+            if !f.is_whole() {
+                return Err(malformed("an `async fn`'s root block with a field holding a place below its binding (every parameter is moved in whole)"));
+            }
+            caps += 1;
+        }
+        if caps < self.body.params.len() {
             return Err(unsupported(root, "an `async fn` parameter with no capture row in the record (every parameter is moved into the future)"));
         }
         let t = self.expr_ty(root)?;
@@ -457,15 +470,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let polled = self.poll_ty(items, parts.output)?;
         self.ret = self.repr(polled).map_err(co_err)?;
         let (row, id) = self.poll_row(self.ret).map_err(co_err)?;
-        self.ret_pass = Self::rust_pass(self.ret)?;
         Ok((g, parts, items, row, id))
     }
 
-    /// The entry block of a function `(result: ptr, a: ptr, cx: ptr)` returning `self.ret`:
-    /// its signature and the three parameters. A `Poll` that would cross in a register is
-    /// refused by name (no aggregate does under the Rust ABI today).
-    fn co_params(&mut self, first: Pass) -> Result<(blaze_lir::func::SigId, Value, Value, Value), BuildError> {
-        let passes = [first, Self::rust_pass(Repr::Ptr)?];
+    /// Bind the receiver and context and locate the storage RESUME writes its Poll into.
+    fn co_params(&mut self, first: Pass) -> Result<(Value, Value, Value), BuildError> {
+        let passes = [first, self.rust_pass(Repr::Ptr)?];
         let (params, rets) = self.sig_of(&passes, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
@@ -479,9 +489,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         match (self.ret_pass, values.as_slice()) {
             (Pass::Ref, &[result, a, cx]) => {
                 self.sret = Some(result);
-                Ok((own, result, a, cx))
+                Ok((result, a, cx))
             }
-            _ => Err(BuildError::UnsupportedSig { what: "a coroutine whose `Poll` is not returned through a result pointer, or whose `Pin` is not passed by address" }),
+            (Pass::Ignore | Pass::Scalar { .. } | Pass::Wide { .. }, &[a, cx]) => {
+                let at = self.temp(self.ret);
+                Ok((self.address(at), a, cx))
+            }
+            _ => Err(malformed("a coroutine entry without its receiver, context or Poll result")),
         }
     }
 
@@ -496,17 +510,35 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// dropped in an unspecified order": here the upvars' tuple's glue, in capture order.
     pub(super) fn run_coroutine(&mut self, block: ExprId) -> Result<blaze_lir::coroutine::Shape, BuildError> {
         let (_, parts, items, row, id) = self.co_entry(block)?;
-        let (_, _, state, cx) = self.co_params(Self::rust_pass(Repr::Ptr)?)?;
+        // RESUME is private to the split pass. Its state parameter is always number one.
+        self.ret_pass = Pass::Ref;
+        let (_, state, cx) = self.co_params(self.rust_pass(Repr::Ptr)?)?;
         self.co = Some(Co { cx, points: 0, poll_row: row, poll_id: id, items, pin: None });
         // The upvars' drop scope, the outermost (a fn's parameters' scope).
         self.scope_marks.push(0);
-        let mut caps = Vec::new_in(self.alloc.clone());
-        self.captures_of(block, &mut caps);
-        if !caps.is_empty() {
+        // The environment's fields, as `coroutine_value` stores them. A field holding a place
+        // below its binding is that place for every use in the body (walk/moves/env_places.rs
+        // `bind_env_place`), held as an `FnOnce` closure's: a by-value one whose type needs drop
+        // is the body's, dropped at its end, at a `return` and on the cancel path of a
+        // suspension unless moved out (`Held::EnvPlace`); a whole binding is noted beside them
+        // for `cover`. A drop flag (a move under a branch) is no saved local: read after a
+        // suspension it is refused by name (`UNNAMED_ACROSS`), as a whole binding's field word.
+        let mut fields: Vec<EnvField, A> = Vec::new_in(self.alloc.clone());
+        for f in self.checked.env_fields(block) {
+            fields.push(f);
+        }
+        if !fields.is_empty() {
             let le = self.layout(parts.env).map_err(co_err)?;
-            self.env_holds(block, parts.env, caps.len())?;
-            for (j, &(p, by)) in caps.iter().enumerate() {
+            self.env_holds(block, parts.env, fields.len())?;
+            for j in 0..fields.len() {
+                let f = fields[j];
                 let at = (state, self.field_offset(le, j)? as i32);
+                if !f.is_whole() {
+                    self.bind_env_place(block, f, Some(at), FnTrait::FnOnce)?;
+                    continue;
+                }
+                self.note_env_whole(f);
+                let (p, by) = (f.base, f.how);
                 match by {
                     CaptureKind::ByRef | CaptureKind::ByMutRef => {
                         let V::Scalar(ptr) = self.load(Repr::Ptr, at) else {
@@ -522,6 +554,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     }
                 }
             }
+            self.settle_env_places(block)?;
         }
         self.walk_root()?;
         // No edge of the body leads here: the state's drop does, when the tag is `Unresumed`.
@@ -557,14 +590,24 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let l = self.ground.intern_list(&[r]).map_err(full)?;
         let pin_ty = self.ground.intern(PNode::Adt(items.pin, l)).map_err(full)?;
         let (prepr, pin_off) = self.pin_repr(pin_ty).map_err(co_err)?;
-        let (own, result, pin, cx) = self.co_params(Self::rust_pass(prepr)?)?;
-        let state = self.b.load(Ty::PTR, Flags::NONE, pin, pin_off as i32, MemAttrs::aligned(3));
+        let pass = self.rust_pass(prepr)?;
+        self.ret_pass = self.rust_pass(self.ret)?;
+        let (result, pin, cx) = self.co_params(pass)?;
+        let state = match pass {
+            Pass::Scalar { ty: Ty::PTR, agg: true, .. } if pin_off == 0 => pin,
+            Pass::Ref => self.b.load(Ty::PTR, Flags::NONE, pin, pin_off as i32, MemAttrs::aligned(3)),
+            _ => return Err(malformed("a poll receiver without its state pointer")),
+        };
         let args = self.ground.intern_list(&[g]).map_err(full)?;
         let place = self.ref_place(Instance { item: items.resume, args });
         let reference = self.b.reference(RefKind::Func, place);
-        // RESUME's signature is this one: three pointers in, nothing out.
-        self.b.call(Flags::NONE, reference, own, &[result, state, cx]);
-        self.b.ret(&[]);
+        let resume = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR); 3], &[]);
+        self.b.call(Flags::NONE, reference, resume, &[result, state, cx]);
+        let mut returned = Vec::with_capacity_in(2, self.alloc.clone());
+        if self.ret_pass != Pass::Ref {
+            self.pass_arg(V::Place(result, 0), self.ret, self.ret_pass, &mut returned)?;
+        }
+        self.b.ret(&returned);
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));
         }
@@ -666,8 +709,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let held_record = self.checked.awaited_of(e).ok_or_else(|| unsupported(e, "`.await` whose held future the check did not record (`Checked::awaited`)"))?;
         let held = self.ground_ty(held_record).map_err(err)?;
         let hrepr = self.repr(held).map_err(err)?;
-        let tpass = Self::rust_pass(trepr)?;
-        let hpass = Self::rust_pass(hrepr)?;
+        let tpass = self.rust_pass(trepr)?;
+        let hpass = self.rust_pass(hrepr)?;
         self.push_val(v, None);
         let place = self.ref_place(into);
         let reference = self.b.reference(RefKind::Func, place);
@@ -712,9 +755,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let polled = self.poll_ty(items, out)?;
         let rrepr = self.repr(polled).map_err(err)?;
         let (row, id) = self.poll_row(rrepr).map_err(err)?;
-        let rpass = Self::rust_pass(rrepr)?;
-        let ppass = Self::rust_pass(prepr)?;
-        let cpass = Self::rust_pass(Repr::Ptr)?;
+        let rpass = self.rust_pass(rrepr)?;
+        let ppass = self.rust_pass(prepr)?;
+        let cpass = self.rust_pass(Repr::Ptr)?;
         let args = self.ground.intern_list(&[held]).map_err(full)?;
         let poll = Instance { item: poll_item, args };
         let held_drops = self.needs_drop(held).map_err(err)?;
@@ -890,14 +933,16 @@ pub(crate) fn build<A: Allocator + Clone>(
     };
     // The split's functions are blaze-lir's rewrite of the walk's: its `unreachable`s are not
     // the walk's one for one, so they carry no trap table (a fault there names no construct).
+    // The split's two functions verified here, once (D163): blaze-lir's split checks its output
+    // in debug builds only, and the emitter takes nothing unproven.
     let resume = Built {
-        func: split.poll,
+        func: blaze_lir::VerifiedFunc::new(split.poll).map_err(BuildError::Verify)?,
         refs: refs.clone(),
         statics: statics.clone(),
         thread_locals: thread_locals.clone(),
         vtables: vtables.clone(),
         traps: Vec::new_in(alloc.clone()),
     };
-    let drop = Built { func: split.drop, refs, statics, thread_locals, vtables, traps: Vec::new_in(alloc) };
+    let drop = Built { func: blaze_lir::VerifiedFunc::new(split.drop).map_err(BuildError::Verify)?, refs, statics, thread_locals, vtables, traps: Vec::new_in(alloc) };
     Ok(crate::BuiltCoroutine { poll, resume, drop, state, niche })
 }

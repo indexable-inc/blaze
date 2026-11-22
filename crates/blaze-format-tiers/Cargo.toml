@@ -18,10 +18,10 @@ doctest = false
 # only: zstd (through zstd-sys's build, cc, jobserver, getrandom) is this crate's alone, and only
 # the store (blaze-cas) and the crates naming a schema's columns depend on it.
 # By path: the workspace entry turns on its `serde`, which would bring serde.
-blaze-format = { path = "../blaze-format" }
+blaze-format.workspace = true
 # By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
 # which a member's entry cannot turn off.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]

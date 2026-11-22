@@ -101,7 +101,7 @@ fn trait_const_has_one_value_per_instance() {
             .map(|d| d.key)
             .unwrap_or_else(|| panic!("`{name}` from the crate root"))
     };
-    let mut key = |ns: Namespace, n: &str| front.keys.item(lib(ns, n)).unwrap_or_else(|e| panic!("{n}'s key: {e:?}"));
+    let key = |ns: Namespace, n: &str| front.keys.item(lib(ns, n)).unwrap_or_else(|e| panic!("{n}'s key: {e:?}"));
     let [s, out_kind, clock_kind, selected, out_name, manifest] =
         ["S", "OUT_KIND", "CLOCK_KIND", "SELECTED", "OUT_NAME", "MANIFEST"].map(|n| key(Namespace::Values, n));
     let [tr, a, b, grant, out, clock] = ["Tr", "A", "B", "Grant", "Out", "Clock"].map(|n| key(Namespace::Types, n));

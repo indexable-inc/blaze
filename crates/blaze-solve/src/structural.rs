@@ -31,9 +31,10 @@ use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{BuiltinSource, Cand, Cx, Rule as CandRule, Step};
 use crate::builtin::{
-    add_constituent_goals, adt_fields, cand, certain, is_ty_var, malformed, require_lang, seeded, trait_pred, usize_ty,
+    adt_fields, cand, certain, is_ty_var, malformed, require_lang, seeded, trait_pred, usize_ty,
 };
-use crate::error::Stop;
+use crate::why_no::Reach;
+use crate::error::{ParamHead, Stop};
 use crate::facts::{AdtFlags, Facts, TraitDef};
 use crate::term::{
     AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, Polarity, Pred, Shape, Ty, TyKind, TypingMode, UintTy, Var, VarKind,
@@ -196,6 +197,9 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
 /// search graph answers.
 fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<Step, Stop> {
     let mut tys: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
+    // What each constituent is of the self type (why_no.rs `Reach`), beside `tys`: a field's
+    // index, a tuple's element; one per type, pushed where the type is.
+    let mut reach: Vec<Reach, Alloc<'_>> = Vec::new_in(cx.alloc);
     match cx.kind(cand.a) {
         TyKind::Uint(_)
         | TyKind::Int(_)
@@ -211,24 +215,32 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
         TyKind::Str => {
             let u8_ = cx.mk(TyKind::Uint(UintTy::U8))?;
             tys.push(cx.mk(TyKind::Slice(u8_))?);
+            reach.push(Reach::Pointee);
         }
         // A pattern type holds its base's bits (typeck.md "Pattern types").
-        TyKind::RawPtr(e, _) | TyKind::Ref(_, e, _) | TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Pat(e, _) => tys.push(e),
-        TyKind::Tuple(l) => tys.extend_from_slice(&cx.list(l)),
-        // The closure's tupled upvars.
-        TyKind::Closure(_, args) => {
-            if args.len < 3 {
-                return Err(malformed());
+        TyKind::RawPtr(e, _) | TyKind::Ref(_, e, _) | TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Pat(e, _) => {
+            tys.push(e);
+            reach.push(Reach::Pointee);
+        }
+        TyKind::Tuple(l) => {
+            tys.extend_from_slice(&cx.list(l));
+            for i in 0..l.len {
+                reach.push(Reach::Element(i));
             }
-            tys.push(cx.arg(args, args.len - 1));
+        }
+        // The closure's tupled upvars.
+        TyKind::Closure(def, args) => {
+            tys.push(crate::builtin::closure_upvars(cx, def, args)?);
+            reach.push(Reach::Captures);
         }
         // An async block's future: its interior, the tuple of its captures and the values it
         // holds across an `.await` (rustc's upvars and witness in one).
         TyKind::Coroutine(_, args) => {
-            if args.len != 2 {
+            if args.len < 2 {
                 return Err(malformed());
             }
             tys.push(cx.arg(args, 1));
+            reach.push(Reach::Interior);
         }
         TyKind::Adt(d, args) => {
             let adt = cx.adt(d)?;
@@ -237,6 +249,7 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
                     return Err(malformed());
                 }
                 tys.push(cx.arg(args, 0));
+                reach.push(Reach::Phantom);
             } else if let Some(row) = adt_summary(cx, d, cand.d)? {
                 // The fields by the ADT's summary (auto_summary.rs): its parameters' goals,
                 // and the goals of the fields it does not see through.
@@ -252,27 +265,43 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
                         return Err(malformed());
                     }
                     tys.push(cx.arg(args, i));
+                    reach.push(Reach::AdtArg(i));
                 }
                 cx.scratch.stats.adt_fields += opaque.len() as u64;
                 for &j in opaque.iter() {
                     let Some(&f) = adt.fields.get(j as usize) else { return Err(malformed()) };
-                    tys.push(cx.import(adt.portable, f, args)?);
+                    tys.push(cx.import_head(ParamHead::Field { adt: d, field: j }, adt.portable, f, args)?);
+                    reach.push(Reach::Field(j));
                 }
             } else {
+                // Every field, in the ADT's order (`adt_fields`).
+                let lo = tys.len();
                 adt_fields(cx, d, args, &mut tys)?;
+                for j in 0..(tys.len() - lo) {
+                    reach.push(Reach::Field(j as u32));
+                }
             }
         }
         // `type_of(opaque).instantiate(args)`: the hidden type. Outside the defining scope the
         // world does not give it yet (`OpaqueDef::hidden` is `None`): ambiguous until it does.
         TyKind::Alias(_, AliasKind::Opaque, d, args) => {
-            let op = cx.opaque(d)?;
+            let op = cx.opaque_hidden(d)?;
             let Some(h) = op.hidden else { return Ok(Step::Done(Certainty::Ambiguous)) };
             tys.push(cx.import(op.portable, h, args)?);
+            reach.push(Reach::Hidden);
         }
         // Disqualified in assembly ("panic!(unexpected type)").
         _ => return Err(malformed()),
     }
-    add_constituent_goals(cx, cand.d, &tys)?;
+    // One reach per type by construction above; a mismatch is the rule's own bug.
+    if reach.len() != tys.len() {
+        return Err(malformed());
+    }
+    // `add_constituent_goals`, each goal with what it is of the self type.
+    for (&t, &r) in tys.iter().zip(reach.iter()) {
+        let p = trait_pred(cx, cand.d, &[t])?;
+        cx.add_from(GoalSource::ImplWhereBound, p, r);
+    }
     Ok(Step::Done(Certainty::Yes))
 }
 
@@ -390,7 +419,7 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
         // wf.rs: "ty::Coroutine(did, args) => { .. Only check the upvar types for WF .. }": the
         // interior here.
         TyKind::Coroutine(_, args) => {
-            if args.len != 2 {
+            if args.len < 2 {
                 return Err(malformed());
             }
             kids.push(cx.arg(args, 1));
@@ -431,7 +460,7 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
             for &p in td.where_clauses {
                 preds.push(cx.import_pred(td.portable, p, trait_args)?);
             }
-            let Some(at) = td.assoc.iter().find(|x| x.def == d) else { return Err(malformed()) };
+            let Some(at) = td.assoc.iter().find(|x| x.def == d) else { return Err(crate::alias::member_not_filed(tr, d)) };
             let (start, len) = (at.bounds_start as usize, at.bounds_len as usize);
             let Some(bounds) = td.item_bounds.get(start..start + len) else { return Err(malformed()) };
             for &p in bounds {

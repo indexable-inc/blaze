@@ -19,10 +19,10 @@
 use alloc::{string::String, vec::Vec};
 use core::time::Duration;
 
-pub use blaze_core::linked::{BorrowedFd, Ended};
+pub use blaze_core::linked::{BorrowedFd, Exit, Waited};
 use blaze_core::{
     Command, Sandbox,
-    linked::{Link, LinkError, LinkedChild},
+    linked::{Link, LinkError, Piped},
     wait::Deadline,
 };
 
@@ -67,10 +67,12 @@ pub struct Spawner {
     io: Io,
 }
 
-/// A started child, until it has ended and been waited for or its group killed. Dropped
-/// before that, its group is killed and it is reaped (blaze-core's `LinkedChild`).
+/// A started child, running while this value lives: a wait that sees its end, and its group's
+/// kill, take it. Dropped before that, its group is killed and it is reaped (blaze-core's
+/// `LinkedChild`). Its output and error pipes are held, unread, as long as it is.
 pub struct Linked {
-    child: LinkedChild,
+    /// The child and its two pipes (held, not read).
+    piped: Piped,
     io: Io,
 }
 
@@ -113,7 +115,7 @@ impl Spawner {
         };
         let link = Link { inherit: spec.inherit, own_group: spec.own_group };
         match blaze_core::linked::start_linked(&command, &link) {
-            Ok(child) => Ok(Linked { child, io: self.io.clone() }),
+            Ok(piped) => Ok(Linked { piped, io: self.io.clone() }),
             Err(error) => Err(refuse(Refused::Host(error.op.what()))),
         }
     }
@@ -122,43 +124,45 @@ impl Spawner {
 impl Linked {
     /// Its process id; also its group's where it leads one.
     pub fn id(&self) -> ProcId {
-        ProcId(self.child.pid())
+        ProcId(self.piped.child.pid())
     }
 
-    /// Waits until it ends or `deadline` (on the driver's clock) passes: how it ended, or
-    /// [`Ended::Deadline`] with it still running. Where the task's deadline is earlier and
-    /// passes first, the wait stops with [`Stopped::Deadline`].
-    pub fn wait_until(&self, cx: &Cx, deadline: Deadline) -> Result<Ended, ProcsError> {
+    /// Waits until it ends or `deadline` (on the driver's clock) passes: how it ended (it is
+    /// reaped and gone), or the child back, still running. Where the task's deadline is earlier
+    /// and passes first, the wait stops with [`Stopped::Deadline`] (the child dropped: killed).
+    pub fn wait_until(self, cx: &Cx, deadline: Deadline) -> Result<Waited<Linked>, ProcsError> {
         let task = cx.deadline();
         let until = deadline.min(task);
-        match self.child.wait_until_on(until, &DriverClock(&self.io)) {
-            Ok(Ended::Deadline) if until < deadline => Err(self.refuse(
-                ProcsOp::WaitLinked,
-                Refused::Stopped(Stopped::Deadline { span: WAIT_SPAN, at: until.get() }),
-            )),
-            Ok(ended) => Ok(ended),
-            Err(error) => Err(self.refused(ProcsOp::WaitLinked, &error)),
+        let proc = Some(self.id());
+        let refuse = |kind| ProcsError { op: ProcsOp::WaitLinked, proc, kind };
+        let Linked { piped: Piped { child, stdout, stderr }, io } = self;
+        match child.wait_until_on(until, &DriverClock(&io)) {
+            Ok(Waited::Running(_)) if until < deadline => {
+                Err(refuse(Refused::Stopped(Stopped::Deadline { span: WAIT_SPAN, at: until.get() })))
+            }
+            Ok(Waited::Running(child)) => Ok(Waited::Running(Linked { piped: Piped { child, stdout, stderr }, io })),
+            Ok(Waited::Ended(exit)) => Ok(Waited::Ended(exit)),
+            Err(error) => Err(refuse(refused(&error))),
         }
     }
 
-    /// `SIGKILL` to its whole group, then its reap: nothing it started is left.
-    pub fn kill_group(&self, cx: &Cx) -> Result<(), ProcsError> {
+    /// `SIGKILL` to its whole group, then its reap: nothing it started is left, and how the
+    /// leader ended.
+    pub fn kill_group(self, cx: &Cx) -> Result<Exit, ProcsError> {
         let _ = cx;
-        self.child.kill_group().map_err(|error| self.refused(ProcsOp::KillGroup, &error))
+        let proc = Some(self.id());
+        self.piped.child.kill_group().map_err(|error| ProcsError { op: ProcsOp::KillGroup, proc, kind: refused(&error) })
     }
+}
 
-    fn refuse(&self, op: ProcsOp, kind: Refused) -> ProcsError {
-        ProcsError { op, proc: Some(self.id()), kind }
-    }
-
-    fn refused(&self, op: ProcsOp, error: &LinkError) -> ProcsError {
-        self.refuse(op, Refused::Host(error.op.what()))
-    }
+/// What blaze-core refused or failed, in its words.
+fn refused(error: &LinkError) -> Refused {
+    Refused::Host(error.op.what())
 }
 
 impl core::fmt::Debug for Linked {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Linked({})", self.child.pid())
+        write!(f, "Linked({})", self.piped.child.pid())
     }
 }
 

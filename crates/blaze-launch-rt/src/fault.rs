@@ -37,11 +37,7 @@ pub unsafe fn fault<const N: usize>(table: &Table<N>, address: usize) {
         Ok(wrote) => wrote,
         Err(_) => buffer.len(),
     };
-    // SAFETY: a write of `wrote` live bytes of `buffer` to descriptor 2, then the process's
-    // end. Async-signal-safe: `write` and `_exit` both are, and a faulting process that holds
-    // a lock another thread took cannot deadlock through them.
-    unsafe {
-        libc::write(2, buffer.as_ptr().cast(), wrote);
-        libc::_exit(134); // 128 + SIGABRT, as a crash would
-    }
+    // Both operations are async-signal-safe, even if the faulting process holds a lock.
+    let _ = blaze_sys::posix::io::write(blaze_sys::Fd::STDERR, &buffer[..wrote]);
+    blaze_sys::posix::signal::exit_now(134) // 128 + SIGABRT, as a crash would
 }

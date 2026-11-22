@@ -8,7 +8,7 @@ A `const fn` is blaze's pure function: deterministic, touching no mutable state,
 can be computed at compile time, cached by its code and arguments, and trusted to be the same
 on every machine. blaze evaluates constants with its own interpreter
 (`crates/hir-ty-mir/src/mir/eval.rs`) and never asks rustc. Everything the pinned nightly
-(`harness/toolchain`) accepts in const is accepted, and gives the value rustc gives; what goes
+(`pins/toolchain`) accepts in const is accepted, and gives the value rustc gives; what goes
 further is an extension a workspace opts into.
 
 ## Const traits, closures and std's const impls

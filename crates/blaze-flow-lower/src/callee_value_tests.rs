@@ -3,46 +3,111 @@
 //! called twice, and a closure of this body whose result holds its capture (callee_value.rs).
 //!
 //! Each body is a small fn of the fixture world, type-checked by the real checker, lowered and
-//! checked by blaze-flow (`findings_with`, which takes the process heap: the shared helper of
-//! tests.rs, listed in the lane's report). The world's lists of clauses are the fixture's own
-//! `std` vectors (`Fx::func` takes one).
+//! checked by blaze-flow (tests.rs `findings_laid`: the heads' region facts declared by hand and
+//! laid in the body's record, region_fixture.rs, D148). The world's lists of clauses are the
+//! fixture's own `std` vectors (`Fx::func` takes one).
 
 use blaze_typeck::fixture::{Bb, Fx};
 use blaze_typeck::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, Name, PClause, PNode, PTy, PatId};
 
-use crate::tests::{Sigs, Wide, findings_with};
-use crate::{AdtFacts, CalleeFacts, Facts, Form, Plant, Refusal, Requirement, SigLife};
+use crate::region_fixture::{BOUND1, Decls, FnHead, P0};
+use crate::tests::{Declared, Sigs, Wide, findings_laid};
+use crate::{AdtFacts, CalleeFacts, Facts, Form, Plant, Refusal, Requirement, UnreadWhy};
 
-/// The fixtures' facts (tests.rs [`Wide`]: closures lowered, signatures read from text) with the
-/// owner's text ([`Facts::own_text`]) and one closure's requirements
-/// ([`Facts::closure_requirements`]).
+/// The fixtures' facts (tests.rs [`Wide`]: closures lowered, the heads' region facts declared)
+/// with one closure's requirements ([`Facts::closure_requirements`]).
 pub(crate) struct Lane {
     pub(crate) wide: Wide,
-    /// The owner's text; empty: not known.
-    pub(crate) own: &'static str,
     /// The closure expression `reqs` are for.
     pub(crate) closure: Option<ExprId>,
     pub(crate) reqs: &'static [Requirement],
 }
 
 impl Lane {
+    /// No head declared.
     pub(crate) fn new() -> Lane {
-        Lane { wide: Wide { sigs: Sigs::new(), life: None }, own: "", closure: None, reqs: &[] }
+        Lane { wide: Wide { sigs: Sigs::new(), life: None }, closure: None, reqs: &[] }
+    }
+
+    /// The heads of `w`'s `g`, `m` and `h` declared ([`World`]).
+    pub(crate) fn of(w: &World) -> Lane {
+        let mut lane = Lane::new();
+        // `fn g(_: &S)` and `fn m(_: &mut S)`: one elided input lifetime `P0`, late-bound.
+        lane.wide.add(w.g, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rs], output: w.unit, slots: &[P0] });
+        lane.wide.add(w.m, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rms], output: w.unit, slots: &[P0] });
+        // `fn h(_: S)`: no lifetime.
+        lane.wide.add(w.h, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[w.st], output: w.unit, slots: &[] });
+        lane
+    }
+}
+
+impl Declared for Lane {
+    fn decls(&self) -> &Decls {
+        self.wide.decls()
     }
 }
 
 impl Facts for Lane {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         self.wide.adt(k)
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
         self.wide.callee(k)
-    }
-    fn sig(&self, item: ItemKey) -> Option<SigLife<'_>> {
-        self.wide.sig(item)
-    }
-    fn own_text(&self) -> Option<&str> {
-        if self.own.is_empty() { None } else { Some(self.own) }
     }
     fn closure_bodies_checked(&self) -> bool {
         true
@@ -67,12 +132,16 @@ pub(crate) fn no_clauses() -> std::vec::Vec<PClause> {
 }
 
 /// `struct S;` with `Copy` known (so `&S` is `Copy` and a `move` of `S` is a move), and
-/// `fn g(_: &S)`, `fn m(_: &mut S)`, `fn h(_: S)`.
+/// `fn g(_: &S)`, `fn m(_: &mut S)`, `fn h(_: S)` (their heads: [`Lane::of`]).
 pub(crate) struct World {
     pub(crate) fx: Fx,
     pub(crate) st: PTy,
     pub(crate) rs: PTy,
+    pub(crate) rms: PTy,
     pub(crate) unit: PTy,
+    pub(crate) g: ItemKey,
+    pub(crate) m: ItemKey,
+    pub(crate) h: ItemKey,
 }
 
 /// The world, with `owners(fx, st, rs, unit)` declaring the owners before it is finished.
@@ -95,12 +164,12 @@ pub(crate) fn world_with(owners: impl FnOnce(&mut Fx, PTy, PTy, PTy)) -> World {
     let p0 = fx.param(0);
     let ref_t = fx.r(Mutbl::Not, p0);
     let _ = fx.imp("impl<T: ?Sized> Copy for &T {}", 1, ref_t, Some((copy, &[])), &[], no_clauses());
-    let _ = fx.func("g", 0, &[rs], unit, no_clauses());
-    let _ = fx.func("m", 0, &[rms], unit, no_clauses());
-    let _ = fx.func("h", 0, &[st], unit, no_clauses());
+    let g = fx.func("g", 0, &[rs], unit, no_clauses());
+    let m = fx.func("m", 0, &[rms], unit, no_clauses());
+    let h = fx.func("h", 0, &[st], unit, no_clauses());
     owners(&mut fx, st, rs, unit);
     fx.finish();
-    World { fx, st, rs, unit }
+    World { fx, st, rs, rms, unit, g, m, h }
 }
 
 /// `name(local)`.
@@ -123,8 +192,9 @@ pub(crate) fn call_ref(b: &mut Bb, name: &str, m: Mutbl, arg: PatId) -> ExprId {
 /// `fn f(p: fn(&S) -> &S, s: S) { let r = p(&s); g(r); m(&mut s); }` is right (the result is
 /// dead when `s` is borrowed mutably). Its negative, `.. let r = p(&s); m(&mut s); g(r); }`,
 /// mutates `s` while the result holds its loan: rustc E0502, here `Invalidated`. Without the
-/// owner's text the pointer's lifetimes are not known: refused by name (`CalleeValueUnknown`),
-/// never accepted.
+/// owner's head regions the pointer's lifetimes are not known: refused by name (D148:
+/// `RegionsUnread { item: f, NoHead }`, where the text's absence was `CalleeValueUnknown`), never
+/// accepted.
 /// Prints: `fn pointer result late: ["borrow Invalidated ..` and `fn pointer result early: []`.
 #[test]
 fn a_fn_pointer_result_is_a_loan_used_after_mutation() {
@@ -135,7 +205,9 @@ fn a_fn_pointer_result_is_a_loan_used_after_mutation() {
         owner = Some((fx.func("f", 0, &[fp, st], unit, no_clauses()), fp));
     });
     let (f, fp) = owner.expect("declared");
-    let text = "fn f(p: fn(&S) -> &S, s: S) { let r = p(&s); m(&mut s); g(r); }";
+    // `fn f(p: fn(&S) -> &S, s: S)`: no lifetime of its own; the pointer's input and output are
+    // its binder's (binder 1, the signature's root is 0; elision in the pointer's type).
+    let f_head = FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[fp, w.st], output: w.unit, slots: &[BOUND1, BOUND1] };
     for late in [false, true] {
         let mut b = Bb::new();
         let (pp, ps) = (b.param("p"), b.param("s"));
@@ -150,10 +222,9 @@ fn a_fn_pointer_result_is_a_loan_used_after_mutation() {
         let mutate = call_ref(&mut b, "m", Mutbl::Mut, ps);
         let st_mut = b.semi(mutate);
         let root = if late { b.block(&[st1, st_mut, st_use], None) } else { b.block(&[st1, st_use, st_mut], None) };
-        let mut facts = Lane::new();
-        facts.wide.add(&w.fx, f, text, &[fp, w.st], w.unit);
-        facts.own = text;
-        let got = findings_with(&w.fx, &b, f, root, &facts, Plant::None);
+        let mut facts = Lane::of(&w);
+        facts.wide.add(f, f_head);
+        let got = findings_laid(&w.fx, &b, f, root, &facts, Plant::None);
         std::println!("fn pointer result {}: {got:?}", if late { "late" } else { "early" });
         let got = got.expect("lowered");
         if late {
@@ -161,9 +232,8 @@ fn a_fn_pointer_result_is_a_loan_used_after_mutation() {
         } else {
             assert!(got.is_empty(), "{got:?}");
         }
-        facts.own = "";
-        let unread = findings_with(&w.fx, &b, f, root, &facts, Plant::None);
-        assert!(matches!(unread, Err(Refusal { form: Form::CalleeValueUnknown, .. })), "{unread:?}");
+        let unread = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::None);
+        assert!(matches!(unread, Err(Refusal { form: Form::RegionsUnread { item, why: UnreadWhy::NoHead }, .. }) if item == f), "{unread:?}");
     }
 }
 
@@ -203,7 +273,7 @@ fn an_fn_mut_called_while_borrowed() {
             let (st2, st3) = (b.semi(c1), b.semi(c2));
             b.block(&[st1, st2, st3], None)
         };
-        let got = findings_with(&w.fx, &b, f, root, &Lane::new(), Plant::None);
+        let got = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::None);
         std::println!("fn mut {}: {got:?}", if borrowed { "while borrowed" } else { "twice" });
         let got = got.expect("lowered");
         if borrowed {
@@ -242,7 +312,7 @@ fn an_fn_once_called_twice() {
         } else {
             b.block(&[st1, st2], None)
         };
-        let got = findings_with(&w.fx, &b, f, root, &Lane::new(), Plant::None);
+        let got = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::None);
         std::println!("fn once {}: {got:?}", if twice { "twice" } else { "once" });
         let got = got.expect("lowered");
         assert_eq!(got.iter().any(|l| l.starts_with("move ")), twice, "{got:?}");
@@ -255,10 +325,12 @@ fn an_fn_once_called_twice() {
 /// A closure of this body whose result is a borrow of its capture (callee_value.rs): `fn f(s:
 /// S) { let c = || &s; let r = c(); g(r); m(&mut s); }` is right. Its negative, `.. let r =
 /// c(); m(&mut s); g(r); }`, mutates `s` while `r` holds the capture's loan: rustc E0502, here
-/// `Invalidated`. CONTROL (rule 23): `Plant::ClosureCallUnrelated` relates nothing into the
-/// result, and the negative is accepted. Before this piece the call was refused
-/// (`CalleeValueUnknown`: the callee is no body parameter).
-/// Prints: `closure result late: ["borrow Invalidated ..`, `closure result early: []` and
+/// refused by the stricter relation's name (`ClosureValueCall`), never a pass. CONTROL (rule
+/// 23): `Plant::ClosureCallUnrelated` relates nothing into the result, and the negative is
+/// accepted. Before this piece the call was refused (`CalleeValueUnknown`: the callee is no
+/// body parameter). D190 step 3 means the one rule to relate it by the closure's own
+/// signature, so that the negative is a reported `Invalidated` there (not yet tested here).
+/// Prints: `closure result late: Err(.. ClosureValueCall ..)`, `closure result early: Ok([])` and
 /// `closure result late, planted ClosureCallUnrelated: []`.
 #[test]
 fn a_closure_result_holds_its_capture() {
@@ -282,16 +354,22 @@ fn a_closure_result_holds_its_capture() {
         let mutate = call_ref(&mut b, "m", Mutbl::Mut, s);
         let st_mut = b.semi(mutate);
         let root = if late { b.block(&[st1, st2, st_mut, st_use], None) } else { b.block(&[st1, st2, st_use, st_mut], None) };
-        let got = findings_with(&w.fx, &b, f, root, &Lane::new(), Plant::None);
+        let got = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::None);
         std::println!("closure result {}: {got:?}", if late { "late" } else { "early" });
-        let got = got.expect("lowered");
         if late {
-            assert!(got.iter().any(|l| l.starts_with("borrow Invalidated")), "{got:?}");
-            let planted = findings_with(&w.fx, &b, f, root, &Lane::new(), Plant::ClosureCallUnrelated);
+            // The call relates the closure's value positions to the result's all ways
+            // (callee_value.rs, noted `ClosureValueCall`: stricter than the closure's own
+            // signature); the E0502 it finds cannot be told from that relation's artifact, so
+            // the body is refused by the relation's name: never reported, never a pass (the
+            // coarse-relations rule, `Lowered::coarse`).
+            assert!(matches!(got, Err(Refusal { form: Form::Unified { why: crate::Unified::ClosureValueCall }, .. })), "{got:?}");
+            let planted = findings_laid(&w.fx, &b, f, root, &Lane::of(&w), Plant::ClosureCallUnrelated);
             std::println!("closure result late, planted ClosureCallUnrelated: {planted:?}");
             assert!(planted.as_ref().is_ok_and(|p| p.is_empty()), "{planted:?}");
         } else {
-            assert!(got.is_empty(), "{got:?}");
+            // THE CLEAN TWIN: `g(r)` before `m(&mut s)`: no finding under the stricter
+            // relation, so none under Rust's: checked clean, never refused up front.
+            assert_eq!(got, Ok(std::vec::Vec::new()), "{got:?}");
         }
     }
 }

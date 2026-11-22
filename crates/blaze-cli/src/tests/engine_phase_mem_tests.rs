@@ -24,7 +24,6 @@
 
 use super::*;
 
-use core::fmt::Write as _;
 
 use blaze_own::FixedString;
 

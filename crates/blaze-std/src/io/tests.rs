@@ -330,6 +330,44 @@ fn a_lent_write_copies_nothing_natively() {
     println!("lent writes: {copies} copies natively, {queued} in the simulation's queue; the bytes equal");
 }
 
+/// `File::read_all` read straight into `into` (`Io::read_all_lent`) answers as the queued
+/// `Effect::ReadAll` does: the same bytes after what `into` held, for a file of 0, 1, 4095,
+/// 4096 and 70,001 bytes; and it went inline (the control: the switched-off world made no
+/// inline call, so the two routes really are two).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_whole_read_is_lent_natively_and_equals_the_queued_one() {
+    let (one, two) = (
+        blaze_core::temp::TempDir::for_test("bstd-whole-queued-"),
+        blaze_core::temp::TempDir::for_test("bstd-whole-lent-"),
+    );
+    let (queued, lent) = (native(&one), native(&two));
+    queued.queued_only(true);
+    for (n, len) in [0usize, 1, 4095, 4096, 70_001].into_iter().enumerate() {
+        let data: Vec<u8> = (0..len as u32).map(|it| (it * 13 % 251) as u8).collect();
+        let mut got = Vec::new();
+        for io in [&queued, &lent] {
+            let cx = root(io);
+            let top = io.need_fs().expect("a world with files").root();
+            let name = path(&format!("whole-{n}"));
+            top.publish(&cx, &name, crate::fs::Content::bytes(&data), crate::fs::Durable::No).expect("the file is written");
+            let file = top.open_read(&cx, &name).expect("the file is opened");
+            let mut into = cx.bytes();
+            into.try_extend(b"pre").expect("room for the prefix");
+            let read = file.read_all(&cx, &mut into).expect("the whole read");
+            assert_eq!(read, len, "read_all says it read the file's {len} bytes");
+            got.push(into.as_slice().to_vec());
+        }
+        assert_eq!(got[0], got[1], "a {len}-byte file: the lent read and the queued read differ");
+        assert_eq!(&got[1][..3], b"pre", "what `into` held is kept");
+        assert_eq!(&got[1][3..], &data[..], "a {len}-byte file read whole");
+    }
+    let counted = |io: &Io| io.seen().map_or(0, |seen| seen.inline.load(Ordering::Relaxed));
+    assert_eq!(counted(&queued), 0, "the switched-off world made calls inline");
+    assert!(counted(&lent) >= 5, "the whole reads did not go inline");
+    println!("whole reads: 5 lengths, lent and queued equal; {} calls inline", counted(&lent));
+}
+
 #[test]
 fn a_lent_append_is_torn_by_a_crash_as_the_model_says() {
     let durable: Vec<u8> = vec![9; 700];

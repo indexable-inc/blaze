@@ -578,9 +578,20 @@ pub struct Body<A: Allocator> {
     pub(crate) tys: Vec<TyWords, A>,
     /// The overlay's list entries (type handles), the lists its types name.
     pub(crate) ty_lists: Vec<u32, A>,
+    /// The record table this body's type handles index, as [`crate::kept::TableId::of`]
+    /// names it: set by [`crate::BodyBuilder::new_with_types_in`], `None` for a body built
+    /// or parsed without one. Not part of the body record's bytes (record.rs): the kept
+    /// record (kept.rs) writes it beside the table, and refuses a body against another.
+    pub(crate) table: Option<crate::kept::TableId>,
 }
 
 impl<A: Allocator> Body<A> {
+    /// The record table this body was built against ([`crate::kept::TableId`]); `None` when
+    /// it was built or parsed without one.
+    pub fn table(&self) -> Option<crate::kept::TableId> {
+        self.table
+    }
+
     /// The body's reader.
     pub fn view(&self) -> BodyRef<'_> {
         BodyRef {

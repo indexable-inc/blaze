@@ -6,14 +6,15 @@ use blaze_manifest::layout::DepKind;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, BTreeMap, String, Vec};
 
-use crate::input::{Ask, CfgAtom, DepSource, FeatureValue, Package, Resolver, TargetDesc};
-use crate::extra::has_test_cfg;
-use crate::{Pass, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
+use crate::input::{Ask, Bin, CfgAtom, DepSource, FeatureValue, Lib, Package, Resolver, TargetDesc};
+use crate::extra::{Extra, has_test_cfg};
+use crate::{Pass, PartialGraph, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
 
 /// An answer to a [`Pass::Need`].
 pub(crate) enum Answer<'a> {
     Pending,
-    /// No manifest on disk for it: listed in [`UnitGraph::unavailable`], never guessed.
+    /// No manifest on disk for it: never guessed; a walk that reaches it ends
+    /// [`Pass::Partial`], naming it.
     Unavailable,
     Read(Package<'a>),
 }
@@ -496,6 +497,57 @@ impl<'l, 'a> Resolution<'l, 'a> {
         Ok(())
     }
 
+    /// Whether every `required-features` entry of the root `id`'s binary `bin` is on, by the
+    /// fixpoint's features of the root's target node (the Cargo Book, "Cargo Targets", "The
+    /// `required-features` field": a feature of the package, or `dep/feature`, which holds when
+    /// the dependency is on with that feature). A name the package lacks is the package's
+    /// error, never a skip. A dependency whose facts are not answered keeps the binary: the
+    /// walk reports that package as needed or unavailable.
+    fn required_on<'s>(&'s self, st: &State<'s, 'a>, id: LockId, package: &Package<'a>, bin: &Bin<'a>) -> Result<bool, UnitError<'a>> {
+        let n = node(id, Side::Target) as usize;
+        let asked_by = || {
+            let mut by = String::new_in(self.alloc);
+            by.push_str("the required-features of bin ");
+            by.push_str(bin.name.as_str());
+            by
+        };
+        for text in bin.required_features.iter() {
+            let Some((dep_key, feature)) = text.as_str().split_once('/') else {
+                match package.feature(text.as_str()) {
+                    Some(f) if get(&st.feats[n], f) => continue,
+                    Some(_) => return Ok(false),
+                    None => return Err(UnitError::NoSuchFeature { package: package.name.clone(), feature: text.clone(), asked_by: asked_by() }),
+                }
+            };
+            let mut named = false;
+            let mut on = false;
+            for (e, dep) in package.deps.iter().enumerate() {
+                if dep.key.as_str() != dep_key || dep.kind != DepKind::Normal {
+                    continue;
+                }
+                named = true;
+                let (on_target, _) = self.holds[id.index()][e];
+                if !on_target || (dep.optional && !get(&st.active[n], e)) {
+                    continue;
+                }
+                let child_id = self.locked(id, package, e)?;
+                let Answer::Read(child) = &self.answers[child_id.index()] else { return Ok(true) };
+                let Some(f) = child.feature(feature) else {
+                    return Err(UnitError::NoSuchFeature { package: child.name.clone(), feature: own(feature, self.alloc), asked_by: asked_by() });
+                };
+                let cn = node(child_id, self.fside(self.child_side(Side::Target, dep.kind, child))) as usize;
+                on |= get(&st.feats[cn], f);
+            }
+            if !named {
+                return Err(UnitError::NoSuchDependency { package: package.name.clone(), dep: own(dep_key, self.alloc) });
+            }
+            if !on {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// The units, walked from the roots.
     fn units<'s>(&'s self, st: &State<'s, 'a>) -> Result<Pass<'a>, UnitError<'a>> {
         let alloc = self.alloc;
@@ -503,25 +555,28 @@ impl<'l, 'a> Resolution<'l, 'a> {
         let mut unavailable: AVec<'a, LockId> = Vec::new_in(alloc);
         let mut keys: AVec<'a, Key> = Vec::new_in(alloc);
         let mut index: BTreeMap<Key, u32, Alloc<'a>> = BTreeMap::new_in(alloc);
-        let mut tmp: AVec<'a, Tmp<'a>> = Vec::new_in(alloc);
-        let add = |key: Key, keys: &mut AVec<'a, Key>, index: &mut BTreeMap<Key, u32, Alloc<'a>>, tmp: &mut AVec<'a, Tmp<'a>>| -> u32 {
+        let mut tmp: AVec<'a, Tmp<'s, 'a>> = Vec::new_in(alloc);
+        // Each unit is added as the target it compiles (finding 9): its key's kind is the
+        // target's, and its crate name and root are made from it, never an empty text for a
+        // kind its package lacks.
+        let add = |id: LockId, target: Target<'s, 'a>, platform: Side, fside: Side, keys: &mut AVec<'a, Key>, index: &mut BTreeMap<Key, u32, Alloc<'a>>, tmp: &mut AVec<'a, Tmp<'s, 'a>>| -> u32 {
+            let key = Key::new(id, target.kind(), target.idx(), platform, fside);
             if let Some(&at) = index.get(&key) {
                 return at;
             }
             let at = keys.len() as u32;
             keys.push(key);
             index.insert(key, at);
-            tmp.push(Tmp { deps: Vec::new_in(alloc), build_script: None, incomplete: false });
+            tmp.push(Tmp { target, deps: Vec::new_in(alloc), build_script: None });
             at
         };
         for &root in self.ask.roots.iter() {
             let Answer::Read(package) = &self.answers[root.index()] else { return Err(UnitError::RootUnanswered { root }) };
             if let Some(lib) = &package.lib {
-                let key = match lib.proc_macro {
-                    true => Key::new(root, Kind::ProcMacro, 0, Side::Host, self.fside(Side::Host)),
-                    false => Key::new(root, Kind::Lib, 0, Side::Target, Side::Target),
+                match lib.proc_macro {
+                    true => add(root, Target::ProcMacro(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
+                    false => add(root, Target::Lib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
                 };
-                add(key, &mut keys, &mut index, &mut tmp);
                 if self.ask.tests {
                     // A proc-macro library's test harness is that library's target compiled as a
                     // test, so it is built for the host and resolves its dependencies' features
@@ -531,17 +586,25 @@ impl<'l, 'a> Resolution<'l, 'a> {
                     // target's unified features: tempo's `tempo-precompiles-macros` harness then
                     // reached `alloy-primitives` with the node's `asm-keccak`, and the macro side
                     // was asked to run sha3-asm's native build script (check-g044908).
-                    let test = match lib.proc_macro {
-                        true => Key::new(root, Kind::TestLib, 0, Side::Host, self.fside(Side::Host)),
-                        false => Key::new(root, Kind::TestLib, 0, Side::Target, Side::Target),
+                    match lib.proc_macro {
+                        true => add(root, Target::TestLib(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
+                        false => add(root, Target::TestLib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
                     };
-                    add(test, &mut keys, &mut index, &mut tmp);
                 }
             }
             for i in 0..package.bins.len() as u32 {
-                add(Key::new(root, Kind::Bin, i, Side::Target, Side::Target), &mut keys, &mut index, &mut tmp);
+                // A binary whose `required-features` are not all on is skipped, its test unit
+                // with it (the Cargo Book, "Cargo Targets", "The `required-features` field":
+                // "If any of the required features are not enabled, the target will be
+                // skipped."). Checked anyway, tempo's `tempo-localnet` (`required-features =
+                // ["localnet"]`, `localnet = ["dep:nix"]`) was three false "cannot find `nix`".
+                if !self.required_on(st, root, package, &package.bins[i as usize])? {
+                    continue;
+                }
+                let bin = &package.bins[i as usize];
+                add(root, Target::Bin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
                 if self.ask.tests {
-                    add(Key::new(root, Kind::TestBin, i, Side::Target, Side::Target), &mut keys, &mut index, &mut tmp);
+                    add(root, Target::TestBin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
                 }
             }
             // Integration tests, examples and benches: by the same switch as the library's
@@ -549,8 +612,8 @@ impl<'l, 'a> Resolution<'l, 'a> {
             // Roots only: a dependency's layout lists none of these (the layout reads them only
             // with `with_test_targets`, for the workspace the user builds).
             if self.ask.tests {
-                for i in 0..package.extras.len() as u32 {
-                    add(Key::new(root, Kind::Extra, i, Side::Target, Side::Target), &mut keys, &mut index, &mut tmp);
+                for (i, extra) in package.extras.iter().enumerate() {
+                    add(root, Target::Extra(i as u32, extra), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
                 }
             }
         }
@@ -563,7 +626,6 @@ impl<'l, 'a> Resolution<'l, 'a> {
             let Answer::Read(package) = &self.answers[id.index()] else { continue };
             let n = node(id, key.fside);
             let mut deps: AVec<'a, (Text<'a>, u32)> = Vec::new_in(alloc);
-            let mut incomplete = false;
             for (e, dep) in package.deps.iter().enumerate() {
                 let wanted = match key.kind {
                     Kind::BuildScript => dep.kind == DepKind::Build,
@@ -585,7 +647,6 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 let child = match &self.answers[child_id.index()] {
                     Answer::Read(child) => child,
                     Answer::Unavailable => {
-                        incomplete = true;
                         unavailable.push(child_id);
                         continue;
                     }
@@ -599,15 +660,14 @@ impl<'l, 'a> Resolution<'l, 'a> {
                     true => Side::Host,
                     false => key.platform,
                 };
-                let ckey = match lib.proc_macro {
-                    true => Key::new(child_id, Kind::ProcMacro, 0, Side::Host, self.fside(Side::Host)),
-                    false => Key::new(child_id, Kind::Lib, 0, platform, self.fside(platform)),
-                };
                 let name = match dep.renamed() {
                     true => underscored(&dep.key, alloc),
                     false => lib.crate_name.clone(),
                 };
-                let cu = add(ckey, &mut keys, &mut index, &mut tmp);
+                let cu = match lib.proc_macro {
+                    true => add(child_id, Target::ProcMacro(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
+                    false => add(child_id, Target::Lib(lib), platform, self.fside(platform), &mut keys, &mut index, &mut tmp),
+                };
                 deps.push((name, cu));
             }
             // A binary, and an integration test, example or bench, uses its package's plain
@@ -615,25 +675,29 @@ impl<'l, 'a> Resolution<'l, 'a> {
             if matches!(key.kind, Kind::Bin | Kind::TestBin | Kind::Extra)
                 && let Some(lib) = &package.lib
             {
-                let own_lib = match lib.proc_macro {
-                    true => Key::new(id, Kind::ProcMacro, 0, Side::Host, self.fside(Side::Host)),
-                    false => Key::new(id, Kind::Lib, 0, Side::Target, Side::Target),
+                let cu = match lib.proc_macro {
+                    true => add(id, Target::ProcMacro(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
+                    false => add(id, Target::Lib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
                 };
-                let cu = add(own_lib, &mut keys, &mut index, &mut tmp);
                 deps.push((lib.crate_name.clone(), cu));
             }
             let build_script = match (key.kind != Kind::BuildScript, &package.build) {
-                (true, Some(_)) => Some(add(Key::new(id, Kind::BuildScript, 0, Side::Host, key.fside), &mut keys, &mut index, &mut tmp)),
+                (true, Some(script)) => Some(add(id, Target::BuildScript(script), Side::Host, key.fside, &mut keys, &mut index, &mut tmp)),
                 _ => None,
             };
             deps.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
             deps.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-            tmp[at as usize] = Tmp { deps, build_script, incomplete };
+            tmp[at as usize].deps = deps;
+            tmp[at as usize].build_script = build_script;
         }
         if !needs.is_empty() {
             needs.sort_unstable();
             needs.dedup();
             return Ok(Pass::Need(needs));
+        }
+        // A package reached without its manifest: no graph, the missing named (states.md 35).
+        if let Some(partial) = PartialGraph::of(unavailable) {
+            return Ok(Pass::Partial(partial));
         }
         // The order: by package (name, version, source), then kind, then configuration; ids
         // are positions in it, so the bytes do not depend on the lock's order or the walk's.
@@ -659,8 +723,6 @@ impl<'l, 'a> Resolution<'l, 'a> {
             let t = &tmp[old as usize];
             units.push(self.unit(st, key, package, t, &new_id));
         }
-        unavailable.sort_unstable();
-        unavailable.dedup();
         // Each package of a unit with its metadata, once, by id (`UnitGraph::meta`).
         let mut ids: AVec<'a, LockId> = Vec::with_capacity_in(units.len(), alloc);
         ids.extend(units.iter().map(|unit: &Unit<'a>| unit.package));
@@ -672,10 +734,10 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 meta.push((id, package.meta.clone()));
             }
         }
-        Ok(Pass::Done(UnitGraph { units, unavailable, resolver: self.resolver, meta }))
+        Ok(Pass::Done(UnitGraph { units, resolver: self.resolver, meta }))
     }
 
-    fn unit(&self, st: &State<'_, 'a>, key: Key, package: &Package<'a>, t: &Tmp<'a>, new_id: &[u32]) -> Unit<'a> {
+    fn unit(&self, st: &State<'_, 'a>, key: Key, package: &Package<'a>, t: &Tmp<'_, 'a>, new_id: &[u32]) -> Unit<'a> {
         let alloc = self.alloc;
         let id = LockId(key.id);
         let n = node(id, key.fside);
@@ -689,27 +751,19 @@ impl<'l, 'a> Resolution<'l, 'a> {
             Side::Target => self.target,
             Side::Host => self.host,
         };
-        let lib_root = package.lib.as_ref().map(|lib| (&lib.crate_name, &lib.root));
-        let bin = |i: u32| &package.bins[i as usize];
-        let (kind, crate_name, root) = match key.kind {
-            Kind::Lib => (UnitKind::Lib, lib_root.map(|l| l.0.clone()), lib_root.map(|l| l.1.clone())),
-            Kind::ProcMacro => (UnitKind::ProcMacro, lib_root.map(|l| l.0.clone()), lib_root.map(|l| l.1.clone())),
-            Kind::TestLib => (UnitKind::Test { bin: None }, lib_root.map(|l| l.0.clone()), lib_root.map(|l| l.1.clone())),
-            Kind::Bin => (UnitKind::Bin(bin(key.idx).name.clone()), Some(underscored(&bin(key.idx).name, alloc)), Some(bin(key.idx).root.clone())),
-            Kind::TestBin => (
-                UnitKind::Test { bin: Some(bin(key.idx).name.clone()) },
-                Some(underscored(&bin(key.idx).name, alloc)),
-                Some(bin(key.idx).root.clone()),
-            ),
-            Kind::BuildScript => (UnitKind::BuildScript, Some(own("build_script_build", alloc)), package.build.clone()),
-            Kind::Extra => {
-                let extra = &package.extras[key.idx as usize];
-                (extra.unit_kind(), Some(underscored(&extra.name, alloc)), Some(extra.root.clone()))
-            }
+        // The unit's target, added with it (its key's kind is the target's).
+        let (kind, crate_name, root) = match t.target {
+            Target::Lib(lib) => (UnitKind::Lib, lib.crate_name.clone(), lib.root.clone()),
+            Target::ProcMacro(lib) => (UnitKind::ProcMacro, lib.crate_name.clone(), lib.root.clone()),
+            Target::TestLib(lib) => (UnitKind::Test { bin: None }, lib.crate_name.clone(), lib.root.clone()),
+            Target::Bin(_, bin) => (UnitKind::Bin(bin.name.clone()), underscored(&bin.name, alloc), bin.root.clone()),
+            Target::TestBin(_, bin) => (UnitKind::Test { bin: Some(bin.name.clone()) }, underscored(&bin.name, alloc), bin.root.clone()),
+            Target::BuildScript(script) => (UnitKind::BuildScript, own("build_script_build", alloc), script.clone()),
+            Target::Extra(_, extra) => (extra.unit_kind(), underscored(&extra.name, alloc), extra.root.clone()),
         };
         // `test` by the kind: the library's and a binary's test units, and a harnessed
         // integration test or bench (the one rule, also the record's).
-        let cfg = unit_cfg(desc, &features, has_test_cfg(&kind), key.kind == Kind::ProcMacro, alloc);
+        let cfg = unit_cfg(desc, &features, has_test_cfg(&kind), ignores_profile_panic(&kind), key.kind == Kind::ProcMacro, alloc);
         let mut deps = Vec::with_capacity_in(t.deps.len(), alloc);
         for (name, cu) in t.deps.iter() {
             deps.push(UnitDep { name: name.clone(), unit: UnitId(new_id[*cu as usize]) });
@@ -726,14 +780,13 @@ impl<'l, 'a> Resolution<'l, 'a> {
             kind,
             for_host: key.platform == Side::Host,
             edition: package.edition,
-            crate_name: crate_name.unwrap_or_else(|| String::new_in(alloc)),
-            root: root.unwrap_or_else(|| String::new_in(alloc)),
+            crate_name,
+            root,
             features,
             cfg,
             deps,
             build_script: t.build_script.map(|b| UnitId(new_id[b as usize])),
             links: package.links.clone(),
-            incomplete: t.incomplete,
         }
     }
 }
@@ -764,9 +817,22 @@ enum Kind {
 /// `debug_assertions` (`check` builds the dev profile, whose `debug-assertions` is on, build
 /// overrides included), `test` on a test harness and `proc_macro` on a proc macro; sorted.
 /// The one place it is made: the record ([`crate::record`]) holds none and remakes it here.
-pub(crate) fn unit_cfg<'a>(desc: &TargetDesc<'a>, features: &[Text<'a>], test: bool, proc_macro: bool, alloc: Alloc<'a>) -> AVec<'a, CfgAtom<'a>> {
-    let mut cfg = Vec::with_capacity_in(desc.cfg.len() + features.len() + 3, alloc);
-    cfg.extend(desc.cfg.iter().cloned());
+///
+/// `unwinds` ([`ignores_profile_panic`]): the unit is a test or bench, which Cargo builds with
+/// `unwind` whatever the profile says (the Cargo Book, Profiles, `panic`: "Tests, benchmarks,
+/// build scripts, and proc macros ignore the `panic` setting. The `rustc` test harness currently
+/// requires `unwind` behavior"): its `panic` atom is `unwind` in place of the desc's (the
+/// profile's). Seen 2026-11-21: a `[profile.dev] panic = "abort"` workspace's lib-test unit cut
+/// its `#[cfg(panic = "unwind")]` tests and `blaze test` ran 0 (blaze-cli test_command_runs.rs
+/// `runs_both_workspace_packages`).
+pub(crate) fn unit_cfg<'a>(desc: &TargetDesc<'a>, features: &[Text<'a>], test: bool, unwinds: bool, proc_macro: bool, alloc: Alloc<'a>) -> AVec<'a, CfgAtom<'a>> {
+    let mut cfg = Vec::with_capacity_in(desc.cfg.len() + features.len() + 4, alloc);
+    if unwinds {
+        cfg.extend(desc.cfg.iter().filter(|atom| atom.name.as_str() != PANIC_KEY).cloned());
+        cfg.push(CfgAtom::pair(PANIC_KEY, "unwind", alloc));
+    } else {
+        cfg.extend(desc.cfg.iter().cloned());
+    }
     for feature in features.iter() {
         cfg.push(CfgAtom { name: own("feature", alloc), value: Some(feature.clone()) });
     }
@@ -780,6 +846,17 @@ pub(crate) fn unit_cfg<'a>(desc: &TargetDesc<'a>, features: &[Text<'a>], test: b
     cfg.sort();
     cfg.dedup();
     cfg
+}
+
+/// The cfg key of the panic strategy (the Reference, conditional compilation, `panic`;
+/// blaze-world panic.rs reads the same name).
+pub(crate) const PANIC_KEY: &str = "panic";
+
+/// Whether a unit of `kind` ignores the profile's `panic` and unwinds: a test harness (the
+/// library's or a binary's), an integration test or a bench, harnessed or not (Cargo's rule,
+/// quoted at [`unit_cfg`]). The one rule; blaze-world panic.rs `unit_panic` asks it.
+pub fn ignores_profile_panic(kind: &UnitKind<'_>) -> bool {
+    matches!(kind, UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Bench(_))
 }
 
 /// A unit's identity: the package, the target, the platform it is built for and the feature
@@ -799,8 +876,48 @@ impl Key {
     }
 }
 
-struct Tmp<'a> {
+/// The target of the package a unit compiles, borrowed from its facts, with its place among
+/// the package's binaries or extras: what a unit is added as, so its key's kind and its crate
+/// name and root are always the target's (finding 9).
+#[derive(Clone, Copy)]
+enum Target<'s, 'a> {
+    Lib(&'s Lib<'a>),
+    ProcMacro(&'s Lib<'a>),
+    /// The library's test harness.
+    TestLib(&'s Lib<'a>),
+    Bin(u32, &'s Bin<'a>),
+    /// A binary's test harness.
+    TestBin(u32, &'s Bin<'a>),
+    /// The build script's root.
+    BuildScript(&'s Text<'a>),
+    /// An integration test, example or bench.
+    Extra(u32, &'s Extra<'a>),
+}
+
+impl Target<'_, '_> {
+    fn kind(self) -> Kind {
+        match self {
+            Target::Lib(_) => Kind::Lib,
+            Target::ProcMacro(_) => Kind::ProcMacro,
+            Target::TestLib(_) => Kind::TestLib,
+            Target::Bin(..) => Kind::Bin,
+            Target::TestBin(..) => Kind::TestBin,
+            Target::BuildScript(_) => Kind::BuildScript,
+            Target::Extra(..) => Kind::Extra,
+        }
+    }
+
+    /// Its place among the package's binaries or extras; 0 for the one library and script.
+    fn idx(self) -> u32 {
+        match self {
+            Target::Bin(i, _) | Target::TestBin(i, _) | Target::Extra(i, _) => i,
+            Target::Lib(_) | Target::ProcMacro(_) | Target::TestLib(_) | Target::BuildScript(_) => 0,
+        }
+    }
+}
+
+struct Tmp<'s, 'a> {
+    target: Target<'s, 'a>,
     deps: AVec<'a, (Text<'a>, u32)>,
     build_script: Option<u32>,
-    incomplete: bool,
 }

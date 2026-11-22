@@ -575,8 +575,15 @@ fn worktree(version: u32, entries: &[(&str, &[u8], i64)]) -> Mem {
     for (path, content, _) in entries {
         mem.put(path, content);
     }
+    write_index(&mut mem, version, entries, 2000);
+    mem
+}
+
+/// `.git/index` of `entries` written at time `at_time`, each entry's ino the one `Mem` gives
+/// its file now (so a file not touched since stats equal to its entry).
+fn write_index(mem: &mut Mem, version: u32, entries: &[(&str, &[u8], i64)], at_time: i64) {
     // Inodes are positions among all keys; write the index after, then fix each entry's ino.
-    mem.put_at(".git/index", &[], 2000);
+    mem.put_at(".git/index", &[], at_time);
     let mut bytes = index(version, entries);
     let mut at = 12;
     let mut previous = "";
@@ -587,12 +594,11 @@ fn worktree(version: u32, entries: &[(&str, &[u8], i64)]) -> Mem {
         at += if version == 4 { 62 + ofs((previous.len() - shared) as u64).len() + (path.len() - shared) + 1 } else { (62 + path.len() + 8) / 8 * 8 };
         previous = path;
     }
-    mem.put_at(".git/index", &bytes, 2000);
-    mem
+    mem.put_at(".git/index", &bytes, at_time);
 }
 
 fn porcelain(mem: &mut Mem, untracked: bool) -> Result<std::string::String, Refused> {
-    status(".git", ".git", "", untracked, TREE, mem, Alloc::global()).map(|s| s.as_str().to_string())
+    status(".git", ".git", "", untracked, false, TREE, mem, Alloc::global()).map(|s| s.as_str().to_string())
 }
 
 /// A file whose stat equals its entry's, older than the index, is clean without being read.
@@ -627,14 +633,30 @@ fn index_version_four_paths() {
     assert_eq!(porcelain(&mut mem, false).unwrap(), " M src/main.rs\n");
 }
 
-/// A file that is not tracked is refused by name when untracked files count (blaze has no
-/// ignore rules), and not looked for under `--untracked-files=no`.
+/// A file that is not tracked is printed in porcelain form when untracked files count, and not
+/// looked for under `--untracked-files=no`.
 #[test]
-fn index_an_untracked_file_is_refused() {
+fn index_an_untracked_file_is_printed() {
     let mut mem = worktree(2, &[("a.txt", b"hello\n", 1000)]);
     mem.put("new.txt", b"x");
-    assert!(matches!(porcelain(&mut mem, true), Err(Refused::Untracked)));
+    assert_eq!(porcelain(&mut mem, true).unwrap(), "?? new.txt\n");
     assert_eq!(porcelain(&mut mem, false).unwrap(), "");
+}
+
+#[test]
+fn index_untracked_uses_negation_nested_and_info_exclude_rules() {
+    let mut mem = worktree(2, &[("a.txt", b"hello\n", 1000)]);
+    mem.put(".gitignore", b".gitignore\n*.tmp\n!important.tmp\nignored-dir/\n");
+    mem.put("ignored.tmp", b"x");
+    mem.put("important.tmp", b"x");
+    mem.put("ignored-dir/file", b"x");
+    mem.put("nested/.gitignore", b".gitignore\n!kept.txt\n");
+    mem.put("nested/kept.txt", b"x");
+    mem.put("nested/other.txt", b"x");
+    mem.put(".git/info/exclude", b"excluded.txt\n");
+    mem.put("excluded.txt", b"x");
+    assert_eq!(porcelain(&mut mem, true).unwrap(), "?? important.tmp\n?? nested/\n");
+    assert_eq!(status(".git", ".git", "", true, true, TREE, &mut mem, Alloc::global()).unwrap().as_str(), "?? important.tmp\n?? nested/kept.txt\n?? nested/other.txt\n");
 }
 
 /// An entry path git would never write (`verify_path`): `..`, absolute, `.git` inside.
@@ -746,4 +768,449 @@ fn mutated_reads(tape: &Tape) -> Result<(), Oid> {
         let _ = parse_index(&files[2], Alloc::global());
     }
     Ok(())
+}
+
+// ---- (f) the status after a change (E2, E3) ----
+
+mod after {
+    //! E2: one status reads each ignore file once. E3: the status after a change
+    //! (`status_after`) is byte-equal to the whole computation after every step of a model
+    //! repository, computes whole only for a typed reason the model also sees, and asks no fact
+    //! of a path the journal did not name (beyond the git folder and the ignore files above a
+    //! named path): its work is bounded by the changed paths, never a walk.
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt;
+
+    use blaze_own::{AString, AVec, Alloc};
+    use blaze_sim::{Broken, Config, Tape};
+
+    use super::{Mem, TREE, write_index};
+    use crate::git::{FileStat, GitFiles};
+    use crate::git_objects::{CoveredSince, Gen, Made, StatusAnswer, StatusPlant, WholeWhy, status, status_after, whole};
+
+    /// A fact asked of the reader.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Fact {
+        Read,
+        Stat,
+        List,
+    }
+
+    /// `Mem`, with every fact asked of it kept.
+    struct Counting<'m> {
+        mem: &'m mut Mem,
+        asked: std::vec::Vec<(Fact, std::string::String)>,
+    }
+
+    impl<'m> Counting<'m> {
+        fn new(mem: &'m mut Mem) -> Self {
+            Counting { mem, asked: std::vec::Vec::new() }
+        }
+
+        fn count(&self, fact: Fact, path: &str) -> usize {
+            self.asked.iter().filter(|(asked, at)| *asked == fact && at == path).count()
+        }
+    }
+
+    impl GitFiles for Counting<'_> {
+        fn read(&mut self, rel: &str, into: &mut AVec<'_, u8>) -> bool {
+            self.asked.push((Fact::Read, rel.to_owned()));
+            self.mem.read(rel, into)
+        }
+        fn read_range(&mut self, rel: &str, at: u64, len: u64, into: &mut AVec<'_, u8>) -> bool {
+            self.asked.push((Fact::Read, rel.to_owned()));
+            self.mem.read_range(rel, at, len, into)
+        }
+        fn stat(&mut self, rel: &str) -> Option<FileStat> {
+            self.asked.push((Fact::Stat, rel.to_owned()));
+            self.mem.stat(rel)
+        }
+        fn list<'a>(&mut self, rel: &str, alloc: Alloc<'a>, into: &mut AVec<'a, AString<'a>>) {
+            self.asked.push((Fact::List, rel.to_owned()));
+            self.mem.list(rel, alloc, into);
+        }
+        fn within<'p>(&self, path: &'p str) -> Option<&'p str> {
+            self.mem.within(path)
+        }
+    }
+
+    /// E2: n untracked files in one folder read its `.gitignore` once, as they read the root's
+    /// and `info/exclude` once (each was read once per path before).
+    #[test]
+    fn each_ignore_file_is_read_once_per_status() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut mem = super::worktree(2, &[("a.txt", b"hello\n", 1000)]);
+        mem.put(".gitignore", b"*.tmp\n");
+        mem.put("d/.gitignore", b"skip.txt\n");
+        mem.put("d/skip.txt", b"x");
+        mem.put("d/e/deep.tmp", b"x");
+        for at in 0..32 {
+            mem.put(&format!("d/f{at:02}.txt"), b"x");
+            mem.put(&format!("d/e/g{at:02}.txt"), b"x");
+        }
+        let mut counting = Counting::new(&mut mem);
+        let text = status(".git", ".git", "", true, true, TREE, &mut counting, alloc).expect("the status");
+        assert!(text.contains("?? d/f00.txt\n") && text.contains("?? d/e/g31.txt\n"), "{text}");
+        assert!(!text.contains("skip.txt") && !text.contains("deep.tmp"), "{text}");
+        for file in [".git/info/exclude", ".gitignore", "d/.gitignore", "d/e/.gitignore"] {
+            assert_eq!(counting.count(Fact::Read, file), 1, "`{file}` read once");
+        }
+    }
+
+    /// What the oracle saw broken.
+    #[derive(Debug)]
+    enum StatusBroken {
+        /// The answer after the change is not the whole computation's.
+        Differs { after: std::string::String, whole: std::string::String },
+        /// Computed whole for a reason the model does not see.
+        WholeWithoutReason { why: WholeWhy },
+        /// Made from the previous answer where the model sees a reason it may not be.
+        ReasonIgnored { expected: std::string::String },
+        /// A fact asked of a path the journal did not name: work beyond the changed paths.
+        Untouched { path: std::string::String },
+    }
+
+    impl fmt::Display for StatusBroken {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                StatusBroken::Differs { after, whole } => write!(f, "the status after the change differs from the whole computation:\nafter:\n{after}whole:\n{whole}"),
+                StatusBroken::WholeWithoutReason { why } => write!(f, "computed whole ({why}) where the model sees no such reason"),
+                StatusBroken::ReasonIgnored { expected } => write!(f, "made from the previous answer where it must be whole ({expected})"),
+                StatusBroken::Untouched { path } => write!(f, "`{path}` was asked though no change reaches it"),
+            }
+        }
+    }
+
+    blaze_sim::plants! {
+        impl StatusPlant breaks StatusBroken {
+            None,
+            KeepRevertedLine => StatusBroken::Differs { .. },
+            NoCollapseUnit => StatusBroken::Differs { .. },
+            CoverageIgnored => StatusBroken::ReasonIgnored { .. },
+            IgnoringUnchecked => StatusBroken::Differs { .. },
+        }
+    }
+
+    const BULK: usize = 8;
+    const CREATE: [&str; 14] = [
+        "a.txt", "b.txt", "src/new.rs", "src/deep/q.rs", "u/x.txt", "u/v/z.txt", "t/one.txt", "t/two/three.txt", "k.tmp", "u/keep.tmp", "nested/n.txt", "nested/m.tmp", ".blaze/x.txt",
+        ".blaze/v2/store/s",
+    ];
+    /// blaze's own folder in the checkout, its ignore file and the bytes that ignore all of it
+    /// (blaze-cli sweep.rs `HOME_IGNORE`, `HOME_IGNORE_TEXT`), and the profile every command
+    /// writes there.
+    const BLAZES: &str = ".blaze";
+    const BLAZES_IGNORE: &str = ".blaze/.gitignore";
+    const IGNORE_ALL: &[u8] = b"*\n";
+    const PROFILE: &str = ".blaze/v2/profile.txt";
+    const CONTENTS: [&[u8]; 3] = [b"one\n", b"two two\n", b"3\n"];
+    const IGNORE_FILES: [&str; 3] = [".gitignore", "u/.gitignore", "t/.gitignore"];
+    const IGNORE_LINES: [&str; 6] = ["*.tmp", "u/", "!keep.tmp", "v/", "three.txt", "two/"];
+
+    /// `p` is `region` or under it.
+    fn inside(region: &str, p: &str) -> bool {
+        p == region || (p.len() > region.len() && p.as_bytes()[region.len()] == b'/' && p.starts_with(region))
+    }
+
+    /// A repository: tracked, untracked and ignored files in nested folders, `.gitignore`
+    /// files and an index; the journal of its changes since the last answer, and that answer.
+    struct Model {
+        mem: Mem,
+        /// The index: each entry's path and bytes.
+        staged: BTreeMap<std::string::String, std::vec::Vec<u8>>,
+        clock: i64,
+        /// The journal's identity (a new one after an overflow) and its events in it.
+        journal: u8,
+        at: u64,
+        /// The paths changed since the previous answer, as the journal names them.
+        changed: BTreeSet<std::string::String>,
+        /// The journal overflowed since the previous answer: what it named before is lost.
+        lost: bool,
+        previous: Option<StatusAnswer<'static>>,
+    }
+
+    impl Model {
+        /// `blazes_ignored`: blaze's folder starts with its ignore-all file (else none, and its
+        /// files are untracked: `?? .blaze/`).
+        fn new(blazes_ignored: bool) -> Model {
+            let mut mem = Mem::default();
+            mem.put(".git/HEAD", b"ref: refs/heads/main\n");
+            mem.put(".git/refs/heads/main", b"0\n");
+            if blazes_ignored {
+                mem.put(BLAZES_IGNORE, IGNORE_ALL);
+            }
+            mem.put(PROFILE, b"profile 0\n");
+            let mut staged = BTreeMap::new();
+            let tracked: [(&str, &[u8]); 5] = [(".gitignore", b"*.tmp\n"), ("a.txt", b"hello\n"), ("nested/x.txt", b"x\n"), ("src/lib.rs", b"lib\n"), ("src/main.rs", b"main\n")];
+            for (path, bytes) in tracked {
+                mem.put(path, bytes);
+                staged.insert(path.to_owned(), bytes.to_vec());
+            }
+            for at in 0..BULK {
+                let path = format!("bulk/f{at}.rs");
+                mem.put(&path, b"bulk\n");
+                staged.insert(path, b"bulk\n".to_vec());
+            }
+            mem.put("u/v/y.txt", b"y\n");
+            mem.put("w.tmp", b"w\n");
+            let mut model = Model { mem, staged, clock: 1000, journal: 0, at: 0, changed: BTreeSet::new(), lost: false, previous: None };
+            model.restage(2000);
+            model
+        }
+
+        fn tick(&mut self) -> i64 {
+            self.clock += 1;
+            self.clock
+        }
+
+        fn change(&mut self, path: &str) {
+            self.at += 1;
+            self.changed.insert(path.to_owned());
+        }
+
+        /// The worktree's files a step may touch: not the git folder's, not the untouched bulk,
+        /// not an ignore file (its own step).
+        fn files(&self) -> std::vec::Vec<std::string::String> {
+            self.mem.files.keys().filter(|path| !path.starts_with(".git/") && !path.starts_with("bulk/") && !path.ends_with(".gitignore")).cloned().collect()
+        }
+
+        fn restage(&mut self, at_time: i64) {
+            let entries: std::vec::Vec<(&str, &[u8], i64)> = self.staged.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice(), self.mem.files.get(path).map_or(1000, |(_, mtime)| *mtime))).collect();
+            let mut mem = std::mem::take(&mut self.mem);
+            write_index(&mut mem, 2, &entries, at_time);
+            self.mem = mem;
+        }
+
+        fn step(&mut self, tape: &Tape) {
+            let content = CONTENTS[tape.below(CONTENTS.len() as u64, "content") as usize];
+            match tape.below(11, "step") {
+                // An edit.
+                0 => {
+                    if let Some(path) = tape.pick(&self.files(), "a file to edit").cloned() {
+                        let at = self.tick();
+                        self.mem.put_at(&path, content, at);
+                        self.change(&path);
+                    }
+                }
+                // A revert: a tracked file back to its index bytes.
+                1 => {
+                    let tracked: std::vec::Vec<std::string::String> = self.staged.keys().filter(|path| !path.starts_with("bulk/") && !path.ends_with(".gitignore")).cloned().collect();
+                    if let Some(path) = tape.pick(&tracked, "a file to revert").cloned() {
+                        let bytes = self.staged[&path].clone();
+                        let at = self.tick();
+                        self.mem.put_at(&path, &bytes, at);
+                        self.change(&path);
+                    }
+                }
+                // A file created.
+                2 => {
+                    if let Some(&path) = tape.pick(&CREATE, "a file to create") {
+                        let at = self.tick();
+                        self.mem.put_at(path, content, at);
+                        self.change(path);
+                    }
+                }
+                // A file deleted.
+                3 => {
+                    if let Some(path) = tape.pick(&self.files(), "a file to delete").cloned() {
+                        self.mem.files.remove(&path);
+                        self.change(&path);
+                    }
+                }
+                // A rename.
+                4 => {
+                    let from = tape.pick(&self.files(), "a file to rename").cloned();
+                    let to = tape.pick(&CREATE, "its new name").copied();
+                    if let (Some(from), Some(to)) = (from, to)
+                        && from != to
+                        && let Some((bytes, _)) = self.mem.files.remove(&from)
+                    {
+                        let at = self.tick();
+                        self.mem.put_at(to, &bytes, at);
+                        self.change(&from);
+                        self.change(to);
+                    }
+                }
+                // An ignore rule added.
+                5 => {
+                    let file = tape.pick(&IGNORE_FILES, "an ignore file").copied().unwrap_or(".gitignore");
+                    let line = tape.pick(&IGNORE_LINES, "a rule").copied().unwrap_or("*.tmp");
+                    let mut bytes = self.mem.files.get(file).map(|(bytes, _)| bytes.clone()).unwrap_or_default();
+                    bytes.extend_from_slice(line.as_bytes());
+                    bytes.push(b'\n');
+                    let at = self.tick();
+                    self.mem.put_at(file, &bytes, at);
+                    self.change(file);
+                }
+                // A path staged (its bytes, or its removal).
+                6 => {
+                    let mut paths = self.files();
+                    paths.extend(self.staged.keys().filter(|path| !path.starts_with("bulk/") && !path.ends_with(".gitignore")).cloned());
+                    paths.sort();
+                    paths.dedup();
+                    if let Some(path) = tape.pick(&paths, "a path to stage").cloned() {
+                        match self.mem.files.get(&path) {
+                            Some((bytes, _)) => {
+                                self.staged.insert(path, bytes.clone());
+                            }
+                            None => {
+                                self.staged.remove(&path);
+                            }
+                        }
+                        let at = 5000 + self.tick();
+                        self.restage(at);
+                        self.change(".git/index");
+                    }
+                }
+                // A commit: the branch moves (its tree is the index's).
+                7 => {
+                    let at = self.tick();
+                    self.mem.put_at(".git/refs/heads/main", format!("{at}\n").as_bytes(), at);
+                    self.change(".git/refs/heads/main");
+                }
+                // blaze's ignore file made or removed (print.rs `ensure_checkout_ignore` makes
+                // it; a person may remove it).
+                8 => {
+                    let at = self.tick();
+                    match self.mem.files.remove(BLAZES_IGNORE) {
+                        Some(_) => {}
+                        None => self.mem.put_at(BLAZES_IGNORE, IGNORE_ALL, at),
+                    }
+                    self.change(BLAZES_IGNORE);
+                }
+                // A command's profile written in blaze's folder, as every command writes it.
+                9 => {
+                    let at = self.tick();
+                    self.mem.put_at(PROFILE, format!("profile {at}\n").as_bytes(), at);
+                    self.change(PROFILE);
+                }
+                // The journal overflows: what it held is lost, a new one starts.
+                _ => {
+                    self.journal = self.journal.wrapping_add(1);
+                    self.at = 0;
+                    self.changed.clear();
+                    self.lost = true;
+                }
+            }
+        }
+
+        /// The untracked unit the whole computation's walk gives `changed`: in the default mode
+        /// the highest folder on its way the index tracks nothing at or under.
+        fn unit<'p>(&self, changed: &'p str, all: bool) -> &'p str {
+            if all {
+                return changed;
+            }
+            let ends = changed.match_indices('/').map(|(at, _)| at).chain(std::iter::once(changed.len()));
+            for end in ends {
+                let folder = &changed[..end];
+                if !self.staged.keys().any(|path| inside(folder, path)) {
+                    return folder;
+                }
+            }
+            changed
+        }
+
+        /// Whether a fact of `path` is one a change reaches: the git folder, a named path, a
+        /// folder on its way or under its unit, or an ignore file of such a folder.
+        fn reached(&self, path: &str, all: bool) -> bool {
+            let near = |q: &str| !q.is_empty() && self.changed.iter().any(|changed| inside(q, changed) || inside(changed, q) || inside(self.unit(changed, all), q));
+            if path.starts_with(".git/") || path == ".gitignore" {
+                return true;
+            }
+            if let Some(folder) = path.strip_suffix("/.gitignore")
+                && near(folder)
+            {
+                return true;
+            }
+            near(path)
+        }
+
+        fn answer(&mut self, all: bool, plant: StatusPlant, alloc: Alloc<'static>) -> Result<(), Broken<StatusBroken>> {
+            let now = Gen { journal: [self.journal; 24], at: self.at };
+            let mut expected = std::vec::Vec::new();
+            if self.previous.is_none() {
+                expected.push(WholeWhy::NoPrevious);
+            } else if self.lost {
+                expected.push(WholeWhy::NotCovered);
+            }
+            if self.changed.iter().any(|path| path.starts_with(".git/")) {
+                expected.push(WholeWhy::GitFolder);
+            }
+            if self.changed.iter().any(|path| path.rsplit('/').next() == Some(".gitignore")) {
+                expected.push(WholeWhy::RulesChanged);
+            }
+            let changed: std::vec::Vec<&str> = self.changed.iter().map(|path| path.as_str()).collect();
+            let covered = match (&self.previous, self.lost) {
+                (None, _) => None,
+                // Replayed only from the new journal's start: the previous answer's place is in
+                // the lost one.
+                (Some(_), true) => Some(CoveredSince::replayed(Gen { journal: [self.journal; 24], at: 0 }, &changed)),
+                (Some(previous), false) => Some(CoveredSince::replayed(previous.place, &changed)),
+            };
+            // The claim blaze-cli makes before its replay: blaze's folder ignores all, its ignore
+            // file read now (the model's place). Planted: claimed unread.
+            let blazes_ignored = self.mem.files.get(BLAZES_IGNORE).is_some_and(|(bytes, _)| bytes.as_slice() == IGNORE_ALL);
+            let covered = covered.map(|covered| match blazes_ignored || plant == StatusPlant::IgnoringUnchecked {
+                true => covered.ignoring(BLAZES),
+                false => covered,
+            });
+            let mut counting = Counting::new(&mut self.mem);
+            let after = status_after(self.previous.as_ref(), covered.as_ref(), true, all, ".git", ".git", "", |_, _| Ok(TREE), now, &mut counting, alloc, plant)
+                .map_err(|why| Broken::Harness(format!("the status after refused: {why:?}")))?;
+            let asked = std::mem::take(&mut counting.asked);
+            let whole = whole(".git", ".git", "", true, all, TREE, &mut self.mem, alloc).map_err(|why| Broken::Harness(format!("the whole status refused: {why:?}")))?;
+            match after.made {
+                Made::Whole(why) if !expected.contains(&why) => return Err(Broken::Oracle(StatusBroken::WholeWithoutReason { why })),
+                Made::Incremental { .. } if !expected.is_empty() => return Err(Broken::Oracle(StatusBroken::ReasonIgnored { expected: format!("{expected:?}") })),
+                _ => {}
+            }
+            if after.answer.text.as_str() != whole.text.as_str() {
+                return Err(Broken::Oracle(StatusBroken::Differs { after: after.answer.text.as_str().to_owned(), whole: whole.text.as_str().to_owned() }));
+            }
+            if let Made::Incremental { .. } = after.made
+                && let Some((_, path)) = asked.iter().find(|(_, path)| !self.reached(path, all))
+            {
+                return Err(Broken::Oracle(StatusBroken::Untouched { path: path.clone() }));
+            }
+            self.previous = Some(after.answer);
+            self.changed.clear();
+            self.lost = false;
+            Ok(())
+        }
+    }
+
+    /// A case: a model repository, its first answer whole, then steps (edit, revert, create,
+    /// delete, rename, an ignore rule, a stage, a commit, a journal overflow), answered after
+    /// some and at the end. Controls: a reverted edit that keeps its ` M` line, a new file in a
+    /// folder already shown `?? dir/` adding its own line, and lost journal coverage taken as
+    /// covered.
+    fn case(tape: &Tape, plant: StatusPlant) -> Result<(), Broken<StatusBroken>> {
+        let alloc = blaze_own::testing::heap().alloc();
+        let all = tape.coin("-uall");
+        let mut model = Model::new(tape.coin("blaze's folder ignored at the start"));
+        model.answer(all, plant, alloc)?;
+        let steps = tape.below(16, "steps") + 1;
+        for _ in 0..steps {
+            model.step(tape);
+            if tape.coin("answer now") {
+                model.answer(all, plant, alloc)?;
+            }
+        }
+        model.answer(all, plant, alloc)
+    }
+
+    #[test]
+    fn the_status_after_a_change_is_the_whole_status() {
+        blaze_sim::controls(Config::cases(256), case);
+    }
+
+    /// The proof's two parts read back as made.
+    #[test]
+    fn a_coverage_proof_reads_back() {
+        let place = Gen { journal: [7; 24], at: 42 };
+        let changed = ["a.txt"];
+        let covered = CoveredSince::replayed(place, &changed);
+        assert_eq!((covered.since(), covered.changed()), (place, &changed[..]));
+    }
 }

@@ -360,6 +360,11 @@ pub fn lower_class(e: &BodyError) -> String {
             Some(super::body::BodyFinding::CfgOut) => String::from(": CfgOut"),
             None => String::new(),
         },
+        // A macro's own error at each call: counted as the program's errors, by the first.
+        BodyError::Calls { errors, .. } => match errors.first() {
+            Some(e) => format!(": {} errors at macro calls, first `{}!`: {}", errors.len(), e.path, e.why),
+            None => String::new(),
+        },
         BodyError::Convert { refused, why, .. } => {
             format!(": {}{}", class_chain(&format!("{refused:?}"), 2), why.as_ref().map(|w| format!(" {}", class_chain(&format!("{w:?}"), 4))).unwrap_or_default())
         }
@@ -388,6 +393,7 @@ pub fn lower_refusal(e: &BodyError) -> String {
             Some(super::body::BodyFinding::Macro { path, .. }) => format!("{class}, the call of `{path}!`"),
             _ => class,
         },
+        BodyError::Calls { .. } => format!("{class} (errors of the program, not a refusal)"),
         _ => class,
     }
 }

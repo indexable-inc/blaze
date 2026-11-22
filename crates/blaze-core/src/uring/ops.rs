@@ -144,6 +144,14 @@ pub(super) const NO_FOLLOW: u8 = 1 << 3;
 /// [`crate::CLONE_OF_NO_FILE`] once its target is unlinked (the bit [`WHOLE`] is).
 pub(super) const NOT_REGULAR: u8 = 1 << 3;
 
+/// A [`Kind::Accept`] of a Unix listen: each connection accepted into a descriptor of the
+/// process's table, not straight into a slot, as `SO_PEERCRED` is read through a descriptor;
+/// its peer's uid checked (`crate::net::Listener::admit`, the decision every driver's accept
+/// takes) before it is put in the driver's half of the table and handed to anyone, and one of
+/// another user, or of a uid that cannot be read, closed unread (uring/flight.rs `admitted`;
+/// the bit [`WHOLE`] is).
+pub(super) const UNIX_PEER: u8 = 1 << 3;
+
 /// A [`Kind::Open`] of a kept file for reads into and writes from memory at offsets
 /// ([`Kind::ReadInto`], [`Kind::WriteFrom`]): opened without `O_APPEND`, which on Linux puts a
 /// positional write at the end, and with [`DIRECT`] `O_DIRECT` (the bit [`WHOLE`] is).

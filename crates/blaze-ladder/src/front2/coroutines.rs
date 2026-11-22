@@ -52,22 +52,38 @@ pub(crate) struct CoroutineTable {
 impl CoroutineTable {
     /// The table of every checked body of `program` (`checked[i]` is fn `i`'s record).
     pub(crate) fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> CoroutineTable {
-        let mut tys = PortableTys::new_in(alloc);
-        let mut rows = Vec::new_in(alloc);
+        let mut table = CoroutineTable::new_in(alloc);
         for (i, done) in checked.iter().enumerate() {
             let Some(done) = done else { continue };
-            let function = program.function(i);
-            let Some((body, _)) = function.body else { continue };
-            let view = body.view(program.body_types(i));
-            let sig = program.sig(i);
-            let generics = sig.parent_count + sig.own_count;
-            for (ordinal, _) in blaze_build::coroutines_in(&view) {
-                let facts = blaze_build::coroutine_facts(&view, done, ordinal, generics, &mut tys, alloc);
-                rows.push((function.key, ordinal, facts));
-            }
+            table.add(program, i, done, alloc);
         }
-        rows.sort_unstable_by_key(|r| (r.0, r.1));
-        CoroutineTable { tys, rows }
+        table
+    }
+
+    /// An empty table, its columns in `alloc` (rule 75).
+    pub(crate) fn new_in(alloc: Alloc<'static>) -> CoroutineTable {
+        CoroutineTable { tys: PortableTys::new_in(alloc), rows: Vec::new_in(alloc) }
+    }
+
+    /// Adds the async blocks of fn `i`'s checked body `done`: the ONE home of a row's making
+    /// ([`Self::of`] is one `add` per body; the run path adds each body as it checks, never
+    /// rebuilding the table). Each row is placed by (owner, ordinal) with `partition_point` and
+    /// an insert, so the table stays sorted for `get`. Returns the rows added.
+    pub(crate) fn add<P: FrontEnd>(&mut self, program: &P, i: usize, done: &Checked<'static>, alloc: Alloc<'static>) -> usize {
+        let function = program.function(i);
+        let Some((body, _)) = function.body else { return 0 };
+        let view = body.view(program.body_types(i));
+        let sig = program.sig(i);
+        let generics = sig.parent_count + sig.own_count;
+        let mut added = 0;
+        for (ordinal, _) in blaze_build::coroutines_in(&view) {
+            let facts = blaze_build::coroutine_facts(&view, done, ordinal, generics, &mut self.tys, alloc);
+            let key = (function.key, ordinal);
+            let at = self.rows.partition_point(|r| (r.0, r.1) < key);
+            self.rows.insert(at, (function.key, ordinal, facts));
+            added += 1;
+        }
+        added
     }
 
     /// The facts of block `ordinal` of `owner`; `None` when the owner has no such block or
@@ -212,6 +228,26 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
     let Some((owner, _)) = program.opaque_of(opaque) else {
         return Err(refused("an `impl Trait` type no fn head of the program made (the seam's `opaque_of`)"));
     };
+    // A trait fn's `impl Trait` (its `async fn`'s future) is an associated type of the trait
+    // (RFC 3425; front2 rpitit.rs): at a ground `Self` its value is the SELECTED impl's, never
+    // the trait fn's default body's. The impl is selected as the call is (the seam's
+    // `resolve`, the one selection: the layout and the call cannot disagree); a fn of no trait,
+    // and a provided fn the impl does not write, resolve to the owner itself: its own record.
+    // The question is asked in the world of a fn WITH a body: a required trait fn's row (a
+    // declared head, program.rs `declared`) has none, and its `in_world` is the ctor world's
+    // refusal, `Missing(FnSig(owner))`, which no fill answers (the REQUIRED run test's "the
+    // world has no answer to FnSig(..)"). Every argument is ground, so the selection is the
+    // same in any body's world (each sees every opaque: `Reveal::All`); the first such row is
+    // the deterministic one.
+    let bodied = |n: &usize| program.function(*n).body.is_some();
+    let Some(world) = program.fn_index(owner).filter(bodied).or_else(|| (0..program.fn_count()).find(bodied)) else {
+        return Err(refused("an `impl Trait` type whose defining fn is not in the program, in a program with no body to select its impl in"));
+    };
+    let list = ground.intern_list(args).map_err(|_| BuildError::Malformed { what: "the ground table is full" })?;
+    let (callee, callee_args) = program.resolve(world, owner, list, ground).map_err(BuildError::Select)?;
+    if callee != owner {
+        return opaque_at_impl(program, checked, facts, opaque, owner, callee, callee_args, ground, scratch);
+    }
     let Some(i) = program.fn_index(owner) else {
         return Err(refused("an `impl Trait` type whose defining fn is not in the program (not reached, or it did not check)"));
     };
@@ -230,6 +266,40 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
         Ok(_) => blaze_build::ground(from, hidden, args, ground, scratch, facts),
         Err(_) => Err(BuildError::Malformed { what: "a hidden type past its record's table" }),
     }
+}
+
+/// [`opaque_hidden`] of trait fn `owner`'s opaque `opaque` where the selection at the ground
+/// arguments chose impl fn `callee` (at `callee_args`, in `ground`: the impl's arguments, then
+/// the fn's own): the type at the opaque's place of the impl fn's return type (front2 rpitit.rs
+/// `place_in`, the walk the impl's associated-type row is read by), grounded there. An impl fn
+/// that writes `impl Trait` or `async fn` gives its own opaque, revealed from its own body's
+/// record by the same grounding; one that writes a type gives it.
+#[expect(clippy::too_many_arguments, reason = "the reveal's question, the selected impl fn and the grounding's tables")]
+fn opaque_at_impl<P: FrontEnd>(
+    program: &P,
+    checked: &[Option<Checked<'static>>],
+    facts: &dyn LayoutFacts,
+    opaque: ItemKey,
+    owner: ItemKey,
+    callee: ItemKey,
+    callee_args: List,
+    ground: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+) -> Result<PTy, BuildError> {
+    let refused = |what| BuildError::UnsupportedSig { what };
+    let (Some(t), Some(j)) = (program.fn_index(owner), program.fn_index(callee)) else {
+        return Err(refused("a trait fn's `impl Trait` type whose trait fn or selected impl fn is not in the program"));
+    };
+    // The impl fn's own opaque is revealed from its record: one not checked yet is asked by
+    // name, to be checked and the build asked again (never read as the trait's default).
+    if program.function(j).body.is_some() && checked.get(j).and_then(Option::as_ref).is_none() {
+        return Err(BuildError::MissingRecord { item: callee });
+    }
+    let (ts, is) = (program.sig(t), program.sig(j));
+    let value = super::rpitit::place_in(ts.types, ts.output, is.types, is.output, opaque, scratch).map_err(refused)?;
+    let mut at: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    at.extend_from_slice(ground.view().list(callee_args).map_err(|_| BuildError::Malformed { what: "a selected impl fn's arguments past the ground table" })?);
+    blaze_build::ground(is.types, value, &at, ground, scratch, facts)
 }
 
 /// Which of a coroutine instance's three functions an instance is (blaze-build coroutine.rs,

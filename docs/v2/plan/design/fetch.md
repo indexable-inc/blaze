@@ -30,9 +30,21 @@ none until `want(unit)` names one, so one machine a command serves every `Fetch`
 under one budget, and a command whose tasks all stand asks nothing. A unit goes: lookup (held:
 `Present`, nothing asked) → request(s) → checks → unpack → put → `Fetched`. At most
 `in_flight_most` requests at once; a request past its deadline is failed by the machine and its
-late answer ignored. No connection, a broken one, no answer in time, a 429 or a 5xx is asked
-again after a doubling backoff, at most `tries_most` tries in all. Anything else fails the unit
-with a typed `Why` at once; a wrong digest is never asked again.
+late answer ignored. Every request is tried ONCE (D172, rule 3): no connection, a broken one,
+no answer in time, a 429, a 5xx or a wrong digest fails the unit with a typed `Why` at once,
+named with its source. (Until 2026-11-20 the first four were asked again after a doubling
+backoff, `tries_most` tries in all.) An answer past a first request's `most` is asked again
+sized to its length: a bigger buffer, not a second try.
+
+THE RULE FOR A FAILURE OUTSIDE THE CHECKOUT, stated once here: a task that failed for a reason
+outside the checkout (the network, a missing source, the store) is OWED again on every command
+until it succeeds, and the profile says how many such tasks a command retried. Its failure is
+never a record that stands: the `Fetch` (and the graph or `Units` that failed for it) goes on
+the Units phase's owed list (blaze-cli engine_units.rs `Discovered::owed`, engine_check.rs), so
+the command's certificate does not stand and the next command runs the task again: a source
+put in cargo's cache or the store since, or a network back, is fetched then. The plan line
+counts them (`owed again N`). A failure of the bytes (a wrong digest, a hostile archive) is
+lasting and stands by its key: the same key fails the same way.
 
 A git commit takes two requests: the protocol v2 advertisement (`info/refs`), then `fetch` of the
 one commit at depth 1 (blaze-git-fetch's sans-IO pieces, carried by the same HTTPS client).

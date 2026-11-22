@@ -72,11 +72,66 @@ fn find(
     Ok(found)
 }
 
-pub(super) fn key_at<'n, S: NamesSource<'n>>(names: S, krate: usize, top: Anchor<'n>, declaration: u32, alloc: Alloc<'_>) -> Result<LibKey, PositionGap> {
+/// The source key of the written local declared at byte `declaration` of `top`'s text (the
+/// lowering's start of it), and the byte its site counts from: [`first_token`] of it, the start
+/// [`find`] and the cold reading ([`in_source`]) give the same declaration.
+pub(super) fn key_at<'n, S: NamesSource<'n>>(names: S, krate: usize, top: Anchor<'n>, declaration: u32, alloc: Alloc<'_>) -> Result<(LibKey, u32), PositionGap> {
     let text = top.text(names).ok_or(PositionGap::NoItem)?;
     let key = names.crate_key(krate).ok_or(PositionGap::NoItem)?;
     let edition = names.edition_of(krate).ok_or(PositionGap::NoItem)?;
-    find(key, top.lib(), text, edition, Find::Declaration(declaration), alloc)?.map(|(key, _)| key).ok_or(PositionGap::NoItem)
+    let first = first_token(text, declaration).ok_or(PositionGap::PastText)?;
+    find(key, top.lib(), text, edition, Find::Declaration(first), alloc)?.ok_or(PositionGap::NoItem)
+}
+
+/// THE WRITTEN-LOCAL START RULE: the first byte of the first token at or after byte `byte` of
+/// `text`, past whitespace and comments, doc comments among them. A local item as the lowering
+/// ranges it starts at its first outer attribute, and a doc comment is one (the Reference,
+/// "Comments", "Doc comments": `///` is the attribute `#[doc = ".."]`); the text scan [`find`]
+/// keys declarations by (blaze-file-items nested.rs `scan`) reads comments as whitespace, so
+/// its declaration starts at the first token after them. curve25519-dalek 4.1.3's `fn m`, local
+/// to `<&FieldElement51 as Mul>::mul` (field.rs:116, two `///` lines, then
+/// `#[inline(always)]`), was ranged from its comment and matched no declaration of the scan, so
+/// its overflow check had no `Location` (tempo's tests, t1530: 42 not run). The site of a
+/// written local counts from this byte, warm ([`super::caller_site`], [`super::source_position`])
+/// and cold ([`in_source`]) alike. Whitespace is Rust's (`Pattern_White_Space`, the Reference,
+/// "Whitespace"); a block comment nests ("Comments"). `None`: `byte` is past the text or inside
+/// a char, a block comment is not closed, or no token follows.
+pub(super) fn first_token(text: &str, byte: u32) -> Option<u32> {
+    let mut at = byte as usize;
+    // Each turn moves past at least one char; the text bounds the turns.
+    for _ in 0..=text.len() {
+        let rest = text.get(at..)?;
+        let next = rest.as_bytes().get(1).copied();
+        match rest.chars().next()? {
+            c if matches!(c, '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{85}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}') => at += c.len_utf8(),
+            '/' if next == Some(b'/') => at += rest.find('\n').unwrap_or(rest.len()),
+            '/' if next == Some(b'*') => {
+                let bytes = rest.as_bytes();
+                let mut depth = 0u32;
+                let mut i = 0usize;
+                loop {
+                    match (bytes.get(i).copied(), bytes.get(i + 1).copied()) {
+                        (Some(b'/'), Some(b'*')) => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        (Some(b'*'), Some(b'/')) => {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        (Some(_), Some(_)) => i += 1,
+                        _ => return None,
+                    }
+                }
+                at += i;
+            }
+            _ => return u32::try_from(at).ok(),
+        }
+    }
+    None
 }
 
 /// A written local's key can arrive before its enclosing body is checked.
@@ -152,8 +207,20 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
     }
     let mut copies = AVec::new_in(alloc);
     let rendered = blaze_scope::blocks::module_text(body, &nested, &mut |c| copies.push(c), alloc);
-    let current = blaze_scope::items_record::grain::outline_today(&rendered, chain, edition, alloc).ok_or(PositionGap::NoItem)?;
-    let range = current.item.range;
+    // The one item of this chain in the block module's text as rendered now: an outline of
+    // this small text alone (not a lookup in a record; the items record no longer finds an item
+    // by chain, lane A4). Two items of one chain is no answer.
+    let outline = blaze_file_items::outline(&rendered, edition, alloc);
+    let mut current = None;
+    for item in outline.items() {
+        if blaze_file_items::item_chain(&outline, item, &rendered) == chain {
+            if current.is_some() {
+                return Err(PositionGap::NoItem);
+            }
+            current = Some(item.range);
+        }
+    }
+    let range = current.ok_or(PositionGap::NoItem)?;
     for copy in copies {
         let end = copy.to.checked_add(copy.len).ok_or(PositionGap::PastText)?;
         if copy.to <= range.start && range.end <= end {
@@ -163,4 +230,26 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
         }
     }
     Err(PositionGap::NoItem)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_token;
+
+    /// curve25519-dalek's shape (two `///` lines, then `#[inline(always)]`): the declaration
+    /// starts at the `#`, where the text scan starts it; a nested block comment and a plain
+    /// `//` are skipped too. The control: a byte already at a token is that byte. An unclosed
+    /// block comment, or no token after the comments, is no answer.
+    #[test]
+    fn a_declaration_starts_past_its_doc_comments() {
+        let text = "    /// Helper.\n    /// Bits.\n    #[inline(always)]\n    fn m() {}";
+        assert_eq!(first_token(text, 4), text.find("#[inline").map(|b| b as u32));
+        let nested = "/* a /* b */ c */ // d\n\u{2028}fn m() {}";
+        assert_eq!(first_token(nested, 0), nested.find("fn").map(|b| b as u32));
+        let at = text.find("fn m").unwrap() as u32;
+        assert_eq!(first_token(text, at), Some(at));
+        assert_eq!(first_token("/* open /* */ fn", 0), None);
+        assert_eq!(first_token("/// only a comment", 0), None);
+        std::println!("a local's declaration starts past its doc comments, at its first token");
+    }
 }

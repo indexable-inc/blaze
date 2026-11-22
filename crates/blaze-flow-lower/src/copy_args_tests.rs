@@ -17,7 +17,7 @@ use std::vec;
 use blaze_typeck::fixture::{Bb, Fx};
 use blaze_typeck::{ItemKey, Name};
 
-use crate::tests::findings_with;
+use crate::region_fixture::{Decls, FnHead, findings};
 use crate::{AdtFacts, CalleeFacts, Facts, Form, Plant, Refusal};
 
 /// `P`'s `Copy` impl bounds `args` (`None`: not read, the derive's rule).
@@ -27,6 +27,64 @@ struct World {
 }
 
 impl Facts for World {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
         let copy = k == self.p;
         Some(AdtFacts { copy, drop_impl: false, needs_drop: !copy, lifetimes: 0, union: false, is_enum: false, is_box: false })
@@ -57,9 +115,14 @@ fn twice(args: Option<&'static [bool]>) -> Result<vec::Vec<String>, Refusal> {
     let p = fx.strukt("P", 1, &[("p", t0)]);
     let ps = fx.adt(p, &[st]);
     let unit = fx.unit();
-    let _h = fx.func("h", 0, &[ps], unit, vec![]);
+    let h = fx.func("h", 0, &[ps], unit, vec![]);
     let f = fx.func("f", 0, &[ps], unit, vec![]);
     fx.finish();
+    // `fn h(_: P<S>)` and `fn f(p: P<S>)`: no lifetime (`P` and `S` declare none).
+    let mut decls = Decls::new();
+    for item in [h, f] {
+        decls.func(item, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[ps], output: unit, slots: &[] });
+    }
     let mut b = Bb::new();
     let pp = b.param("p");
     let mut stmts = vec::Vec::new();
@@ -70,7 +133,7 @@ fn twice(args: Option<&'static [bool]>) -> Result<vec::Vec<String>, Refusal> {
         stmts.push(b.semi(call));
     }
     let root = b.block(&stmts, None);
-    findings_with(&fx, &b, f, root, &World { p, args }, Plant::None)
+    findings(&fx, &b, f, root, &World { p, args }, &decls, Plant::None)
 }
 
 fn moved(got: &Result<vec::Vec<String>, Refusal>) -> bool {

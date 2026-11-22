@@ -126,9 +126,10 @@ const fn folded_multiply(x: u64, y: u64) -> u64 {
     (full as u64) ^ ((full >> 64) as u64)
 }
 
-/// The short path's mixer: a word of at most eight key bytes, zero-extended.
+/// The short path's mixer: a word of at most eight key bytes, zero-extended. Also what
+/// [`fold_part`](crate::fold_part) folds a digest key's other fields in with.
 #[inline(always)]
-const fn mix(word: u64) -> u64 {
+pub(crate) const fn mix(word: u64) -> u64 {
     folded_multiply(word ^ PLAIN_XOR, PLAIN_MUL)
 }
 

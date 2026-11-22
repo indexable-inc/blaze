@@ -2,7 +2,7 @@
 //!
 //! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
-use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_hash::{FixedState, Map};
 use stdx::iter::IterExt;
 use std::alloc::Global;
 

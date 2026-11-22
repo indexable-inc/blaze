@@ -8,8 +8,12 @@
 //! What it does not do is refused by name ([`LinkOp`]): a sandbox (`Sandbox::On`: the
 //! sandbox's helper joins this surface later, never by starting the program outside it), a
 //! memory limit, and input written to its standard input. Its standard input is `/dev/null`;
-//! its standard output and error are pipes the caller takes ([`LinkedChild::take_outputs`])
-//! and reads: unread, a pipe fills and the child blocks on its next write.
+//! its standard output and error are pipes given to the caller once, with the child
+//! ([`Piped`]), to read: unread, a pipe fills and the child blocks on its next write.
+//!
+//! Its end is a fact of its type: a wait gives [`Waited::Ended`] with its [`Exit`] (the child
+//! taken, reaped) or [`Waited::Running`] with the child back; a kill takes the child and gives
+//! its [`Exit`]. No value says "ended" of a child still running.
 //!
 //! Waits: on Linux [`crate::wait::exited`] (the thread's wait ring, or a pidfd), on macOS a
 //! kqueue holding `EVFILT_PROC`/`NOTE_EXIT` for the pid, waited on through
@@ -28,7 +32,6 @@ pub mod run;
 
 pub use std::os::fd::BorrowedFd;
 use std::{
-    cell::Cell,
     fmt, io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     path::PathBuf,
@@ -53,15 +56,45 @@ pub struct Link<'a> {
     pub own_group: bool,
 }
 
-/// How a linked child ended, or that the deadline came first.
+/// How a linked child ended: an exit or a signal, nothing else. A child still running when a
+/// deadline came is no end: a wait gives it back ([`Waited::Running`]), and a kill, which
+/// reaps, always has one (states.md 16).
+///
+/// ```compile_fail
+/// // "Still running" is not an end: the variant the old `Ended` had is gone.
+/// let _ = blaze_core::linked::Exit::Deadline;
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ended {
+pub enum Exit {
     /// It exited with this status.
     Exited(i32),
     /// A signal of this number ended it.
     Signaled(i32),
-    /// The deadline passed with it still running.
-    Deadline,
+}
+
+/// What a wait by a deadline found: the child's end (it is reaped, and the child is gone), or
+/// the child given back, still running, when the deadline came first. `E` is what an end
+/// carries ([`Exit`] here; bstd's served run adds its channel's end).
+#[must_use = "a running child given back is the caller's to wait for or kill"]
+#[derive(Debug)]
+pub enum Waited<C, E = Exit> {
+    Ended(E),
+    Running(C),
+}
+
+/// A linked child just started ([`run::start_run`]): the child, and the read ends of the
+/// streams asked as [`run::Output::Pipe`], each given once, here (there is no second take).
+pub struct Started {
+    pub child: LinkedChild,
+    pub stdout: Option<OwnedFd>,
+    pub stderr: Option<OwnedFd>,
+}
+
+/// A child [`start_linked`] started: both its output and its error are pipes.
+pub struct Piped {
+    pub child: LinkedChild,
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
 }
 
 /// What a step on a linked child was, for its error.
@@ -98,6 +131,12 @@ pub enum LinkOp {
     /// The kernel's kill at the parent's death (`run::ParentDeath::Kernel`) is asked, and this
     /// system has none (macOS).
     NoParentDeathSignal,
+    /// A stream asked as a pipe came back without one (`start_linked` asks both).
+    NoPipe,
+    /// Linux: the child's confinement ([`run::RunLink::confine`], D177) was refused by the
+    /// kernel at this step, in the child before its program ran; the program never ran.
+    #[cfg(target_os = "linux")]
+    Confine(blaze_sys::linux::confine::Step),
 }
 
 impl LinkOp {
@@ -123,6 +162,17 @@ impl LinkOp {
             LinkOp::NotOwnGroup => "killing its group, when it was started without a group of its own",
             LinkOp::NoParentDeathSignal => {
                 "the kernel's kill at the parent's death is asked, and this system has none (Linux's PR_SET_PDEATHSIG)"
+            }
+            LinkOp::NoPipe => "a stream asked as a pipe came back from the start without one",
+            #[cfg(target_os = "linux")]
+            LinkOp::Confine(step) => {
+                use blaze_sys::linux::confine::Step;
+                match step {
+                    Step::NoNewPrivs => "confining it before its program ran: prctl(PR_SET_NO_NEW_PRIVS) (D177)",
+                    Step::Limit(_) => "confining it before its program ran: prlimit64 of a resource limit (D177)",
+                    Step::Landlock => "confining it before its program ran: landlock_restrict_self (D177)",
+                    Step::Seccomp => "confining it before its program ran: seccomp(SET_MODE_FILTER) (D177)",
+                }
             }
         }
     }
@@ -158,19 +208,19 @@ pub(crate) enum LinkPlant {
     KillLeaderOnly,
 }
 
-/// A child [`start_linked`] started, not yet reaped until it has ended and been waited for or
-/// killed. Dropped unreaped, its group (or, without one, itself) is killed and reaped; where
-/// that reap fails it stays listed as abandoned ([`super::Waiter::Abandoned`]).
+/// A child [`start_linked`] started, running and unreaped while this value lives: a wait that
+/// sees its end and a kill both take it (`self`), reap it and give its [`Exit`], so a child is
+/// never signalled or waited for after its reap (its pid may be another's by then). Dropped
+/// unreaped, its group (or, without one, itself) is killed and reaped; where that reap fails
+/// it stays listed as abandoned ([`super::Waiter::Abandoned`]).
 pub struct LinkedChild {
     pid: libc::pid_t,
     program: PathBuf,
     own_group: bool,
     /// The clock of [`LinkedChild::wait_until`]'s deadline: zero at its start.
     clock: Monotonic,
-    /// How it ended, once reaped: then its pid may be another's, and nothing signals it.
-    ended: Cell<Option<Ended>>,
-    stdout: Option<OwnedFd>,
-    stderr: Option<OwnedFd>,
+    /// Set by the reap just before the value is dropped, so the drop kills nothing.
+    reaped: bool,
     /// Kept so the pid it names stays this process's for the driver's own waits.
     #[cfg(target_os = "linux")]
     _pidfd: OwnedFd,
@@ -181,18 +231,24 @@ pub struct LinkedChild {
 }
 
 /// `command` started linked as `link` says: its descriptors given, its group its own where
-/// asked, listed until reaped; no input, its output and error piped to the caller
-/// ([`LinkedChild::take_outputs`]). [`run::start_run`] with [`run::Streams::PIPED`]: its
-/// refusals are that function's.
-pub fn start_linked(command: &Command, link: &Link<'_>) -> Result<LinkedChild, LinkError> {
+/// asked, listed until reaped; no input, its output and error piped to the caller (given once,
+/// in [`Piped`]). [`run::start_run`] with [`run::Streams::PIPED`]: its refusals are that
+/// function's.
+pub fn start_linked(command: &Command, link: &Link<'_>) -> Result<Piped, LinkError> {
     let run = run::RunLink {
         inherit: link.inherit,
         own_group: link.own_group,
         streams: run::Streams::PIPED,
         arg0: None,
         parent_death: run::ParentDeath::DropOnly,
+        confine: None,
     };
-    run::start_run(command, &run)
+    let Started { child, stdout, stderr } = run::start_run(command, &run)?;
+    match (stdout, stderr) {
+        (Some(stdout), Some(stderr)) => Ok(Piped { child, stdout, stderr }),
+        // `child` drops here: killed and reaped.
+        _ => Err(child.error(LinkOp::NoPipe, 0)),
+    }
 }
 
 impl LinkedChild {
@@ -206,40 +262,31 @@ impl LinkedChild {
         &self.clock
     }
 
-    /// Its standard output and error, once: the caller reads them (unread, a full pipe stops
-    /// the child at its next write).
-    pub fn take_outputs(&mut self) -> Option<(OwnedFd, OwnedFd)> {
-        match (self.stdout.take(), self.stderr.take()) {
-            (Some(out), Some(err)) => Some((out, err)),
-            _ => None,
-        }
-    }
-
     /// Waits until it ends or `deadline` passes on [`LinkedChild::clock`]: how it ended (then it
-    /// is reaped), or [`Ended::Deadline`] with it still running and unreaped.
-    pub fn wait_until(&self, deadline: Deadline) -> Result<Ended, LinkError> {
-        self.wait_until_on(deadline, &self.clock)
+    /// is reaped and gone), or the child back, still running and unreaped.
+    pub fn wait_until(self, deadline: Deadline) -> Result<Waited<LinkedChild>, LinkError> {
+        let clock = self.clock;
+        self.wait_until_on(deadline, &clock)
     }
 
     /// As [`LinkedChild::wait_until`], `deadline` on `clock` (a driver's own, so a task's
     /// deadline and this wait agree).
-    pub fn wait_until_on(&self, deadline: Deadline, clock: &impl Clock) -> Result<Ended, LinkError> {
-        if let Some(ended) = self.ended.get() {
-            return Ok(ended);
-        }
+    pub fn wait_until_on(mut self, deadline: Deadline, clock: &impl Clock) -> Result<Waited<LinkedChild>, LinkError> {
         match self.exited_by(deadline, clock)? {
-            true => self.reap_now(),
-            false => Ok(Ended::Deadline),
+            true => self.reap_now().map(Waited::Ended),
+            false => Ok(Waited::Running(self)),
         }
     }
 
-    /// `SIGKILL` to its whole group, then its reap: nothing it started is left. Refused for a
-    /// child started without a group of its own ([`LinkOp::NotOwnGroup`]).
-    pub fn kill_group(&self) -> Result<(), LinkError> {
+    /// `SIGKILL` to its whole group, then its reap: nothing it started is left, and how the
+    /// leader ended (an end that came before the kill is the one read). Refused for a child
+    /// started without a group of its own ([`LinkOp::NotOwnGroup`]; the refused child is
+    /// dropped, which kills and reaps it alone).
+    pub fn kill_group(self) -> Result<Exit, LinkError> {
         self.kill_with(LinkPlant::None)
     }
 
-    pub(crate) fn kill_with(&self, plant: LinkPlant) -> Result<(), LinkError> {
+    pub(crate) fn kill_with(mut self, plant: LinkPlant) -> Result<Exit, LinkError> {
         if !self.own_group {
             return Err(self.error(LinkOp::NotOwnGroup, 0));
         }
@@ -248,9 +295,9 @@ impl LinkedChild {
             LinkPlant::KillLeaderOnly => self.pid,
         };
         // SAFETY: no pointers. The group's id is the leader's pid, which is unreaped (so no
-        // one else's) until `reap_now`; after its reap the id stays the group's while any
-        // member lives (POSIX: a group's id is not reused within the group's lifetime), and
-        // with no member left the kill finds none (ESRCH).
+        // one else's) while this value lives (`reap_now` takes it); members it started keep
+        // the id the group's (POSIX: a group's id is not reused within the group's lifetime),
+        // and with no member left the kill finds none (ESRCH).
         let sent = unsafe { libc::kill(target, libc::SIGKILL) };
         if sent != 0 {
             let os = io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -259,10 +306,7 @@ impl LinkedChild {
                 return Err(self.error(LinkOp::KillGroup, os));
             }
         }
-        if self.ended.get().is_none() {
-            self.reap_now()?;
-        }
-        Ok(())
+        self.reap_now()
     }
 
     fn error(&self, op: LinkOp, os: i32) -> LinkError {
@@ -325,19 +369,20 @@ impl LinkedChild {
         Err(self.error(LinkOp::Wait, libc::ENOSYS))
     }
 
-    /// Reaps it, which has exited or was killed: how it ended, kept.
-    fn reap_now(&self) -> Result<Ended, LinkError> {
+    /// Reaps it, which has exited or was killed: how it ended. Takes the child: once reaped its
+    /// pid may be another's, so nothing may signal or wait for it after this.
+    fn reap_now(mut self) -> Result<Exit, LinkError> {
         let (status, _used) = super::reap(self.pid).map_err(|error| self.error(LinkOp::Reap, os_of(&error)))?;
-        let ended = if libc::WIFEXITED(status) {
-            Ended::Exited(libc::WEXITSTATUS(status))
+        // Reaped: the drop below kills nothing.
+        self.reaped = true;
+        if libc::WIFEXITED(status) {
+            Ok(Exit::Exited(libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            Ended::Signaled(libc::WTERMSIG(status))
+            Ok(Exit::Signaled(libc::WTERMSIG(status)))
         } else {
             // A reap without WUNTRACED reports only an exit or a signal's end.
-            return Err(self.error(LinkOp::Reap, 0));
-        };
-        self.ended.set(Some(ended));
-        Ok(ended)
+            Err(self.error(LinkOp::Reap, 0))
+        }
     }
 }
 
@@ -345,15 +390,15 @@ impl Drop for LinkedChild {
     /// Never left running: killed (its group where it has one) and reaped. Drop cannot return
     /// an error: a reap that fails leaves it listed, abandoned, for a stall report to name.
     fn drop(&mut self) {
-        if self.ended.get().is_some() {
+        if self.reaped {
             return;
         }
         let target = if self.own_group { -self.pid } else { self.pid };
-        // SAFETY: no pointers; the pid is unreaped (`ended` is none), so it and its group are
-        // this process's child's.
+        // SAFETY: no pointers; the pid is unreaped (`reaped` is false), so it and its group
+        // are this process's child's.
         unsafe { libc::kill(target, libc::SIGKILL) };
         if super::reap(self.pid).is_ok() {
-            self.ended.set(Some(Ended::Signaled(libc::SIGKILL)));
+            self.reaped = true;
         }
         // `listed` drops after this: unreaped, it marks the child abandoned.
         let _ = &self.listed;

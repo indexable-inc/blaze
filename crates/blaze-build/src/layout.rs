@@ -275,8 +275,30 @@ pub fn closure_facts(
     }
     let (e, kind, sig) = (rows.column::<0>()[row], rows.column::<1>()[row], rows.column::<2>()[row]);
     let mut params: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(generics as usize, scratch);
-    for i in 0..generics {
-        params.push(out.intern(PNode::Param(i)).map_err(full)?);
+    let from = checked.types.view();
+    let malformed = BuildError::Malformed {
+        what: "a closure's checked type does not identify its owner, ordinal and generic arguments",
+    };
+    let Some(&ty) = checked.expr_ty.get(e.ix()) else {
+        return Err(malformed);
+    };
+    let Ok(PNode::Closure { owner, ordinal: which, args }) = from.node(ty) else {
+        return Err(malformed);
+    };
+    if owner != body.owner || which != ordinal || args.len != generics {
+        return Err(malformed);
+    }
+    let Ok(identity) = from.list(args) else {
+        return Err(malformed);
+    };
+    for (index, &arg) in identity.iter().enumerate() {
+        let Ok(node) = from.node(arg) else {
+            return Err(malformed);
+        };
+        if !matches!(node, PNode::Param(i) | PNode::ConstParam(i) if i as usize == index) {
+            return Err(malformed);
+        }
+        params.push(out.intern(node).map_err(full)?);
     }
     let sig = crate::copy_written(checked.types.view(), sig, &params, body, out, scratch)?;
     let env = environment(body, checked, e, &params, out, scratch)?;
@@ -288,12 +310,13 @@ pub fn closure_facts(
     Ok((kind, sig, env))
 }
 
-/// The captures of closure or `async` block `e` of the body `checked` records, in the checker's
-/// order (the rows of `Checked::captures` whose first column is `e`): the binding and how. THE
-/// ONE LIST an environment is made of. Field `j` of the environment IS capture `j` here: the
-/// facts' environment type ([`environment`], for [`closure_facts`] and `coroutine_facts`) and the
-/// walk's every write and read of a capture (closure.rs `captures_of`, coroutine.rs) take it from
-/// this function, so the two cannot disagree on a count or an order.
+/// The WHOLE-BINDING captures of closure or `async` block `e` of the body `checked` records, in
+/// the checker's order (the rows of `Checked::captures` whose first column is `e`): the binding
+/// and how. An environment's fields are `Checked::env_fields` (blaze-typeck env_fields.rs, the
+/// active strategy), which [`environment`] and the walk (closure.rs, coroutine.rs)
+/// both read, so the two cannot disagree on a count or an order; these rows equal those fields
+/// under `WholeBindings` only. Kept for the ladder's `reach_capture_copy` (front2/check.rs),
+/// which moves to `env_fields` at the switch.
 pub fn captures<'c>(checked: &'c blaze_typeck::Checked<'_>, e: ExprId) -> impl Iterator<Item = (blaze_typeck::PatId, blaze_typeck::CaptureKind)> + 'c {
     let caps = &checked.captures;
     (0..caps.len()).filter(move |&c| caps.column::<0>()[c] == e).map(move |c| (caps.column::<1>()[c], caps.column::<2>()[c]))
@@ -311,13 +334,32 @@ pub(crate) fn environment(
     out: &mut PortableTys<'_>,
     scratch: Alloc<'_>,
 ) -> Result<PTy, BuildError> {
+    environment_by::<blaze_typeck::ActiveEnv>(body, checked, e, params, out, scratch)
+}
+
+/// [`environment`] under the environment strategy `R` (blaze-typeck env_fields.rs, rule 78):
+/// one field per `Checked::env_fields_by::<R>` field, in its order. A place's field is the type
+/// the place analysis filed (`T`, `&T` or `&mut T` of the PLACE's type: `&String` for a
+/// by-reference capture of `s.name`), a whole binding's its type wrapped by how it is held.
+pub(crate) fn environment_by<R: blaze_typeck::EnvRule>(
+    body: &blaze_typeck::BodyView<'_>,
+    checked: &blaze_typeck::Checked<'_>,
+    e: ExprId,
+    params: &[PTy],
+    out: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+) -> Result<PTy, BuildError> {
     let full = |_| BuildError::Malformed { what: "an environment's facts table is full" };
     let from = checked.types.view();
     let mut fields: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    for (p, by) in captures(checked, e) {
-        let lt = *checked.local_ty.get(p.ix()).ok_or(BuildError::Malformed { what: "a captured binding without a type" })?;
+    for f in checked.env_fields_by::<R>(e) {
+        if let Some(stored) = f.stored {
+            fields.push(crate::copy_written(from, stored, params, body, out, scratch)?);
+            continue;
+        }
+        let lt = *checked.local_ty.get(f.base.ix()).ok_or(BuildError::Malformed { what: "a captured binding without a type" })?;
         let t = crate::copy_written(from, lt, params, body, out, scratch)?;
-        fields.push(match by {
+        fields.push(match f.how {
             blaze_typeck::CaptureKind::ByRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Not, t)).map_err(full)?,
             blaze_typeck::CaptureKind::ByMutRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Mut, t)).map_err(full)?,
             blaze_typeck::CaptureKind::ByValue => t,
@@ -571,6 +613,8 @@ impl DynChain {
 pub struct Layout {
     /// The type (of the ground table); a variant's row holds its enum's type.
     pub ty: PTy,
+    /// Ground type whose function-call convention this value inherits.
+    pub(crate) call_ty: PTy,
     /// The size; of an unsized layout, the offset where its tail starts, not rounded up to the
     /// alignment (`Layouts::size_of_val` rounds once, after adding the tail).
     pub size: u64,
@@ -592,6 +636,36 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// The Reference, “The transparent representation”. A transparent struct or
+    /// single-variant enum has the layout and function-call ABI of its one non-1-ZST
+    /// field. `call_ty` is inherited from that field, so nesting composes. Pattern
+    /// types inherit their base's. A union keeps its target's union convention.
+    /// Ordinary structs stay indirect even when their bytes describe a single scalar.
+    pub fn rust_pass(&self, ground: blaze_typeck::PTys<'_>) -> Result<crate::abi::Pass, Refusal> {
+        use crate::abi::Pass;
+
+        if self.tail != Tail::Sized {
+            return Err(Refusal::Unsupported("an unsized value passed by value"));
+        }
+        if self.is_zst() {
+            // An address needed for a local destructor is supplied in that frame.
+            return Ok(Pass::Ignore);
+        }
+        let base = ground.node(self.call_ty).map_err(|_| Refusal::Malformed("a call ABI type past the ground table"))?;
+        if let (PNode::Ptr(..) | PNode::Ref(..), Some((_, metadata))) = (base, self.pair) {
+            return Ok(Pass::Wide { metadata: crate::intrinsics::lir(metadata.prim).0 });
+        }
+        match base {
+            PNode::Ptr(..) | PNode::Ref(..) | PNode::FnPtr(..) | PNode::Bool | PNode::Char
+            | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) => {
+                let s = self.scalar.ok_or(Refusal::Malformed("a scalar ABI field without a scalar layout"))?;
+                let (ty, signed) = crate::intrinsics::lir(s.prim);
+                Ok(rust_scalar(ty, signed, self.fields != Fields::Primitive))
+            }
+            _ => Ok(Pass::Ref),
+        }
+    }
+
     pub fn is_zst(&self) -> bool {
         self.size == 0 && self.tail == Tail::Sized
     }
@@ -599,6 +673,78 @@ impl Layout {
     pub fn align_bytes(&self) -> u64 {
         1u64 << self.align
     }
+}
+
+pub(crate) fn rust_scalar(ty: blaze_lir::Ty, signed: bool, agg: bool) -> crate::abi::Pass {
+    use blaze_lir::{Ty, func::Ext};
+    let ext = match (ty, signed) {
+        (Ty::I8 | Ty::I16, true) => Ext::Sext,
+        (Ty::I8 | Ty::I16, false) => Ext::Zext,
+        _ => Ext::None,
+    };
+    crate::abi::Pass::Scalar { ty, ext, agg }
+}
+
+#[cfg(test)]
+#[test]
+fn transparent_calls_inherit_only_the_abi_fields_convention() {
+    use self::tests::{F, G, World, lay};
+    use crate::abi::Pass;
+    use blaze_lir::{Ty, func::Ext};
+    use blaze_typeck::{List, Mutbl};
+
+    let transparent = ReprAttrs { transparent: true, ..ReprAttrs::RUST };
+    let mut w = World::default();
+    let wrapper = w.strukt(1, &[F::P(0)], transparent);
+    let single = w.def(AdtKind::Enum, 1, &[&[F::Leaf(PNode::Tuple(List::EMPTY)), F::P(0)]], transparent);
+    let plain = w.strukt(1, &[F::P(0)], ReprAttrs::RUST);
+    let union = w.def(AdtKind::Union, 1, &[&[F::P(0)]], transparent);
+    let option = w.option();
+    let mut g = G::new();
+    let u = g.n(PNode::Uint(UintTy::U64));
+    let s = g.n(PNode::Str);
+    let wide = g.r(s);
+    let principal = g.n(PNode::ExTrait(ItemKey(0x77), List::EMPTY));
+    let predicates = g.t.intern_list(&[principal]).unwrap();
+    let object = g.n(PNode::Dynamic(predicates));
+    let receiver = g.r(object);
+    let raw = g.n(PNode::Ptr(Mutbl::Not, u));
+    let low = g.n(PNode::ConstValue { bits: 1, ty: u });
+    let high = g.n(PNode::ConstValue { bits: u64::MAX as u128, ty: u });
+    let range = g.t.intern_list(&[low, high]).unwrap();
+    let nonnull = g.n(PNode::Pat(raw, range));
+    let nn = g.adt(wrapper, &[nonnull]);
+    let nullable = g.adt(option, &[nn]);
+    let newtype = g.adt(plain, &[u]);
+    let unit = g.tuple(&[]);
+    let aggregate = g.tuple(&[u, u, u]);
+    let wrapped = g.adt(wrapper, &[u]);
+    let nested = g.adt(single, &[wrapped]);
+    let mut ls = Layouts::new_in(std::alloc::Global);
+    let scalar = |ty| Pass::Scalar { ty, ext: Ext::None, agg: true };
+    for (ty, want) in [
+        (wrapped, scalar(Ty::I64)),
+        (nested, scalar(Ty::I64)),
+        (g.adt(wrapper, &[unit]), Pass::Ignore),
+        (nn, scalar(Ty::PTR)),
+        (nullable, scalar(Ty::PTR)),
+        (wide, Pass::Wide { metadata: Ty::I64 }),
+        (g.adt(wrapper, &[wide]), Pass::Wide { metadata: Ty::I64 }),
+        (g.adt(wrapper, &[receiver]), Pass::Wide { metadata: Ty::PTR }),
+        (newtype, Pass::Ref),
+        (g.adt(wrapper, &[newtype]), Pass::Ref),
+        (g.adt(wrapper, &[aggregate]), Pass::Ref),
+        (g.adt(union, &[u]), Pass::Ref),
+    ] {
+        let row = lay(&w, &mut g, &mut ls, ty).unwrap();
+        assert_eq!(ls.get(row).rust_pass(g.t.view()).unwrap(), want, "ground type {ty:?}");
+    }
+    // Plant the old classification for the erased formatter's argument only. The
+    // same pointer bytes now cross as the address of their storage.
+    let row = lay(&w, &mut g, &mut ls, nn).unwrap();
+    let old = Layout { call_ty: nn, ..*ls.get(row) };
+    assert_eq!(old.rust_pass(g.t.view()).unwrap(), Pass::Ref);
+    println!("transparent scalar, nullable pointer, two-word and indirect ABI classes verified");
 }
 
 /// Why a type has no layout.
@@ -679,6 +825,7 @@ enum Order {
 
 /// A struct-like layout before it is a row.
 struct Uni {
+    call_ty: Option<PTy>,
     first: u32,
     len: u32,
     size: u64,
@@ -1154,6 +1301,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             let scalar = Scalar { prim: p, valid: valid.unwrap_or(WrappingRange::full(p.bits())) };
             Layout {
                 ty: t,
+                call_ty: t,
                 size: p.size(),
                 align: p.align(),
                 tail: Tail::Sized,
@@ -1168,6 +1316,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         };
         let zst = |uninhabited| Layout {
             ty: t,
+            call_ty: t,
             size: 0,
             align: 0,
             tail: Tail::Sized,
@@ -1258,6 +1407,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     self.offsets.extend_from_slice(&[0, PTR_BYTES]);
                     Layout {
                         ty: t,
+                        call_ty: t,
                         size: 2 * PTR_BYTES,
                         align: PTR_ALIGN,
                         tail: Tail::Sized,
@@ -1287,6 +1437,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 };
                 Layout {
                     ty: t,
+                    call_ty: t,
                     size: 0,
                     align,
                     tail: Tail::Slice { stride },
@@ -1309,6 +1460,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 let size = el.size.checked_mul(n).filter(|&s| s <= MAX_SIZE).ok_or(Refusal::TooLarge)?;
                 Layout {
                     ty: t,
+                    call_ty: t,
                     size,
                     align: el.align,
                     tail: Tail::Sized,
@@ -1362,6 +1514,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             // and 2; no field is visible through it.
             PNode::Dynamic(_) => Layout {
                 ty: t,
+                call_ty: t,
                 size: 0,
                 align: 0,
                 tail: Tail::Dyn,
@@ -1389,6 +1542,7 @@ impl<A: Allocator + Clone> Layouts<A> {
     fn struct_row(&self, t: PTy, u: Uni) -> Layout {
         Layout {
             ty: t,
+            call_ty: u.call_ty.unwrap_or(t),
             size: u.size,
             align: u.align,
             tail: u.tail,
@@ -1538,7 +1692,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 pair = l.pair;
             }
         }
-        Ok(Uni { first, len: ids.len() as u32, size, align, tail, uninhabited, niche, scalar, pair })
+        Ok(Uni { call_ty: None, first, len: ids.len() as u32, size, align, tail, uninhabited, niche, scalar, pair })
     }
 
     fn adt(&mut self, t: PTy, key: ItemKey, cx: &mut LayoutCx<'_, '_>, parts: &[PTy]) -> Result<LayoutId, Refusal> {
@@ -1607,6 +1761,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 let size = align_up(size, align)?;
                 self.push(Layout {
                     ty: t,
+                    call_ty: t,
                     size,
                     align,
                     tail: Tail::Sized,
@@ -1630,9 +1785,9 @@ impl<A: Allocator + Clone> Layouts<A> {
             let id = self.done(p).ok_or(Refusal::Malformed("a field not laid out"))?;
             let l = *self.get(id);
             align = align.max(l.align);
-            if !l.is_zst() {
+            if !l.is_zst() || l.align != 0 {
                 if inner.is_some() {
-                    return Err(Refusal::Malformed("a `repr(transparent)` struct with two non-zero-sized fields"));
+                    return Err(Refusal::Malformed("a transparent type with two fields other than size zero and alignment one"));
                 }
                 inner = Some(l);
             }
@@ -1656,6 +1811,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         }
         Ok(match inner {
             Some(l) => Uni {
+                call_ty: Some(l.call_ty),
                 first,
                 len: fields.len() as u32,
                 size: l.size,
@@ -1666,7 +1822,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                 scalar: l.scalar,
                 pair: l.pair,
             },
-            None => Uni { first, len: fields.len() as u32, size: 0, align, tail: Tail::Sized, uninhabited: false, niche: None, scalar: None, pair: None },
+            None => Uni { call_ty: None, first, len: fields.len() as u32, size: 0, align, tail: Tail::Sized, uninhabited: false, niche: None, scalar: None, pair: None },
         })
     }
 
@@ -1695,6 +1851,16 @@ impl<A: Allocator + Clone> Layouts<A> {
         let ds = &self.discrs[discr_first as usize..];
         let (min, max) = (ds.iter().copied().min().unwrap_or(0), ds.iter().copied().max().unwrap_or(0));
         let fields_of = |v: usize| parts.get(adt.variants[v].fields.range()).ok_or(Refusal::Malformed("a variant's fields past their column"));
+
+        if attrs.transparent {
+            if n != 1 {
+                return Err(Refusal::Malformed("a transparent enum without exactly one variant"));
+            }
+            let u = self.transparent(fields_of(0)?)?;
+            let mut row = self.struct_row(t, u);
+            row.discrs = discrs;
+            return self.push(row);
+        }
 
         if n == 0 {
             let mut l = self.zst_row(t, true);
@@ -1880,6 +2046,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             }
             let id = self.push(Layout {
                 ty: t,
+                call_ty: t,
                 size,
                 align,
                 tail: Tail::Sized,
@@ -1906,8 +2073,18 @@ impl<A: Allocator + Clone> Layouts<A> {
             Some((a, b)) if whole && niche.offset == PTR_BYTES && b.prim == reserved.prim => Some((Scalar::full(a.prim), reserved)),
             _ => None,
         };
+        // A nullable scalar payload, including Option<NonNull<u8>>, has the
+        // payload's ABI. A wide payload can leave its metadata uninitialized in
+        // the empty variant. Do not read that word as a live pointer or length.
+        let call_ty = match fields_of(largest)? {
+            [field] if scalar.is_some() => {
+                self.get(self.done(*field).ok_or(Refusal::Malformed("an enum payload without its layout"))?).call_ty
+            }
+            _ => t,
+        };
         self.push(Layout {
             ty: t,
+            call_ty,
             size,
             align,
             tail: Tail::Sized,
@@ -1930,6 +2107,7 @@ impl<A: Allocator + Clone> Layouts<A> {
     fn zst_row(&self, t: PTy, uninhabited: bool) -> Layout {
         Layout {
             ty: t,
+            call_ty: t,
             size: 0,
             align: 0,
             tail: Tail::Sized,
@@ -1979,6 +2157,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         for (v, u) in unis.iter().enumerate() {
             let id = self.push(Layout {
                 ty: t,
+                call_ty: t,
                 size,
                 align,
                 tail: Tail::Sized,
@@ -1996,6 +2175,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         let scalar = (size == tag.prim.size()).then_some(tag);
         self.push(Layout {
             ty: t,
+            call_ty: t,
             size,
             align,
             tail: Tail::Sized,

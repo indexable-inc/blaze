@@ -18,7 +18,7 @@ doctest = false
 blaze-own.workspace = true
 # The domain-separated BLAKE3 `Hasher`: an outside name's symbol, a record's fold digest. By
 # path: the workspace entry turns on its `serde` adapter.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the tests hand every function.

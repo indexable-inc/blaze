@@ -103,6 +103,8 @@ fn run_once(name: &str, workers: Option<u32>) -> (std::string::String, Option<(s
         macos_min: "11.0",
     };
     let script = NativeScript {
+        // A test's run: no record is kept, so any key names its trees.
+        key: blaze_ids::ContentId([7; 32]),
         program: &exe,
         c,
         env: &env,

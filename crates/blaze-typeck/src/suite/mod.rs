@@ -27,9 +27,9 @@ use crate::columns::{AdjustKind, Checked};
 use crate::diag::DiagCode;
 use crate::body::IntSuffix;
 use crate::ids::{ExprId, ItemKey, LangItem, Mutbl, Name, PatId, UintTy};
-use crate::infer::{InferCtx, InferPlant, assoc_def};
+use crate::infer::{InferCtx, InferPlant};
 use crate::machine::Plant;
-use crate::portable::{PNode, PTy};
+use crate::portable::PNode;
 use crate::world::{Needs, PClause};
 use crate::{Outcome, check_with};
 use crate::fixture::{Bb, Fx, show};
@@ -40,6 +40,7 @@ mod assoc_item_bounds;
 mod async_closures;
 mod async_fmt;
 mod await_impl;
+mod checked_record;
 mod closure_identity;
 mod closures;
 mod const_args;
@@ -65,6 +66,9 @@ mod instance_holes;
 mod infer_const_arg;
 mod legacy_const;
 mod lower_forms;
+mod method_object_step;
+mod handler_blanket;
+mod closure_try_from;
 mod mut_places;
 mod neg_unsigned;
 mod op_callees;
@@ -76,8 +80,18 @@ mod qpath_defaults;
 mod opaque_supertraits;
 mod opaque_nested;
 mod opaque_hidden_closure;
+/// A self-recursive boxed future revealed one layer at an instance (`TypingMode::PostAnalysis`).
+mod opaque_post_analysis_recursive;
 /// E0425 names the segment that failed (rules/lit_path.rs `path_miss`).
 mod path_miss;
+mod pat_editions;
+/// An impl parameter named only by a where-clause projection (reth's `DebugNodeLauncher`).
+mod impl_param_by_projection;
+/// The body's own signature's projections as rows at its root (design B).
+mod sig_rows;
+/// A callee's trait bound as a row at the call whatever its trait names, and a selected
+/// impl's where-clauses as further rows there.
+mod bound_rows;
 mod pattern_types;
 mod pin_unsize;
 mod pin_unsize_interior;
@@ -88,6 +102,7 @@ mod self_paths;
 mod self_ty_paths;
 mod type_alias_paths;
 mod panic_hook_closure;
+mod why_maybe;
 mod suggest;
 mod where_const;
 mod where_projection;
@@ -103,6 +118,7 @@ mod self_fn_impl_args;
 mod specialize;
 mod dyn_closure_sig;
 mod diag_node;
+mod undecided_origin;
 mod fn_ptr_fn_traits;
 
 /// The keys of the world's items the cases name.
@@ -280,11 +296,13 @@ fn check_body(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, plant: Plant, ip: I
     let (stopped, again) = check_body_by(fx, b, owner, root, plant, ip, true);
     assert!(pulled == stopped, "`{}`: the pull and the stop differ:\n{pulled:?}\n{stopped:?}", fx.name_of(owner));
     assert!(rounds <= again, "`{}`: the pull asked {rounds} goals again, the stop {again}", fx.name_of(owner));
+    // Every clean body the suite checks round-trips through its record (D163 R1, rule 26).
+    checked_record::round_trips(fx.name_of(owner), &pulled, &stopped);
     pulled
 }
 
 /// The comparison compares something: the stop asks goals again for facts, the pull asks none
-/// (`ConstHolds` is the one question still stopped for; this body asks none).
+/// (every question is pulled, `ConstHolds` too: where_const.rs holds that one).
 #[test]
 fn pull_asks_no_goal_again() {
     let (fx, it) = world();
@@ -297,7 +315,7 @@ fn pull_asks_no_goal_again() {
 
 /// One check of the body; `stop`: the stop strategy. Also how many goals were asked again
 /// after a fact was filled.
-fn check_body_by(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, plant: Plant, ip: InferPlant, stop: bool) -> (Checked<'static>, u64) {
+pub(super) fn check_body_by(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, plant: Plant, ip: InferPlant, stop: bool) -> (Checked<'static>, u64) {
     let mut cx = InferCtx::new_in(Alloc::global());
     cx.plant = ip;
     cx.stop_for_facts = stop;

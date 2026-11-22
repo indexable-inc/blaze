@@ -203,9 +203,8 @@ impl<'l, 'a> Passing<'l, 'a> {
             let start = out.len();
             for raw in package.extras.iter().filter(|raw| raw.kind == kind) {
                 match self.written(found, raw, &inferred) {
-                    Some(Ok(target)) => out.push(target),
-                    Some(Err(refusal)) => refused.push(refusal),
-                    None => pending = true,
+                    Ok(target) => out.push(target),
+                    Err(refusal) => refused.push(refusal),
                 }
             }
             if auto {
@@ -285,19 +284,19 @@ impl<'l, 'a> Passing<'l, 'a> {
 
     /// A `[[test]]` (`[[example]]`, `[[bench]]`) table as a target: "The `path` field specifies
     /// where the source for the crate is located, relative to the `Cargo.toml` file. If not
-    /// specified, the inferred path is used based on the target name." A written path's file
-    /// is checked in its directory's listing; `None` while that listing is still to come, and
-    /// a target these rules refuse is `Some(Err(..))`.
+    /// specified, the inferred path is used based on the target name." A written path is the
+    /// root as written (no listing asked; its reader looks at it once); a target these rules
+    /// refuse is the `Err`.
     fn written(
-        &mut self,
+        &self,
         found: &Found<'l, 'a>,
         raw: &RawExtra<'a>,
         inferred: &[(Text<'a>, Text<'a>)],
-    ) -> Option<Result<ExtraTarget<'a>, RefusedTarget<'a>>> {
+    ) -> Result<ExtraTarget<'a>, RefusedTarget<'a>> {
         let alloc = self.alloc();
         let dir = found.dir.as_str();
         let refuse = |target: &str, why: TargetRefused<'a>| {
-            Some(Err(RefusedTarget { kind: raw.kind, target: String::from_str_in(target, alloc), at: raw.span, why }))
+            Err(RefusedTarget { kind: raw.kind, target: String::from_str_in(target, alloc), at: raw.span, why })
         };
         let Some(name) = &raw.name else { return refuse("", TargetRefused::NoName) };
         // Only a workspace member's targets are read here (`Layout::with_test_targets`): a
@@ -312,24 +311,21 @@ impl<'l, 'a> Passing<'l, 'a> {
                     return refuse(name, TargetRefused::NoFile { path });
                 }
             },
+            // A written path is the root, exactly that file relative to the manifest's directory,
+            // wherever it is under the package (cargo's rule), as a `[lib]` or `[[bin]]` path is
+            // (layout/mod.rs `rooted`): no listing is asked to look for it. Its one look is its
+            // reader's, the crate root's read (an absent root is named there, its row absent, so
+            // the file made later moves it). Until 2026-11-20 the parent's listing was asked and
+            // the file looked for in it, but the command's listings hold only the names a
+            // discovery reads (blaze-cli sweep.rs `wanted`: `lib.rs`, `main.rs`, `build.rs`,
+            // `*.rs` under `tests/`), so `tests/integration/mod.rs` or a package's own
+            // `regression_tests.rs` was refused "no file" while there (turso: eight tests).
             Some(path) => match join(dir, path, alloc) {
-                Some(root) if within(&root, dir) && root.as_str() != dir => {
-                    let (parent, leaf) = match root.as_str().rfind('/') {
-                        Some(cut) => (&root.as_str()[..cut], &root.as_str()[cut + 1..]),
-                        None => ("", root.as_str()),
-                    };
-                    match self.list(parent) {
-                        None => return None,
-                        Some(entries) => match entries.is_some_and(|entries| entries.iter().any(|(n, d)| n.as_str() == leaf && !*d)) {
-                            true => root,
-                            false => return refuse(name, TargetRefused::NoFile { path: root.clone() }),
-                        },
-                    }
-                }
+                Some(root) if within(&root, dir) && root.as_str() != dir => root,
                 _ => return refuse(name, TargetRefused::OutsidePackage { path: path.clone() }),
             },
         };
-        Some(Ok(ExtraTarget {
+        Ok(ExtraTarget {
             kind: raw.kind,
             name: name.clone(),
             root,
@@ -338,6 +334,6 @@ impl<'l, 'a> Passing<'l, 'a> {
             harness: raw.harness.unwrap_or(true),
             test: raw.test.unwrap_or(raw.kind.tested_by_default()),
             required_features: raw.required_features.clone(),
-        }))
+        })
     }
 }

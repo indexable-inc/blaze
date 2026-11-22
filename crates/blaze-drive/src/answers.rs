@@ -117,11 +117,6 @@ pub(crate) fn row_bytes(row: &Row<'_>) -> u64 {
     (ROW_BYTES + lists) as u64
 }
 
-/// The bytes of `readers` reader entries and `cell_readers` cell reader entries in a page.
-pub(crate) fn reader_bytes(readers: usize, cell_readers: usize) -> u64 {
-    (readers * WIDTHS[READERS] + cell_readers * WIDTHS[CELL_READERS]) as u64
-}
-
 // --- The page form, read in place ----------------------------------------------------------
 //
 // A page is three parts, every field little-endian and fixed-width:

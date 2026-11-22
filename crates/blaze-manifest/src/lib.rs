@@ -1,5 +1,5 @@
 //! `Cargo.toml` and `.cargo/config.toml` read as the pinned nightly's cargo
-//! (`harness/toolchain`) reads them, its `cargo-features` activated but its `-Z` flags not
+//! (`pins/toolchain`) reads them, its `cargo-features` activated but its `-Z` flags not
 //! read, so that blaze knows a workspace without running cargo: its packages, targets,
 //! dependencies and features, and the configuration that applies. What cargo accepts reads
 //! the same here; what it rejects is rejected with its message. `cargo metadata --no-deps` is

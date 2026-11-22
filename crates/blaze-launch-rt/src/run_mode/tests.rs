@@ -111,8 +111,8 @@ impl Memory for Sim {
         THUNKS + 16 * u64::from(slot.0)
     }
 
-    fn outside(&mut self, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
-        Err(RunModeError::Outside { symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
+    fn outside(&mut self, record: RecordId, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
+        Err(RunModeError::Outside { record, symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
     }
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {

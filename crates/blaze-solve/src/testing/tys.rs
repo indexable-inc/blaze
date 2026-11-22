@@ -142,8 +142,8 @@ impl TestTys {
             return Ok(t);
         }
         let k = self.nodes[t.0 as usize];
-        let mut sub = |s: &mut TestTys, x: Ty| s.resolve(x, depth + 1);
-        let mut list = |s: &mut TestTys, l: List| -> Result<List, SolveError> {
+        let sub = |s: &mut TestTys, x: Ty| s.resolve(x, depth + 1);
+        let list = |s: &mut TestTys, l: List| -> Result<List, SolveError> {
             let mut v = Vec::new();
             for i in 0..l.len {
                 let x = s.lists[(l.start + i) as usize];

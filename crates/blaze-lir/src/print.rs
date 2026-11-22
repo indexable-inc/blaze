@@ -22,7 +22,7 @@
 //! `(values)`, `[blocks]` or `[lanes]`, an immediate in decimal, a constant as hex words
 //! from the most significant, and rows of the tables as `refN`, `sN`, `ssN`, `iN`, `aN`.
 
-use std::fmt::{self, Write as _};
+use std::fmt;
 
 use crate::{
     flags::{AtomicRmw, FloatCond, IntCond, Shown},

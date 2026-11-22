@@ -171,6 +171,30 @@ impl<'a, T> Col<'a, T> {
 }
 
 impl<'a> PTys<'a> {
+    /// Appends every child in declaration order. A projection's arguments precede its term.
+    pub fn children_of(self, node: PNode, out: &mut impl Extend<PTy>) -> Result<(), CheckError> {
+        match node {
+            PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
+            | PNode::Opaque(_, l) | PNode::Closure { args: l, .. } | PNode::Coroutine { args: l, .. }
+            | PNode::Alias { args: l, .. } | PNode::Dynamic(l) | PNode::ExTrait(_, l) => {
+                out.extend(self.list(l)?.iter().copied());
+            }
+            PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::ConstValue { ty: t, .. } => out.extend([t]),
+            PNode::Future(_, a, b) | PNode::Array(a, b) => out.extend([a, b]),
+            PNode::Pat(base, ranges) => {
+                out.extend([base]);
+                out.extend(self.list(ranges)?.iter().copied());
+            }
+            PNode::ExProj { args, term, .. } => {
+                out.extend(self.list(args)?.iter().copied());
+                out.extend([term]);
+            }
+            PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str
+            | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_) => {}
+        }
+        Ok(())
+    }
+
     /// The empty table.
     pub const EMPTY: PTys<'static> = PTys { nodes: Col::EMPTY, lists: Col::EMPTY };
 
@@ -323,7 +347,7 @@ fn hash_list(l: List, h: &mut StableHasher) {
 /// `ConstValue`'s type too): the one walk order of a record's terms, for converting them
 /// (infer/facts.rs) and for hashing them (world.rs `Hashes`).
 pub(crate) fn node_children(t: PTys<'_>, n: PNode, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>) -> Result<(), CheckError> {
-    let mut list = |l: List, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>| -> Result<(), CheckError> {
+    let list = |l: List, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>| -> Result<(), CheckError> {
         for i in l.range() {
             let p = t.list_slot(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
             out.push(p.0);
@@ -859,6 +883,87 @@ const _: fn() = || {
 };
 
 impl<'a> PortableTys<'a> {
+    /// Instantiates a recorded type in this table. Replacements are in the caller's scope,
+    /// so even a replacement that contains a parameter is returned without descending into it.
+    pub fn subst(&mut self, root: PTy, args: &[PTy]) -> Result<PTy, CheckError> {
+        let alloc = self.alloc();
+        let mut mapped = HashMap::new_in(alloc);
+        let mut stack = Vec::new_in(alloc);
+        let mut children = Vec::new_in(alloc);
+        stack.push((root, false));
+        while let Some((at, expanded)) = stack.pop() {
+            if mapped.contains_key(&at) {
+                continue;
+            }
+            let view = self.view();
+            let node = view.node(at)?;
+            if let PNode::Param(index) | PNode::ConstParam(index) = node {
+                let site = crate::error::ParamSite::PortableSubstitution { root, node: at };
+                let &arg = args.get(index as usize).ok_or(CheckError::Malformed(Malformed::Param {
+                    index, args: args.len() as u32, site,
+                }))?;
+                view.node(arg)?;
+                mapped.insert(at, arg);
+                continue;
+            }
+            children.clear();
+            view.children_of(node, &mut children)?;
+            if children.is_empty() {
+                mapped.insert(at, at);
+                continue;
+            }
+            if !expanded {
+                stack.push((at, true));
+                for &child in children.iter().rev() {
+                    if child.0 >= at.0 {
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: at.0, child: child.0 }));
+                    }
+                    stack.push((child, false));
+                }
+                continue;
+            }
+            let mut changed = false;
+            for child in children.iter_mut() {
+                let replacement = *mapped.get(child).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: at.0, child: child.0 }))?;
+                changed |= *child != replacement;
+                *child = replacement;
+            }
+            let value = if changed { self.rebuild(node, &children)? } else { at };
+            mapped.insert(at, value);
+        }
+        mapped.get(&root).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }))
+    }
+
+    /// Reassembles a node from the children returned by `PTys::children_of`, in that order.
+    fn rebuild(&mut self, node: PNode, children: &[PTy]) -> Result<PTy, CheckError> {
+        let node = match node {
+            PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: children[0], bits },
+            PNode::Tuple(_) => PNode::Tuple(self.intern_list(children)?),
+            PNode::Ref(m, _) => PNode::Ref(m, children[0]),
+            PNode::Ptr(m, _) => PNode::Ptr(m, children[0]),
+            PNode::Array(..) => PNode::Array(children[0], children[1]),
+            PNode::Slice(_) => PNode::Slice(children[0]),
+            PNode::Pat(..) => PNode::Pat(children[0], self.intern_list(&children[1..])?),
+            PNode::Adt(k, _) => PNode::Adt(k, self.intern_list(children)?),
+            PNode::FnDef(k, _) => PNode::FnDef(k, self.intern_list(children)?),
+            PNode::FnPtr(_, h) => PNode::FnPtr(self.intern_list(children)?, h),
+            PNode::Closure { owner, ordinal, .. } => PNode::Closure { owner, ordinal, args: self.intern_list(children)? },
+            PNode::Future(e, ..) => PNode::Future(e, children[0], children[1]),
+            PNode::Coroutine { owner, ordinal, .. } => PNode::Coroutine { owner, ordinal, args: self.intern_list(children)? },
+            PNode::Alias { trait_, name, .. } => PNode::Alias { trait_, name, args: self.intern_list(children)? },
+            PNode::Opaque(k, _) => PNode::Opaque(k, self.intern_list(children)?),
+            PNode::Dynamic(_) => PNode::Dynamic(self.intern_list(children)?),
+            PNode::ExTrait(k, _) => PNode::ExTrait(k, self.intern_list(children)?),
+            PNode::ExProj { trait_, name, args, .. } => {
+                let n = args.len as usize;
+                PNode::ExProj { trait_, name, args: self.intern_list(&children[..n])?, term: children[n] }
+            }
+            PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str
+            | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_) => node,
+        };
+        self.intern(node)
+    }
+
     /// The allocator this table's own part lives in: its maker's, handed down (D102), so a
     /// question asked over the table (the run path's `drop_impl`) allocates its scratch there
     /// and fetches no allocator of its own.
@@ -904,6 +1009,24 @@ impl<'a> PortableTys<'a> {
             Own::Owned { index, .. } => index.node_index.get(n).copied(),
             Own::Stable(s) => s.find_node(n),
         }
+    }
+
+    /// Every interned list of the whole table (the base's, then the own), in the order
+    /// interned: what [`PortableTys::fork_in`] re-interns, and what the checked-body record
+    /// (crate::checked_record) keeps so a decode lays each list at the same index.
+    pub(crate) fn list_rows_in<'b>(&self, alloc: Alloc<'b>) -> Result<Vec<List, Alloc<'b>>, CheckError> {
+        let mut rows = Vec::new_in(alloc);
+        if let Some(b) = self.base {
+            b.each_list_row(&mut |l| {
+                rows.push(l);
+                Ok(())
+            })?;
+        }
+        self.each_list_row(&mut |l| {
+            rows.push(l);
+            Ok(())
+        })?;
+        Ok(rows)
     }
 
     /// Each own interned list, in the order interned.

@@ -22,21 +22,22 @@
 
 use std::{
     fmt, io,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::io::OwnedHandle,
     path::Path,
     sync::Arc,
 };
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use std::alloc::Global;
-use windows_sys::Win32::{
-    Foundation::{
+use blaze_sys::windows::{
+    Handle,
+    foundation::{
         ERROR_ACCESS_DENIED, ERROR_CANT_ACCESS_FILE, ERROR_DELETE_PENDING, ERROR_FILE_NOT_FOUND,
         ERROR_HANDLE_EOF, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
         ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
-        ERROR_PATH_NOT_FOUND, HANDLE,
+        ERROR_PATH_NOT_FOUND,
     },
-    Storage::FileSystem::{
+    fs::{
         CreateFileW, ExtendedFileIdType, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_128, FILE_ID_DESCRIPTOR,
         FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
@@ -44,20 +45,17 @@ use windows_sys::Win32::{
         GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         OPEN_EXISTING, OpenFileById, VOLUME_NAME_DOS, VOLUME_NAME_GUID, VOLUME_NAME_NT,
     },
-    System::{
-        IO::{DeviceIoControl, OVERLAPPED},
-        Ioctl::{
-            FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_UNPRIVILEGED_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1,
-            USN_JOURNAL_DATA_V1, USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE,
-            USN_REASON_COMPRESSION_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
-            USN_REASON_DATA_TRUNCATION, USN_REASON_EA_CHANGE, USN_REASON_ENCRYPTION_CHANGE,
-            USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE,
-            USN_REASON_INDEXABLE_CHANGE, USN_REASON_INTEGRITY_CHANGE, USN_REASON_NAMED_DATA_EXTEND,
-            USN_REASON_NAMED_DATA_OVERWRITE, USN_REASON_NAMED_DATA_TRUNCATION,
-            USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
-            USN_REASON_REPARSE_POINT_CHANGE, USN_REASON_SECURITY_CHANGE, USN_REASON_STREAM_CHANGE,
-            USN_RECORD_V2, USN_RECORD_V3,
-        },
+    io::{
+        DeviceIoControl, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_UNPRIVILEGED_USN_JOURNAL, OVERLAPPED,
+        READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V1, USN_REASON_BASIC_INFO_CHANGE,
+        USN_REASON_CLOSE, USN_REASON_COMPRESSION_CHANGE, USN_REASON_DATA_EXTEND,
+        USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION, USN_REASON_EA_CHANGE,
+        USN_REASON_ENCRYPTION_CHANGE, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+        USN_REASON_HARD_LINK_CHANGE, USN_REASON_INDEXABLE_CHANGE, USN_REASON_INTEGRITY_CHANGE,
+        USN_REASON_NAMED_DATA_EXTEND, USN_REASON_NAMED_DATA_OVERWRITE,
+        USN_REASON_NAMED_DATA_TRUNCATION, USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+        USN_REASON_REPARSE_POINT_CHANGE, USN_REASON_SECURITY_CHANGE, USN_REASON_STREAM_CHANGE,
+        USN_RECORD_V2, USN_RECORD_V3,
     },
 };
 
@@ -604,7 +602,7 @@ impl System for Volume {
         // security attributes. No access is asked: a name needs none.
         let opened = sys::owned(unsafe {
             OpenFileById(
-                self.hint.as_raw_handle(),
+                sys::handle_of(&self.hint),
                 &descriptor,
                 0,
                 SHARE_ALL,
@@ -648,7 +646,12 @@ fn final_path(handle: &OwnedHandle, flags: u32, into: &mut Vec<u16>) -> io::Resu
         into.resize(room, 0);
         // SAFETY: an open handle and a buffer of the length given.
         let len = unsafe {
-            GetFinalPathNameByHandleW(handle.as_raw_handle(), into.as_mut_ptr(), room as u32, flags)
+            GetFinalPathNameByHandleW(
+                sys::handle_of(handle),
+                into.as_mut_ptr(),
+                room as u32,
+                flags,
+            )
         };
         let len = len as usize;
         if len == 0 {
@@ -670,7 +673,7 @@ fn file_id(handle: &OwnedHandle) -> io::Result<(u64, u128)> {
     // valid for any bytes written.
     sys::check(unsafe {
         GetFileInformationByHandleEx(
-            handle.as_raw_handle(),
+            sys::handle_of(handle),
             FileIdInfo,
             (&raw mut info).cast(),
             size_of::<FILE_ID_INFO>() as u32,
@@ -687,7 +690,7 @@ fn volume_info(handle: &OwnedHandle) -> io::Result<(String, u32)> {
     // is not asked for.
     sys::check(unsafe {
         GetVolumeInformationByHandleW(
-            handle.as_raw_handle(),
+            sys::handle_of(handle),
             std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),
@@ -713,7 +716,7 @@ fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
             std::ptr::null(),
             OPEN_EXISTING,
             flags,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     })
 }
@@ -726,7 +729,7 @@ fn query(handle: &OwnedHandle) -> io::Result<USN_JOURNAL_DATA_V1> {
     // the `USN_JOURNAL_DATA_V1` it writes; plain integers, valid for any bytes written.
     sys::check(unsafe {
         DeviceIoControl(
-            handle.as_raw_handle(),
+            sys::handle_of(handle),
             FSCTL_QUERY_USN_JOURNAL,
             std::ptr::null(),
             0,
@@ -912,8 +915,8 @@ impl Journal {
     }
 
     /// The volume handle the reads are on: what the port is told of and a cancel names.
-    pub(super) fn raw(&self) -> HANDLE {
-        self.reader.as_raw_handle()
+    pub(super) fn raw(&self) -> Handle {
+        sys::handle_of(&self.reader)
     }
 
     /// The synchronous handle of the volume a flush's [`mark`] is asked through.
@@ -976,7 +979,7 @@ impl Journal {
         // and writes them in place (`METHOD_NEITHER`).
         sys::pending(unsafe {
             DeviceIoControl(
-                self.reader.as_raw_handle(),
+                sys::handle_of(&self.reader),
                 FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
                 (&raw const self.input).cast(),
                 size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
@@ -1042,12 +1045,21 @@ impl Journal {
     }
 
     fn batch(&mut self) -> Box<Journaled> {
-        let (files, lost) = self.names.drain();
+        let (mut files, mut lost) = self.names.drain();
+        // The watched directory's own name is `itself` (a file) or `whole` (a loss): never a
+        // name beneath it (`Journaled`'s one rule, the root's too).
+        let dir = &self.names.dir;
+        let whole = lost.iter().find(|(name, _)| name == dir).map(|&(_, why)| why);
+        lost.retain(|(name, _)| name != dir);
+        let itself = files.iter().any(|name| name == dir);
+        files.retain(|name| name != dir);
         self.told = self.next;
         // alloc: the batch as `Done::Journaled` boxes it, once per batch.
         Box::new(Journaled {
             files,
             lost,
+            whole,
+            itself,
             cursor: Cursor::Usn { volume: self.serial, journal: self.journal, next: self.next },
             caught_up: self.caught_up,
         })

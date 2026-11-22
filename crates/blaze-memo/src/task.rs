@@ -9,7 +9,7 @@
 use std::{
     alloc::Global,
     cell::{Cell, RefCell},
-    fmt::{self, Write as _},
+    fmt,
     num::NonZeroUsize,
     ptr,
     sync::Once,

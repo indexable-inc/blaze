@@ -35,7 +35,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
+use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, WriterOpts, schema_of};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc};
 
@@ -486,7 +486,7 @@ pub fn build_impl_index<'a>(
 
 fn write_bucket<'a>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc: Alloc<'a>) -> RecordBytes<'a> {
     let (kind, trait_, shape) = key.parts();
-    let mut out = Writer::new_in(BUCKET_SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: BUCKET_SCHEMA, alloc: alloc, capacity: None });
     let rows_at = out.push_slice(rows);
     let at = out.next::<BucketRoot>();
     let root = BucketRoot {
@@ -502,7 +502,7 @@ fn write_bucket<'a>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc:
 }
 
 fn write_directory<'a>(krate: CrateItemKey, entries: &[DirEntry], alloc: Alloc<'a>) -> RecordBytes<'a> {
-    let mut out = Writer::new_in(DIRECTORY_SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: DIRECTORY_SCHEMA, alloc: alloc, capacity: None });
     let entries_at = out.push_slice(entries);
     let at = out.next::<DirectoryRoot>();
     let root = DirectoryRoot {
@@ -522,7 +522,7 @@ struct Unread {
 }
 
 fn write_no_impls<'a>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], unread: Unread, alloc: Alloc<'a>) -> RecordBytes<'a> {
-    let mut out = Writer::new_in(NO_IMPLS_SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: NO_IMPLS_SCHEMA, alloc: alloc, capacity: None });
     let traits_at = out.push_slice(traits);
     let buckets_at = out.push_slice(buckets);
     let at = out.next::<NoImplsRoot>();

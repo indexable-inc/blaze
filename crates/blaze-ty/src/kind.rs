@@ -345,11 +345,6 @@ pub(crate) const fn child_classes(tag: u32, kind: u8, b: bool) -> u8 {
     }
 }
 
-/// Whether `kind` is a type kind (not a predicate or an existential predicate).
-pub const fn is_type(kind: u8) -> bool {
-    kind <= ty::ERROR
-}
-
 /// Whether `kind` is a predicate kind.
 pub const fn is_pred(kind: u8) -> bool {
     kind >= ty::P_TRAIT && kind <= ty::P_AMBIGUOUS

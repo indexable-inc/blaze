@@ -10,8 +10,9 @@
 //! never related.
 //!
 //! THE RULE: a type parameter `U` of the body outlives exactly what the body may assume of it:
-//! its declared `U: 'r` (the body's own [`crate::CallBounds::outlives`], read from its text by
-//! the reader of its lifetime part, so the `Named` numbers agree) and the bounds its
+//! its declared `U: 'r` (the body's own [`crate::CallBounds::outlives`], since D148 read from
+//! its head's region facts, `RegionFacts::outlives` with the subject from its clause, so the
+//! region is in the one numbering its signature column uses) and the bounds its
 //! signature's types imply (`&'x U` in an input or the output is well formed only when
 //! `U: 'x`: the Reference, "Implied bounds"); `'static` outlives it. That is a placeholder
 //! origin `ρ_U`, made when first needed, with those relations `known`: the same table the
@@ -23,8 +24,8 @@
 //! WHAT IS NOT READ, and so turns a finding into a refusal rather than an error
 //! ([`ParamOrigin::certain`] false; blaze-ladder borrows.rs maps it to
 //! `Form::ParamOutlivesUnread`): a trait bound on `U` (`U: Any` implies `U: 'static` through
-//! its supertrait; trait headers' outlives are not read), a bound in the container's header
-//! that the reader did not resolve (`unread_below`), a body whose bounds were not filed, and
+//! its supertrait; a trait's supertrait outlives are not read), a container whose region
+//! facts were not read (`unread_below`), a body whose bounds were not filed, and
 //! `U` met in the signature under an ADT that declares lifetimes, a trait object, an opaque or
 //! alias type or a fn pointer (their implied bounds are not read). A trait bound can only add
 //! to what `U` outlives, so a relation the read bounds already prove stays proven: only a
@@ -32,11 +33,11 @@
 
 use blaze_flow::Origin;
 use blaze_own::Vec;
+use blaze_typeck::regions::Region;
 use blaze_typeck::{ExprId, List, PNode, PTy};
 use core::alloc::Allocator;
 
-use crate::sig::Region;
-use crate::{CallBounds, Facts, Form, Lower, MOST_POSITIONS, Plant, Refusal, TyD};
+use crate::{CallBounds, Facts, Form, Lower, MOST_POSITIONS, OutlivesType, Plant, Refusal, TyD};
 
 /// The placeholder origin standing for "what the body's type parameter `param` outlives".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,12 +49,19 @@ pub struct ParamOrigin {
     pub certain: bool,
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
+impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// The body's type parameters `t` holds (pushed to `params`; unsorted, may repeat), and
     /// whether it holds another type whose lifetimes the lowering does not count as positions:
     /// an alias, an opaque type, a closure, a coroutine, a trait object, an inference variable,
     /// an error, or a fn pointer whose parameters or result hold a reference.
     pub(crate) fn unplaced(&self, t: PTy, e: ExprId, params: &mut Vec<u32, A>) -> Result<bool, Refusal> {
+        self.outlives_components(t, e, params, false)
+    }
+
+    /// For a bound on the value itself, a closure or async block stores its captures.
+    /// A projection of that same value can depend on other types (e.g. its output).
+    /// Only open the captures for the former, and only with an exact capture witness.
+    pub(crate) fn outlives_components(&self, t: PTy, e: ExprId, params: &mut Vec<u32, A>, captures: bool) -> Result<bool, Refusal> {
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
         stack.push(t);
         let mut steps = 0u32;
@@ -64,6 +72,37 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
             match self.node(t, e)? {
                 PNode::Param(u) => params.push(u),
+                PNode::Closure { owner, ordinal, .. } if captures && owner == self.body.owner => {
+                    let Some(upvars) = self.ck.closures.column::<3>().get(ordinal as usize) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    let Some(tuple) = *upvars else { return Ok(true) };
+                    stack.push(tuple);
+                }
+                PNode::Future(block, _, _) if captures => {
+                    if !matches!(self.expr(block)?, blaze_typeck::Expr::AsyncBlock { .. })
+                        || !matches!(self.ck.coroutine_witness(block), Some(blaze_typeck::CoroutineWitness::NeedsSavedLocals | blaze_typeck::CoroutineWitness::Complete))
+                    {
+                        return Ok(true);
+                    }
+                    // The borrow of a by-reference capture is already a position of the
+                    // value in npos. Its referent can additionally contain a caller parameter.
+                    let rows = self.ck.captures.column::<0>();
+                    let start = rows.partition_point(|&at| at < block);
+                    for i in start..rows.len() {
+                        if rows[i] != block { break; }
+                        let pat = self.ck.captures.column::<1>()[i];
+                        let Some(&ty) = self.ck.local_ty.get(pat.ix()) else { return self.refuse(Form::Malformed, e) };
+                        stack.push(ty);
+                    }
+                }
+                // A bound on the value itself (`g::<impl Sized>(h(&s))`, `T: 'static`): an
+                // opaque type's captured lifetimes ARE its positions (`npos` counts them, the
+                // hidden output's regions laid into them, RFC 1214 / the Reference, "impl
+                // Trait", "Capturing"), which the bound relates as it does a reference's; its
+                // type arguments are walked for the caller's parameters and for what has none.
+                // For a projection of the value (`captures` false) it stays unplaced.
+                PNode::Opaque(_, l) if captures => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Alias { .. }
                 | PNode::Opaque(_, _)
                 | PNode::Dynamic(_)
@@ -72,7 +111,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 | PNode::Coroutine { .. }
                 | PNode::Infer
                 | PNode::Error => return Ok(true),
-                PNode::FnPtr(l, _) => {
+                PNode::FnPtr(l, _) | PNode::FnDef(_, l) => {
                     for &x in self.list(l, e)? {
                         if self.npos(x, e)? > 0 {
                             return Ok(true);
@@ -81,7 +120,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     }
                 }
                 PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 _ => {}
             }
         }
@@ -110,7 +149,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
             match self.node(t, e)? {
                 PNode::Param(u) => {
-                    if in_adt {
+                    if in_adt && !self.implied_given {
                         self.param_unsure.push(u);
                     } else if under != u32::MAX {
                         let outer = self.origs[(start + under) as usize];
@@ -134,6 +173,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         off += self.npos(x, e)?;
                     }
                 }
+                // A trait object's and a fn pointer's components are in the implied bounds
+                // when given (front2 adt_outlives.rs walks them componentwise).
+                PNode::Dynamic(_) | PNode::FnPtr(..) if self.implied_given => {}
                 PNode::Alias { .. } | PNode::Opaque(_, _) | PNode::Dynamic(_) | PNode::FnPtr(..) | PNode::Closure { .. } => {
                     // What these imply on a parameter inside them is not read: every
                     // parameter's failures become refusals.
@@ -159,8 +201,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         match own {
             Some(b) => {
                 certain &= u >= b.unread_below && b.trait_bounded.binary_search(&u).is_err();
-                for &(p, r) in b.outlives {
-                    if p == u && known {
+                for &(subject, r) in b.outlives {
+                    if subject == OutlivesType::Param(u) && known {
                         let x = self.universal(r);
                         self.b.known(o, x);
                     }
@@ -189,15 +231,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// relates or refuses it), never by `call_by_signature` (which reads no bounds).
     pub(crate) fn owes_type_outlives(&self, bounds: CallBounds<'_>, g: List, e: ExprId) -> Result<Option<u32>, Refusal> {
         let args: &'c [PTy] = self.list(g, e)?;
+        // A bound on the output is independent of the future's own captures. It must
+        // reach the generic signature even for an entirely capture-free block.
+        for &(subject, _) in bounds.outlives {
+            if !matches!(subject, OutlivesType::Param(_)) {
+                return Ok(Some(subject.param()));
+            }
+        }
         let mut params: Vec<u32, A> = Vec::new_in(self.alloc.clone());
         for (i, &t) in args.iter().enumerate() {
             let i = i as u32;
-            let bound = i < bounds.unread_below || bounds.outlives.iter().any(|&(p, _)| p == i);
+            let bound = i < bounds.unread_below || bounds.outlives.iter().any(|&(s, _)| s == OutlivesType::Param(i));
             if !bound {
                 continue;
             }
             params.clear();
-            if self.unplaced(t, e, &mut params)? || !params.is_empty() {
+            if self.npos(t, e)? != 0 || self.unplaced(t, e, &mut params)? || !params.is_empty() {
                 return Ok(Some(i));
             }
         }

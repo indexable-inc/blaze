@@ -43,7 +43,7 @@ impl<A: GlobalAlloc + Sync + 'static> Under for A {}
 /// Runs each column `ROUNDS` times, the first alternating each round, and prints each one's
 /// best per unit and the system's time over blaze's.
 fn row(name: &str, units: u64, runs: [&mut dyn FnMut() -> Duration; 2]) {
-    let mut runs = runs;
+    let runs = runs;
     let mut best = [Duration::MAX; 2];
     for round in 0..ROUNDS {
         for k in 0..2 {

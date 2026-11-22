@@ -253,6 +253,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ask"
+version = "0.0.0"
+dependencies = [
+ "blaze-core",
+ "blaze-ids",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-audit"
 version = "0.0.0"
 dependencies = [
@@ -284,6 +294,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-memo",
+ "blaze-own",
  "blaze-profile",
  "blaze-rng",
  "blaze-trace",
@@ -369,6 +380,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-borrow"
+version = "0.0.0"
+dependencies = [
+ "blaze-flow",
+ "blaze-own",
+ "blaze-typeck",
+]
+
+[[package]]
 name = "blaze-build"
 version = "0.0.0"
 dependencies = [
@@ -391,9 +411,11 @@ dependencies = [
  "blaze-fetch",
  "blaze-git-fetch",
  "blaze-ids",
+ "blaze-json",
  "blaze-manifest",
  "blaze-mem",
  "blaze-own",
+ "blaze-pins",
  "blaze-sim",
  "blaze-spawn",
  "blaze-surface",
@@ -410,30 +432,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-c"
+version = "0.0.0"
+dependencies = [
+ "blaze-format-core",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-cad"
+version = "0.0.0"
+dependencies = [
+ "blaze-cad-field",
+ "blaze-cad-mesh",
+ "blaze-cad-out",
+ "blaze-cad-picture",
+ "blaze-deflate",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-text",
+ "blaze-units",
+]
+
+[[package]]
+name = "blaze-cad-field"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-hash",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-text",
+ "blaze-units",
+]
+
+[[package]]
+name = "blaze-cad-mesh"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-cad-field",
+ "blaze-int",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-units",
+]
+
+[[package]]
+name = "blaze-cad-out"
+version = "0.0.0"
+dependencies = [
+ "blaze-cad-mesh",
+ "blaze-data",
+ "blaze-deflate",
+ "blaze-int",
+ "blaze-json",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-text",
+ "blaze-units",
+]
+
+[[package]]
+name = "blaze-cad-picture"
+version = "0.0.0"
+dependencies = [
+ "blaze-cad-field",
+ "blaze-cad-out",
+ "blaze-deflate",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-units",
+]
+
+[[package]]
 name = "blaze-cas"
 version = "0.0.0"
 dependencies = [
- "blaze-alloc-count",
- "blaze-bytes",
- "blaze-check",
  "blaze-core",
  "blaze-data",
  "blaze-format",
- "blaze-format-tiers",
- "blaze-graph",
  "blaze-hash",
  "blaze-ids",
  "blaze-json",
  "blaze-keyed",
  "blaze-mem",
- "blaze-queue",
- "blaze-reclaim",
  "blaze-sim",
- "blaze-spin",
  "blaze-trace",
- "blaze-v2-proof",
  "libc",
- "zstd",
 ]
 
 [[package]]
@@ -454,6 +547,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-cc"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-c",
+ "blaze-own",
+ "blaze-roots",
+ "blaze-sim",
+ "blaze-std",
+]
+
+[[package]]
 name = "blaze-cert"
 version = "0.0.0"
 dependencies = [
@@ -468,8 +573,8 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-rng",
+ "blaze-sys",
  "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -479,9 +584,11 @@ dependencies = [
  "blaze-answer",
  "blaze-apple-sdk",
  "blaze-blake3",
+ "blaze-body",
  "blaze-build-script",
  "blaze-cas",
  "blaze-code",
+ "blaze-comptime",
  "blaze-core",
  "blaze-deflate",
  "blaze-drive",
@@ -500,8 +607,11 @@ dependencies = [
  "blaze-launch",
  "blaze-lex",
  "blaze-lint",
+ "blaze-lir",
  "blaze-manifest",
  "blaze-mem",
+ "blaze-meter",
+ "blaze-native",
  "blaze-own",
  "blaze-proc-macro",
  "blaze-remote",
@@ -513,6 +623,7 @@ dependencies = [
  "blaze-sim",
  "blaze-std",
  "blaze-surface",
+ "blaze-sys",
  "blaze-tar",
  "blaze-text",
  "blaze-toml",
@@ -520,6 +631,7 @@ dependencies = [
  "blaze-typeck",
  "blaze-unit-graph",
  "blaze-wasi",
+ "blaze-watch",
  "blaze-world",
  "edition",
  "parser",
@@ -543,6 +655,28 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "rustc_lexer",
+]
+
+[[package]]
+name = "blaze-comptime"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-cbor",
+ "blaze-own",
+ "blaze-roots",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-comptime-sys"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-comptime",
+ "blaze-own",
+ "blaze-roots",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -584,6 +718,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-meter",
  "blaze-own",
  "blaze-queue",
  "blaze-radix",
@@ -592,7 +727,17 @@ dependencies = [
  "blaze-spin",
  "blaze-sys",
  "libc",
- "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "blaze-cunit"
+version = "0.0.0"
+dependencies = [
+ "blaze-code",
+ "blaze-ids",
+ "blaze-native",
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -629,13 +774,12 @@ dependencies = [
  "blaze-fetch",
  "blaze-format",
  "blaze-git-fetch",
+ "blaze-hash",
  "blaze-id",
  "blaze-ids",
  "blaze-manifest",
  "blaze-own",
- "blaze-run",
  "blaze-sim",
- "blaze-surface",
  "blaze-text",
  "blaze-unit-graph",
 ]
@@ -645,6 +789,7 @@ name = "blaze-ed25519"
 version = "0.0.0"
 dependencies = [
  "blaze-int",
+ "blaze-own",
  "blaze-sim",
  "ring",
 ]
@@ -669,6 +814,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-answer",
  "blaze-drive",
+ "blaze-hash",
  "blaze-id",
  "blaze-own",
  "blaze-sim",
@@ -701,6 +847,7 @@ dependencies = [
  "blaze-mem",
  "blaze-native",
  "blaze-own",
+ "blaze-pins",
  "blaze-sha256",
  "blaze-tier",
 ]
@@ -771,6 +918,7 @@ dependencies = [
 name = "blaze-flow-lower"
 version = "0.0.0"
 dependencies = [
+ "blaze-borrow",
  "blaze-flow",
  "blaze-own",
  "blaze-typeck",
@@ -786,13 +934,12 @@ dependencies = [
  "blaze-manifest",
  "blaze-own",
  "blaze-semver",
- "blaze-serde",
+ "blaze-sys",
  "blaze-toml",
  "blaze-trace",
  "blaze-unicode",
  "diff",
  "intern",
- "libc",
  "parser",
  "rustc_lexer",
  "serde",
@@ -834,44 +981,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-front-items"
-version = "0.0.0"
-dependencies = [
- "blaze-bytes",
- "blaze-cas",
- "blaze-ids",
- "blaze-kernel",
- "blaze-report",
- "blaze-sim",
- "blaze-store-check",
- "span",
- "syntax",
-]
-
-[[package]]
 name = "blaze-fuzz"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
-]
-
-[[package]]
-name = "blaze-gc"
-version = "0.0.0"
-dependencies = [
- "blaze-core",
- "blaze-data",
- "blaze-hash",
- "blaze-ids",
- "blaze-json",
- "blaze-own",
- "blaze-queue",
- "blaze-spin",
- "blaze-trace",
- "libc",
- "stdx",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -906,9 +1020,9 @@ dependencies = [
  "blaze-radix",
  "blaze-reclaim",
  "blaze-rng",
- "blaze-serde",
  "blaze-sim",
  "blaze-spin",
+ "blaze-sys",
  "corosensei",
  "crossbeam-deque",
  "libc",
@@ -916,7 +1030,6 @@ dependencies = [
  "serde_json",
  "stdx",
  "test-utils",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -946,7 +1059,6 @@ dependencies = [
  "blaze-sim",
  "blaze-swiss",
  "foldhash",
- "serde",
 ]
 
 [[package]]
@@ -959,23 +1071,8 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-own",
  "blaze-sim",
-]
-
-[[package]]
-name = "blaze-host"
-version = "0.0.0"
-dependencies = [
- "blaze-cas",
- "blaze-core",
- "blaze-format",
- "blaze-graph",
- "blaze-ids",
- "blaze-keyed",
- "blaze-queue",
- "blaze-sim",
- "blaze-trace",
- "blaze-vfs",
 ]
 
 [[package]]
@@ -1016,6 +1113,7 @@ dependencies = [
  "blaze-data",
  "blaze-hash",
  "blaze-mem",
+ "blaze-meter",
  "blaze-own",
  "blaze-radix",
  "blaze-rng",
@@ -1024,18 +1122,6 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "blaze-image"
-version = "0.0.0"
-dependencies = [
- "blaze-alloc-count",
- "blaze-bytes",
- "blaze-core",
- "blaze-format",
- "blaze-ids",
- "blaze-sim",
 ]
 
 [[package]]
@@ -1059,6 +1145,7 @@ dependencies = [
  "blaze-inproc-rt",
  "blaze-mem",
  "blaze-spin",
+ "blaze-sys",
  "libc",
 ]
 
@@ -1067,11 +1154,12 @@ name = "blaze-inproc-rt"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
+ "blaze-own",
  "blaze-radix",
  "blaze-spin",
+ "blaze-sys",
  "libc",
  "parking_lot",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1086,21 +1174,6 @@ dependencies = [
  "blaze-data",
  "blaze-own",
  "blaze-sim",
-]
-
-[[package]]
-name = "blaze-kernel"
-version = "0.0.0"
-dependencies = [
- "blaze-cas",
- "blaze-core",
- "blaze-format",
- "blaze-hash",
- "blaze-ids",
- "blaze-record",
- "blaze-report",
- "blaze-sim",
- "blaze-store-check",
 ]
 
 [[package]]
@@ -1126,6 +1199,9 @@ dependencies = [
 name = "blaze-ladder"
 version = "0.0.0"
 dependencies = [
+ "blaze-ask",
+ "blaze-body",
+ "blaze-body-lower",
  "blaze-build",
  "blaze-build-script",
  "blaze-cas",
@@ -1153,12 +1229,14 @@ dependencies = [
  "blaze-mem",
  "blaze-native",
  "blaze-own",
+ "blaze-producers",
  "blaze-run",
  "blaze-scope",
  "blaze-sim",
  "blaze-solve",
  "blaze-std",
  "blaze-surface",
+ "blaze-sys",
  "blaze-tier",
  "blaze-toolchain",
  "blaze-typeck",
@@ -1172,6 +1250,7 @@ dependencies = [
 name = "blaze-launch"
 version = "0.0.0"
 dependencies = [
+ "blaze-own",
  "blaze-protocol",
  "blaze-sim",
 ]
@@ -1184,7 +1263,9 @@ dependencies = [
  "blaze-blake3",
  "blaze-check",
  "blaze-code",
+ "blaze-comptime-sys",
  "blaze-core",
+ "blaze-export",
  "blaze-launch",
  "blaze-mem",
  "blaze-native",
@@ -1192,6 +1273,7 @@ dependencies = [
  "blaze-queue",
  "blaze-run",
  "blaze-sim",
+ "blaze-sys",
  "blaze-tier",
  "libc",
 ]
@@ -1200,11 +1282,14 @@ dependencies = [
 name = "blaze-launcher"
 version = "0.0.0"
 dependencies = [
+ "blaze-comptime",
+ "blaze-comptime-sys",
  "blaze-core",
  "blaze-launch",
  "blaze-launch-rt",
  "blaze-own",
  "blaze-std",
+ "blaze-sys",
  "libc",
 ]
 
@@ -1255,17 +1340,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-llvm"
+name = "blaze-live"
 version = "0.0.0"
 dependencies = [
- "blaze-code",
- "blaze-core",
- "blaze-emit",
- "blaze-inproc",
- "blaze-lir",
+ "blaze-cbor",
  "blaze-own",
- "blaze-tier",
- "llvm-sys",
+ "blaze-sim",
+ "blaze-text",
+ "blaze-unicode",
 ]
 
 [[package]]
@@ -1312,9 +1394,9 @@ dependencies = [
  "blaze-json",
  "blaze-mem",
  "blaze-own",
+ "blaze-pins",
  "blaze-resolve",
  "blaze-semver",
- "blaze-serde",
  "blaze-sim",
  "blaze-source",
  "blaze-toml",
@@ -1326,18 +1408,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-math"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-mem"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-meter",
  "blaze-own",
  "blaze-reclaim",
  "blaze-rng",
  "blaze-sim",
  "blaze-swiss",
+ "blaze-sys",
  "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1374,6 +1465,44 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "blaze-meter"
+version = "0.0.0"
+dependencies = [
+ "blaze-sys",
+]
+
+[[package]]
+name = "blaze-names-demand"
+version = "0.0.0"
+dependencies = [
+ "blaze-id",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-names-source"
+version = "0.0.0"
+dependencies = [
+ "blaze-expand",
+ "blaze-file-items",
+ "blaze-format",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-names-demand",
+ "blaze-own",
+ "blaze-scope",
+ "blaze-sim",
+ "blaze-surface",
+ "blaze-tokens",
+ "blaze-unit-graph",
+ "edition",
 ]
 
 [[package]]
@@ -1445,6 +1574,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-pins"
+version = "0.0.0"
+
+[[package]]
 name = "blaze-proc-macro"
 version = "0.0.0"
 dependencies = [
@@ -1463,7 +1596,9 @@ dependencies = [
  "blaze-manifest",
  "blaze-mem",
  "blaze-own",
+ "blaze-pins",
  "blaze-record",
+ "blaze-roots",
  "blaze-sha256",
  "blaze-sim",
  "blaze-spawn",
@@ -1505,8 +1640,8 @@ dependencies = [
  "blaze-parquet",
  "blaze-queue",
  "blaze-report",
- "blaze-serde",
  "blaze-sim",
+ "blaze-sys",
  "blaze-trace",
  "blaze-v2-proof",
  "ix-prof",
@@ -1515,18 +1650,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "stdx",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "blaze-program"
-version = "0.0.0"
-dependencies = [
- "blaze-format",
- "blaze-hash",
- "blaze-ids",
- "blaze-keyed",
- "blaze-sim",
 ]
 
 [[package]]
@@ -1539,7 +1662,6 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-kit",
- "blaze-serde",
  "blaze-sim",
  "serde",
  "serde_json",
@@ -1550,6 +1672,7 @@ name = "blaze-queue"
 version = "0.0.0"
 dependencies = [
  "blaze-check",
+ "blaze-own",
  "blaze-spin",
 ]
 
@@ -1661,7 +1784,6 @@ dependencies = [
  "blaze-ids",
  "blaze-own",
  "blaze-semver",
- "blaze-serde",
  "blaze-source",
  "blaze-toml",
  "blaze-trace",
@@ -1678,6 +1800,15 @@ name = "blaze-rng"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-roots"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -1707,6 +1838,7 @@ dependencies = [
  "blaze-ids",
  "blaze-manifest",
  "blaze-mem",
+ "blaze-memchr",
  "blaze-own",
  "blaze-sim",
  "blaze-surface",
@@ -1735,6 +1867,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-core",
  "blaze-data",
+ "blaze-pins",
  "blaze-sim",
  "blaze-toml",
  "blaze-unicode",
@@ -1751,20 +1884,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-serde"
-version = "0.0.0"
-dependencies = [
- "blaze-protocol",
- "blaze-serde-derive",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "blaze-serde-derive"
-version = "0.0.0"
-
-[[package]]
 name = "blaze-sha256"
 version = "0.0.0"
 dependencies = [
@@ -1779,25 +1898,6 @@ version = "0.0.0"
 dependencies = [
  "blaze-own",
  "blaze-rng",
-]
-
-[[package]]
-name = "blaze-solo"
-version = "0.0.0"
-dependencies = [
- "blaze-cas",
- "blaze-core",
- "blaze-data",
- "blaze-front-items",
- "blaze-ids",
- "blaze-json",
- "blaze-kernel",
- "blaze-own",
- "blaze-sim",
- "blaze-store-check",
- "blaze-trace",
- "blaze-vfs",
- "syntax",
 ]
 
 [[package]]
@@ -1883,6 +1983,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-stage"
+version = "0.0.0"
+dependencies = [
+ "blaze-engine",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-int",
+ "blaze-mem",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-std"
 version = "0.0.0"
 dependencies = [
@@ -1902,12 +2015,14 @@ dependencies = [
  "blaze-json",
  "blaze-kit",
  "blaze-mem",
+ "blaze-meter",
  "blaze-own",
  "blaze-phf",
  "blaze-radix",
  "blaze-reclaim",
  "blaze-report",
  "blaze-rng",
+ "blaze-roots",
  "blaze-sha256",
  "blaze-sim",
  "blaze-spin",
@@ -1928,18 +2043,6 @@ dependencies = [
  "blaze-ids",
  "blaze-json",
  "blaze-sim",
-]
-
-[[package]]
-name = "blaze-storemodel"
-version = "0.0.0"
-dependencies = [
- "blaze-cas",
- "blaze-core",
- "blaze-ids",
- "blaze-kernel",
- "blaze-rng",
- "blaze-store-check",
 ]
 
 [[package]]
@@ -2052,6 +2155,7 @@ dependencies = [
 name = "blaze-trace"
 version = "0.0.0"
 dependencies = [
+ "blaze-own",
  "tracing",
 ]
 
@@ -2104,6 +2208,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-units"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+ "blaze-text",
+]
+
+[[package]]
 name = "blaze-url"
 version = "0.0.0"
 dependencies = [
@@ -2119,27 +2232,6 @@ dependencies = [
  "blaze-graph",
  "blaze-ids",
  "blaze-store-check",
-]
-
-[[package]]
-name = "blaze-vfs"
-version = "0.0.0"
-dependencies = [
- "blaze-alloc-count",
- "blaze-bytes",
- "blaze-check",
- "blaze-core",
- "blaze-format",
- "blaze-hash",
- "blaze-ids",
- "blaze-image",
- "blaze-mem",
- "blaze-protocol",
- "blaze-reclaim",
- "blaze-report",
- "blaze-serde",
- "hashbrown 0.17.1",
- "serde",
 ]
 
 [[package]]
@@ -3042,6 +3134,7 @@ dependencies = [
  "blaze-script",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-sys",
  "blaze-trace",
  "gimli",
  "libc",
@@ -3135,16 +3228,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
-name = "llvm-sys"
-version = "231.0.1"
-dependencies = [
- "anyhow",
- "cc",
- "lazy_static",
- "libc",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3170,16 +3253,6 @@ name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
-
-[[package]]
-name = "macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "synstructure",
-]
 
 [[package]]
 name = "memchr"
@@ -3973,6 +4046,7 @@ dependencies = [
  "blaze-manifest",
  "blaze-mem",
  "blaze-own",
+ "blaze-pins",
  "blaze-script",
  "blaze-sha256",
  "blaze-text",
@@ -4111,22 +4185,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f99e664ecd2d85a68c87e3c7a3cfe691f647ea9e835de984aba4d54a41f817d4"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "span"
-version = "0.0.0"
-dependencies = [
- "blaze-alloc-count",
- "blaze-format",
- "blaze-hash",
- "blaze-ids",
- "blaze-mem",
- "blaze-memo",
- "blaze-text-size",
- "blaze-unicode",
- "stdx",
- "syntax",
 ]
 
 [[package]]
@@ -5144,6 +5202,10 @@ dependencies = [
 [[patch.unused]]
 name = "cranelift-object"
 version = "0.137.1"
+
+[[patch.unused]]
+name = "llvm-sys"
+version = "231.0.1"
 
 [[patch.unused]]
 name = "ra-ap-rustc_ast_ir"

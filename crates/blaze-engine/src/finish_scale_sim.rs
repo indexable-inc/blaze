@@ -394,6 +394,9 @@ fn judge(last: &ScaleLast, finished: &Finished<'static, Work<'static>>, bounded:
         let bound = settle.saw_calls * shape.probes();
         oracle(settle.compared <= bound, || format!("{} reads compared for {} saw calls: past {bound}, {} a question (a binary search over {} reads)", settle.compared, settle.saw_calls, shape.probes(), shape.reads()))?;
     }
+    oracle(finished.report.index.writes == 0 && finished.answer.readers.is_empty(), || {
+        format!("refreshing seen values changed no membership but issued {} writes and folded {} edits", finished.report.index.writes, finished.answer.readers.len())
+    })?;
     Ok(())
 }
 

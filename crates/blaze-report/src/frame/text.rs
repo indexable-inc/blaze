@@ -219,7 +219,7 @@ pub(crate) fn push_cells<'t>(
     plant: Plant,
 ) -> u32 {
     let at_byte = |offset: usize| if base == u32::MAX { u32::MAX } else { base + offset as u32 };
-    let mut push = |cells: &mut AVec<'_, Cell<'t>>, col: &mut u32, byte: u32, show: Show<'t>, width: u32, class: Class| {
+    let push = |cells: &mut AVec<'_, Cell<'t>>, col: &mut u32, byte: u32, show: Show<'t>, width: u32, class: Class| {
         cells.push(Cell { byte, col: *col, width, show, class, diff, ink: Ink::None, mark: u32::MAX });
         *col += match plant {
             Plant::WideOffByOne if width == 2 => 1,

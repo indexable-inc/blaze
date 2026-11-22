@@ -138,20 +138,22 @@ mod tests {
     /// "Macro invocation": `(..)` and `[..]` forms end with `;` as items), in text order with
     /// its attributes, and its block is written (the `if`'s block holding `d!();` is a module
     /// of its own: the call may declare items there, "Statements", "Item declarations": their
-    /// scope is "the block containing the statement"); a call not in statement position
-    /// (`let x = v!();`) is not.
+    /// scope is "the block containing the statement"); a call in an expression (`let x =
+    /// v!();`) is written as one too: its expansion may be a block expression declaring items
+    /// in its own block (tokio's `select!`), and the names library expands it only when its
+    /// definition or input may write one (resolve.rs `expand_call`).
     #[test]
     fn a_statement_call_is_written_into_its_block() {
         let text = "fn f() { let x = v!(); #[cfg(a)] a::b!(X, (1)); impl A for X {} c! { impl B for X {} } if x { d!(); } e![x] }";
         assert_eq!(
             made(text),
-            "mod __blaze_block_0 {\nuse super::*;\n#[cfg(a)] a::b!(X, (1));\nimpl A for X {}\nc! { impl B for X {} }\nmod __blaze_block_1 {\nuse super::*;\nd!();\n}\ne![x];\n}\n"
+            "mod __blaze_block_0 {\nuse super::*;\nv!();\n#[cfg(a)] a::b!(X, (1));\nimpl A for X {}\nc! { impl B for X {} }\nmod __blaze_block_1 {\nuse super::*;\nd!();\n}\ne![x];\n}\n"
         );
     }
 
     #[test]
     fn no_impl_no_module() {
-        assert_eq!(made("fn f() { fn g() {} const K: u8 = 1; use a::b; let y = m!{ 1 }; let s = \"impl struct\"; }"), "");
+        assert_eq!(made("fn f() { fn g() {} const K: u8 = 1; use a::b; let y = !m != 1; let s = \"impl struct\"; }"), "");
     }
 
     /// A body whose only statement is a macro call makes its block a module: what the call

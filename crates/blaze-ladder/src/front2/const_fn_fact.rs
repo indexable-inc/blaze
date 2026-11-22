@@ -14,10 +14,9 @@
 //!   member of the struct, variant 0) and an enum's tuple VARIANT by the names library
 //!   (`variant_of`): its ADT's row is made later by the layout's own need (consts.rs
 //!   `adt_row`), never guessed;
-//! - a free fn of any crate (core's `const fn`s included): its head, read from its text;
-//! - a fn declared in a body (one a macro call wrote included): its head, read from the text
-//!   its enclosing body's lowering kept (locals.rs), never from the names library, which keys
-//!   no such item;
+//! - a free fn of any crate (core's `const fn`s included): its head record;
+//! - a fn declared in a body (one a macro call wrote included): its local head fact, never from
+//!   the names library, which keys no such item;
 //! - an impl's fn (`SpecialFields::new()`, `Vec::new()`: protobuf 3.7.2's generated
 //!   `default_instance` statics call only inherent `const fn`s of impls, of its own crate and
 //!   of alloc): its signature row (`Store::fns`), its own want (`Want::MemberFn`), made on use:
@@ -32,40 +31,39 @@ use std::boxed::Box;
 use std::format;
 use std::vec::Vec;
 
-use blaze_consteval::{Fact, FnKind, Intrinsic};
-use blaze_id::ItemKey as LibKey;
-use blaze_lower::head;
-use blaze_own::Alloc;
+use blaze_consteval::{Fact, FnKind};
 use blaze_surface::ItemDetail;
 use blaze_typeck::ItemKey;
 
 use super::check::Records;
-use super::consts::{ConstFail, is_panic_lang, written_name};
-use super::heads::{CrateCfg, Store, Want};
+use super::consts::ConstFail;
+use super::heads::{Store, Want};
 use super::index::Index;
 use super::item_shown::{ItemShown, head_error_shown};
 use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::source::NamesSource;
 
 /// What a call of `item` does in a constant, from front2's facts; a missing fact is
-/// `FnKind::Missing` naming it. `alloc` holds the callee's lowered head while it is read.
-pub fn fn_fact<'n, S: NamesSource<'n>>(names: S, keys: &Keys, index: &Index<'n>, store: &Store<'n>, item: ItemKey, alloc: Alloc<'_>) -> FnKind {
+/// `FnKind::Missing` naming it. A made head carries the qualifiers needed here.
+pub fn fn_fact<'n, S: NamesSource<'n>>(names: S, keys: &Keys, index: &Index<'n>, store: &Store<'n>, item: ItemKey) -> FnKind {
     if let Some(c) = store.ctors.get(&item) {
         let variant = keys.library_in(names, item).and_then(|lib| names.variant_of(lib)).map_or(0, |(_, i)| i);
         return FnKind::Ctor { adt: c.adt, variant };
     }
     if let Some(Origin::Member { container, kind, .. }) = keys.origin(item) {
-        return member_fact(names, keys, index, store, item, *container, *kind, alloc);
+        return member_fact(names, keys, index, store, item, *container, *kind);
     }
     // An item declared in a body (core's `const fn precondition_check`, which
     // `assert_unsafe_precondition!` writes in a block of `Layout::from_size_align_unchecked`;
     // the `const fn gcd` of `<[T]>::align_to_offsets`): `Keys::local` files its key as an
     // `Origin::Item`, so `library_in` gives its library key, but the names library keys no such
-    // item and holds no text for it. Its head is read from the text its enclosing body's
-    // lowering kept (locals.rs `Locals::head`), as consts.rs `check_as` reads its body.
+    // item. Its head is read from the enclosing body's local facts (locals.rs `Locals::head`).
+    if let Some(f) = store.fns.get(&item) {
+        return f.const_call(names, index);
+    }
     if let Some(local) = store.locals.head(item) {
         return match local.kind {
-            super::locals::LocalKind::Fn => head_fact(names, index, local.lib, local.text, alloc),
+            super::locals::LocalKind::Fn => FnKind::Missing(Fact::Signature),
             _ => FnKind::Missing(Fact::NotAFn),
         };
     }
@@ -73,21 +71,17 @@ pub fn fn_fact<'n, S: NamesSource<'n>>(names: S, keys: &Keys, index: &Index<'n>,
         Some(lib) => match names.variant_of(lib) {
             // An enum's tuple variant whose ADT row is not made: a ctor by the names library.
             Some((enum_, variant)) => FnKind::Ctor { adt: checker_of(enum_), variant },
-            None => match names.text_of(lib) {
-                Some(text) => head_fact(names, index, lib, text.text, alloc),
-                None => FnKind::Missing(Fact::Text),
-            },
+            None => FnKind::Missing(Fact::Signature),
         },
         // A fn declared in a body: its row, made when its enclosing body was lowered.
         None => match store.fns.get(&item) {
-            Some(f) => head_fact(names, index, f.lib, f.text, alloc),
+            Some(f) => f.const_call(names, index),
             None => FnKind::Missing(Fact::Origin),
         },
     }
 }
 
 /// A member's kind: a struct's ctor, or a fn of an impl or a trait by its signature row.
-#[expect(clippy::too_many_arguments, reason = "the records fn_fact reads, passed on whole")]
 fn member_fact<'n, S: NamesSource<'n>>(
     names: S,
     keys: &Keys,
@@ -96,7 +90,6 @@ fn member_fact<'n, S: NamesSource<'n>>(
     item: ItemKey,
     container: ItemKey,
     kind: MemberKind,
-    alloc: Alloc<'_>,
 ) -> FnKind {
     match kind {
         // A tuple struct's ctor (heads.rs files it as the struct's `Ctor` member) whose row is
@@ -106,7 +99,7 @@ fn member_fact<'n, S: NamesSource<'n>>(
         MemberKind::Const | MemberKind::Type | MemberKind::Anon => return FnKind::Missing(Fact::NotAFn),
     }
     if let Some(f) = store.fns.get(&item) {
-        return head_fact(names, index, f.lib, f.text, alloc);
+        return f.const_call(names, index);
     }
     if store.fn_gaps.contains_key(&item) {
         return FnKind::Missing(Fact::SignatureRefused);
@@ -118,43 +111,6 @@ fn member_fact<'n, S: NamesSource<'n>>(
         Some(trait_) if matches!(names.detail_of(trait_), Some(ItemDetail::Trait)) => FnKind::Missing(Fact::TraitMembers),
         _ => FnKind::Missing(Fact::Container),
     }
-}
-
-/// A fn's kind from its head as written (`text`, of library item `lib`): a panic entry of
-/// core, an intrinsic, `const`, or not const.
-fn head_fact<'n, S: NamesSource<'n>>(names: S, index: &Index<'n>, lib: LibKey, text: &str, alloc: Alloc<'_>) -> FnKind {
-    if index.lang_name_of(lib).is_some_and(is_panic_lang) {
-        return FnKind::Panic;
-    }
-    let Some(krate) = names.crate_of(lib) else { return FnKind::Missing(Fact::Crate) };
-    let (Some(atoms), Some(edition)) = (names.cfg_atoms(krate), names.edition_of(krate)) else { return FnKind::Missing(Fact::Crate) };
-    let Ok(sig) = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc) else { return FnKind::Missing(Fact::Head) };
-    let v = sig.view();
-    let intrinsic = v.rows(v.list(head::ATTRS)).ok().is_some_and(|rows| {
-        rows.iter().any(|&n| v.attr(n).ok().and_then(|a| v.text_at(a.path).ok()).is_some_and(|p| p == "rustc_intrinsic"))
-    });
-    let flags = v.head[head::FLAGS];
-    if intrinsic {
-        let Some(name) = written_name(names, lib) else { return FnKind::Missing(Fact::IntrinsicName) };
-        match Intrinsic::named(name) {
-            Ok(w) => return FnKind::Intrinsic(w),
-            // An intrinsic with a written body that the table does not hold (core's
-            // `const fn is_val_statically_known<T: Copy>(_arg: T) -> bool { false }`, which
-            // `checked_ilog` calls, so `u32::MAX.ilog(BASE)` in fmt/num.rs's array length
-            // reaches it) is that body: core/src/intrinsics/mod.rs says a backend may
-            // implement an intrinsic with a body or use the body, and rustc's const evaluator
-            // calls the body of one it does not implement (only a body-less intrinsic must be
-            // overridden). The run-time build does the same (program/tabled.rs builds an
-            // intrinsic that has a body by its body). Its `const` decides, as for any fn.
-            Err(_) if flags & blaze_lower::machine::sig::HAS_BODY != 0 => {}
-            // A body-less name the table lacks is its own kind: the evaluator refuses a call
-            // of it as `Refusal::UnknownIntrinsic`, which compiled code keeps like any final
-            // refusal.
-            Err(_) => return FnKind::UnknownIntrinsic,
-        }
-    }
-    // The head was read: its `const` (or its absence) is the answer.
-    if flags & blaze_lower::machine::sig::CONST != 0 { FnKind::Const } else { FnKind::NotConst }
 }
 
 /// The evaluator refused a call of `callee` as `Refusal::FnFact { fact }` (the fact rides on

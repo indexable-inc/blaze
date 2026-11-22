@@ -133,6 +133,21 @@ goal Node: Send => yes
 case auto_cycle_mutual_yes = trait_goals.rs::consider_auto_trait_candidate
 goal A: Sync => yes
 
+# An opaque whose hidden type names the opaque itself (a recursive `async fn`'s future holds
+# `Pin<Box<its own opaque>>` across its await): the auto rule sees the hidden type
+# (structural.rs), and the opaque inside it normalizes to itself, rigid (alias.rs
+# `normalize_opaque_type`, analysis), so the auto goal meets itself on coinductive edges only.
+# Revealing the hidden type in normalization met the opaque's own normalization inductively
+# over blaze-typeck's Terms (whose relation generalizes the nested opaque into a projection
+# goal): overflow for both cases below there (blaze-typeck suite `solver_cases_over_terms`).
+case auto_cycle_opaque_self_yes = trait_goals.rs::consider_auto_trait_candidate (opaque_types.rs normalize_opaque_type)
+opaque Of: Clone = (u32, Box<opaque#Of>)
+goal opaque#Of: Send => yes
+
+case auto_cycle_opaque_self_rc_no = trait_goals.rs::consider_auto_trait_candidate (opaque_types.rs normalize_opaque_type)
+opaque Og: Clone = (Rc<u8>, Box<opaque#Og>)
+goal opaque#Og: Send => no
+
 # ---- nested ADTs, answered through the auto-trait summaries (auto_summary.rs) ----
 # Each step a summary takes is one the rule takes; where an impl may apply it stops.
 
@@ -191,6 +206,20 @@ params T
 goal S1<T>: Send => no
 
 # ---- no structural impl ----
+
+case owner_summary_field_args = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# Cell has its own Send impl, so this field must be imported even with summaries enabled.
+struct Packet<A, B>(fn(A) -> (), Cell<B>)
+goal Packet<Rc<u8>, u16>: Send => yes
+goal Packet<u16, Rc<u8>>: Send => no
+
+case owner_adt_field_args = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# An environment clause for Send takes the ordinary, unsummarized field path.
+struct Packet<A, B>(fn(A) -> (), Cell<B>)
+params X
+env X: Send
+goal Packet<Rc<u8>, X>: Send => yes
+goal Packet<X, Rc<u8>>: Send => no
 
 case auto_dyn_with_auto_bound_yes = assembly/mod.rs::assemble_object_bound_candidates
 goal dyn Debug + Send: Send => yes

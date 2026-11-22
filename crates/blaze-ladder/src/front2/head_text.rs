@@ -6,8 +6,9 @@
 //! `ItemText::text`, `Member::text`). A scan of the HEAD for a lifetime (`'a`) must not read the
 //! docs: alloc/src/rc.rs documents `Rc` as "'Rc' stands for 'Reference Counted'", and a scan of
 //! the whole text took `Rc` for an ADT that declares lifetimes, so every `Rc<T>` got an origin
-//! and a call returning one was refused `ElisionAmbiguous` (front2 borrows.rs
-//! `adt_head_lifetimes`; the same for a documented fn's `writes_lifetime`: "it's" read as `'s`).
+//! and a call returning one was refused `ElisionAmbiguous` (front2 borrows.rs' scan of an ADT's
+//! head, gone since D155 counts from the items record; the same for a documented fn's
+//! `writes_lifetime`: "it's" read as `'s`).
 
 /// `text` after its leading whitespace, comments (`//..`, `/*..*/` nested) and outer attributes
 /// (`#[..]`, brackets balanced, string literals skipped). A text that ends inside one of them

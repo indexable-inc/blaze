@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-166 invariants, 23 refinements, 12 reference models.
-By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
+154 invariants, 22 refinements, 12 reference models.
+By level: 141 tested, 34 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -66,25 +66,6 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
 - **`the_summary_is_the_same_whatever_order_the_misses_arrive_in`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): the summary is deterministic for a given pair of trees: the same reports, and the same reasons, whatever order the build's misses arrive in.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
-
-### blaze-cas
-
-- **`the_pool_reads_back_what_its_files_hold`** *simulated* (`crates/blaze-cas/src/pool/tests.rs`): whatever the faults, the schedule, the evictions and the crashes, a read hands back the bytes its file holds or a refusal its faults explain, nothing pinned or loading is given back, the process holds exactly the pages in use, and every load ends.
-  Controls: `an_eviction_that_keeps_the_version`, `an_eviction_of_a_pinned_page`, `pages_unloaded_before_they_are_given_back`, `a_page_loaded_as_its_read_is_asked`, `a_load_with_no_block_checks`, `a_failed_load_kept`, `a_commit_that_does_not_pin_its_file_s_last_page`, `a_prefetch_issued_while_a_demand_load_is_in_flight`, `two_loads_of_one_page`, `a_prefetch_the_budget_is_not_charged_for`, `block_checks_that_stop_at_the_first_bad_block`, `a_load_that_makes_no_room`.
-- **`a_load_that_makes_room_first_keeps_the_pool_within_its_budget_and_what_is_pinned`** *simulated* (`crates/blaze-cas/src/pool/tests.rs`): the pool's resident bytes never exceed its budget plus what its readers pin, when every load makes room first: after each read the pool holds at most the budget, or, where readers pin more than that, at most what they pin.
-  Controls: `an_eviction_that_keeps_the_version`, `an_eviction_of_a_pinned_page`, `pages_unloaded_before_they_are_given_back`, `a_page_loaded_as_its_read_is_asked`, `a_load_with_no_block_checks`, `a_failed_load_kept`, `a_commit_that_does_not_pin_its_file_s_last_page`, `a_prefetch_issued_while_a_demand_load_is_in_flight`, `two_loads_of_one_page`, `a_prefetch_the_budget_is_not_charged_for`, `block_checks_that_stop_at_the_first_bad_block`, `a_load_that_makes_no_room`.
-- **`a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn`** *simulated* (`crates/blaze-cas/src/tests.rs`): at any point of any number of commits, under injected IO failures, a crash loses no put that was reported durable, and the store opens with only whole values.
-  Controls: `a_put_reported_durable_that_no_sync_made_so`.
-- **`a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them`** *simulated* (`crates/blaze-cas/src/tests/block_checks.rs`): after a crash at any point of any number of commits, under injected IO failures, the store opens; each pack's checks file holds the checks of the blocks its head names, and the store holds the same; every put reported durable reads back the bytes it was given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_head_written_before_its_syncs`.
-- **`a_place_gives_its_values_bytes_whole_through_any_crash`** *simulated* (`crates/blaze-cas/src/tests/place_crash.rs`): whatever is put, placed, replaced and derived, with `placed/` full or not, and wherever the power goes, (1) a place that ends well leaves its path holding exactly its value's bytes, so a whole file of `placed/` is cloned from only when its bytes are its value's: one written or derived by this run, or one an earlier run left that hashes to its name (a derived value's is never kept: it is made again from its base and its ranges); (2) until a place ends well its path holds what it held or the new value whole, never a part; (3) after a crash a path holds nothing, or the whole of a value once placed there, or what the power left of a place of one (nothing of a place is synced: any of the sectors of a value written where it goes, or a derived value's base with any of its ranges written), never bytes of anything else; (4) no clone the store asks for is of a file with data not written back, so no place waits for a write-back a clone forced; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`, `a_clone_of_a_dirty_file_on_the_edit_path`, `an_image_put_whole_with_its_room`.
-- **`an_image_put_as_its_runs_over_holes_is_placed_writing_its_runs_and_none_of_its_room`** *simulated* (`crates/blaze-cas/src/tests/place_crash.rs`): an image put as its runs over the base of holes ([`derived::holes`]) is placed as the file those runs give, and from its put to its place nothing writes its room: the record is the runs, and the place writes the base once and the runs once (into the store's own file of it, which the output is a clone of). The image is then a base as any other, so the edit after it derives from it.
-  Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`, `a_clone_of_a_dirty_file_on_the_edit_path`, `an_image_put_whole_with_its_room`.
-- **`a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back`** *simulated* (`crates/blaze-cas/src/tests/place_made.rs`): an output placed from its maker's bytes ([`Store::place_made`]), whatever the store's own whole files are doing beside it (written, sealed, their write-backs in flight or held for ever) and wherever the power goes, (1) asks the driver for nothing that waits for a sync, for no clone but a patch's ([`Store::place_patched`]) of its path's own file, and for no write-back but its path's own as it ends, so no clone of a file of the store's with data not written back is made for it, and a patch's clone forces out at most what its path's last place wrote; (2) is answered once its own effects have completed, with write-backs the disk never completes still held: its answer waits for no write-back; (3) ends with its path holding exactly its file, the runs over zeros at its length, and reports the runs' bytes as written there; (4) until it ends its path holds what it held or the new file whole, never a part; (5) after a crash its path holds nothing, a value once placed there whole, or what the power left of one (each byte the value's, a zero or, for a patch, its base's), never bytes of anything else; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_made_output_cloned_from_a_file_just_written`, `a_made_output_whose_answer_waits_for_a_write_back`, `a_patch_cloned_from_a_file_never_written_back`.
-- **`two_stores_placing_one_value_at_one_path_both_succeed_in_any_order`** *simulated* (`crates/blaze-cas/src/tests/place_race.rs`): any schedule of two stores placing the same value at one shared path ends with both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_remove_then_clone_onto_the_path`.
 
 ### blaze-client
 
@@ -179,11 +160,6 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
   Controls: `a_lane_changed_by_someone_else`, `a_change_applied_to_a_root_it_was_not_written_for`, `half_a_change_kept`, `a_root_that_depends_on_history`, `nodes_that_end_by_count`, `a_git_tree_that_would_not_round_trip`.
 - **`a_git_tree_round_trips_through_a_root`** *simulated* (`crates/blaze-hub/src/tests.rs`): git tree to root to git tree gives the same object ids. A commit's tree imported is the root the hub itself builds of those files; that root, hashed again by an index that has seen nothing, is the tree's id, and its tree object is git's bytes; and after a change, the lane's root exports as the tree git makes of the changed files.
   Controls: `a_lane_changed_by_someone_else`, `a_change_applied_to_a_root_it_was_not_written_for`, `half_a_change_kept`, `a_root_that_depends_on_history`, `nodes_that_end_by_count`, `a_git_tree_that_would_not_round_trip`.
-
-### blaze-image
-
-- **`the_images_file_is_always_one_image_whole`** *simulated* (`crates/blaze-image/src/place/tests.rs`): after any run of images placed, let go, failed and cut by a crash, the image's file holds one image whole, byte for byte what a fresh build wrote: the one placed once the placing said so (and after a crash then), the one before it when the placing was let go, and one of the two when it failed or the power went; and it opens and verifies. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_rename_without_its_sync`, `blocks_shared_from_bytes_the_file_no_longer_holds`.
 
 ### blaze-inproc
 
@@ -332,11 +308,6 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
 - **`a_scopes_tasks_have_all_ended_when_it_joins`** *tested* (`crates/blaze-std/src/tests/scopes.rs`): when `Scope::join` returns its tasks have all ended. Nothing a task started is still in flight in the driver, each `Task::join` gives exactly what its closure did, and the scope's own join gives the first failure, naming the task.
   Controls: `a_join_that_drops_a_failure`.
 
-### blaze-storemodel
-
-- **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
-  Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
-
 ### blaze-units
 
 - **`the_ratchet_is_read_in_place_of_the_levels_table`** *tested* (`crates/blaze-units/src/load/plan/tests.rs`): where a workspace has `[workspace.metadata.blaze.lints-ratchet]`, this blaze reads its levels in place of `[workspace.metadata.blaze.lints]` (which a released blaze reads) and after `lints-when-ready`, so the ratchet's level of a lint is the one that holds.
@@ -355,13 +326,6 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
 - **`a_probe_is_a_search_directory_or_a_library_name_directly_in_one`** *simulated* (`crates/blaze-usercode/src/pure/tests.rs`): a read is the loader's walk of the run's library search path exactly when it is a search directory (there or not) or a library's name directly in one; a name found there is a load, which no pure key covers.
 - **`what_the_sandbox_answered_is_not_what_cannot_be_traced`** *tested* (`crates/blaze-usercode/src/trace.rs`): what the sandbox answered from the run's provider is no input and nothing that can't be traced, and only what it answered: a run with only such lines is kept as any traced run, and a pure script's check (`pure::check`) passes it, while randomness it did not answer, beside an answer, is still what can't be traced.
   Controls: `randomness_that_was_not_answered`, `an_answer_taken_for_what_cannot_be_traced`.
-
-### blaze-vfs
-
-- **`a_file_renamed_over_another_between_its_stamp_and_its_read_is_never_read_as_empty`** *simulated* (`crates/blaze-vfs/src/watch/tests.rs`): a file an editor replaces by a rename is seen as what it was or what it is, never as empty, whichever way the journal tells the rename and wherever the read of the temporary file falls; and once everything told is looked at, the head is the disk.
-  Controls: `a_stamp_saved_for_a_read_that_found_the_file_renamed_away`, `a_request_that_builds_what_the_disk_never_had`.
-- **`a_file_replaced_by_renames_500_times_is_always_one_of_its_versions`** *simulated* (`crates/blaze-vfs/src/watch/tests.rs`): whatever falls between a file's stamp and its read, a file replaced by a rename is seen as what it was or what it is, never as anything else, and a request made after a replacement builds what the disk has. 500 replacements a seed, with a request after about half of them.
-  Controls: `a_stamp_saved_for_a_read_that_found_the_file_renamed_away`, `a_request_that_builds_what_the_disk_never_had`.
 
 ### hir
 
@@ -453,11 +417,6 @@ By level: 142 tested, 46 simulated, 1 model-checked, 0 proved.
 
 - **`the_rows_kept_by_deltas_are_the_rows_made_whole`** *tested* (`crates/blaze-cargo/src/serve/unit/codegen/kept/tests.rs`): for any program and sequence of edits (a body edited, a call added or dropped, a function removed, a static or a span table changed or gone), the rows, span tables and id a link keeps by applying each build's delta are those of rows made whole from the build, and what it says changed is what did.
   Controls: `a_row_not_refreshed_for_a_caller`, `a_given_id_not_updated_for_a_removed_function`.
-
-### blaze-cas
-
-- **`the_store_reads_back_what_a_map_holds`** *simulated* (`crates/blaze-cas/src/tests/model_check.rs`): the store is a map. Any run of puts, gets, flushes, settles and reopens reads back what a `BTreeMap` given the same puts holds, refuses other bytes under a key it has, and verifies clean. `HEGEL_TEST_CASES=<n>` runs it longer.
-  Controls: `a_flush_that_commits_nothing`.
 
 ### blaze-codegen
 

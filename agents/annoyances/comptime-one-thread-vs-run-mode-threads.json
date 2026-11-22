@@ -1,0 +1,15 @@
+{
+ "id": "comptime-one-thread-vs-run-mode-threads",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer lane (D175 run path)",
+ "where": "crates/blaze-comptime-sys/src/child.rs (module doc and `Cell`'s `unsafe impl Sync`) against crates/blaze-launch-rt/src/run_mode.rs `run` (the control and socket-reader threads)",
+ "what": "child.rs's one process static is sound because 'a compile-time child has ONE thread (pthread_create is refused)'. The native run path every compile-time program now takes (D175) always starts two launcher threads, blaze-run-control and blaze-run-read, and the control thread is the one that binds C names: `child::binding(\"environ\")` builds the layer's environ from the control thread while the program's thread may be inside a layer function.",
+ "cost": "about twenty minutes to notice while wiring run_mode/bind.rs `Table`",
+ "cause": "the layer was written for a process the program alone runs in; the run path's driver has its own threads, which the program's `pthread_create` refusal does not cover",
+ "whys": "the one-thread claim counts the program's threads, not the launcher's",
+ "class": "a soundness argument by thread count that leaves out the driver's own threads",
+ "prevention": "wanted: `binding` never touches LAYER (for How::Data, answer the address of a layer word filled at install, or bind data at install time on the program's thread); the claim restated as 'one thread calls the layer' with the control thread named as never calling it",
+ "annoyance": "none beyond the claim",
+ "workaround": "fixed by construction: run_mode/bind.rs `Table` is made only by `Table::bind(os)`, which binds every How::Data row on the thread that installed the layer before `run` starts its threads; `Bind::address` answers data rows from that list and refuses a data row not in it, so the control thread never touches LAYER; child.rs's SAFETY restated",
+ "state": "fixed"
+}

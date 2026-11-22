@@ -1,18 +1,22 @@
 //! The crate's tests. The oracle is a truth table over at most 10 variables: every operation
 //! equals the table's, equal tables are equal ids, export then import gives equal bytes and an
 //! equal id, `implies` is inclusion, `sat_count` the popcount, the cover covers exactly. Each
-//! planted bug (`crate::plant`) is caught by a named control.
+//! planted bug ([`CondPlant`]) is caught by its control, by the invariant it names, and the
+//! arena's node cap is drawn down to its smallest legal value and reached.
 
+use core::fmt;
 use std::{format, string::String, vec::Vec as StdVec};
 
-use blaze_own::{AVec, Alloc};
-use blaze_sim::{Broke, Config, Tape, check, control};
+use blaze_own::{AVec, Alloc, planted::Planted};
+use blaze_sim::{Broken, Config, NoPlant, Point, Tape, check, controls};
 
 use crate::cfg::{self, Op};
 use crate::isop::Cover;
-use crate::plant::{self, Plant};
 use crate::portable::{export, import};
-use crate::{Atom, Bdd, Cond, CondError, ImportError, Limits, Space, SpaceBuilder, Var};
+use crate::{
+    Atom, Bdd, Cond, CondError, CondPlant, ImportError, Limits, PlantedBdd, Space, SpaceBuilder,
+    Var,
+};
 
 mod space;
 
@@ -73,8 +77,90 @@ impl Tt {
     }
 }
 
-fn harness(e: impl core::fmt::Display) -> Broke {
-    Broke::Harness(format!("{e}"))
+/// The invariants the truth-table oracle checks; `op` names the operation that made the
+/// condition.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum CondBroken {
+    /// A condition is not its operation's truth table.
+    TableDiffers { op: &'static str },
+    /// Two conditions of equal tables have different ids (by any path, the Shannon rebuild
+    /// among them).
+    DifferentIds { op: &'static str, one: Cond, other: Cond },
+    /// `implies` is not inclusion of the tables.
+    ImpliesNotInclusion { op: &'static str },
+    /// `disjoint` is not an empty intersection of the tables.
+    DisjointNotEmpty { op: &'static str },
+    /// `sat_count` is not the table's popcount within `valid`.
+    SatCountNotPopcount { op: &'static str },
+    /// `any_sat`'s answer or witness does not satisfy the table within `valid`.
+    NoWitness { op: &'static str },
+    /// `support` is not the variables the table depends on.
+    Support { op: &'static str, listed: StdVec<u16>, depends: StdVec<u16> },
+    /// The portable form was refused on import.
+    PortableRefused { op: &'static str, error: ImportError },
+    /// The portable form came back as another id in its own arena.
+    PortableOtherId { op: &'static str },
+    /// The portable form written from a fresh arena is other bytes, or another function.
+    PortableOtherBytes { op: &'static str },
+    /// The cover is not exactly its condition.
+    CoverInexact { op: &'static str },
+    /// The cover holds a cube without which it is still exact.
+    CoverRedundant { op: &'static str },
+    /// A drawn cfg predicate did not parse.
+    CfgUnparsed { text: String, error: String },
+    /// A cfg predicate lowered to another function than its value under every assignment.
+    CfgLoweredWrong { text: String },
+    /// An atom outside the space was not reported absent, or one inside it was.
+    CfgAbsent { text: String, atom: String },
+    /// An arena holds more nodes than its cap, or refused below it.
+    NodeCap { nodes: usize, cap: u32 },
+}
+
+impl fmt::Display for CondBroken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CondBroken::TableDiffers { op } => write!(f, "{op} differs from its table"),
+            CondBroken::DifferentIds { op, one, other } => {
+                write!(f, "equal tables, different ids: {op} {one:?} and {other:?}")
+            }
+            CondBroken::ImpliesNotInclusion { op } => write!(f, "implies is not inclusion for {op}"),
+            CondBroken::DisjointNotEmpty { op } => {
+                write!(f, "disjoint is not an empty intersection for {op}")
+            }
+            CondBroken::SatCountNotPopcount { op } => write!(f, "sat_count is not the popcount for {op}"),
+            CondBroken::NoWitness { op } => write!(f, "any_sat gave no satisfying witness for {op}"),
+            CondBroken::Support { op, listed, depends } => {
+                write!(f, "support {listed:?} is not the variables {op} depends on {depends:?}")
+            }
+            CondBroken::PortableRefused { op, error } => write!(f, "portable: {op}: {error}"),
+            CondBroken::PortableOtherId { op } => write!(f, "portable: {op} came back as another id"),
+            CondBroken::PortableOtherBytes { op } => {
+                write!(f, "portable: {op} wrote other bytes from another arena")
+            }
+            CondBroken::CoverInexact { op } => write!(f, "the cover of {op} is not exactly it"),
+            CondBroken::CoverRedundant { op } => write!(f, "the cover of {op} has a redundant cube"),
+            CondBroken::CfgUnparsed { text, error } => write!(f, "`{text}` did not parse: {error}"),
+            CondBroken::CfgLoweredWrong { text } => write!(f, "`{text}` lowered to another function"),
+            CondBroken::CfgAbsent { text, atom } => {
+                write!(f, "`{text}`: the unset atom {atom} was not reported absent")
+            }
+            CondBroken::NodeCap { nodes, cap } => {
+                write!(f, "the arena holds {nodes} nodes against its cap of {cap}")
+            }
+        }
+    }
+}
+
+fn harness(e: impl fmt::Display) -> Broken<CondBroken> {
+    Broken::Harness(format!("{e}"))
+}
+
+/// `Ok` when `held`, else the invariant `broken`.
+fn holds(held: bool, broken: impl FnOnce() -> CondBroken) -> Result<(), Broken<CondBroken>> {
+    match held {
+        true => Ok(()),
+        false => Err(Broken::Oracle(broken())),
+    }
 }
 
 /// A space of `n` switches `v00`, `v01`, ...: their names sort in index order, so variable `i`
@@ -88,12 +174,12 @@ fn switches(n: usize, alloc: Alloc<'static>) -> Space<'static> {
     b.build().unwrap_or_else(|e| panic!("{e}"))
 }
 
-fn table(bdd: &Bdd<'_>, c: Cond, n: usize) -> Tt {
+fn table<P: Planted<CondPlant>>(bdd: &PlantedBdd<'_, P>, c: Cond, n: usize) -> Tt {
     Tt::from_fn(n, |j| bdd.eval(c, |v| j >> v.index() & 1 == 1))
 }
 
 /// The table's function built a second way: Shannon expansion over the rows, through `ite`.
-fn from_table(bdd: &mut Bdd<'_>, t: Tt) -> Result<Cond, CondError> {
+fn from_table<P: Planted<CondPlant>>(bdd: &mut PlantedBdd<'_, P>, t: Tt) -> Result<Cond, CondError> {
     let mut level: StdVec<Cond> = (0..Tt::rows(t.n)).map(|j| if t.get(j) { Cond::TRUE } else { Cond::FALSE }).collect();
     for i in (0..t.n).rev() {
         let x = bdd.var(Var::new(i as u16))?;
@@ -107,17 +193,14 @@ fn from_table(bdd: &mut Bdd<'_>, t: Tt) -> Result<Cond, CondError> {
     Ok(level[0])
 }
 
-/// One case: random operations on a pool of conditions and their tables, then every check.
-fn ops_match_tables(tape: &Tape, planted: Plant) -> Result<(), Broke> {
-    plant::with(planted, || ops_case(tape))
-}
-
-fn ops_case(tape: &Tape) -> Result<(), Broke> {
+/// One case: random operations on a pool of conditions and their tables, then every check;
+/// every arena it makes takes `plant` ([`NoPlant`] for the clean run).
+fn ops_match_tables<P: Planted<CondPlant>>(tape: &Tape, plant: P) -> Result<(), Broken<CondBroken>> {
     let alloc = blaze_own::testing::heap().alloc();
     let n = 1 + tape.index(MOST_VARS, "variables");
     let space = switches(n, alloc);
     let cache_bits = 1 + tape.index(10, "cache bits") as u8;
-    let mut bdd = Bdd::new_in(n, Limits { nodes: 1 << 20, cache_bits }, alloc).map_err(harness)?;
+    let mut bdd = PlantedBdd::new_planted(n, Limits { nodes: 1 << 20, cache_bits }, alloc, plant).map_err(harness)?;
     let mut pool: StdVec<(Cond, Tt, &'static str)> = StdVec::from([
         (Cond::TRUE, Tt::from_fn(n, |_| true), "true"),
         (Cond::FALSE, Tt::from_fn(n, |_| false), "false"),
@@ -154,24 +237,18 @@ fn ops_case(tape: &Tape) -> Result<(), Broke> {
     }
     // Every operation equals its table.
     for &(c, t, op) in &pool {
-        if table(&bdd, c, n) != t {
-            return Err(Broke::Oracle(format!("{op} differs from its table")));
-        }
+        holds(table(&bdd, c, n) == t, || CondBroken::TableDiffers { op })?;
     }
     // Equal tables are equal ids, built by any path.
-    for (i, &(ci, ti, _)) in pool.iter().enumerate() {
+    for (i, &(ci, ti, op)) in pool.iter().enumerate() {
         for &(cj, tj, _) in &pool[..i] {
-            if (ti == tj) != (ci == cj) {
-                return Err(Broke::Oracle(format!("equal tables, different ids: {ci:?} {cj:?}")));
-            }
+            holds((ti == tj) == (ci == cj), || CondBroken::DifferentIds { op, one: ci, other: cj })?;
         }
     }
     let rebuilt_from = if n <= 6 { 0 } else { pool.len().saturating_sub(4) };
     for &(c, t, op) in &pool[rebuilt_from..] {
         let again = from_table(&mut bdd, t).map_err(harness)?;
-        if again != c {
-            return Err(Broke::Oracle(format!("equal tables, different ids: {op} {c:?}, its table {again:?}")));
-        }
+        holds(again == c, || CondBroken::DifferentIds { op, one: c, other: again })?;
     }
     let valid = pool[tape.index(pool.len(), "valid")];
     let mut support: AVec<'_, Var> = AVec::new_in(alloc);
@@ -181,55 +258,47 @@ fn ops_case(tape: &Tape) -> Result<(), Broke> {
     let mut cover = Cover::new_in(alloc);
     for &(c, t, op) in &pool {
         let other = pool[tape.index(pool.len(), "other")];
-        if bdd.implies(c, other.0).map_err(harness)? != t.within(other.1) {
-            return Err(Broke::Oracle(format!("implies is not inclusion for {op}")));
-        }
-        if bdd.disjoint(c, other.0).map_err(harness)? != (t.map2(other.1, |x, y| x && y).count() == 0) {
-            return Err(Broke::Oracle(format!("disjoint is not an empty intersection for {op}")));
-        }
+        let implies = bdd.implies(c, other.0).map_err(harness)?;
+        holds(implies == t.within(other.1), || CondBroken::ImpliesNotInclusion { op })?;
+        let disjoint = bdd.disjoint(c, other.0).map_err(harness)?;
+        holds(disjoint == (t.map2(other.1, |x, y| x && y).count() == 0), || CondBroken::DisjointNotEmpty { op })?;
         let within = t.map2(valid.1, |x, y| x && y);
-        if bdd.sat_count(c, valid.0).map_err(harness)? != within.count() {
-            return Err(Broke::Oracle(format!("sat_count is not the popcount for {op}")));
-        }
+        let count = bdd.sat_count(c, valid.0).map_err(harness)?;
+        holds(count == within.count(), || CondBroken::SatCountNotPopcount { op })?;
         let found = bdd.any_sat(c, valid.0, &mut witness).map_err(harness)?;
         let row = witness.iter().filter(|(_, on)| *on).fold(0usize, |j, (v, _)| j | 1 << v.index());
-        if found != (within.count() > 0) || (found && !within.get(row)) {
-            return Err(Broke::Oracle(format!("any_sat gave no satisfying witness for {op}")));
-        }
+        holds(found == (within.count() > 0) && (!found || within.get(row)), || CondBroken::NoWitness { op })?;
         bdd.support(c, &mut support).map_err(harness)?;
         let depends: StdVec<u16> = (0..n).filter(|&i| t.depends(i)).map(|i| i as u16).collect();
         let listed: StdVec<u16> = support.iter().map(|v| v.index()).collect();
         if listed != depends {
-            return Err(Broke::Oracle(format!("support {listed:?} is not the variables {op} depends on {depends:?}")));
+            return Err(Broken::Oracle(CondBroken::Support { op, listed, depends }));
         }
         // Portable: into this arena gives the id; into a fresh one, equal bytes back.
         export(&mut bdd, &space, c, &mut bytes).map_err(harness)?;
-        let same = import(&mut bdd, &space, &bytes).map_err(|e| Broke::Oracle(format!("portable: {op}: {e}")))?;
-        if same != c {
-            return Err(Broke::Oracle(format!("portable: {op} came back as another id")));
-        }
-        let mut fresh = Bdd::new_in(n, Limits { nodes: 1 << 16, cache_bits: 8 }, alloc).map_err(harness)?;
-        let there = import(&mut fresh, &space, &bytes).map_err(|e| Broke::Oracle(format!("portable: {op}: {e}")))?;
+        let same = import(&mut bdd, &space, &bytes)
+            .map_err(|error| Broken::Oracle(CondBroken::PortableRefused { op, error }))?;
+        holds(same == c, || CondBroken::PortableOtherId { op })?;
+        let mut fresh =
+            PlantedBdd::new_planted(n, Limits { nodes: 1 << 16, cache_bits: 8 }, alloc, plant).map_err(harness)?;
+        let there = import(&mut fresh, &space, &bytes)
+            .map_err(|error| Broken::Oracle(CondBroken::PortableRefused { op, error }))?;
         export(&mut fresh, &space, there, &mut again).map_err(harness)?;
-        if again.as_slice() != bytes.as_slice() || table(&fresh, there, n) != t {
-            return Err(Broke::Oracle(format!("portable: {op} wrote other bytes from another arena")));
-        }
+        holds(again.as_slice() == bytes.as_slice() && table(&fresh, there, n) == t, || {
+            CondBroken::PortableOtherBytes { op }
+        })?;
         // The cover: exactly the function, and no cube can go.
         let r = cover.compute(&mut bdd, c, c, 1 << 20).map_err(harness)?;
         let cubes = cover_tables(&cover, n);
         let union = cubes.iter().fold(Tt::from_fn(n, |_| false), |u, t| u.map2(*t, |x, y| x || y));
-        if r != c || union != t {
-            return Err(Broke::Oracle(format!("the cover of {op} is not exactly it")));
-        }
+        holds(r == c && union == t, || CondBroken::CoverInexact { op })?;
         for skip in 0..cubes.len() {
             let rest = cubes
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| *i != skip)
                 .fold(Tt::from_fn(n, |_| false), |u, (_, t)| u.map2(*t, |x, y| x || y));
-            if rest == t {
-                return Err(Broke::Oracle(format!("the cover of {op} has a redundant cube")));
-            }
+            holds(rest != t, || CondBroken::CoverRedundant { op })?;
         }
     }
     Ok(())
@@ -244,24 +313,111 @@ fn cover_tables(cover: &Cover<'_>, n: usize) -> StdVec<Tt> {
         .collect()
 }
 
+blaze_sim::plants! {
+    /// The bugs planted in the arena, each with the invariant of the truth-table oracle that
+    /// must catch it.
+    enum ArenaControl breaks CondBroken {
+        /// The arena as it is.
+        None,
+        /// A function and its negation stop sharing a node: two ids for one table.
+        UniqueSkipsComplement => CondBroken::DifferentIds { .. },
+        /// An `ite` answered from another `ite`'s cache entry: a condition off its table.
+        IteCacheSkipsElse => CondBroken::TableDiffers { .. },
+        /// `restrict` takes the other cofactor: the restricted condition off its table.
+        RestrictWrongBranch => CondBroken::TableDiffers { op: "restrict" },
+    }
+}
+
+impl ArenaControl {
+    /// The arena's plant this control plants.
+    fn planted(self) -> CondPlant {
+        match self {
+            ArenaControl::None => CondPlant::None,
+            ArenaControl::UniqueSkipsComplement => CondPlant::UniqueSkipsComplement,
+            ArenaControl::IteCacheSkipsElse => CondPlant::IteCacheSkipsElse,
+            ArenaControl::RestrictWrongBranch => CondPlant::RestrictWrongBranch,
+        }
+    }
+}
+
 #[test]
 fn operations_equal_their_truth_tables() {
-    check(Config::cases(400), |tape| ops_match_tables(tape, Plant::Clean));
+    check(Config::cases(400), |tape| ops_match_tables(tape, NoPlant));
 }
 
 #[test]
-fn control_a_unique_table_without_complement_normalisation_is_caught() {
-    control(Config::cases(2000), Plant::Clean, Plant::UniqueSkipsComplement, "different ids", ops_match_tables);
+fn every_arena_plant_is_caught_by_its_invariant() {
+    controls(Config::cases(2000), |tape, plant: ArenaControl| ops_match_tables(tape, plant.planted()));
+}
+
+blaze_sim::points! {
+    /// Where the arena's limits simulation has to get.
+    enum ArenaPoint {
+        /// An operation was refused at the drawn node cap.
+        NodeCap,
+    }
+}
+
+impl blaze_sim::Limits for Limits {
+    const SHIPPED: Limits = Limits::SHIPPED;
+
+    fn draw(tape: &Tape) -> Limits {
+        Limits {
+            nodes: tape.limit(Limits::SHIPPED.nodes, Limits::SMALLEST.nodes, "most nodes"),
+            cache_bits: tape.limit(Limits::SHIPPED.cache_bits, Limits::SMALLEST.cache_bits, "cache bits"),
+        }
+    }
+}
+
+/// One case of the limits simulation: the arena's limits drawn, then up to 40 operations over
+/// up to 8 variables; every condition made equals its table, the arena never holds more than
+/// its cap, and a refusal is the cap's own, at the cap.
+fn under_drawn_limits(tape: &Tape) -> Result<(), Broken<CondBroken>> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let limits: Limits = tape.limits();
+    let n = 1 + tape.index(8, "variables");
+    let mut bdd = Bdd::new_in(n, limits, alloc).map_err(harness)?;
+    let mut pool: StdVec<(Cond, Tt)> =
+        StdVec::from([(Cond::TRUE, Tt::from_fn(n, |_| true)), (Cond::FALSE, Tt::from_fn(n, |_| false))]);
+    for _ in 0..tape.below(40, "operations") {
+        let a = pool[tape.index(pool.len(), "a")];
+        let made = match tape.below(3, "operation") {
+            0 => {
+                let i = tape.index(n, "variable");
+                bdd.var(Var::new(i as u16)).map(|c| (c, Tt::var(n, i)))
+            }
+            1 => {
+                let b = pool[tape.index(pool.len(), "b")];
+                bdd.and(a.0, b.0).map(|c| (c, a.1.map2(b.1, |x, y| x && y)))
+            }
+            _ => {
+                let b = pool[tape.index(pool.len(), "b")];
+                bdd.xor(a.0, b.0).map(|c| (c, a.1.map2(b.1, |x, y| x != y)))
+            }
+        };
+        let held = bdd.nodes();
+        holds(held <= limits.nodes as usize, || CondBroken::NodeCap { nodes: held, cap: limits.nodes })?;
+        match made {
+            Ok((c, t)) => {
+                holds(table(&bdd, c, n) == t, || CondBroken::TableDiffers { op: "an operation under drawn limits" })?;
+                pool.push((c, t));
+            }
+            Err(CondError::NodeCap { cap }) if cap == limits.nodes && held == cap as usize => {
+                tape.reach(ArenaPoint::NodeCap);
+                return Ok(());
+            }
+            Err(CondError::NodeCap { cap }) => {
+                return Err(Broken::Oracle(CondBroken::NodeCap { nodes: held, cap }));
+            }
+            Err(other) => return Err(harness(other)),
+        }
+    }
+    Ok(())
 }
 
 #[test]
-fn control_an_ite_cache_keyed_without_its_else_is_caught() {
-    control(Config::cases(2000), Plant::Clean, Plant::IteCacheSkipsElse, "differs from its table", ops_match_tables);
-}
-
-#[test]
-fn control_a_restrict_that_takes_the_wrong_branch_is_caught() {
-    control(Config::cases(2000), Plant::Clean, Plant::RestrictWrongBranch, "restrict differs", ops_match_tables);
+fn the_node_cap_is_drawn_down_to_its_smallest_and_reached() {
+    check(Config::cases(400).must_reach_points(<ArenaPoint as Point>::IDS), under_drawn_limits);
 }
 
 /// A random predicate as text, and its value under an assignment, by Rust's rules.
@@ -337,23 +493,22 @@ fn eval_ops(ops: &[Op<'_>], n: usize, j: usize) -> bool {
 
 #[test]
 fn a_cfg_predicate_lowers_to_its_value_under_every_assignment() {
-    check(Config::cases(400), |tape| {
+    check(Config::cases(400), |tape| -> Result<(), Broken<CondBroken>> {
         let alloc = blaze_own::testing::heap().alloc();
         let n = 1 + tape.index(7, "variables");
         let space = switches(n, alloc);
-        let mut bdd = Bdd::new_in(n, Limits::TASK, alloc).map_err(harness)?;
+        let mut bdd = Bdd::new_in(n, Limits::SHIPPED, alloc).map_err(harness)?;
         let mut text = String::new();
         draw_predicate(tape, n, &mut text, 4);
-        let expr = cfg::parse(&text, alloc).map_err(|e| Broke::Oracle(format!("`{text}` did not parse: {e}")))?;
+        let expr = cfg::parse(&text, alloc).map_err(|e| {
+            Broken::Oracle(CondBroken::CfgUnparsed { text: text.clone(), error: format!("{e}") })
+        })?;
         let mut absent = AVec::new_in(alloc);
         let c = cfg::lower(&expr, &space, "pkg", &mut bdd, &mut absent).map_err(harness)?;
         let want = Tt::from_fn(n, |j| eval_ops(&expr.ops, n, j));
-        if table(&bdd, c, n) != want {
-            return Err(Broke::Oracle(format!("`{text}` lowered to another function")));
-        }
-        if text.contains(&format!("v{n:02}")) == absent.is_empty() {
-            return Err(Broke::Oracle(format!("`{text}`: the unset atom v{n:02} was not reported absent")));
-        }
+        holds(table(&bdd, c, n) == want, || CondBroken::CfgLoweredWrong { text: text.clone() })?;
+        let atom = format!("v{n:02}");
+        holds(text.contains(&atom) != absent.is_empty(), || CondBroken::CfgAbsent { text: text.clone(), atom })?;
         Ok(())
     });
 }
@@ -362,7 +517,7 @@ fn a_cfg_predicate_lowers_to_its_value_under_every_assignment() {
 fn malformed_portable_rows_are_refused_by_name() {
     let alloc = blaze_own::testing::heap().alloc();
     let space = switches(3, alloc);
-    let mut bdd = Bdd::new_in(3, Limits::TASK, alloc).unwrap();
+    let mut bdd = Bdd::new_in(3, Limits::SHIPPED, alloc).unwrap();
     let (a, b) = (bdd.var(Var::new(0)).unwrap(), bdd.var(Var::new(1)).unwrap());
     let f = bdd.xor(a, b).unwrap();
     let mut bytes = AVec::new_in(alloc);

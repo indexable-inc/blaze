@@ -185,20 +185,6 @@ pub(crate) fn check_increasing<T: Record, K: Ord>(
     }
 }
 
-/// Whether `index`, a row's reference to another row, is [`NONE`] or below `len`.
-pub(crate) fn check_index<T: Record>(
-    index: u32,
-    len: usize,
-    row: &T,
-    buffer: &[u8],
-    what: &'static str,
-) -> Result<(), FormatError> {
-    match index == NONE || wide(index) < len {
-        true => Ok(()),
-        false => Err(FormatError::Invalid { at: at_of_record(row, buffer), what }),
-    }
-}
-
 /// `index` as an option: [`NONE`] is none.
 pub(crate) fn index_of(index: u32) -> Option<crate::ItemIndex> {
     match index {

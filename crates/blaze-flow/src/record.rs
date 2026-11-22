@@ -5,7 +5,7 @@ use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::flow::{Bound, Flow};
-use crate::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
+use crate::loans::{BorrowFinding, LoanParts, TierOne, facts, loan_parts, tier_one, tier_two};
 use crate::moves::{MoveFinding, check_moves_planted};
 
 /// A planted bug for the simulations' controls; `None` everywhere but in a control.
@@ -46,6 +46,9 @@ impl Checked {
 pub struct Record<A: Allocator> {
     pub moves: Vec<MoveFinding, A>,
     pub borrows: Vec<BorrowFinding, A>,
+    /// The borrow, the conflict and the later use of each `Invalidated` finding in `borrows`,
+    /// in its order (loans.rs [`loan_parts`]).
+    pub loan_parts: Vec<LoanParts, A>,
     pub proof: Option<Checked>,
 }
 
@@ -71,9 +74,10 @@ pub fn check_planted<A: Allocator + Clone>(
     let moves = check_moves_planted(flow, plant, alloc.clone())?;
     let facts = facts(flow, alloc.clone())?;
     let (borrows, tier) = match tier_one(flow, &facts, plant, alloc.clone())? {
-        TierOne::Accepted => (Vec::new_in(alloc), 1),
-        TierOne::Refused => (tier_two(flow, &facts, plant, alloc)?, 2),
+        TierOne::Accepted => (Vec::new_in(alloc.clone()), 1),
+        TierOne::Refused => (tier_two(flow, &facts, plant, alloc.clone())?, 2),
     };
+    let loan_parts = loan_parts(flow, &facts, &borrows, alloc);
     let proof = (moves.is_empty() && borrows.is_empty()).then_some(Checked { tier });
-    Ok(Record { moves, borrows, proof })
+    Ok(Record { moves, borrows, loan_parts, proof })
 }

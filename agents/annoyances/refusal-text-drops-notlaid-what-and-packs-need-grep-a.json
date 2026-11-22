@@ -1,0 +1,12 @@
+{
+ "id": "refusal-text-drops-notlaid-what-and-packs-need-grep-a",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), blaze-solve/blaze-ladder writer (pieces 1-3, tempo-correct-1120)",
+ "where": "blaze-int notes reports/tempo-correct-1120/c2135wave69 refused-by-cause.txt; ~/.blaze fetch-store packs (BLZFPK03)",
+ "what": "Two costs. (1) The 485-body row 'a region position the signature's walk does not lay' keeps only the generic text: the specific RegionRefusal::NotLaid `what` (which says which form was refused, e.g. a `use<..>` opaque) is lost in the grouping, so the cause had to be found by reading the callee (commonware Clock::sleep) instead of from the report. Only three rows carried a callee key at all. (2) A dependency's source (tokio, commonware) lives only in the fetch-store packs, which are binary: plain grep skips them; `grep -a` is needed to find text in them, or the cargo registry copy when one exists.",
+ "class": "a refusal grouped by its outer words, not by the inner reason that names the form",
+ "prevention": "group refused-by-cause by the innermost typed reason (the NotLaid `what` and the callee's path), and print the callee as a path, not an ItemKey number",
+ "annoyance": "an hour of reading to recover what one more field in the report would have said",
+ "workaround": "read the callee's source from ~/.cargo/registry and `grep -a` over the packs",
+ "state": "open"
+}

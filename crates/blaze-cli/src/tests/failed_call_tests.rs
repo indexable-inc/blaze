@@ -35,7 +35,7 @@ fn workspace(seed: u64, call: &str) -> Io {
 #[test]
 fn a_failed_macro_call_is_an_error_naming_the_call_and_the_reason() {
     let io = workspace(61, "make!(struct foo);");
-    let first = check(&io, work::Sizes::USUAL);
+    let first = check(&io);
     let out = stdout(&io);
     assert!(first.errors >= 1, "a failed call is an error:\n{out}");
     assert_eq!(out.matches(CALL).count(), 1, "exactly one finding names the call:\n{out}");
@@ -43,9 +43,9 @@ fn a_failed_macro_call_is_an_error_naming_the_call_and_the_reason() {
     assert!(line.contains("no rule of the macro's 1 matched") && line.contains("rule 1 of 1"), "the matcher's reason: {line}\n{out}");
     assert!(out.contains("crates/a/src/lib.rs"), "the item's file is named:\n{out}");
     let seen = out.len();
-    let repeat = check(&io, work::Sizes::USUAL);
+    let repeat = check(&io);
     let again = &stdout(&io)[seen..];
-    assert_eq!(repeat.runs, 0, "{}", repeat.profile);
+    assert!(repeat.stood(), "the repeat stands on its certificate:\n{}", repeat.profile);
     assert_eq!(again.matches(CALL).count(), 1, "the repeat shows it from the record:\n{again}");
     println!("failed call: {line}");
 }
@@ -56,8 +56,8 @@ fn a_failed_macro_call_is_an_error_naming_the_call_and_the_reason() {
 #[test]
 fn a_call_a_rule_takes_is_no_finding() {
     let io = workspace(62, "make!(fn foo);");
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
-    assert!(checked.failed.is_empty(), "{:?}\n{}", checked.failed, checked.profile);
+    assert_eq!(checked.failures, 0, "{}", checked.profile);
     assert_eq!((checked.errors, out.matches(CALL).count()), (0, 0), "{out}");
 }

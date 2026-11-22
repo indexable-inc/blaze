@@ -3,6 +3,7 @@
 //! process, and its messages decoded from any bytes without a panic.
 
 use blaze_ids::rng::SplitMix64;
+use blaze_sys::posix::net;
 
 use super::rendezvous::{
     self, Message, Request, Token, decode_reply, decode_request, encode_reply,
@@ -18,13 +19,8 @@ use crate::{Access, Error};
 const FORTY_TWO: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
 
 fn pair() -> (Channel, Channel) {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` is two writable ints for the new sockets.
-    assert_eq!(
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
-        0
-    );
-    (Channel::from_raw(i64::from(fds[0])).unwrap(), Channel::from_raw(i64::from(fds[1])).unwrap())
+    let [a, b] = net::socketpair(net::AF_UNIX, net::SOCK_STREAM, 0).unwrap();
+    (Channel::from_raw(i64::from(a.raw())).unwrap(), Channel::from_raw(i64::from(b.raw())).unwrap())
 }
 
 fn over(at: u64, len: u64, access: Access, place: Place) -> Overlay {

@@ -9,6 +9,8 @@ use super::*;
 
 use std::collections::BTreeMap as StdMap;
 
+use crate::store::Store;
+
 use blaze_answer::{AnswerError, AnswerView, CellDigest, Flags, Health, LinesKey, Plant, SegmentRef, Serial, TreeDigest, nothing_changed};
 use blaze_drive::cells::Cell;
 use blaze_drive::{Key, Kind, Name};
@@ -26,7 +28,7 @@ pub(super) type List<T> = std::vec::Vec<T>;
 
 /// The command's store on the checkout `ws`, opened as `blaze why` opens it (engine_why.rs
 /// `explain`), handed to `f`, then committed: what `f` put and pinned is visible to the next.
-pub(super) fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &'s mut crate::store::CommandStore<'m, 'r, bstd::io::LentDriver>, &engine_check::Opts<'static>) -> R) -> R {
+pub(super) fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &'s mut crate::store::CommandStore<'m, 'r, bstd::io::LentDriver>, &engine_check::Opts<'static>, &'m crate::store::CommandLent) -> R) -> R {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
@@ -36,10 +38,10 @@ pub(super) fn with_store<R>(io: &Io, f: impl for<'m, 'r, 's> FnOnce(&bstd::Cx, &
     let phases = Phases::new(io.need_clock().expect("a clock"));
     let opened = crate::store::open_for_command(&cx, io, opts.place.home, &root, opts.place.checkout, phases.clock(), &err, opts.heap).expect("the store opens");
     let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), &err, erased.handle()).expect("the command's store");
-    let out = f(&cx, &mut store, &opts);
+    let out = f(&cx, &mut store, &opts, &opened.lent);
     crate::store::Store::after_answer(&mut store, &cx, &mut blaze_drive::profile::Profile::default()).expect("the store commits");
     drop(store);
-    crate::store::after_answer_printed(&cx, opened.lent, false, phases.clock(), &err).expect("after the answer");
+    crate::store::after_answer_printed(&cx, opened.lent, &opened.home, false, phases.clock(), &err).expect("after the answer");
     out
 }
 
@@ -158,18 +160,18 @@ fn both_forms_answer_alike() {
     let tree = TreeDigest([7; 32]);
     let other = TreeDigest([8; 32]);
     let alloc = blaze_own::testing::heap().alloc();
-    let (saved, counts, facts) = with_store(&io, |cx, store, opts| {
+    let (saved, counts, facts) = with_store(&io, |cx, store, opts, lent| {
         let frame = cx.frame();
-        let name = crate::engine_answer::root_name(opts.place.checkout, &opts.tools, frame);
+        let name = crate::engine_answer::root_name(opts.place.checkout, frame);
         let pointer = crate::engine_answer::load_pointer(cx, store, &name).expect("the store reads").expect("engine-check stored an answer").expect("its pointer reads");
         let (kept, _) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("the store reads").expect("its pages read");
         let empty = AnswerView::empty(Plant::None, opts.heap.shared());
         let mut next = RowsNext::new(&empty, Counts::default(), Plant::None, alloc);
-        put_whole(&kept.answer, &|_| None, &mut next).expect("every row is put");
+        put_whole(&kept.answer, &|name| kept.records.get(name).copied(), &mut next).expect("every row is put");
         let counts = next.counts();
         let effects = next.finish(&tree, &summary(&pointer.facts), &LinesKey(pointer.lines.0.0)).expect("the commit");
         let names = root_names(opts.place.checkout, &opts.tools, &tree, frame);
-        let saved = write_effects(&mut StoreSink { cx, store: &mut *store }, &names, &[], &effects, pointer.lines, alloc).expect("the store takes the writes");
+        let saved = write_effects(&mut StoreSink { cx, store: &mut *store, lent, toolchain: opts.toolchain }, &names, &effects, alloc).expect("the store takes the writes");
         (saved, counts, pointer.facts)
     });
     // The running counts, kept row by row, are the page form's whole count (engine_answer.rs
@@ -177,19 +179,34 @@ fn both_forms_answer_alike() {
     assert_eq!(counts, Counts { files: facts.files, findings: facts.findings }, "the rows' running counts against the pointer's facts");
     assert!(saved.new_segments > 0 && saved.puts == saved.new_segments + 1 && saved.segments == saved.new_segments, "a first answer puts its segments and its root: {saved:?}");
     assert!(saved.new_bytes > 0, "its segments have bytes: {saved:?}");
-    let (pages, rows) = with_store(&io, |cx, store, opts| {
+    let (pages, rows) = with_store(&io, |cx, store, opts, lent| {
         let frame = cx.frame();
-        let name = crate::engine_answer::root_name(opts.place.checkout, &opts.tools, frame);
+        let name = crate::engine_answer::root_name(opts.place.checkout, frame);
         let pointer = crate::engine_answer::load_pointer(cx, store, &name).expect("the store reads").expect("a stored answer").expect("its pointer reads");
         let (kept, root) = crate::engine_answer::load_answer(cx, store, pointer.root, opts.heap.shared()).expect("the store reads").expect("its pages read");
         let names = root_names(opts.place.checkout, &opts.tools, &tree, frame);
+        let before_open = lent.counts().gets;
         let stored = load_root(cx, store, names.checkout.as_str()).expect("the store reads").expect("a rows root").expect("the rows root reads");
+        let whole = facts.owed == 0 && facts.printed.replayable;
+        assert_eq!(certified(&stored, &tree), whole, "the certificate from the root alone");
+        assert!(!certified(&stored, &other), "no certificate for another tree");
+        // The manifest names a one-key record; the second get is its authenticated root.
+        // Count from before load_root so a traversal hidden inside open also fails the oracle.
+        let root_reads = lent.counts().gets - before_open;
+        assert_eq!(root_reads, 2, "certificate needs only the name record and its root");
+        println!("certificate task pages 0 ({root_reads} root records read)");
         let by_tree = load_root(cx, store, names.tree.as_str()).expect("the store reads").expect("a root by the tree").expect("it reads");
         assert_eq!(stored.key, by_tree.key, "the checkout's and the tree's names hold one root");
-        let whole = facts.owed == 0 && facts.printed.replayable;
-        assert_eq!(certified(&stored, &tree).expect("the root's summary reads"), whole, "the certificate from the root alone");
-        assert!(!certified(&stored, &other).expect("the root's summary reads"), "no certificate for another tree");
+        let before_children = lent.counts().gets;
         let rows = load_rows(cx, store, &stored, opts.heap.shared()).expect("the store reads").expect("the rows read");
+        // Include open in the measurement, independently of the row probe counters.
+        let eager_gets = lent.counts().gets - before_children;
+        println!("full rows open fetched {eager_gets} child records");
+        // Plant one child fetch on the certificate path and apply the same two-get budget.
+        let child = rows.view().segments().iter().find(|one| one.kind == blaze_answer::SegmentKind::Rows).expect("the fixture stores task rows");
+        let before_plant = lent.counts().gets;
+        crate::store::Store::get(store, cx, Key(child.id)).expect("the store reads").expect("the row segment exists");
+        assert!(root_reads + (lent.counts().gets - before_plant) > 2, "the certificate budget detects an eager row fetch");
         assert_eq!(rows.facts(), pointer.facts, "the root's summary holds the pointer's facts");
         let paged = PagesAnswer::new(&kept, root.bytes, pointer.facts, Some(tree));
         let (names_asked, cells, files) = universe(&kept.answer);
@@ -271,8 +288,13 @@ impl Memory {
 
     /// The rows answer `name` pins (a root must be pinned).
     pub(super) fn open(&self, name: &str) -> Result<RowsAnswer<'_>, RowsUnreadable> {
-        let root = self.root(name).unwrap_or_else(|| panic!("{name} pins a root"));
-        RowsAnswer::open(root, |one: &SegmentRef| self.records.get(&one.id.0).map(|bytes| bytes.as_slice()), Plant::None, blaze_own::testing::heap().shared())
+        let root = self.checked_root(name)?;
+        RowsAnswer::open(&root, |one: &SegmentRef| self.records.get(&one.id.0).map(|bytes| bytes.as_slice()), Plant::None, blaze_own::testing::heap().shared())
+    }
+
+    fn checked_root(&self, name: &str) -> Result<RowsRoot<'_>, RowsUnreadable> {
+        let bytes = self.root(name).unwrap_or_else(|| panic!("{name} pins a root"));
+        RowsRoot::open(self.pins[name][0], bytes)
     }
 }
 
@@ -292,6 +314,30 @@ impl AnswerSink for Recording {
 
     fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), core::convert::Infallible> {
         self.ops.push(Op::Pin(name.to_owned(), keys.to_vec()));
+        Ok(())
+    }
+
+    fn index_rows(&mut self, owner: Key, records: &[Key], _: &[(Name, Key)], _: blaze_own::Alloc<'_>) -> Result<(), Self::Error> {
+        // This model has no expansion payloads. CAS sorts and deduplicates index records.
+        let mut keys = records.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        let bytes = keys.iter().flat_map(|key| key.0.0).collect();
+        let index = blaze_cas::plain::beside_key(blaze_cas::Key(owner.0));
+        self.ops.push(Op::Put(Key(index.0), bytes));
+        Ok(())
+    }
+
+    fn pin_children(&mut self, names: &RootNames<'_>, segments: &[SegmentRef], lines: Key, _: blaze_own::Alloc<'_>) -> Result<(), Self::Error> {
+        let mut keys: List<_> = segments.iter().map(|one| Key(one.id)).collect();
+        keys.push(lines);
+        keys.extend(segments.iter().filter(|one| one.kind == blaze_answer::SegmentKind::Rows).map(|one| Key(blaze_cas::plain::beside_key(blaze_cas::Key(one.id)).0)));
+        self.pin(names.checkout_segments.as_str(), &keys)?;
+        self.pin(names.tree_segments.as_str(), &keys)
+    }
+
+    fn keep_toolchain(&mut self, _: &[(Name, Key)], _: blaze_own::Alloc<'_>) -> Result<(), Self::Error> {
+        // The recording sink's worlds have no toolchain crates.
         Ok(())
     }
 }
@@ -350,8 +396,7 @@ pub(super) fn commit(last: &AnswerView<'_>, counts: Counts, plant: Plant, tree: 
     let facts = Facts { files: counts.files, printed: Printed { names: true, bodies_whole: true, replayable: true }, findings: counts.findings, owed: 0 };
     let effects = next.finish(tree, &summary(&facts), &LinesKey([0; 32])).expect("the commit");
     let mut sink = Recording::default();
-    let lines = Key(ContentId([0; 32]));
-    match write_effects(&mut sink, names, last.segments(), &effects, lines, alloc) {
+    match write_effects(&mut sink, names, &effects, alloc) {
         Ok(_) => {}
         Err(never) => match never {},
     }
@@ -379,7 +424,16 @@ fn one_question_touches_one_row() {
     let empty = AnswerView::empty(Plant::None, super::engine_check_tests::opts(&io, 2, false).heap.shared());
     let mut memory = Memory::default();
     memory.apply(&commit(&empty, Counts::default(), Plant::None, &tree, &puts, &names));
-    let answer = memory.open(names.checkout.as_str()).expect("the answer opens");
+    let mut children_fetched = 0;
+    let mut child_bytes = 0;
+    let root = memory.checked_root(names.checkout.as_str()).expect("the certificate opens");
+    assert!(certified(&root, &tree), "the complete answer stands from its root");
+    let answer = RowsAnswer::open(&root, |child| {
+        let bytes = memory.records.get(&child.id.0)?;
+        children_fetched += 1;
+        child_bytes += bytes.len();
+        Some(bytes.as_slice())
+    }, Plant::None, super::engine_check_tests::opts(&io, 2, false).heap.shared()).expect("the answer opens");
     let total = answer.bytes();
     let task = answer.task(&task_name(1000)).expect("task 1000 is named");
     let row = answer.row(task).expect("its row reads").expect("it has a row");
@@ -388,7 +442,7 @@ fn one_question_touches_one_row() {
     let readers = answer.readers(cell, alloc).expect("its readers read");
     assert_eq!(readers.len(), 20, "tasks 1000 to 1019 read task 999's cell");
     let touched = answer.touched();
-    println!("one row and one cell's readers of 2,000 rows: {touched:?} of {total} B");
+    println!("open fetched {children_fetched} child records ({child_bytes} mapped bytes); lookup of one row and one cell's readers: {touched:?} of {total} B");
     assert_eq!(touched.rows, 1, "one row's question touched one row: {touched:?}");
     assert!(touched.bytes * 100 < total, "under 1% of the answer's {total} B: {touched:?}");
     // The rows with findings come from their column: none here, so no row is read.
@@ -414,9 +468,10 @@ fn another_tree_is_no_certificate() {
     let root = memory.root(names_2.checkout.as_str()).expect("the checkout pins the second root");
     assert!(!nothing_changed(root, &first).expect("the root reads"), "the second root does not answer the first tree");
     assert!(nothing_changed(root, &second).expect("the root reads"), "the second root answers the second tree");
-    let stored = RowsRoot { key: root_key(root), bytes: root };
-    assert!(!certified(&stored, &first).expect("the summary reads"), "no certificate for the first tree");
-    assert!(certified(&stored, &second).expect("the summary reads"), "a certificate for the second tree");
+    assert!(matches!(RowsRoot::open(Key(ContentId([0; 32])), root), Err(RowsUnreadable::RootDigest { .. })));
+    let stored = RowsRoot::open(root_key(root), root).expect("the root is authentic");
+    assert!(!certified(&stored, &first), "no certificate for the first tree");
+    assert!(certified(&stored, &second), "a certificate for the second tree");
     let answer = memory.open(names_2.checkout.as_str()).expect("the second answer opens");
     assert!(!answer.certificate(&first) && answer.certificate(&second), "the seam's certificate is the root's");
     assert_eq!(answer.view().health(), Health::Fine, "two requests call for no compaction");
@@ -424,6 +479,144 @@ fn another_tree_is_no_certificate() {
     assert_eq!(answer.stands(reader), Some(true), "a carried row whose read did not move stands by its generation");
     let kept = memory.open(names_1.tree.as_str()).expect("the first tree's name still opens");
     assert!(kept.certificate(&first) && kept.serial() < answer.serial(), "the first tree's root is the first request's");
+}
+
+/// The two levels CAS follows from an indexed root. The test reads the manifest's actual
+/// named indexes independently of the rows publisher.
+fn reached(lent: &crate::store::CommandLent, name: &str) -> std::collections::BTreeSet<Key> {
+    let named = lent.root_named(name).expect("a named root");
+    let root = lent.get(&named).expect("root lookup").expect("the named root exists");
+    assert_eq!(root.tag, blaze_cas::plain::INDEXED_ROOT_TAG);
+    let mut reached = std::collections::BTreeSet::new();
+    for index in root.bytes.as_chunks::<32>().0 {
+        let index = blaze_cas::Key(ContentId(*index));
+        let held = lent.get(&index).expect("index lookup").expect("the indexed root's child exists");
+        assert_eq!(held.tag, blaze_cas::plain::INDEX_TAG);
+        assert_eq!(held.bytes.len() % 32, 0);
+        reached.extend(held.bytes.as_chunks::<32>().0.iter().map(|key| Key(ContentId(*key))));
+    }
+    reached
+}
+
+#[test]
+fn a_delta_pins_its_result_and_the_carried_payloads() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    let tree = TreeDigest([4; 32]);
+    let krate = Name::new(Kind::CrateScope, ContentId([7; 32]));
+    let names_record = Key(digest(1, 0));
+    let expansion = Key(digest(2, 0));
+    let lines = Key(digest(3, 0));
+    let facts = Facts { files: 0, printed: Printed { names: true, bodies_whole: true, replayable: true }, findings: 0, owed: 1 };
+    let old_owed = with_store(&io, |cx, store, opts, lent| {
+        let alloc = opts.heap.alloc();
+        for (key, bytes) in [(names_record, b"scope".as_slice()), (expansion, b"expansion"), (lines, b"output")] {
+            store.put(cx, key, bytes).expect("store the payload");
+        }
+        store.index_beside(cx, names_record, &[expansion]).expect("the names record owns an expansion");
+        store.toolchain_crates(&[krate.subject]);
+        let empty = AnswerView::empty(Plant::None, opts.heap.shared());
+        let mut next = RowsNext::new(&empty, Counts::default(), Plant::None, alloc);
+        let row = NextRow {
+            key: names_record, out: digest(4, 0), phase: Phase::new(Stage::Names, 0), file: file_name(), source: krate.subject, flags: Flags(0), findings: 0, record: names_record,
+        };
+        next.put(krate, &row, [], &[(CELL, digest(5, 0))]).expect("the names row is put");
+        next.owe_cells([(CellId { of: krate, cell: CELL }, Serial(1))]).expect("the request owes one cell");
+        let effects = next.finish(&tree, &summary(&facts), &LinesKey(lines.0.0)).expect("the base answer");
+        let names = root_names("ws", &tools(), &tree, cx.frame());
+        write_effects(&mut StoreSink { cx, store, lent, toolchain: opts.toolchain }, &names, &effects, alloc).expect("publish the base");
+        Key(effects.segments().iter().find(|one| one.kind == blaze_answer::SegmentKind::OwedCells).expect("one owed cell").id)
+    });
+    with_store(&io, |cx, store, opts, lent| {
+        let alloc = opts.heap.alloc();
+        let names = root_names("ws", &tools(), &tree, cx.frame());
+        let root = load_root(cx, store, names.checkout.as_str()).unwrap().unwrap().unwrap();
+        let rows = load_rows(cx, store, &root, opts.heap.shared()).unwrap().unwrap();
+        let mut next = RowsNext::new(rows.view(), rows.counts(), Plant::None, alloc);
+        next.owe_cells([]).expect("the delta settles the owed cell");
+        let effects = next.finish(&tree, &summary(&Facts { owed: 0, ..facts }), &LinesKey(lines.0.0)).expect("a delta carrying every row");
+        let saved = write_effects(&mut StoreSink { cx, store, lent, toolchain: opts.toolchain }, &names, &effects, alloc).expect("publish the delta");
+        assert_eq!(saved.new_segments, 1, "only the replacement owed set is new");
+    });
+    with_store(&io, |cx, store, opts, lent| {
+        let names = root_names("ws", &tools(), &tree, cx.frame());
+        let root = load_root(cx, store, names.checkout.as_str()).unwrap().unwrap().unwrap();
+        let rows = load_rows(cx, store, &root, opts.heap.shared()).unwrap().unwrap();
+        let mut expected: std::collections::BTreeSet<Key> = rows.view().segments().iter().map(|one| Key(one.id)).collect();
+        let expansion_index = Key(blaze_cas::plain::beside_key(blaze_cas::Key(names_record.0)).0);
+        expected.extend([lines, names_record, expansion_index, expansion]);
+        assert!(!expected.contains(&old_owed), "the old owed set was replaced");
+        for name in [names.checkout_segments.as_str(), names.tree_segments.as_str()] {
+            assert_eq!(reached(lent, name), expected, "{name} keeps the resulting answer's records");
+        }
+        let toolchain = crate::store::roots::RootName::toolchain(opts.toolchain);
+        let shared = reached(lent, toolchain.as_str());
+        assert!(shared.contains(&names_record) && shared.contains(&expansion), "the toolchain retains its names and expansion");
+    });
+}
+
+fn payload_history(tape: &blaze_sim::Tape, omit_carried: bool) -> Result<(), blaze_sim::Broke> {
+    let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("a frame for root names");
+    let tree = TreeDigest([1; 32]);
+    let names = root_names("ws", &tools(), &tree, &frame);
+    let empty = AnswerView::empty(Plant::None, blaze_own::testing::heap().shared());
+    let mut memory = Memory::default();
+    let mut count = 1;
+    memory.apply(&commit(&empty, Counts::default(), Plant::None, &tree, &[put_of(0, 0..0, 0)], &names));
+    for _ in 0..4 {
+        let last = memory.open(names.checkout.as_str()).expect("open the last committed generation");
+        let mut ops = commit(last.view(), last.counts(), Plant::None, &tree, &[put_of(count, 0..count, 1)], &names);
+        if omit_carried {
+            // Plant the old writer's missing edge from the new root to a carried payload index.
+            let first = last.view().segments().iter().find(|one| one.kind == blaze_answer::SegmentKind::Rows).expect("the base's rows");
+            let missing = Key(blaze_cas::plain::beside_key(blaze_cas::Key(first.id)).0);
+            for op in &mut ops {
+                if let Op::Pin(name, keys) = op && name == names.checkout_segments.as_str() {
+                    keys.retain(|key| *key != missing);
+                }
+            }
+        }
+        drop(last);
+        // Children may reach disk before the manifest's one durable flip. After a cut,
+        // the named roots collectively have the last acknowledged generation.
+        let cut = tape.index(ops.len() + 1, "published effects before crash");
+        if cut == ops.len() || tape.one_in(2, "flip and acknowledge") {
+            memory.apply(&ops);
+            count += 1;
+        } else {
+            for op in &ops[..cut] {
+                if matches!(op, Op::Put(_, _)) {
+                    memory.apply(core::slice::from_ref(op));
+                }
+            }
+        }
+        let after = memory.open(names.checkout.as_str()).expect("the named generation opens");
+        let pins = &memory.pins[names.checkout_segments.as_str()];
+        let mut reached = std::collections::BTreeSet::new();
+        for segment in after.view().segments().iter().filter(|one| one.kind == blaze_answer::SegmentKind::Rows) {
+            let index = Key(blaze_cas::plain::beside_key(blaze_cas::Key(segment.id)).0);
+            if pins.contains(&index) {
+                let bytes = &memory.records[&index.0.0];
+                reached.extend(bytes.as_chunks::<32>().0.iter().map(|key| Key(ContentId(*key))));
+            }
+        }
+        for i in 0..count {
+            let key = Key(ContentId::of("engine_answer_rows_tests record", &task_name(i).subject.0));
+            if !reached.contains(&key) {
+                return Err(blaze_sim::Broke::Oracle(format!("lost a carried payload: task {i}, record {key:?}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_acknowledged_row_payload_is_reachable_after_a_cut() {
+    blaze_sim::check(blaze_sim::Config::cases(32), |tape| payload_history(tape, false));
+}
+
+#[test]
+fn the_oracle_catches_an_unpinned_carried_payload() {
+    blaze_sim::control(blaze_sim::Config::cases(32), false, true, "lost a carried payload", payload_history);
 }
 
 /// Control: a row whose read moved after it (a stale generation) is not served as standing, nor

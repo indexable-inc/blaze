@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
-use super::{SimCells, harness, key, oracle};
+use super::{Lap, SimCells, harness, key, oracle};
 use crate::Plant;
 use crate::ring::{Cells, Drain, Event, Got, Op, PUSH_OPS, Ring, Step, push_ops_planted};
 
@@ -172,20 +172,24 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 
 #[test]
 fn rings_lose_only_the_oldest_and_never_block() {
-    check(Config::cases(3000), |tape| run(tape, Plant::None));
+    let lap = Lap::new("ring: only the oldest lost, never blocked");
+    check(Config::cases(3000), |tape| lap.case(run(tape, Plant::None)));
 }
 
 #[test]
 fn the_oracle_catches_a_torn_entry() {
-    control(Config::cases(5000), Plant::None, Plant::NoRecheck, "torn", run);
+    let lap = Lap::new("ring: control, a torn entry");
+    control(Config::cases(5000), Plant::None, Plant::NoRecheck, "torn", |tape, plant| lap.case(run(tape, plant)));
 }
 
 #[test]
 fn the_oracle_catches_a_wrong_gap_count() {
-    control(Config::cases(3000), Plant::None, Plant::LostOffByOne, "gap count", run);
+    let lap = Lap::new("ring: control, a wrong gap count");
+    control(Config::cases(3000), Plant::None, Plant::LostOffByOne, "gap count", |tape, plant| lap.case(run(tape, plant)));
 }
 
 #[test]
 fn the_oracle_catches_a_producer_that_waits() {
-    control(Config::cases(3000), Plant::None, Plant::WaitForReader, "blocked", run);
+    let lap = Lap::new("ring: control, a producer that waits");
+    control(Config::cases(3000), Plant::None, Plant::WaitForReader, "blocked", |tape, plant| lap.case(run(tape, plant)));
 }

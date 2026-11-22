@@ -226,9 +226,10 @@ pub fn write<'a>(names: &CrateNames<'_>, alloc: Alloc<'a>) -> Result<Split<'a>, 
             Ok(origins) => split(origins).map_err(|error| ExpansionRecordsError::Origins { call: *call, error })?,
             Err(_) => (&[][..], &[][..]),
         };
-        let key = key_of(made.text, column)?;
-        calls.push(Call { call: *call, text: made.text, call_part, column, key });
+        // The key is set by `fill_keys` below, for every call, before any is read.
+        calls.push(Call { call: *call, text: made.text, call_part, column, key: ContentId::default() });
     }
+    fill_keys(&mut calls, alloc)?;
     // Sorted by call key: the map's order is the machine's (rule 25).
     calls.sort_unstable_by_key(|c| c.call);
     let count = fits(calls.len(), "a crate's macro calls")?;
@@ -276,6 +277,62 @@ pub fn write<'a>(names: &CrateNames<'_>, alloc: Alloc<'a>) -> Result<Split<'a>, 
         directory.extend_from_slice(c.call_part);
     }
     Ok(Split { directory, records })
+}
+
+/// The records [`fill_keys`] hashes side by side at once: blaze-blake3's batch.
+const KEY_BATCH: usize = 64;
+
+/// The longest record whose key is hashed beside others' (a BLAKE3 chunk, one SIMD lane); a
+/// longer one is hashed alone either way, by [`key_of`] from its parts.
+const SHORT_RECORD: usize = blaze_ids::b3::CHUNK_LEN;
+
+/// Each call's key, the [`key_of`] its text and column. A record of at most [`SHORT_RECORD`]
+/// bytes is written into one reused buffer as [`ExpansionRecord::write`] writes it, and
+/// [`KEY_BATCH`] of them are hashed side by side ([`ContentId::of_each_domain`]); a longer one
+/// goes through [`key_of`], streamed from its parts with no copy. Both digest the record's bytes
+/// in [`RECORDS`] (`key_of`'s parts are those bytes in order, and BLAKE3 hashes a stream by its
+/// bytes, not by its updates), so each key is the one `key_of` gives
+/// (`batched_keys_are_key_of`).
+fn fill_keys(calls: &mut [Call<'_>], alloc: Alloc<'_>) -> Result<(), ExpansionRecordsError> {
+    let mut scratch: AVec<'_, u8> = AVec::new_in(alloc);
+    let mut members = [0usize; KEY_BATCH];
+    // Where each waiting record ends in `scratch`; the first starts at 0.
+    let mut ends = [0usize; KEY_BATCH + 1];
+    let mut count = 0;
+    for at in 0..calls.len() {
+        let (text, column) = (calls[at].text, calls[at].column);
+        if RECORD_HEAD + pad4(text.len()) + column.len() > SHORT_RECORD {
+            calls[at].key = key_of(text, column)?;
+            continue;
+        }
+        ExpansionRecord::write(text, column, &mut scratch)?;
+        members[count] = at;
+        count += 1;
+        ends[count] = scratch.len();
+        if count == KEY_BATCH {
+            hash_keys(calls, &members[..count], &ends[..=count], &scratch);
+            scratch.clear();
+            count = 0;
+        }
+    }
+    hash_keys(calls, &members[..count], &ends[..=count], &scratch);
+    Ok(())
+}
+
+/// The keys of the records `scratch[ends[i]..ends[i + 1]]`, side by side, into the calls
+/// `members[i]`.
+fn hash_keys(calls: &mut [Call<'_>], members: &[usize], ends: &[usize], scratch: &[u8]) {
+    let count = members.len();
+    let mut inputs: [&[u8]; KEY_BATCH] = [&[]; KEY_BATCH];
+    for (at, input) in inputs[..count].iter_mut().enumerate() {
+        *input = &scratch[ends[at]..ends[at + 1]];
+    }
+    let mut keys = [ContentId::default(); KEY_BATCH];
+    ContentId::of_each_domain(&RECORDS, &inputs[..count], &mut keys[..count])
+        .expect("as many key slots as records: both are `members.len()`");
+    for (&member, key) in members.iter().zip(keys) {
+        calls[member].key = key;
+    }
 }
 
 /// One call's row of a directory.
@@ -408,5 +465,122 @@ impl<'s> Directory<'s> {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{string::String, vec::Vec};
+
+    use blaze_sim::{Config, Tape};
+
+    use super::*;
+
+    /// A length near where a record stops being short, or any up to past a chunk.
+    fn length(tape: &Tape, label: &'static str) -> usize {
+        match tape.coin(label) {
+            true => tape.index(1100, label),
+            false => SHORT_RECORD - RECORD_HEAD - 8 + tape.index(16, label),
+        }
+    }
+
+    /// Up to 200 drawn texts (ASCII) and columns.
+    fn drawn(tape: &Tape) -> Vec<(String, Vec<u8>)> {
+        let count = tape.index(if cfg!(miri) { 20 } else { 201 }, "calls");
+        (0..count)
+            .map(|_| {
+                let mut text = std::vec![0u8; length(tape, "text")];
+                tape.fill(&mut text, "text bytes");
+                let text: Vec<u8> = text.iter().map(|b| b'a' + b % 26).collect();
+                let mut column = std::vec![0u8; length(tape, "column") % 600];
+                tape.fill(&mut column, "column bytes");
+                (String::from_utf8(text).expect("ASCII"), column)
+            })
+            .collect()
+    }
+
+    /// Every key [`fill_keys`] sets, side by side or alone, is [`key_of`] of the call's text and
+    /// column and [`record_key`] of the record [`ExpansionRecord::write`] makes of them.
+    #[test]
+    fn batched_keys_are_key_of() {
+        blaze_sim::check(Config::cases(if cfg!(miri) { 4 } else { 128 }), |tape| {
+            let alloc = blaze_own::testing::heap().alloc();
+            let datas = drawn(tape);
+            let mut calls: Vec<Call<'_>> = datas
+                .iter()
+                .enumerate()
+                .map(|(at, (text, column))| {
+                    let mut call = [0u8; 32];
+                    call[..8].copy_from_slice(&u64::try_from(at).expect("a count fits u64").to_le_bytes());
+                    Call { call: ItemKey(ContentId(call)), text, call_part: &[], column, key: ContentId::default() }
+                })
+                .collect();
+            fill_keys(&mut calls, alloc).expect("drawn records fit a u32");
+            for (at, call) in calls.iter().enumerate() {
+                let alone = key_of(call.text, call.column).expect("drawn records fit a u32");
+                let mut bytes = AVec::new_in(alloc);
+                ExpansionRecord::write(call.text, call.column, &mut bytes).expect("drawn records fit a u32");
+                assert_eq!(call.key, alone, "call {at}: {} B of text, {} B of column", call.text.len(), call.column.len());
+                assert_eq!(call.key, record_key(&bytes), "call {at}: the record's own digest");
+            }
+        });
+    }
+
+    /// Records whose bytes end a byte either side of 1, 2, 3, 4, 8 and 16 chunks (and on them),
+    /// in a drawn order among short ones, so the batch, the streamed [`key_of`] (four updates
+    /// over a lazily merged stack) and the one-shot [`record_key`] each meet every tree shape
+    /// up to 16 chunks: all three keys equal.
+    #[test]
+    fn keys_across_chunk_edges_are_key_of() {
+        let mut shapes: Vec<(usize, usize)> = Vec::new();
+        for chunks in [1usize, 2, 3, 4, 8, 16] {
+            for delta in -5i64..=5 {
+                for column in [0usize, 1, 3, 70, 600] {
+                    let target = usize::try_from(i64::try_from(chunks * 1024).expect("small") + delta).expect("positive");
+                    let room = target - RECORD_HEAD - column;
+                    // A text of a multiple of four bytes, the column taking the rest, so the
+                    // record is `target` bytes exactly.
+                    let text = room / 4 * 4;
+                    shapes.push((text, column + room - text));
+                }
+            }
+        }
+        for short in [0usize, 5, 64, 400] {
+            shapes.push((short, short % 9));
+        }
+        blaze_sim::check(Config::cases(if cfg!(miri) { 2 } else { 16 }), |tape| {
+            let alloc = blaze_own::testing::heap().alloc();
+            let mut order = shapes.clone();
+            if cfg!(miri) {
+                order.retain(|&(text, column)| RECORD_HEAD + text + column <= 3 * 1024);
+            }
+            tape.shuffle(&mut order, "order");
+            let datas: Vec<(String, Vec<u8>)> = order
+                .iter()
+                .map(|&(text, column)| {
+                    let text: String = (0..text).map(|at| char::from(b'a' + u8::try_from(at % 26).expect("small"))).collect();
+                    let column: Vec<u8> = (0..column).map(|at| u8::try_from(at % 251).expect("small")).collect();
+                    (text, column)
+                })
+                .collect();
+            let mut calls: Vec<Call<'_>> = datas
+                .iter()
+                .enumerate()
+                .map(|(at, (text, column))| {
+                    let mut call = [0u8; 32];
+                    call[..8].copy_from_slice(&u64::try_from(at).expect("a count fits u64").to_le_bytes());
+                    Call { call: ItemKey(ContentId(call)), text, call_part: &[], column, key: ContentId::default() }
+                })
+                .collect();
+            fill_keys(&mut calls, alloc).expect("records fit a u32");
+            for call in &calls {
+                let alone = key_of(call.text, call.column).expect("records fit a u32");
+                let mut bytes = AVec::new_in(alloc);
+                ExpansionRecord::write(call.text, call.column, &mut bytes).expect("records fit a u32");
+                let what = std::format!("{} B record, {} B of text, {} B of column", bytes.len(), call.text.len(), call.column.len());
+                assert_eq!(call.key, alone, "{what}: batched against key_of");
+                assert_eq!(alone, record_key(&bytes), "{what}: key_of against the record's one-shot digest");
+            }
+        });
     }
 }

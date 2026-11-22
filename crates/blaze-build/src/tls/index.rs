@@ -28,8 +28,8 @@
 use core::alloc::Allocator;
 
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
-use blaze_lir::func::{BlockKind, Conv, Func, RefKind};
-use blaze_lir::{BuildError, Builder, Flags, Full, IntCond, Op, Ty};
+use blaze_lir::func::{BlockKind, Conv, RefKind};
+use blaze_lir::{BuildError, Builder, Flags, Full, IntCond, Op, Ty, VerifiedFunc};
 
 use super::NO_MEMORY_TRAP;
 
@@ -78,7 +78,7 @@ const LEAST_SLOTS: u64 = 16;
 /// in `desc.root`, `*root_at = t`. Then `p = t.slot[index]`; if null: `row = desc.vars[index]`,
 /// `p = aligned_alloc(a, round_up(max(row.size, 1), a))` with `a = max(row.align, 16)` (null:
 /// trap), `memcpy(p, row.init, row.init_len)`, the rest of `size` zeroed, `t.slot[index] = p`.
-pub fn getter<A: Allocator + Clone>(alloc: A) -> Result<Func<A>, BuildError> {
+pub fn getter<A: Allocator + Clone>(alloc: A) -> Result<VerifiedFunc<A>, BuildError> {
     let mut b = Builder::<A, Full>::new_in(64, alloc);
     let sig = b.sig(
         Conv::C,
@@ -258,7 +258,7 @@ pub fn getter<A: Allocator + Clone>(alloc: A) -> Result<Func<A>, BuildError> {
     b.trap(SET_FAILED_TRAP);
     b.begin(bad_row);
     b.trap(BAD_ROW_TRAP);
-    b.finish_checked()
+    b.finish_verified()
 }
 
 /// The ender, the key's destructor: `fn(t: *mut Table)` (C convention).
@@ -272,7 +272,7 @@ pub fn getter<A: Allocator + Clone>(alloc: A) -> Result<Func<A>, BuildError> {
 /// Gap, stated: a destructor that first runs in the LAST round beside this one may find the
 /// table gone (macOS orders the keys of one round by no promise). On Linux glibc runs
 /// `__call_tls_dtors` (std's cxa path) before any key destructor, so there is no gap there.
-pub fn ender<A: Allocator + Clone>(alloc: A) -> Result<Func<A>, BuildError> {
+pub fn ender<A: Allocator + Clone>(alloc: A) -> Result<VerifiedFunc<A>, BuildError> {
     let mut b = Builder::<A, Full>::new_in(64, alloc);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
     b.set_signature(sig);
@@ -362,5 +362,5 @@ pub fn ender<A: Allocator + Clone>(alloc: A) -> Result<Func<A>, BuildError> {
 
     b.begin(set_failed);
     b.trap(SET_FAILED_TRAP);
-    b.finish_checked()
+    b.finish_verified()
 }

@@ -1,0 +1,15 @@
+{
+ "id": "codec-limits-without-shipped-values",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), wave-1124-sansio group b fork (blaze-deflate, blaze-tar)",
+ "where": "crates/blaze-deflate/src/inflate.rs Limits, crates/blaze-tar/src/read.rs Limits",
+ "what": "D165 asks for `pub const SHIPPED` on each crate's Limits, but both codecs' Limits say every field is the caller's choice and ship no value. The simulation's `impl blaze_sim::Limits` had to take the tests' own loose bounds as SHIPPED, so the draw ranges from 0 up to a test constant, not up to anything a caller uses.",
+ "cost": "a design call per crate, and the convention brief did not say what to do for a caller-chosen cap",
+ "cause": "the D165 convention was written for components that own their caps; a codec's caps belong to its caller (blaze-fetch, blaze-git-fetch, blaze-http, blaze-std png)",
+ "whys": "no SHIPPED exists because none is right for every caller; each caller holds its own values inline",
+ "class": "a cap owned by the caller: the simulation of the component can't draw toward a shipped value it does not know",
+ "prevention": "wanted: each caller's Limits value becomes a named const in the caller, and the caller's own simulation draws it; or D165 says in words that a caller-owned cap's SHIPPED is the test's loosest bound",
+ "annoyance": "no compile in a write-only lane, so whether `tape.limit` takes u32/u64 and whether the `plants!` pattern accepts an or-pattern is read from source, not shown",
+ "workaround": "tests use the loose constant as SHIPPED and state it in a doc comment",
+ "state": "open"
+}

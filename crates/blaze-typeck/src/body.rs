@@ -398,6 +398,31 @@ pub struct BodyView<'b> {
     /// written by a macro's expansion is here as any other: an operation inside the expanded
     /// block is inside it, whoever wrote either (the Reference, "Unsafe blocks").
     pub unsafe_blocks: &'b [ExprId],
+    /// The edition of each expression's first word (rustc's `expr.span.edition()`), as runs over
+    /// ascending ids: a row `(first, ed)` gives `ed` to `first` and every later id up to the
+    /// next row; an id before the first row has the body's `edition`. A word a macro wrote has
+    /// its defining crate's edition (blaze-expand's mark), any other the body's. Canonical:
+    /// ids strictly ascending, each row's edition other than the one before it (the first
+    /// row's other than `edition`), so equal text gives equal bytes. Runs, not one row per
+    /// expression: inside a 2018 crate's expansion nearly every expression is 2018, and a row
+    /// is paid only where the edition changes in id order; no contiguity of an expansion's
+    /// ids is assumed, only that fewer changes cost fewer rows. Read by [`Self::expr_edition`]:
+    /// a block's tail temporaries (rustc region.rs `resolve_block`: `blk.span.edition()`), an
+    /// `if let`'s scrutinee scope and a closure's capture precision follow it.
+    pub expr_editions: &'b [(ExprId, Edition)],
+    /// The edition of each pattern's first word, as [`Self::expr_editions`] over pattern ids:
+    /// the edition 2024 binding-mode errors are by it (rules/pat.rs).
+    pub pat_editions: &'b [(PatId, Edition)],
+}
+
+/// The edition at `id` in the runs `runs` (rows `(first, edition)`, ascending), `body`
+/// before the first row.
+fn edition_in<I: Ord + Copy>(runs: &[(I, Edition)], id: I, body: Edition) -> Edition {
+    let n = runs.partition_point(|&(first, _)| first <= id);
+    match n.checked_sub(1).and_then(|i| runs.get(i)) {
+        Some(&(_, ed)) => ed,
+        None => body,
+    }
 }
 
 fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], CheckError> {
@@ -516,6 +541,17 @@ impl<'b> BodyView<'b> {
     /// Whether the block `e` is written `unsafe` ([`BodyView::unsafe_blocks`]).
     pub(crate) fn is_unsafe_block(&self, e: ExprId) -> bool {
         self.unsafe_blocks.binary_search(&e).is_ok()
+    }
+
+    /// The edition the expression `e`'s first word was written in ([`BodyView::expr_editions`]):
+    /// for a block its `{` (or the `unsafe`, `async`, `const` or label before it).
+    pub fn expr_edition(&self, e: ExprId) -> Edition {
+        edition_in(self.expr_editions, e, self.edition)
+    }
+
+    /// The edition the pattern `p`'s first word was written in ([`BodyView::pat_editions`]).
+    pub fn pat_edition(&self, p: PatId) -> Edition {
+        edition_in(self.pat_editions, p, self.edition)
     }
 
     /// The expressions directly under `e`, pushed onto `out` in source order: a block's

@@ -229,7 +229,7 @@ use core::alloc::Allocator;
 use core::fmt;
 use std::alloc::Global;
 
-use blaze_lir::{Func, VerifyError};
+use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{Instance, InstanceKey, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized};
@@ -510,15 +510,6 @@ pub trait Adts {
         None
     }
 
-    /// The key the program gives fn instance `instance` (a promoted operand's fn item, its
-    /// arguments in `ground`), so a promoted record's `DataTarget::Fn(key)` is resolved to a
-    /// reference of this function (walk/promote.rs). No answer is refused with
-    /// [`BuildError::NoPromotedFnKey`].
-    fn promoted_fn_key(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<InstanceKey> {
-        let _ = (instance, ground);
-        None
-    }
-
     /// The fn instance that key `key` names in an evaluated constant's record (a
     /// `DataTarget::Fn(key)` of a [`Adts::const_value`] or [`Adts::const_block_value`] answer:
     /// `const F: fn() = f::<u8>;`), its arguments interned in `ground`. The fn is named in the
@@ -726,8 +717,9 @@ pub fn closure_of(ground: PTys<'_>, ty: PTy) -> Option<ClosureOf> {
 
 /// One built function.
 pub struct Built<A: Allocator> {
-    /// The function, verified.
-    pub func: Func<A>,
+    /// The function with its proof (D163): verified once where it was built, and handed to the
+    /// emitter as `func.verified()`, never checked again.
+    pub func: blaze_lir::VerifiedFunc<A>,
     /// By function reference place: the callee instance, its arguments in the ground table.
     /// Two calls of one instance share one place.
     pub refs: Vec<Instance, A>,
@@ -848,11 +840,8 @@ pub enum BuildError {
     /// Promoted borrow `expr` of `owner`'s body, whose value at the instance
     /// [`Adts::promoted_value`] does not hold. Never built as a frame temporary.
     NoPromotedValue { expr: ExprId, owner: ItemKey },
-    /// Path `expr` in a promoted operand names fn `item`, whose instance key
-    /// [`Adts::promoted_fn_key`] does not give.
-    NoPromotedFnKey { expr: ExprId, item: ItemKey },
-    /// The value of constant path or const block `expr` holds a fn pointer to instance `key`,
-    /// which [`Adts::const_fn_instance`] does not give.
+    /// The value of constant path, const block or promoted borrow `expr` holds a fn pointer to
+    /// instance `key`, which [`Adts::const_fn_instance`] does not give.
     NoConstFnInstance { expr: ExprId, key: InstanceKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
@@ -895,6 +884,10 @@ pub enum BuildError {
     /// world does not say where `expr` is or whether a fn is tracked, or a tracked fn is taken
     /// where its shim would be needed (a fn pointer, a vtable slot).
     TrackCaller { expr: Option<ExprId>, item: ItemKey, why: &'static str },
+    /// The layout row of declared field `field` of a value of type `ty` (its head node) is
+    /// named `found`, not the declared field's name (walk.rs `decl_field`): the rows are not in
+    /// declaration order, so no offset is read by index. This crate's bug, named.
+    FieldOrder { ty: blaze_typeck::PNode, field: u32, found: blaze_typeck::Name },
 }
 
 /// What an `.await` and a coroutine's entries need of the library: the answer of
@@ -986,13 +979,10 @@ impl fmt::Display for BuildError {
             BuildError::NoPromotedValue { expr, owner } => {
                 write!(f, "expression {}: the promoted borrow of fn {:#x} has no promoted value at this instance in the build's `Adts`", expr.0, owner.0)
             }
-            BuildError::NoPromotedFnKey { expr, item } => {
-                write!(f, "expression {}: fn {:#x} in a promoted value has no instance key in the build's `Adts`", expr.0, item.0)
-            }
             BuildError::NoConstFnInstance { expr, key } => {
                 write!(
                     f,
-                    "expression {}: the value of the constant this path or const block reads holds a fn pointer to instance {key:?}, \
+                    "expression {}: the value of the constant, const block or promoted borrow here holds a fn pointer to instance {key:?}, \
                      which no record the build's `Adts` holds names (every evaluated record names the instance of each of its fn words: \
                      blaze-consteval `ConstRecord::fns`)",
                     expr.0
@@ -1042,6 +1032,11 @@ impl fmt::Display for BuildError {
             BuildError::TrackCaller { expr: None, item, why } => {
                 write!(f, "a call the build inserted: the `#[track_caller]` location for fn {:#x}: {why}", item.0)
             }
+            BuildError::FieldOrder { ty, field, found } => write!(
+                f,
+                "the layout of {ty:?}: the row of declared field {field} is named {:#x}, not that field's name (rows out of declaration order: blaze-build walk.rs `decl_field`)",
+                found.0
+            ),
         }
     }
 }

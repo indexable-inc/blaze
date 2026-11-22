@@ -1,0 +1,42 @@
+[package]
+name = "blaze-cad-out"
+description = "What the CAD library hands to the world (D183): a binary glTF 2.0 (`.glb`) writer from first principles, one node per part in its hierarchy with transforms, each part's name, mass, centre, inertia, roles, joint, collider and levels of detail in its `extras`, materials from roles (metallic-roughness, KHR_materials_clearcoat, KHR_materials_emissive_strength), KHR_mesh_quantization on request, its JSON from its own emitter on blaze-text and its BIN chunk 4-byte aligned; a PNG encoder (RGBA8 or grey) on blaze-deflate; a plain-text summary, one part per line; no_std, no alloc, no core::fmt in what it writes, the same bytes on every machine"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Base crates only, each on workspace crates alone (D180: no package from a registry).
+[dependencies]
+# The meshes written, their verifier's types and the 16-bit quantization with its stated bound.
+blaze-cad-mesh.workspace = true
+# `Vec`, `Alloc`, `AllocFailure`, the plant seam.
+blaze-own.workspace = true
+# The JSON chunk's text and the summary: typed writers into a `Put` sink, never `core::fmt`.
+blaze-text.workspace = true
+# PNG's IDAT stream (zlib) and its chunks' CRC-32.
+blaze-deflate.workspace = true
+# Integer conversions that say what they do, in place of `as`.
+blaze-int.workspace = true
+# `Length` at the public boundary (a level's error and switch distance), written in metres.
+blaze-units.workspace = true
+
+[dev-dependencies]
+# Property tests and typed planted-bug controls (D165).
+blaze-sim.workspace = true
+# The tests' validating glTF parser reads the JSON chunk with the workspace's own reader.
+blaze-json.workspace = true
+# The `Value` that reader returns, named in the parser's signatures.
+blaze-data.workspace = true
+# `testing::heap()`: a test's root allocator (D170 C1: no `Global` in tests either).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

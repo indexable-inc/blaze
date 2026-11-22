@@ -11,7 +11,7 @@
 use core::fmt;
 
 use blaze_code::record::{CodeRecord, CodeView, SiteKind, TrapSource};
-use blaze_lir::View;
+use blaze_lir::Verified;
 use blaze_own::Alloc;
 
 use crate::{BULK_INLINE_MOST, Called, Isa, Names, RecordEmitError, RoutinePlaces, record::emit_record_sourced};
@@ -20,7 +20,7 @@ use crate::{BULK_INLINE_MOST, Called, Isa, Names, RecordEmitError, RoutinePlaces
 /// the routines the record calls ([`Called`]) last. Each of the build's `traps` becomes its
 /// `unreachable`'s trap row (blaze-code record.rs `TrapSource`).
 pub fn emit_record_measured<'a>(
-    func: View<'_>,
+    func: Verified<'_>,
     names: &dyn Names,
     routines: &RoutinePlaces,
     isa: Isa,

@@ -23,17 +23,17 @@ const KEEP_EVERY: Duration = Duration::from_millis(100);
 // instant with nothing running on the thread. `the_mach_calls_resolve` fails naming any that
 // an OS update removed.
 unsafe extern "C" {
-    fn thread_suspend(target: libc::thread_act_t) -> libc::kern_return_t;
-    fn thread_resume(target: libc::thread_act_t) -> libc::kern_return_t;
+    fn thread_suspend(target: blaze_sys::posix::thread::thread_act_t) -> blaze_sys::posix::proc::kern_return_t;
+    fn thread_resume(target: blaze_sys::posix::thread::thread_act_t) -> blaze_sys::posix::proc::kern_return_t;
     fn thread_get_state(
-        target: libc::thread_act_t,
-        flavor: libc::thread_flavor_t,
-        state: *mut libc::natural_t,
-        count: *mut libc::mach_msg_type_number_t,
-    ) -> libc::kern_return_t;
+        target: blaze_sys::posix::thread::thread_act_t,
+        flavor: blaze_sys::posix::thread::thread_flavor_t,
+        state: *mut blaze_sys::posix::proc::natural_t,
+        count: *mut blaze_sys::posix::thread::mach_msg_type_number_t,
+    ) -> blaze_sys::posix::proc::kern_return_t;
 }
 
-const ARM_THREAD_STATE64: libc::thread_flavor_t = 6;
+const ARM_THREAD_STATE64: blaze_sys::posix::thread::thread_flavor_t = 6;
 
 /// `arm_thread_state64_t`.
 #[repr(C)]
@@ -48,8 +48,8 @@ struct State {
     pad: u32,
 }
 
-const STATE_COUNT: libc::mach_msg_type_number_t =
-    (size_of::<State>() / size_of::<libc::natural_t>()) as _;
+const STATE_COUNT: blaze_sys::posix::thread::mach_msg_type_number_t =
+    (size_of::<State>() / size_of::<blaze_sys::posix::proc::natural_t>()) as _;
 const _: () = assert!(STATE_COUNT == 68);
 
 use crate::stack::ADDRESS;
@@ -59,7 +59,7 @@ use crate::stack::ADDRESS;
 /// thread is stopped.
 #[derive(Default)]
 pub(crate) struct Thread {
-    port: libc::mach_port_t,
+    port: blaze_sys::posix::thread::mach_port_t,
     low: u64,
     high: u64,
     tid: u64,
@@ -69,13 +69,13 @@ pub(crate) struct Thread {
 impl Thread {
     pub(crate) fn enter(&mut self, tid: u64) {
         // SAFETY: `pthread_self` has no precondition.
-        let me = unsafe { libc::pthread_self() };
+        let me = blaze_sys::posix::thread::pthread_self();
         // SAFETY: `me` is this thread, alive; its port stays valid while it lives.
-        self.port = unsafe { libc::pthread_mach_thread_np(me) };
+        self.port = unsafe { blaze_sys::posix::thread::pthread_mach_thread_np(me) };
         // SAFETY: as above; the highest address of its stack.
-        let high = unsafe { libc::pthread_get_stackaddr_np(me) } as u64;
+        let high = unsafe { blaze_sys::posix::thread::pthread_get_stackaddr_np(me) } as u64;
         // SAFETY: as above.
-        let size = unsafe { libc::pthread_get_stacksize_np(me) } as u64;
+        let size = unsafe { blaze_sys::posix::thread::pthread_get_stacksize_np(me) } as u64;
         self.low = high.saturating_sub(size);
         self.high = high;
         self.tid = tid;
@@ -95,35 +95,14 @@ impl Thread {
             return None;
         }
         let info = basic_info(self)?;
-        let us = |it: libc::time_value_t| it.seconds as u64 * 1_000_000 + it.microseconds as u64;
+        let us = |it: blaze_sys::posix::io::TimeValue| it.seconds as u64 * 1_000_000 + it.microseconds as u64;
         Some((us(info.user_time) + us(info.system_time)) * 1_000)
     }
 }
 
 /// The thread's `THREAD_BASIC_INFO`, `None` if the kernel refused it.
-fn basic_info(thread: &Thread) -> Option<libc::thread_basic_info> {
-    let mut info = libc::thread_basic_info {
-        user_time: libc::time_value_t { seconds: 0, microseconds: 0 },
-        system_time: libc::time_value_t { seconds: 0, microseconds: 0 },
-        cpu_usage: 0,
-        policy: 0,
-        run_state: 0,
-        flags: 0,
-        suspend_count: 0,
-        sleep_time: 0,
-    };
-    let mut count = libc::THREAD_BASIC_INFO_COUNT;
-    // SAFETY: `info` is a `thread_basic_info` of `count` words to fill, for a live thread's
-    // port (the caller holds the lock its thread takes to leave).
-    let got = unsafe {
-        libc::thread_info(
-            thread.port,
-            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
-            (&raw mut info).cast(),
-            &mut count,
-        )
-    };
-    (got == libc::KERN_SUCCESS).then_some(info)
+fn basic_info(thread: &Thread) -> Option<blaze_sys::posix::thread::thread_basic_info> {
+    blaze_sys::posix::thread::thread_basic_info_of(thread.port).ok()
 }
 
 fn lock<T>(mutex: &Lock<T>) -> LockGuard<'_, T> {
@@ -166,7 +145,7 @@ pub(super) fn run(hz: u32) {
 
 /// Whether the thread is on a CPU now: a thread blocked in the kernel uses none.
 fn running(thread: &Thread) -> bool {
-    basic_info(thread).is_some_and(|info| info.run_state == libc::TH_STATE_RUNNING)
+    basic_info(thread).is_some_and(|info| info.run_state == blaze_sys::posix::proc::TH_STATE_RUNNING)
 }
 
 /// Stops the thread, reads its stack and lets it go: nothing allocated and no lock taken
@@ -196,7 +175,7 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
         fiber: 0,
     };
     // SAFETY: the port of a live thread that is not this one (the sampler holds no ring).
-    if unsafe { thread_suspend(thread.port) } != libc::KERN_SUCCESS {
+    if unsafe { thread_suspend(thread.port) } != blaze_sys::posix::thread::KERN_SUCCESS {
         return None;
     }
     let mut state = State::default();
@@ -206,7 +185,7 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     let got = unsafe {
         thread_get_state(thread.port, ARM_THREAD_STATE64, (&raw mut state).cast(), &mut count)
     };
-    if got == libc::KERN_SUCCESS {
+    if got == blaze_sys::posix::thread::KERN_SUCCESS {
         walk(&state, thread.low, thread.high, &mut sample);
         sample.span = ring.innermost();
         (sample.job, sample.fiber) = ring.running_now();
@@ -216,7 +195,7 @@ fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     }
     // SAFETY: the thread suspended above, resumed once.
     unsafe { thread_resume(thread.port) };
-    (got == libc::KERN_SUCCESS && sample.depth > 0).then_some(sample)
+    (got == blaze_sys::posix::thread::KERN_SUCCESS && sample.depth > 0).then_some(sample)
 }
 
 /// The stopped thread's PC, then the return address of each frame record from its frame
@@ -282,7 +261,9 @@ mod tests {
     fn the_mach_calls_resolve() {
         for name in [c"thread_suspend", c"thread_get_state", c"thread_resume"] {
             // SAFETY: `RTLD_DEFAULT` searches every loaded image; `name` is NUL-terminated.
-            let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            let at = unsafe {
+                blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, name.as_ptr())
+            };
             assert!(
                 !at.is_null(),
                 "the Mach call {name:?}, which the sampler stops threads with, is gone from this macOS"

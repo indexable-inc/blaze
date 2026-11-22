@@ -20,17 +20,16 @@ use blaze_scope::resolve::{CrateInput, Names, SourceTexts, aligned, resolve_crat
 use blaze_scope::task::Serial;
 use blaze_scope::{items_record, names_record};
 use blaze_surface::{Edition, ItemKind};
-use blaze_typeck::PortableTys;
 use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
-use super::head::{FreezeError, FrozenHead, FrozenHeads, FrozenHeadsOpts, HeadSource, Plant, SeededHeads, SeededHeadsOpts, StoreHeads, StoreHeadsOpts, export, freeze, head_task, import, reads_seen, want_bytes};
+use super::head::{FreezeError, FrozenHead, FrozenHeads, FrozenHeadsOpts, HeadSource, Plant, SeededHeads, SeededHeadsOpts, StoreHeads, StoreHeadsOpts, export, freeze, head_task, reads_seen, want_bytes};
 use crate::front2::by_origin;
 use crate::front2::head_record::{self, HeadAt};
 use crate::front2::heads::{Store, Want};
 use crate::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
 use crate::front2::lifetimes::LifeOf;
-use crate::front2::project::head_digest::want_digest_in;
-use crate::front2::source::{Load, Log, NamesSource, Records};
+use crate::front2::project::head_digest::{import_with_opaque_origins, opaque_origin, want_digest_in};
+use crate::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 
 const CORE: &str = "#![no_core]
 #![feature(no_core, lang_items)]
@@ -155,14 +154,8 @@ impl SourceTexts<'static> for Texts {
     }
 }
 
-pub(super) fn a() -> Alloc<'static> {
+pub(crate) fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
-}
-
-/// A fresh table a head is imported into: over stable columns, as a store's is (head.rs
-/// `import` interns through a shared borrow).
-fn fresh_table() -> PortableTys<'static> {
-    crate::front2::rows::stable_tys(a()).expect("a table over fresh stable columns")
 }
 
 fn input(name: &'static str, root: &'static str, deps: &'static [(&'static str, usize)]) -> CrateInput<'static> {
@@ -181,7 +174,7 @@ fn input(name: &'static str, root: &'static str, deps: &'static [(&'static str, 
 }
 
 /// The names source a body job reads: each crate's records.
-pub(super) type Src = &'static Records<'static>;
+pub(crate) type Src =&'static Records<'static>;
 
 /// Each crate's records as `blaze check`'s body job gives them, kept for the test run.
 struct Kept {
@@ -189,6 +182,8 @@ struct Kept {
     items: AVec<'static, &'static [u8]>,
     /// Per crate: (package path, text).
     files: AVec<'static, AVec<'static, (&'static str, &'static str)>>,
+    /// Per crate: (macro call, the text it made), as the engine's store serves an expansion.
+    expansions: AVec<'static, AVec<'static, (LibKey, &'static str)>>,
 }
 
 impl Load<'static> for Kept {
@@ -204,12 +199,10 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.iter().find(|(p, _)| *p == path.as_str()).map(|(_, t)| *t)
     }
 
-    fn expansion(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<&'static str> {
-        None
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    /// The texts, with no origins kept.
+    fn expansion(&self, krate: usize, call: blaze_id::ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.iter().find(|(c, _)| *c == call).map(|(_, t)| *t)?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 
@@ -222,13 +215,13 @@ fn world() -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
 }
 
 /// [`world`] over `app` as the app's text.
-pub(super) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
+pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaze_mem::Frame) {
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
     let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let solved: &'static Names<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(solved, a()));
     let g = a();
-    let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g) };
+    let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g), expansions: AVec::new_in(g) };
     let mut crate_names: AVec<'static, &'static str> = AVec::new_in(g);
     let mut crate_keys: AVec<'static, CrateItemKey> = AVec::new_in(g);
     for c in solved.crates().iter() {
@@ -237,6 +230,10 @@ pub(super) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaz
         let mut files = AVec::new_in(g);
         files.extend(c.files.iter().map(|f| (f.package.as_str(), f.text)));
         kept.files.push(files);
+        let mut made = AVec::new_in(g);
+        // Found by its call's key (`expansion`), so the map's order is never read.
+        made.extend(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, m.text))));
+        kept.expansions.push(made);
         crate_names.push(c.name);
         crate_keys.push(c.key);
     }
@@ -256,7 +253,7 @@ pub(super) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaz
 }
 
 /// Every cell of `app`: each item's whole want, and each impl fn's own; sorted by key.
-pub(super) fn cells(names: Src) -> AVec<'static, Want> {
+pub(crate) fn cells(names: Src) -> AVec<'static, Want> {
     let mut out: AVec<'static, Want> = AVec::new_in(a());
     NamesSource::each_item(names, APP_AT, &mut |key, _| {
         let Ok(kind) = by_origin::kind_of_lib(names, key) else { return };
@@ -420,7 +417,7 @@ fn a_frozen_head_imports_as_today_s_head() {
         }
         let mut text_of = |at: HeadAt| texts.iter().find(|(t, _)| *t == at).map(|(_, s)| *s);
         // Into the store's own table: equal to the head filed there, term for term.
-        let heads = import(&frozen, &mut text_of, &store.tys, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
+        let heads = import_with_opaque_origins(names, &keys, &store, &frozen, &mut text_of, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for (at, head) in heads.iter() {
             let filed = head_record::from_store(&store, *at).unwrap_or_else(|e| panic!("{at:?}: {e}"));
             if let Some(what) = head_record::same(head.as_ref(), filed, store.tys.view()) {
@@ -429,10 +426,11 @@ fn a_frozen_head_imports_as_today_s_head() {
             compared += 1;
         }
         // Into a fresh table: written again, the same record.
-        let fresh = fresh_table();
-        let again = import(&frozen, &mut text_of, &fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
+        let fresh = Store::new(sized, frame, a());
+        let fresh_keys = Keys::new();
+        let again = import_with_opaque_origins(names, &fresh_keys, &fresh, &frozen, &mut text_of, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for ((at, head), e) in again.iter().zip(frozen.heads()) {
-            let bytes = head_record::encode(head.as_ref(), fresh.view(), a()).unwrap_or_else(|e| panic!("{at:?}: {e}"));
+            let bytes = head_record::encode_with_origins(head.as_ref(), fresh.tys.view(), a(), &|key| opaque_origin(names, &fresh_keys, &fresh, key)).unwrap_or_else(|e| panic!("{at:?}: {e}"));
             assert!(bytes[..] == e.record[..], "ORACLE: {w:?}, head {at:?} read into a fresh table writes other bytes");
         }
     }
@@ -466,8 +464,9 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
             }
         }
         let mut text_of = |at: HeadAt| texts.iter().find(|(t, _)| *t == at).map(|(_, s)| *s);
-        let fresh = fresh_table();
-        let heads = import(&frozen, &mut text_of, &fresh, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
+        let fresh = Store::new(sized, frame, a());
+        let fresh_keys = Keys::new();
+        let heads = import_with_opaque_origins(names, &fresh_keys, &fresh, &frozen, &mut text_of, a(), a()).unwrap_or_else(|e| panic!("import {w:?}: {e}"));
         for (at, head) in heads.iter() {
             match head {
                 head_record::Head::Trait { assoc_side, life, .. } => {
@@ -487,7 +486,24 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
                     assert!(life.is_some(), "ORACLE: {at:?}: an impl's lifetime part is not in its record");
                     frames += usize::from(m.consts.len() == 1);
                 }
-                head_record::Head::Fn { life, .. } => assert!(life.is_some(), "ORACLE: {at:?}: a fn's lifetime part is not in its record"),
+                // Which refusal, as the store that made every cell filed it for the same fn
+                // (`Store::region_gaps`; the freeze's own store is dropped with the freeze).
+                head_record::Head::Fn { regions, .. } => assert!(
+                    regions.is_some(),
+                    "ORACLE: {at:?}: a fn's regions are not in its record (form 22); the gap: {:?}; the fn's own gap: {:?}; its text: {:?}",
+                    match at {
+                        HeadAt::Fn(k) => store.region_gaps.get(k),
+                        _ => None,
+                    },
+                    match at {
+                        HeadAt::Fn(k) => store.fn_gaps.get(k),
+                        _ => None,
+                    },
+                    match at {
+                        HeadAt::Fn(k) => store.fns.get(k).map(|h| h.text),
+                        _ => None,
+                    },
+                ),
                 _ => {}
             }
         }
@@ -964,4 +980,264 @@ fn edited(from: &'static str, old: &str, new: &str) -> &'static str {
     v.extend_from_slice(new.as_bytes());
     v.extend_from_slice(from[at + old.len()..].as_bytes());
     core::str::from_utf8(v.leak()).expect("an edit of UTF-8 by UTF-8")
+}
+
+/// D148 across stores (tempo: 9,115 bodies refused `[NoHead]`, every callee whose head came
+/// from a record): every head of a kind that holds regions reaches another store laid or
+/// refused by name, never absent. Oracle: a free fn `f(&u8) -> &u8`, an inherent `S::m`, a
+/// trait's declared `Tr::g` and its impl's for `u8`, each frozen to its cell's record and
+/// filed into a store holding nothing else (no text made into heads there), read the same
+/// signature column as the store that made them; and a head whose regions its maker refused
+/// softly (planted: `Unlaid::NoContainer`, a kind past the first five bytes) or never made (planted: refused, then not filed)
+/// reads `Refused` with its kind's name in the other store, as in its maker. Control (rule
+/// 23): the old filer (the decoded heads to `file_heads` alone, no recorded regions) reads
+/// both planted heads as `NoHead`, the tempo answer.
+#[test]
+fn every_head_reaches_another_store_laid_or_refused_by_name() {
+    use super::head::{RecordedRegions, file_frozen};
+    use blaze_typeck::region_facts::UnreadWhy;
+    use blaze_typeck::regions::Region;
+    const APP: &str = "pub fn f(x: &u8) -> &u8 { x }
+pub struct S { b: u8 }
+impl S {
+    pub fn m(&self) -> &u8 { &self.b }
+}
+pub trait Tr {
+    fn g(&self) -> &u8;
+}
+impl Tr for u8 {
+    fn g(&self) -> &u8 { self }
+}
+pub fn soft(x: &u8) -> &u8 { x }
+pub fn unmade(x: &u8) -> &u8 { x }
+";
+    let (names, sized, frame) = world_of(APP);
+    let named = |name: &str| {
+        let mut found = None;
+        NamesSource::each_item(names, APP_AT, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(name) {
+                found = Some(key);
+            }
+        });
+        found.unwrap_or_else(|| panic!("`{name}` in the fixture"))
+    };
+    let sig = |store: &Store<'_>, k: blaze_typeck::ItemKey| -> std::vec::Vec<Region> {
+        let filed = store.regions.made(k).unwrap_or_else(|| panic!("ORACLE: {k:?}'s regions: {}", store.regions.unread(k)));
+        filed.regions().sig.as_ref().unwrap_or_else(|| panic!("ORACLE: {k:?} has no signature column")).as_slice().to_vec()
+    };
+    // Each fn cell made in its own store, frozen, and filed into a store of nothing else.
+    let mut laid = 0;
+    for w in cells(names).iter().copied() {
+        if !matches!(w, Want::Fn(_) | Want::MemberFn(..) | Want::Members(_)) {
+            continue;
+        }
+        if let Want::Fn(lib) = w
+            && (lib == named("soft") || lib == named("unmade"))
+        {
+            continue;
+        }
+        let mut made = Store::new(sized, frame, a());
+        let mut keys = Keys::new();
+        made.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
+        let bytes = export(names, &keys, &mut made, w, Plant::None, a()).unwrap_or_else(|e| panic!("export {w:?}: {e}"));
+        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read {w:?}: {e}"));
+        let other = Store::new(sized, frame, a());
+        let other_keys = Keys::new();
+        file_frozen(names, w, frozen, &other, &other_keys, a()).unwrap_or_else(|e| panic!("file {w:?}: {e}"));
+        for e in frozen.heads() {
+            let HeadAt::Fn(k) = e.at else { continue };
+            assert_eq!(e.recorded, RecordedRegions::Laid, "ORACLE: {w:?}'s fn {k:?} is not recorded laid");
+            assert_eq!(sig(&other, k), sig(&made, k), "ORACLE: {w:?}'s fn {k:?} reads another column filed from its record");
+            laid += 1;
+        }
+    }
+    // `f`, `S::m`, `Tr::g` (the trait's) and `<u8 as Tr>::g`.
+    assert!(laid >= 4, "ORACLE: {laid} fn heads crossed stores, fewer than the four callees");
+    // The planted heads: a soft refusal and regions never made.
+    for (name, plant) in [("soft", true), ("unmade", false)] {
+        let lib = named(name);
+        let (w, k) = (Want::Fn(lib), checker_of(lib));
+        let mut made = Store::new(sized, frame, a());
+        let mut keys = Keys::new();
+        made.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure `{name}`: {e}"));
+        if plant {
+            made.regions.file_unlaid(k, head_record::Unlaid::NoContainer, head_record::Unlaid::NoContainer.name());
+        } else {
+            made.regions.file_refused(k);
+        }
+        let want_kind = if plant { head_record::Unlaid::NoContainer } else { head_record::Unlaid::NotMade };
+        let bytes = export(names, &keys, &mut made, w, Plant::None, a()).unwrap_or_else(|e| panic!("export `{name}`: {e}"));
+        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `{name}`: {e}"));
+        let other = Store::new(sized, frame, a());
+        file_frozen(names, w, frozen, &other, &Keys::new(), a()).unwrap_or_else(|e| panic!("file `{name}`: {e}"));
+        assert!(other.fns.contains_key(&k), "ORACLE: `{name}`'s head was not filed");
+        assert_eq!(other.regions.unread(k).why, UnreadWhy::Refused { what: want_kind.name() }, "ORACLE: `{name}` reached the other store without its refusal's name");
+        // CONTROL: the old filer, the heads alone.
+        let old = Store::new(sized, frame, a());
+        let mut text_of = |at: HeadAt| match at {
+            HeadAt::Fn(_) => names.seeded_text_of(lib).map(|t| t.text),
+            _ => None,
+        };
+        let heads = import_with_opaque_origins(names, &Keys::new(), &old, &frozen, &mut text_of, a(), a()).unwrap_or_else(|e| panic!("import `{name}`: {e}"));
+        old.file_heads(w, heads).unwrap_or_else(|e| panic!("file `{name}`'s heads alone: {e:?}"));
+        assert_eq!(old.regions.unread(k).why, UnreadWhy::NoHead, "CONTROL: the heads alone already carried `{name}`'s refusal, so the recorded regions were not the cause");
+    }
+}
+
+/// The fixture's world, handed whole to the one thread that files on a small stack.
+struct Handed {
+    names: Src,
+    sized: Option<LibKey>,
+    frame: &'static blaze_mem::Frame,
+    bytes: std::vec::Vec<u8>,
+    want: Want,
+}
+
+// SAFETY: `Records` and `Frame` are not `Sync` (cells, a bump cursor) because two threads must
+// not use one at once. The test thread hands the world to exactly one spawned thread and then
+// only joins it: nothing of the world is touched on the test thread until the join returns,
+// so every use is from one thread at a time, ordered by the join. Neither holds a reference
+// into a thread-local.
+unsafe impl Send for Handed {}
+
+/// The stack a decoded head costs. blaze-cli `a_future_that_stops_being_send_reaches_its_caller`
+/// overflowed a 2 MiB stack 145 frames deep, through head_record `decode_retaining`,
+/// `import_with_opaque_origins`, `file_frozen` and `seed`: every frame held heads with their
+/// clauses (`Preds`) and regions (`FiledRegions`) inline, ~1.4 KB a copy, and a debug frame
+/// keeps a copy per temporary. Oracle: a fn cell holding every optional part a fn's record
+/// has (where-clauses, laid regions, an opaque with its bounds and laid regions) is read and
+/// filed into a fresh store on a thread of 256 KiB, and every part is filed there. Control
+/// (rule 23): on the test's own stack the record is checked to hold every part, so the small
+/// thread is not passed by a record with little to decode. The sizes themselves are held by
+/// `head_record::HEAD_MOST` and `FILED_REGIONS_MOST`, the inline form refused beside them.
+#[test]
+fn a_head_with_every_part_files_on_a_small_stack() {
+    use super::head::{RecordedRegions, file_frozen};
+    const APP: &str = "#![no_std]
+pub trait Tr {}
+impl Tr for u8 {}
+pub fn every<'a, T: Tr>(x: &'a T, y: &'a u8) -> impl Tr + 'a
+where
+    T: 'a,
+{
+    *y
+}
+";
+    const STACK: usize = 256 << 10;
+    let (names, sized, frame) = world_of(APP);
+    let mut lib = None;
+    NamesSource::each_item(names, APP_AT, &mut |key, _| {
+        if NamesSource::name_of(names, key) == Some("every") {
+            lib = Some(key);
+        }
+    });
+    let want = Want::Fn(lib.expect("`every` in the fixture"));
+    let mut made = Store::new(sized, frame, a());
+    let mut keys = Keys::new();
+    made.ensure(names, &mut keys, want).unwrap_or_else(|e| panic!("ensure `every`: {e}"));
+    let bytes = export(names, &keys, &mut made, want, Plant::None, a()).unwrap_or_else(|e| panic!("export `every`: {e}"));
+    // CONTROL: the record holds a fn and its opaque, each with its clauses and laid regions.
+    let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `every`: {e}"));
+    let (mut fns, mut opaques) = (0, 0);
+    for e in frozen.heads() {
+        let k = head_record::regions_key(e.at);
+        match e.at {
+            HeadAt::Fn(_) => fns += 1,
+            HeadAt::Opaque(_) => opaques += 1,
+            other => panic!("CONTROL: `every`'s cell holds a {other:?}"),
+        }
+        assert_eq!(e.recorded, RecordedRegions::Laid, "CONTROL: {:?}'s regions are not in the record", e.at);
+        assert!(made.preds.get(&k).is_some(), "CONTROL: {:?} has no clauses to record", e.at);
+    }
+    assert_eq!((fns, opaques), (1, 1), "CONTROL: `every`'s cell is not one fn and its opaque");
+    let handed = Handed { names, sized, frame, bytes: bytes.to_vec(), want };
+    let small = std::thread::Builder::new()
+        .name(std::string::String::from("head-on-a-small-stack"))
+        .stack_size(STACK)
+        .spawn(move || {
+            let h = handed;
+            let mut kept: AVec<'static, u8> = AVec::new_in(a());
+            kept.extend_from_slice(&h.bytes);
+            let frozen = FrozenHead::read(&kept).unwrap_or_else(|e| panic!("read `every` on the small stack: {e}"));
+            let other = Store::new(h.sized, h.frame, a());
+            file_frozen(h.names, h.want, frozen, &other, &Keys::new(), a()).unwrap_or_else(|e| panic!("file `every` on the small stack: {e}"));
+            let mut filed = 0;
+            for e in frozen.heads() {
+                let k = head_record::regions_key(e.at);
+                assert!(other.regions.made(k).is_some(), "ORACLE: {:?}'s regions were not filed: {}", e.at, other.regions.unread(k));
+                assert!(other.preds.get(&k).is_some(), "ORACLE: {:?}'s clauses were not filed", e.at);
+                if let HeadAt::Fn(_) = e.at {
+                    assert!(other.fns.contains_key(&k), "ORACLE: {:?}'s head was not filed", e.at);
+                }
+                filed += 1;
+            }
+            filed
+        })
+        .unwrap_or_else(|e| panic!("spawn a thread of {STACK} bytes: {e}"));
+    let filed = small.join().unwrap_or_else(|_| panic!("ORACLE: filing `every` on a {STACK}-byte stack failed"));
+    assert_eq!(filed, 2, "ORACLE: the small stack filed {filed} heads, not the fn and its opaque");
+}
+
+/// A fn whose signature names an ADT filed from its RECORD lays the column a store that
+/// lowered the ADT from text lays (D148, D155). `V<u8>` is `V<u8, G>`: a store lowering `V`
+/// from text makes `G` on the way (its default), one filing `V`'s frozen head (every engine
+/// store: a dependency's, std's `Vec<u8>` is `Vec<u8, Global>`) never names `G`, and before
+/// D155 the column's walk met `G` uncounted (the tempo `[NoHead]` of every `Vec`-taking
+/// toolchain or dependency fn). `G`'s count is a fact of its text, read from its crate's items
+/// record through the names, so no head of `G` is needed. Oracle: filed from `V`'s record, `d`
+/// lays the column the text store lays. Controls (rule 23): `G` is unmade in the seeded store
+/// before `d` is made, so the oracle is not met by a store that never lacked it; and with the
+/// names answering no count for `G` (`Records::plant_no_lifetimes`) the same seeded store
+/// refuses `d`'s column by name (`Unlaid::Counts`).
+#[test]
+fn a_fn_over_a_recorded_adt_lays_its_defaults_counts() {
+    const APP: &str = "pub struct G;
+pub struct V<T, A = G> { t: T, a: A }
+pub fn d(v: &V<u8>) -> &u8 { &v.t }
+";
+    let (names, sized, frame) = world_of(APP);
+    let named = |name: &str| {
+        let mut found = None;
+        NamesSource::each_item(names, APP_AT, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(name) {
+                found = Some(key);
+            }
+        });
+        found.unwrap_or_else(|| panic!("`{name}` in the fixture"))
+    };
+    let (g, v, d) = (named("G"), named("V"), named("d"));
+    let (w, k) = (Want::Fn(d), checker_of(d));
+    let sig = |store: &Store<'_>| -> std::vec::Vec<blaze_typeck::regions::Region> {
+        let filed = store.regions.made(k).unwrap_or_else(|| panic!("ORACLE: `d`'s regions: {}", store.regions.unread(k)));
+        filed.regions().sig.as_ref().unwrap_or_else(|| panic!("ORACLE: `d` has no signature column")).as_slice().to_vec()
+    };
+    // The text store: `d` made from nothing, `V` and its default lowered from text.
+    let mut text = Store::new(sized, frame, a());
+    let mut text_keys = Keys::new();
+    text.ensure(names, &mut text_keys, w).unwrap_or_else(|e| panic!("ensure `d`: {e}"));
+    assert!(text.made(text.need(g)), "CONTROL: the text store did not make `G`, so it is not the default's maker");
+    // The seeded store: `V`'s frozen head filed first, then `d` made.
+    let mut maker = Store::new(sized, frame, a());
+    let mut maker_keys = Keys::new();
+    maker.ensure(names, &mut maker_keys, Want::Adt(v)).unwrap_or_else(|e| panic!("ensure `V`: {e}"));
+    let bytes = export(names, &maker_keys, &mut maker, Want::Adt(v), Plant::None, a()).unwrap_or_else(|e| panic!("export `V`: {e}"));
+    let seeded_store = |planted: bool| -> Store<'static> {
+        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `V`: {e}"));
+        let mut seeded = Store::new(sized, frame, a());
+        let mut seeded_keys = Keys::new();
+        super::head::file_frozen(names, Want::Adt(v), frozen, &seeded, &seeded_keys, a()).unwrap_or_else(|e| panic!("file `V`: {e}"));
+        assert!(!seeded.made(seeded.need(g)), "CONTROL: filing `V`'s record made `G`: the cause is absent and the oracle proves nothing");
+        if planted {
+            names.plant_no_lifetimes(g);
+        }
+        seeded.ensure(names, &mut seeded_keys, w).unwrap_or_else(|e| panic!("ensure `d` over `V`'s record: {e}"));
+        seeded
+    };
+    let seeded = seeded_store(false);
+    assert_eq!(sig(&seeded), sig(&text), "ORACLE: `d` over `V`'s record lays another column than over `V`'s text");
+    // CONTROL: the names answer no count for `G`; `d`'s column is refused by name.
+    let planted = seeded_store(true);
+    assert!(planted.regions.made(k).is_none(), "CONTROL: with `G`'s count unanswered `d`'s column was laid");
+    let kind = planted.region_gaps.get(&k).map(crate::front2::heads::RegionGap::unlaid);
+    assert_eq!(kind, Some(head_record::Unlaid::Counts), "CONTROL: `d`'s refusal is not `Counts`: {:?}", planted.region_gaps.get(&k));
 }

@@ -29,8 +29,16 @@ blaze-core.workspace = true
 # The run mode's allocator, named once in `main` and handed down.
 blaze-own = { workspace = true, features = ["std"] }
 
+# A `comptime:` entry (D175, comptime.rs): the layer's C functions, installed over the
+# compile-time host's descriptor; the protocol's frame form.
+blaze-comptime-sys = { workspace = true, features = ["child"] }
+blaze-comptime.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# comptime.rs: the host's descriptor read, written and polled to a deadline, the clock, the
+# page size and the process's end, through the one wrapper (no new `libc::` use).
+blaze-sys.workspace = true
 
 [lints]
 workspace = true

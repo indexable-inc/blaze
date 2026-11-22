@@ -2,7 +2,7 @@
 //! parses, the view gives the node, token, text or value the handle gives.
 
 use crate::{
-    AstNode as _, AstToken as _, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken,
+    AstNode as _, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxToken,
     Text, TextRange, TextSize,
     ast::{
         self, HasArgList as _, HasAttrs as _, HasLoopBody as _, HasModuleItem as _, HasName as _,

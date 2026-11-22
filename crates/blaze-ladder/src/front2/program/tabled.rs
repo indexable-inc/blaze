@@ -83,7 +83,7 @@ fn row<'n>(
     let Some(head) = store.fns.get(&key) else {
         return Err(Front2Refusal::NoHead { function: function() });
     };
-    let symbols = symbols_of(names, head.lib, head.text, path)?;
+    let symbols = symbols_of(names, head.lib, crate::front2::links::values_key(names, store, head.lib), head.text, path)?;
     let (at, foreign) = super::head_abi::placed_fn(names, store, key, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     // A fn an `extern` block in a BODY declares is foreign as a module-level one is: the
     // names library places no local item, so its block's ABI and its declared name are the

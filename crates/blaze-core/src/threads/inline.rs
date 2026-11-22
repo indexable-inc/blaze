@@ -73,6 +73,23 @@ pub enum Lent {
     At(u64),
 }
 
+/// What a lent whole-file read ([`Inline::read_all_lent`]) found.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an outcome with an error's text
+pub enum LentRead {
+    /// The file's `len` bytes, in the first `len` bytes of the room (`0` for a missing file, as
+    /// the queued `ReadAll` answers it); the room's last byte is unused.
+    Read { len: u64 },
+    /// The asker gave no room for a file of `len` bytes (its allocator refused).
+    NoRoom { len: u64 },
+    /// The file's length moved between its `fstat` (`stated`) and its read (`read` bytes, one
+    /// past `stated` when it grew). Not read again: a file written while it is read has no one
+    /// "whole" to return, and a second read races the same writer (rule no-fallback: no retry);
+    /// the asker learns it by name and decides.
+    Moved { stated: u64, read: u64 },
+    /// The call failed, saying this (the text a queued call's `Done::Failed` carries).
+    Failed(IoError),
+}
+
 /// The span name an inline effect's call opens, or `None` for one that keeps its queue (the
 /// module's table, the one place it is decided).
 pub fn inline_op(effect: &Effect) -> Option<&'static str> {
@@ -156,6 +173,26 @@ impl Inline {
             }),
         };
         self.ended(done)
+    }
+
+    /// [`Effect::ReadAll`] of `file` straight into the asker's memory: `room(len)` is asked
+    /// once, after the `fstat`, for exactly `len + 1` bytes (the last one says the file grew),
+    /// and the file is read into it with no copy after the kernel's (blaze-core fs.rs
+    /// `read_whole_into`). The calls: `open`, `fstat`, one `pread`, `close`, where the
+    /// queued route's `std::fs::read` makes `open`, `fstat`, two `read`s and `close` and the
+    /// asker then copies its `Vec`. Ends as the queued `ReadAll` would in what it reads; a
+    /// length that moved is [`LentRead::Moved`].
+    pub fn read_all_lent<'b>(&self, file: &FileName, room: impl FnOnce(u64) -> Option<&'b mut [u8]>) -> LentRead {
+        let done = crate::lock::io_wait("read all", file.as_str(), || {
+            super::at(&self.root, file, |path| crate::fs::read_whole_into(path, room))
+        });
+        match done {
+            Ok(read) => read,
+            #[cfg(test)]
+            Err(_) if self.swallow => LentRead::Read { len: 0 },
+            // alloc: an error path.
+            Err(error) => LentRead::Failed(IoError(error.to_string())),
+        }
     }
 
     /// A call's result as the driver's thread hands it back (`work_on`, kqueue.rs): its error

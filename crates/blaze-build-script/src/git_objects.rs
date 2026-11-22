@@ -35,7 +35,7 @@ pub(crate) struct Store<'a> {
 
 fn join<'a>(base: &str, name: &str, alloc: Alloc<'a>) -> AString<'a> {
     let mut out = String::from_str_in(base, alloc);
-    if !base.is_empty() {
+    if !base.is_empty() && !name.is_empty() {
         out.push('/');
     }
     out.push_str(name);
@@ -531,8 +531,11 @@ fn plain(path: &str) -> Result<&str, Refused> {
 
 /// `status --porcelain [--untracked-files=no]` of the worktree at `work` whose git folder is
 /// `gitdir`, HEAD's tree being `head_tree`: one line per changed tracked file in index order
-/// (` M` modified, ` D` deleted), then, when `untracked`, a refusal if any file is neither
-/// tracked nor provably ignored (blaze has no ignore rules: D54).
+/// (` M` modified, ` D` deleted), then, when `untracked`, the untracked files that no checkout
+/// ignore rule covers. `all` keeps every file below an untracked directory; otherwise Git's
+/// default `?? dir/` collapse is used. Each ignore file is read through [`GitFiles`], so editing
+/// one re-asks the status fact. The machine's global ignore files are deliberately not read
+/// (D54 and rule 25).
 ///
 /// A tracked file is clean when its stat (size, mtime, ctime, inode, device, owner) equals the
 /// entry's and its mtime is older than the index file's (git's racy-git rule: an entry written
@@ -542,7 +545,58 @@ fn plain(path: &str) -> Result<&str, Refused> {
 /// tree root must equal HEAD's tree, else refused (walking HEAD's tree is not built).
 /// Cost: one index read, one stat per entry, a hash per file whose stat differs; with
 /// `untracked`, a listing of every folder and a stat per name. Floor: the stats.
-pub(crate) fn status<'a>(gitdir: &str, common: &str, work: &str, untracked: bool, head_tree: Oid, files: &mut impl GitFiles, alloc: Alloc<'a>) -> Result<AString<'a>, Refused> {
+pub(crate) fn status<'a>(gitdir: &str, common: &str, work: &str, untracked: bool, all: bool, head_tree: Oid, files: &mut impl GitFiles, alloc: Alloc<'a>) -> Result<AString<'a>, Refused> {
+    Ok(whole(gitdir, common, work, untracked, all, head_tree, files, alloc)?.text)
+}
+
+/// [`status`] whole, with what a record keeps of it for [`status_after`].
+#[allow(clippy::too_many_arguments, reason = "the repository's three folders, the question, HEAD's tree, the reader and the allocator")]
+pub(crate) fn whole<'a>(gitdir: &str, common: &str, work: &str, untracked: bool, all: bool, head_tree: Oid, files: &mut impl GitFiles, alloc: Alloc<'a>) -> Result<Computed<'a>, Refused> {
+    let prepared = prepare(gitdir, common, work, head_tree, files, alloc)?;
+    let mut store: Option<Store<'a>> = None;
+    let mut out = String::new_in(alloc);
+    for entry in prepared.index.entries.iter() {
+        tracked_line(entry, work, common, &prepared, files, &mut store, alloc, &mut out)?;
+    }
+    if untracked {
+        let walk = Walk { work, gitdir, index: &prepared.index, all, alloc };
+        let mut ignores = crate::git_ignore::Ignores::new(alloc);
+        let mut found: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        let mut seen = 0u32;
+        walk.untracked("", false, files, &mut ignores, &mut found, &mut seen)?;
+        found.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for path in found.iter() {
+            push_line(&mut out, "?? ", path)?;
+        }
+    }
+    Ok(Computed { text: out, text_auto: prepared.text_auto })
+}
+
+/// A status computed: its porcelain text, and whether `* text=auto` was in force.
+pub(crate) struct Computed<'a> {
+    pub(crate) text: AString<'a>,
+    pub(crate) text_auto: bool,
+}
+
+/// What a status reads before its first entry.
+struct Prepared<'a> {
+    index: Index<'a>,
+    /// The index file's mtime: git's racy rule compares each entry's with it.
+    index_time: (i64, u32),
+    text_auto: bool,
+}
+
+/// `prefix path\n` appended to `out` (the path plain, else refused by name).
+fn push_line(out: &mut AString<'_>, prefix: &str, path: &str) -> Result<(), Refused> {
+    out.push_str(prefix);
+    out.push_str(plain(path)?);
+    out.push('\n');
+    Ok(())
+}
+
+/// The index read (its cache tree proven HEAD's), the config's check, and the attributes'
+/// `text=auto`: what [`status`] reads before its first entry.
+fn prepare<'a>(gitdir: &str, common: &str, work: &str, head_tree: Oid, files: &mut impl GitFiles, alloc: Alloc<'a>) -> Result<Prepared<'a>, Refused> {
     let index_path = join(gitdir, "index", alloc);
     let mut bytes = Vec::new_in(alloc);
     if !files.read(&index_path, &mut bytes) {
@@ -582,147 +636,611 @@ pub(crate) fn status<'a>(gitdir: &str, common: &str, work: &str, untracked: bool
             }
         }
     }
-    // The object store, opened at the first file whose clean asks its index blob.
-    let mut store: Option<Store<'a>> = None;
-    let mut blob = Vec::new_in(alloc);
-    let mut out = String::new_in(alloc);
-    let mut content = Vec::new_in(alloc);
-    for entry in index.entries.iter() {
-        let path = join(work, &entry.path, alloc);
-        let stat = files.stat(&path);
-        match entry.mode & 0o170000 {
-            0o160000 => {
-                // A submodule: clean only when not checked out (an empty folder or none).
-                let mut names = Vec::new_in(alloc);
-                files.list(&path, alloc, &mut names);
-                if !names.is_empty() {
-                    return Err(Refused::Submodule);
-                }
-                continue;
-            }
-            0o100000 | 0o120000 => {}
-            _ => return Err(Refused::IndexMalformed { at: 0 }),
-        }
-        let Some(stat) = stat else {
-            out.push_str(" D ");
-            out.push_str(plain(&entry.path)?);
-            out.push('\n');
-            continue;
-        };
-        let want_kind = if entry.mode & 0o170000 == 0o120000 { FileKind::Symlink } else { FileKind::File };
-        if stat.kind != want_kind {
-            return Err(Refused::TypeChanged);
-        }
-        if entry.assume_valid {
-            continue;
-        }
-        let executable = entry.mode & 0o111 != 0;
-        let mode_differs = want_kind == FileKind::File && stat.executable != executable;
-        let same_stat = u64::from(entry.size) == stat.size & 0xffff_ffff
-            && entry.mtime == (stat.mtime.0 as u32, stat.mtime.1)
-            && entry.ctime == (stat.ctime.0 as u32, stat.ctime.1)
-            && entry.ino == stat.ino as u32
-            && entry.uid == stat.uid
-            && entry.gid == stat.gid;
-        let racy = i64::from(entry.mtime.0) >= index_time.0;
-        if !mode_differs && same_stat && !racy {
-            continue;
-        }
-        let changed = if mode_differs {
-            true
-        } else {
-            content.clear();
-            if want_kind == FileKind::Symlink {
-                // A link's blob is its target text (git's `ce_compare_link`); no attribute
-                // applies to it, and it is never followed.
-                files.read_link(&path, &mut content).map_err(|why| match why {
-                    LinkUnread::NotALink => Refused::TypeChanged,
-                    LinkUnread::Unreadable | LinkUnread::ReaderCannot => Refused::LinkUnread(why),
-                })?;
-            } else {
-                if !files.read(&path, &mut content) {
-                    return Err(Refused::TypeChanged);
-                }
-                if text_auto {
-                    // git convert.c `crlf_to_git` under CRLF_AUTO: a text file with CR LF pairs
-                    // is converted unless its index blob is text holding CR LF already.
-                    if crate::git_attributes::auto_may_convert(&content) {
-                        let opened = match store.take() {
-                            Some(opened) => opened,
-                            None => Store::open(common, files, alloc)?,
-                        };
-                        let kind = opened.read(&entry.id, files, alloc, &mut blob)?;
-                        store = Some(opened);
-                        // `has_crlf_in_index` reads a blob; another kind reads as none.
-                        if kind != Kind::Blob || !crate::git_attributes::blob_has_crlf(&blob) {
-                            // Text under `auto` has no lone CR: every CR starts a CR LF pair.
-                            content.retain(|b| *b != b'\r');
-                        }
-                    }
-                } else if content.contains(&b'\r') {
-                    return Err(Refused::AttributesNotApplied);
-                }
-            }
-            Oid::of(Kind::Blob, &content) != entry.id
-        };
-        if changed {
-            out.push_str(" M ");
-            out.push_str(plain(&entry.path)?);
-            out.push('\n');
-        }
-    }
-    if untracked {
-        untracked_walk(work, &index, files, alloc)?;
-    }
-    Ok(out)
+    Ok(Prepared { index, index_time, text_auto })
 }
 
-/// Every file under `work` (but `.git`) must be tracked: an untracked one would be listed by
-/// git unless an ignore rule covers it, and blaze has no ignore rules, so it is refused.
-/// Iterative, at most [`MOST_ENTRIES`] names.
-fn untracked_walk(work: &str, index: &Index<'_>, files: &mut impl GitFiles, alloc: Alloc<'_>) -> Result<(), Refused> {
-    let mut pending: AVec<'_, AString<'_>> = Vec::new_in(alloc);
-    pending.push(String::new_in(alloc));
-    let mut seen = 0u32;
-    while let Some(rel) = pending.pop() {
+/// One tracked entry's line of the status, appended to `out` (none when it is clean): ` D` for
+/// a file gone, ` M` for one whose bytes or mode differ. The object store is opened at the first
+/// file whose clean asks its index blob, and kept in `store` for the next.
+#[allow(clippy::too_many_arguments, reason = "the entry, the worktree, the store's folder, what was prepared, the reader, the store, the allocator and the output")]
+fn tracked_line<'a>(entry: &Entry<'_>, work: &str, common: &str, prepared: &Prepared<'_>, files: &mut impl GitFiles, store: &mut Option<Store<'a>>, alloc: Alloc<'a>, out: &mut AString<'a>) -> Result<(), Refused> {
+    let path = join(work, &entry.path, alloc);
+    let stat = files.stat(&path);
+    match entry.mode & 0o170000 {
+        0o160000 => {
+            // A submodule: clean only when not checked out (an empty folder or none).
+            let mut names = Vec::new_in(alloc);
+            files.list(&path, alloc, &mut names);
+            if !names.is_empty() {
+                return Err(Refused::Submodule);
+            }
+            return Ok(());
+        }
+        0o100000 | 0o120000 => {}
+        _ => return Err(Refused::IndexMalformed { at: 0 }),
+    }
+    let Some(stat) = stat else {
+        return push_line(out, " D ", &entry.path);
+    };
+    let want_kind = if entry.mode & 0o170000 == 0o120000 { FileKind::Symlink } else { FileKind::File };
+    if stat.kind != want_kind {
+        return Err(Refused::TypeChanged);
+    }
+    if entry.assume_valid {
+        return Ok(());
+    }
+    let executable = entry.mode & 0o111 != 0;
+    let mode_differs = want_kind == FileKind::File && stat.executable != executable;
+    let same_stat = u64::from(entry.size) == stat.size & 0xffff_ffff
+        && entry.mtime == (stat.mtime.0 as u32, stat.mtime.1)
+        && entry.ctime == (stat.ctime.0 as u32, stat.ctime.1)
+        && entry.ino == stat.ino as u32
+        && entry.uid == stat.uid
+        && entry.gid == stat.gid;
+    let racy = i64::from(entry.mtime.0) >= prepared.index_time.0;
+    if !mode_differs && same_stat && !racy {
+        return Ok(());
+    }
+    let changed = if mode_differs {
+        true
+    } else {
+        let mut content = Vec::new_in(alloc);
+        if want_kind == FileKind::Symlink {
+            // A link's blob is its target text (git's `ce_compare_link`); no attribute applies
+            // to it, and it is never followed.
+            files.read_link(&path, &mut content).map_err(|why| match why {
+                LinkUnread::NotALink => Refused::TypeChanged,
+                LinkUnread::Unreadable | LinkUnread::ReaderCannot => Refused::LinkUnread(why),
+            })?;
+        } else {
+            if !files.read(&path, &mut content) {
+                return Err(Refused::TypeChanged);
+            }
+            if prepared.text_auto {
+                // git convert.c `crlf_to_git` under CRLF_AUTO: a text file with CR LF pairs is
+                // converted unless its index blob is text holding CR LF already.
+                if crate::git_attributes::auto_may_convert(&content) {
+                    let opened = match store.take() {
+                        Some(opened) => opened,
+                        None => Store::open(common, files, alloc)?,
+                    };
+                    let mut blob = Vec::new_in(alloc);
+                    let kind = opened.read(&entry.id, files, alloc, &mut blob)?;
+                    *store = Some(opened);
+                    // `has_crlf_in_index` reads a blob; another kind reads as none.
+                    if kind != Kind::Blob || !crate::git_attributes::blob_has_crlf(&blob) {
+                        // Text under `auto` has no lone CR: every CR starts a CR LF pair.
+                        content.retain(|b| *b != b'\r');
+                    }
+                }
+            } else if content.contains(&b'\r') {
+                return Err(Refused::AttributesNotApplied);
+            }
+        }
+        Oid::of(Kind::Blob, &content) != entry.id
+    };
+    if changed {
+        push_line(out, " M ", &entry.path)?;
+    }
+    Ok(())
+}
+
+/// Whether `path` is `region` or under it (`""`: everything).
+fn within(region: &str, path: &str) -> bool {
+    region.is_empty() || path == region || (path.len() > region.len() && path.as_bytes()[region.len()] == b'/' && path.starts_with(region))
+}
+
+/// The untracked walk of one status computation: the worktree, the git folder (its
+/// `info/exclude`), the index and the mode (`all`: every file; else git's default collapse).
+struct Walk<'w, 'a> {
+    work: &'w str,
+    gitdir: &'w str,
+    index: &'w Index<'a>,
+    all: bool,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> Walk<'_, 'a> {
+    /// Whether the index tracks `path` itself.
+    fn tracked(&self, path: &str) -> bool {
+        self.index.entries.binary_search_by(|entry| entry.path.as_bytes().cmp(path.as_bytes())).is_ok()
+    }
+
+    /// Whether the index tracks a file under the folder `dir` (`""`: the root).
+    fn tracked_below(&self, dir: &str) -> bool {
+        if dir.is_empty() {
+            return !self.index.entries.is_empty();
+        }
+        // The paths under `dir/` are together in byte order: the first path not before `dir/`
+        // (compared without making it) is under it, or none is.
+        let d = dir.as_bytes();
+        let at = self.index.entries.partition_point(|entry| {
+            let path = entry.path.as_bytes();
+            let n = path.len().min(d.len());
+            match path[..n].cmp(&d[..n]) {
+                core::cmp::Ordering::Less => true,
+                core::cmp::Ordering::Greater => false,
+                // `path` is `dir` or a prefix of it: before `dir/`.
+                core::cmp::Ordering::Equal if path.len() <= d.len() => true,
+                core::cmp::Ordering::Equal => path[d.len()] < b'/',
+            }
+        });
+        self.index.entries.get(at).is_some_and(|entry| within(dir, &entry.path) && entry.path.len() > dir.len())
+    }
+
+    /// The untracked files under `rel` (`""`: the root), in porcelain form, pushed to `found` in
+    /// walk order: a file by its path; in the default mode a folder the index tracks nothing
+    /// under, holding at least one file no rule ignores, as `dir/` (git's collapse: the highest
+    /// such folder, never one with a tracked file below). With `first`, nothing is pushed and
+    /// the walk ends at the first such file: whether there is one. Bounded by [`MOST_ENTRIES`]
+    /// names; ignore files are read once each per walk (`ignores`).
+    #[allow(clippy::too_many_arguments, reason = "the walk's bounded state")]
+    fn untracked(&self, rel: &str, first: bool, files: &mut impl GitFiles, ignores: &mut crate::git_ignore::Ignores<'a>, found: &mut AVec<'a, AString<'a>>, seen: &mut u32) -> Result<bool, Refused> {
+        let alloc = self.alloc;
         let mut names = Vec::new_in(alloc);
-        files.list(&join(work, &rel, alloc), alloc, &mut names);
+        files.list(&join(self.work, rel, alloc), alloc, &mut names);
+        let mut any = false;
         for name in names.iter() {
-            seen += 1;
-            if seen > MOST_ENTRIES {
+            *seen += 1;
+            if *seen > MOST_ENTRIES {
                 return Err(Refused::TooManyEntries);
             }
             if rel.is_empty() && name.as_str() == ".git" {
                 continue;
             }
-            let child = join(&rel, name, alloc);
-            let tracked = index.entries.binary_search_by(|entry| entry.path.as_bytes().cmp(child.as_bytes())).is_ok();
-            if tracked {
+            let child = join(rel, name, alloc);
+            if self.tracked(&child) {
                 continue;
             }
-            match files.stat(&join(work, &child, alloc)).map(|stat| stat.kind) {
-                Some(FileKind::Dir) => {
-                    let mut prefix = String::from_str_in(&child, alloc);
-                    prefix.push('/');
-                    let at = index.entries.partition_point(|entry| entry.path.as_bytes() < prefix.as_bytes());
-                    let has_tracked = index.entries.get(at).is_some_and(|entry| entry.path.starts_with(prefix.as_str()));
-                    if !has_tracked {
-                        // A folder with no tracked file: git lists it as `?? dir/` if it holds any file.
-                        let mut inner = Vec::new_in(alloc);
-                        files.list(&join(work, &child, alloc), alloc, &mut inner);
-                        if !inner.is_empty() {
-                            return Err(Refused::Untracked);
-                        }
-                        continue;
-                    }
-                    pending.push(child);
+            if self.one(&child, first, files, ignores, found, seen)? {
+                any = true;
+                if first {
+                    return Ok(true);
                 }
-                Some(_) => return Err(Refused::Untracked),
-                None => {}
+            }
+        }
+        Ok(any)
+    }
+
+    /// One untracked name `child` (not tracked itself): a folder walked (or collapsed), a file
+    /// kept unless a rule ignores it. Whether it holds or is an untracked file.
+    #[allow(clippy::too_many_arguments, reason = "the walk's bounded state")]
+    fn one(&self, child: &str, first: bool, files: &mut impl GitFiles, ignores: &mut crate::git_ignore::Ignores<'a>, found: &mut AVec<'a, AString<'a>>, seen: &mut u32) -> Result<bool, Refused> {
+        let alloc = self.alloc;
+        match files.stat(&join(self.work, child, alloc)).map(|stat| stat.kind) {
+            Some(FileKind::Dir) => {
+                if ignores.ignored(self.work, self.gitdir, child, true, files) {
+                    return Ok(false);
+                }
+                if first {
+                    return self.untracked(child, true, files, ignores, found, seen);
+                }
+                if !self.all && !self.tracked_below(child) {
+                    let holds = self.untracked(child, true, files, ignores, found, seen)?;
+                    if holds {
+                        let mut dir = String::from_str_in(child, alloc);
+                        dir.push('/');
+                        found.push(dir);
+                    }
+                    return Ok(holds);
+                }
+                self.untracked(child, false, files, ignores, found, seen)
+            }
+            Some(_) => {
+                if ignores.ignored(self.work, self.gitdir, child, false, files) {
+                    return Ok(false);
+                }
+                if !first {
+                    found.push(String::from_str_in(child, alloc));
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+pub use after::{After, CoveredSince, Gen, Made, StatusAnswer, StatusPlant, WholeWhy};
+pub(crate) use after::status_after;
+
+/// The status after a change (E3, 2026-11-20): from the previous answer and the journal's
+/// changed paths, byte-equal to [`whole`]. Its entry is git.rs `status_after`.
+mod after {
+    use super::*;
+
+/// A place in a journal of changes: which journal (its identity, as bytes: the volume's event
+/// store, a USN journal, the simulation's) and how far into it. Opaque here; blaze-cli
+/// journal_sweep.rs makes it from the journal's cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Gen {
+    pub journal: [u8; 24],
+    pub at: u64,
+}
+
+impl Gen {
+    /// Whether `later` is a place of this journal, at or after this one.
+    pub fn reaches(self, later: Gen) -> bool {
+        self.journal == later.journal && self.at <= later.at
+    }
+}
+
+/// Proof that `changed` names every path of the checkout that changed since the journal's place
+/// `since` (rule 74): made by the journal's replay alone (blaze-cli journal_sweep.rs, where its
+/// `judge` accepted the replay from `since`), its names and its lost subtrees, each relative to
+/// the checkout, sorted. Not a boolean: [`status_after`] takes it, and with none computes the
+/// status whole, saying so ([`WholeWhy::NotCovered`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CoveredSince<'c> {
+    since: Gen,
+    changed: &'c [&'c str],
+    /// A folder under which every untracked name is ignored all through the window
+    /// ([`CoveredSince::ignoring`]), relative as `changed` is.
+    ignored: Option<&'c str>,
+}
+
+impl<'c> CoveredSince<'c> {
+    /// The replay's proof: from `since`, the paths `changed` (sorted, each once). At git.rs
+    /// `status_after` they are relative to the served tree's root; [`status_after`] here takes
+    /// them relative to the worktree (the entry rebases them, [`CoveredSince::rebased`]). Only a
+    /// journal's replay makes one.
+    pub fn replayed(since: Gen, changed: &'c [&'c str]) -> Self {
+        CoveredSince { since, changed, ignored: None }
+    }
+
+    /// This proof, with `folder` known to ignore every untracked name beneath it from `since` to
+    /// the place now: its own ignore file read exactly `*` before the replay, and not named by
+    /// it (blaze-cli journal_sweep.rs `CheckoutChanges::ignored_whole` makes the claim; were the
+    /// file named, the status is whole, [`WholeWhy::RulesChanged`]). A `*` in a folder's own
+    /// ignore file outranks every outer rule for the names in it, and the walk does not enter a
+    /// folder so ignored, so no untracked name under `folder` has a line, then or now: a region
+    /// whose untracked unit is under it is not walked, and lists and reads nothing. A tracked
+    /// name there is the index's, as anywhere.
+    pub fn ignoring(self, folder: &'c str) -> Self {
+        CoveredSince { ignored: Some(folder), ..self }
+    }
+
+    /// This proof rebased to the worktree `work` (git.rs `status_after`): `changed`, the paths
+    /// the entry rebased, and the ignored folder rebased the same way, dropped when it is not
+    /// beneath the worktree (no name of it is then in the status).
+    pub fn rebased<'d>(&self, work: &str, changed: &'d [&'d str]) -> CoveredSince<'d>
+    where
+        'c: 'd,
+    {
+        let ignored = self.ignored.and_then(|folder| match work.is_empty() {
+            true => Some(folder),
+            false => folder.strip_prefix(work).and_then(|rest| rest.strip_prefix('/')),
+        });
+        CoveredSince { since: self.since, changed, ignored }
+    }
+
+    pub fn since(&self) -> Gen {
+        self.since
+    }
+
+    pub fn changed(&self) -> &'c [&'c str] {
+        self.changed
+    }
+
+    /// The folder [`CoveredSince::ignoring`] named, if any.
+    pub fn ignored(&self) -> Option<&'c str> {
+        self.ignored
+    }
+}
+
+/// A status answer as the next command starts from it ([`status_after`]): two facts that are
+/// stored apart (blaze-cli engine_script_reads.rs), never as one record:
+/// - what a script observes: the porcelain `text` (byte-equal to the whole computation) for the
+///   question `untracked`/`all`, kept as the answer record (the git answer's digest preimage,
+///   [`crate::git::Answer::digest_bytes`]) under a key made from the cell's digest;
+/// - its coverage: the `text=auto` it was computed under, HEAD's `tree` it was compared with,
+///   and the journal's `place` (taken before any file was read), a small record hashed into no
+///   cell.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StatusAnswer<'a> {
+    pub text: AString<'a>,
+    pub untracked: bool,
+    pub all: bool,
+    pub text_auto: bool,
+    pub tree: Oid,
+    pub place: Gen,
+}
+
+/// Why a status was computed whole: each case the change-driven answer does not cover, decided
+/// before any fact is read and printed in the profile (rule 3: never a quiet fallback).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WholeWhy {
+    /// No previous answer: the first command, an older record's form, or its records missing
+    /// (a lapsed or never written coverage root).
+    NoPrevious,
+    /// The previous answer is of another question (`-uno`, `-uall`).
+    OtherQuestion,
+    /// The journal's replay does not start at the previous answer's place (no replay, a reset,
+    /// a lost history, another journal, a replay from a later checkpoint).
+    NotCovered,
+    /// A path under a git folder changed: the index, HEAD, a ref, the config (a stage, a
+    /// commit, a checkout).
+    GitFolder,
+    /// An ignore or attributes file changed: every path's rule may have moved.
+    RulesChanged,
+    /// The worktree's folder itself was named (a lost history of all of it).
+    WorkNamed,
+    /// The git folder is outside the worktree (a linked worktree's, a separate `--git-dir`):
+    /// the worktree's journal does not see the index, HEAD or the refs change.
+    GitFolderOutside,
+}
+
+impl core::fmt::Display for WholeWhy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            WholeWhy::NoPrevious => "no previous answer of this form",
+            WholeWhy::OtherQuestion => "the previous answer is of another question",
+            WholeWhy::NotCovered => "the journal's replay does not start at the previous answer's place",
+            WholeWhy::GitFolder => "a path under a git folder changed (the index, HEAD, a ref, the config)",
+            WholeWhy::RulesChanged => "an ignore or attributes file changed",
+            WholeWhy::WorkNamed => "the worktree's folder itself was named",
+            WholeWhy::GitFolderOutside => "the git folder is outside the worktree, where its journal does not see it",
+        })
+    }
+}
+
+/// How a status after a change was made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Made {
+    /// From the previous answer: `regions` subtrees named by the journal recomputed.
+    Incremental { regions: u32 },
+    /// Whole, for the reason given.
+    Whole(WholeWhy),
+}
+
+/// What [`status_after`] answers: the status now, at the place `covered` reached, and how.
+#[derive(Debug)]
+pub struct After<'a> {
+    pub answer: StatusAnswer<'a>,
+    pub made: Made,
+}
+
+/// The decision [`status_after`] makes before any fact is read: the regions to recompute (each
+/// worktree-relative, none under another, sorted), or why the status is computed whole.
+#[allow(clippy::too_many_arguments, reason = "the previous answer, its proof, the question, the repository's folders, the place now, the allocator and the plant")]
+fn decide<'a>(
+    previous: &StatusAnswer<'_>,
+    covered: Option<&CoveredSince<'_>>,
+    untracked: bool,
+    all: bool,
+    gitdir: &str,
+    common: &str,
+    work: &str,
+    now: Gen,
+    alloc: Alloc<'a>,
+    plant: impl blaze_own::planted::Planted<StatusPlant>,
+) -> Result<AVec<'a, AString<'a>>, WholeWhy> {
+    if previous.untracked != untracked || (previous.all != all && untracked) {
+        return Err(WholeWhy::OtherQuestion);
+    }
+    let covered = covered.ok_or(WholeWhy::NotCovered)?;
+    // The replay must start exactly at the previous answer's place: a later start (a journal
+    // checkpoint) hides the changes between, which a certificate proved left the answer's text
+    // alone but not its `text=auto` (an attributes edit that changes no line).
+    let reached = previous.place == covered.since && covered.since.reaches(now);
+    if !reached && !plant.has(StatusPlant::CoverageIgnored) {
+        return Err(WholeWhy::NotCovered);
+    }
+    // The journal is the worktree's: a git folder outside it (a linked worktree's, a separate
+    // `--git-dir`) changes unseen.
+    let inside = |folder: &str| match work.is_empty() {
+        // The reader's namespace is the worktree: a relative folder is in it.
+        true => !folder.is_empty() && !folder.starts_with('/') && !folder.starts_with("../") && folder != "..",
+        false => folder.len() > work.len() && within(work, folder),
+    };
+    if !inside(gitdir) || !inside(common) {
+        return Err(WholeWhy::GitFolderOutside);
+    }
+    let mut regions: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    for &rel in covered.changed {
+        if rel.is_empty() {
+            return Err(WholeWhy::WorkNamed);
+        }
+        let full = join(work, rel, alloc);
+        if within(gitdir, &full) || within(common, &full) || rel.split('/').any(|part| part == ".git") {
+            return Err(WholeWhy::GitFolder);
+        }
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        if name == ".gitignore" || name == ".gitattributes" {
+            return Err(WholeWhy::RulesChanged);
+        }
+        regions.push(String::from_str_in(rel, alloc));
+    }
+    Ok(outermost(regions, alloc))
+}
+
+/// `paths` sorted, each kept unless it is under another (`a/c` is under `a`, though `a-b`
+/// sorts between them).
+fn outermost<'a>(mut paths: AVec<'a, AString<'a>>, alloc: Alloc<'a>) -> AVec<'a, AString<'a>> {
+    paths.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let mut kept: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    for path in paths {
+        if !kept.iter().any(|outer| within(outer, &path)) {
+            kept.push(path);
+        }
+    }
+    kept
+}
+
+/// The path of a porcelain line (`XY path`, a collapsed folder with its `/`).
+fn line_path(line: &str) -> &str {
+    line.get(3..).unwrap_or_default()
+}
+
+/// The status of the worktree `work` now, from the `previous` answer and the paths the journal
+/// says changed since it (`covered`), sans-IO through `files` (E3, 2026-11-20). Byte-equal to
+/// [`whole`]'s text: the previous lines outside every region the journal named are kept, and
+/// each region is computed as the whole computation computes it (its tracked entries, and its
+/// untracked unit: in the default mode the highest folder above it the index tracks nothing
+/// under, so the collapse is the whole's), then the lines are put in the whole's order (tracked
+/// by path, untracked by path). Where the change-driven answer is not covered the decision is
+/// made before any fact is read, typed ([`WholeWhy`]), and the status computed whole.
+///
+/// Cost after a change: one index read and its stat; per region one index lookup, a stat per
+/// tracked entry in it (a hash where the stat differs), and in an untracked unit the walk of
+/// that unit alone; ignore files only for an untracked path, once each. No walk of the tree,
+/// and no read of HEAD or the commit: `head_tree` (which may read a pack) is asked only for a
+/// whole computation; after a change the previous answer's tree stands, as no path under the
+/// git folder changed since it (else the decision is [`WholeWhy::GitFolder`]).
+#[allow(clippy::too_many_arguments, reason = "the previous answer, its proof, the question, the repository's folders, HEAD's tree, the place now, the reader and the allocator")]
+pub(crate) fn status_after<'a, F: GitFiles>(
+    previous: Option<&StatusAnswer<'_>>,
+    covered: Option<&CoveredSince<'_>>,
+    untracked: bool,
+    all: bool,
+    gitdir: &str,
+    common: &str,
+    work: &str,
+    head_tree: impl FnOnce(&mut F, Alloc<'a>) -> Result<Oid, Refused>,
+    now: Gen,
+    files: &mut F,
+    alloc: Alloc<'a>,
+    plant: impl blaze_own::planted::Planted<StatusPlant>,
+) -> Result<After<'a>, Refused> {
+    let all = all && untracked;
+    // The folder the proof says ignores every untracked name beneath it (`CoveredSince::ignoring`).
+    let ignored = covered.and_then(|covered| covered.ignored());
+    let decided = match previous {
+        Some(previous) => decide(previous, covered, untracked, all, gitdir, common, work, now, alloc, plant).map(|regions| (previous, regions)),
+        None => Err(WholeWhy::NoPrevious),
+    };
+    let (previous, regions) = match decided {
+        Ok(decided) => decided,
+        Err(why) => {
+            let tree = head_tree(files, alloc)?;
+            let computed = whole(gitdir, common, work, untracked, all, tree, files, alloc)?;
+            return Ok(After { answer: StatusAnswer { text: computed.text, untracked, all, text_auto: computed.text_auto, tree, place: now }, made: Made::Whole(why) });
+        }
+    };
+    let head_tree = previous.tree;
+    // The index and its time: the racy rule's. Config and attributes are as the previous
+    // answer read them (a change to any is a whole computation, above).
+    let index_path = join(gitdir, "index", alloc);
+    let mut bytes = Vec::new_in(alloc);
+    if !files.read(&index_path, &mut bytes) {
+        return Err(Refused::Malformed(GitFile::Index));
+    }
+    let index_time = files.stat(&index_path).ok_or(Refused::Malformed(GitFile::Index))?.mtime;
+    let index = parse_index(&bytes, alloc)?;
+    if index.root_tree != Some(head_tree) {
+        return Err(Refused::StagedUnproven);
+    }
+    let prepared = Prepared { index, index_time, text_auto: previous.text_auto };
+    let walk = Walk { work, gitdir, index: &prepared.index, all, alloc };
+    // Each region's untracked unit: itself in `-uall`; else the highest folder on its way the
+    // index tracks nothing under (the whole's collapse), or itself.
+    let mut units: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    for region in regions.iter() {
+        let mut unit = region.as_str();
+        if !all && !plant.has(StatusPlant::NoCollapseUnit) {
+            let ends = region.match_indices('/').map(|(at, _)| at).chain(core::iter::once(region.len()));
+            for end in ends {
+                let folder = &region[..end];
+                if !walk.tracked(folder) && !walk.tracked_below(folder) {
+                    unit = folder;
+                    break;
+                }
+            }
+        }
+        units.push(String::from_str_in(unit, alloc));
+    }
+    let units = outermost(units, alloc);
+    let keep_stale = plant.has(StatusPlant::KeepRevertedLine);
+    let mut tracked: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    let mut kept_untracked: AVec<'_, &str> = Vec::new_in(alloc);
+    for line in previous.text.split_terminator('\n') {
+        let path = line_path(line);
+        let bare = path.strip_suffix('/').unwrap_or(path);
+        if line.starts_with("?? ") {
+            if !units.iter().any(|unit| within(unit, bare)) {
+                kept_untracked.push(line);
+            }
+        } else if !regions.iter().any(|region| within(region, path)) || keep_stale {
+            let mut kept = String::from_str_in(line, alloc);
+            kept.push('\n');
+            tracked.push(kept);
+        }
+    }
+    // Each region's tracked entries, as the whole computes them.
+    let mut store: Option<Store<'a>> = None;
+    for region in regions.iter() {
+        let from = prepared.index.entries.partition_point(|entry| entry.path.as_bytes() < region.as_bytes());
+        for entry in prepared.index.entries[from..].iter().take_while(|entry| within(region, &entry.path)) {
+            let mut line = String::new_in(alloc);
+            tracked_line(entry, work, common, &prepared, files, &mut store, alloc, &mut line)?;
+            // With the line kept above (a planted bug), the region's own is not added twice.
+            let twice = keep_stale && tracked.iter().any(|it| it.as_str() == line.as_str());
+            if !line.is_empty() && !twice {
+                tracked.push(line);
             }
         }
     }
-    Ok(())
+    tracked.sort_by(|a, b| line_path(a).as_bytes().cmp(line_path(b).as_bytes()));
+    // Each unit's untracked lines, as the whole computes them: the unit's folders above it
+    // proven unignored (the whole's walk reaches it only through them), then the unit itself.
+    let mut found: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    if untracked {
+        let mut ignores = crate::git_ignore::Ignores::new(alloc);
+        let mut seen = 0u32;
+        for unit in units.iter() {
+            // A unit in a folder that ignored every untracked name all through the window (the
+            // proof's, `CoveredSince::ignoring`: blaze's own, written by every command) has no
+            // untracked line, then or now: neither listed nor its ignore files read.
+            if ignored.is_some_and(|folder| !folder.is_empty() && within(folder, unit)) {
+                continue;
+            }
+            // A tracked unit (an edited tracked file) has no untracked line: asked first, from
+            // the index alone, so its edit reads no ignore file.
+            if walk.tracked(unit) {
+                continue;
+            }
+            let hidden = unit.match_indices('/').any(|(end, _)| ignores.ignored(work, gitdir, &unit[..end], true, files));
+            if hidden {
+                continue;
+            }
+            walk.one(unit, false, files, &mut ignores, &mut found, &mut seen)?;
+        }
+    }
+    let mut out = String::new_in(alloc);
+    for line in tracked.iter() {
+        out.push_str(line);
+    }
+    let mut lines: AVec<'a, &str> = Vec::new_in(alloc);
+    lines.extend(kept_untracked.iter().copied().map(line_path));
+    lines.extend(found.iter().map(|path| path.as_str()));
+    lines.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    lines.dedup();
+    for path in lines.iter() {
+        push_line(&mut out, "?? ", path)?;
+    }
+    let regions = u32::try_from(regions.len()).unwrap_or(u32::MAX);
+    Ok(After { answer: StatusAnswer { text: out, untracked, all, text_auto: prepared.text_auto, tree: head_tree, place: now }, made: Made::Incremental { regions } })
+}
+
+/// The bugs a control plants in [`status_after`] (blaze_own::planted, D165).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusPlant {
+    /// The status as it is.
+    None,
+    /// A previous tracked line in a named region is kept: a reverted edit keeps its ` M`.
+    KeepRevertedLine,
+    /// A region's untracked unit is the region itself: a new file in a folder already shown
+    /// as `?? dir/` adds its own line.
+    NoCollapseUnit,
+    /// Lost coverage is taken as covered: the change-driven answer from a place the journal
+    /// does not reach.
+    CoverageIgnored,
+    /// The proof claims a folder ignores every untracked name (`CoveredSince::ignoring`)
+    /// without its ignore file read: planted where the claim is made (the tests' model), as
+    /// blaze-cli journal_sweep.rs would be with its read skipped.
+    IgnoringUnchecked,
+}
+
+impl blaze_own::planted::Plants for StatusPlant {}
 }
 
 /// Whether the repository has any tag: a name under `refs/tags/` or a `refs/tags/` line of

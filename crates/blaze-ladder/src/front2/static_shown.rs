@@ -1,5 +1,5 @@
 //! A static named in a refusal (rule 19: an error names the thing). A module-level static is
-//! its path ([`fn_shown`]); a static declared in a BODY has no path in the names library (the
+//! its path (row_path.rs `shown_name`, as reach.rs `fn_shown`); a static declared in a BODY has no path in the names library (the
 //! hello's `static MANIFEST`, which bstd's `main!` writes inside the `fn main` it makes), so it
 //! is named by its own written head (`static MANIFEST: $crate::grant::Manifest`), the item whose
 //! body declares it, and its key. Before this the refusal named it by its key alone
@@ -11,7 +11,9 @@ use std::string::String;
 use blaze_typeck::ItemKey;
 
 use super::check::Records;
-use super::reach::fn_shown;
+use super::heads::Store;
+use super::keys::Keys;
+use super::source::NamesSource;
 
 /// The most characters of a local static's head shown (its declaration up to `=`); the rest
 /// of a longer head is said to be cut, never dropped silently.
@@ -20,8 +22,18 @@ const MOST_HEAD: usize = 200;
 /// Static `k` as a refusal names it: a module-level static's path, or a local static's written
 /// head with the item it is declared in and its key in hex.
 pub(crate) fn static_shown(r: &Records<'_, '_>, k: ItemKey) -> String {
-    let Some(local) = r.store.locals.head(k) else { return fn_shown(r, k) };
-    let enclosing = fn_shown(r, local.enclosing);
+    static_shown_in(r.names, &*r.keys, &*r.store, k)
+}
+
+/// [`static_shown`] over the parts a lazy program holds (its names, key map and store): the one
+/// home both the eager program.rs `made_statics` and program/lazy/fill.rs name a refused static
+/// by. A static a macro writes in a block (tracing's `callsite2!` `static __CALLSITE`) has no
+/// path; named by `ItemShown` alone it was "an item the names source holds no path for".
+pub(crate) fn static_shown_in<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, k: ItemKey) -> String {
+    // reach.rs `fn_shown` over these parts: the one printer of an item's name.
+    let shown = |k: ItemKey| super::row_path::shown_name(names, keys, store, k);
+    let Some(local) = store.locals.head(k) else { return shown(k) };
+    let enclosing = shown(local.enclosing);
     match static_name(local.text) {
         Some(name) => format!("static `{name}`, declared in the body of `{enclosing}` (key {:#034x})", k.0),
         // No `static <name>` in its text (not reached for a kept static row): the text is shown,

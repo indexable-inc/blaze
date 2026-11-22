@@ -95,7 +95,11 @@ fn check_text_on(text: &str, core: Core) -> (std::string::String, std::vec::Vec<
 fn notes_say_why(case: &str, notes: &[std::string::String], said: &str) {
     for note in notes {
         assert!(!note.contains("the flow lowering refused a form"), "{case}: a form the lowering refused without words: {note}\n{said}");
-        if note.contains("could not be related through that signature") {
+        if note.contains("CallUnrelated {") || note.contains("the call could not be related") {
+            let reason = note.split_once("borrows not checked: [")
+                .and_then(|(_, rest)| rest.split_once("] the call could not be related through the callee's signature"))
+                .map(|(reason, _)| reason);
+            assert!(reason.is_some_and(|r| r.starts_with("Shape/") || r.starts_with("Unaligned/") || r == "Bounds"), "{case}: the call's reason leads its note: {note}\n{said}");
             let worded = note.contains("shape_why: Some(") || (note.contains("Unaligned(") && !note.contains("Unaligned(NotTried)")) || note.contains("lacks: Bounds");
             assert!(worded, "{case}: a call refused without its reason: {note}\n{said}");
             assert!(note.contains("head: \"") || note.contains("fn "), "{case}: the callee is named by its head: {note}\n{said}");

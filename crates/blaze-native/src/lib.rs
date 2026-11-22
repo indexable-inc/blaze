@@ -31,6 +31,7 @@ pub mod libraries;
 pub mod macho;
 pub mod object;
 pub mod resolve;
+pub mod tbd;
 pub mod unwind;
 
 /// The platform a native object is built for: it fixes the one object format accepted

@@ -1,28 +1,21 @@
-//! The planted bug for the precedence oracle's control (rule 53).
+//! The bugs a control can plant in precedence (D165, rule 78: a strategy is a type parameter at
+//! one seam). [`Version::cmp_precedence_planted`](crate::Version::cmp_precedence_planted) and
+//! the identifiers' `cmp_planted` take one as `plant: impl Planted<SemverPlant>`; shipped code
+//! (`Ord`, `cmp_precedence`, `VersionReq::matches`) passes `NoPlant`, whose every `has` is
+//! `false`, so the check compiles away. The precedence oracle's control (tests.rs) passes a
+//! value.
 
-use core::cmp::Ordering;
-use std::cell::Cell;
+#![blaze::sans_io]
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    Clean,
+use blaze_own::planted::Plants;
+
+/// A bug a control plants in precedence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SemverPlant {
+    /// The code as it is.
+    None,
     /// Numeric identifiers compare as text, so `beta.11 < beta.2`.
     NumbersAsText,
 }
 
-std::thread_local! {
-    static PLANTED: Cell<Plant> = const { Cell::new(Plant::Clean) };
-}
-
-pub(crate) fn identifier(a: &str, b: &str, order: Ordering) -> Ordering {
-    match PLANTED.with(Cell::get) {
-        Plant::NumbersAsText => a.cmp(b),
-        Plant::Clean => order,
-    }
-}
-
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for SemverPlant {}

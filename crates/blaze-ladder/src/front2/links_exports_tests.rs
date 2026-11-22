@@ -8,7 +8,7 @@ use blaze_id::{ContentId, ItemKey};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemIndex};
 
-use super::{CrateExport, CrateLinks, Gather, LinksError};
+use super::{CrateExport, CrateLinks, Entry, Gather, KeyFor, LinksError, TextOf};
 
 const MAC: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
 
@@ -23,8 +23,8 @@ pub(super) fn index_key(at: ItemIndex) -> ItemKey {
 /// The facts of one file `text` as the only text of crate `t`, on macOS.
 fn links_of<'a>(text: &'a str, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
     let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-    let mut gather = Gather::new("t", Edition::E2021, MAC, alloc);
-    gather.text(text, &outline, &|at| Some(index_key(at)))?;
+    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+    gather.text(TextOf::File("src/lib.rs"), text, &outline, &|at| Entry::Keyed(index_key(at)))?;
     gather.finish()
 }
 
@@ -74,8 +74,11 @@ fn two_exporters_of_one_name_refused() {
 
     // An exported entry the names source gives no key is refused by name, never passed over.
     let outline = blaze_file_items::outline(one, Edition::E2021, alloc);
-    let mut gather = Gather::new("t", Edition::E2021, MAC, alloc);
-    assert_eq!(gather.text(one, &outline, &|_| None).err(), Some(LinksError::Unkeyed { krate: "t", at: ItemIndex(0) }));
+    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+    assert_eq!(
+        gather.text(TextOf::File("src/lib.rs"), one, &outline, &|_| Entry::Unkeyed).err(),
+        Some(LinksError::Unkeyed { krate: "t", text: TextOf::File("src/lib.rs"), at: ItemIndex(0), line: 1, item: "S", needs: KeyFor::Export })
+    );
 
     println!("links: two exporters of `f` refused (TwoExports), each export keeps its item");
 }

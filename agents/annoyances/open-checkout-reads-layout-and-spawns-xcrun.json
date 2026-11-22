@@ -1,0 +1,15 @@
+{
+ "id": "open-checkout-reads-layout-and-spawns-xcrun",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), journal writer",
+ "where": "crates/blaze-cli/src/engine_check.rs edge (open checkout); run_package.rs locate; sdk.rs",
+ "what": "'open checkout' takes 22 ms on every command (U9 measured 5 ms on all10 before). locate runs with_layout, which reads the whole workspace layout (4.46 MB of frame in that phase) only to find the root; sdk::resolve spawns xcrun when SDKROOT is unset. Neither is a .blaze creation, a lock or a sync.",
+ "cost": "22 ms of every command, against a floor of about 1 ms",
+ "cause": "the root and the SDK are recomputed from scratch by each command",
+ "whys": "locate reused the layout reader instead of the manifest's [workspace] rule; the SDK path is not a record",
+ "class": "per-command work that a key would skip (rule 77)",
+ "prevention": "done: the phase is split into five marks (the origin named, the workspace's root, the host's facts and tools, the macOS SDK with xcrun or SDKROOT, the environment and printer) so the profile names its parts; to do: the root from the start manifest's [workspace] walk up, and the SDK path as a record keyed by its inputs",
+ "annoyance": "tempo's edit already marked 16 phases, so MOST was raised to 24 to keep the four new marks their own rows",
+ "workaround": "none needed",
+ "state": "open"
+}

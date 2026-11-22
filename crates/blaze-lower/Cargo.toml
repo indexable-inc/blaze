@@ -20,9 +20,9 @@ doctest = false
 
 [dependencies]
 # By path, as blaze-typeck takes them: the workspace entries turn on features this crate does not use.
-blaze-format-core = { path = "../blaze-format-core" }
-blaze-hash = { path = "../blaze-hash" }
-blaze-ids = { path = "../blaze-ids" }
+blaze-format-core.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
 blaze-own.workspace = true
 blaze-surface.workspace = true
 blaze-file-items.workspace = true

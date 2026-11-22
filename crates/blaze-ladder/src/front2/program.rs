@@ -26,18 +26,19 @@ use blaze_typeck::{
 };
 
 use super::Front2;
-use super::body::{Body, BodyError, lower_again, lower_fn};
+use super::body::{Body, BodyError, lower_again};
+use super::lower_made::{LowerTarget, lower_made};
 use super::buckets::Buckets;
 use super::check::{BuildOrder, CheckFail, Records, check_body};
 use super::consts::Consts;
-use super::heads::{CrateCfg, FnHead, Store};
+use super::heads::{CrateCfg, Store};
 use super::keys::{MemberKind, checker_of};
 use super::reach::{First, Reached, Start, fn_shown, reach_all};
 use super::test_entry::{EntryShape, TestEntryRefusal};
 use super::spell::Spelling;
 use super::types::Why;
 use super::world_items::BodyWorld;
-use crate::front::{At, FnKind, FnLang, HOSTED_START, LitTexts, int_value, string_bytes, unquote};
+use crate::front::{At, FnKind, FnLang, HOSTED_START, LitTexts, int_value, string_bytes};
 use blaze_hash::HashMap;
 use blaze_lower::head;
 use std::boxed::Box;
@@ -52,6 +53,9 @@ pub mod suite;
 pub mod run_entry;
 mod tabled;
 mod left_out;
+/// `symbols_of` and the link table on ring's in-body `prefixed_extern!`: one symbol.
+#[cfg(test)]
+mod ring_in_body_tests;
 pub use left_out::{LeftAt, LeftOut};
 pub mod lazy;
 pub mod walk_report;
@@ -317,6 +321,9 @@ pub struct Front2Program<'n> {
     projection_why: core::cell::RefCell<Option<Box<str>>>,
     /// What the instance questions' worlds asked and found unmade (the seam's `make_asked`).
     asked: RefCell<Vec<super::world_items::Fill, Global>>,
+    /// What the instance questions' worlds could not answer and no fill makes (a refused
+    /// candidate impl, by name): `make_asked`'s refusal when no fill is left (rule 19).
+    asked_gaps: RefCell<Vec<super::world_items::Gap, Global>>,
     /// The walk's steps ([`super::reach::Census::edges`]), sorted, once each: a root's static
     /// reach is read from them (program/suite.rs `Suite::reach_of`).
     edges: Vec<(ItemKey, ItemKey), Global>,
@@ -811,6 +818,23 @@ impl<'n> Front2Program<'n> {
         let prepared = Prepares::new_in(alloc);
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
         let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
+        // The records, with the program's one constant evaluator, are made BEFORE the roots
+        // are lowered: a root's written type may name a constant (`size_of::<[u32;
+        // BUFFER_SIZE]>()` in `main`: the Reference, "Array types": the length is a constant
+        // expression, a const context), which its lowering asks for as `Why::NeedConst`. A
+        // root is lowered by the one loop that evaluates what a lowering needs and lowers
+        // again (front2/lower_made.rs), as every reached fn is (reach.rs); a bare `lower_fn`
+        // here returned the need as `main`'s refusal.
+        let mut consts = Consts::default();
+        let mut records = Records {
+            names,
+            keys: &mut front.keys,
+            index: &front.index,
+            store: &mut store,
+            buckets: &mut buckets,
+            order: BuildOrder::AsAsked,
+            consts: Some((&mut consts, prepared)),
+        };
         for &lib in roots.iter() {
             // An entry declared in a block (super::nested_exports): the bodies around it are
             // lowered first, outermost first, so each keeps its local items (locals.rs
@@ -819,12 +843,12 @@ impl<'n> Front2Program<'n> {
             // coordinator's ruling 19:1x).
             let mut lowered = Ok(());
             for &outer in super::nested_exports::enclosing_bodies(names, alloc, lib)?.iter() {
-                if let Err(e) = lower_fn(names, prepared, &mut front.keys, &mut store, outer) {
+                if let Err(e) = lower_made(&mut records, prepared, LowerTarget::Free(outer)) {
                     lowered = Err(e);
                     break;
                 }
             }
-            let lowered = lowered.and_then(|()| lower_fn(names, prepared, &mut front.keys, &mut store, lib));
+            let lowered = lowered.and_then(|()| lower_made(&mut records, prepared, LowerTarget::Free(lib)));
             match (lowered, left_out.as_deref_mut()) {
                 (Ok(m), _) => {
                     mains.push(m);
@@ -856,16 +880,6 @@ impl<'n> Front2Program<'n> {
         for (m, s) in mains.iter().zip(spells.iter()) {
             scopes.push(m.scope(s));
         }
-        let mut consts = Consts::default();
-        let mut records = Records {
-            names,
-            keys: &mut front.keys,
-            index: &front.index,
-            store: &mut store,
-            buckets: &mut buckets,
-            order: BuildOrder::AsAsked,
-            consts: Some((&mut consts, prepared)),
-        };
         // In a survey a root that does not check is filed and left out, and the walk goes on
         // from what it calls by name: what is reachable is surveyed whatever the root is.
         let mut checked: Vec<Option<Checked<'static>>, Global> = Vec::with_capacity_in(mains.len(), Global);
@@ -1208,7 +1222,7 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), edges, consts, prepared, start: start2, recipes, reached_by_crate };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), edges, consts, prepared, start: start2, recipes, reached_by_crate };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -1249,8 +1263,11 @@ impl<'n> Front2Program<'n> {
             reveal: super::opaque_auto::Reveal::All,
         };
         let out = f(&world);
-        // What the question found unmade, for the build's `make_asked`.
+        // What the question found unmade, for the build's `make_asked`; what it found refused
+        // (a candidate impl's header, by name), for `make_asked`'s refusal when nothing is
+        // left to make: never the bare `Missing` (rule 19).
         self.asked.borrow_mut().extend(world.fills.into_inner());
+        self.asked_gaps.borrow_mut().extend(world.gaps.into_inner());
         Ok(out)
     }
 }
@@ -1325,7 +1342,8 @@ fn exported_entry<'n, S: super::source::NamesSource<'n>>(names: S) -> Result<Opt
         let name = it.name.unwrap_or("_");
         // `symbols_of` reads a `#[no_mangle]` fn's export from the NAME it is given: the bare
         // name here, never `shown` (which appends the place for the TwoEntries message).
-        let export = symbols_of(names, key, it.text, name)?.export;
+        // A module-level free fn: its own key holds its value rows.
+        let export = symbols_of(names, key, key, it.text, name)?.export;
         let rank = match export.as_deref() {
             Some(HOSTED_START) => 0,
             Some("main") => 1,
@@ -1386,7 +1404,9 @@ fn declared_identifier<'b>(v: &blaze_lower::View<'b>) -> Option<&'b str> {
     Some(name.strip_prefix("r#").unwrap_or(name))
 }
 
-fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text: &str, path: &str) -> Result<Symbols, Front2Refusal> {
+/// `values_at`: the key whose value rows a `link_name`/`export_name` written as a macro call
+/// reads (links.rs `values_key`: `lib` itself, or a body's foreign declaration's library twin).
+fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, values_at: LibKey, text: &str, path: &str) -> Result<Symbols, Front2Refusal> {
     let refuse = |why: String| Front2Refusal::Attrs { function: path.into(), why: why.into_boxed_str() };
     let krate = names.crate_of(lib).ok_or_else(|| refuse(format!("no crate holds {:x}", lib)))?;
     let atoms = names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg atoms are not read")))?;
@@ -1395,13 +1415,22 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
     // A body (`{ .. }`, not `;`) is the signature lowering's own flag (blaze-lower machine.rs
-    // `sig::HAS_BODY`), as front2/const_fn_fact.rs `head_fact` reads it.
+    // `sig::HAS_BODY`), as the frozen fn head's qualifiers read by const_fn_fact.rs.
     let has_body = v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY != 0;
     let intrinsic_declared = super::intrinsic_rule::Declared { has_body, must_be_overridden: false };
     let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
-        let value = || v.text_at(a.args).map(|t| Box::<str>::from(unquote(t))).map_err(|e| refuse(format!("{e:?}")));
+        // The cooked string, as the native image reads it (links.rs `symbol_of`): escapes
+        // applied, a leading `\u{1}` kept as the exact-symbol mark, and a value written as a
+        // macro call (ring's `concat!(prefix!(), stringify!(f))`) the names' row of the item,
+        // expanded once by its crate's solve: the link table's symbol, over records too.
+        let value = |attr: &'static str| {
+            let t = v.text_at(a.args).map_err(|e| refuse(format!("{e:?}")))?;
+            super::links::symbol_of(t, Some(values_at), |item| names.attr_value(item, attr), edition, Alloc::global())
+                .map(Box::<str>::from)
+                .map_err(|why| refuse(format!("`#[{attr} = {t}]`: {why:?}")))
+        };
         match v.text_at(a.path).map_err(|e| refuse(format!("{e:?}")))?.trim() {
             // The fn's own identifier, from its signature; never the shown `path`, which for a
             // fn declared in a block is no name (check.rs `item_shown` prints its key):
@@ -1410,8 +1439,8 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text
                 let name = declared_identifier(&v).ok_or_else(|| refuse(String::from("a `#[no_mangle]` fn whose signature's lowering holds no name")))?;
                 out.export = Some(name.into());
             }
-            "export_name" => out.export = Some(value()?),
-            "link_name" => out.link_name = Some(value()?),
+            "export_name" => out.export = Some(value("export_name")?),
+            "link_name" => out.link_name = Some(value("link_name")?),
             "rustc_intrinsic" => out.intrinsic = true,
             super::intrinsic_rule::MUST_BE_OVERRIDDEN => out.intrinsic_declared.must_be_overridden = true,
             "rustc_nounwind" => out.nounwind = true,
@@ -1652,10 +1681,20 @@ impl FrontEnd for Front2Program<'_> {
     /// The fills the instance questions' worlds noted, made as the body check makes its own
     /// (check.rs `make_all`).
     fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
-        let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));        if fills.is_empty() {
-            return Ok(false);
-        }
+        let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));
+        let mut gaps = core::mem::replace(self.asked_gaps.get_mut(), Vec::new_in(Global));
         let owner = self.fns[i].key;
+        if fills.is_empty() {
+            // As the lazy program's: a refused answer is the instance's refusal by name.
+            if gaps.is_empty() {
+                return Ok(false);
+            }
+            gaps.sort_unstable_by_key(|g| format!("{g:?}"));
+            gaps.dedup_by_key(|g| format!("{g:?}"));
+            return Err(crate::run::RunError::Front2(Front2Refusal::Asked { function: self.fns[i].path.clone(), error: CheckFail::Gap { owner, gaps } }));
+        }
+        // With the evaluator the program keeps, as the lazy program's `make_asked` (its
+        // comment says why: a head these fills make may name a constant).
         let mut records = Records {
             names: self.front.names,
             keys: &mut self.front.keys,
@@ -1663,7 +1702,7 @@ impl FrontEnd for Front2Program<'_> {
             store: &mut self.store,
             buckets: &mut self.buckets,
             order: BuildOrder::AsAsked,
-            consts: None,
+            consts: Some((&mut self.consts, self.prepared)),
         };
         super::check::make_all(&mut records, fills, owner)
             .map_err(|error| crate::run::RunError::Front2(Front2Refusal::Asked { function: self.fns[i].path.clone(), error }))?;

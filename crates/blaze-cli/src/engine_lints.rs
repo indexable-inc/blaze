@@ -1,7 +1,7 @@
 //! The `Lints` stage of `blaze engine-check` (docs/v2/plan/design/lints-stage.md, D135): ONE
 //! task an item, every selected token rule in its one walk, so an edit relints what it changed.
 //!
-//! THE PLAN, from text: one `Lint` task a lint unit an outline lists (lints.rs `parts`: unit 0 the
+//! THE PLAN, from text: one `Lint` task a lint unit an outline lists (lints.rs `parts_in`: unit 0 the
 //! file with its top-level items as holes, one unit an outline entry with its children as holes),
 //! in `Phase { stage: Lints, wave: 0 }`, named as the outline names it (its file and its entry's
 //! chain), its source the unit's (its own bytes, holes, scope and `variant-count` read) with the
@@ -10,7 +10,7 @@
 //!
 //! THE TASK, on the pool: one job a file, its text read once and checked against the id its
 //! outline's key was made from, outlined once, and its entered units linted by blaze-lint in one
-//! pass each (lints.rs `lint_units`; blaze-lint lib.rs: one lex, each token dispatched to the
+//! pass each (lints.rs `lint_units_in`; blaze-lint lib.rs: one lex, each token dispatched to the
 //! rules registered for its kind). Its row: `WHOLE` defined at the record's out (a digest of the
 //! findings and their words, never of the cost), no read, its findings' count. Its record: the
 //! findings as drive findings (rule number, item-relative range, words) and a payload of the
@@ -50,14 +50,17 @@ const SOURCE_DOMAIN: &str = "blaze-cli engine lint task source 1";
 /// What refuses a lint task here (rule 19).
 const RULE: &str = "blaze-cli engine_lints.rs";
 
-/// One `Lint` task a lint unit of each outline, none when no rule is selected (sorted by name).
-/// Its source (rule 21): the unit's (lints.rs `unit_source`), the rule set's id (a change of the
-/// step or of `lints-add` relints every unit and nothing else) and the edition.
+/// One `Lint` task a lint unit of each outline (sorted by name), whatever the step's rule set:
+/// the set a unit runs is the step's joined with what its file's marks add (lints.rs
+/// `lint_units_in`, blaze-lint `RootMarks::rules`), so an empty step set is no reason to skip a
+/// file that denies a lint or is a sans-IO core. The marks are not in the outline's record, so
+/// the plan cannot tell those files apart here; an unmarked file under an empty set makes empty
+/// records, kept by their keys after the first run.
+/// Its source (rule 21): the unit's (lints.rs `unit_source`, which holds the marks' key), the
+/// rule set's id (a change of the step or of `lints-add` relints every unit and nothing else)
+/// and the edition.
 pub(crate) fn plan<'h>(outlined: &[Outlined<'_>], rules: &RuleSet, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned = SVec::new_in(alloc);
-    if rules.is_empty() {
-        return planned;
-    }
     let set = rules.id();
     for one in outlined.iter() {
         let Ok(record) = &one.made else { continue };
@@ -93,14 +96,12 @@ struct Unit {
 }
 
 /// One file's job, made on the coordinator: its outline's place and its entered tasks, each with
-/// (task name, unit name, unit source) as lints.rs `lint_units` asks.
+/// (task name, unit name, unit source) as lints.rs `lint_units_in` asks.
 /// What the worker needs of the outline is copied out (its path, source and edition), so the job
 /// crosses to a worker with no part of the outline's record.
 struct FileJob<'p> {
     file: usize,
-    path: &'p [u8],
-    source: ContentId,
-    edition: u8,
+    text: FileText<'p>,
     tasks: std::vec::Vec<Task, Global>,
     asked: std::vec::Vec<(Name, Name, ContentId), Global>,
 }
@@ -172,7 +173,7 @@ impl LintsStage {
             };
             if jobs.last().is_none_or(|job| job.file != file) {
                 let one = &outlined[file];
-                jobs.push(FileJob { file, path: &one.path[..], source: one.source, edition: one.edition, tasks: std::vec::Vec::new_in(Global), asked: std::vec::Vec::new_in(Global) });
+                jobs.push(FileJob { file, text: FileText { path: &one.path[..], source: one.source, edition: one.edition }, tasks: std::vec::Vec::new_in(Global), asked: std::vec::Vec::new_in(Global) });
             }
             if let Some(job) = jobs.last_mut() {
                 job.tasks.push(*task);
@@ -204,7 +205,7 @@ impl LintsStage {
                 let clock = clock.clone();
                 running.push(scope.may_overlap("engine lints", LINTS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let made = work::unwinding(|| lint_file(cx, root, job, rules));
+                    let made = work::unwinding(|| lint_file(cx, root, job.text, &job.asked, rules));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns)))
                 }));
             }
@@ -244,19 +245,13 @@ impl LintsStage {
                 }
             };
             for (task, unit) in job.tasks.iter().zip(units) {
-                let record = match unit.made {
-                    Ok(record) => record,
-                    Err(why) => {
-                        refuse(task, why, buffer);
-                        continue;
+                match unit_done(task, job.file, unit, alloc) {
+                    Ok((done, made)) => {
+                        buffer.done.push(done);
+                        self.made.push(made);
                     }
-                };
-                let name = task.planned.name;
-                let mut defines = SVec::with_capacity_in(1, alloc);
-                defines.push((WHOLE, record.out));
-                let findings = u32::try_from(record.findings.len()).unwrap_or(u32::MAX);
-                buffer.done.push(Done { name, key: task.key, out: record.out, defines, reads: SVec::new_in(alloc), findings, failed: false });
-                self.made.push(Made { name, file: job.file, chain: unit.chain, item: unit.item, record });
+                    Err(why) => refuse(task, why, buffer),
+                }
             }
         }
         self.made.sort_unstable_by_key(|one| one.name);
@@ -348,11 +343,87 @@ impl LintsStage {
     }
 }
 
+/// The file a lint job reads, as its outline names it: its path, the id of its text with its
+/// edition folded in (engine_tasks.rs `edition_source`) and its edition byte.
+#[derive(Clone, Copy)]
+struct FileText<'p> {
+    path: &'p [u8],
+    source: ContentId,
+    edition: u8,
+}
+
+/// One unit's row (`WHOLE` defined at the record's out, no read, its findings' count) and what
+/// the request keeps of it: the one conversion from a worker's [`Unit`] to the engine's `Done`,
+/// for the phase path's join and the `Ready` driver's [`LintsStage::lint_units`] alike (rule 30).
+/// A unit that failed is its `Why`; the caller files the task's failed row.
+fn unit_done<'a>(task: &Task, file: usize, unit: Unit, alloc: SharedAlloc<'a>) -> Result<(Done<'a>, Made), Why> {
+    let record = unit.made?;
+    let name = task.planned.name;
+    let mut defines = SVec::with_capacity_in(1, alloc);
+    defines.push((WHOLE, record.out));
+    let findings = u32::try_from(record.findings.len()).unwrap_or(u32::MAX);
+    let done = Done { name, key: task.key, out: record.out, defines, reads: SVec::new_in(alloc), findings, failed: false };
+    Ok((done, Made { name, file, chain: unit.chain, item: unit.item, record }))
+}
+
+/// What the request keeps of one unit the `Ready` driver ran ([`LintsStage::lint_units`]): its
+/// result, or its refusal and why, merged into the stage after the drive by [`LintsStage::keep`]
+/// (a run reads the stage, never writes it: it runs on any worker).
+pub(crate) enum UnitKept {
+    Made(Made),
+    Refused(Name, Why),
+}
+
+impl LintsStage {
+    /// A file's entered `Lint` tasks in ONE walk, for the `Ready` driver (D187): the file's text
+    /// read and checked as a phase's job does, its units walked once for their scopes (lints.rs
+    /// `lint_units_in`; a unit's scope comes from its parents, so a walk a unit would read the
+    /// file once a unit), the rules run on each asked unit, and each task's row with what the
+    /// request keeps of it, in `asked`'s order. `file` is the outline's place in the planner's
+    /// outlines; `asked` each task with its unit's source as the outline lists it. A failure of
+    /// the whole file (its text moved, a panic) is each task's failed row, named.
+    pub(crate) fn lint_units<'a>(&self, cx: &Cx, root: &Dir<ReadWrite>, file: usize, one: &Outlined<'_>, asked: &[(Task, ContentId)], alloc: SharedAlloc<'a>) -> SVec<'a, (Done<'a>, UnitKept)> {
+        let text = FileText { path: &one.path[..], source: one.source, edition: one.edition };
+        let mut units: SVec<'a, (Name, Name, ContentId)> = SVec::with_capacity_in(asked.len(), alloc);
+        units.extend(asked.iter().map(|(task, unit)| (task.planned.name, task.planned.name, *unit)));
+        let mut rows: SVec<'a, (Done<'a>, UnitKept)> = SVec::with_capacity_in(asked.len(), alloc);
+        let refused = |task: &Task, why: Why| (crate::engine_tasks::failed(task, alloc), UnitKept::Refused(task.planned.name, why));
+        match work::unwinding(|| lint_file(cx, root, text, &units, &self.rules)) {
+            Ok(Ok(made)) => {
+                // `lint_file` answers each asked unit once, in order: a missing answer is named.
+                let mut made = made.into_iter();
+                for (task, _) in asked.iter() {
+                    rows.push(match made.next().map(|unit| unit_done(task, file, unit, alloc)) {
+                        Some(Ok((done, kept))) => (done, UnitKept::Made(kept)),
+                        Some(Err(why)) => refused(task, why),
+                        None => refused(task, Why::Refused { what: "a `Lint` task its file's walk did not answer", rule: RULE }),
+                    });
+                }
+            }
+            Ok(Err(why)) => rows.extend(asked.iter().map(|(task, _)| refused(task, why))),
+            Err(work::Panicked) => rows.extend(asked.iter().map(|(task, _)| refused(task, Why::Refused { what: "its file's lint walk panicked; that file's lint units alone failed", rule: RULE }))),
+        }
+        rows
+    }
+
+    /// What a `Ready` run of a unit made, kept as the phase path keeps it: a result in name order
+    /// (as [`LintsStage::result`] searches), or a refusal.
+    pub(crate) fn keep(&mut self, kept: UnitKept) {
+        match kept {
+            UnitKept::Made(made) => {
+                let at = self.made.partition_point(|one| one.name < made.name);
+                self.made.insert(at, made);
+            }
+            UnitKept::Refused(name, why) => self.refused.push((name, why)),
+        }
+    }
+}
+
 /// One file's lint job on a worker, in its task's frame: its text read once and checked against
 /// the id its outline was made from (a difference is [`Why::Changed`]: no re-read, rule 3),
-/// outlined once, its asked units linted (lints.rs `lint_units`), and each unit's item found by
+/// outlined once, its asked units linted (lints.rs `lint_units_in`), and each unit's item found by
 /// its name for its chain.
-fn lint_file(cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>, rules: &RuleSet) -> Result<std::vec::Vec<Unit, Global>, Why> {
+fn lint_file(cx: &Cx, root: &Dir<ReadWrite>, job: FileText<'_>, asked: &[(Name, Name, ContentId)], rules: &RuleSet) -> Result<std::vec::Vec<Unit, Global>, Why> {
     let refused = |what: &'static str| Why::Refused { what, rule: RULE };
     let frame = cx.frame();
     let path = core::str::from_utf8(job.path).map_err(|_| refused("its file's path is not UTF-8"))?;
@@ -367,15 +438,18 @@ fn lint_file(cx: &Cx, root: &Dir<ReadWrite>, job: &FileJob<'_>, rules: &RuleSet)
     let erased = blaze_own::Erased::new(frame);
     let outline = blaze_file_items::outline(text, edition, erased.handle());
     let subject = crate::signature::file_subject(path);
-    let mut did: blaze_own::Vec<Option<Result<Record<Global>, Why>>, Global> = blaze_own::Vec::with_capacity_in(job.asked.len(), Global);
-    crate::lints::lint_units(&outline, text, path, subject, &job.asked, rules, erased.handle(), &mut did).map_err(refused)?;
+    let mut did: blaze_own::Vec<Option<Result<Record<Global>, Why>>, Global> = blaze_own::Vec::with_capacity_in(asked.len(), Global);
+    // The same marks the outline's parts were keyed with (work.rs `outline_file`): the file
+    // stands as its own crate root, as there.
+    let marks = crate::lints::marks_of(text, text);
+    crate::lints::lint_units_in(&outline, text, path, subject, asked, rules, marks, erased.handle(), &mut did).map_err(refused)?;
     // Each unit by its name (unit 0 the file, unit `i + 1` entry `i`), searched once a task.
     let items = outline.items();
     let mut names: std::vec::Vec<(Name, usize), Global> = std::vec::Vec::with_capacity_in(items.len() + 1, Global);
     names.extend((0..=items.len()).map(|at| (crate::lints::unit_name(subject, &outline, at, text), at)));
     names.sort_unstable();
-    let mut units = std::vec::Vec::with_capacity_in(job.asked.len(), Global);
-    for ((name, _, _), made) in job.asked.iter().zip(did) {
+    let mut units = std::vec::Vec::with_capacity_in(asked.len(), Global);
+    for ((name, _, _), made) in asked.iter().zip(did) {
         let entry = names.binary_search_by_key(name, |(unit, _)| *unit).ok().and_then(|at| names[at].1.checked_sub(1)).map(|at| &items[at]);
         let chain = entry.map(|item| work::item_chain(&outline, item, text));
         let item = entry.map(|item| blaze_own::String::from_str_in(crate::item_name::shown_name(item, text), Global));

@@ -338,17 +338,6 @@ impl<'a> Vars<'a> {
         self.log_bound(table, r);
     }
 
-    /// Lowers the universe of `v`'s class to `u` if it is higher.
-    pub(crate) fn lower_universe(&mut self, table: Table, v: u32, u: Universe) {
-        let r = self.find(table, v);
-        let ti = table.at();
-        let was = self.t[ti].universe[ix(r)];
-        if u.0 < was {
-            self.t[ti].universe[ix(r)] = u.0;
-            self.note(table, OP_UNIVERSE, r, was);
-        }
-    }
-
     // ---- snapshots -----------------------------------------------------------------------
 
     /// Opens a snapshot (`InferCtxtLike::start_snapshot`).

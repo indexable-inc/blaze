@@ -1168,12 +1168,6 @@ impl Graph {
         self.freed_keys.append(&mut other.freed_keys);
     }
 
-    /// The job that makes `key`'s current flight, if a job does.
-    pub(crate) fn claimer(&self, key: Key) -> Option<JobId> {
-        let claimer = self.key_claimer[*self.keys.get(&key)? as usize];
-        (claimer != NONE).then_some(JobId(claimer))
-    }
-
     /// The job `job`'s wait ends with: the one it waits for, or the claimer of the key it
     /// waits for. None for a wait on a counter, or on a key no job claimed.
     pub(crate) fn waits_for(&self, job: JobId) -> Option<JobId> {

@@ -98,6 +98,7 @@ impl RecordSource for Store {
 /// wrote, and the order of publications and stores.
 struct Sim {
     next: u64,
+    stubbed: AVec<'static, SlotId>,
     published: AVec<'static, (u32, u64, AVec<'static, u8>)>,
     copied: AVec<'static, (u64, AVec<'static, u8>)>,
     /// "static", "store", "key" or "write", in order: no record's word is stored before the
@@ -118,7 +119,8 @@ struct Sim {
 const DATA: u64 = 0x9_0000_0000;
 
 impl Memory for Sim {
-    fn stub(&mut self, _slot: SlotId) -> Result<(), RunModeError> {
+    fn stub(&mut self, slot: SlotId) -> Result<(), RunModeError> {
+        self.stubbed.push(slot);
         Ok(())
     }
 
@@ -134,8 +136,8 @@ impl Memory for Sim {
         THUNKS + 16 * u64::from(slot.0)
     }
 
-    fn outside(&mut self, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
-        Err(RunModeError::Outside { symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
+    fn outside(&mut self, record: RecordId, symbol: Symbol, name: &str) -> Result<Outside, RunModeError> {
+        Err(RunModeError::Outside { record, symbol, name: super::CName::new(name), why: "the simulation binds no C names" })
     }
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
@@ -204,7 +206,7 @@ struct Seen {
     memory: Sim,
 }
 
-/// The entry's stub fired; then the parent's `Data` (when `told` holds any), `Declare` and
+/// The entry's stub fired; then the parent's `Declare`, `Data` (when `told` holds any) and
 /// `Publish` of `f`'s record, the acts carried as the native driver does, to the first error.
 fn run(statics: &[(Symbol, AVec<'static, u8>)], twice: bool) -> Seen {
     run_with(code(Alloc::global()), statics, twice, 0)
@@ -213,6 +215,17 @@ fn run(statics: &[(Symbol, AVec<'static, u8>)], twice: bool) -> Seen {
 /// [`run`] of the record `code`, with `thread_locals` `ThreadLocals` messages (naming [`DESC`]
 /// and [`ENDER`]) after the `Data`.
 fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], twice: bool, thread_locals: usize) -> Seen {
+    let pairs = [Declared { symbol: WireSymbol(F.0), slot: F_WIRE }];
+    run_declaring(code, statics, twice, thread_locals, &pairs)
+}
+
+fn run_declaring(
+    code: AVec<'static, u8>,
+    statics: &[(Symbol, AVec<'static, u8>)],
+    twice: bool,
+    thread_locals: usize,
+    pairs: &[Declared],
+) -> Seen {
     let alloc = Alloc::global();
     let mut store = Store { records: Vec::new_in(alloc) };
     let f = store.put(code);
@@ -224,6 +237,7 @@ fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], tw
     }
     let mut memory = Sim {
         next: AREA,
+        stubbed: Vec::new_in(alloc),
         published: Vec::new_in(alloc),
         copied: Vec::new_in(alloc),
         order: Vec::new_in(alloc),
@@ -242,6 +256,7 @@ fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], tw
     acts.clear();
 
     let mut down = std::vec::Vec::new();
+    Down::Declare { pairs: List::of(pairs) }.encode(0, &mut down).expect("Declare encodes");
     if !told.is_empty() {
         Down::Data { data: List::of(&told) }.encode(1, &mut down).expect("Data encodes");
         if twice {
@@ -253,8 +268,6 @@ fn run_with(code: AVec<'static, u8>, statics: &[(Symbol, AVec<'static, u8>)], tw
             .encode(10 + n as u64, &mut down)
             .expect("ThreadLocals encodes");
     }
-    let pairs = [Declared { symbol: WireSymbol(F.0), slot: F_WIRE }];
-    Down::Declare { pairs: List::of(&pairs) }.encode(3, &mut down).expect("Declare encodes");
     Down::Publish { slot: F_WIRE, tier: Tier::Zero, record: f }.encode(4, &mut down).expect("Publish encodes");
     if let Err(why) = mode.on(Event::Frame(&down), &mut acts) {
         return Seen { result: Err(why), memory };
@@ -330,6 +343,51 @@ fn a_static_is_placed_before_the_record_that_names_it() {
     assert!(matches!(again.result, Err(RunModeError::StaticTwice { .. })), "a static sent twice: {:?}", again.result);
     assert_eq!(m.rooms.as_slice(), &[Room::Code, Room::Code], "read-only statics lie in the code area");
     println!("run mode: 2 statics placed before the record naming them; its load reads S's word; T holds S, itself and f; 2 controls refused");
+}
+
+/// A static initialized with `[g, f]` holds both function addresses even when only `f` has
+/// a body. Change the first relocation to `f`, then omit it, and check the published bytes
+/// against the same pair of expected addresses each time.
+#[test]
+fn the_oracle_catches_a_wrong_instance_and_a_zero_function_word() {
+    let alloc = Alloc::global();
+    const G: Symbol = Symbol([2; 32]);
+    let pairs = [
+        Declared { symbol: WireSymbol(F.0), slot: F_WIRE },
+        Declared { symbol: WireSymbol(G.0), slot: Slot(5) },
+    ];
+    let placed = |first: Option<Symbol>, declared: &[Declared]| {
+        let mut words = Vec::new_in(alloc);
+        if let Some(symbol) = first {
+            words.push((0, Some(Target { space: Space::Func, symbol }), 0));
+        }
+        words.push((8, Some(Target { space: Space::Func, symbol: F }), 0));
+        let array = datum(Place::ReadOnly, &[0; 16], &words, alloc);
+        let seen = run_declaring(code(alloc), &[(S, array)], false, 0, declared);
+        assert_eq!(seen.result, Ok(()));
+        if first == Some(G) {
+            assert!(seen.memory.stubbed.contains(&SlotId(1)), "g must have a stub before its first call");
+        }
+        let bytes = &seen.memory.published[0].2;
+        let first = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let second = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+        [first, second]
+    };
+
+    // The entry gets local slot 0 at start, g gets local slot 1 on declaration. Only the
+    // entry is published. These addresses come from the simulated reservation's layout.
+    let expected = [THUNKS + 16, THUNKS];
+    assert_eq!(placed(Some(G), &pairs), expected);
+    // Replaying a start list with only f's code declares f alone. Filling the datum must
+    // still number and stub g from its symbol.
+    assert_eq!(placed(Some(G), &pairs[..1]), expected);
+    let wrong = placed(Some(F), &pairs);
+    assert_eq!(wrong, [THUNKS, THUNKS]);
+    assert_ne!(wrong, expected);
+    let zero = placed(None, &pairs);
+    assert_eq!(zero, [0, THUNKS]);
+    assert_ne!(zero, expected);
+    println!("static fn words hold g and f; the wrong instance and a zero word are detected");
 }
 
 /// Step 3 (the Reference, "Static items": a `static mut`, or a static whose type holds an

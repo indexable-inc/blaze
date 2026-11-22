@@ -153,6 +153,41 @@ fn cmpxchg_succeeds_and_fails() {
     }
 }
 
+/// A `cmpxchg` whose cell is past `sp + 32 KiB` (the 2048th value on) returns its old value:
+/// before pass.rs `FAR` the far address was made in `x12`, the register the old value is held
+/// in, and `st` wrote the cell's address as the old value. Padded by unused constants on each
+/// side of the boundary; the control (rule 23): with `FAR` back at `X12` the cases from 2048
+/// on fail on "the old value" and those below pass.
+#[test]
+fn far_cells_keep_cmpxchg_old_values() {
+    let flags = Flags::NONE.with_ordering(Ordering::SeqCst).with_failure(Ordering::SeqCst);
+    for lse in [true, false] {
+        for pad in [2040u32, 2047, 2048, 4200] {
+            let func = function(&[Ty::PTR, Ty::I64, Ty::I64], &[Ty::I64, Ty::I1], |b, v| {
+                for n in 0..pad {
+                    let _ = b.iconst(Ty::I64, u128::from(n));
+                }
+                let pair = b.cmpxchg(flags, v[0], v[1], v[2], attrs(Ty::I64));
+                vec![b.project(pair, 0), b.project(pair, 1)]
+            });
+            let code = emitted_for(func.view(), &[], isa(lse)).expect("emits");
+            let exec = run::place(&code, |_| unreachable!());
+            // SAFETY: an emitted C function of a pointer and two integers returning two
+            // integers, which AAPCS64 returns in x0 and x1 as it does this struct.
+            let f = unsafe { std::mem::transmute::<usize, extern "C" fn(u64, u64, u64) -> Two>(exec.code_address() as usize) };
+            for (old, expected, new) in [(5u64, 5u64, 9u64), (5, 6, 9)] {
+                let mut cell = Box::new(old);
+                let at = &mut *cell as *mut u64 as u64;
+                let Two(got, ok) = f(at, expected, new);
+                let what = format!("lse {lse}, after {pad} values: {old:#x} {expected:#x} {new:#x}");
+                assert_eq!(got, old, "{what}: the old value");
+                assert_eq!(ok & 1 == 1, old == expected, "{what}: the flag");
+                assert_eq!(*cell, if old == expected { new } else { old }, "{what}: the cell");
+            }
+        }
+    }
+}
+
 #[repr(C)]
 struct Two(u64, u64);
 

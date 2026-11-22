@@ -9,11 +9,16 @@
 //!
 //! `cargo run --release -p blaze-swiss --example index_cost`. The 10^7 row holds 2^22 groups
 //! of 32 bytes (134 MB) and an 80 MB column; the miss measurement 256 MB before them.
+//!
+//! The index's memory is the process's heap, named once at the entry (`blaze_own::Heap::process`,
+//! a plain binary's `fn main`), not `Global`: what is measured is the probe, not the allocator,
+//! and the index allocates only while it is built, outside every timing.
 
 #![feature(allocator_api)]
 
-use std::{alloc::Global, hint::black_box, time::Instant};
+use std::{hint::black_box, time::Instant};
 
+use blaze_own::{Heap, SharedAlloc};
 use blaze_swiss::{Index, prefetch};
 
 /// splitmix64's step: a fixed stream of well-mixed words.
@@ -68,7 +73,7 @@ fn miss_costs(words: usize) -> (f64, f64) {
 }
 
 /// ns per lookup of `find_many` over `queries`, `B` at a time.
-fn batched<const B: usize>(index: &Index<Global>, column: &[u64], queries: &[u64]) -> f64 {
+fn batched<const B: usize>(index: &Index<SharedAlloc<'static>>, column: &[u64], queries: &[u64]) -> f64 {
     best_ns(queries.len(), || {
         let mut found = 0;
         for chunk in queries.chunks_exact(B) {
@@ -85,6 +90,7 @@ fn batched<const B: usize>(index: &Index<Global>, column: &[u64], queries: &[u64
 }
 
 fn main() {
+    let heap = Heap::process();
     let (latency, gather) = miss_costs(1 << 25);
     println!(
         "a miss over 256 MB: {latency:.1} ns alone, {gather:.2} ns overlapped ({:.1} misses \
@@ -99,7 +105,7 @@ fn main() {
     for n in [1_000u64, 100_000, 10_000_000] {
         // Held keys are even words of the stream, misses odd ones: the sets never meet.
         let column: Vec<u64> = (0..n).map(|at| splitmix(2 * at) & !1).collect();
-        let index = Index::new_in(Global);
+        let index = Index::new_in(heap.shared());
         for (at, &key) in column.iter().enumerate() {
             index.insert(at, splitmix(key), at as u32, |value| splitmix(column[value as usize]));
         }

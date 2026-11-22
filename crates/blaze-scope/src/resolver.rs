@@ -1341,12 +1341,6 @@ impl<'a, N: Name> Resolver<'a, N> {
     pub fn stats(&self) -> FillStats {
         self.out.stats
     }
-
-    /// Switches on a planted bug, for a control.
-    #[cfg(test)]
-    pub(crate) fn set_plant(&mut self, plant: Plant) {
-        self.plant = plant;
-    }
 }
 
 /// Fills `out.cycle` with the modules the reads of `waits` were answered in progress on, those

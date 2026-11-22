@@ -31,12 +31,12 @@
 
 mod rungs;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use blaze_code::record::{Space, Symbol};
 use blaze_emit::{Isa, Os};
 use blaze_ladder::code_records::{
-    Builder, CodeKey, CodeStore, EntryView, InstanceNames, KeyPlant, LirSeen, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted,
+    Builder, CodeKey, CodeStore, EntryView, entry_of, InstanceNames, KeyPlant, LirSeen, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted,
     getter_parts,
 };
 use blaze_ladder::refusal::SourceFile;
@@ -99,7 +99,13 @@ fn builder_of(tier: TierName, overflow: OverflowChecks, edition: &str) -> Builde
     Builder {
         isa: Isa { lse: true, os: Os::MacOs },
         tier,
-        settings: Settings::baseline(overflow, blaze_build::Panic::Unwind),
+        // `panic = abort`, as the ladder's rungs are built and run (run.rs `build_survey`,
+        // `build_from(.., Panic::Abort, ..)`) and as tests/d106_records.rs builds its rungs:
+        // under `panic = unwind` an `extern "C"` body is nounwind, so each call in it lands on
+        // a terminate block calling `#[lang = "panic_cannot_unwind"]` (blaze-build
+        // walk/nounwind.rs `terminate_block`), which these `#![no_core]` programs and the
+        // ladder's rungs do not declare. Declaring it would add an instance to every count here.
+        settings: Settings::baseline(overflow, blaze_build::Panic::Abort),
         toolchain: ToolchainId([7; 32]),
         producer: blaze_ids::producer::Producers::for_tests(b"code records test builder").get::<blaze_ids::producer::CodeBuilder>(),
         edition: edition::PackageEdition::of_manifest(edition).expect("the package's edition is one blaze knows"),
@@ -177,7 +183,9 @@ fn who(symbol: Symbol, all: &[Met], declared: &BTreeMap<Symbol, Vec<u8>>) -> Str
 /// either way the walk met it, so its entry is in `store`.
 fn check_entry(rung: &str, store: &dyn CodeStore, met: &Met, all: &[Met]) -> Result<Targets, String> {
     let caller = &met.function;
-    let bytes = store.get(met.key).map_err(|e| format!("{rung}: `{caller}`: the store: {e:?}"))?;
+    // Through the code key's pointer: the walk puts each entry under its content key and points
+    // the code key at it (run.rs, "Put under its content key").
+    let bytes = entry_of(store, met.key).map_err(|e| format!("{rung}: `{caller}`: the store: {e:?}"))?;
     let bytes = bytes.ok_or_else(|| format!("{rung}: no entry for `{caller}` under {}", met.key))?;
     let entry = EntryView::read(bytes).map_err(|e| format!("{rung}: `{caller}`'s entry: {e}"))?;
     entry.no_address_word().map_err(|e| format!("{rung}: `{caller}`: {e}"))?;
@@ -315,7 +323,11 @@ fn a_second_build_makes_nothing() {
     let (third, _) = walk_program(PROGRAM, &mut other, TierName::Reference);
     assert_eq!(keys(&first), keys(&third));
     for m in &first {
-        assert_eq!(store.get(m.key).expect("reads"), other.get(m.key).expect("reads"), "`{}`: two builders of one key write equal bytes", m.function);
+        // Through the code key's pointer (`entry_of`): the entry is put under its content key,
+        // and a plain `get` of the code key is `None` on both sides, which compared equal.
+        let mine = entry_of(&store, m.key).expect("reads").unwrap_or_else(|| panic!("`{}`: no entry under its code key", m.function));
+        let theirs = entry_of(&other, m.key).expect("reads").unwrap_or_else(|| panic!("`{}`: no entry under its code key elsewhere", m.function));
+        assert_eq!(mine, theirs, "`{}`: two builders of one key write equal bytes", m.function);
     }
     let line = format!("second build: {summary}; keys equal, entries byte-equal");
     println!("{line}");
@@ -411,7 +423,7 @@ fn the_overflow_setting_moves_every_key() {
 struct Seen(Vec<(Symbol, usize)>);
 
 impl LirSeen for Seen {
-    fn seen(&mut self, _function: &str, symbol: Symbol, func: &blaze_lir::Func<std::alloc::Global>, _names: &InstanceNames<'_>) {
+    fn seen(&mut self, _function: &str, symbol: Symbol, func: blaze_lir::Verified<'_>, _names: &InstanceNames<'_>) {
         self.0.push((symbol, func.view().len()));
     }
 }

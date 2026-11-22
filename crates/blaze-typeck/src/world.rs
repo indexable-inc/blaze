@@ -19,6 +19,7 @@ use crate::error::{CheckError, Malformed, Stop};
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PathIdx, ScopeId, UintTy};
 use crate::portable::{PTy, PTys};
+use crate::regions::Region;
 
 #[cfg(test)]
 mod read_digest;
@@ -109,6 +110,10 @@ pub enum Question {
     /// The default values of an ADT's fields (`struct S { a: u8 = 1 }`, RFC 3681), as a
     /// base-less struct expression `S { .. }` reads them ([`World::field_defaults`]).
     FieldDefaults(ItemKey),
+    /// Whether the body may name the member fn `name` of inherent impl `container` (its
+    /// visibility against the body's module, [`World::member_visible`]): what method lookup
+    /// reads before it takes an inherent candidate.
+    MemberVisible(ItemKey, Name),
 }
 
 /// Whether a question's record is made from items alone or from another body's check.
@@ -148,7 +153,8 @@ impl Question {
             | Question::ConstParams(_)
             | Question::AssocGenerics(..)
             | Question::TypeAlias(_)
-            | Question::FieldDefaults(_) => RecordKind::Item,
+            | Question::FieldDefaults(_)
+            | Question::MemberVisible(..) => RecordKind::Item,
         }
     }
 }
@@ -212,6 +218,8 @@ impl TraitFlags {
     pub const COINDUCTIVE: u32 = 1 << 4;
     /// `#[const_trait]`.
     pub const CONST: u32 = 1 << 5;
+    /// The trait has early-bound lifetime arguments erased from its portable trait reference.
+    pub const LIFETIME_PARAMS: u32 = 1 << 6;
 
     pub const fn has(self, bits: u32) -> bool {
         self.0 & bits != 0
@@ -310,6 +318,18 @@ pub enum PClause {
     /// its item's; `args` are those generics as this item's table writes them (the identity
     /// for the item's own clause), substituted as a trait clause's are.
     Const { cond: ItemKey, args: List },
+    /// `ty: 'region` (`T: 'a`, `where &'b U: 'static`; D148). The type checker treats it as
+    /// true: lifetimes are erased here, and the borrow check is what proves it (as rustc's
+    /// typeck leaves region obligations to region resolution). Every place that turns a clause
+    /// into a goal or an assumption passes it over (machine.rs `register_predicates`,
+    /// infer/facts.rs `clauses`, rules/control.rs, rules/opaque_def.rs, rules/await_impl.rs,
+    /// specialize.rs, stalled.rs, instance.rs); the region is in the head's region numbering
+    /// (`regions::Region`), the clause's place in its head's list keyed by `nth` in the head's
+    /// `HeadRegions::outlives`.
+    TypeOutlives { ty: PTy, region: Region },
+    /// `'long: 'short` (`'a: 'b`, `where 'a: 'static`; D148): true for the type checker, as
+    /// [`PClause::TypeOutlives`] is.
+    RegionOutlives { long: Region, short: Region },
 }
 
 /// The value of a `where const` condition at ground arguments: blaze-solve's answer type,
@@ -532,6 +552,12 @@ impl TypeAttrs {
     /// arguments and nothing else. Typing reads nothing of it; the body check's `args-inline`
     /// (rules/args_inline.rs) does. Bit 64.
     pub const ARGS: u32 = 64;
+    /// `#[repr(packed)]`, `#[repr(packed(N))]` or `#[repr(C, packed)]` on a struct or union: a
+    /// field may be unaligned, so a closure or `async` block capturing a field BY REFERENCE
+    /// captures the struct instead, whatever the field's alignment (capture_places.rs `borrow`;
+    /// rustc_hir_typeck upvar.rs `restrict_repr_packed_field_ref_capture`). The world sets it
+    /// from the type's repr, the one fact layout reads too. Bit 128.
+    pub const PACKED: u32 = 128;
     /// Bits 8..12: an enum's discriminant type ([`DiscrRepr`]); 0 is `Unread`.
     const DISCR: u32 = 0xf << 8;
 
@@ -602,13 +628,27 @@ pub struct ClosureFacts<'w> {
 }
 
 /// An async block's facts, from its owner's check (`PNode::Coroutine`): its output and its
-/// interior (the tuple of what it holds), both of `types` in the owner's parameters (`Param(i)`
-/// is the coroutine type's `args[i]`).
+/// interior (the tuple of what it holds), both of `types` in the owner's parameters
+/// (`Param(i)` is the coroutine type's `args[i]`), and what that interior is ([`InteriorIs`]).
+/// A producer whose captured places are not known cannot answer this question yet.
 #[derive(Clone, Copy, Debug)]
 pub struct CoroutineFacts<'w> {
     pub output: PTy,
     pub interior: PTy,
     pub types: PTys<'w>,
+    pub is: InteriorIs,
+}
+
+/// How the producer determined the coroutine's stored state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorIs {
+    /// The stored state: the flow's saved locals and the captures (or a block that never
+    /// suspends, whose state is its captures).
+    Exact,
+    /// The candidate types collected by the body checker. Flow can discard a candidate
+    /// or store a reference to it. For example, proving `T: Send` leaves `&T: Send`
+    /// open until `T: Sync` is established. Only an exact row supplies a solver witness.
+    Superset,
 }
 
 /// Everything the driver may learn from outside the body. Implemented by the item layer over
@@ -653,9 +693,15 @@ pub trait World {
     /// The facts of closure `ordinal` of `owner`'s body (`Question::Closure`): `Missing` while
     /// the owner's body is not checked; `None` when its record has no such closure.
     fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<ClosureFacts<'_>>>;
+    /// The exact environment in the signature's type table. Signature-only
+    /// providers can answer callable goals, but cannot establish a capture trait.
+    fn closure_with_captures(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<(ClosureFacts<'_>, Option<PTy>)>> {
+        self.closure(seal, owner, ordinal).map(|row| row.map(|call| (call, None)))
+    }
     /// The facts of async block `ordinal` of `owner`'s body (`Question::Coroutine`): `Missing`
-    /// while the owner's body is not checked; `None` when its record has no such block. The
-    /// default is the gap (`Missing`): a world that holds no body records cannot answer it, and
+    /// while the owner's body or the block's exact interior is unavailable; `None` when its
+    /// record has no such block. The default is the gap (`Missing`): a world that holds no
+    /// body records cannot answer it, and
     /// a `PNode::Coroutine` it meets stays unlowered (never guessed). DEFAULTED so no world
     /// breaks; a world that holds body records answers it (blaze-ladder front2, the fixture).
     fn coroutine(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<CoroutineFacts<'_>>> {
@@ -712,11 +758,45 @@ pub trait World {
         let (_, _) = (seal, adt);
         Err(Missing)
     }
+    /// Whether the checked body may name the member fn `name` of the inherent impl
+    /// `container` (`Question::MemberVisible`): the Reference, "Visibility and privacy": a
+    /// private item (or `pub(self)`) is visible in its module and the modules under it,
+    /// `pub(super)` in its parent's, `pub(in path)` in the module the path names, `pub(crate)`
+    /// in its crate, `pub` everywhere. Method lookup asks it of each inherent candidate
+    /// before taking it (rustc's probe.rs `push_candidate`: an inaccessible candidate is set
+    /// aside as a private candidate, so a visible trait method of that name is found instead:
+    /// reth's private `Tx::<RW>::put(kind, key, value)` beside `DbTxMut::put(key, value)`).
+    /// DEFAULTED to `true`: right only for a world whose inherent members are all visible from
+    /// the bodies it checks, which is every world but the one over real crates (blaze-ladder
+    /// front2 answers it); the method becomes required with the next batch over the worlds.
+    fn member_visible(&self, seal: Seal, container: ItemKey, name: Name) -> Fetch<bool> {
+        let (_, _, _) = (seal, container, name);
+        Ok(true)
+    }
     /// The questions the last check of this body asked, before the walk starts: fetch them in
     /// one batch. Answers nothing.
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
         let _ = (seal, questions);
     }
+    /// Which question the run is about to ask of this world (`Some`), or that the answer is in
+    /// (`None`): [`Asking::repeat`] says this run had an answer to it already, so every read
+    /// the world makes answering it again is one it recorded then (a world that records its
+    /// own reads mutes them: blaze-ladder front2 tables/recorder.rs `Repeats::Quiet`), and
+    /// [`Asking::kind`] is the question's [`QUESTION_KINDS`](crate::QUESTION_KINDS) index, what
+    /// a world counts its reads under. Answers nothing. Nothing by default.
+    fn asking(&self, seal: Seal, ask: Option<Asking>) {
+        let _ = (seal, ask);
+    }
+}
+
+/// One ask as [`World::asking`] is told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asking {
+    /// The question's kind, its index in [`QUESTION_KINDS`](crate::QUESTION_KINDS).
+    pub kind: usize,
+    /// This run had an answer (`Ok`) to the same question already: the world's reads of it
+    /// are listed (the run's memo, `Reads::heard`).
+    pub repeat: bool,
 }
 
 /// The read list: each question asked and the content hash of its answer, sorted by question
@@ -837,6 +917,14 @@ impl Holed for ConstHolds {
     }
 }
 
+/// A visibility answer's stand-in ([`World::member_visible`]): visible, so the round goes on
+/// and asks what the candidate's check needs; nothing past a hole leaves the run.
+impl Holed for bool {
+    fn hole() -> Self {
+        true
+    }
+}
+
 /// A planted bug of the hole tests (`tests::a_hole_*`); `None` outside them.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,6 +950,12 @@ pub struct Reads<'w, 'a, W: World> {
     tally: Option<Tallying<'w>>,
     /// The digests of the record tables' terms this run has hashed (`rooted_hash`).
     hashes: Hashes<'a>,
+    /// THE RUN'S MEMO OF ASKS (rule 77): every question the world answered (`Ok`) in this run,
+    /// its syntactic prefetch's answers too. A question in it is asked again as a repeat
+    /// ([`Asking::repeat`]): the world's reads of it were recorded at its first answer, so a
+    /// world that records them mutes the second. A hole is not in it (the next ask may be
+    /// answered, by reads the hole's did not make).
+    heard: blaze_hash::HashSet<Question, Alloc<'a>>,
 }
 
 /// A run's memo of term digests: a record table's node (the table's number, its index) to
@@ -937,7 +1031,7 @@ impl<'a> Hashes<'a> {
     /// reach (a list: its length, then its terms'). Content only: two stores holding one head
     /// give one digest whatever order each interned its terms in.
     fn rooted<T: Tabled>(&mut self, v: &T) -> Result<u64, CheckError> {
-        let mut h = StableHasher::new("answer shape");
+        let mut h = StableHasher::new(T::DOMAIN);
         v.hash_shape(&mut h);
         self.roots.clear();
         let mut roots = core::mem::replace(&mut self.roots, Vec::new_in(self.alloc));
@@ -989,6 +1083,7 @@ pub(crate) enum Root {
 /// its read-list digest hashes the record without the table, then the terms its own handles
 /// reach (`Reads::rooted_hash`), never the rest of the table.
 pub(crate) trait Tabled: ContentHash {
+    const DOMAIN: &'static str = "answer shape";
     /// Pushes the record's handles into its table and returns the table (`None`: no record).
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>>;
     /// Hashes what is hashed besides the reached terms: the record without its table and
@@ -999,6 +1094,7 @@ pub(crate) trait Tabled: ContentHash {
 }
 
 impl<T: Tabled> Tabled for Option<T> {
+    const DOMAIN: &'static str = T::DOMAIN;
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         self.as_ref().and_then(|v| v.parts(roots))
     }
@@ -1031,6 +1127,10 @@ fn clauses_shape(cs: &[PClause], h: &mut StableHasher) {
                 h.tag(2);
                 h.u128(cond.0);
             }
+            // The kind only: the region is no input of a type check (the clause is true here),
+            // and a lifetime-only edit must not move what type checks read (D148).
+            PClause::TypeOutlives { .. } => h.tag(3),
+            PClause::RegionOutlives { .. } => h.tag(4),
         }
     }
 }
@@ -1043,6 +1143,8 @@ fn clause_roots(cs: &[PClause], roots: &mut Vec<Root, Alloc<'_>>) {
                 roots.push(Root::List(args));
                 roots.push(Root::Ty(term));
             }
+            PClause::TypeOutlives { ty, .. } => roots.push(Root::Ty(ty)),
+            PClause::RegionOutlives { .. } => {}
         }
     }
 }
@@ -1186,23 +1288,80 @@ impl ContentHash for ClosureFacts<'_> {
     }
 }
 
+impl Tabled for (ClosureFacts<'_>, Option<PTy>) {
+    const DOMAIN: &'static str = "blaze.closure-facts.v2.captures";
+
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.0.sig));
+        roots.extend(self.1.map(Root::Ty));
+        Some(self.0.types)
+    }
+
+    fn hash_shape(&self, h: &mut StableHasher) {
+        self.0.hash_shape(h);
+        h.u32(u32::from(self.1.is_some()));
+    }
+}
+
+impl ContentHash for (ClosureFacts<'_>, Option<PTy>) {
+    fn hash_into(&self, h: &mut StableHasher) {
+        *h = h.bytes(Self::DOMAIN.as_bytes());
+        self.0.hash_into(h);
+        self.1.map(|p| p.0).hash_into(h);
+    }
+}
+
 impl Tabled for CoroutineFacts<'_> {
+    const DOMAIN: &'static str = "blaze.coroutine-facts.v2.exact";
+
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         roots.push(Root::Ty(self.output));
         roots.push(Root::Ty(self.interior));
         Some(self.types)
     }
-    fn hash_shape(&self, _h: &mut StableHasher) {
-        // Two handles and their table: all its content is the terms `parts` reaches.
+    fn hash_shape(&self, h: &mut StableHasher) {
+        // Two handles and their table: all its content is the terms `parts` reaches, and what
+        // the interior is. An exact record hashes as it did before `InteriorIs` (no byte), so
+        // every exact read's digest stands; a superset record adds one tag, so a reader that
+        // checked against a superset is entered again when its producer's flow is repaired.
+        match self.is {
+            InteriorIs::Exact => {}
+            InteriorIs::Superset => h.tag(1),
+        }
     }
 }
 
 impl ContentHash for CoroutineFacts<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
+        *h = h.bytes(Self::DOMAIN.as_bytes());
         h.u32(self.output.0);
         h.u32(self.interior.0);
+        if self.is == InteriorIs::Superset {
+            h.tag(1);
+        }
         self.types.hash_into(h);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_coroutine_read_requires_an_exact_witness_in_its_key() {
+    let nodes = [crate::portable::PNode::Bool, crate::portable::PNode::Tuple(List::EMPTY)];
+    let types = PTys::flat(&nodes, &[]);
+    let record = CoroutineFacts { output: PTy(0), interior: PTy(1), types, is: InteriorIs::Exact };
+    let mut hashes = Hashes::new_in(Alloc::global());
+    let exact = hashes.rooted(&Some(record)).expect("a checked coroutine");
+    // A superset record of the same types is another answer: a reader checked against it is
+    // entered again when the producer's flow gives the exact one.
+    let superset = hashes.rooted(&Some(CoroutineFacts { is: InteriorIs::Superset, ..record })).expect("a superset coroutine");
+    assert_ne!(exact, superset, "a superset interior read the same as an exact one");
+    let mut unqualified = StableHasher::new("answer shape");
+    unqualified.tag(1);
+    for t in [record.output, record.interior] {
+        unqualified.u64(hashes.term(0, types, t.0).expect("a term in the record"));
+    }
+    assert_ne!(exact, unqualified.finish(), "the old key did not certify an exact interior");
+    assert_ne!(exact, hashes.rooted(&None::<CoroutineFacts<'_>>).expect("an absent block"));
 }
 
 impl Tabled for AliasDef<'_> {
@@ -1248,6 +1407,20 @@ impl Tabled for Hidden<'_> {
     }
 }
 
+impl Hidden<'_> {
+    /// The digest a caller records after revealing this opaque's hidden type.
+    pub fn answer_digest(self, alloc: Alloc<'_>) -> Result<u64, CheckError> {
+        Hashes::new_in(alloc).rooted(&Some(self))
+    }
+}
+
+impl CoroutineFacts<'_> {
+    /// The digest a caller records for this exact output and interior.
+    pub fn answer_digest(self, alloc: Alloc<'_>) -> Result<u64, CheckError> {
+        Hashes::new_in(alloc).rooted(&Some(self))
+    }
+}
+
 /// The content digest of ground arguments `args` of a table `types` holding only them (as
 /// exported, hash-consed: its bytes are a function of the arguments' structure), which names a
 /// `where const` condition's record with the condition's key ([`Question::ConstHolds`]).
@@ -1284,7 +1457,29 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
             log,
             tally,
             hashes: Hashes::new_in(alloc),
+            heard: blaze_hash::HashSet::new_in(alloc),
         }
+    }
+
+    /// The start of one ask of `q`: the world told what it answers next and whether this run
+    /// answered it already ([`World::asking`]); the stamp the tally times the answer from.
+    /// [`Reads::record_with`] tells the world the answer is in.
+    fn ask(&self, q: Question) -> u64 {
+        self.world.asking(Self::seal(), Some(Asking { kind: question_kind(q), repeat: self.heard.contains(&q) }));
+        self.stamp()
+    }
+
+    /// One ask of the syntactic prefetch (not a read of the run: nothing enters the read list),
+    /// framed as [`Reads::ask`] frames a read, so the world counts and mutes it alike; an `Ok`
+    /// answer enters [`Reads::heard`] (the world recorded its reads).
+    fn ask_ahead<T>(&mut self, q: Question, answer: impl FnOnce(&'w W) -> Fetch<T>) -> Fetch<T> {
+        self.world.asking(Self::seal(), Some(Asking { kind: question_kind(q), repeat: self.heard.contains(&q) }));
+        let got = answer(self.world);
+        self.world.asking(Self::seal(), None);
+        if got.is_ok() {
+            self.heard.insert(q);
+        }
+        got
     }
 
     /// The recorder for one run that also keeps `tally`, reading `clock`.
@@ -1351,13 +1546,6 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
     }
 
-    /// Marks the asks that follow as a ground solver goal's (`true`) or not.
-    pub(crate) fn in_ground_goal(&mut self, ground: bool) {
-        if let Some(l) = &mut self.log {
-            l.cursor.ground_goal = ground;
-        }
-    }
-
     /// The ask log of the run, with its end.
     pub(crate) fn take_log(&mut self) -> Option<AskLog<'a>> {
         let l = self.log.take()?;
@@ -1372,27 +1560,41 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The one seam every read of another item's record goes through: asks the world, logs
     /// the ask when measuring, and enters the answer's hash into the read list.
     fn record<T: ContentHash + Holed>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
-        self.record_with(q, got, asked_at, |_, v| Ok(hash_of("answer", v)))
+        self.record_with(q, got, asked_at, |_, v| Ok(Some(hash_of("answer", v))))
     }
 
     /// The read-list digest of this run's latest answer to `q` (a record already read).
     pub(crate) fn digest(&self, q: Question) -> Result<u64, CheckError> {
-        self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))
+        self.recorded(q).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))
+    }
+
+    /// The read-list digest of this run's latest answer to `q`, `None` when no answer to it
+    /// entered the list (never asked, a hole, or an opaque seen as itself: [`Reads::opaque_record`]).
+    pub(crate) fn recorded(&self, q: Question) -> Option<u64> {
+        self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1)
     }
 
     /// `record` for an answer with a table: its digest covers only the terms it reaches.
     fn record_tabled<T: Tabled + Holed>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
-        self.record_with(q, got, asked_at, |h, v| h.rooted(v))
+        self.record_with(q, got, asked_at, |h, v| h.rooted(v).map(Some))
     }
 
+    /// The one seam's body. `digest` gives the answer's read-list digest, or `None` for an
+    /// answer that is no read of the program (it is asked, counted and logged as any answer,
+    /// and enters no read list).
     fn record_with<T: Holed>(
         &mut self,
         q: Question,
         got: Fetch<T>,
         asked_at: u64,
-        digest: impl FnOnce(&mut Hashes<'a>, &T) -> Result<u64, CheckError>,
+        digest: impl FnOnce(&mut Hashes<'a>, &T) -> Result<Option<u64>, CheckError>,
     ) -> Result<T, Stop> {
         let answered_at = self.stamp();
+        // The answer is in ([`Reads::ask`] began it): the world's reads are its own again.
+        self.world.asking(Self::seal(), None);
+        if got.is_ok() {
+            self.heard.insert(q);
+        }
         if let Some(l) = &mut self.log {
             l.asks.push(Ask {
                 question: q,
@@ -1406,8 +1608,9 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
         match got {
             Ok(v) => {
-                let d = digest(&mut self.hashes, &v)?;
-                self.entries.push((q, d));
+                if let Some(d) = digest(&mut self.hashes, &v)? {
+                    self.entries.push((q, d));
+                }
                 self.count(q, false, asked_at, answered_at);
                 Ok(v)
             }
@@ -1459,12 +1662,13 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let mut second: Vec<Question, Alloc<'a>> = Vec::new_in(alloc);
         for (i, bp) in body.paths.iter().enumerate() {
             let def = match bp.lang {
-                Some(l) => self.world.lang_path(Self::seal(), l),
+                Some(l) => self.ask_ahead(Question::LangPath(l), |w| w.lang_path(Self::seal(), l)),
                 None => {
                     names.clear();
                     let Ok(segs) = body.segment_list(bp.segments) else { continue };
                     names.extend(segs.iter().map(|s| s.name));
-                    self.world.resolve_path(Self::seal(), bp.scope, PathIdx(i as u32), &names).map(|r| r.ok().map(|r| r.def))
+                    let path = PathIdx(i as u32);
+                    self.ask_ahead(Question::Path(bp.scope, path), |w| w.resolve_path(Self::seal(), bp.scope, path, &names)).map(|r| r.ok().map(|r| r.def))
                 }
             };
             let Ok(Some(def)) = def else { continue };
@@ -1488,7 +1692,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
         for e in body.exprs {
             let crate::body::Expr::MethodCall { scope, name, .. } = *e else { continue };
-            let Ok(traits) = self.world.traits_in_scope(Self::seal(), scope) else { continue };
+            let Ok(traits) = self.ask_ahead(Question::TraitsInScope(scope), |w| w.traits_in_scope(Self::seal(), scope)) else { continue };
             for &t in traits {
                 second.push(Question::AssocItem(t, name));
                 second.push(Question::TraitDef(t));
@@ -1509,25 +1713,25 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     pub fn fn_sig(&mut self, item: ItemKey) -> Result<Option<FnSig<'w>>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::FnSig(item));
                 let got = self.world.fn_sig(Self::seal(), item);
         self.record_tabled(Question::FnSig(item), got, asked_at)
     }
 
     pub fn predicates(&mut self, item: ItemKey) -> Result<Predicates<'w>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Predicates(item));
                 let got = self.world.predicates(Self::seal(), item);
         self.record_tabled(Question::Predicates(item), got, asked_at)
     }
 
     pub fn adt(&mut self, item: ItemKey) -> Result<Option<Adt<'w>>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Adt(item));
                 let got = self.world.adt(Self::seal(), item);
         self.record_tabled(Question::Adt(item), got, asked_at)
     }
 
     pub fn impls_of(&mut self, trait_: ItemKey, shape: Shape) -> Result<&'w [ItemKey], Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::ImplsOf(trait_, shape));
                 let got = self.world.impls_of(Self::seal(), trait_, shape);
         self.record(Question::ImplsOf(trait_, shape), got, asked_at)
     }
@@ -1535,7 +1739,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// An impl's header, checked where it enters: a trait impl's arguments after `Self` must
     /// number the trait's parameters besides `Self` (`CheckError::ImplTraitArity` names it).
     pub fn impl_header(&mut self, item: ItemKey) -> Result<Option<ImplHeader<'w>>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::ImplHeader(item));
                 let got = self.world.impl_header(Self::seal(), item);
         let h = self.record_tabled(Question::ImplHeader(item), got, asked_at)?;
         if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
@@ -1556,19 +1760,19 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     pub fn inherent(&mut self, shape: Shape, name: Name) -> Result<&'w [AssocItem], Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Inherent(shape, name));
                 let got = self.world.inherent(Self::seal(), shape, name);
         self.record(Question::Inherent(shape, name), got, asked_at)
     }
 
     pub fn assoc_item(&mut self, container: ItemKey, name: Name) -> Result<Option<AssocItem>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::AssocItem(container, name));
                 let got = self.world.assoc_item(Self::seal(), container, name);
         self.record(Question::AssocItem(container, name), got, asked_at)
     }
 
     pub fn traits_in_scope(&mut self, scope: ScopeId) -> Result<&'w [ItemKey], Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::TraitsInScope(scope));
                 let got = self.world.traits_in_scope(Self::seal(), scope);
         self.record(Question::TraitsInScope(scope), got, asked_at)
     }
@@ -1579,43 +1783,77 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         path: PathIdx,
         segments: &[Name],
     ) -> Result<crate::path_miss::PathAnswer, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Path(scope, path));
                 let got = self.world.resolve_path(Self::seal(), scope, path, segments);
         self.record(Question::Path(scope, path), got, asked_at)
     }
 
     pub fn lang_item(&mut self, item: LangItem) -> Result<Option<ItemKey>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Lang(item));
                 let got = self.world.lang_item(Self::seal(), item);
         self.record(Question::Lang(item), got, asked_at)
     }
 
     pub fn lang_path(&mut self, item: LangItem) -> Result<Option<Def>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::LangPath(item));
                 let got = self.world.lang_path(Self::seal(), item);
         self.record(Question::LangPath(item), got, asked_at)
     }
 
     pub fn const_value(&mut self, item: ItemKey) -> Result<Option<u64>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Const(item));
                 let got = self.world.const_value(Self::seal(), item);
         self.record(Question::Const(item), got, asked_at)
     }
 
     pub fn opaque_hidden(&mut self, item: ItemKey) -> Result<Option<Hidden<'w>>, Stop> {
-        let asked_at = self.stamp();
-                let got = self.world.opaque_hidden(Self::seal(), item);
-        self.record_tabled(Question::Opaque(item), got, asked_at)
+        use crate::rules::async_fn::{SupersetFrom, superset_record};
+        let hidden = self.opaque_record(item)?;
+        if let Some(h) = hidden {
+            let alloc = self.alloc();
+            if superset_record(self, SupersetFrom::Import(h), alloc)?.is_some() {
+                // The opaque's declared bounds still apply. Structural auto-trait leakage
+                // waits until the producer supplies the stored state.
+                return Ok(None);
+            }
+        }
+        Ok(hidden)
     }
 
-    pub fn closure(&mut self, owner: ItemKey, ordinal: u32) -> Result<Option<ClosureFacts<'w>>, Stop> {
-        let asked_at = self.stamp();
-        let got = self.world.closure(Self::seal(), owner, ordinal);
+    /// The hidden type of `item` as this run's world reveals it. A hidden type given is a read
+    /// (its digest enters the list). `None`, the opaque seen as itself (not in the running
+    /// check's leak list: front2 opaque_auto.rs `Reveal::InBody`), is NOT: it reads nothing of
+    /// the program (the opaque's bounds are their own read, `Question::Predicates`), only the
+    /// state of this check, which a later reveal changes while the program stays as it was.
+    /// Recorded, it put two answers to one fact in one body's list whenever two parts of a
+    /// check saw the opaque at two leak lists (the check's last round, then the stalled-goal
+    /// decision that revealed it: front2 stalled_goals.rs), and the list was refused
+    /// (`TwoAnswers`, rule 21). A check that sees the opaque as itself decides nothing by its
+    /// hidden type (an auto trait on it is undecided until it is revealed: blaze-solve
+    /// `Ask::first_hidden_unknown`), so its answers depend only on the reads it keeps.
+    pub(crate) fn opaque_record(&mut self, item: ItemKey) -> Result<Option<Hidden<'w>>, Stop> {
+        let asked_at = self.ask(Question::Opaque(item));
+        let got = self.world.opaque_hidden(Self::seal(), item);
+        self.record_with(Question::Opaque(item), got, asked_at, |h, v| match v {
+            Some(_) => h.rooted(v).map(Some),
+            None => Ok(None),
+        })
+    }
+
+    pub fn closure(&mut self, owner: ItemKey, ordinal: u32) -> Result<Option<(ClosureFacts<'w>, Option<PTy>)>, Stop> {
+        let asked_at = self.ask(Question::Closure(owner, ordinal));
+        let got = self.world.closure_with_captures(Self::seal(), owner, ordinal);
         self.record_tabled(Question::Closure(owner, ordinal), got, asked_at)
     }
 
     pub fn coroutine(&mut self, owner: ItemKey, ordinal: u32) -> Result<Option<CoroutineFacts<'w>>, Stop> {
-        let asked_at = self.stamp();
+        Ok(self.coroutine_record(owner, ordinal)?.filter(|facts| facts.is == InteriorIs::Exact))
+    }
+
+    /// Read the precision and hash the producer's actual answer, including provisional
+    /// rows. Only `coroutine` supplies facts for importing a solver term.
+    pub(crate) fn coroutine_record(&mut self, owner: ItemKey, ordinal: u32) -> Result<Option<CoroutineFacts<'w>>, Stop> {
+        let asked_at = self.ask(Question::Coroutine(owner, ordinal));
         let got = self.world.coroutine(Self::seal(), owner, ordinal);
         self.record_tabled(Question::Coroutine(owner, ordinal), got, asked_at)
     }
@@ -1625,54 +1863,63 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         self.world.goal_share()
     }
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::Attrs(item));
                 let got = self.world.attrs(Self::seal(), item);
         self.record(Question::Attrs(item), got, asked_at)
     }
 
     pub fn trait_def(&mut self, trait_: ItemKey) -> Result<Option<TraitDef<'w>>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::TraitDef(trait_));
                 let got = self.world.trait_def(Self::seal(), trait_);
         self.record_tabled(Question::TraitDef(trait_), got, asked_at)
     }
 
     pub fn assoc_parent(&mut self, item: ItemKey) -> Result<Option<AssocParent>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::AssocParent(item));
                 let got = self.world.assoc_parent(Self::seal(), item);
         self.record(Question::AssocParent(item), got, asked_at)
     }
 
     pub fn const_holds(&mut self, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Result<ConstHolds, Stop> {
-        let asked_at = self.stamp();
+        let q = Question::ConstHolds(cond, ground_args_digest(args, types));
+        let asked_at = self.ask(q);
                 let got = self.world.const_holds(Self::seal(), cond, args, types);
-        self.record(Question::ConstHolds(cond, ground_args_digest(args, types)), got, asked_at)
+        self.record(q, got, asked_at)
     }
 
     pub fn const_params(&mut self, item: ItemKey) -> Result<ConstParams<'w>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::ConstParams(item));
                 let got = self.world.const_params(Self::seal(), item);
         self.record_tabled(Question::ConstParams(item), got, asked_at)
     }
 
     /// The generics of a trait's associated type ([`World::assoc_generics`]).
     pub fn assoc_generics(&mut self, trait_: ItemKey, name: Name) -> Result<Option<AssocGenerics>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::AssocGenerics(trait_, name));
         let got = self.world.assoc_generics(Self::seal(), trait_, name);
         self.record(Question::AssocGenerics(trait_, name), got, asked_at)
     }
 
     /// A type alias's definition ([`World::type_alias`]).
     pub fn type_alias(&mut self, item: ItemKey) -> Result<Option<AliasDef<'w>>, Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::TypeAlias(item));
         let got = self.world.type_alias(Self::seal(), item);
         self.record_tabled(Question::TypeAlias(item), got, asked_at)
     }
 
     /// The default value of each field of ADT `adt` ([`World::field_defaults`]).
     pub fn field_defaults(&mut self, adt: ItemKey) -> Result<&'w [Option<ItemKey>], Stop> {
-        let asked_at = self.stamp();
+        let asked_at = self.ask(Question::FieldDefaults(adt));
         let got = self.world.field_defaults(Self::seal(), adt);
         self.record(Question::FieldDefaults(adt), got, asked_at)
+    }
+
+    /// Whether the body may name inherent member `name` of `container`
+    /// ([`World::member_visible`]).
+    pub fn member_visible(&mut self, container: ItemKey, name: Name) -> Result<bool, Stop> {
+        let asked_at = self.ask(Question::MemberVisible(container, name));
+        let got = self.world.member_visible(Self::seal(), container, name);
+        self.record(Question::MemberVisible(container, name), got, asked_at)
     }
 
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug
@@ -1764,6 +2011,15 @@ impl ContentHash for PClause {
                 h.u32(args.start);
                 h.u32(args.len);
             }
+            // The type, not the region: the clause is true for every type check, so its region
+            // is no input of one; the head's regions digest holds it (D148: a lifetime-only
+            // edit moves that digest and not this one). The tag stays: the clause takes a place
+            // in the list, and `nth` counts it.
+            PClause::TypeOutlives { ty, region: _ } => {
+                h.tag(3);
+                h.u32(ty.0);
+            }
+            PClause::RegionOutlives { long: _, short: _ } => h.tag(4),
         }
     }
 }

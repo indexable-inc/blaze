@@ -109,9 +109,20 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
         RanAs::Wasm => (blaze_proc_macro::script_unit::module_of(&store, package, version, features), "wasm-sha256"),
         RanAs::Native => (blaze_proc_macro::script_unit::module_of_native(&store, package, version, features, host), "bin-sha256"),
     };
+    let unread = |error: &blaze_proc_macro::script_unit::ModuleLookupError| {
+        let words = bstd::mem::format_in!(held, "the build script of {package} {version}: {error}");
+        Did::Hole(refused("the module store could not be read"), held_str(words.as_str(), held))
+    };
+    let found = match found {
+        Ok(found) => found,
+        Err(error) => return Ok(unread(&error)),
+    };
     let Some(record) = found else {
         let asked = asked_lines(ran_as, package, version, features, host);
-        let nearest = blaze_proc_macro::script_unit::records_named(&store, package, version);
+        let nearest = match blaze_proc_macro::script_unit::records_named(&store, package, version) {
+            Ok(nearest) => nearest,
+            Err(error) => return Ok(unread(&error)),
+        };
         let mut beside = std::string::String::new();
         match nearest.iter().min_by_key(|(_, identity)| differing(&asked, ran_as, identity.as_str()).count()) {
             None => beside.push_str(" the store holds no record of this package and version;"),

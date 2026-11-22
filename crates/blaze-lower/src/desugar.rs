@@ -43,7 +43,7 @@
 use blaze_surface::Range;
 
 use crate::form::*;
-use crate::machine::{Machine, NOT_CORO, idx};
+use crate::machine::{Machine, idx};
 
 /// A `for` loop's two nodes: the expression it is (the outer `match`) and the loop its
 /// `break` and `continue` leave.

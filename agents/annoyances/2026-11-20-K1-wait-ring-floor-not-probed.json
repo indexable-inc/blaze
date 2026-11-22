@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "K1",
+  "area": "blaze-sys linux::probe and linux::slot (D185, no kernel floor)",
+  "annoyance": "D185 says no kernel floor and every form chosen from probed facts, but blaze-core's wait/ring.rs states 'Linux 7.3 is blaze's floor ... Nothing is probed' and uses the ring unconditionally for every process not marked `__BLAZE_SANDBOXED`; the 7.3 part is an io_uring futex accounting fix no probe can see, so the real floor today is 7.3 whatever the slots say. blaze-core's uring.rs setup errors still read the kernel version from uname (`cgroup::kernel()`). uring::Register has no PROBE operation, so a probe of the ring's operations needs its own raw call. libc 0.2.191 has no SYS_cachestat for x86-64 or aarch64, so the number-table test writes 451.",
+  "workaround": "probe.rs states the floor and its setter in its module doc and lists the wait-ring slot (ring vs wait/direct.rs, chosen from RingFacts::futex/waitid/wait_ring_flags) as the next conversion, needing the owner's call on the unprobeable fix; probe.rs makes the IORING_REGISTER_PROBE call itself."
+}

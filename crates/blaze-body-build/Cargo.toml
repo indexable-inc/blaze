@@ -15,7 +15,7 @@ doctest = false
 
 [dependencies]
 # The input: the verified body (`Verified`) and its rows.
-blaze-body = { path = "../blaze-body" }
+blaze-body.workspace = true
 # The pieces that do not depend on the walk: `Adts` (the facts seam), `Subst`, `Built`, `Instance`,
 # `ground`, `Layouts`, `needs_drop`, `PanicConst`, and the ABI and scalar helpers this crate asks
 # to be made public (the report lists each).

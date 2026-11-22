@@ -16,9 +16,16 @@ doctest = false
 [dependencies]
 # The one bounded spin, for a slot another thread is mid-way through.
 blaze-spin.workspace = true
+# `Box` in a named allocator, `AllocFailure`, and the plant seam (`planted`). no_std, and below
+# this crate (it depends on blaze-memchr and blaze-int alone).
+blaze-own.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()`: a test's allocator (no `Global`, no `Alloc::global()`).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

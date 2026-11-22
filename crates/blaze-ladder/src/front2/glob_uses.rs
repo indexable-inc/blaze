@@ -336,10 +336,10 @@ where
 }
 
 /// What `name`, the first segment of a path written in block `scope` of the body `owner` (of
-/// `module`), is through the glob imports of the blocks around it, nearest first, up to the
-/// block that declares `explicit` (the item or named import [`Locals::find`] answered, which
-/// wins over its own block's globs and everything outside). `None`: no glob imports it before
-/// that; the caller goes on with `explicit`, else the module.
+/// `module`), names before reaching `explicit`, the item or named import [`Locals::find`]
+/// found in the original syntax. At each block a direct binding from an attribute replacement
+/// wins over that block's globs. Inner blocks are searched first. With no hit, the caller
+/// continues with `explicit` or the body's module.
 pub fn before<'n, 'l, 'a, S: NamesSource<'n>>(
     locals: &Locals<'l>,
     paths: &Paths<S>,
@@ -382,6 +382,11 @@ where
         };
         let declares = |e: &Row<'l>| b.rows.iter().any(|r| r.scope == here && r.kind == e.kind && r.name == e.name && r.key == e.key && r.range == e.range);
         if explicit.is_some_and(declares) {
+            ended = true;
+            break;
+        }
+        if let Some(binding) = super::scope_table::direct_name_in(b, here, name, ns, depth, alloc, paths.names, b.names_of_blocks)? {
+            uses.push(binding);
             ended = true;
             break;
         }

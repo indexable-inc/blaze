@@ -23,9 +23,9 @@ fn two_members_each_read_under_its_own_directory() {
     write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
     write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n");
     write(&io, "b/src/lib.rs", "use a::g;\nuse a::f;\npub fn h() -> u8 {\n    f()\n}\n");
-    let checked = check(&io, work::Sizes::USUAL);
+    let checked = check(&io);
     let out = stdout(&io);
-    assert!(checked.failed.is_empty(), "{:?}\n{out}", checked.failed);
+    assert_eq!(checked.failures, 0, "{out}\n{}", checked.profile);
     assert!(!out.contains("names not resolved"), "the names world is made for two members:\n{out}");
     assert!(!out.contains("no `f` in `a`"), "`a::f` is declared in a/src/lib.rs:\n{out}");
     assert_eq!(out.matches("error[unresolved]").count(), 1, "{out}\n{}", checked.profile);

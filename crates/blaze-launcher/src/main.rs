@@ -26,6 +26,10 @@
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
 ))]
+// comptime.rs: blaze-comptime-sys's `Limits { page, .. }` (its tunables defaulted, rule 83).
+#![feature(default_field_values)]
+
+mod comptime;
 
 use std::ffi::{CString, OsString, c_char, c_int};
 use std::io::Write;
@@ -146,13 +150,16 @@ const HOSTED_FILE_THREADS: usize = 1;
 
 /// The run path's mode (docs/v2/plan/design/run.md, piece 5): the parent, `blaze run`, set
 /// `BLAZE_LAUNCH_FD=3` (its socket pair's end), `BLAZE_LAUNCH_STORE` (the folder of code records)
-/// and `BLAZE_LAUNCH_ENTRY` (`<unit|c-main|hosted>:<symbol>`), and for a hosted entry
+/// and `BLAZE_LAUNCH_ENTRY` (`<unit|c-main|hosted|comptime>:<symbol>`), and for a hosted entry
 /// `BLAZE_LAUNCH_GRANTS` (blaze-launch grants.rs: the `(kind, name)` pairs the command line
-/// granted). Each is read once here and removed from the environment the program gets. Never
-/// returns: the program ends the process.
+/// granted), and for a program that links C `BLAZE_LAUNCH_NATIVE` (its native library record's
+/// 64 hex digits: run_mode.rs `run`'s `native`). Each is read once here and removed from the
+/// environment the program gets. A
+/// `comptime:` entry (D175) is a compile-time program: its host on descriptor 4 (comptime.rs).
+/// Never returns: the program, or for a compile-time one this launcher, ends the process.
 fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::SharedAlloc<'static>) -> ! {
     use blaze_launch::grants;
-    use blaze_launch_rt::run_mode::{self, EntryForm, Folder, Handed, STOPPED, Start};
+    use blaze_launch_rt::run_mode::{self, Dlsym, End, EntryForm, Folder, Handed, STOPPED, Start};
     use std::os::fd::{FromRawFd, OwnedFd};
 
     if fd.as_encoded_bytes() != b"3" {
@@ -165,29 +172,42 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_STORE (the folder of the run's code records) is not");
     };
     let Some(entry) = std::env::var_os("BLAZE_LAUNCH_ENTRY") else {
-        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_ENTRY (`<unit|c-main|hosted>:<symbol>`) is not");
+        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_ENTRY (`<unit|c-main|hosted|comptime>:<symbol>`) is not");
     };
     let start = match Start::parse(entry.as_encoded_bytes()) {
         Ok(start) => start,
         Err(why) => stop(CANNOT_RUN, &why.to_string()),
+    };
+    // The program's native library (blaze-launch wire/run.rs `Down::Native`'s rule): set only
+    // when the program links C, and then the parent's first frame is its `Native`. A
+    // compile-time program has none.
+    let native = match (std::env::var_os("BLAZE_LAUNCH_NATIVE"), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime) => stop(CANNOT_RUN, "BLAZE_LAUNCH_NATIVE is set for a compile-time program, which links no native library"),
+        (Some(hex), _) => match run_mode::parse_record(hex.as_encoded_bytes()) {
+            Ok(record) => Some(record),
+            Err(why) => stop(CANNOT_RUN, &format!("BLAZE_LAUNCH_NATIVE (the program's native library record): {why}")),
+        },
     };
     /// The entry's form with what only a hosted one has: its grants' text.
     enum Form {
         Unit,
         CMain,
         Hosted(OsString),
+        Comptime,
     }
     // Grants are a hosted program's alone: the parent sets the variable for a hosted entry
     // (the empty text when the command line granted nothing) and for no other.
     let form = match (start.form, std::env::var_os(grants::VAR)) {
         (EntryForm::Unit, None) => Form::Unit,
         (EntryForm::CMain, None) => Form::CMain,
+        (EntryForm::Comptime, None) => Form::Comptime,
         (EntryForm::Hosted, Some(granted)) => Form::Hosted(granted),
         (EntryForm::Hosted, None) => stop(
             CANNOT_RUN,
             &format!("BLAZE_LAUNCH_ENTRY names a hosted entry and {} (the grants of its command line) is not set", grants::VAR),
         ),
-        (EntryForm::Unit | EntryForm::CMain, Some(_)) => stop(
+        (EntryForm::Unit | EntryForm::CMain | EntryForm::Comptime, Some(_)) => stop(
             CANNOT_RUN,
             &format!("{} is set and BLAZE_LAUNCH_ENTRY names no hosted entry: grants are a hosted program's", grants::VAR),
         ),
@@ -198,6 +218,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         std::env::remove_var("BLAZE_LAUNCH_FD");
         std::env::remove_var("BLAZE_LAUNCH_STORE");
         std::env::remove_var("BLAZE_LAUNCH_ENTRY");
+        std::env::remove_var("BLAZE_LAUNCH_NATIVE");
         std::env::remove_var(grants::VAR);
     }
     // SAFETY: asks whether descriptor 3 is open; changes nothing.
@@ -209,10 +230,43 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     let socket = unsafe { OwnedFd::from_raw_fd(3) };
     let store = store.into_vec();
     let folder = Folder::new(&store);
+    // An ordinary run binds C names in this process's images and ends through `exit`: `run`
+    // returns only when the program could not start.
+    let ordinary = |socket, handed| match run_mode::run(socket, &folder, start.entry, native, handed, Dlsym, End::Exit, shared) {
+        Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+        Err(why) => why.to_string(),
+    };
     let why = match form {
         // Nothing of the hosted world is made for these: the start stays the launcher's own.
-        Form::Unit => run_mode::run(socket, &folder, start.entry, Handed::Unit, shared),
-        Form::CMain => run_mode::run(socket, &folder, start.entry, Handed::CMain, shared),
+        Form::Unit => ordinary(socket, Handed::Unit),
+        Form::CMain => ordinary(socket, Handed::CMain),
+        // A compile-time program (D175): the layer on descriptor 4 first, then the run with
+        // its C names bound through the table, which RETURNS the entry's status (G5); the
+        // launcher ends the process as the entry's return from C `main` does, through the
+        // layer's `exit`.
+        Form::Comptime => 'comptime: {
+            if let Err(why) = comptime::install(shared.local()) {
+                break 'comptime why.to_string();
+            }
+            let (argc, argv) = match comptime::argv() {
+                Ok(args) => args,
+                Err(why) => break 'comptime why.to_string(),
+            };
+            // SAFETY: `argc` and `argv` are the layer's (`child::argv`): `argc` strings and a
+            // null, in words the installed layer keeps, unchanged, for the process's life.
+            let args = unsafe { run_mode::ComptimeArgs::new(argc, argv) };
+            // The table's data rows bound HERE, on the thread that installed the layer, before
+            // `run` starts its threads: its control thread binds the rest from constants and
+            // never touches the layer's cell (run_mode/bind.rs `Table`).
+            let table = match run_mode::Table::bind(comptime::OS) {
+                Ok(table) => table,
+                Err(why) => break 'comptime why.to_string(),
+            };
+            match run_mode::run(socket, &folder, start.entry, None, Handed::Comptime(args), table, End::Return, shared) {
+                Ok(status) => comptime::exit(status).to_string(),
+                Err(why) => why.to_string(),
+            }
+        }
         Form::Hosted(granted) => {
             let grants = match grants::parse(granted.as_encoded_bytes()) {
                 Ok(grants) => grants,
@@ -228,7 +282,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
             // which it does only when the program could not start (its control thread joined,
             // no program code ran): `HostTableAt::new`'s contract.
             let at = unsafe { run_mode::HostTableAt::new(core::ptr::NonNull::from(&table).cast()) };
-            run_mode::run(socket, &folder, start.entry, Handed::Hosted(at), shared)
+            ordinary(socket, Handed::Hosted(at))
         }
     };
     stop(STOPPED, &format!("the program could not start: {why}"))

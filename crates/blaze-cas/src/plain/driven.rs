@@ -1,7 +1,6 @@
 //! The plain store's thin driver: [`Plain`]'s effects carried out on a [`Driver`] (the native
 //! one, or the simulation in tests), reads into a caller's buffer by `pread`, the fetch-on-miss
-//! seam (blaze-keyed's [`Source`] and [`Verifier`]: one home, rule 30), and the store a root's
-//! settings choose ([`Opened`]).
+//! seam (blaze-keyed's [`Source`] and [`Verifier`]: one home, rule 30).
 
 use std::alloc::Allocator;
 use std::{
@@ -23,7 +22,7 @@ use blaze_keyed::{
 use super::{
     core::{Batch, Committed, Found, Got, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
-    settings::{Form, Settings},
+    settings::Settings,
 };
 use crate::{Corrupt, Key};
 
@@ -537,8 +536,8 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         }
     }
 
-    /// Up to `slices` compaction slices, each bounded by [`super::SLICE_BYTES`], until one says
-    /// there is no more. Lowers the calling thread first ([`lower_this_thread`]): call it after
+    /// Up to `slices` compaction slices until one says there is no more: a pruning or sweeping
+    /// slice bounded by [`super::SLICE_BYTES`], a tiered merge by the amortisation (module doc). Lowers the calling thread first ([`lower_this_thread`]): call it after
     /// the command has answered, or from its own invocation, never before a build's first read.
     pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
         lower_this_thread()?;
@@ -811,24 +810,4 @@ fn nonce() -> u64 {
     let here = 0u8;
     let address = (&here as *const u8 as usize as u64).to_le_bytes();
     format::id_of("blaze plain store nonce 1", &[&std::process::id().to_le_bytes(), &blaze_core::system_wall_ns().to_le_bytes(), &address])
-}
-
-/// The store a root's settings (`<root>/store.json`) choose: the packs, as before, or the plain
-/// store.
-pub enum Opened<A: Allocator + Clone> {
-    Packs(crate::Driven),
-    Plain(Driven<Native, A>),
-}
-
-impl<A: Allocator + Clone> Opened<A> {
-    /// The plain store's in `alloc`, the caller's.
-    pub fn open(root: &Path, alloc: A) -> Result<Opened<A>, String> {
-        let settings = Settings::read(root)?;
-        match settings.form {
-            Form::Packs => crate::Driven::open(root).map(Opened::Packs),
-            // The packs' open says its failure as text; the plain store's typed error is
-            // printed beside it.
-            Form::Plain => Driven::open(root, &settings, alloc).map(Opened::Plain).map_err(|it| it.to_string()),
-        }
-    }
 }

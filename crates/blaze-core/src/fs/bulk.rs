@@ -20,19 +20,20 @@
 
 use std::{io, path::Path};
 
+use blaze_sys::{Errno, posix::proc};
 use crate::{DirName, FileName, Meta, Stamp};
 
 /// What is asked of every entry (`ATTR_CMN_RETURNED_ATTRS` and `ATTR_CMN_NAME` the call
 /// requires; `ATTR_CMN_ERROR` so one entry's failure is its own).
-const COMMON: u32 = libc::ATTR_CMN_RETURNED_ATTRS
-    | libc::ATTR_CMN_NAME
+const COMMON: u32 = proc::ATTR_CMN_RETURNED_ATTRS
+    | proc::ATTR_CMN_NAME
     | ATTR_CMN_ERROR
-    | libc::ATTR_CMN_DEVID
-    | libc::ATTR_CMN_OBJTYPE
-    | libc::ATTR_CMN_MODTIME
-    | libc::ATTR_CMN_CHGTIME
-    | libc::ATTR_CMN_ACCESSMASK
-    | libc::ATTR_CMN_FILEID;
+    | proc::ATTR_CMN_DEVID
+    | proc::ATTR_CMN_OBJTYPE
+    | proc::ATTR_CMN_MODTIME
+    | proc::ATTR_CMN_CHGTIME
+    | proc::ATTR_CMN_ACCESSMASK
+    | proc::ATTR_CMN_FILEID;
 /// `ATTR_CMN_ERROR` of <sys/attr.h>, which the libc crate does not name.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 
@@ -42,13 +43,13 @@ const BUFFER: usize = 64 << 10;
 /// `enum vtype` of <sys/vnode.h>, which `ATTR_CMN_OBJTYPE` is, as `st_mode`'s type bits.
 fn type_bits(vtype: u32) -> Option<u32> {
     Some(u32::from(match vtype {
-        1 => libc::S_IFREG,
-        2 => libc::S_IFDIR,
-        3 => libc::S_IFBLK,
-        4 => libc::S_IFCHR,
-        5 => libc::S_IFLNK,
-        6 => libc::S_IFSOCK,
-        7 => libc::S_IFIFO,
+        1 => proc::S_IFREG,
+        2 => proc::S_IFDIR,
+        3 => proc::S_IFBLK,
+        4 => proc::S_IFCHR,
+        5 => proc::S_IFLNK,
+        6 => proc::S_IFSOCK,
+        7 => proc::S_IFIFO,
         _ => return None,
     }))
 }
@@ -106,26 +107,27 @@ fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>, Option<u64
     let has = |bit: u32| common & bit != 0;
     // Right after the set, before the name, whatever its bit.
     let error = if has(ATTR_CMN_ERROR) { fields.u32()? } else { 0 };
-    if !has(libc::ATTR_CMN_NAME) {
+    if !has(proc::ATTR_CMN_NAME) {
         return None;
     }
     let name = fields.name()?;
     // The rest in the order of their bits, each there only when returned. `dev_t` is an
     // `i32`, widened as std's `MetadataExt::dev` widens `st_dev`.
-    let dev = if has(libc::ATTR_CMN_DEVID) { Some(fields.u32()? as i32 as u64) } else { None };
-    let vtype = if has(libc::ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
-    let modified = if has(libc::ATTR_CMN_MODTIME) { Some(fields.time_ns()?) } else { None };
-    let changed = if has(libc::ATTR_CMN_CHGTIME) { Some(fields.time_ns()?) } else { None };
-    let access = if has(libc::ATTR_CMN_ACCESSMASK) { Some(fields.u32()?) } else { None };
-    let id = if has(libc::ATTR_CMN_FILEID) { Some(fields.u64()?) } else { None };
+    let dev = if has(proc::ATTR_CMN_DEVID) { Some(fields.u32()? as i32 as u64) } else { None };
+    let vtype = if has(proc::ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
+    let modified = if has(proc::ATTR_CMN_MODTIME) { Some(fields.time_ns()?) } else { None };
+    let changed = if has(proc::ATTR_CMN_CHGTIME) { Some(fields.time_ns()?) } else { None };
+    let access = if has(proc::ATTR_CMN_ACCESSMASK) { Some(fields.u32()?) } else { None };
+    let id = if has(proc::ATTR_CMN_FILEID) { Some(fields.u64()?) } else { None };
     let dir_len =
-        if of_dir & libc::ATTR_DIR_DATALENGTH != 0 { Some(fields.u64()?) } else { None };
+        if of_dir & proc::ATTR_DIR_DATALENGTH != 0 { Some(fields.u64()?) } else { None };
     let file_len =
-        if of_file & libc::ATTR_FILE_DATALENGTH != 0 { Some(fields.u64()?) } else { None };
+        if of_file & proc::ATTR_FILE_DATALENGTH != 0 { Some(fields.u64()?) } else { None };
     if error != 0 {
-        let stamp = match error as i32 {
-            libc::ENOENT | libc::ENOTDIR => Stamp::GONE,
-            _ => Stamp::UNKNOWN,
+        let stamp = if error == u32::from(Errno::NoEnt.raw()) || error == u32::from(Errno::NotDir.raw()) {
+            Stamp::GONE
+        } else {
+            Stamp::UNKNOWN
         };
         return Some((name, Ok(stamp), dev));
     }

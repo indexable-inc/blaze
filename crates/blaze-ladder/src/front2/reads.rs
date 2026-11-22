@@ -120,6 +120,10 @@ pub enum FactKind {
     /// The default values of an ADT's fields (`Question::FieldDefaults`), read by a
     /// base-less struct expression `S { a: 1, .. }`. `key`: the ADT.
     FieldDefaults = 26,
+    /// Whether a body may name an inherent impl's member fn (`Question::MemberVisible`: the
+    /// member's visibility, kept in its impl's head, against the body's module). `key`: the
+    /// impl; `detail`: the member's name and the body's module.
+    MemberVisible = 27,
 }
 
 /// One fact a body's check asked for (module docs). Ordered as its bytes are
@@ -230,7 +234,9 @@ impl<'a> BodyReads<'a> {
     /// The list's one digest: its reach, then each row's fact bytes, whether it has an answer
     /// and the answer (little-endian), in the list's order.
     pub fn digest(&self, alloc: Alloc<'_>) -> ContentId {
-        let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
+        // One allocation: the reach byte, then per row its fact (25), the answer flag (1) and
+        // the answer (a `u64`, 8): 34. Capacity changes no byte hashed.
+        let mut bytes: AVec<'_, u8> = AVec::with_capacity_in(1 + self.rows.len() * 34, alloc);
         bytes.push(match self.reach {
             Reach::Whole => 1,
             Reach::Asked => 2,
@@ -363,6 +369,8 @@ pub fn fact_of(q: Question, module: tc::ItemKey, paths: &[BodyPath], segments: &
         Question::AssocGenerics(trait_, name) => about(FactKind::AssocGenerics, trait_, name.0),
         Question::TypeAlias(item) => about(FactKind::TypeAlias, item, 0),
         Question::FieldDefaults(adt) => about(FactKind::FieldDefaults, adt, 0),
+        // The answer is the body's module's: two bodies of one module that ask it are one fact.
+        Question::MemberVisible(container, name) => about(FactKind::MemberVisible, container, part(&(name, module))),
     })
 }
 
@@ -394,6 +402,7 @@ pub fn facts_with_buckets<'a>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, Read>, ReadsError> {
     let mut rows: AVec<'a, Read> = AVec::new_in(alloc);
+    let mut bucket_facts = super::buckets::BucketReadUnion::new(alloc);
     for (i, &q) in questions.iter().enumerate() {
         let answer = answers.and_then(|all| all.get(i).copied());
         rows.push(Read { fact: fact_of(q, module, paths, segments)?, answer });
@@ -407,9 +416,9 @@ pub fn facts_with_buckets<'a>(
                     continue;
                 }
                 let sight = b.sight_made(seen).map_err(ReadsError::Unseen)?;
-                rows.extend(read.iter().filter(|bucket| sight.sees_read(bucket)).map(bucket_row));
+                rows.extend(read.iter().filter(|bucket| sight.sees_read(bucket) && bucket_facts.keep_fact(bucket)).map(bucket_row));
             }
-            Question::Inherent(shape, _) => rows.extend(b.inherent_reads(shape).iter().map(bucket_row)),
+            Question::Inherent(shape, _) => rows.extend(b.inherent_reads(shape).iter().filter(|bucket| bucket_facts.keep_fact(bucket)).map(bucket_row)),
             _ => {}
         }
     }

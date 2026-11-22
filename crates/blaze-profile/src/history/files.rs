@@ -3858,10 +3858,6 @@ impl<H: Host> Files<H> {
         &self.host
     }
 
-    pub(crate) fn host_mut(&mut self) -> &mut H {
-        &mut self.host
-    }
-
     /// The history's directory under the driver's root.
     pub(crate) fn dir(&self) -> &FileName {
         &self.dir

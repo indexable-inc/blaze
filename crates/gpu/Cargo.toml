@@ -10,7 +10,7 @@ publish = false
 doctest = false
 
 [dependencies]
-gpu-macros = { path = "../gpu-macros" }
+gpu-macros.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

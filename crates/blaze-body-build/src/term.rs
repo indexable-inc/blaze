@@ -39,6 +39,8 @@ enum ResultTo {
     Nothing,
     /// The call's one value, to `dest`.
     Value { dest: Place, lay: LayoutId },
+    /// The returned data pointer and its metadata, to `dest`.
+    Wide { dest: Place, lay: LayoutId },
     /// Already written through the hidden result pointer, at `dest` itself (`temp: None`) or
     /// at a temporary copied to `dest` after the call.
     Memory { dest: Place, lay: LayoutId, temp: Option<Value> },
@@ -104,20 +106,21 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         Ok(())
     }
 
-    /// `return`: `_0`'s value as the one result, or nothing (a zero-sized result, or one
-    /// already written through the hidden pointer).
+    /// Return the registers of `_0`. An ignored or indirect result has no registers.
     fn ret(&mut self) -> Result<(), BuildError> {
         match self.ret {
             Pass::Ignore | Pass::Ref => self.b.ret(&[]),
             Pass::Scalar { .. } => {
                 let place = self.v.local_place(blaze_body::Local(0));
-                let (at, _) = self.resolve(place)?;
-                let x = match at {
-                    At::Val(x) => x,
-                    At::Mem { ptr, off, lay, .. } => self.load_at(ptr, off, lay)?,
-                };
+                let (x, _) = self.operand(Operand::Move(place))?;
                 let x = self.scalar(x)?;
                 self.b.ret(&[x]);
+            }
+            Pass::Wide { .. } => {
+                let place = self.v.local_place(blaze_body::Local(0));
+                let (x, _) = self.operand(Operand::Move(place))?;
+                let values = self.wide_values(x)?;
+                self.b.ret(&values);
             }
             Pass::Memory { .. } | Pass::Words { .. } => return Err(self.malformed("a C pass of a value of the Rust ABI")),
         }
@@ -163,13 +166,14 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         Ok((instance, self.adts.nounwind(item) != Some(true)))
     }
 
-    /// The registers of argument `x` (of ground type `g`, layout `lay`) passed as `pass`: a
-    /// scalar's value, or the address of a copy the callee owns. A move of a value in memory
-    /// passes the place itself (the body moved out of it).
+    /// Append the registers for argument `x` of layout `lay`: a scalar, the two words of a
+    /// wide pointer, or the address of a copy the callee owns. Moving an indirect argument
+    /// from memory transfers the place itself.
     fn pass_arg(&mut self, x: V, lay: LayoutId, pass: Pass, moved: bool, out: &mut Vec<Value, A>) -> Result<(), BuildError> {
         match pass {
             Pass::Ignore => {}
             Pass::Scalar { .. } => out.push(self.scalar(x)?),
+            Pass::Wide { .. } => out.extend(self.wide_values(x)?),
             Pass::Ref => {
                 let (ptr, off) = match (x, moved) {
                     (V::Mem { ptr, off, .. }, true) => (ptr, off),
@@ -228,6 +232,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 let result = match rpass {
                     Pass::Ignore => ResultTo::Nothing,
                     Pass::Scalar { .. } => ResultTo::Value { dest, lay },
+                    Pass::Wide { .. } => ResultTo::Wide { dest, lay },
                     Pass::Ref => {
                         let (ptr, temp) = match self.dest_memory(dest)? {
                             Some(ptr) => (ptr, None),
@@ -324,6 +329,11 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         match result {
             ResultTo::Nothing => {}
             ResultTo::Value { dest, lay } => self.write(dest, V::One(r), lay)?,
+            ResultTo::Wide { dest, lay } => {
+                let data = self.b.project(r, 0);
+                let metadata = self.b.project(r, 1);
+                self.write(dest, V::Two(data, metadata), lay)?;
+            }
             ResultTo::Memory { temp: None, .. } => {}
             ResultTo::Memory { dest, lay, temp: Some(ptr) } => {
                 let x = self.load_at(ptr, 0, lay)?;

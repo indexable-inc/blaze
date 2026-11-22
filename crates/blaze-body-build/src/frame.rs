@@ -5,13 +5,12 @@ use core::alloc::Allocator;
 
 use blaze_body::{Block as BodyBlock, BlockKind as BodyKind, Local, LocalKind, Place, Proj, StmtKind, Value as BodyValue};
 use blaze_build::drop_facts::needs_drop;
-use blaze_build::intrinsics::lir;
-use blaze_build::layout::{LayoutId, Prim, Tail, Variants};
+use blaze_build::layout::{LayoutError, LayoutId, Variants};
 use blaze_build::{Panic, abi};
 use blaze_lir::builder::Variadic;
-use blaze_lir::func::{BlockKind, Conv, Ext, SlotKind};
+use blaze_lir::func::{BlockKind, Conv, SlotKind};
 use blaze_lir::{Flags, Ty, Value};
-use blaze_typeck::{LangItem, PNode, PTy};
+use blaze_typeck::{LangItem, PTy};
 
 use crate::{BuildError, Cx, Held, Pass, V};
 
@@ -96,54 +95,22 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
         Ok(self.b.slot(size, l.align, kind))
     }
 
-    /// How a value of ground type `g` crosses a call of the Rust ABI: the walk's plan (its
-    /// `repr` then `rust_pass`), read from the ground type and the one layout, so a function
-    /// this crate builds and one the walk builds call each other. Nothing for `()`, `!`, a fn
-    /// item and a zero-sized aggregate that needs no drop; a struct, tuple, array, closure or
-    /// wide pointer by the address of the caller's copy (whatever its layout's scalars); every
-    /// other scalar in one register, a `bool` and an integer under 32 bits widened by its sign.
+    /// Use the same layout decision for a parameter, an argument and a return place.
     pub(crate) fn pass_of(&mut self, g: PTy) -> Result<Pass, BuildError> {
-        let scalar = |ty: Ty, ext: Ext| Pass::Scalar { ty, ext, agg: false };
-        // A pattern type is held as its base, as the walk holds it.
-        let g = match self.node(g)? {
-            PNode::Pat(base, _) => base,
-            _ => g,
+        let id = self.layout(g)?;
+        let layout = *self.layouts.get(id);
+        layout.rust_pass(self.subst.ground.view())
+            .map_err(|why| BuildError::Layout { stmt: self.stmt, error: LayoutError { ty: g, why } })
+    }
+
+    /// The two typed registers of a wide pointer, whether kept in registers or in a slot.
+    pub(crate) fn wide_values(&mut self, value: V) -> Result<[Value; 2], BuildError> {
+        let value = match value {
+            V::Mem { ptr, off, lay } => self.load_at(ptr, off, lay)?,
+            v => v,
         };
-        Ok(match self.node(g)? {
-            PNode::Never | PNode::FnDef(..) => Pass::Ignore,
-            PNode::Tuple(l) if l.len == 0 => Pass::Ignore,
-            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
-                let lay = self.layout(g)?;
-                let l = *self.layouts.get(lay);
-                if l.tail != Tail::Sized {
-                    return Err(self.unsupported("a value of an unsized type passed by value"));
-                }
-                if l.size == 0 && !self.needs_drop_of(g)? { Pass::Ignore } else { Pass::Ref }
-            }
-            PNode::Ref(..) | PNode::Ptr(..) => {
-                let lay = self.layout(g)?;
-                if self.layouts.get(lay).pair.is_some() { Pass::Ref } else { scalar(Ty::PTR, Ext::None) }
-            }
-            PNode::FnPtr(..) => scalar(Ty::PTR, Ext::None),
-            PNode::Bool => scalar(Ty::I8, Ext::Zext),
-            PNode::Int(_) | PNode::Uint(_) | PNode::Char | PNode::Float(_) => {
-                let lay = self.layout(g)?;
-                let s = self.layouts.get(lay).scalar.ok_or(self.malformed("a primitive whose layout is not one scalar"))?;
-                let (ty, signed) = lir(s.prim);
-                let ext = match s.prim {
-                    Prim::Int { .. } if ty.bits(crate::PTR_BITS) < 32 => {
-                        if signed {
-                            Ext::Sext
-                        } else {
-                            Ext::Zext
-                        }
-                    }
-                    _ => Ext::None,
-                };
-                scalar(ty, ext)
-            }
-            _ => return Err(self.malformed("a type with no value of its own passed across a call")),
-        })
+        let V::Two(a, b) = value else { return Err(self.malformed("a two-register argument or result without both scalar values")) };
+        Ok([a, b])
     }
 
     /// Whether ground type `g` needs drop (blaze-build's one rule, `drop_facts::needs_drop`).
@@ -209,7 +176,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             let hidden = next.next().ok_or(self.malformed("a signature without its result pointer"))?;
             decided[ret_local.index()] = Some(Held::At(hidden));
         }
-        let mut given: Vec<(Local, Pass, Value), A> = Vec::with_capacity_in(args.len(), self.alloc.clone());
+        let mut given = Vec::with_capacity_in(args.len(), self.alloc.clone());
         for (n, a) in args.iter().enumerate() {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
             match passes[n] {
@@ -218,9 +185,17 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                     let x = next.next().ok_or(self.malformed("a parameter without its register"))?;
                     if pass == Pass::Ref && memory[a.index()] {
                         decided[a.index()] = Some(Held::At(x));
+                    } else if pass == Pass::Ref {
+                        let value = self.load_at(x, 0, self.lays[a.index()])?;
+                        given.push((a, value));
                     } else {
-                        given.push((a, pass, x));
+                        given.push((a, V::One(x)));
                     }
+                }
+                Pass::Wide { .. } => {
+                    let lo = next.next().ok_or(self.malformed("a wide parameter without its address"))?;
+                    let hi = next.next().ok_or(self.malformed("a wide parameter without its metadata"))?;
+                    given.push((a, V::Two(lo, hi)));
                 }
                 Pass::Memory { .. } | Pass::Words { .. } => return Err(self.malformed("a C pass of a value of the Rust ABI")),
             }
@@ -241,12 +216,8 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             self.held.push(held);
         }
         // The parameters' values put where their locals are.
-        for &(a, pass, x) in given.iter() {
+        for &(a, value) in given.iter() {
             let lay = self.lays[a.index()];
-            let value = match pass {
-                Pass::Ref => self.load_at(x, 0, lay)?,
-                _ => V::One(x),
-            };
             self.put(a, value, lay)?;
         }
         // The body's blocks; a cleanup block only when panics unwind.

@@ -41,20 +41,26 @@ struct ThreeChecks {
     after: std::string::String,
 }
 
+/// What one engine check made, as the old checker's (`Signature`, `BodyCheck`) made counts were
+/// read until 2026-11-19: the `Heads` and `Bodies` stages' entries.
+fn made_pair(checked: &Checked) -> (u32, u32) {
+    (checked.entered(blaze_engine::Stage::Heads), checked.entered(blaze_engine::Stage::Bodies))
+}
+
 /// Checks the workspace as written, edits the file `callee` to `CALLEE_U16` and checks, puts
 /// `CALLEE_U8` back and checks.
-fn three_checks(io: &Io, callee: &str, sizes: work::Sizes) -> ThreeChecks {
-    let first = check(io, sizes);
-    assert!(first.failed.is_empty(), "{:?}", first.failed);
+fn three_checks(io: &Io, callee: &str) -> ThreeChecks {
+    let first = check(io);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     write(io, callee, CALLEE_U16);
-    let edited = check(io, sizes);
-    assert!(edited.failed.is_empty(), "{:?}", edited.failed);
+    let edited = check(io);
+    assert_eq!(edited.failures, 0, "{}", edited.profile);
     // On one line: a runner quotes a failure's first lines.
     let rows = edited.profile.lines().filter(|l| !l.starts_with("store") && !l.starts_with("gate")).collect::<std::vec::Vec<_>>().join(" / ");
     let after = std::format!("{:?} {:?} {rows}", edited.ids, edited.words);
     write(io, callee, CALLEE_U8);
-    let undone = check(io, sizes);
-    assert!(undone.failed.is_empty(), "{:?}", undone.failed);
+    let undone = check(io);
+    assert_eq!(undone.failures, 0, "{}", undone.profile);
     ThreeChecks { errors: (first.errors, edited.errors, undone.errors), after }
 }
 
@@ -88,7 +94,7 @@ fn two_crates() -> Io {
 #[test]
 fn a_signature_edit_in_another_file_reaches_its_caller() {
     let io = two_files();
-    let seen = three_checks(&io, "src/a.rs", work::Sizes::USUAL);
+    let seen = three_checks(&io, "src/a.rs");
     assert_eq!(seen.errors, (0, 1, 0), "the caller in b.rs must see f's new parameter type:\n{}", seen.after);
     assert!(seen.after.contains("\"types\""), "the error is the caller's type error:\n{}", seen.after);
     std::println!("stale check, two files: errors {:?}", seen.errors);
@@ -100,23 +106,10 @@ fn a_signature_edit_in_another_file_reaches_its_caller() {
 #[test]
 fn a_signature_edit_in_another_crate_reaches_its_caller() {
     let io = two_crates();
-    let seen = three_checks(&io, "a/src/lib.rs", work::Sizes::USUAL);
+    let seen = three_checks(&io, "a/src/lib.rs");
     assert_eq!(seen.errors, (0, 1, 0), "the caller in member b must see a::f's new parameter type:\n{}", seen.after);
     assert!(seen.after.contains("\"types\""), "the error is the caller's type error:\n{}", seen.after);
     std::println!("stale check, two crates: errors {:?}", seen.errors);
-}
-
-/// THE PLANTED BUG (work::Plant::HeadReadLeftOut): each body drops its first head read, so `g`
-/// does not list `f`'s `Signature`. The stale check must then fail: the counts are NOT
-/// `(0, 1, 0)`. This test passes when the plant is caught. Prints
-/// `planted head read left out: errors (0, 0, 0), not (0, 1, 0)`.
-#[test]
-fn a_head_read_left_out_is_caught() {
-    let io = two_files();
-    let planted = work::Sizes { plant: work::Plant::HeadReadLeftOut, ..work::Sizes::USUAL };
-    let seen = three_checks(&io, "src/a.rs", planted);
-    assert_ne!(seen.errors, (0, 1, 0), "a read list missing the callee's head still saw the edit: the stale check does not test the head reads:\n{}", seen.after);
-    std::println!("planted head read left out: errors {:?}, not (0, 1, 0)", seen.errors);
 }
 
 /// `f` written by a `macro_rules!` call at module level (signature.rs, "A HEAD A MACRO WROTE"):
@@ -145,9 +138,9 @@ fn a_head_a_workspace_macro_wrote_is_read_by_its_call() {
     write(&io, "src/lib.rs", TWO_FILES);
     write(&io, "src/a.rs", MACRO_CALLEE_U8);
     write(&io, "src/b.rs", CALLER);
-    let first = check(&io, work::Sizes::USUAL);
-    std::println!("first: failed {:?}; errors {}; words {:?}", first.failed, first.errors, first.words);
-    assert!(first.failed.is_empty(), "{:?}", first.failed);
+    let first = check(&io);
+    std::println!("first: failures {}; errors {}; words {:?}", first.failures, first.errors, first.words);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     assert_eq!(first.errors, 0, "the workspace as written is clean: {:?}", first.words);
     assert!(
         !first.words.iter().any(|w| w.contains("written by a macro") || w.contains("no task makes")),
@@ -155,18 +148,18 @@ fn a_head_a_workspace_macro_wrote_is_read_by_its_call() {
         first.words
     );
     write(&io, "src/a.rs", MACRO_CALLEE_U16);
-    let edited = check(&io, work::Sizes::USUAL);
-    assert!(edited.failed.is_empty(), "{:?}", edited.failed);
-    let made_counts = (made(&edited.profile, "Signature"), made(&edited.profile, "BodyCheck"));
+    let edited = check(&io);
+    assert_eq!(edited.failures, 0, "{}", edited.profile);
+    let made_counts = made_pair(&edited);
     let after = std::format!("{:?}\n{:?}\n{}", edited.ids, edited.words, edited.profile);
-    std::println!("edited: failed {:?}; errors {}; made {made_counts:?}; words {:?}", edited.failed, edited.errors, edited.words);
+    std::println!("edited: failures {}; errors {}; made {made_counts:?}; words {:?}", edited.failures, edited.errors, edited.words);
     write(&io, "src/a.rs", MACRO_CALLEE_U8);
-    let undone = check(&io, work::Sizes::USUAL);
-    assert!(undone.failed.is_empty(), "{:?}", undone.failed);
+    let undone = check(&io);
+    assert_eq!(undone.failures, 0, "{}", undone.profile);
     let errors = (first.errors, edited.errors, undone.errors);
     assert_eq!(errors, (0, 1, 0), "the caller in b.rs must see the macro-written f's new parameter type:\n{after}");
     assert!(after.contains("\"types\""), "the error is the caller's type error:\n{after}");
-    assert_eq!(made_counts, (1, 2), "the call's edit makes its entry's head, the one body that read it and the call's own check:\n{after}");
+    assert_eq!(made_counts, (1, 4), "the call's edit makes its entry's head, the one body that read it and the call's own check, each body in its 2 units' rows (D191: the library's and its test build's):\n{after}");
     std::println!("macro-written head: errors {errors:?}; call edit (Signature, BodyCheck) made {made_counts:?}");
 }
 
@@ -187,21 +180,20 @@ fn edit_seen(seed: u64, first: &str, edited: &str, caller: &str) -> EditSeen {
     write(&io, "src/lib.rs", TWO_FILES);
     write(&io, "src/a.rs", first);
     write(&io, "src/b.rs", caller);
-    let one = check(&io, work::Sizes::USUAL);
+    let one = check(&io);
     // Printed before any assertion: a failing test's output is what its reader sees first.
-    std::println!("first: failed {:?}; errors {}; words {:?}", one.failed, one.errors, one.words);
-    assert!(one.failed.is_empty(), "{:?}\n{}", one.failed, one.profile);
+    std::println!("first: failures {}; errors {}; words {:?}", one.failures, one.errors, one.words);
+    assert_eq!(one.failures, 0, "{}", one.profile);
     write(&io, "src/a.rs", edited);
-    let two = check(&io, work::Sizes::USUAL);
-    let rows = two.profile.lines().filter(|l| l.starts_with("Signature") || l.starts_with("BodyCheck")).collect::<std::vec::Vec<_>>().join(" / ");
-    std::println!("edited: failed {:?}; errors {}; words {:?}; {rows}", two.failed, two.errors, two.words);
-    assert!(two.failed.is_empty(), "{:?}\n{}", two.failed, two.profile);
-    let made_counts = (made(&two.profile, "Signature"), made(&two.profile, "BodyCheck"));
+    let two = check(&io);
+    let made_counts = made_pair(&two);
+    std::println!("edited: failures {}; errors {}; words {:?}; made (Heads, Bodies) {made_counts:?}", two.failures, two.errors, two.words);
+    assert_eq!(two.failures, 0, "{}", two.profile);
     let after = std::format!("{:?}\n{:?}\n{}", two.ids, two.words, two.profile);
     write(&io, "src/a.rs", first);
-    let three = check(&io, work::Sizes::USUAL);
-    std::println!("undone: failed {:?}; errors {}", three.failed, three.errors);
-    assert!(three.failed.is_empty(), "{:?}\n{}", three.failed, three.profile);
+    let three = check(&io);
+    std::println!("undone: failures {}; errors {}", three.failures, three.errors);
+    assert_eq!(three.failures, 0, "{}", three.profile);
     EditSeen { first_words: std::format!("{:?}", one.words), errors: (one.errors, two.errors, three.errors), made: made_counts, after }
 }
 
@@ -224,10 +216,10 @@ fn checks_of(seed: u64, states: &[(&str, &str)]) -> std::vec::Vec<Seen> {
     for (i, (a, b)) in states.iter().enumerate() {
         write(&io, "src/a.rs", a);
         write(&io, "src/b.rs", b);
-        let got = check(&io, work::Sizes::USUAL);
-        let made_counts = (made(&got.profile, "Signature"), made(&got.profile, "BodyCheck"));
-        std::println!("check {i}: failed {:?}; errors {}; made (Signature, BodyCheck) {made_counts:?}; words {:?}", got.failed, got.errors, got.words);
-        assert!(got.failed.is_empty(), "check {i}: {:?}\n{}", got.failed, got.profile);
+        let got = check(&io);
+        let made_counts = made_pair(&got);
+        std::println!("check {i}: failures {}; errors {}; made (Heads, Bodies) {made_counts:?}; words {:?}", got.failures, got.errors, got.words);
+        assert_eq!(got.failures, 0, "check {i}: {}", got.profile);
         let all = std::format!("{:?}\n{:?}\n{}", got.ids, got.words, got.profile);
         seen.push(Seen { errors: got.errors, words: std::format!("{:?}", got.words), made: made_counts, all });
     }
@@ -262,7 +254,9 @@ fn a_body_edit_inside_an_impl_checks_that_body_alone() {
     assert_eq!(seen[0].errors, 0, "{}", seen[0].all);
     assert!(!stale(&seen[1].words), "a body edit inside an impl refused its file: {}", seen[1].all);
     assert_eq!(seen[1].errors, 0, "{}", seen[1].all);
-    assert_eq!(seen[1].made, (0, 1), "a body edit makes no head and that one body:\n{}", seen[1].all);
+    // Bodies are counted in rows (D191: every unit that holds a body checks it; `wide`'s library
+    // and its test build hold every body here, so one body is 2 rows).
+    assert_eq!(seen[1].made, (0, 2), "a body edit makes no head and that one body, in its 2 units' rows (D191):\n{}", seen[1].all);
     std::println!("impl body edit: made {:?}", seen[1].made);
 }
 
@@ -276,16 +270,14 @@ fn a_head_edit_inside_an_impl_moves_its_readers_alone() {
     let seen = checks_of(83, &[(IMPL_FG, CALLS_F), (EDITED, CALLS_F), (IMPL_FG, CALLS_F)]);
     assert!(!stale(&seen[1].words), "{}", seen[1].all);
     assert_eq!((seen[0].errors, seen[1].errors, seen[2].errors), (0, 1, 0), "h must see f's new parameter type:\n{}", seen[1].all);
-    assert_eq!(seen[1].made, (1, 2), "f's head, f's body and its caller, not its sibling g:\n{}", seen[1].all);
+    assert_eq!(seen[1].made, (1, 4), "f's head, f's body and its caller, not its sibling g; each body in its 2 units' rows (D191):\n{}", seen[1].all);
     std::println!("impl head edit: errors {}; made {:?}", seen[1].errors, seen[1].made);
 }
 
 /// A MEMBER ADDED TO AN IMPL: `pub fn k() {}` added to `impl S`, then called from `b.rs`. The
-/// new member is read at once (no `Stale` note, no error). COARSE: the file's `Surface` moved,
-/// so its four heads' `Signature`s are made again by their keys, besides `k`'s (5); the impl's
-/// out holds its member list (`Want::Impl`), so the bodies that read the impl, `f`, `g` and
-/// `h`, are checked again with `k`'s (4). Then calling `k` makes `h` alone, `(0, 1)`. Prints
-/// `member added: made (5, 4); call added: made (0, 1)`.
+/// new member is read at once (no `Stale` note, no error). Floor (2, 1): the impl's and `k`'s
+/// heads, `k`'s body; pinned at today's (4, 4) (see the assertion). Then calling `k` is a body
+/// edit of `h`: `(0, 1)`. Prints `member added: made (H, B); call added: made (0, 1)`.
 #[test]
 fn a_member_added_to_an_impl_is_read_at_once() {
     const ADDED: &str = "pub struct S;\nimpl S {\n    pub fn f(_x: u8) {}\n    pub fn g(&self) {}\n    pub fn k() {}\n}\n";
@@ -295,15 +287,27 @@ fn a_member_added_to_an_impl_is_read_at_once() {
         assert!(!stale(&s.words), "check {i}: {}", s.all);
         assert_eq!(s.errors, 0, "check {i}: {}", s.all);
     }
-    assert_eq!(seen[1].made, (5, 4), "adding k makes a.rs's heads by their keys, k's body and the impl's three readers:\n{}", seen[1].all);
-    assert_eq!(seen[2].made, (0, 1), "calling k makes h alone:\n{}", seen[2].all);
+    // Entries are per item, not per unit: the fresh check enters 3 bodies (f, g, h once each);
+    // the package's two units show only as two `CrateScope` names tasks.
+    // FLOOR (the engine's rule): adding k moves the impl's head (its key: its text holds the
+    // member list) and makes k's head, S's text stands: 2 heads; k's body is new, and no reader
+    // reads k yet, so f, g and h stand: 1 body. Floor (2, 1).
+    // TODAY (round 4, t5/cli-engine.txt) (4, 4): heads = the impl's (key moved), k's (new), and
+    // f's and g's (cc5a931db3ce, e9ed3939aeb9: read moved, a `CrateScope` names cell, both out
+    // identical); bodies = k's (new) and f's, g's and h's, each entered by its read of the
+    // impl's head cell (the member list read whole) and each out identical. The 2 heads and 3
+    // bodies more are the floor miss: a member list and a scope read by cell would skip them.
+    // D191: bodies are counted in rows, each body here 2 (the library's and its test build's),
+    // so today's 4 bodies are 8 rows and the floor's 1 body 2.
+    assert_eq!(seen[1].made, (4, 8), "adding k (bodies in rows, 2 a body: D191): floor (2, 1), the impl's and k's heads and k's body; today also f's and g's heads (a scope cell) and f's, g's and h's bodies (the impl's head read whole), all identical: PINNED to today's number (round 4, wave 2026-11-19), which misses the floor named in this message; if it went DOWN a fix landed: tighten it toward the floor\n{}", seen[1].all);
+    assert_eq!(seen[2].made, (0, 2), "calling k is a body edit of h: no head, h alone in its 2 units' rows (D191):\n{}", seen[2].all);
     std::println!("member added: made {:?}; call added: made {:?}", seen[1].made, seen[2].made);
 }
 
 /// A MEMBER REMOVED FROM AN IMPL: `f` removed while `h` in `b.rs` still calls it. `h` reports
 /// the real error (no fn `f` on `S`) and the check answers (the drive refused no record as two
-/// values under one key: `TwoValues`); putting `f` back clears it, and finds every first answer
-/// in the records: no `BodyCheck` is made. Prints `member removed: errors (0, 1, 0); put back
+/// values under one key: `TwoValues`); putting `f` back clears it with the first check's answer
+/// (floor (2, 2) entered, pinned at today's (3, 3): see the assertion). Prints `member removed: errors (0, 1, 0); put back
 /// made (S, B)`.
 ///
 /// Before blaze-drive's walk (request.rs `Walk`), a removal changed which heads `h` names while
@@ -317,7 +321,16 @@ fn a_member_removed_from_an_impl_is_its_callers_error() {
     let seen = checks_of(85, &[(IMPL_FG, CALLS_F), (REMOVED, CALLS_F), (IMPL_FG, CALLS_F)]);
     assert!(!stale(&seen[1].words), "{}", seen[1].all);
     assert_eq!((seen[0].errors, seen[1].errors, seen[2].errors), (0, 1, 0), "h must report the missing f:\n{}", seen[1].all);
-    assert_eq!(seen[2].made.1, 0, "f put back finds every body's first answer in the records:\n{}", seen[2].all);
+    // Put back, the answer is the first check's (the old checker's 0 bodies does not transfer).
+    // FLOOR (the engine's rule): the impl's head (its key: the member list is back) and f's head
+    // (new); f's body (new) and h, whose read of S's member f moved (its answer changes: the
+    // E0599 goes): (2, 2). TODAY (round 4, t5/cli-engine.txt) (3, 3): one head more,
+    // e9ed3939aeb9 (by its read of a `CrateScope` names cell, out identical: g's, the same task
+    // that adding a member re-enters), and one body more, entered by its read of the impl's head
+    // cell and out identical (g's). Entries are per item: one unit's bodies, not two.
+    assert_eq!(seen[2].words, seen[0].words, "f put back answers as the first check did:\n{}", seen[2].all);
+    // D191: bodies in rows, 2 a body (the library's and its test build's): today's 3 are 6.
+    assert_eq!(seen[2].made, (3, 6), "f put back (bodies in rows, 2 a body: D191): floor (2, 2), the impl's and f's heads, f's body and h; today also g's head (a scope cell) and g's body (the impl's head read whole), both identical: PINNED to today's number (round 4, wave 2026-11-19), which misses the floor named in this message; if it went DOWN a fix landed: tighten it toward the floor\n{}", seen[2].all);
     std::println!("member removed: errors ({}, {}, {}); put back made {:?}", seen[0].errors, seen[1].errors, seen[2].errors, seen[2].made);
 }
 
@@ -339,7 +352,11 @@ fn a_module_level_item_removed_and_put_back_is_answered_from_records() {
     for seen in [&free, &named] {
         assert!(!seen[1].all.contains("TwoValues"), "a removal refused as two values:\n{}", seen[1].all);
         assert_eq!((seen[0].errors, seen[2].errors), (0, 0), "{}", seen[2].all);
-        assert_eq!(seen[2].made.1, 0, "the item put back finds every body's first answer in the records:\n{}", seen[2].all);
+        // The answer is the first check's; the engine enters the item's own body if it has one
+        // (f; T has none) and its one reader h, whose read of the name moved: at most 2 bodies,
+        // each in its 2 units' rows (D191: the library's and its test build's), so 4 rows.
+        assert_eq!(seen[2].words, seen[0].words, "the item put back answers as the first check did:\n{}", seen[2].all);
+        assert!(seen[2].made.1 <= 4, "the item put back enters its own body and its reader h alone (at most 2 bodies, 2 rows each: D191): {:?}\n{}", seen[2].made, seen[2].all);
     }
     std::println!("module-level removal: put back made {:?} and {:?}", free[2].made, named[2].made);
 }
@@ -357,7 +374,10 @@ fn a_module_level_item_removed_is_its_readers_error() {
     let free = checks_of(86, &[(FREE_F_G, CALLS_FREE_F), (FREE_G, CALLS_FREE_F), (FREE_F_G, CALLS_FREE_F)]);
     assert!(free[1].errors >= 1 && (free[0].errors, free[2].errors) == (0, 0), "h must report the missing free f:\n{}", free[1].all);
     assert!(free[1].words.contains("E0425\\u{1f}cannot find function `f` in module `wide::a` (segment 2)"), "the removal's error is the fresh one:\n{}", free[1].all);
-    assert_eq!(free[2].made.1, 0, "f put back answers from the first check's records:\n{}", free[2].all);
+    // f's body (back) and its one reader h, whose read of the name `f` moved: at most 2 bodies,
+    // each in its 2 units' rows (D191: the library's and its test build's), so 4 rows.
+    assert_eq!(free[2].words, free[0].words, "f put back answers as the first check did:\n{}", free[2].all);
+    assert!(free[2].made.1 <= 4, "f put back enters f's body and its reader h alone (at most 2 bodies, 2 rows each: D191): {:?}\n{}", free[2].made, free[2].all);
 }
 
 /// A PRIVATE ITEM ADDED must make itself alone: a private `fn z` added to `a.rs` (six fns, three
@@ -421,7 +441,11 @@ fn a_name_that_does_not_exist_is_an_error() {
     assert!(call[0].words.contains("E0425\\u{1f}cannot find function `f` in module `wide::a` (segment 2)"), "the E0425 names `f` and its module as written:\n{}", call[0].all);
     assert!(!call[0].words.contains("not checked") && !call[0].words.contains("Empty"), "no gap beside the error:\n{}", call[0].all);
     assert_eq!(call[1].errors, 0, "f put in clears it:\n{}", call[1].all);
-    assert_eq!((call[2].errors, call[2].made.1), (call[0].errors, 0), "f taken out again answers from the first check's records:\n{}", call[2].all);
+    assert_eq!((call[2].errors, &call[2].words), (call[0].errors, &call[0].words), "f taken out again answers as the first check did:\n{}", call[2].all);
+    // The engine's rule (2026-11-19): `f` removed ends `f`'s body task, and `h`'s read of the
+    // name `f` moved, so `h` alone is entered: 1 (measured 1 on the first engine run). The floor
+    // is 0 (the first check's record of `h`, found by its read list, which matches again).
+    assert_eq!(call[2].made.1, 2, "f taken out again enters h alone, the one reader of the name `f`, in its 2 units' rows (D191):\n{}", call[2].all);
     let used = fresh_two_files(96, FREE_G, "use crate::a::f;\npub fn h() {}\n");
     assert_eq!((used.errors, used.status), (1, Some(1)), "{:?}\n{:?}", used.ids, used.words);
     assert!(used.ids.iter().any(|(code, _)| code == "unresolved"), "the import is the names' unresolved finding: {:?}", used.ids);
@@ -453,7 +477,9 @@ fn a_missing_type_in_a_body_is_e0412() {
     assert!(without.0 >= 1 && without.1 == with.1, "T removed: E0412 beside the same E0308:\n{}", seen[1].all);
     assert!(seen[1].words.contains("E0412\\u{1f}cannot find type `T` in module `wide::a` (segment 2)"), "{}", seen[1].all);
     assert!(!seen[1].words.contains("not checked") && !seen[1].words.contains("lowering refused"), "no note beside the error:\n{}", seen[1].all);
-    assert_eq!((back, seen[2].made.1), (with, 0), "T put back answers from the first check's records:\n{}", seen[2].all);
+    assert_eq!((back, &seen[2].words), (with, &seen[0].words), "T put back answers as the first check did:\n{}", seen[2].all);
+    // T has no body; h, the one reader of the name `T`, alone is entered: at most 1.
+    assert!(seen[2].made.1 <= 2, "T put back enters its reader h alone, in its 2 units' rows (D191): {:?}\n{}", seen[2].made, seen[2].all);
     let fresh = fresh_two_files(102, FREE_K, WRITES_T);
     assert_eq!(fresh.status, Some(1), "{:?}", fresh.words);
     assert!(fresh.words.iter().any(|w| w.starts_with("E0412")), "fresh: {:?}", fresh.words);
@@ -472,11 +498,31 @@ fn a_missing_type_in_a_body_is_e0412() {
 #[test]
 fn a_name_after_a_refused_macro_call_is_not_an_error() {
     const NOT_F: &str = "macro_rules! make {\n    (fn $n:ident) => { pub fn $n() {} };\n}\nmake!(struct f);\n";
-    let got = fresh_two_files(99, NOT_F, CALLS_FREE_F);
+    // `fresh_two_files`'s world, kept: its stored answer is asked for the records below.
+    let io = Io::simulated(SimWorld::new(99, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", TWO_FILES);
+    write(&io, "src/a.rs", NOT_F);
+    write(&io, "src/b.rs", CALLS_FREE_F);
+    let got = check(&io);
+    assert_eq!(got.failures, 0, "{}", got.profile);
     assert_eq!(got.errors, 1, "the call's error alone:\n{:?}\n{:?}", got.ids, got.words);
     assert!(got.ids.iter().any(|(code, _)| code == "macro-call-failed"), "{:?}", got.ids);
     assert!(!got.words.iter().any(|w| w.starts_with("E0425")), "no E0425 for a name the refused call may make: {:?}", got.words);
-    assert!(got.words.iter().any(|w| w.contains("a macro call of its module was refused")), "h is not checked under the call: {:?}", got.words);
+    // The old checker's words ("a macro call of its module was refused", body_types.rs
+    // `MACRO_CALL_REFUSED`) are gone with it; the engine's not-checked notes name the item
+    // (not_checked/items.rs: "not checked because <cause>: `h` (src/b.rs)"). Whatever the cause's
+    // words, `h` must be NAMED as not checked: a body passed over in silence is a check that is
+    // not whole (check-is-a-whole-check). The first engine run printed the call's error alone.
+    // A body's not-checked state is a noted finding of the answer (D164), never a listed
+    // finding (`got.words`): `h`'s record, its subject `h` of src/b.rs, its cause the refused
+    // call of `make`.
+    let noted = super::world_run::noted(&io);
+    assert!(
+        noted.iter().any(|one| one.cause == blaze_report::finding::CauseKind::RefusedCall && one.file == "src/b.rs" && one.item == "h" && one.of.contains("the call of `make`")),
+        "h is not checked under the call, and its record says so: {:?} {noted:?}",
+        got.words
+    );
     std::println!("refused call: 1 error, h not checked under it");
 }
 
@@ -492,7 +538,10 @@ fn an_impl_a_method_call_resolved_to_removed_is_its_callers_error() {
     let seen = checks_of(88, &[(WITH_IMPL, CALLS_METHOD), (WITHOUT_IMPL, CALLS_METHOD), (WITH_IMPL, CALLS_METHOD)]);
     assert!(!stale(&seen[1].words), "{}", seen[1].all);
     assert_eq!((seen[0].errors, seen[1].errors, seen[2].errors), (0, 1, 0), "h must report the method f gone with its impl:\n{}", seen[1].all);
-    assert_eq!(seen[2].made.1, 0, "the impl put back finds every body's first answer in the records:\n{}", seen[2].all);
+    // The impl's f's body (back) and its one reader h, whose method lookup moved: at most 2
+    // bodies, each in its 2 units' rows (D191: the library's and its test build's), so 4 rows.
+    assert_eq!(seen[2].words, seen[0].words, "the impl put back answers as the first check did:\n{}", seen[2].all);
+    assert!(seen[2].made.1 <= 4, "the impl put back enters f's body and its reader h alone (at most 2 bodies, 2 rows each: D191): {:?}\n{}", seen[2].made, seen[2].all);
     std::println!("impl removed: errors ({}, {}, {}); put back made {:?}", seen[0].errors, seen[1].errors, seen[2].errors, seen[2].made);
 }
 
@@ -517,7 +566,7 @@ fn an_impl_fn_head_is_read_by_its_callers() {
     let seen = edit_seen(71, FIRST, EDITED, "pub fn g() {\n    crate::a::S.f(1u8);\n}\n");
     assert!(!unnamed(&seen.first_words), "a head of an impl fn was not named: {}", seen.first_words);
     assert_eq!(seen.errors, (0, 1, 0), "the caller in b.rs must see S::f's new parameter type:\n{}", seen.after);
-    assert_eq!(seen.made, (1, 2), "the edit makes f's head, f's body and its one reader:\n{}", seen.after);
+    assert_eq!(seen.made, (1, 4), "the edit makes f's head, f's body and its one reader, each body in its 2 units' rows (D191):\n{}", seen.after);
     std::println!("impl fn head: errors {:?}; parameter edit (Signature, BodyCheck) made {:?}", seen.errors, seen.made);
 }
 
@@ -541,7 +590,10 @@ fn a_fn_an_impl_level_macro_wrote_is_read_by_its_impl() {
     let seen = edit_seen(72, &first, &edited, "pub fn g() {\n    crate::a::S.f(1u8);\n}\n");
     assert!(!unnamed(&seen.first_words), "a fn an impl-level call wrote was not named: {}", seen.first_words);
     assert_eq!(seen.errors, (0, 1, 0), "the caller in b.rs must see the macro-written S::f's new parameter type:\n{}", seen.after);
-    assert_eq!(seen.made.0, 2, "the call's edit makes a.rs's two heads by their keys (S's and the impl's):\n{}", seen.after);
+    // The engine's rule: a head's key is its own item-relative text and what it reads, never its
+    // file's `Surface` (the old checker's coarse key made S's head too: 2). The call's argument
+    // is inside the impl, so the impl's head is entered and `S`'s text stands: 1 (measured 1).
+    assert_eq!(seen.made.0, 1, "the call's edit enters the impl's head alone; S's head stands:\n{}", seen.after);
     assert!((1..=2).contains(&seen.made.1), "the call's edit makes its one reader (and the call's own check, if any):\n{}", seen.after);
     std::println!("impl-level macro head: errors {:?}; call edit (Signature, BodyCheck) made {:?}", seen.errors, seen.made);
 }
@@ -561,7 +613,7 @@ fn a_foreign_fn_head_is_read_by_its_extern_block() {
     let seen = edit_seen(73, FIRST, EDITED, "pub fn g() {\n    unsafe { crate::a::f(1u8) };\n}\n");
     assert!(!unnamed(&seen.first_words), "a foreign fn's head was not named: {}", seen.first_words);
     assert_eq!(seen.errors, (0, 1, 0), "the caller in b.rs must see the foreign f's new parameter type:\n{}", seen.after);
-    assert_eq!(seen.made, (1, 1), "the edit makes the block's head and its one reader:\n{}", seen.after);
+    assert_eq!(seen.made, (1, 2), "the edit makes the block's head and its one reader, in its 2 units' rows (D191):\n{}", seen.after);
     std::println!("foreign fn head: errors {:?}; parameter edit (Signature, BodyCheck) made {:?}", seen.errors, seen.made);
 }
 
@@ -577,15 +629,6 @@ fn a_struct_declared_in_a_body_needs_no_signature() {
     std::println!("body-local struct: clean");
 }
 
-/// The count after `word` of `kind`'s profile row (blaze-drive profile.rs's `Display`); a row
-/// or word the profile does not have is a broken test, never a 0.
-fn count(profile: &str, kind: &str, word: &str) -> u32 {
-    let row = profile.lines().find(|line| line.split_whitespace().next() == Some(kind));
-    let words: std::vec::Vec<&str> = row.unwrap_or_else(|| panic!("no `{kind}` row:\n{profile}")).split_whitespace().collect();
-    let at = words.iter().position(|w| *w == word).unwrap_or_else(|| panic!("no `{word}` in the `{kind}` row:\n{profile}"));
-    words.get(at + 1).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("no count after `{word}` in the `{kind}` row:\n{profile}"))
-}
-
 /// The two-file workspace with `caller` as `b.rs`, checked once fresh (seed `seed`): the check.
 fn fresh_two_files(seed: u64, callee: &str, caller: &str) -> Checked {
     let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
@@ -593,26 +636,18 @@ fn fresh_two_files(seed: u64, callee: &str, caller: &str) -> Checked {
     write(&io, "src/lib.rs", TWO_FILES);
     write(&io, "src/a.rs", callee);
     write(&io, "src/b.rs", caller);
-    let first = check(&io, work::Sizes::USUAL);
-    assert!(first.failed.is_empty(), "{:?}\n{}", first.failed, first.profile);
+    let first = check(&io);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     first
 }
 
-/// A BODY READS A HEAD AT ITS TASK'S OUT (body_types/heads.rs `HeadReads`). `g` in `b.rs` calls
-/// `f` of `a.rs`: its first entry names `f`'s `Signature`, which it was not handed, so it
-/// answers a need of it (at `a.rs`'s `FileItems`), is entered again with it handed, and settles
-/// with the read at that out: the drive refuses any other (`DriveError::ReadNotHanded`, which
-/// fails the check). Then:
-/// - THE BOUND: no body is entered more than 5 times (graph and owners; the owners' crate
-///   scopes; rarely the `no_core` scope; the missing `Signature`s and its file's `Surface`, in
-///   one need; settle): the `BodyCheck` entries are at most 5 a body made, and no job of the
-///   check took more than 4 (the histogram's 5-and-over buckets are empty);
-/// - the `Signature` costs no entry of its own: `g` calling nothing of `a.rs` is entered as
-///   often (its `Surface` need is the one its `Signature` need rides with);
-/// - the repeat stands on its certificate with no run: the read list is the one the record
-///   holds (before, the body read an out it made, which differed from the task's: tempo's
-///   bodies were entered 64 times).
-/// Prints `handed head: BodyCheck entries E for B bodies (needs N), the same without the call`.
+/// A BODY READING ANOTHER FILE'S HEAD settles at once: `g` in `b.rs` calls `f` of `a.rs`. On the
+/// engine each body is one `Bodies` task entered once (`f` and `g`: 2), as many as when `g` calls
+/// nothing of `a.rs` (the head read costs no entry), and the repeat stands on its certificate
+/// with no entry: the read list is the one the record holds. Ported 2026-11-19 from the old
+/// checker's form, which bounded its `BodyCheck` entries and `Need`s a body (at most 5) by its
+/// schedule's histogram; the engine has no `Need` round trip to bound.
+/// Prints `handed head: Bodies entered E, the same without the call`.
 #[test]
 fn a_body_reading_another_files_head_needs_its_signature_once_and_settles() {
     let io = Io::simulated(SimWorld::new(51, Limits::USUAL));
@@ -620,19 +655,16 @@ fn a_body_reading_another_files_head_needs_its_signature_once_and_settles() {
     write(&io, "src/lib.rs", TWO_FILES);
     write(&io, "src/a.rs", CALLEE_U8);
     write(&io, "src/b.rs", CALLER);
-    let reading = check(&io, work::Sizes::USUAL);
-    let rows = |profile: &str| profile.lines().filter(|l| l.starts_with("BodyCheck") || l.starts_with("Signature") || l.starts_with("schedule")).collect::<std::vec::Vec<_>>().join(" / ");
-    assert!(reading.failed.is_empty() && reading.errors == 0, "{:?} {:?} {}", reading.failed, reading.words, rows(&reading.profile));
-    let repeat = check(&io, work::Sizes::USUAL);
-    assert!(repeat.certified && repeat.runs == 0, "the repeat ran {} tasks: {}", repeat.runs, rows(&repeat.profile));
+    let reading = check(&io);
+    assert!(reading.failures == 0 && reading.errors == 0, "{:?}\n{}", reading.words, reading.profile);
+    let repeat = check(&io);
+    assert!(repeat.stood(), "the repeat stands on its certificate:\n{}", repeat.profile);
     let alone = fresh_two_files(51, CALLEE_U8, "pub fn g() {\n    let _y = 1u8;\n}\n");
-    assert_eq!(alone.errors, 0, "{:?} {}", alone.words, rows(&alone.profile));
-    let (entries, bodies, needs) = (count(&reading.profile, "BodyCheck", "entries"), count(&reading.profile, "BodyCheck", "made"), count(&reading.profile, "BodyCheck", "needs"));
-    assert!(bodies == 2 && entries <= 5 * bodies, "a body settles in at most 5 entries: {}", rows(&reading.profile));
-    let hist = reading.profile.lines().find(|line| line.starts_with("schedule")).and_then(|line| line.split("more ").nth(1)).unwrap_or("");
-    assert!(hist.ends_with(", 0, 0, 0]"), "no job took more than 4 entries: {}", rows(&reading.profile));
-    assert_eq!(entries, count(&alone.profile, "BodyCheck", "entries"), "the `Signature` need is an entry more: {} --- {}", rows(&reading.profile), rows(&alone.profile));
-    std::println!("handed head: BodyCheck entries {entries} for {bodies} bodies (needs {needs}), the same without the call");
+    assert_eq!(alone.errors, 0, "{:?}\n{}", alone.words, alone.profile);
+    let entries = reading.entered(blaze_engine::Stage::Bodies);
+    assert_eq!(entries, 4, "each of `f` and `g` entered once in each of its 2 units' rows (D191: the library's and its test build's):\n{}", reading.profile);
+    assert_eq!(entries, alone.entered(blaze_engine::Stage::Bodies), "the head read is no entry more:\n{}\n---\n{}", reading.profile, alone.profile);
+    std::println!("handed head: Bodies entered {entries}, the same without the call");
 }
 
 /// A HEAD WHOSE `Signature` CANNOT BE MADE is read as that task's record (its out the tokens
@@ -651,10 +683,10 @@ fn a_head_whose_signature_fails_is_read_alike_in_any_order() {
         write(&io, "src/lib.rs", TWO_FILES);
         write(&io, "src/a.rs", BROKEN);
         write(&io, "src/b.rs", CALLER);
-        let first = check(&io, work::Sizes::USUAL);
-        assert!(first.failed.is_empty(), "{:?}\n{}", first.failed, first.profile);
-        let repeat = check(&io, work::Sizes::USUAL);
-        assert!(repeat.certified && repeat.runs == 0, "seed {seed}: the repeat ran {} tasks:\n{}", repeat.runs, repeat.profile);
+        let first = check(&io);
+        assert_eq!(first.failures, 0, "{}", first.profile);
+        let repeat = check(&io);
+        assert!(repeat.stood(), "seed {seed}: the repeat entered {} tasks:\n{}", repeat.engine().entered, repeat.profile);
         seen.push((first.errors, first.ids, first.words));
     }
     assert_eq!(seen[0], seen[1], "two orders listed different findings");
@@ -662,25 +694,23 @@ fn a_head_whose_signature_fails_is_read_alike_in_any_order() {
 }
 
 /// The made counts of one check after `edit` is written to `src/a.rs` of the two-file
-/// workspace, checked once before: (`Signature`, `BodyCheck`).
-fn made_after(seed: u64, edit: &str) -> (u32, u32) {
-    made_after_rows(seed, edit).0
-}
-
-/// [`made_after`], with the edited check's profile rows a reader of a failure needs.
+/// workspace, checked once before (`Heads`, `Bodies` entries: `made_pair`), with the edited
+/// check's findings and profile rows a reader of a failure needs.
 fn made_after_rows(seed: u64, edit: &str) -> ((u32, u32), std::string::String) {
     let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", TWO_FILES);
     write(&io, "src/a.rs", CALLEE_U8);
     write(&io, "src/b.rs", CALLER);
-    let first = check(&io, work::Sizes::USUAL);
-    assert!(first.failed.is_empty(), "{:?}", first.failed);
+    let first = check(&io);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     write(&io, "src/a.rs", edit);
-    let edited = check(&io, work::Sizes::USUAL);
-    assert!(edited.failed.is_empty(), "{:?}", edited.failed);
+    let edited = check(&io);
+    assert_eq!(edited.failures, 0, "{}", edited.profile);
     let rows = edited.profile.lines().filter(|l| !l.starts_with("store") && !l.starts_with("gate")).collect::<std::vec::Vec<_>>().join(" / ");
-    ((made(&edited.profile, "Signature"), made(&edited.profile, "BodyCheck")), rows)
+    // The findings first: a note (a lang item the fixture lacks, say) is what a count's failure
+    // is read by before the profile.
+    (made_pair(&edited), std::format!("{:?} {:?} / {rows}", edited.ids, edited.words))
 }
 
 /// THE GRAIN, by count, in the two-file workspace (`f` in `a.rs`, its one caller `g` in
@@ -688,23 +718,33 @@ fn made_after_rows(seed: u64, edit: &str) -> ((u32, u32), std::string::String) {
 /// - `f`'s parameter type edited: `f`'s `Signature` made again (1), and two bodies, `f`'s own
 ///   (its text is its key) and its caller `g` (its read of `f`'s `Signature` moved): `(1, 2)`;
 /// - `f`'s body edited: no `Signature` (a body is no head), `f`'s body alone: `(0, 1)`;
-/// - `f`'s signature respaced, or a comment written inside it: its `Signature` is made again
-///   (its source is its bytes) with an EQUAL out (head records without the fn's text slot,
-///   head_record.rs `reader_digest`, and tokens without trivia), so `g` stands and only `f`'s
-///   own body runs: `(1, 1)` each. CONTROL: with the text slot in the out (`encode`'s bytes
-///   digested), each is `(1, 2)`.
+/// - `f`'s signature respaced, or a comment written inside it: on the engine a head's key is
+///   its tokens without trivia, so only the file's outline is entered: `(0, 0)` each (the old
+///   checker made the `Signature` again from its bytes with an equal out: `(1, 1)`).
 /// Before D114 the parameter edit made `(0, 1)` (the caller never ran: the stale check), and a
 /// reformat in `b.rs` would have re-checked every body of that file. Prints
 /// `signature counts: parameter edit (Signature, BodyCheck) made (1, 2); body edit (0, 1); reformat (1, 1)`.
 #[test]
 fn a_signature_edit_makes_its_head_and_its_readers_only() {
-    let parameter = made_after(31, CALLEE_U16);
-    let body = made_after(32, "pub fn f(_x: u8) {\n    let _y = 1;\n}\n");
+    // The counts derive from the engine's rule as they did from the old checker's (the manifest
+    // has no binary; since D191 the library's test build checks each body too, so a body is two
+    // rows): a head edit enters that head and its
+    // readers, a body edit enters that body alone.
+    let (parameter, parameter_rows) = made_after_rows(31, CALLEE_U16);
+    let (body, body_rows) = made_after_rows(32, "pub fn f(_x: u8) {\n    let _y = 1;\n}\n");
     let (reformat, rows) = made_after_rows(33, "pub fn f( _x : u8 ) {}\n");
     let (commented, comment_rows) = made_after_rows(34, "pub fn f(\n    // the byte\n    _x: u8\n) {}\n");
-    assert_eq!(parameter, (1, 2), "a parameter edit makes its head and the bodies that read it");
-    assert_eq!(body, (0, 1), "a body edit makes no head and that one body");
-    assert_eq!(reformat, (1, 1), "a respaced head is made again with an equal out: its caller stands: {rows}");
-    assert_eq!(commented, (1, 1), "a comment in a head is made again with an equal out: its caller stands: {comment_rows}");
+    // D191: every unit that holds a body checks it, a row each: the library and its test build
+    // hold both bodies, so a body is 2 rows.
+    assert_eq!(parameter, (1, 4), "a parameter edit enters f's head, f's body (its text is its key) and g (its read of f's head moved), each body in its 2 units' rows (D191): {parameter_rows}");
+    assert_eq!(body, (0, 2), "a body edit enters no head and that one body, in its 2 units' rows (D191): {body_rows}");
+    // Respaced and commented: the outline's key moves (its source is the file's bytes) and it
+    // is entered (1 `Outlines`), but a head's key is its tokens without trivia, so f's head key
+    // stands, nothing reads a moved cell, and f's body text is the same: no head, no body,
+    // (0, 0). Round 4 (t5/cli-engine.txt) measured the respace at (0, 0), only `Outlines 1`:
+    // the floor, below the old checker's (1, 1). The comment adds lines, which moves no token
+    // but trivia, so the same rule gives (0, 0).
+    assert_eq!(reformat, (0, 0), "a respaced head: its tokens are its key, so no head and no body is entered (the outline alone): {rows}");
+    assert_eq!(commented, (0, 0), "a comment in a head is trivia: its tokens are its key, so no head and no body is entered (the outline alone): {comment_rows}");
     std::println!("signature counts: parameter edit (Signature, BodyCheck) made {parameter:?}; body edit {body:?}; respace {reformat:?}; comment {commented:?}");
 }

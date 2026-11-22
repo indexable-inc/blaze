@@ -60,10 +60,10 @@ pub fn from_slice_in<T: FromValue<A>, A: Allocator + Clone>(
     Ok(Cursor::root(&value, alloc).get::<T>()?)
 }
 
-/// `bytes` as JSON under [`Limits::DEFAULT`], read as a `T` in `A`'s default allocator
+/// `bytes` as JSON under [`Limits::SHIPPED`], read as a `T` in `A`'s default allocator
 /// (`from_slice::<Settings, Global>(bytes)`).
 pub fn from_slice<T: FromValue<A>, A: Allocator + Clone + Default>(bytes: &[u8]) -> Result<T, FromJsonError<A>> {
-    from_slice_in(bytes, Limits::DEFAULT, A::default())
+    from_slice_in(bytes, Limits::SHIPPED, A::default())
 }
 
 /// `value` as JSON text written as `options` says, in `alloc`.

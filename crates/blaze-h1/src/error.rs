@@ -46,8 +46,10 @@ pub enum Why {
     TransferEncoding,
     /// A chunk size that is no hex number or overflows.
     ChunkSize,
-    /// A chunk-size line longer than 4096 bytes.
-    ChunkLineOver,
+    /// A chunk-size line longer than the caller allows ([`Limits::most_chunk_line`]).
+    ///
+    /// [`Limits::most_chunk_line`]: crate::Limits::most_chunk_line
+    ChunkLineOver { most: u16 },
     /// A chunk not ended by CRLF.
     ChunkEnd,
     /// A body longer than the caller allows.
@@ -110,7 +112,7 @@ impl fmt::Display for Error {
             Why::LengthAndChunked => f.write_str("both Content-Length and Transfer-Encoding"),
             Why::TransferEncoding => f.write_str("a Transfer-Encoding other than `chunked`"),
             Why::ChunkSize => f.write_str("a chunk size that is no hex number"),
-            Why::ChunkLineOver => f.write_str("a chunk-size line past 4096 bytes"),
+            Why::ChunkLineOver { most } => write!(f, "a chunk-size line past the most allowed, {most} bytes"),
             Why::ChunkEnd => f.write_str("a chunk not ended by CRLF"),
             Why::BodyOver { most } => write!(f, "a body longer than the most allowed, {most} bytes"),
             Why::Truncated { body } => write!(f, "the connection ended after {body} bytes of the body, before its end"),

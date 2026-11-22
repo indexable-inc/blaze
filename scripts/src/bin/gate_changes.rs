@@ -46,8 +46,8 @@ const CODE: &[&str] = &[
     // Found by blaze-fmt's search up from a directory; not known to be unread by its tests.
     ".rustfmt.toml",
     ".clippy.toml",
-    // The pinned nightly the job runs.
-    "harness/toolchain",
+    // The pinned nightly the job runs, and every other fact of the pin (pins/README.md).
+    "pins/",
     // The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
     ".github/actions/toolchain/",

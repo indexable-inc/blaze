@@ -128,7 +128,8 @@ fn bodies_through_modules_are_checked_and_an_unrelated_item_enters_none() {
     let mut bodies: std::vec::Vec<(&'static str, Option<blaze_drive::Kind>, u32)> =
         after.because.iter().filter(|(group, _)| group.stage == blaze_engine::Stage::Bodies).map(|(group, count)| (group.cause, group.definer.map(|name| name.kind), *count)).collect();
     bodies.sort();
-    assert_eq!(bodies, [("new", None, 1)], "an unrelated item added to `dep::m` enters its own body alone: {}", entries(&after));
+    // D191: `dep`'s library and its test build both hold the new fn, a row each.
+    assert_eq!(bodies, [("new", None, 2)], "an unrelated item added to `dep::m` enters its own body alone, in its 2 units' rows (D191): {}", entries(&after));
     let after_other: std::vec::Vec<_> = after.bodies.0.iter().filter(|note| !note.contains("borrows not checked")).collect();
     assert!(after_other.is_empty(), "no body note after the edit: {:?}", after.bodies.0);
 }

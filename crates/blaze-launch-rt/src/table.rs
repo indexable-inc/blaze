@@ -77,7 +77,7 @@ pub struct Shared {
     /// channel: a program thread says things here at any point of its life, its end included
     /// (`sys::Handoff` says why that rules a channel out). A stub's need is not here: it is a
     /// row of `waiters`, which allocates nothing.
-    queue: SegQueue<Event>,
+    queue: SegQueue<Event, std::alloc::Global>,
     /// The control thread's bell: a counter each [`Shared::ring`] adds one to and wakes
     /// (`blaze_core::wait::wake_shared`), which the control thread sleeps on in
     /// [`Shared::wait`]. One word for the queue and the waiters' ring alike, so a stub (which
@@ -390,11 +390,8 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
         // A forked child of a threaded process may hold any lock another thread held at the
         // fork, so it says this with one `write` and ends with `_exit`, as a signal handler
         // would.
-        // SAFETY: a write of a live constant to descriptor 2, then the process's end.
-        unsafe {
-            libc::write(2, WHY.as_ptr().cast(), WHY.len());
-            libc::_exit(127)
-        }
+        let _ = blaze_sys::posix::io::write(blaze_sys::Fd::STDERR, WHY);
+        blaze_sys::posix::signal::exit_now(127)
     }
     // Nothing below may need a thread-local of the launcher's: a stub can fire while its
     // thread is ending, after they are gone (`sys::Handoff`). And nothing below allocates

@@ -11,7 +11,7 @@ use blaze_ladder::front::{At, FnKind};
 use blaze_ladder::front2::keys::{MemberKind, checker_of, member_key_of};
 use blaze_ladder::front2::internal_symbol::{InternalRefused, definition};
 use blaze_ladder::front2::program::{Front2Program, Front2Refusal, lazy::LazyProgram};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, check_body};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
@@ -146,16 +146,11 @@ impl<'a> Load<'a> for Kept<'a> {
         (path.as_str() == c.path).then_some(c.text)
     }
 
-    fn expansion(&self, krate: usize, call: LibKey) -> Option<&'a str> {
-        Some(self.0.get(krate)?.expansions.iter().find(|e| e.0 == call)?.1)
-    }
-
-    fn expansion_origins(&self, krate: usize, call: LibKey) -> Option<(&'a [u8], &'a [u8])> {
-        let bytes = self.0.get(krate)?.expansions.iter().find(|e| e.0 == call)?.2;
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).expect("the fixture expansion's origin column"))
+    fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'a>> {
+        let row = self.0.get(krate)?.expansions.iter().find(|e| e.0 == call)?;
+        let bytes = row.2;
+        let origins = if bytes.is_empty() { (&[][..], &[][..]) } else { blaze_scope::expansion_origins::split(bytes).expect("the fixture expansion's origin column") };
+        Some(LoadedExpansion { text: row.1, origins: Some(origins) })
     }
 }
 
@@ -425,7 +420,7 @@ fn compare_binding(provider: &'static str, plant: bool) {
         };
         let body = BodyFrame {
             frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
-            heads: None, sources: None, goals: None,
+            heads: None, sources: None, goals: None, census: None,
         };
         let filed = check_body(view, &Task { planned, key: Key(ABSENT) }, &body, kept, blaze_own::testing::heap().shared())
             .expect("the caller's BodyCheck read list");
@@ -813,6 +808,26 @@ fn an_async_blocks_call_site_uses_its_enclosing_method() {
 fn a_nested_functions_call_site_uses_its_own_body() {
     check_site("fn outer() -> u8 {\n    fn sample() -> u8 { tracked(7) }\n    sample()\n}",
         "outer() as i32", "fn sample", "tracked(7)", "    fn sample");
+}
+
+/// curve25519-dalek 4.1.3 field.rs:116's shape: a fn local to a body, two doc comments and
+/// an attribute above it. The lowering ranges it from its first `///`, the text scan from its
+/// `#[inline(always)]`; before the fix no declaration matched and the call had no site
+/// (`Adts::caller_site`, tempo's tests t1530). Its site counts from the attribute (seam_rules
+/// local_position.rs `first_token`), warm, from the other front and cold, and moves with an
+/// edit above it. The twin is [`a_documented_nested_functions_call_site_uses_its_own_body`];
+/// the control, with no comment, [`a_nested_functions_call_site_uses_its_own_body`].
+#[test]
+fn a_documented_attributed_nested_functions_call_site_uses_its_own_body() {
+    check_site("fn outer() -> u8 {\n    /// Helper to multiply.\n    /// Two lines.\n    #[inline(always)]\n    fn sample() -> u8 { tracked(17) }\n    sample()\n}",
+        "outer() as i32", "#[inline(always)]\n    fn sample", "tracked(17)", "    /// Helper");
+}
+
+/// The twin: a doc comment and no attribute; the site counts from `fn`.
+#[test]
+fn a_documented_nested_functions_call_site_uses_its_own_body() {
+    check_site("fn outer() -> u8 {\n    /** Block doc. */\n    /// Line doc.\n    fn sample() -> u8 { tracked(18) }\n    sample()\n}",
+        "outer() as i32", "fn sample", "tracked(18)", "    /** Block");
 }
 
 #[test]

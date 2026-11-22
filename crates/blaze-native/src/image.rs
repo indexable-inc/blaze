@@ -34,7 +34,7 @@
 use blaze_own::AVec;
 
 use crate::Platform;
-use crate::libraries::Library;
+use crate::libraries::Linked;
 use crate::unwind::Row;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,7 +72,7 @@ pub struct Image<'a> {
     pub words: AVec<'a, &'a [u8]>,
     pub inits: u32,
     pub descriptor_at: u64,
-    pub libraries: AVec<'a, Library<'a>>, // Plan::libraries, load order
+    pub libraries: AVec<'a, Linked<'a>>, // Plan::libraries, load order
     /// Mach-O: the unwind rows the `UnwindInfo` region encodes, as data (sorted by start; a
     /// DWARF-mode row's low 24 bits are its FDE's offset in the `EhFrame` region). Empty on ELF.
     /// An executable writer (blaze-export eh_out.rs, W9) builds its one `__unwind_info` from them.

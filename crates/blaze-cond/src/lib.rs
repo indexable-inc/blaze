@@ -69,8 +69,14 @@
 // blaze's lints (`blaze::sans_io` on the modules) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
-// Tests compare against truth tables on std's vectors and keep the planted bug in a thread-local.
+// Tests compare against truth tables on std's vectors.
 #[cfg(test)]
 extern crate std;
 
@@ -85,6 +91,7 @@ mod space;
 #[cfg(test)]
 mod tests;
 
-pub use bdd::{Bdd, Cond, Limits, MOST_NODES, MOST_VARS, Stats, Var, Witness};
+pub use bdd::{Bdd, Cond, Limits, MOST_NODES, MOST_VARS, PlantedBdd, Stats, Var, Witness};
+pub use plant::CondPlant;
 pub use error::{CondError, ImportError, ParseError, SpaceError};
 pub use space::{Atom, Space, SpaceBuilder, VarKey, VarKind};

@@ -22,9 +22,15 @@
 
 #![no_std]
 #![cfg_attr(test, feature(allocator_api))]
-// `#![blaze::sans_io]` in the modules names blaze's tool; inert under rustc.
+// `#![blaze::sans_io]` names blaze's tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes, portable_simd)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
 #[cfg(test)]
 extern crate std;
@@ -48,10 +54,13 @@ use core::alloc::Allocator;
 use blaze_own::Vec;
 
 pub use checksum::{Adler32, Crc32, adler32, crc32};
-pub use deflate::{Deflate, DeflateError, Level};
+pub use deflate::{Deflate, DeflateError, Level, PlantedDeflate};
 pub use error::{Error, Format, Tree, Why};
-pub use gzip::{GzipDecoder, GzipEncoder};
-pub use inflate::{Fed, Inflate, InflateInto, Limits, MAX_RATIO, RATIO_SLACK};
+pub use gzip::{GzipDecoder, GzipEncoder, PlantedGzipDecoder};
+pub use inflate::{
+    Fed, Inflate, InflateInto, Limits, MAX_RATIO, PlantedInflate, PlantedInflateInto, RATIO_SLACK,
+};
+pub use plant::DeflatePlant;
 pub use zlib::{ZlibDecoder, ZlibEncoder, ZlibInto};
 
 /// `input` deflated at `level`, appended to `out`; the deflater's buffers in `alloc`.

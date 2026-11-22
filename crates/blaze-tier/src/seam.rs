@@ -8,7 +8,7 @@
 
 use core::fmt;
 
-use blaze_lir::View;
+use blaze_lir::Verified;
 use blaze_own::Alloc;
 
 use crate::{Machine, Names, Outside, TableError, record::Emitted, record::FormError};
@@ -32,13 +32,15 @@ impl TierName {
     }
 }
 
-/// One tier: a function in, an emitted code record out.
+/// One tier: a function in, an emitted code record out. The function is the proof
+/// `blaze_lir::verify` answered (D163): no tier is handed unchecked LIR, and none checks it
+/// again.
 pub trait Tier {
     const NAME: TierName;
 
     fn emit<'a>(
         &self,
-        func: View<'_>,
+        func: Verified<'_>,
         names: &dyn Names,
         machine: Machine,
         alloc: Alloc<'a>,

@@ -39,7 +39,10 @@
 //! search by property.
 
 #![no_std]
-#![feature(portable_simd)]
+#![feature(portable_simd, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]

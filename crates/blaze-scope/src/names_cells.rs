@@ -63,7 +63,7 @@ use crate::resolve::{CrateNames, aligned};
 pub const KEY_DOMAIN: &str = "blaze v2 crate names cell key 1";
 /// The domain of a cell's digest. "1": a `Module` cell that held the module's textual macros
 /// and marks, now the `Textual` cell's.
-pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 2";
+pub const DIGEST_DOMAIN: &str = "blaze v2 crate names cell digest 3";
 
 static KEYS: Domain = Domain::new(KEY_DOMAIN);
 static DIGESTS: Domain = Domain::new(DIGEST_DOMAIN);
@@ -213,6 +213,25 @@ fn item_digest<'a>(items: &ItemsRecord<'a>, key: ItemKey, read: ReadText<'_, 'a>
             // `NamesSource::extern_abi` answers through this cell alone, so an edit of the
             // block's string moves it.
             h.std(&row.foreign);
+            // The lifetimes its generics declare (D155, `ItemIdentity::lifetimes`): what
+            // `NamesSource::declared_lifetimes` answers through this cell alone (the text is
+            // hashed here by its place only), so an edit of the generics moves it.
+            h.std(&row.lifetimes);
+            // Its `link_name`/`export_name` values written as macro calls, as the solve
+            // expanded them (the record's value table, `NamesSource::attr_value`): what a body
+            // naming the item's symbol reads through this cell alone, so a value that moves
+            // while the item's text stays (ring's `prefix!()` reads `CARGO_PKG_VERSION`, a
+            // macro defined elsewhere is edited) moves it (rule 21). An item with no such row
+            // hashes nothing here: its digest is the one it had before the table existed.
+            for (byte, attr) in crate::attr_values::ATTRS.iter().enumerate() {
+                if let Some(answer) = items.attr_value(key, attr)? {
+                    let (state, text) = match answer {
+                        Ok(value) => (0u8, value),
+                        Err(words) => (1u8, words),
+                    };
+                    h.update(&[6, byte as u8, state]).update(&(text.len() as u64).to_le_bytes()).update(text.as_bytes());
+                }
+            }
             if row.kind == ItemKind::Module {
                 // A module's row holds its HEAD only (attributes, visibility, name): what it
                 // holds is its own cells', so an item added inside an inline module moves that
@@ -227,7 +246,7 @@ fn item_digest<'a>(items: &ItemsRecord<'a>, key: ItemKey, read: ReadText<'_, 'a>
                     }
                 }
             } else {
-                span_text(&mut h, items, row.text, read)?;
+                h.std(&row.text.map(|span| span.at));
             }
             span_text(&mut h, items, row.impl_header, read)?;
         }
@@ -317,7 +336,11 @@ fn members_digest<'a>(items: &ItemsRecord<'a>, owner: ItemKey, read: ReadText<'_
     for member in members.iter() {
         let member = member?;
         h.id(&member.key.0).std(&member.name).std(&member.kind).update(&[u8::from(member.body_holds_items)]).std(&member.written_by);
-        span_text(&mut h, items, member.text, read)?;
+        if member.kind == ItemKind::Function {
+            h.std(&member.text.map(|span| span.at));
+        } else {
+            span_text(&mut h, items, member.text, read)?;
+        }
     }
     Ok(Some(h.finish()))
 }
@@ -633,7 +656,8 @@ pub const MAX_ROWS: usize = 1 << 24;
 /// solve's own files and expansions; each of `wholes` is a [`NameCell::Whole`].
 pub fn crate_table<'a>(names: &CrateNames<'a>, names_record: &[u8], items_record: &[u8], wholes: &[(Section, &[u8])], alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CellsError> {
     let record = NamesRecord::open(Verified::check(aligned(names_record, alloc)).map_err(CellsError::Names)?);
-    let items = ItemsRecord::open(aligned(items_record, alloc), alloc).map_err(CellsError::Items)?;
+    let mut items = ItemsRecord::open(aligned(items_record, alloc), alloc).map_err(CellsError::Items)?;
+    items.use_solved_texts(names);
     let read = |of: TextOf<'_>| -> Option<&'a str> {
         match of {
             TextOf::File { index, .. } => names.files.get(index as usize).map(|file| file.text),

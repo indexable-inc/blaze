@@ -14,7 +14,7 @@ type Table<'a, T> = Vec<T, SharedAlloc<'a>>;
 
 use crate::bytes::{arr, put_u32, put_u64, u32_at, u64_at};
 use crate::segment::{CellsView, DictView, OwedView, RowView, RowsBytes, RowsView, RunView, SegmentKind};
-use crate::{AnswerError, COMPACT_AT, CellDigest, CellNo, FORMAT, LinesKey, MAX_RUNS, MAX_SEGMENTS, Plant, ROOT, ROOT_MAGIC, Serial, TaskId, TreeDigest};
+use crate::{AnswerError, COMPACT_AT, CellDigest, CellNo, FORMAT, LinesKey, MAX_RUNS, MAX_SEGMENTS, MAX_SUMMARY, Plant, ROOT, ROOT_MAGIC, Serial, TaskId, TreeDigest};
 
 /// The domain of a segment's id: the content digest of its bytes.
 pub(crate) const SEGMENT_DOMAIN: &str = "blaze-answer segment 1";
@@ -38,18 +38,22 @@ impl SegmentRef {
     }
 }
 
-/// A root's fields, read in place.
-struct RootView<'a> {
+/// A bounded root directory. Parsing checks its structure without opening any child.
+#[derive(Clone, Copy, Debug)]
+pub struct RootView<'a> {
     serial: Serial,
     tree: TreeDigest,
     lines: LinesKey,
     summary: &'a [u8],
     entries: &'a [u8],
-    count: usize,
 }
 
 impl<'a> RootView<'a> {
-    fn parse(bytes: &'a [u8]) -> Result<RootView<'a>, AnswerError> {
+    /// Maximum bytes to read or authenticate for one root.
+    pub const MAX_BYTES: usize = ROOT_HEAD + MAX_SUMMARY + 4 + MAX_SEGMENTS * ROOT_ENTRY;
+
+    /// Validate the root's format, layout, directory limits and set cardinalities.
+    pub fn parse(bytes: &'a [u8]) -> Result<RootView<'a>, AnswerError> {
         if bytes.len() < ROOT_HEAD {
             return Err(AnswerError::RootShort { at: bytes.len() });
         }
@@ -61,11 +65,17 @@ impl<'a> RootView<'a> {
             return Err(AnswerError::Format { segment: ROOT, found: format });
         }
         let summary_len = u32_at(bytes, ROOT_HEAD - 4) as usize;
+        if summary_len > MAX_SUMMARY {
+            return Err(AnswerError::Cap { what: "summary bytes", cap: MAX_SUMMARY as u64 });
+        }
         let at = ROOT_HEAD + summary_len;
         if bytes.len() < at + 4 {
             return Err(AnswerError::RootShort { at: bytes.len() });
         }
         let count = u32_at(bytes, at) as usize;
+        if count > MAX_SEGMENTS {
+            return Err(AnswerError::Cap { what: "segments a root", cap: MAX_SEGMENTS as u64 });
+        }
         let end = at + 4 + count * ROOT_ENTRY;
         if bytes.len() < end {
             return Err(AnswerError::RootShort { at: bytes.len() });
@@ -74,9 +84,23 @@ impl<'a> RootView<'a> {
             return Err(AnswerError::RootTrailing { at: end });
         }
         let entries = &bytes[at + 4..end];
-        for i in 0..count {
-            if SegmentKind::from_u8(entries[i * ROOT_ENTRY]).is_none() {
-                return Err(AnswerError::SegmentKind { segment: i as u32, found: entries[i * ROOT_ENTRY] });
+        let mut runs = 0;
+        let mut whole = 0u16;
+        for (i, entry) in entries.chunks_exact(ROOT_ENTRY).enumerate() {
+            let segment = i as u32;
+            let kind = SegmentKind::from_u8(entry[0]).ok_or(AnswerError::SegmentKind { segment, found: entry[0] })?;
+            if kind.is_run() {
+                runs += 1;
+                if runs > MAX_RUNS {
+                    return Err(AnswerError::Cap { what: "runs a root", cap: MAX_RUNS as u64 });
+                }
+            }
+            if kind.is_whole() {
+                let bit = 1u16 << entry[0];
+                if whole & bit != 0 {
+                    return Err(AnswerError::TwoWhole { kind, segment });
+                }
+                whole |= bit;
             }
         }
         Ok(RootView {
@@ -85,15 +109,67 @@ impl<'a> RootView<'a> {
             lines: LinesKey(arr(bytes, 48)),
             summary: &bytes[ROOT_HEAD..ROOT_HEAD + summary_len],
             entries,
-            count,
         })
     }
 
-    fn entry(&self, i: usize) -> SegmentRef {
-        let at = i * ROOT_ENTRY;
-        let kind = SegmentKind::from_u8(self.entries[at]).expect("a root's kinds are checked at parse");
-        SegmentRef { kind, len: u64_at(self.entries, at + 1), id: ContentId(arr(self.entries, at + 9)) }
+    pub fn tree(&self) -> TreeDigest {
+        self.tree
     }
+
+    pub fn lines(&self) -> LinesKey {
+        self.lines
+    }
+
+    pub fn summary(&self) -> &'a [u8] {
+        self.summary
+    }
+
+    pub fn byte_len(&self) -> usize {
+        ROOT_HEAD + self.summary.len() + 4 + self.entries.len()
+    }
+
+    /// Child references in lookup order, newest first.
+    pub fn segments(&self) -> impl ExactSizeIterator<Item = SegmentRef> + '_ {
+        self.entries.chunks_exact(ROOT_ENTRY).map(|entry| SegmentRef {
+            kind: SegmentKind::from_u8(entry[0]).expect("root kinds checked at parse"),
+            len: u64_at(entry, 1),
+            id: ContentId(arr(entry, 9)),
+        })
+    }
+
+    /// Explicitly check the contents of every child against this root and verify its indexes.
+    /// A scrub reads all segment bytes. Certificate lookup uses the directory alone.
+    pub fn scrub<'s>(&'s self, fetch: impl FnMut(&SegmentRef) -> Option<&'s [u8]>, alloc: SharedAlloc<'s>) -> Result<(), AnswerError> {
+        let view = AnswerView::read_segments(*self, fetch, |segment, child, bytes| {
+            let found = ContentId::of(SEGMENT_DOMAIN, bytes);
+            if found != child.id {
+                return Err(AnswerError::SegmentDigest { segment, expected: child.id, found });
+            }
+            Ok(())
+        }, Plant::None, alloc)?;
+        view.verify()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn root_limits_are_checked_before_following_children() {
+    let refusal = |root: &[u8]| {
+        AnswerView::open(root, |child| panic!("opened child {child:?} of an invalid root"), Plant::None, blaze_own::testing::heap().shared()).err()
+    };
+    let mut bytes = [0; ROOT_HEAD + 4 + 2 * ROOT_ENTRY];
+    bytes[..4].copy_from_slice(&ROOT_MAGIC);
+    bytes[4..8].copy_from_slice(&FORMAT.to_le_bytes());
+    bytes[ROOT_HEAD - 4..ROOT_HEAD].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(refusal(&bytes), Some(AnswerError::Cap { what: "summary bytes", cap: MAX_SUMMARY as u64 }));
+    bytes[ROOT_HEAD - 4..ROOT_HEAD].fill(0);
+    bytes[ROOT_HEAD..ROOT_HEAD + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(refusal(&bytes), Some(AnswerError::Cap { what: "segments a root", cap: MAX_SEGMENTS as u64 }));
+
+    bytes[ROOT_HEAD..ROOT_HEAD + 4].copy_from_slice(&2u32.to_le_bytes());
+    bytes[ROOT_HEAD + 4] = SegmentKind::Owed as u8;
+    bytes[ROOT_HEAD + 4 + ROOT_ENTRY] = SegmentKind::Owed as u8;
+    assert_eq!(refusal(&bytes), Some(AnswerError::TwoWhole { kind: SegmentKind::Owed, segment: 1 }));
 }
 
 /// The root's bytes: the commit record of one answer.
@@ -188,23 +264,35 @@ impl<'a> AnswerView<'a> {
     /// The answer `root` names, each segment's bytes from `fetch` (a mapping of the store's
     /// segment of that id). Checks the root, each segment's head and length against the root, and
     /// every bound an accessor indexes by (rule 74: once, here); each refusal names the segment.
-    pub fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], mut fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
-        let parsed = RootView::parse(root)?;
-        if parsed.count > MAX_SEGMENTS {
-            return Err(AnswerError::Cap { what: "segments a root", cap: MAX_SEGMENTS as u64 });
-        }
+    pub fn open<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(root: &'a [u8], fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
+        Self::from_root(RootView::parse(root)?, fetch, plant, alloc)
+    }
+
+    /// Open store-held segments of a previously parsed root. The store supplies the bytes
+    /// filed under the requested identity.
+    pub fn from_root<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(parsed: RootView<'a>, fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
+        Self::read_segments(parsed, fetch, |_, _, _| Ok(()), plant, alloc)
+    }
+
+    fn read_segments(
+        parsed: RootView<'a>,
+        mut fetch: impl FnMut(&SegmentRef) -> Option<&'a [u8]>,
+        mut check: impl FnMut(u32, &SegmentRef, &[u8]) -> Result<(), AnswerError>,
+        plant: Plant,
+        alloc: SharedAlloc<'a>,
+    ) -> Result<AnswerView<'a>, AnswerError> {
         let mut view = AnswerView::empty(plant, alloc);
         view.serial = parsed.serial;
         view.tree = parsed.tree;
         view.lines = parsed.lines;
         view.summary = parsed.summary;
-        for i in 0..parsed.count {
-            let one = parsed.entry(i);
+        for (i, one) in parsed.segments().enumerate() {
             let segment = i as u32;
             let Some(bytes) = fetch(&one) else { return Err(AnswerError::MissingSegment { segment, id: one.id }) };
             if bytes.len() as u64 != one.len {
                 return Err(AnswerError::SegmentLength { segment, expected: one.len, found: bytes.len() as u64 });
             }
+            check(segment, &one, bytes)?;
             match one.kind {
                 SegmentKind::Dict => view.dicts.push((segment, DictView::open(bytes, segment)?)),
                 SegmentKind::Rows => view.rows.push((segment, RowsView::open(bytes, segment)?)),
@@ -212,19 +300,10 @@ impl<'a> AnswerView<'a> {
                 SegmentKind::Run => view.runs.push((segment, RunView::open(bytes, SegmentKind::Run, segment)?)),
                 SegmentKind::Plans => view.plans.push((segment, RunView::open(bytes, SegmentKind::Plans, segment)?)),
                 SegmentKind::Findings => view.findings.push((segment, RunView::open(bytes, SegmentKind::Findings, segment)?)),
-                SegmentKind::Owed => match view.owed {
-                    None => view.owed = Some((segment, OwedView::open(bytes, segment)?)),
-                    Some(_) => return Err(AnswerError::TwoWhole { kind: one.kind, segment }),
-                },
-                SegmentKind::OwedCells => match view.owed_cells {
-                    None => view.owed_cells = Some((segment, CellsView::open(bytes, SegmentKind::OwedCells, segment)?)),
-                    Some(_) => return Err(AnswerError::TwoWhole { kind: one.kind, segment }),
-                },
+                SegmentKind::Owed => view.owed = Some((segment, OwedView::open(bytes, segment)?)),
+                SegmentKind::OwedCells => view.owed_cells = Some((segment, CellsView::open(bytes, SegmentKind::OwedCells, segment)?)),
             }
             view.segments.push(one);
-        }
-        if view.run_count() > MAX_RUNS {
-            return Err(AnswerError::Cap { what: "runs a root", cap: MAX_RUNS as u64 });
         }
         view.dicts.reverse();
         for (segment, dict) in view.dicts.iter() {
@@ -242,13 +321,13 @@ impl<'a> AnswerView<'a> {
 
     /// Another checkout's answer for `tree` (a second worktree at the same commit, a branch
     /// switched back, a tree CI checked), its root found in the shared store by the tree's digest:
-    /// [`AnswerView::open`], then the tree it answers held to the one asked.
+    /// The root must identify the requested tree before any child is opened.
     pub fn adopt<F: FnMut(&SegmentRef) -> Option<&'a [u8]>>(tree: &TreeDigest, root: &'a [u8], fetch: F, plant: Plant, alloc: SharedAlloc<'a>) -> Result<AnswerView<'a>, AnswerError> {
-        let view = AnswerView::open(root, fetch, plant, alloc)?;
-        match view.tree == *tree {
-            true => Ok(view),
-            false => Err(AnswerError::TreeMismatch),
+        let directory = RootView::parse(root)?;
+        if directory.tree != *tree {
+            return Err(AnswerError::TreeMismatch);
         }
+        Self::from_root(directory, fetch, plant, alloc)
     }
 
     /// The request that made this answer.
@@ -481,22 +560,45 @@ impl<'a> AnswerView<'a> {
 }
 
 /// The tasks under `key` in `runs` (of `kind`), ascending: each run's entries for the key (one
-/// binary search a run), summed per task. A sum other than 0 or 1 is
-/// [`AnswerError::ReadersSum`].
+/// binary search a run), summed per task. Keep one cursor per matching run. The leaves of the
+/// tournament hold their current postings, and each internal node holds its smallest child.
+/// Advancing one cursor updates only its path to the root.
 fn summed<'m>(kind: SegmentKind, runs: &[(u32, RunView<'_>)], key: u32, alloc: Alloc<'m>) -> Result<AVec<'m, TaskId>, AnswerError> {
-    let mut entries: AVec<'m, (TaskId, i32)> = Vec::new_in(alloc);
-    for (_, run) in runs.iter() {
-        entries.extend(run.of(CellNo(key)));
+    // A posting uses bit 31 for its sign, so no decoded TaskId can be u32::MAX.
+    const END: (u32, usize, i32) = (u32::MAX, 0, 0);
+    let mut cursors = Vec::with_capacity_in(runs.len(), alloc);
+    let mut tree = [END; 2 * MAX_RUNS];
+    // AnswerView::open and Commit::finish cap the total number of runs at MAX_RUNS.
+    let leaves = runs.len().next_power_of_two();
+    for (segment, run) in runs.iter() {
+        let mut cursor = run.of(CellNo(key)).enumerate();
+        if let Some((_, (task, sign))) = cursor.next() {
+            let slot = cursors.len();
+            tree[leaves + slot] = (task.0, slot, sign);
+            cursors.push((*segment, cursor));
+        }
     }
-    entries.sort_unstable_by_key(|(task, _)| *task);
+    for parent in (1..leaves).rev() {
+        tree[parent] = tree[2 * parent].min(tree[2 * parent + 1]);
+    }
     let mut out = Vec::new_in(alloc);
-    let mut i = 0;
-    while i < entries.len() {
-        let task = entries[i].0;
+    while tree[1] != END {
+        let task = TaskId(tree[1].0);
         let mut sum = 0;
-        while i < entries.len() && entries[i].0 == task {
-            sum += entries[i].1;
-            i += 1;
+        while tree[1].0 == task.0 {
+            let (_, slot, sign) = tree[1];
+            sum += sign;
+            let mut node = leaves + slot;
+            let (segment, cursor) = &mut cursors[slot];
+            tree[node] = match cursor.next() {
+                Some((_, (next, sign))) if next > task => (next.0, slot, sign),
+                Some((at, _)) => return Err(AnswerError::Unsorted { segment: *segment, section: "matched run slice", at }),
+                None => END,
+            };
+            while node > 1 {
+                node /= 2;
+                tree[node] = tree[2 * node].min(tree[2 * node + 1]);
+            }
         }
         match sum {
             0 => {}
@@ -505,4 +607,21 @@ fn summed<'m>(kind: SegmentKind, runs: &[(u32, RunView<'_>)], key: u32, alloc: A
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+#[test]
+fn a_disordered_posting_slice_names_its_segment() {
+    use crate::segment::{RunSums, encode_run};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut entries = Vec::from_slice_in(&[(7, 1, 1), (7, 3, 1)], alloc);
+    let mut bytes = encode_run(SegmentKind::Run, &mut entries, RunSums::Request, Plant::None, Serial(1), alloc).unwrap().unwrap();
+    let last = bytes.len() - 4;
+    bytes[last..].copy_from_slice(&0u32.to_le_bytes());
+    let run = RunView::open(&bytes, SegmentKind::Run, 5).unwrap();
+    assert_eq!(
+        summed(SegmentKind::Run, &[(5, run)], 7, alloc).unwrap_err(),
+        AnswerError::Unsorted { segment: 5, section: "matched run slice", at: 1 }
+    );
 }

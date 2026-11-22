@@ -15,7 +15,7 @@ use blaze_launch::wire::run::Symbol;
 use blaze_own::{AVec, Vec};
 
 use super::*;
-use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open};
+use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
 
 /// Model row `n`: every word distinct from every other row's.
 fn row(n: u32) -> Row {
@@ -41,8 +41,8 @@ fn back(lent: Lent<Sim, StoreAlloc>) -> Sim {
     lent.into_store().into_driver()
 }
 
-const TODAY: Certificate = Certificate([0x7a; 32]);
-const OTHER: Certificate = Certificate([0x7b; 32]);
+const TODAY: Certificate = Certificate::for_tests([0x7a; 32]);
+const OTHER: Certificate = Certificate::for_tests([0x7b; 32]);
 
 /// The model run's head: a Rust start's shim, and a personality routine.
 const ENTRY: StartHead = StartHead {
@@ -61,14 +61,15 @@ fn rows_round_trip_and_another_certificate_yields_symbols_only() {
     let alloc = erased.handle();
     let model = rows(300);
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(TODAY, ENTRY, &model, &mut bytes).expect("300 rows fit");
+    encode_lines(&TODAY, ENTRY, &model, &mut bytes).expect("300 rows fit");
     assert_eq!(bytes.len(), HEAD + 300 * ROW);
     let view = read(bytes.as_slice(), alloc).expect("a list reads");
-    assert_eq!(view.certificate, TODAY);
     let back: std::vec::Vec<Row> = view.iter().collect();
     assert_eq!(back, model, "the rows read are not the rows written");
     let mut again: AVec<'_, u8> = Vec::new_in(alloc);
-    let entry = match view.under(TODAY) {
+    // The certificate written is read back: the list is today's under it (below), another's
+    // under any other (the last match).
+    let entry = match view.under(&TODAY) {
         Held::Today(today) => {
             assert_eq!(today.iter().collect::<std::vec::Vec<_>>(), model);
             today.head()
@@ -76,9 +77,9 @@ fn rows_round_trip_and_another_certificate_yields_symbols_only() {
         Held::Other(_) => panic!("today's certificate read as another"),
     };
     assert_eq!(entry, ENTRY, "the entry line read is not the one written");
-    encode(view.certificate, entry, &back, &mut again).expect("again");
+    encode_lines(&TODAY, entry, &back, &mut again).expect("again");
     assert_eq!(again.as_slice(), bytes.as_slice(), "a rewrite of the rows read is other bytes");
-    match view.under(OTHER) {
+    match view.under(&OTHER) {
         Held::Other(symbols) => {
             let got: std::vec::Vec<Symbol> = symbols.iter().collect();
             let want: std::vec::Vec<Symbol> = model.iter().map(|row| row.symbol).collect();
@@ -107,9 +108,9 @@ fn the_cap_refuses_row_8193_by_name() {
     let mut over = rows(MOST_ROWS as u32);
     over.push(past);
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    assert_eq!(encode(TODAY, ENTRY, &over, &mut bytes), Err(CapError::Full { symbol: past.symbol }));
+    assert_eq!(encode_lines(&TODAY, ENTRY, &over, &mut bytes), Err(CapError::Full { symbol: past.symbol }));
     assert!(bytes.is_empty(), "a refused encode wrote bytes");
-    encode(TODAY, ENTRY, kept.as_slice(), &mut bytes).expect("the cap itself fits");
+    kept.encode(&TODAY, ENTRY, &mut bytes).expect("the cap itself fits");
     assert_eq!(bytes.len(), LONGEST);
     assert_eq!(read(bytes.as_slice(), alloc).expect("a full list reads").len(), MOST_ROWS);
     std::println!("start list: 8192 rows kept, row 8193 refused by its symbol");
@@ -127,7 +128,7 @@ fn truncated_or_oversized_input_is_a_typed_error() {
     let erased = blaze_own::Erased::new(&frame);
     let alloc = erased.handle();
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(TODAY, ENTRY, &rows(3), &mut bytes).expect("3 rows");
+    encode_lines(&TODAY, ENTRY, &rows(3), &mut bytes).expect("3 rows");
     let whole = bytes.as_slice();
     for cut in 0..whole.len() {
         match read(&whole[..cut], alloc) {
@@ -147,12 +148,20 @@ fn truncated_or_oversized_input_is_a_typed_error() {
     let mut version = std::vec::Vec::from(whole);
     version[8..12].copy_from_slice(&(VERSION + 1).to_le_bytes());
     assert_eq!(read(&version, alloc).map(|_| ()), Err(ReadError::Version { found: VERSION + 1 }));
+    // The version just before today's, derived from the constant (rule 26): an old home's list
+    // is reported as old at its head and remade, never read on to fail at an entry.
+    let mut older = std::vec::Vec::from(whole);
+    older[8..12].copy_from_slice(&(VERSION - 1).to_le_bytes());
+    assert_eq!(read(&older, alloc).map(|_| ()), Err(ReadError::Old { found: VERSION - 1 }), "the previous version's list was read, or refused as something else");
     let mut count = std::vec::Vec::from(whole);
     count[12..16].copy_from_slice(&(MOST_ROWS as u32 + 1).to_le_bytes());
     assert_eq!(read(&count, alloc).map(|_| ()), Err(ReadError::TooMany { rows: MOST_ROWS as u32 + 1 }));
+    // The first word no launcher form has, derived from the one table of forms (`word_form`),
+    // never a literal: a form added later moves it.
+    let unknown = (0u32..).find(|&word| word_form(word).is_none()).expect("a word no form has");
     let mut form = std::vec::Vec::from(whole);
-    form[48..52].copy_from_slice(&3u32.to_le_bytes());
-    assert_eq!(read(&form, alloc).map(|_| ()), Err(ReadError::Form { found: 3 }), "an entry form no launcher has was read");
+    form[48..52].copy_from_slice(&unknown.to_le_bytes());
+    assert_eq!(read(&form, alloc).map(|_| ()), Err(ReadError::Form { found: unknown }), "an entry form no launcher has was read");
     let mut word = std::vec::Vec::from(whole);
     word[84..88].copy_from_slice(&2u32.to_le_bytes());
     assert_eq!(read(&word, alloc).map(|_| ()), Err(ReadError::Personality { found: 2 }), "a personality word past 1 was read");
@@ -161,13 +170,13 @@ fn truncated_or_oversized_input_is_a_typed_error() {
     assert_eq!(read(&stray, alloc).map(|_| ()), Err(ReadError::Personality { found: 0 }), "no routine with a symbol that is not zero was read");
     let none = StartHead { personality: None, ..ENTRY };
     let mut unnamed: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(TODAY, none, &rows(1), &mut unnamed).expect("1 row");
-    match read(unnamed.as_slice(), alloc).expect("a list naming no routine").under(TODAY) {
+    encode_lines(&TODAY, none, &rows(1), &mut unnamed).expect("1 row");
+    match read(unnamed.as_slice(), alloc).expect("a list naming no routine").under(&TODAY) {
         Held::Today(today) => assert_eq!(today.head(), none, "a head naming no routine read back as another"),
         Held::Other(_) => panic!("today's certificate read as another"),
     }
     let mut twice: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(TODAY, ENTRY, &[row(1), row(2), row(1)], &mut twice).expect("the encoder does not dedup");
+    encode_lines(&TODAY, ENTRY, &[row(1), row(2), row(1)], &mut twice).expect("the encoder does not dedup");
     assert_eq!(read(twice.as_slice(), alloc).map(|_| ()), Err(ReadError::Twice { symbol: row(1).symbol }));
     std::println!("start list: every truncation and overlong input refused by kind");
 }
@@ -185,11 +194,12 @@ fn an_equal_list_writes_nothing_and_the_newer_wins() {
     let alloc = erased.handle();
     let name = ListName::of(&ContentId::of("start list test shape", b"run hello"));
     let mut first: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(TODAY, ENTRY, &rows(5), &mut first).expect("5 rows");
+    encode_lines(&TODAY, ENTRY, &rows(5), &mut first).expect("5 rows");
+    let cx = test_cx();
     let lent = process(Sim::new(1, Faults::default()), 1);
     assert_eq!(held(&lent, &name).expect("a read"), None, "a list before any was written");
     assert_eq!(write(&lent, &name, None, first.as_slice()).expect("a write"), Wrote::Written);
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&cx, &lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 2);
     let kept = held(&lent, &name).expect("a read").expect("the list written");
     assert_eq!(kept, first.as_slice(), "the next process read other bytes");
@@ -197,9 +207,9 @@ fn an_equal_list_writes_nothing_and_the_newer_wins() {
     assert_eq!(write(&lent, &name, Some(kept), first.as_slice()).expect("a write"), Wrote::Nothing);
     assert_eq!((lent.counts().puts, lent.uncommitted_bytes()), (puts, 0), "an equal list wrote");
     let mut second: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(OTHER, ENTRY, &rows(2), &mut second).expect("2 rows");
+    encode_lines(&OTHER, ENTRY, &rows(2), &mut second).expect("2 rows");
     assert_eq!(write(&lent, &name, Some(kept), second.as_slice()).expect("a write"), Wrote::Written);
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&cx, &lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 3);
     assert_eq!(held(&lent, &name).expect("a read"), Some(second.as_slice()), "the newer list did not win");
     let other = ListName::of(&ContentId::of("start list test shape", b"test hello"));

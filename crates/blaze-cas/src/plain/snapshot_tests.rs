@@ -35,7 +35,7 @@ use blaze_mem::Frame;
 use blaze_sim::{Broke, Config as SimConfig, Tape};
 
 use super::super::{
-    core::{Liveness, PlainConfig, SEGMENTS_MOST, TAGS},
+    core::{Liveness, PlainConfig, TAGS, TIER_SEGMENTS_MOST},
     driven::{Cut, Driven},
     lent::Lent,
     test_root,
@@ -49,9 +49,9 @@ type Store<'f> = Lent<Sim, &'f Frame>;
 const TAG: Tag = Tag(1);
 /// The keys a history draws from: `0..KEYS`.
 const KEYS: u32 = 48;
-/// A fill commits this many segments of one fresh key each: past `SEGMENTS_MOST`, so the next
-/// compaction merges.
-const FILL: u32 = SEGMENTS_MOST as u32 + 1;
+/// A fill commits this many segments of one fresh key each: tiny segments all of tier 0, past
+/// its `K` ([`TIER_SEGMENTS_MOST`]), so the next compaction merges.
+const FILL: u32 = TIER_SEGMENTS_MOST as u32 + 1;
 /// At most this many fills a history; the fills' keys are `KEYS..ALL`.
 const FILLS_MOST: u32 = 2;
 /// Every key a history may put is below `ALL`; `ALL` itself is never put (an absent key).

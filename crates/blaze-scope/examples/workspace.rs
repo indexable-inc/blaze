@@ -342,6 +342,7 @@ fn main() -> ExitCode {
         assert!(passes <= 64, "no graph after 64 passes");
         match res.pass().unwrap_or_else(|e| panic!("{e}")) {
             Pass::Done(graph) => break graph,
+            Pass::Partial(partial) => panic!("no unit graph: the manifests of {:?} are missing", partial.missing()),
             Pass::Need(needs) => {
                 for id in needs.iter() {
                     let facts = sources.package(*id).unwrap_or_else(|e| panic!("{e}"));
@@ -353,7 +354,7 @@ fn main() -> ExitCode {
     let graph = leak(graph);
     let graph_ms = t_graph.elapsed().as_secs_f64() * 1e3;
     println!("workspace     {}", root.display());
-    println!("unit graph    {} units, {} unavailable, {} members, {passes} passes", graph.units.len(), graph.unavailable.len(), member_ids.len());
+    println!("unit graph    {} units, {} members, {passes} passes", graph.units.len(), member_ids.len());
 
     // Phase 2: the toolchain and the crate list.
     let t_tc = Instant::now();

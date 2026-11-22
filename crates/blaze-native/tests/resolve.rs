@@ -17,9 +17,9 @@ mod w2_obj;
 
 use blaze_hash::FixedState;
 use blaze_native::Platform;
-use blaze_native::libraries::{InstallName, Library, LibraryError, LibraryKind, install_name, write_install_name};
+use blaze_native::libraries::{Library, LibraryError, LibraryKind, Source, source};
 use blaze_native::resolve::{Input, InputKind, Origin, Plan, Resolution, ResolveError, Wanted, plan};
-use blaze_own::{AString, Alloc};
+use blaze_own::Alloc;
 use w2_obj::{Sym, archive, macho};
 
 const MAC: Platform = Platform::MacosArm64;
@@ -146,24 +146,41 @@ fn whole_archive_pulls_all() {
     assert_eq!(resolution_of(&plan, b"_c"), Some(Resolution::Common { object: 2, symbol: 0, size: 16, align_log2: 3 }));
 }
 
-/// NATIVE.md 3.5's macOS table, and the Reference's "framework — Indicates a macOS framework":
-/// `c++` -> "/usr/lib/libc++.1.dylib"; framework `IOKit` ->
-/// "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit"; `stdc++` has no macOS library
-/// and is refused by name, never guessed. Prints `install names ok`.
+/// NATIVE.md 3.5, and ld64's search of the SDK for `-l<N>` (`usr/lib/lib<N>.tbd`) and
+/// `-framework <N>` (`System/Library/Frameworks/<N>.framework/<N>.tbd`): on macOS a library is
+/// named by its stub, and its install name is the stub's, READ (Foundation's `Versions/C`, never
+/// a `Versions/A` built from the name); a name that cannot be one file's is refused. On Linux,
+/// glibc's table: `c` is `libc.so.6`, `stdc++` waits on the owner, a framework is refused.
+/// TWIN (the proof is the platform's): a Linux plan refuses a library resolved for macOS.
+///
+/// Prints `install names ok`.
 #[test]
-fn install_names_macos() {
-    let cxx = Library { kind: LibraryKind::Dylib, name: "c++" };
-    assert_eq!(install_name(MAC, cxx), Ok(InstallName::Fixed("/usr/lib/libc++.1.dylib")));
-    let iokit = Library { kind: LibraryKind::Framework, name: "IOKit" };
-    let mut out = AString::new_in(Alloc::global());
-    write_install_name(MAC, iokit, &mut out).expect("framework");
-    assert_eq!(out.as_str(), "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit");
-    let stdcxx = Library { kind: LibraryKind::Dylib, name: "stdc++" };
-    assert_eq!(
-        install_name(MAC, stdcxx),
-        Err(LibraryError::Unknown { platform: MAC, kind: LibraryKind::Dylib, name: "stdc++" })
-    );
+fn install_names() {
+    const LINUX: Platform = Platform::LinuxArm64;
+    let foundation = Library { kind: LibraryKind::Framework, name: "Foundation" };
+    let Ok(Source::Stub(at)) = source(MAC, foundation) else { panic!("a framework is named by its stub") };
+    assert_eq!(format!("{at}"), "System/Library/Frameworks/Foundation.framework/Foundation.tbd");
+    let stub: &[u8] = b"--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\n\
+        install-name: '/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation'\n...\n";
+    let linked = at.linked(stub).expect("the stub reads");
+    assert_eq!(linked.install(), "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation");
+    assert_eq!((linked.library(), linked.platform()), (foundation, MAC));
+    match source(MAC, Library { kind: LibraryKind::Dylib, name: "c++" }) {
+        Ok(Source::Stub(at)) => assert_eq!(format!("{at}"), "usr/lib/libc++.tbd"),
+        other => panic!("`c++` is named by its stub: {other:?}"),
+    }
     let bad = Library { kind: LibraryKind::Framework, name: "../x" };
-    assert!(matches!(install_name(MAC, bad), Err(LibraryError::Unknown { .. })));
+    assert_eq!(source(MAC, bad), Err(LibraryError::Name { kind: LibraryKind::Framework, name: "../x" }));
+
+    match source(LINUX, Library { kind: LibraryKind::Dylib, name: "c" }) {
+        Ok(Source::Linked(c)) => assert_eq!(c.install(), "libc.so.6"),
+        other => panic!("`c` is glibc's: {other:?}"),
+    }
+    assert!(matches!(source(LINUX, Library { kind: LibraryKind::Dylib, name: "stdc++" }), Err(LibraryError::Undecided { .. })));
+    assert_eq!(source(LINUX, foundation), Err(LibraryError::FrameworkOffMac { name: "Foundation" }));
+
+    let libraries = [linked];
+    let refused = plan(LINUX, &[], Wanted { roots: &[], rust: &[], libraries: &libraries }, FixedState, blaze_own::testing::heap().alloc()).err();
+    assert_eq!(refused, Some(ResolveError::Library { name: "Foundation", resolved_for: MAC }));
     println!("install names ok");
 }

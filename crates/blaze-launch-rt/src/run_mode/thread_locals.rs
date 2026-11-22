@@ -161,18 +161,27 @@ pub(super) fn native_thread_key(ender: u64) -> Result<ThreadKey, RunModeError> {
     // function `fn(t: *mut Table)` blaze-build's `tls::index::ender` builds, compiled on its
     // first call (the thunk loads the slot word; the stub asks the parent). One pointer
     // argument, no result: the ABI of pthread's destructor type.
-    let destructor = unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut libc::c_void)>(ender) };
-    let mut key: libc::pthread_key_t = 0;
-    // SAFETY: `key` is a live local the call fills; the destructor lives as long as the
-    // process (a thunk in the run's mapping, never unmapped).
-    let errno = unsafe { libc::pthread_key_create(&mut key, Some(destructor)) };
-    if errno != 0 {
-        return Err(RunModeError::ThreadKey { errno });
-    }
-    let key = u64::from(key);
+    let destructor = unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut core::ffi::c_void)>(ender) };
+    #[cfg(target_os = "macos")]
+    let key = blaze_sys::posix::thread::key_create(Some(destructor))
+        .map_err(|error| RunModeError::ThreadKey { errno: i32::from(error.raw()) })?;
+    #[cfg(not(target_os = "macos"))]
+    let key = {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: `key` is a live local the call fills; the destructor lives as long as the
+        // process (a thunk in the run's mapping, never unmapped).
+        let errno = unsafe { libc::pthread_key_create(&mut key, Some(destructor)) };
+        if errno != 0 {
+            return Err(RunModeError::ThreadKey { errno });
+        }
+        u64::from(key)
+    };
     match root_word(key) {
         Ok(root) => Ok(ThreadKey { key, root }),
         Err(why) => {
+            #[cfg(target_os = "macos")]
+            let _ = blaze_sys::posix::thread::key_delete(key);
+            #[cfg(not(target_os = "macos"))]
             // SAFETY: the key was made above and no thread holds a value under it yet.
             unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) };
             Err(why)

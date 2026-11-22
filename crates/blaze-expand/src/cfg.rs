@@ -42,11 +42,94 @@ enum Op {
 
 /// A group open: its operator, the outcome so far, and how many predicates it holds.
 #[derive(Clone, Copy)]
-struct Open {
+struct Open<V> {
     op: Op,
-    acc: bool,
+    acc: V,
     count: u32,
     at: u32,
+}
+
+/// A predicate's outcome as it is folded: two-valued (`bool`: the build's answer, every atom
+/// known) or Kleene's three values ([`Tri`]: what is known before the cfg set is whole). ONE
+/// parser reads both ([`predicate_in`], rule 30), so the two never read a predicate apart.
+trait Truth: Copy {
+    fn of(value: bool) -> Self;
+    fn or(self, other: Self) -> Self;
+    fn and(self, other: Self) -> Self;
+    fn not(self) -> Self;
+}
+
+impl Truth for bool {
+    fn of(value: bool) -> bool {
+        value
+    }
+    fn or(self, other: bool) -> bool {
+        self | other
+    }
+    fn and(self, other: bool) -> bool {
+        self & other
+    }
+    fn not(self) -> bool {
+        !self
+    }
+}
+
+/// A predicate's outcome when some atoms are not known yet (Kleene's strong three-valued
+/// logic): `Yes` and `No` are what every completion of the unknown atoms gives, so a `No` is
+/// never wrong; `Unknown` is any outcome some completion could move ([`cfg_predicate_tri`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tri {
+    No,
+    Yes,
+    Unknown,
+}
+
+impl Tri {
+    /// A known value.
+    pub fn of(value: bool) -> Tri {
+        if value { Tri::Yes } else { Tri::No }
+    }
+
+    /// The two-valued outcome, when it is known.
+    pub fn known(self) -> Option<bool> {
+        match self {
+            Tri::No => Some(false),
+            Tri::Yes => Some(true),
+            Tri::Unknown => None,
+        }
+    }
+
+    /// Both hold (Kleene's `and`): `No` when either is, `Yes` when both are.
+    pub fn and(self, other: Tri) -> Tri {
+        match (self, other) {
+            (Tri::No, _) | (_, Tri::No) => Tri::No,
+            (Tri::Yes, Tri::Yes) => Tri::Yes,
+            _ => Tri::Unknown,
+        }
+    }
+}
+
+impl Truth for Tri {
+    fn of(value: bool) -> Tri {
+        Tri::of(value)
+    }
+    fn or(self, other: Tri) -> Tri {
+        match (self, other) {
+            (Tri::Yes, _) | (_, Tri::Yes) => Tri::Yes,
+            (Tri::No, Tri::No) => Tri::No,
+            _ => Tri::Unknown,
+        }
+    }
+    fn and(self, other: Tri) -> Tri {
+        Tri::and(self, other)
+    }
+    fn not(self) -> Tri {
+        match self {
+            Tri::No => Tri::Yes,
+            Tri::Yes => Tri::No,
+            Tri::Unknown => Tri::Unknown,
+        }
+    }
 }
 
 /// The outcome of the predicate `tokens`, asking `atom(name, value)` for each atom (`value` is
@@ -68,9 +151,32 @@ pub fn cfg_predicate_at<E>(
     alloc: Alloc<'_>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
 ) -> Result<bool, CfgPredicateError<E>> {
+    predicate_in::<bool, E>(tokens, range, alloc, atom)
+}
+
+/// [`cfg_predicate_at`] in Kleene's three values: `atom` answers [`Tri::Unknown`] for an atom not
+/// known yet (plan time knows a unit's `test` before its whole cfg set), and the outcome is
+/// `No` only when every answer the unknown atoms could have gives `false`. The same parser as the
+/// two-valued outcome ([`predicate_in`]): where every atom is known, the two agree.
+pub fn cfg_predicate_tri(
+    tokens: &TokenStream<'_>,
+    range: Range<usize>,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Tri,
+) -> Result<Tri, CfgPredicateError<core::convert::Infallible>> {
+    predicate_in::<Tri, core::convert::Infallible>(tokens, range, alloc, &mut |name, value| Ok(atom(name, value)))
+}
+
+/// THE ONE READING of a cfg predicate (the module doc), folded in `V`.
+fn predicate_in<V: Truth, E>(
+    tokens: &TokenStream<'_>,
+    range: Range<usize>,
+    alloc: Alloc<'_>,
+    atom: &mut dyn FnMut(&str, Option<&str>) -> Result<V, E>,
+) -> Result<V, CfgPredicateError<E>> {
     let list = tokens.tokens().get(..range.end).unwrap_or(&[]);
     let malformed = |at: usize| CfgPredicateError::Malformed { token: u32::try_from(at).unwrap_or(u32::MAX) };
-    let mut stack: AVec<'_, Open> = Vec::new_in(alloc);
+    let mut stack: AVec<'_, Open<V>> = Vec::new_in(alloc);
     let mut value_buf = Buf::new_in(alloc);
     let mut at = range.start;
     loop {
@@ -87,7 +193,7 @@ pub fn cfg_predicate_at<E>(
         };
         let mut value = match (op, next) {
             (Some(op), Some(TokenKind::Open(Delim::Paren))) => {
-                let acc = op == Op::All;
+                let acc = V::of(op == Op::All);
                 stack.push(Open { op, acc, count: 0, at: u32::try_from(at).unwrap_or(u32::MAX) });
                 at += 2;
                 // An empty group closes at once.
@@ -121,13 +227,13 @@ pub fn cfg_predicate_at<E>(
             };
             if let Some(v) = value.take() {
                 match top.op {
-                    Op::Any => top.acc |= v,
-                    Op::All => top.acc &= v,
+                    Op::Any => top.acc = top.acc.or(v),
+                    Op::All => top.acc = top.acc.and(v),
                     Op::Not => {
                         if top.count > 0 {
                             return Err(CfgPredicateError::NotTakesOne { token: top.at });
                         }
-                        top.acc = !v;
+                        top.acc = v.not();
                     }
                 }
                 top.count += 1;

@@ -55,9 +55,12 @@
 //! cover (a box behind a reference: E0507); `**make()` (a temporary reached by two box
 //! dereferences); a dereference other than a
 //! box's on the way (E0507); a moved part under a box other than through its contents; the
-//! contents of an unsized box (E0161, the checker's); more than 64 parts of one local; a match
-//! by tests moving out of `*b` (walk/moves.rs `scrutinee_in_place`: "out of a `Box`, not
-//! built").
+//! contents of an unsized box (E0161, the checker's); more than 64 parts of one local.
+//!
+//! A match by tests moving out of `*b` or `*s.bx` (`if let Type::Path(mut ty) = *group.elem`,
+//! syn's `ambig_ty`) is built by the same paths: walk/moves/field_scrutinee.rs
+//! `field_chain_local` finds the owning local by `path_steps`, the binding's part is the
+//! scrutinee's path then the pattern's (`[Field elem, Deref, Variant Path, Field 0]`).
 
 use core::alloc::Allocator;
 
@@ -69,7 +72,7 @@ use blaze_typeck::{AdjustKind, Expr, ExprId, LangItem, Mutbl, PNode, PTy, PatId,
 
 use super::super::{Held, NO_EXPR, Repr, Shape, TyErr, V, Walk, malformed, unsupported};
 use super::{Do, Node, Step};
-use crate::{BuildError, Instance};
+use crate::BuildError;
 
 /// How deep the first-field chain from a `Box` to its data pointer may go (`Box` → `Unique` →
 /// `NonNull` → the pointer in the pinned library: three; a twin's box: one).

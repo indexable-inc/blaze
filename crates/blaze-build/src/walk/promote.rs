@@ -16,18 +16,19 @@
 //! fallback to a temporary: that is the wrong code this replaces). The record's allocations are
 //! the function's data rows (the walk's `data_rows`, one home with a constant path's), so two
 //! promotions of equal bytes in one function share nothing promised: Rust promises no address
-//! equality between promotions. A shared borrow inside the operand (`&&7`) is promoted too, and
-//! its value is an allocation of the outer record: the outer row points at a row made from that
-//! allocation, not at the row of the inner borrow's own record (the same bytes, no promised
-//! address).
+//! equality between promotions.
 //!
 //! A fn pointer in the value (the vtable's four entries) is a relocation to a fn instance by
-//! its [`InstanceKey`]. The walk can reference only an instance it names as an [`Instance`], so
-//! the candidates are the fn items the operand itself names (`clone_arc_raw::<W>` at this
-//! instance's arguments), each keyed by [`crate::Adts::promoted_fn_key`] exactly as the program
-//! keys instances; any other (`&SOME_TABLE`, a constant path whose value holds fn pointers) is
-//! the instance [`crate::Adts::const_fn_instance`] gives, as for a constant path's value, or is
-//! refused by name.
+//! its key, read back to an `Instance` as a constant path's or a const block's is: the
+//! evaluator's record names the instance of each of its fn words (blaze-consteval
+//! `ConstRecord::fns`), and [`crate::Adts::const_fn_instance`] answers from it. A key no record
+//! names is refused by name ([`BuildError::NoConstFnInstance`]). The instance is a `Func`
+//! reference of the function, so the run reaches it by `Built::refs` as a fn coerced in a body:
+//! a lazy front end with no row for it yet tables it there (run/make_one.rs `Step::Table`).
+//! Before (tempo tests t0850, 2026-11-21): the fn items the operand names were keyed first by a
+//! second answer (`Adts::promoted_fn_key`, the program's row of the fn), and a fn the body
+//! names only as a value has no row on the lazy path before the build (eyre's
+//! `&ErrorVTable { object_drop: object_drop::<E>, .. }`), so the build was refused.
 
 use core::alloc::Allocator;
 
@@ -35,14 +36,11 @@ use blaze_lir::Value;
 use blaze_lir::builder::DataReloc;
 use blaze_lir::func::{RefId, RefKind};
 use blaze_own::Vec;
-use blaze_typeck::{ExprId, PNode};
+use blaze_typeck::ExprId;
 
 use super::{V, Walk, malformed, unsupported};
+use crate::BuildError;
 use crate::data::{DataRecord, DataTarget};
-use crate::{BuildError, Instance, InstanceKey};
-
-/// The most expressions one promoted operand's fn-item search visits.
-const MOST_OPERAND_STEPS: usize = 1 << 14;
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// Whether the checker listed borrow `e` as promoted (`Checked::promoted`, sorted).
@@ -51,83 +49,24 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// `&operand` promoted (the module doc): pushes the address of the value's constant row.
-    pub(super) fn promoted_ref(&mut self, e: ExprId, operand: ExprId) -> Result<(), BuildError> {
+    pub(super) fn promoted_ref(&mut self, e: ExprId) -> Result<(), BuildError> {
         let adts = self.adts;
         let owner = self.body.owner;
         let record = adts.promoted_value(owner, e, self.args).ok_or(BuildError::NoPromotedValue { expr: e, owner })?;
         record.check().map_err(|_| malformed("a promoted borrow's record that breaks the data form"))?;
-        let fns = self.promoted_fns(operand)?;
-        let at = self.data_rows(e, record, &fns)?;
+        let at = self.data_rows(e, record)?;
         self.push_val(V::Scalar(at), None);
         Ok(())
     }
 
-    /// The fn instances operand `operand` names by path, each with its key: the only fn
-    /// targets a promoted record may hold here. By a work list over the promotable forms.
-    fn promoted_fns(&mut self, operand: ExprId) -> Result<Vec<(InstanceKey, Instance), A>, BuildError> {
-        use blaze_typeck::Expr;
-        let mut out: Vec<(InstanceKey, Instance), A> = Vec::new_in(self.alloc.clone());
-        let mut work: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
-        work.push(operand);
-        let mut steps = 0usize;
-        while let Some(x) = work.pop() {
-            steps += 1;
-            if steps > MOST_OPERAND_STEPS {
-                return Err(unsupported(operand, "a promoted operand past the walk's bound on its expressions"));
-            }
-            match self.expr(x)? {
-                Expr::Lit(_) => {}
-                Expr::Paren(i) => work.push(i),
-                Expr::Tuple { elems } | Expr::Array { elems } => {
-                    let l = self.body.expr_lists.get(elems.range()).ok_or(malformed("a promoted literal's elements past `expr_lists`"))?;
-                    work.extend_from_slice(l);
-                }
-                Expr::Struct { fields, base: blaze_typeck::StructBase::None, .. } => {
-                    let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a promoted struct literal's fields past `field_inits`"))?;
-                    for f in inits {
-                        work.push(f.expr);
-                    }
-                }
-                Expr::Call { callee, args } => {
-                    let l = self.body.expr_lists.get(args.range()).ok_or(malformed("a promoted call's arguments past `expr_lists`"))?;
-                    work.extend_from_slice(l);
-                    work.push(callee);
-                }
-                // A shared borrow inside the operand (`&&7`, ignore's `&[(&["ada"], &["*.adb"])]`)
-                // is one the checker promoted too (blaze-typeck rules/promote.rs): its value is
-                // in this record as an allocation of its own (`DataTarget::Local`, as a constant
-                // path's referent is), made a data row by `data_rows`, so the outer row points at
-                // a row, never at the frame. Its operand may name fn items, so the walk goes on
-                // into it. A borrow the checker did not promote is a runtime temporary: refused.
-                Expr::Ref { mutbl: blaze_typeck::Mutbl::Not, operand: inner } if self.is_promoted(x) => work.push(inner),
-                Expr::Ref { .. } => return Err(unsupported(x, "a borrow inside a promoted operand that the checker did not promote")),
-                Expr::Path(_) => {
-                    let t = self.expr_ty(x)?;
-                    if let PNode::FnDef(item, args) = self.node_at(x, t)? {
-                        let instance = Instance { item, args };
-                        if out.iter().any(|&(_, i)| i == instance) {
-                            continue;
-                        }
-                        let adts = self.adts;
-                        let key = adts.promoted_fn_key(instance, self.ground).ok_or(BuildError::NoPromotedFnKey { expr: x, item })?;
-                        out.push((key, instance));
-                    }
-                }
-                _ => return Err(unsupported(x, "a promoted operand of a form the checker does not promote")),
-            }
-        }
-        Ok(out)
-    }
-
     /// Each allocation of `record` as a data row of the function, its relocations resolved;
     /// returns the root's address: the one home of a promoted borrow's rows and of a constant
-    /// path's or a const block's (walk.rs `const_record_value`, which passes no `fns`). A fn
-    /// target is a `Func` reference of this function: one of `fns` (the fn items a promoted
-    /// operand names), else the instance [`crate::Adts::const_fn_instance`] says the evaluator
-    /// keyed (a fn the constant's own body names, or one a `const fn` it called made), else
-    /// refused with [`BuildError::NoConstFnInstance`]. Rows are made targets first, by an
-    /// explicit stack; a cycle among the allocations is refused.
-    pub(super) fn data_rows(&mut self, e: ExprId, record: &DataRecord<std::alloc::Global>, fns: &[(InstanceKey, Instance)]) -> Result<Value, BuildError> {
+    /// path's or a const block's (walk.rs `const_record_value`). A fn target is a `Func`
+    /// reference of this function to the instance [`crate::Adts::const_fn_instance`] says the
+    /// evaluator keyed (a fn the operand or the constant's own body names, or one a `const fn`
+    /// it called made), else refused with [`BuildError::NoConstFnInstance`]. Rows are made
+    /// targets first, by an explicit stack; a cycle among the allocations is refused.
+    pub(super) fn data_rows(&mut self, e: ExprId, record: &DataRecord<std::alloc::Global>) -> Result<Value, BuildError> {
         const TODO: u8 = 0;
         const OPEN: u8 = 1;
         let n = record.allocs.len();
@@ -176,13 +115,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     // It becomes a `Func` reference of this function exactly as a fn item
                     // coerced to a fn pointer here does, so the run reaches it by `Built::refs`.
                     DataTarget::Fn(key) => {
-                        let instance = match fns.iter().find(|&&(k, _)| k == key) {
-                            Some(&(_, instance)) => instance,
-                            None => {
-                                let adts = self.adts;
-                                adts.const_fn_instance(key, self.ground).ok_or(BuildError::NoConstFnInstance { expr: e, key })?
-                            }
-                        };
+                        let adts = self.adts;
+                        let instance = adts.const_fn_instance(key, self.ground).ok_or(BuildError::NoConstFnInstance { expr: e, key })?;
                         self.refuse_tracked_pointer(e, instance)?;
                         let place = self.ref_place(instance);
                         self.b.reference(RefKind::Func, place)

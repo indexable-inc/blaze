@@ -611,7 +611,7 @@ pub(crate) fn write_records<'a, 'b>(names: &CrateNames<'a>, built: &Built<'_, 'a
     modules.sort_unstable();
     // Every other crate a part's scopes name an item of, and what that crate reaches.
     let mut reach = [AVec::new_in(alloc), AVec::new_in(alloc)];
-    let mut add = |part: Part, key: ItemKey, reach: &mut [AVec<'b, CrateItemKey>; 2]| {
+    let add = |part: Part, key: ItemKey, reach: &mut [AVec<'b, CrateItemKey>; 2]| {
         if key.0.0[..8] == own {
             return;
         }
@@ -1382,6 +1382,10 @@ impl<P: Par> Par for OfMembers<'_, P> {
         self.par.map(n, f, out);
     }
 
+    fn outline_files<'a>(&self, krate: &'a str, files: &[(&'a str, &'a str)], edition: blaze_surface::Edition, alloc: Alloc<'a>, out: &mut AVec<'a, blaze_file_items::Outline<'a>>) -> Result<(), NamesError<'a>> {
+        self.par.outline_files(krate, files, edition, alloc, out)
+    }
+
     fn stage(&self, stage: crate::task::Stage) {
         self.par.stage(stage);
     }
@@ -1409,6 +1413,194 @@ impl<P: Par> Par for OfMembers<'_, P> {
     fn names_part(&self, part: crate::task::NamesPart) {
         self.par.names_part(part);
     }
+
+    fn block_scopes(&self) -> crate::surface::BlockScopes {
+        self.par.block_scopes()
+    }
+}
+
+/// `par` with D189's seam set to `scopes` ([`Par::block_scopes`]), for a whole-crate solve:
+/// no groups, no D116 check (the differential's two solves are the crate's own, once each).
+struct Strategy<'p, P> {
+    par: &'p P,
+    scopes: crate::surface::BlockScopes,
+}
+
+impl<P: Par> Par for Strategy<'_, P> {
+    fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
+        self.par.map(n, f, out);
+    }
+
+    fn outline_files<'a>(&self, krate: &'a str, files: &[(&'a str, &'a str)], edition: blaze_surface::Edition, alloc: Alloc<'a>, out: &mut AVec<'a, blaze_file_items::Outline<'a>>) -> Result<(), NamesError<'a>> {
+        self.par.outline_files(krate, files, edition, alloc, out)
+    }
+
+    fn stage(&self, stage: crate::task::Stage) {
+        self.par.stage(stage);
+    }
+
+    fn call_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> crate::task::Scratch {
+        self.par.call_scratch(work)
+    }
+
+    fn expand_part(&self, part: crate::task::ExpandPart, macro_name: &str, size: usize) {
+        self.par.expand_part(part, macro_name, size);
+    }
+
+    fn expand_call(&self, def: ItemKey, input: &str) {
+        self.par.expand_call(def, input);
+    }
+
+    fn names_part(&self, part: crate::task::NamesPart) {
+        self.par.names_part(part);
+    }
+
+    fn tree_record_read(&self, bytes: usize) {
+        self.par.tree_record_read(bytes);
+    }
+
+    fn block_scopes(&self) -> crate::surface::BlockScopes {
+        self.scopes
+    }
+}
+
+/// D189 step 4's whole-crate differential (proof 3) on one crate as the command resolves it,
+/// against its dependencies' records `deps` (the arguments are [`resolve_crate`]'s): the crate
+/// solved twice, under `BlockScopes::Modules` and under `Bodies`, every body the `Bodies` solve
+/// held then solved by [`crate::body_scope::body_scope`], and the two impl tables compared row by
+/// row ([`crate::body_scope::impl_diff`]). A body `body_scope` refuses is a verdict row, never
+/// skipped silently. The crate's record is not written; nothing is kept.
+///
+/// Both halves in the one `alloc`: [`block_scopes_modules_side`] then
+/// [`block_scopes_bodies_side`]. The command runs the halves each in a frame of its own, in
+/// sequence (blaze-cli names/scope.rs), so its peak is one solve, never two.
+#[allow(clippy::too_many_arguments, reason = "resolve_crate's arguments, each named")]
+pub fn block_scopes_differential<'a, S: SourceTexts<'a>, P: Par>(
+    input: &CrateInput<'a>,
+    deps: &[&'a [u8]],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    prepares: &'a Prepares<'a>,
+    alloc: Alloc<'a>,
+) -> Result<crate::body_scope::BlockScopesVerdict<'a>, crate::body_scope::DifferentialError<'a>> {
+    let modules = block_scopes_modules_side(input, deps, sysroot, sources, source, par, prepares, alloc, alloc)?;
+    block_scopes_bodies_side(&modules, input, deps, sysroot, sources, source, par, prepares, alloc)
+}
+
+/// `deps` decoded in `alloc`, each kept as long as it.
+fn decoded_deps<'a>(deps: &[&'a [u8]], alloc: Alloc<'a>) -> Result<AVec<'a, &'a DepScope<'a>>, CrateScopeError<'a>> {
+    let mut decoded = AVec::with_capacity_in(deps.len(), alloc);
+    for (at, bytes) in deps.iter().enumerate() {
+        let record = read_record(bytes, alloc).map_err(|error| CrateScopeError::Record { at, error })?;
+        decoded.push(&*Box::leak(Box::new_in(record, alloc)));
+    }
+    Ok(decoded)
+}
+
+/// The `Modules` half of [`block_scopes_differential`]: the crate solved under
+/// `BlockScopes::Modules` in `alloc`, and what the comparison reads of it (its impl rows, their
+/// modules' chains, its headers) copied into `out` ([`crate::body_scope::ModulesSide`]). The
+/// caller may then drop `alloc`'s frame: nothing of the result is in it. An error is in `alloc`.
+#[allow(clippy::too_many_arguments, reason = "resolve_crate's arguments, each named")]
+pub fn block_scopes_modules_side<'a, 'o, S: SourceTexts<'a>, P: Par>(
+    input: &CrateInput<'a>,
+    deps: &[&'a [u8]],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    prepares: &'a Prepares<'a>,
+    alloc: Alloc<'a>,
+    out: Alloc<'o>,
+) -> Result<crate::body_scope::ModulesSide<'o>, crate::body_scope::DifferentialError<'a>> {
+    use crate::body_scope::{DifferentialError, ModulesSide};
+    use crate::surface::BlockScopes;
+
+    let decoded = decoded_deps(deps, alloc).map_err(DifferentialError::Names)?;
+    let kept = crate::expansions::KeptExpansions::none(alloc);
+    let modules_par = Strategy { par, scopes: BlockScopes::Modules };
+    let (side, _) = with_names(input, &decoded, sysroot, sources, source, &modules_par, prepares, &kept, alloc, |names, _| Ok(ModulesSide::of(&names, alloc, out))).map_err(DifferentialError::Names)?;
+    side.map_err(|error| DifferentialError::Rows { krate: input.name, error })
+}
+
+/// The `Bodies` half of [`block_scopes_differential`]: the crate solved under
+/// `BlockScopes::Bodies` in `alloc`, every held body solved as its own, and the impl table
+/// compared with the `Modules` side `modules` ([`block_scopes_modules_side`], in a frame that
+/// outlives this one).
+#[allow(clippy::too_many_arguments, reason = "resolve_crate's arguments, each named")]
+pub fn block_scopes_bodies_side<'a, 'o: 'a, S: SourceTexts<'a>, P: Par>(
+    modules: &crate::body_scope::ModulesSide<'o>,
+    input: &CrateInput<'a>,
+    deps: &[&'a [u8]],
+    sysroot: Sysroot,
+    sources: &S,
+    source: usize,
+    par: &P,
+    prepares: &'a Prepares<'a>,
+    alloc: Alloc<'a>,
+) -> Result<crate::body_scope::BlockScopesVerdict<'a>, crate::body_scope::DifferentialError<'a>> {
+    use crate::body_scope::{BodyScope, BodyScopeRefusal, DifferentialError};
+    use crate::surface::BlockScopes;
+
+    let decoded = decoded_deps(deps, alloc).map_err(DifferentialError::Names)?;
+    let kept = crate::expansions::KeptExpansions::none(alloc);
+    let leak = |names: CrateNames<'a>| -> &'a CrateNames<'a> { Box::leak(Box::new_in(names, alloc)) };
+
+    let bodies_par = Strategy { par, scopes: BlockScopes::Bodies };
+    let solve = |names: CrateNames<'a>, built: &Built<'_, 'a>| -> Result<_, CrateScopeError<'a>> {
+        let c = leak(names);
+        let body_deps = crate::resolve::BodyDeps::of_built(built, alloc);
+        let mut scopes: AVec<'a, BodyScope<'a>> = AVec::with_capacity_in(c.bodies.len(), alloc);
+        let mut refused: AVec<'a, BodyScopeRefusal<'a>> = AVec::new_in(alloc);
+        // The block modules (as `Modules` keys them) of each refused body: its impls are
+        // missing from the `Bodies` table because of the refusal (the verdict says how many).
+        let mut refused_blocks: AVec<'a, ItemKey> = AVec::new_in(alloc);
+        // The crate's tree record read once for every held body (rule 74, D189's floor).
+        let tree = crate::resolve::ReadTree::of(c, alloc).map_err(|error| CrateScopeError::Names(NamesError::TreeRecord { krate: input.name, error }))?;
+        // Each body's work (its cells over its chain and the modules it reads, cells/mod.rs
+        // `load_body`; the read list's scope bytes) in the driver's scratch, reset after it: tempo's `core` outgrew its 4 GiB
+        // frame with every body's work kept (21 Nov 05:33). No macro call is open here (the
+        // crate is solved), and a body's own calls run in this frame (resolve.rs
+        // `solve_held_body_scratch`), so the scratch is never asked twice at once.
+        let hook = |work: &mut dyn FnMut(Alloc<'_>)| par.call_scratch(work);
+        for held in c.bodies.iter() {
+            match crate::body_scope::body_scope_scratch(&tree, &body_deps, input, source, *held, sources, prepares, &hook, alloc) {
+                Ok(scope) => scopes.push(scope),
+                Err(refusal) => {
+                    let nested = blaze_file_items::nested::scan(held.src.text, alloc);
+                    refused_blocks.extend(crate::blocks::block_modules(c.key, held.src.key, &nested, alloc).iter().flatten().copied());
+                    refused.push(refusal);
+                }
+            }
+        }
+        refused_blocks.sort_unstable();
+        refused_blocks.dedup();
+        Ok((c, scopes, refused, refused_blocks))
+    };
+    let ((bodies, scopes, refused, refused_blocks), _) = with_names(input, &decoded, sysroot, sources, source, &bodies_par, prepares, &kept, alloc, solve).map_err(DifferentialError::Names)?;
+
+    let bodies_rows = crate::body_scope::bodies_impl_table(bodies, &scopes, alloc).map_err(|error| DifferentialError::Rows { krate: input.name, error })?;
+    let diff = crate::body_scope::impl_diff(&modules.rows, &bodies_rows, alloc);
+    let under_refused = |module: ItemKey| {
+        refused_blocks.binary_search(&module).is_ok() || modules.chain(module).is_some_and(|chain| chain.iter().any(|m| refused_blocks.binary_search(m).is_ok()))
+    };
+    let only_modules_refused = diff.only_modules.iter().filter(|r| under_refused(r.module)).count();
+    let mut headers = crate::body_scope::ImplHeaders::of(bodies, &scopes, alloc);
+    headers.add_side(modules);
+    Ok(crate::body_scope::BlockScopesVerdict {
+        krate: input.name,
+        held: bodies.bodies.len(),
+        solved: scopes.len(),
+        modules_made: scopes.iter().map(|s| s.solved.made_outside).sum(),
+        refused,
+        modules_rows: modules.rows.len(),
+        bodies_rows: bodies_rows.len(),
+        diff,
+        only_modules_refused,
+        headers,
+    })
 }
 
 /// One crate's names (through [`resolve_one`]) against its dependencies' records, handed to

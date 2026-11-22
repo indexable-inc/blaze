@@ -31,7 +31,7 @@ use blaze_surface::Range;
 use blaze_typeck::{ExprId, ItemKey, Name, OwnTys, PTy, PortableTys};
 
 use super::check::{BodyScope, MOST_ROUNDS};
-use super::heads::{CrateCfg, FnHead, HeadError, Maps, Store, Want, own_generics};
+use super::heads::{CrateCfg, FnHead, HeadError, Maps, Store, Want};
 use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::scoped::ScopedBy;
 use super::source::NamesSource;
@@ -56,6 +56,39 @@ pub enum BodyFinding {
     CfgOut,
 }
 
+/// A macro call in a body whose expansion is the macro's OWN error (the Reference, "Macros":
+/// `compile_error!` "causes compilation to fail with the given error message"; `env!` of an
+/// unset variable and `include_str!`/`include_bytes!` of a file that is not there, not UTF-8 or
+/// does not lex fail "at compile time" at the call): an error of the program at the call, as
+/// rustc reports it there, with the expander's words (blaze-lower by_name.rs
+/// `Failure::Diagnostic`'s display, "including `x.json`: no such file").
+#[derive(Debug)]
+pub struct CallError {
+    /// The call's range in the item's text.
+    pub at: Range,
+    pub path: Box<str, Global>,
+    pub why: Box<str, Global>,
+}
+
+/// Whether a body call's finding is the macro's own error ([`CallError`]) rather than a call
+/// blaze could not take. Only the builtins whose failure is the program's: an include of a
+/// file that is missing, not UTF-8 or does not lex (Rust's rules), or whose path leaves what
+/// the crate may read (D60 as D111 amends it: "refused by its path and the rule", an error at
+/// the call naming the path and D60, blaze-cli include_outside_tests.rs), `compile_error!`, an
+/// unset `env!`. Every include failure is named (no `..`), so a new kind is decided. A rule
+/// that did not match may be the expander's own gap: it stays a finding of a refused body.
+pub fn call_error(why: &blaze_lower::by_name::NotExpanded<'_>) -> bool {
+    use blaze_expand::{Diagnostic as D, IncludeFailure as I};
+    use blaze_lower::by_name::{Failure, NotExpanded};
+    matches!(
+        why,
+        NotExpanded::Failed(Failure::Diagnostic {
+            diagnostic: D::Include { why: I::Missing | I::NotUtf8 | I::DoesNotLex | I::Outside, .. } | D::CompileError { .. } | D::EnvNotDefined { .. },
+            ..
+        })
+    )
+}
+
 /// Why a fn's body is not ready for the check loop.
 #[derive(Debug)]
 pub enum BodyError {
@@ -73,8 +106,12 @@ pub enum BodyError {
     /// What its lowering did not take, in the order found: expander, then constructs, then
     /// errors.
     Lowered { item: LibKey, findings: Vec<BodyFinding, Global> },
+    /// Every finding of its lowering is a macro call's OWN error ([`call_error`]): the
+    /// program's errors at those calls, in the order found, never a refusal ("not checked").
+    /// A lowering with any other finding is [`BodyError::Lowered`], these among its findings.
+    Calls { item: LibKey, errors: Vec<CallError, Global> },
     /// `to_typeck` refused it; `why` is the type builder's reason when a written type did.
-    Convert { item: LibKey, refused: Refused, why: Option<Why> },
+    Convert { item: LibKey, refused: Refused, why: Option<Why>, expanded_type: Option<Result<Box<str>, blaze_lower::TextAt>> },
     /// A head the body's types need could not be made.
     Head { item: LibKey, error: HeadError },
     /// Still needing heads after [`MOST_ROUNDS`] conversions.
@@ -99,10 +136,16 @@ pub enum BodyError {
     Made { item: LibKey, need: super::lower_made::Needed, after: u32 },
 }
 
+// A pooled body task can return this error through a failed constant evaluation.
+const _: () = {
+    const fn worker_error<T: Send + 'static>() {}
+    worker_error::<BodyError>();
+};
+
 impl core::fmt::Display for BodyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            BodyError::Const { item, error } => write!(f, "constant {item:x}, an array length: {error}"),
+            BodyError::Const { item, error } => write!(f, "constant {:?} required by this body: {error}", checker_of(*item)),
             BodyError::NoText(k) => write!(f, "fn {k:x}: the names library holds no text for it (a member of a trait or an impl is lowered by `lower_member`)"),
             BodyError::NoHead(k) => write!(f, "member fn {k:?}: its head is not in the store, and no want makes it (it is no fn or constant of a trait or impl whose head front2 made)"),
             BodyError::NoBody(k) => write!(f, "fn {k:?}: its text has no body (a required trait method, an intrinsic or a foreign fn)"),
@@ -110,13 +153,32 @@ impl core::fmt::Display for BodyError {
             BodyError::Generics { item, why } => write!(f, "fn {item:x}: its generic parameters: {why:?}"),
             BodyError::Record { item, owner, why } => write!(f, "body {owner:?} (in the text of {item:x}): its lowered record: {why:?}"),
             BodyError::Lowered { item, findings } => {
+                // One line: a refusal carried as text into another body's gap (an auto trait
+                // of this fn's future: opaque_auto.rs) or a report's one-line row must still
+                // name what was not taken (rule 19); a newline cut the findings off there.
                 write!(f, "fn {item:x}: {} things its lowering did not take", findings.len())?;
-                for x in findings {
-                    write!(f, "\n  {x:?}")?;
+                for (i, x) in findings.iter().enumerate() {
+                    write!(f, "{} {x:?}", if i == 0 { ":" } else { ";" })?;
                 }
                 Ok(())
             }
-            BodyError::Convert { item, refused, why } => write!(f, "fn {item:x}: to_typeck refused {refused:?} ({why:?})"),
+            BodyError::Calls { item, errors } => {
+                write!(f, "fn {item:x}: {} macro calls failed with their own error", errors.len())?;
+                for e in errors {
+                    write!(f, "\n  the call of `{}!`: {}", e.path, e.why)?;
+                }
+                Ok(())
+            }
+            BodyError::Convert { item, refused, why, expanded_type } => {
+                write!(f, "fn {item:x}: to_typeck refused {refused:?}")?;
+                if let Some(text) = expanded_type {
+                    match text {
+                        Ok(text) => write!(f, " in expanded type `{text}`")?,
+                        Err(place) => write!(f, " in an expanded type whose source range cannot be read ({place:?})")?,
+                    }
+                }
+                write!(f, " ({why:?})")
+            }
             BodyError::Head { item, error } => write!(f, "fn {item:x}: {error}"),
             BodyError::Rounds { item, last } => write!(f, "fn {item:x}: still needs the head of {last:x} after {MOST_ROUNDS} conversions"),
             BodyError::Made { item, need, after } => write!(f, "fn {item:x}: still needs {need:?} after {after} makes (at most {})", super::lower_made::MOST_MADE),
@@ -313,17 +375,18 @@ impl ExpandCx for NoHost {
 /// reason kept, since `to_typeck`'s refusal has no room for it.
 struct BodyTypes<'b, S> {
     builder: Builder<'b, Maps, S>,
+    /// The check's allocator. A constant request survives this lowering round.
+    mark_alloc: Alloc<'static>,
     env: Env<'b>,
     failed: Option<Why>,
+    /// The expanded spelling for a refusal whose item-relative range points to the call.
+    expanded_type: Option<blaze_lower::BodyRange>,
     /// The item's text, which a written type's range is relative to: a [`TypeMiss`] reads its
     /// path there.
     text: &'b str,
     /// Each written type that names nothing (E0412), converted as the error type so the rest of
     /// the body is checked.
     misses: Vec<TypeMiss, Global>,
-    /// The body's blocks that are modules of the names library holding a struct, enum, union
-    /// or type alias ([`super::locals::BodyLocals::blocks`]); empty for most bodies.
-    blocks: &'b [super::locals::BlockModule],
     /// The items declared in bodies, and whose body this is: a path through a type alias is
     /// expanded only where no item of the body takes its first segment
     /// ([`super::world_paths::AliasPaths`]).
@@ -335,41 +398,6 @@ struct BodyTypes<'b, S> {
     async_ret: Option<(lf::TypeId, PTy)>,
 }
 
-impl<'b, 'n, S: NamesSource<'n>> BodyTypes<'b, S> {
-    /// Where the type `t` is written: the body's names, read at the module of the innermost
-    /// block around it that declares a type (the Reference, "Statements", "Item
-    /// declarations": "Declaring an item within a statement block restricts its scope to the
-    /// block containing the statement"; the block's module is its items plus a glob import of
-    /// the scope outside, so every other name reads as before). The body's generic
-    /// parameters and `Self` stay in scope: they are the body's, not the block's items'.
-    /// A type an expansion wrote reads at the block of the outermost macro call that made it;
-    /// one written with `super` names nothing of a block (a block's item has no path) and
-    /// reads at the body's module, where `super` is the module's parent.
-    fn env_at(&self, view: &View<'_>, t: lf::TypeId) -> Result<Env<'b>, Refused> {
-        let mut env = self.env;
-        if self.blocks.is_empty() {
-            return Ok(env);
-        }
-        let range = view.type_range(t)?;
-        // A type an expansion wrote is read at the outermost macro call that made it (the
-        // Reference, "Macros By Example", "Hygiene": macro_rules! "local variables are looked up
-        // at the macro definition site while other symbols are looked up at the macro
-        // invocation site"; builtin `offset_of!` takes its type from the call's tokens): the
-        // call's range ([`View::site`]) places it in its block.
-        let r = match view.item_relative(range) {
-            Some(r) => r,
-            None => view.site(range)?,
-        };
-        if view.text_at(range)?.contains("super") {
-            return Ok(env);
-        }
-        if let Some(b) = self.blocks.iter().rev().find(|b| b.open <= r.start && r.start < b.close) {
-            env.module = b.module;
-        }
-        Ok(env)
-    }
-}
-
 impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     fn ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
         if let Some((at, out)) = self.async_ret {
@@ -377,7 +405,17 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 return Ok(out);
             }
         }
-        let env = self.env_at(view, t)?;
+        let range = view.type_range(t)?;
+        let mut env = self.env;
+        // A const expression or type macro that the builder reads as text still needs
+        // the block containing that text. Only the item's own bytes index this table.
+        // Each written path, including every path inside an expansion, has its own scope.
+        if let Some(r) = view.item_relative(range)
+            && let Some(body) = self.locals.body(self.owner)
+            && let Some(block) = body.blocks.iter().rev().find(|b| b.open <= r.start && r.start < b.close)
+        {
+            env.module = block.module;
+        }
         match self.builder.ty(tys, &env, view, t) {
             Ok(ty) => Ok(ty),
             Err(why) => {
@@ -391,14 +429,34 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 };
                 // A path the names library decided names nothing: the program's E0412, the type
                 // the error type, the body checked for everything else (type_miss.rs).
-                if let Why::Resolve(crate::resolve::ResolveError::Path(e), r) = &why
-                    && let Some(miss) = TypeMiss::of(self.builder.resolver.names, self.text, *e, *r)
-                {
-                    self.misses.push(miss);
-                    return tys.intern(blaze_typeck::PNode::Error).map_err(Refused::from);
+                if let Why::Resolve(crate::resolve::ResolveError::Path(e), r) = &why {
+                    let names = self.builder.resolver.names;
+                    let miss = if range.in_expansion() {
+                        // A bare type name has exactly one segment and no children whose
+                        // lookup could have failed. Its spelling is in the expansion, while
+                        // the diagnostic belongs on the invocation that produced it.
+                        if let lf::TypeRef::Path(p) = view.ty(t)?
+                            && let [segment] = view.segments(view.path(p)?)?
+                            && let lf::Segment { kind: lf::SegKind::Ident, has_args: false, name: Some(n), .. } = lf::Segment::decode(*segment)?
+                        {
+                            let name = view.name_text(n)?;
+                            TypeMiss::of(names, name, *e, Range::new(0, name.len() as u32)).map(|miss| TypeMiss { at: *r, ..miss })
+                        } else {
+                            None
+                        }
+                    } else {
+                        TypeMiss::of(names, self.text, *e, *r)
+                    };
+                    if let Some(miss) = miss {
+                        self.misses.push(miss);
+                        return tys.intern(blaze_typeck::PNode::Error).map_err(Refused::from);
+                    }
+                }
+                if range.in_expansion() && !matches!(why, Why::Need(_) | Why::NeedConst(..)) {
+                    self.expanded_type = Some(range);
                 }
                 self.failed = Some(why);
-                Err(Refused::Form { what: "a written type", range: view.site(view.type_range(t)?)? })
+                Err(Refused::Form { what: "a written type", range: view.site(range)? })
             }
         }
     }
@@ -429,6 +487,11 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         self.const_arg_in(view, c, tys, None, None)
     }
 
+    fn method_const_term(&mut self, view: &View<'_>, c: lf::ConstIdx, scope: lf::ScopeId, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        let made = self.const_arg_in(view, c, tys, None, Some(scope));
+        self.arg_term(made, view, c, None)
+    }
+
     /// [`Types::const_term`], typed by the parameter the argument fills when the path's item
     /// is known ([`BodyTypes::arg_param`]): the Reference, "Constant evaluation", "Const
     /// context": a const generic argument is a const context, so `enc_16lsd::<{
@@ -449,7 +512,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 Err(Refused::Form { what: "a const argument", range })
             }
         };
-        self.arg_term(made)
+        self.arg_term(made, view, c, Some(at))
     }
 
     /// [`Types::const_arg`], with what blaze cannot value yet a GAP ([`const_gap`]): the body
@@ -458,7 +521,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     /// `Why::NeedConst`: the driver makes the record and converts again; a program's error).
     fn const_term(&mut self, view: &View<'_>, c: lf::ConstIdx, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
         let made = self.const_arg(view, c, tys);
-        self.arg_term(made)
+        self.arg_term(made, view, c, None)
     }
 
     /// `[x; len]`'s length as a const term, by the one home for written constants
@@ -479,13 +542,25 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
                 Err(why) => Err(why),
             },
-            Ok(None) => match self.body_anon(text, scope_within(view, at)?, usize_node, range, tys) {
-                Some(made) => made,
-                None => self.builder.const_term(tys, &self.env, text, range, &|tys| super::types::intern(tys, usize_node)),
-            },
+            Ok(None) => {
+                // Replaying a block creates its inner scope again. Its containing
+                // scope is the one from which the synthetic member inherits names.
+                let scope = match view.expr(len)? {
+                    lf::Expr::Block { scope, .. } => view.scope(scope)?.parent,
+                    _ => scope_within(view, at)?,
+                };
+                let local = match scope {
+                    Some(scope) => self.body_anon(view.text_at(at)?, view.marks_in(at, self.mark_alloc)?, Some(scope), usize_node, range, tys),
+                    None => None,
+                };
+                match local {
+                    Some(made) => made,
+                    None => self.builder.const_term(tys, &self.env, text, range, &|tys| super::types::intern(tys, usize_node)),
+                }
+            }
             Err(why) => Err(why),
         };
-        self.term(made, "an array repeat length", range)
+        self.term(made, text, "an array repeat length", range)
     }
 
     /// A generic argument of a body path written as one plain name (`foo::<N>()`,
@@ -530,16 +605,16 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                     Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
                     Err(why) => Err(why),
                 };
-                return self.term(made, "a const argument", range);
+                return self.term(made, name, "a const argument", range);
             }
-            Err(why) => return self.term(Err(why), "a const argument", range),
+            Err(why) => return self.term(Err(why), name, "a const argument", range),
             Ok(Some(LocalArg::Type) | None) => {}
         }
         if !is_const && self.builder.resolver.path(self.env.module, false, &[name], Ns::Value).is_err() {
             return Types::ty(self, view, t, tys).map(ConstTerm::Is);
         }
         let made = self.builder.const_term(tys, &self.env, name, range, &|tys| super::types::intern(tys, blaze_typeck::PNode::Infer));
-        self.term(made, "a const argument", range)
+        self.term(made, name, "a const argument", range)
     }
 
     /// A path through a type alias whose aliased type fixes arguments (`type Call<P, C> =
@@ -569,11 +644,11 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
 /// on with a hole): an expression over a generic parameter (types.rs `const_value_bits`
 /// refuses it by these words: blaze-typeck's type form has no node for an unevaluated
 /// expression), or an anonymous constant whose type is not known where the body is converted
-/// or that the evaluator refused ([`Why::ConstPath`]). `None`: a refusal that stays one.
-fn const_gap(why: &Why) -> Option<ConstGapWhy> {
+/// ([`Why::ConstPath`]). A refusal carrying a cause stays a refusal.
+fn const_gap(why: &Why, written: &str) -> Option<ConstGapWhy> {
     match why {
         Why::Unsupported(what, _) if *what == "a constant expression over a generic parameter" => Some(ConstGapWhy::OverGeneric),
-        Why::ConstPath(text, _) => Some(ConstGapWhy::AnonInBody(blaze_lower::typeck::GapText::of(text))),
+        Why::ConstPath(text, _) => blaze_lower::typeck::GapText::quote(written, text).map(ConstGapWhy::AnonInBody),
         _ => None,
     }
 }
@@ -581,10 +656,10 @@ fn const_gap(why: &Why) -> Option<ConstGapWhy> {
 impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     /// A made const term: the term, its gap ([`const_gap`]), or the refusal `what` at `range`
     /// with the builder's reason kept.
-    fn term(&mut self, made: Result<PTy, Why>, what: &'static str, range: Range) -> Result<ConstTerm, Refused> {
+    fn term(&mut self, made: Result<PTy, Why>, written: &str, what: &'static str, range: Range) -> Result<ConstTerm, Refused> {
         match made {
             Ok(t) => Ok(ConstTerm::Is(t)),
-            Err(why) => match const_gap(&why) {
+            Err(why) => match const_gap(&why, written) {
                 Some(gap) => Ok(ConstTerm::Gap(gap)),
                 None => {
                     self.failed = Some(why);
@@ -595,18 +670,28 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     }
 
     /// A made const argument as a term: the term, its gap when the builder's reason is one
-    /// ([`const_gap`]: the reason is dropped, the body goes on with a hole), or the refusal.
-    fn arg_term(&mut self, made: Result<PTy, Refused>) -> Result<ConstTerm, Refused> {
-        match made {
-            Ok(t) => Ok(ConstTerm::Is(t)),
-            Err(refused) => match self.failed.as_ref().and_then(const_gap) {
-                Some(gap) => {
-                    self.failed = None;
-                    Ok(ConstTerm::Gap(gap))
-                }
-                None => Err(refused),
-            },
+    /// ([`const_gap`]), or the refusal. A GAT receiver needs its value for the projection,
+    /// so a gap there retains the evaluator's reason and the argument's site.
+    fn arg_term(&mut self, made: Result<PTy, Refused>, view: &View<'_>, c: lf::ConstIdx, at: Option<ArgAt>) -> Result<ConstTerm, Refused> {
+        let refused = match made {
+            Ok(t) => return Ok(ConstTerm::Is(t)),
+            Err(refused) => refused,
+        };
+        let Some(why) = &self.failed else { return Err(refused) };
+        let written = match why {
+            Why::ConstPath(..) => view.text_at(view.const_range(c)?)?,
+            _ => "",
+        };
+        let Some(gap) = const_gap(why, written) else { return Err(refused) };
+        if let Some(at) = at && gat_segment(view, at)?.is_some() {
+            return Err(Refused::Form {
+                what: "an unvalued const argument on a generic associated type's segment in a value path (`<T as Tr>::Out::<{ .. }>::x`)",
+                range: view.site(view.const_range(c)?)?,
+            });
         }
+        self.failed = None;
+        self.expanded_type = None;
+        Ok(ConstTerm::Gap(gap))
     }
 
     /// [`Types::const_arg`] of the argument `c`: its parameter's type `want` when known (else
@@ -616,35 +701,20 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     fn const_arg_in(&mut self, view: &View<'_>, c: lf::ConstIdx, tys: &mut PortableTys<'_>, want: Option<PTy>, scope: Option<lf::ScopeId>) -> Result<PTy, Refused> {
         let at = view.const_range(c)?;
         let range = view.site(at)?;
-        let mut text = view.text_at(at)?.trim();
+        let source = view.text_at(at)?;
+        let marks = view.marks_in(at, self.mark_alloc)?;
+        let mut text = source.trim();
         if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
             text = inner.trim();
         }
-        let variant = match text.split_once("::") {
-            Some(_) => {
-                let (abs, rest) = match text.strip_prefix("::") {
-                    Some(rest) => (true, rest),
-                    None => (false, text),
-                };
-                let mut segs: Vec<&str, Global> = Vec::new_in(Global);
-                segs.extend(rest.split("::").map(str::trim));
-                match self.builder.resolver.path(self.env.module, abs, &segs, crate::resolve::Ns::Value) {
-                    Ok(found) if found.consumed as usize == segs.len() => match found.kind {
-                        crate::resolve::Kind::Variant { adt, index } => Some((adt, index)),
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            }
-            None => None,
-        };
         let want_ty = |tys: &mut PortableTys<'_>| match want {
             Some(t) => Ok(t),
             None => super::types::intern(tys, blaze_typeck::PNode::Infer),
         };
-        let made = match variant {
-            Some((adt, index)) => tys.variant_value(checker_of(adt), index).map_err(|e| Why::Program(format!("the type table refused a variant's value: {e:?}").into_boxed_str(), range)),
-            None => {
+        let made = match self.const_variant(source, text, &marks, scope, range) {
+            Err(why) => Err(why),
+            Ok(Some((adt, index))) => return tys.variant_value(checker_of(adt), index).map_err(Refused::from),
+            Ok(None) => {
                 let node = match want {
                     Some(t) => tys.view().get(t).copied(),
                     None => None,
@@ -655,7 +725,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                 // type is its own (anon.rs `written_ty`: std's `Ipv4Addr` `Display`,
                 // `DisplayBuffer::<{ LONGEST_IPV4_ADDR.len() }>::new()`), else refused by its
                 // text.
-                let local = self.body_anon(text, scope, node.unwrap_or(blaze_typeck::PNode::Infer), range, tys);
+                let local = self.body_anon(source, marks, scope, node.unwrap_or(blaze_typeck::PNode::Infer), range, tys);
                 match local {
                     Some(made) => made,
                     None => self.builder.const_term(tys, &self.env, text, range, &want_ty),
@@ -669,6 +739,60 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                 Err(Refused::Form { what: "a const argument", range })
             }
         }
+    }
+
+    /// A variant path has its own const representation. Its first token uses the
+    /// same hygiene as the scalar expression we would otherwise copy.
+    fn const_variant(
+        &self,
+        source: &str,
+        text: &str,
+        marks: &[(u32, blaze_lower::mark_site::TextMark)],
+        scope: Option<lf::ScopeId>,
+        range: Range,
+    ) -> Result<Option<(LibKey, u32)>, Why> {
+        if !text.contains("::") {
+            return Ok(None);
+        }
+        let abs = text.starts_with("::");
+        let rest = text.strip_prefix("::").unwrap_or(text);
+        let mut segments = blaze_own::AVec::new_in(self.mark_alloc);
+        for word in rest.split("::").map(str::trim) {
+            let ident = word.strip_prefix("r#").unwrap_or(word);
+            if word != "$crate" && (ident.is_empty() || !ident.chars().all(|c| c == '_' || c.is_alphanumeric())) {
+                return Ok(None);
+            }
+            segments.push(word);
+        }
+        let first = segments[0];
+        let offset = blaze_scope::expansion_origins::offset_in(source, first)
+            .ok_or(Why::Unsupported("the first segment of an enum constant is outside the argument text", range))?;
+        let mark = marks.binary_search_by_key(&offset, |m| m.0).ok().map(|i| marks[i].1);
+        let site = super::item_site::marked_site(self.builder.resolver.names, mark, first, abs, self.env.module, range)?;
+        let mut module = site.module;
+        let mut dollar = site.dollar_crate;
+        let mut absolute = abs;
+        if !abs {
+            let (row, hit) = super::scope_table::value_prefix(
+                &self.builder.resolver, self.locals, self.owner, self.env.module, scope.map(|s| s.0), first, false, mark, self.mark_alloc,
+            ).map_err(|gap| Why::Unsupported(gap.form, range))?;
+            if let Some(hit) = hit {
+                let mut through = hit.path;
+                through.extend_from_slice(&segments[1..]);
+                segments = through;
+                module = hit.at;
+                absolute = hit.abs;
+                dollar = hit.dollar;
+            } else if let Some(row) = row {
+                let Some(at) = row.module else { return Ok(None) };
+                module = at;
+            }
+        }
+        let found = self.builder.resolver.path_with(module, dollar, absolute, &segments, crate::resolve::Ns::Value);
+        Ok(match found {
+            Ok(crate::resolve::Target { consumed, kind: crate::resolve::Kind::Variant { adt, index }, .. }) if consumed as usize == segments.len() => Some((adt, index)),
+            _ => None,
+        })
     }
 
     /// Whether the constant expression `text`, written in block `scope` of this body, names an
@@ -701,22 +825,38 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
         false
     }
 
-    /// The constant expression `text` of type `ty` written in block `scope` of this body, when
-    /// it names an item declared in the body: an anonymous constant of the body
-    /// ([`super::anon::Ask::in_body`]), its names read in that block first, evaluated once by
-    /// the same machine as any constant ([`super::anon::body_value`]). An expression that also
-    /// names a generic parameter in scope has no value here (the OverGeneric gap, as for the
-    /// module's). `None`: the expression names no item of the body (or no block is known),
-    /// and the module's reading applies.
-    fn body_anon(&self, text: &str, scope: Option<lf::ScopeId>, ty: blaze_typeck::PNode, range: Range, tys: &mut PortableTys<'_>) -> Option<Result<PTy, Why>> {
-        let mut text = text.trim();
-        if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
-            text = inner.trim();
-        }
-        let scope = scope?;
-        if !self.names_body_item(text, scope.0) {
+    /// File a constant with its enclosing scope when it refers to a block item or carries
+    /// expansion marks. The marks start relative to `source`, including its whitespace.
+    fn body_anon(&self, source: &str, mut marks: blaze_own::AVec<'static, (u32, blaze_lower::mark_site::TextMark)>, scope: Option<lf::ScopeId>, ty: blaze_typeck::PNode, range: Range, tys: &mut PortableTys<'_>) -> Option<Result<PTy, Why>> {
+        let text = source.trim();
+        let inner = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')).map_or(text, str::trim);
+        let local = scope.is_some_and(|scope| self.names_body_item(inner, scope.0));
+        if !local && marks.is_empty() {
             return None;
         }
+        if !local {
+            // A literal, inference hole or standalone const parameter already has a
+            // contextual reading. None of these has an item path to resolve.
+            let digits = inner.strip_prefix('-').map_or(inner, str::trim_start);
+            if matches!(inner, "_" | "true" | "false")
+                || self.env.params.iter().any(|(n, _)| *n == Name::of(inner))
+                || parser::LexedStr::single_token(parser::Edition::CURRENT, digits).is_some_and(|(kind, _)| kind.is_literal())
+            {
+                return None;
+            }
+        }
+        let Some(scope) = scope else {
+            return Some(Err(Why::Unsupported("an anonymous constant with marked tokens whose enclosing block is missing", range)));
+        };
+        // Keep braces belonging to the expression: its block may declare its own items.
+        let leading = (source.len() - source.trim_start().len()) as u32;
+        marks.retain_mut(|(start, _)| {
+            if *start < leading || *start - leading >= text.len() as u32 {
+                return false;
+            }
+            *start -= leading;
+            true
+        });
         // `Self` where it is a ground type (`Self::BITS` in `impl DecodeValue for u128`) is no
         // parameter: the constant is filed with it in scope. A generic parameter, or a `Self`
         // that is not ground, leaves the expression with no value here.
@@ -729,7 +869,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
             // can be made of it, refused by the expression's name.
             return Some(Err(Why::ConstPath(Box::from(text), range)));
         };
-        let bits = match super::anon::body_value(self.builder.heads, ask, range) {
+        let bits = match super::anon::body_value(self.builder.heads, ask.carry_marks(marks), range) {
             Ok(bits) => bits,
             Err(why) => return Some(Err(why)),
         };
@@ -742,16 +882,33 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     /// ADT's, a trait's (its arguments follow `Self`) or a type alias's const parameters, as
     /// its head filed them ([`super::types::Heads::const_params`]). A head not made yet is
     /// [`Why::Need`] (the driver makes it and converts again, `lower_at`). `None`: the type is
-    /// the checker's to find: a segment after an anchor or a generic parameter, an associated
+    /// the checker's to find: a value member after an anchor or a generic parameter, an associated
     /// item (`Ty::f::<{..}>`), or a path whose first segment a block of the body may name (a
     /// local item, a named or glob import), which the module's names do not see.
     fn arg_param(&self, view: &View<'_>, at: ArgAt) -> Result<Option<PTy>, Why> {
         use crate::resolve::{Kind, Ns};
-        // A path the type builder does not read as written (`$crate`, parenthesized
-        // arguments) is the checker's.
-        let Ok((abs, texts, segs, _)) = super::types::path_texts_of(view, at.path, false) else { return Ok(None) };
+        use super::types::{Bounded, Heads};
+        // Resolve the anchor's trait at its own spelling, including a macro's `$crate`.
+        // Both ArgAt and the GAT head number own parameters from zero and erase lifetimes.
+        if let Some((path, name)) = gat_segment(view, at)? {
+            let (abs, names, _, r) = super::types::path_texts(view, path)?;
+            let Bounded::Trait(owner) = self.builder.bound_target(&self.env, view, path, abs, &names, r)? else { return Ok(None) };
+            let heads = self.builder.heads;
+            if !heads.trait_has_assoc(owner, name).ok_or(Why::Need(owner))? {
+                return Ok(None);
+            }
+            let Some(params) = heads.assoc_const_params(owner, name) else {
+                return if heads.trait_supers(owner).is_none() {
+                    Err(Why::Need(owner))
+                } else {
+                    Err(Why::Unsupported("a generic associated type whose declared const parameters are missing", r))
+                };
+            };
+            return Ok(params.iter().find(|(i, _)| *i == at.index).map(|&(_, ty)| ty));
+        }
+        let Ok((abs, texts, segs, range)) = super::types::path_texts_of(view, at.path, false) else { return Ok(None) };
         let seg = at.segment as usize;
-        if seg >= texts.len() || segs.iter().take(seg + 1).any(|s| !matches!(s.kind, lf::SegKind::Ident | lf::SegKind::Crate | lf::SegKind::SelfMod | lf::SegKind::Super)) {
+        if seg >= texts.len() || segs.iter().take(seg + 1).any(|s| !matches!(s.kind, lf::SegKind::Ident | lf::SegKind::Crate | lf::SegKind::DollarCrate | lf::SegKind::SelfMod | lf::SegKind::Super)) {
             return Ok(None);
         }
         if self.env.params.iter().any(|(n, _)| *n == Name::of(texts[0])) {
@@ -769,7 +926,8 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
         }
         let upto = &texts[..=seg];
         let ns = if seg + 1 == texts.len() { Ns::Value } else { Ns::Type };
-        let Ok(found) = self.builder.resolver.path(self.env.module, abs, upto, ns) else { return Ok(None) };
+        let site = super::item_site::written_site(&self.builder.resolver, self.builder.marks, self.env.module, view, at.path, abs, texts[0], range)?;
+        let Ok(found) = self.builder.resolver.path_with(site.module, site.dollar_crate, abs, upto, ns) else { return Ok(None) };
         if found.consumed as usize != upto.len() {
             return Ok(None);
         }
@@ -783,6 +941,19 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
         // reading of the arguments.
         Ok(consts.iter().find(|(i, _)| *i == index).map(|&(_, t)| t))
     }
+}
+
+/// The trait path and associated type of an argument on `Out` in `<T as Tr>::Out::<A>::x`.
+fn gat_segment(view: &View<'_>, at: ArgAt) -> Result<Option<(blaze_typeck::PathIdx, Name)>, lf::BadRow> {
+    if at.segment == 1
+        && let [first, assoc, _] = view.segments(view.path(at.path)?)?
+        && let lf::Segment { kind: lf::SegKind::Anchor, trait_: Some(tr), .. } = lf::Segment::decode(*first)?
+        && let Some(name) = lf::Segment::decode(*assoc)?.name
+        && let lf::TypeRef::Path(path) = view.ty(tr)?
+    {
+        return Ok(Some((path, Name(view.name(name)?))));
+    }
+    Ok(None)
 }
 
 /// The block of the first path written inside `at` (an expression's range), which is the
@@ -832,33 +1003,29 @@ pub fn lower_again<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, ke
 
 fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
     let krate = names.crate_of(item).ok_or(BodyError::NoText(item))?;
-    // A fn declared in a body: its kept text, its body lowered in its enclosing body's module,
-    // its generics read at its block's module as its head is (`LocalHead::names_at`).
-    let (module, head_at, text) = match store.locals.head(checker_of(item)) {
-        Some(h) => (h.module, h.names_at, h.text),
-        None => names.text_of(item).map(|it| (it.module, it.module, it.text)).ok_or(BodyError::NoText(item))?,
+    let owner = checker_of(item);
+    // The body's tokens keep their expansion marks. Its generic names, types and bounds
+    // have already been resolved at their declaration in the function head.
+    let (module, text, marks) = match store.locals.head(owner) {
+        Some(h) => (h.module, h.text, h.marks),
+        None => {
+            let it = names.text_of(item).ok_or(BodyError::NoText(item))?;
+            let marks = super::item_site::item_marks(names, item, it.text).map_err(|e| BodyError::Generics { item, why: e.why() })?;
+            (it.module, it.text, marks)
+        }
     };
-    // A crate whose cfg or edition the source has not read has no text for the item either.
-    let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
-    let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
-    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), store.tys.alloc()).map_err(|_| BodyError::Cfg(item))?;
-    let mut params = Vec::new_in(Global);
-    let mut consts = Vec::new_in(Global);
-    // Its generics resolve by their tokens' marks, as its head's (front2 item_site.rs); a local
-    // fn's are its enclosing body's when a macro wrote that body (locals.rs `LocalHead::marks`),
-    // as `Store::marks` reads its head.
-    let marks = match store.locals.head(checker_of(item)) {
-        Some(h) => h.marks,
-        None => super::item_site::item_marks(names, item, text).map_err(|e| BodyError::Generics { item, why: e.why() })?,
+    if !store.fns.contains_key(&owner) && into.is_none() {
+        store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
+    }
+    let head = store.fns.get(&owner).ok_or(BodyError::NoHead(owner))?;
+    let site = Site {
+        item, owner, krate, module, text, marks,
+        params: head.params.clone(),
+        consts: head.consts.clone(),
+        bounds: head.bounds.clone(),
+        self_: head.self_,
+        self_assoc: head.self_assoc.clone(),
     };
-    let b = Builder { resolver: Paths { names }, heads: &store.maps, marks };
-    own_generics(&b, &mut store.tys, head_at, &sig.view(), 0, &mut params, &mut consts).map_err(|why| BodyError::Generics { item, why })?;
-    let mut bounds = Vec::new_in(Global);
-    let env = Env { module: head_at, params: &params, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &consts, body: None };
-    b.param_bounds(&mut store.tys, &env, &sig.view(), 0, &mut bounds).map_err(|why| BodyError::Generics { item, why })?;
-    // Its body's words keep the same marks as its generics: a fn a macro wrote is lowered with
-    // them (`Site::marks`).
-    let site = Site { item, owner: checker_of(item), krate, module, text, marks, params, consts, bounds, self_: SelfTy::None, self_assoc: Vec::new_in(Global) };
     lower_at(names, prepared, keys, store, site, into)
 }
 
@@ -897,14 +1064,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     // else the container's own (front2 item_site.rs `head_marks`). A derived impl's `default`
     // writes `crate::default::Default::default()`, its `crate` core's only by its mark.
     let marks = match keys.origin(key) {
-        // An anonymous constant's text is front2's own rendering `const _: T = EXPR;`
-        // (anon.rs `file_asked`), kept in the frame and named under its MODULE, which has no
-        // place among the items: no column of marks reaches it, and its words are read at that
-        // module, as a rewritten expansion text's are (item_site.rs `marks_of`'s `Ok(None)`).
-        // Before, its marks were asked of the module's place and every such constant was
-        // refused (`NoPlace`: `size_of::<Self>()` in core's `from_le_bytes`, crypto_bigint's
-        // `nlimbs(256)`). OPEN (D122 E5): a def-site word in such an expression keeps no mark.
-        Some(Origin::Member { kind: MemberKind::Anon, .. }) => None,
+        Some(Origin::Member { kind: MemberKind::Anon, .. }) => store.anon_marks.get(&key).copied(),
         Some(Origin::Member { kind, name, .. }) => {
             let item_kind = match kind {
                 MemberKind::Fn => blaze_surface::ItemKind::Function,
@@ -1012,7 +1172,7 @@ fn defaults_gate<'n, S: NamesSource<'n>>(names: S, krate: usize, typeck: &Typeck
 /// `Locals::library_body`, by the same slice test.
 fn library_body<'n, S: NamesSource<'n>>(names: S, item: LibKey, text: &str) -> Option<LibKey> {
     let same = |t: &str| core::ptr::eq(t.as_ptr(), text.as_ptr()) && t.len() == text.len();
-    if names.text_of(item).is_some_and(|it| same(it.text)) {
+    if names.seeded_text_of(item).is_some_and(|it| same(it.text)) {
         return Some(item);
     }
     let mut found = None;
@@ -1040,14 +1200,15 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
-    // The body's blocks the names library made modules: a call written in one reads its path
-    // there (scoped.rs `written_blocks`). Only for a text that is the library's item's or
-    // member's own (a local item's body, an anonymous constant's rendering: none).
+    // The body's blocks the names library made modules: a call in one, written by hand or by
+    // an expansion, reads its path there (scoped.rs `body_blocks`). Only for a text that is the
+    // library's item's or member's own (a local item's body, an anonymous constant's
+    // rendering: none).
     let blocks = match (library_body(names, item, text), names.crate_key(krate)) {
-        (Some(body), Some(crate_key)) => super::scoped::written_blocks(crate_key, body, text, alloc),
-        _ => blaze_own::AVec::new_in(alloc),
+        (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
+        _ => None,
     };
-    let scoped = ScopedBy { names, module, prepared: Some(prepared), blocks: &blocks };
+    let scoped = ScopedBy { names, module, prepared: Some(prepared), blocks: blocks.as_ref().map(super::scoped::BodyBlocks::modules) };
     // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
     // includes, proc macros; `NoHost` refused them all.
     let host = super::body_host::BodyHost::of(names, store.sources, krate, item, module, alloc);
@@ -1063,6 +1224,12 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     if let Some(sources) = body_sources {
         let place = super::body_left::body_place(names, krate, item, text.len());
         super::body_left::file_body_left_reads(sources, krate, place, expand.call_reads(), expand.reads(), alloc);
+        // Its includes too, placed from the body's file as the body host placed them, the file
+        // asked only at the first include read (body_left.rs `file_body_left_includes`: over
+        // records it reads the crate's items section whole). A body with no file had every
+        // include refused by its host (`HostAsk::Include`): no read.
+        let calling = || sources.folder(krate).and_then(|package| super::body_host::body_file(names, krate, item)?.package.in_package(package, alloc));
+        super::body_left::file_body_left_includes(sources, krate, place, calling, expand.call_reads(), expand.reads(), alloc);
     }
     match values.failed {
         Some(ValuesFail::Resolve(error)) => return Err(BodyError::PatternName { item, error }),
@@ -1072,7 +1239,19 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let lowered = lowered.map_err(|_| BodyError::Cfg(item))?;
     let view = lowered.view();
     let mut findings = Vec::new_in(Global);
+    // The calls whose finding is the macro's own error ([`call_error`]): each also stays a
+    // finding below, so a lowering with any other finding is refused exactly as before.
+    let mut calls: Vec<CallError, Global> = Vec::new_in(Global);
     for m in expand.findings() {
+        if call_error(&m.why) {
+            // At its site (rule 71): the call itself, or the outermost call in the item's text
+            // whose expansion wrote it (`dep::missing_of!()` writing `env!("UNSET")`), the range
+            // the lowering's own note of it is mapped to below. Before, the raw range (past the
+            // item's text) never equalled that site, so the note stayed a finding of its own and
+            // an unset `env!` a macro wrote printed "not checked" (check_body_env.rs, t82).
+            let at = view.call_site(m.at).map_err(|t| BodyError::Record { item, owner, why: Why::from(t) })?;
+            calls.push(CallError { at, path: Box::from(m.path.as_str()), why: format!("{}", m.why).into_boxed_str() });
+        }
         let debug = format!("{:?}", m.why);
         // The chain, then the host's ask when a host refused (`HostError { ask: ProcMacro, .. }`).
         let ask = debug.split_once("ask: ").map(|(_, rest)| crate::class_chain::class_chain(rest, 1));
@@ -1086,6 +1265,14 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let record = |why: Why| BodyError::Record { item, owner, why };
     for u in view.unhandled() {
         let range = view.site(u.range).map_err(|t| record(Why::from(t)))?;
+        // The lowering's own note of a call whose expansion failed, at the very range of a
+        // call whose failure is the macro's own error (above): the same error said twice, so
+        // it is that call's, not a finding of its own (D189: an `include_str!` of a missing
+        // file is the program's error at the call; the twin, any other unexpanded call, has
+        // no call error at its range and stays a finding).
+        if u.why == lf::Why::ExpansionFailed && calls.iter().any(|c| c.at == range) {
+            continue;
+        }
         findings.push(BodyFinding::Unhandled { syntax: blaze_file_items::syntax_kind(u.syntax), why: u.why, range });
     }
     for d in view.diags() {
@@ -1097,6 +1284,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
         findings.push(BodyFinding::CfgOut);
     }
     if !findings.is_empty() {
+        // Every finding a call's own error: the program's errors at its calls.
+        if calls.len() == findings.len() {
+            return Err(BodyError::Calls { item, errors: calls });
+        }
         return Err(BodyError::Lowered { item, findings });
     }
     // The items declared in the body: kept for the command (their text, keys and blocks).
@@ -1106,26 +1297,17 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     // An `async fn`'s coroutine output is its written return type in RETURN position (the
     // Reference, "Async functions": `async fn f() -> T` is `fn f() -> impl Future<Output = T>`;
     // an `impl Trait` in `T` is one of `f`'s opaques): the head's `T`, read from the head
-    // ([`super::async_output`]). A free fn's head is made here when it is not yet (a member's
-    // was made by `lower_member_into`); lowered again into a finished table (`into`), the head
-    // was made by the first lowering, and its absence is refused by the fn's key.
+    // ([`super::async_output`]). Both free and member bodies enter with their head made.
     let async_ret = match super::async_output::written(&view) {
         None => None,
-        Some(t) => {
-            if super::async_output::of(store, owner).is_none() && into.is_none() {
-                store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
-            }
-            Some((t, super::async_output::of(store, owner).ok_or(BodyError::NoHead(owner))?))
-        }
+        Some(t) => Some((t, super::async_output::of(store, owner).ok_or(BodyError::NoHead(owner))?)),
     };
-
-    // The body's blocks that are modules holding a local type: a written type is read there.
-    let blocks: &'n [super::locals::BlockModule] = store.locals.body(owner).map_or(&[], |b| b.blocks);
 
     let mut last = item;
     let mut typeck = None;
     for _ in 0..MOST_ROUNDS {
         let mut types = BodyTypes {
+            mark_alloc: alloc,
             // Every word's mark is in the lowered record (`View::mark_of_path`): an expansion's
             // lowered into the body, and the item's own when a macro wrote it
             // (`lower_body_expanding_marked`), so the builder needs no second copy of them.
@@ -1143,9 +1325,9 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                 body: Some(super::block_type_uses::BodyScope { locals: &store.locals, owner, module, alloc }),
             },
             failed: None,
+            expanded_type: None,
             text,
             misses: Vec::new_in(Global),
-            blocks,
             locals: &store.locals,
             owner,
             async_ret,
@@ -1198,7 +1380,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             Err(Refused::NoBody) => return Err(BodyError::NoBody(owner)),
             Err(refused) => match types.failed.take() {
                 // Lowered again into a finished table: a head it lacks cannot be added there.
-                Some(why @ Why::Need(_)) if again_now => return Err(BodyError::Convert { item, refused, why: Some(why) }),
+                Some(why @ Why::Need(_)) if again_now => return Err(BodyError::Convert { item, refused, why: Some(why), expanded_type: None }),
                 Some(Why::Need(k)) => {
                     last = k;
                     // A free fn's head (its const parameters, which type a const argument
@@ -1209,7 +1391,15 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                     };
                     store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
                 }
-                why => return Err(BodyError::Convert { item, refused, why }),
+                why => {
+                    // The caller's site owns its parameters on the heap. Its allocator can
+                    // also own the spelling after the worker drops the lowering and store.
+                    let expanded_type = types.expanded_type.map(|at| view.text_at(at).map(|text| {
+                        let bytes = text.as_bytes().to_vec_in(*params.allocator());
+                        std::string::String::from_utf8(bytes).expect("copied from a str").into_boxed_str()
+                    }));
+                    return Err(BodyError::Convert { item, refused, why, expanded_type });
+                }
             },
         }
     }

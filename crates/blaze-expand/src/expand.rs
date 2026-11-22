@@ -184,28 +184,17 @@ impl<'a> Out<'_, 'a> {
         Ok(())
     }
 
-    /// [`Out::push`] with the context already made for `origin` ([`Out::ctx_for`]): a writer
-    /// that keeps the contexts it made for its sources pushes many tokens of one context so.
-    pub(crate) fn push_ctx(
-        &mut self,
-        kind: TokenKind,
-        text: &str,
-        origin: TokenOrigin,
-        ctx: Ctx,
-    ) -> Result<(), ExpandError> {
-        self.push_bytes_ctx(kind, text.as_bytes(), origin, ctx)
-    }
 
-    /// [`Out::push_ctx`] of a token's text read as bytes
-    /// ([`crate::tokens::TokenStream::bytes_at`]).
-    pub(crate) fn push_bytes_ctx(
+    /// [`Out::push`] with the context already made for `origin` ([`Out::ctx_for`]), of a text
+    /// proved whole ([`crate::tokens::WholeText`]): a token's text copied with no UTF-8 check.
+    pub(crate) fn push_whole_ctx(
         &mut self,
         kind: TokenKind,
-        text: &[u8],
+        text: crate::tokens::WholeText<'_>,
         origin: TokenOrigin,
         ctx: Ctx,
     ) -> Result<(), ExpandError> {
-        self.exp.tokens.push_bytes(kind, text, ctx)?;
+        self.exp.tokens.push_whole(kind, text, ctx)?;
         self.exp.origins.push(origin);
         Ok(())
     }

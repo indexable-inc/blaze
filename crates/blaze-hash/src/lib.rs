@@ -28,6 +28,7 @@
 //! | Ordinary keys: ids, names blaze made, tuples, paths of the tree | [`FixedState`] | `FixedState` (zero-sized) | HashDoS: its seed is fixed and public, so whoever picks the keys can pick many that share a hash, and each insert then walks them all |
 //! | Keys an outsider picks: a source's names and literals, file names, a request's headers | [`SipKey`] | the key from the randomness grant (bstd's `Io::sip_key`), handed in by the table's maker; no `Default`, so no table of it is made without one | nothing known while the key stays secret (a keyed PRF) |
 //! | Keys that are hashes already: a content ID, a store key, a fingerprint | [`BuildKeyHasher`] | `BuildKeyHasher::default()` (zero-sized) | anything, if the key is not really a hash: it takes the key's first word as its hash |
+//! | Keys that hold a digest beside other fields: an engine cell (kind, subject, cell) | [`DigestState`] over a [`DigestKey`] | `DigestState` (zero-sized) | whoever writes the digested inputs, at a cost of trying inputs per key; the build's own inputs only (`digest`'s documentation) |
 //!
 //! [`FixedState`] holds nothing of the machine or the run (rule 25): its hasher is foldhash's
 //! on constants written in `fold`, seed 0, with no address, clock, thread or process input.
@@ -95,6 +96,12 @@
 // blaze's lints (`blaze::trust`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+// A core: tables and hashers over memory their caller hands in. The one read of the operating
+// system, `SipKey::random`'s `getentropy` (and `LazyKey::get` through it), is allowed at its
+// site until its callers (intern) take a key from bstd's `Io::sip_key` (batch P4-random).
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
 #![blaze::trust(
     unsafe,
     reason = "the table's own memory (`raw`: control words, slots initialized exactly where tagged live, one allocation in the table's allocator), a `PlainKey`'s bytes read as `u8`s (`plain`: the trait's contract says none is padding) and libc's `getentropy` for `SipKey::random`; each block names the invariant it relies on"
@@ -118,6 +125,7 @@ use core::hash::{BuildHasher, Hasher};
 
 pub mod adaptive;
 mod blake3;
+mod digest;
 mod fold;
 pub mod hash_map;
 pub mod hash_set;
@@ -140,6 +148,7 @@ mod sip;
 mod tests;
 
 pub use blake3::{Blake3, Blake3Hasher};
+pub use digest::{DigestKey, DigestState, digest_word, fold_part};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
 pub use sip::{LazyKey, SipHasher, SipKey};
 pub use order::{OrderMap, OrderMapOpts, OrderSet, OrderSetOpts};

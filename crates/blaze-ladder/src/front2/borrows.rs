@@ -19,40 +19,91 @@
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
 use blaze_flow_lower::{
-    AdtFacts, CallLacks, CalleeFacts, FieldRegion, Facts, FieldLead, Refusal, Requirement, ShapeRefusal, SigBuf, SigLife, SigRefusal,
+    AdtFacts, CallLacks, CalleeFacts, FieldRegion, Facts, FieldLead, NoRegions, Refusal, RegionFacts, Requirement, ShapeRefusal, SigLife,
 };
-use blaze_flow_lower::sig::{read_async_signature_with, read_impl_signature_with, read_signature_with};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Arc};
 use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, AskedAdts, HeadAnswer, adt_read, file_borrow_reads, head_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
-use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, nested_inner_first, nested_range, next_nested};
+use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
 use super::index::Index;
-use super::keys::{Keys, Origin, checker_of};
+use super::keys::{Origin, checker_of};
 use super::project::{BodyRef, BodyVerdict, MOST_LENS, ProjectWorld};
 use super::project_records::BodySource;
 use super::source::NamesSource;
+use super::tables::view::BodyHeadFacts;
 use super::types::Why;
+
+/// The facts a callee's generic shape is counted by (D148: the same as its signature column's):
+/// each declared count from the names (`HeadsArity`), an opaque's captures from its head record
+/// (`RegionFacts::opaque_captures`, head_record.rs `RegionReader`), as the column was laid.
+/// Never the in-process maps for an opaque: they hold only heads made in this process, so a
+/// callee whose head came from its record was `CountUnknown(OpaqueCaptures)` (tempo's 102).
+struct ShapeArity<'a, H: super::types::Heads + ?Sized, S, R: RegionFacts + ?Sized> {
+    declared: super::types::HeadsArity<'a, H, S>,
+    regions: &'a R,
+}
+
+impl<'n, H: super::types::Heads + ?Sized, S: NamesSource<'n>, R: RegionFacts + ?Sized> tc::regions::Arity for ShapeArity<'_, H, S, R> {
+    fn adt_lifetimes(&self, adt: tc::ItemKey) -> tc::regions::Count {
+        tc::regions::Arity::adt_lifetimes(&self.declared, adt)
+    }
+    fn opaque_captures(&self, opaque: tc::ItemKey) -> tc::regions::Count {
+        self.regions.opaque_captures(opaque).map_or(tc::regions::Count::NotKnown, tc::regions::Count::Known)
+    }
+    fn alias_lifetimes(&self, trait_: tc::ItemKey, name: tc::Name) -> tc::regions::Count {
+        tc::regions::Arity::alias_lifetimes(&self.declared, trait_, name)
+    }
+    fn trait_lifetimes(&self, trait_: tc::ItemKey) -> tc::regions::Count {
+        tc::regions::Arity::trait_lifetimes(&self.declared, trait_)
+    }
+}
 
 /// Each head's trait bounds with lifetime arguments (piece RB8).
 #[path = "borrows_ties.rs"]
 mod ties;
 
-/// The signature reader's world: written paths resolved, aliases expanded (lane B11).
-#[path = "borrow_sig_world.rs"]
-mod sig_world;
-
-/// Each field's regions read from its written type, and each `Copy` impl's demands of the
-/// ADT's arguments (lane B11).
+/// Each field's regions from its head record's field column (D148), and each `Copy` impl's
+/// demands of the ADT's arguments (lane B11).
 #[path = "borrow_fields.rs"]
 mod fields;
+pub(crate) use fields::{NO_ROW, declared_lifetimes, freeze_field_regions};
+
+/// The region projection of an ADT's head. A body holds a share of these immutable
+/// columns, so reading a field never copies the other fields' regions into its frame.
+pub type AdtFieldRegions = Arc<FieldRegions, Alloc<'static>>;
+pub struct FieldRegions {
+    pub at: AVec<'static, (u32, u32)>,
+    pub list: AVec<'static, FieldRegion>,
+}
+
+impl FieldRegions {
+    pub(crate) fn new(at: AVec<'static, (u32, u32)>, list: AVec<'static, FieldRegion>, alloc: Alloc<'static>) -> AdtFieldRegions {
+        Arc::new_in(FieldRegions { at, list }, alloc)
+    }
+
+    fn field(&self, index: usize) -> Option<&[FieldRegion]> {
+        let &(start, len) = self.at.get(index)?;
+        if (start, len) == NO_ROW {
+            return None;
+        }
+        self.list.get(start as usize..start as usize + len as usize)
+    }
+}
+
+struct RegionFields {
+    first_variant: usize,
+    variant_count: usize,
+    first_field: usize,
+    regions: AdtFieldRegions,
+}
 
 /// One finding of the move or borrow check: its code (rustc's error code where one names the
 /// same rule, else a word), what it says, and its item-relative range.
@@ -62,6 +113,24 @@ pub struct BorrowDiagnostic {
     pub end: u32,
     pub code: &'static str,
     pub text: &'static str,
+    /// An `Invalidated` finding's borrow: the item-relative range of the statement that took
+    /// it (blaze-flow `LoanParts::issued`, rule 71); `None` for any other finding.
+    pub borrowed: Option<(u32, u32)>,
+    /// What keeps that loan live at the conflict (blaze-flow `LoanParts::kept`); `None` for any
+    /// other finding.
+    pub kept: Option<KeptAt>,
+}
+
+/// What keeps a loan live where it is invalidated (blaze-flow `Kept`), its range item-relative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum KeptAt {
+    /// The later use: rustc's "borrow later used here".
+    Use { start: u32, end: u32 },
+    /// A lifetime of the signature holds the loan: it must outlive the call.
+    Signature,
+    /// None was found, or the finding had no parts row: blaze-flow's liveness invariant broke.
+    /// Named in the note, never dropped (rule 3).
+    Unfound,
 }
 
 /// Why a body's type check gave no record to lower: the borrow check runs over a body whose
@@ -90,6 +159,13 @@ pub enum BorrowRefused {
     TypeTable(tc::CheckError),
     /// The lowering refused a form, by name, at an item-relative range.
     Lower(Refusal),
+    /// A finding that reads regions, in a body one of whose flows the lowering related at some
+    /// step by a relation stricter than Rust's (blaze-flow-lower `Lowered::coarse`: the first
+    /// such step's form and item-relative range, `CallGenericUnaligned`, `AwaitValueUnrelated`
+    /// or `ProjectionUnbound`): the finding may be the relation's artifact, so the body's
+    /// borrows are not checked, by that step's name. A body clean under it stands checked;
+    /// move findings read no region and are kept (`check_borrows`).
+    Stricter(Refusal),
     /// A check went past its stated bound (rule 18): a bug of the checker, named.
     Bound(blaze_flow::Bound<tc::ItemKey>),
     /// A closure's or async block's body needs a lifetime relation among its captures,
@@ -98,20 +174,38 @@ pub enum BorrowRefused {
     /// borrows_nested.rs `Requirements`, closures and async blocks alike; one that names a
     /// closure's parameter or result, an async block's output or a closure's environment
     /// reference is this): at the item-relative range of the first.
-    NestedOutlives { start: u32, end: u32 },
+    NestedOutlives { from: Option<blaze_flow_lower::External>, into: Option<blaze_flow_lower::External>, start: u32, end: u32 },
     /// The lowering refused an ADT it has no facts for (`Form::UnknownAdt`, at the
     /// item-relative `start..end`) because the store could not make the ADT's row: the first
     /// such ADT of the body by checker key, why its row was not made, and how many others of
     /// the body were not made either (borrows_unmade.rs).
     AdtNotMade { adt: tc::ItemKey, why: AdtUnmade, others: u32, start: u32, end: u32 },
-    /// The lowering refused a call of `callee`, whose head writes lifetimes, at the
-    /// item-relative `start..end` because the head's lifetime part was not read from its text
-    /// (`Form::CallWritesLifetimes` lacking `CallLacks::Sig`): the callee by checker key and
-    /// library item, its head's first words, and why its text was not read.
-    CallSigUnread { callee: tc::ItemKey, item: Option<blaze_id::ItemKey>, head: Words, why: SigRefusal, start: u32, end: u32 },
+    /// The lowering refused a call of `callee` (or the body of `callee` itself), with an
+    /// argument or the result carrying a lifetime, at the item-relative `start..end`, because
+    /// its head regions were not read from its head record (`Form::RegionsUnread`, D148): the
+    /// callee by checker key and library item, its head's first words, and why (`NoHead`: no
+    /// head record holds them; `HeadRefused`: the head was refused, its own error reported
+    /// there; `RecordForm`: a record of another form, rebuilt). Never checked under a guess.
+    /// `gap`: when this store made the callee's head (the body's own fn, or a callee made
+    /// here), the making store's detail of the refusal (heads.rs `RegionGap::say`: for E0107
+    /// the path, its declared and its written lifetime counts); empty for a head read from
+    /// another store's record, whose answer is its kind alone (`why`) beside `head`.
+    /// `unlaid`: the refusal's typed kind as this store filed it (made here, or read from the
+    /// callee's frozen head, form 12: the same in every store), whose class is printed first
+    /// (`[NotLaid/ProjectionBoundElsewhere/Output]`); `None` when the head was not filed whole.
+    RegionsUnread {
+        callee: tc::ItemKey,
+        item: Option<blaze_id::ItemKey>,
+        head: Words,
+        why: tc::region_facts::UnreadWhy,
+        unlaid: Option<super::head_record::Unlaid>,
+        gap: Words,
+        start: u32,
+        end: u32,
+    },
     /// The lowering refused a call of `callee`, whose head writes lifetimes and whose lifetime
     /// part WAS read, at the item-relative `start..end`, because the call could not be related
-    /// through that signature (`Form::CallWritesLifetimes` lacking anything but `Sig`):
+    /// through that signature (`Form::CallWritesLifetimes`):
     /// `lacks` says what (`Shape`: the head's generic shape was not read, `shape_why` says at
     /// which input or output and why; `Bounds`: its declared bounds were not filed;
     /// `Unaligned`: the call's types did not line up with the instantiated head, its `Misfit`
@@ -137,27 +231,177 @@ impl BorrowRefused {
             BorrowRefused::FactUnknown { .. } => "a trait fact of an ADT is not known",
             BorrowRefused::TypeTable(_) => "the body's type table could not be read",
             BorrowRefused::Lower(_) => "the flow lowering refused a form",
+            BorrowRefused::Stricter(_) => "a borrow finding under a relation stricter than Rust's, which may be the relation's own",
             BorrowRefused::Bound(_) => "the check went past its bound",
             BorrowRefused::NestedOutlives { .. } => {
                 "a closure or async block needs a lifetime relation its owner must prove that is no requirement on the closure value's regions"
             }
             BorrowRefused::AdtNotMade { .. } => "an ADT the body moves or drops could not be made from the records",
-            BorrowRefused::CallSigUnread { .. } => "a callee's signature writes lifetimes its text was not read for",
-            BorrowRefused::CallUnrelated { .. } => "a call of a fn whose signature writes lifetimes could not be related through that signature",
+            BorrowRefused::RegionsUnread { .. } => "a callee's head regions were not read",
+            BorrowRefused::CallUnrelated { .. } => "the call could not be related through the callee's signature",
         }
     }
 
     /// The item-relative range the refusal is about: the refused form's, else none.
     pub fn range(&self) -> Option<(u32, u32)> {
         match self {
-            BorrowRefused::Lower(r) => Some((r.range.start, r.range.end)),
-            BorrowRefused::NestedOutlives { start, end } => Some((*start, *end)),
+            BorrowRefused::Lower(r) | BorrowRefused::Stricter(r) => Some((r.range.start, r.range.end)),
+            BorrowRefused::NestedOutlives { start, end, .. } => Some((*start, *end)),
             BorrowRefused::AdtNotMade { start, end, .. } => Some((*start, *end)),
-            BorrowRefused::CallSigUnread { start, end, .. } => Some((*start, *end)),
+            BorrowRefused::RegionsUnread { start, end, .. } => Some((*start, *end)),
             BorrowRefused::CallUnrelated { start, end, .. } => Some((*start, *end)),
             _ => None,
         }
     }
+}
+
+impl core::fmt::Display for BorrowRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RegionsUnread { why, unlaid, gap, .. } => {
+                use tc::region_facts::UnreadWhy;
+                match (why, unlaid) {
+                    (UnreadWhy::NoHead, _) => f.write_str("[NoHead] ")?,
+                    (UnreadWhy::HeadRefused, _) => f.write_str("[HeadRefused] ")?,
+                    (UnreadWhy::RecordForm { found }, _) => write!(f, "[RecordForm/{found}] ")?,
+                    // The typed class first and short (blaze-cli `first_refusal_class` keeps
+                    // up to the first `] `), then the cause in Rust's words and its part.
+                    (UnreadWhy::Refused { what }, Some(u)) => {
+                        f.write_str("[")?;
+                        u.class(&mut *f)?;
+                        match u {
+                            super::head_record::Unlaid::NotLaid { part, .. } => write!(f, "] {what}, in {part}. ")?,
+                            _ => write!(f, "] {what}. ")?,
+                        }
+                    }
+                    (UnreadWhy::Refused { what }, None) => write!(f, "[Refused: {what}] ")?,
+                }
+                // The making store's detail, when this store made the head (rule 19).
+                if !gap.as_str().is_empty() {
+                    write!(f, "[{}] ", gap.as_str())?;
+                }
+            }
+            Self::CallUnrelated { lacks, shape_why, .. } => write!(f, "[{}] ", call_relation_reason(*lacks, *shape_why))?,
+            // The stricter step by form and reason, first: the class the refusals are counted by.
+            Self::Stricter(r) => {
+                if let Some((form, why)) = stricter_reason(r.form) {
+                    write!(f, "[{form}/{why}] ")?;
+                }
+            }
+            Self::NestedOutlives { from, into, .. } => {
+                use blaze_flow_lower::External;
+                let endpoint = |end| match end {
+                    Some(External::Sig) => "External::Sig",
+                    Some(External::SigOwner(_)) => "External::SigOwner",
+                    Some(External::Late) => "External::Late",
+                    Some(External::Env) => "External::Env",
+                    Some(External::Capture(_)) => "capture",
+                    Some(External::Static) => "'static",
+                    None => "hidden",
+                };
+                write!(f, "[{} -> {}] ", endpoint(*from), endpoint(*into))?;
+            }
+            _ => {}
+        }
+        write!(f, "{}: {self:?}", self.text())
+    }
+}
+
+fn call_relation_reason(lacks: CallLacks, shape: Option<ShapeRefusal>) -> &'static str {
+    use blaze_flow_lower::Misfit;
+    match lacks {
+        CallLacks::Bounds => "Bounds",
+        CallLacks::JoinedSuperset => "JoinedSuperset",
+        CallLacks::Shape => match shape {
+            None => "Shape",
+            Some(ShapeRefusal::Unknown { .. }) => "Shape/Unknown",
+            Some(ShapeRefusal::Bound { .. }) => "Shape/Bound",
+            Some(ShapeRefusal::AdtUnknown { .. }) => "Shape/AdtUnknown",
+            Some(ShapeRefusal::CountUnknown { .. }) => "Shape/CountUnknown",
+            Some(ShapeRefusal::Unnameable { .. }) => "Shape/Unnameable",
+            Some(ShapeRefusal::NoHead) => "Shape/NoHead",
+        },
+        CallLacks::Unaligned(why) => match why {
+            Misfit::NotTried => "Unaligned/NotTried",
+            Misfit::Inputs { .. } => "Unaligned/Inputs",
+            Misfit::Malformed { .. } => "Unaligned/Malformed",
+            Misfit::RegionCount { .. } => "Unaligned/RegionCount",
+            Misfit::InputProjection { .. } => "Unaligned/InputProjection",
+            Misfit::Skeleton { .. } => "Unaligned/Skeleton",
+            Misfit::ProjectionLoose { .. } => "Unaligned/ProjectionLoose",
+            Misfit::Positions { .. } => "Unaligned/Positions",
+        },
+    }
+}
+
+/// The stricter step's class for a [`BorrowRefused::Stricter`] note, its form and the reason
+/// it carries (`lacks`, `why`) by variant name: what the "refused by cause" line counts by
+/// (blaze-cli engine_bodies.rs `first_refusal_class` keeps the bracket). The callee, trait and
+/// range are in the rest of the note, not the class.
+fn stricter_reason(form: blaze_flow_lower::Form) -> Option<(&'static str, &'static str)> {
+    use blaze_flow_lower::{AwaitUnrelated as A, Form, ProjectionUnbound as P};
+    Some(match form {
+        Form::CallGenericUnaligned { lacks, .. } => ("CallGenericUnaligned", call_relation_reason(lacks, None)),
+        Form::AwaitValueUnrelated { why, .. } => (
+            "AwaitValueUnrelated",
+            match why {
+                A::NotACall => "NotACall",
+                A::NoHead => "NoHead",
+                A::NotIdentity => "NotIdentity",
+                A::HeadUnread => "HeadUnread",
+                A::NoWrittenReturn => "NoWrittenReturn",
+                A::OpaqueOutputUnread { .. } => "OpaqueOutputUnread",
+                A::OpaqueOutputUnaligned { .. } => "OpaqueOutputUnaligned",
+                A::NoBounds => "NoBounds",
+                A::BoundUnread { .. } => "BoundUnread",
+                A::ShapeUnread => "ShapeUnread",
+                A::SignatureUnaligned => "SignatureUnaligned",
+                A::GenericUnaligned(m) => call_relation_reason(CallLacks::Unaligned(m), None),
+            },
+        ),
+        Form::ProjectionUnbound { why, .. } => (
+            "ProjectionUnbound",
+            match why {
+                P::NoRow => "NoRow",
+                P::RowNotImpl => "RowNotImpl",
+                P::RowUnanswered => "RowUnanswered",
+                P::RowsDisagree => "RowsDisagree",
+                P::SlotsUncounted { .. } => "SlotsUncounted",
+                P::InsideImplValue => "InsideImplValue",
+                P::ImplHeaderUnread => "ImplHeaderUnread",
+                P::ImplAssocUnread => "ImplAssocUnread",
+                P::ImplParamsUnread => "ImplParamsUnread",
+                P::GatLifetimes => "GatLifetimes",
+                P::SelfTypeUnread => "SelfTypeUnread",
+                P::SelfSlotsDiffer { .. } => "SelfSlotsDiffer",
+                P::SelfRegionUnnumbered => "SelfRegionUnnumbered",
+                P::BoundTwice => "BoundTwice",
+                P::ValueUnaligned => "ValueUnaligned",
+            },
+        ),
+        // A statement-level stricter relation (blaze-flow-lower `Unified`): each by its own
+        // name, so the refusals split by it.
+        Form::Unified { why } => (
+            "Unified",
+            match why {
+                blaze_flow_lower::Unified::ValueInexact => "ValueInexact",
+                blaze_flow_lower::Unified::BorrowInexact => "BorrowInexact",
+                blaze_flow_lower::Unified::SlotInexact => "SlotInexact",
+                blaze_flow_lower::Unified::BinaryOperator => "BinaryOperator",
+                blaze_flow_lower::Unified::DerefTarget => "DerefTarget",
+                blaze_flow_lower::Unified::AsyncBlockOutput => "AsyncBlockOutput",
+                blaze_flow_lower::Unified::ClosureValueCall => "ClosureValueCall",
+                blaze_flow_lower::Unified::ClosureCallSig => "ClosureCallSig",
+                blaze_flow_lower::Unified::ClosureSigTies => "ClosureSigTies",
+                blaze_flow_lower::Unified::VarianceUnknown { .. } => "VarianceUnknown",
+                blaze_flow_lower::Unified::VarianceInexact => "VarianceInexact",
+                blaze_flow_lower::Unified::AggregateHub => "AggregateHub",
+            },
+        ),
+        // blaze-flow-lower records no other form as `coarse` (lib.rs `Lowered::coarse`): no
+        // bracket, the note's rest names the form by its `Debug`.
+        _ => return None,
+    })
 }
 
 /// What one body's move and borrow check gave.
@@ -171,14 +415,11 @@ pub struct BorrowVerdict<'a> {
     /// The item-relative range of the closure or async block whose own flow gave `refused`;
     /// `None` for the owner's flow (the flow census names the closure a refusal is in).
     pub within: Option<(u32, u32)>,
-    /// How many impls' texts the facts' gathering read (sig_impl.rs `ImplTextsMemo`: each once
-    /// a body, its floor; a test reads it, nothing prints it).
-    pub impl_text_reads: u32,
 }
 
 impl<'a> BorrowVerdict<'a> {
     fn new_in(alloc: Alloc<'a>) -> BorrowVerdict<'a> {
-        BorrowVerdict { findings: AVec::new_in(alloc), refused: None, within: None, impl_text_reads: 0 }
+        BorrowVerdict { findings: AVec::new_in(alloc), refused: None, within: None }
     }
 
     /// Checked to its end with no finding.
@@ -196,12 +437,25 @@ pub struct BorrowLangs {
     /// `Clone`: a `Copy` impl's `T: Clone` bound beside `T: Copy` asks nothing more of `T`
     /// (`Copy: Clone`), read by [`Facts::copy_args`]'s provider (borrow_fields.rs).
     pub clone: Option<tc::ItemKey>,
+    /// The traits whose every proof relates no region ([`Facts::trait_relates_nothing`]):
+    /// `Sized`, `MetaSized`, `PointeeSized` and `Destruct`. Each is `#[rustc_deny_explicit_impl]`
+    /// in core (library/core/src/marker.rs: no impl can be written), and its builtin rule reads
+    /// no region: sizedness ignores lifetimes, and `Destruct` "non-const bounds will always
+    /// hold for every type" (its doc there). A `[const] Destruct` in a const context asks a
+    /// const `Drop`, whose impl must be as generic as its type (E0366): no region either.
+    pub relates_nothing: [Option<tc::ItemKey>; 4],
 }
 
 impl BorrowLangs {
     pub fn of(index: &Index<'_>) -> BorrowLangs {
         let lang = |n: &str| index.lang(n).map(checker_of);
-        BorrowLangs { copy: lang("copy"), drop: lang("drop"), owned_box: lang("owned_box"), clone: lang("clone") }
+        BorrowLangs {
+            copy: lang("copy"),
+            drop: lang("drop"),
+            owned_box: lang("owned_box"),
+            clone: lang("clone"),
+            relates_nothing: [lang("sized"), lang("meta_sized"), lang("pointee_sized"), lang("destruct")],
+        }
     }
 }
 
@@ -218,20 +472,18 @@ pub struct BorrowFacts<'a> {
     /// Beside `fields`: how each field's declared type begins ([`field_lead`]), what a pattern
     /// that peels references under the field peels (blaze-flow-lower `Facts::field_lead`).
     field_leads: AVec<'a, FieldLead>,
-    /// Beside `fields`: where each field's regions are in `field_region_list` (borrow_fields.rs
-    /// `field_regions_of`), or `fields::NO_ROW` (blaze-flow-lower `Facts::field_regions`).
-    field_region_at: AVec<'a, (u32, u32)>,
-    field_region_list: AVec<'a, FieldRegion>,
+    /// Frozen field region columns by ADT, addressed by variant and field in constant time.
+    field_regions: blaze_hash::HashMap<tc::ItemKey, RegionFields, Alloc<'a>>,
     /// Per ADT whose one `Copy` impl was read, sorted by checker key: where its arguments'
     /// needs are in `copy_need` (borrow_fields.rs `copy_args_of`; `Facts::copy_args`).
     copy_args: AVec<'a, (u128, u32, u32)>,
     copy_need: AVec<'a, bool>,
+    /// The body owner's type parameters bounded by `Copy` in its clauses (own and inherited:
+    /// `Preds::clauses`), sorted, each once (`Facts::param_copy`).
+    param_copy: AVec<'a, u32>,
+    /// Per callee with a made head, sorted. Its signature regions are NOT here: the lowering
+    /// reads them from the head records ([`BorrowFacts::read_by`], D148), each in place.
     callees: AVec<'a, (u128, CalleeFacts)>,
-    /// The lifetime part of each fn whose text `read_signature` could line up with its head
-    /// (the stand-in for question H1: read from the fn's own text, never guessed).
-    sigs: AVec<'a, (u128, SigBuf<Alloc<'a>>)>,
-    /// Each fn whose signature text was not read, and why.
-    sig_refused: AVec<'a, (u128, SigRefusal)>,
     /// Each head's declared type-outlives bounds and their read rows (front2 call_generics.rs):
     /// a call of a head that writes lifetimes, with lifetime-carrying generic arguments, is
     /// related through them (blaze-flow-lower generic_call.rs, pieces BR3 and BR4).
@@ -246,25 +498,27 @@ pub struct BorrowFacts<'a> {
     /// by checker key: what a `CallWritesLifetimes { lacks: Shape }` refusal is worded with.
     shape_refused: AVec<'a, (u128, ShapeRefusal)>,
     /// Each trait that is the principal of a trait object of the body's types, sorted, and
-    /// whether its header declares a lifetime (`None`: its text not read; sig_impl.rs
-    /// `trait_lifetimes`, its row `trait_read`).
+    /// whether it declares a lifetime: its head record's lifetime count (`None`: unread), its
+    /// row filed once with the ties' (borrows_ties.rs `trait_count`).
     object_traits: AVec<'a, (u128, Option<bool>)>,
-    /// Each impl the type check selected at one of the body's calls (`Checked::selected`),
-    /// sorted, with its item text and its `(name, text)` associated type members, copied into
-    /// the body's allocator (blaze-flow-lower `Facts::impl_source`; sig_impl.rs `impl_texts`,
-    /// its row `impl_source_read`). An impl whose text the source does not give has no row,
-    /// and a call that needs it is refused by name (`ImplUnread`).
-    impl_sources: AVec<'a, (u128, &'a str, &'a [(&'a str, &'a str)])>,
-    /// How many impls' texts the gathering read from the source (sig_impl.rs `ImplTextsMemo`:
-    /// one an impl a body).
-    impl_text_reads: u32,
+    /// Each trait an `ExTrait` node of the body's types or of the heads' columns names, sorted,
+    /// and how many lifetime parameters it declares, from the one region counter (types.rs
+    /// `HeadsArity`, `Arity::trait_lifetimes`; `None`: not known), for blaze-flow-lower
+    /// `Facts::trait_lifetimes` (the one call rule). The read: the names source files the
+    /// trait's `Item` cell as it answers (tables/view.rs `declared_lifetimes`, D155).
+    trait_counts: AVec<'a, (u128, Option<u32>)>,
+    /// Each `<_ as trait_>::name` of those types, sorted, and its lifetime count (the trait's
+    /// plus the associated type's own, `Arity::alias_lifetimes`), for `Facts::alias_lifetimes`;
+    /// its reads the trait's `Item` and `Members` cells, filed by the names source likewise.
+    alias_counts: AVec<'a, (u128, tc::Name, Option<u32>)>,
     /// Whether a fn-pointer type's bound lifetimes are read as bound (`Facts::fn_binders`);
     /// `false` only under the control `FactsPlant::FnBindersFree`.
     fn_binders: bool,
-    /// The variance of each ADT's lifetime and type parameters, in head order, from its head
-    /// record (lifetimes.rs `AdtLife.variances`), for blaze-flow-lower `Facts::adt_variances`:
-    /// per ADT where its run is in `variance_list`. An ADT with no row is taken invariant in
-    /// every parameter by the lowering (sound).
+    /// The variance of each ADT's lifetime, type and const parameters, lifetimes first, from
+    /// the ADT facts (adt_facts.rs, [`adt_variances_in`]), for blaze-flow-lower
+    /// `Facts::adt_variances`: per ADT where its run is in `variance_list`. An ADT with no row
+    /// (its facts refused) is taken invariant by the lowering, which records that stricter
+    /// step (`Unified::VarianceUnknown`).
     variance_at: AVec<'a, (u128, u32, u32)>,
     variance_list: AVec<'a, blaze_flow_lower::Variance>,
     /// The body's owner and its callees, sorted: the fns whose heads were asked.
@@ -280,35 +534,73 @@ pub struct BorrowFacts<'a> {
     /// One read row per ADT and per head the facts were taken of (front2 borrow_reads.rs),
     /// for the body's read list (rule 21).
     reads: AVec<'a, Read>,
-    /// The text of the body's own fn (blaze-flow-lower `Facts::own_text`): a call through one
-    /// of the body's parameters reads that parameter's written type from it. Empty: not known.
-    /// No read row of its own: the owner's text is the body's own input (its key covers it).
-    own_text: AVec<'a, u8>,
+    /// The bounds the owner's signature types and its impl's header types imply (RFC 1214;
+    /// [`owner_implied`]), in the owner's numbering: `T: 'r` and `'long: 'short`.
+    implied: super::adt_outlives::OutlivesBuf<'a>,
+    /// Whether `implied` was computed: `None` under `FactsPlant::NoVariances` (no ADT facts),
+    /// `Some(Err(why))` where it was refused (then nothing is implied beyond what is declared).
+    implied_state: Option<Result<(), super::adt_facts::ImpliedRefusal>>,
+    /// Whether the owner is a `const` or `static` item (an associated const too): its body is
+    /// a constant initializer (blaze-flow-lower `Facts::constant_initializer`). The owner's
+    /// kind is its own text's, so the body's key covers it.
+    constant_initializer: bool,
+    /// [`BorrowLangs::relates_nothing`], copied by the gather: the core lang items, read from
+    /// the toolchain's library (its key covers them).
+    relates_nothing: [Option<tc::ItemKey>; 4],
+}
+
+/// The facts the lowering asks: a body's gathered [`BorrowFacts`] with the head records' region
+/// facts (head_record.rs `RegionReader` over `Store::regions`, D148), the one home of every
+/// fn's signature regions, read in place. Made by [`BorrowFacts::read_by`] once the gathering
+/// has let go of the records.
+#[derive(Clone, Copy)]
+pub struct ReadBy<'f, 'a> {
+    pub facts: &'f BorrowFacts<'a>,
+    regions: &'f dyn RegionFacts,
+    /// The table `regions`' columns are laid over: the head store's (`Store::tys`, heads.rs
+    /// lays each signature there), never the checked record's, whose `PTy`s are a fresh
+    /// numbering (blaze-typeck writeback.rs, `PortableTys::new_in`).
+    tys: tc::PTys<'f>,
 }
 
 impl<'a> BorrowFacts<'a> {
+    /// These facts with `regions`, the head records' region facts, and `tys`, the table their
+    /// columns are laid over (`r.store.tys.view()`), as the lowering's [`Facts`].
+    pub fn read_by<'f>(&'f self, regions: &'f dyn RegionFacts, tys: tc::PTys<'f>) -> ReadBy<'f, 'a> {
+        ReadBy { facts: self, regions, tys }
+    }
+
+    /// The bounds the owner's signature and impl header imply (RFC 1214: a fn assumes its
+    /// inputs and output well-formed, an impl its header types), in the owner's numbering:
+    /// `(type parameter, region)` and `(long, short)`, each sorted. `Ok(None)`: not computed
+    /// (the control `FactsPlant::NoVariances`); `Err(why)`: refused, nothing implied.
+    pub fn implied(&self) -> Result<Option<(&[(u32, tc::regions::Region)], &[(tc::regions::Region, tc::regions::Region)])>, super::adt_facts::ImpliedRefusal> {
+        match self.implied_state {
+            None => Ok(None),
+            Some(Err(why)) => Err(why),
+            Some(Ok(())) => Ok(Some((self.implied.params.as_slice(), self.implied.regions.as_slice()))),
+        }
+    }
+
     fn new_in(alloc: Alloc<'a>) -> BorrowFacts<'a> {
         BorrowFacts {
-            own_text: AVec::new_in(alloc),
             adts: AVec::new_in(alloc),
             variants: AVec::new_in(alloc),
             fields: AVec::new_in(alloc),
             field_params: AVec::new_in(alloc),
             field_leads: AVec::new_in(alloc),
-            field_region_at: AVec::new_in(alloc),
-            field_region_list: AVec::new_in(alloc),
+            field_regions: blaze_hash::HashMap::new_in(alloc),
             copy_args: AVec::new_in(alloc),
             copy_need: AVec::new_in(alloc),
+            param_copy: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
-            sigs: AVec::new_in(alloc),
-            sig_refused: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             ties: ties::TiesTable::new_in(alloc),
             shapes: AVec::new_in(alloc),
             shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
-            impl_sources: AVec::new_in(alloc),
-            impl_text_reads: 0,
+            trait_counts: AVec::new_in(alloc),
+            alias_counts: AVec::new_in(alloc),
             fn_binders: true,
             variance_at: AVec::new_in(alloc),
             variance_list: AVec::new_in(alloc),
@@ -317,6 +609,10 @@ impl<'a> BorrowFacts<'a> {
             unknown_why: AVec::new_in(alloc),
             unmade: AVec::new_in(alloc),
             reads: AVec::new_in(alloc),
+            implied: super::adt_outlives::OutlivesBuf::new_in(alloc),
+            implied_state: None,
+            constant_initializer: false,
+            relates_nothing: [None; 4],
         }
     }
 
@@ -329,11 +625,6 @@ impl<'a> BorrowFacts<'a> {
     /// The fns whose heads were asked: the body's owner and its callees, by checker key.
     pub fn items(&self) -> &[u128] {
         &self.items
-    }
-
-    /// Each fn whose signature text was not read, and why.
-    pub fn sig_refused(&self) -> &[(u128, SigRefusal)] {
-        &self.sig_refused
     }
 
     /// Each ADT whose `Copy` or `Drop` answer was not known, and which.
@@ -351,110 +642,130 @@ impl<'a> BorrowFacts<'a> {
         &self.unmade
     }
 
-    /// How many impls' texts were read from the source while gathering (each once a body:
-    /// sig_impl.rs `ImplTextsMemo`), for a test of that floor.
-    pub fn impl_text_reads(&self) -> u32 {
-        self.impl_text_reads
-    }
-
     fn variant(&self, adt: tc::ItemKey, variant: u32) -> Option<(u32, u32)> {
         let at = self.variants.binary_search_by_key(&(adt.0, variant), |&(a, v, _, _)| (a, v)).ok()?;
         self.variants.get(at).map(|&(_, _, first, count)| (first, count))
     }
 }
 
-impl Facts for BorrowFacts<'_> {
-    fn own_text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.own_text).ok().filter(|t| !t.is_empty())
+impl Facts for ReadBy<'_, '_> {
+    /// A fn's signature regions (`Facts::sig`, provided over this) and every other head region
+    /// fact: the head records', never a text read here (D148).
+    fn regions(&self) -> &dyn RegionFacts {
+        self.regions
+    }
+    fn region_tys(&self) -> Option<tc::PTys<'_>> {
+        Some(self.tys)
     }
     fn fn_binders(&self) -> bool {
-        self.fn_binders
+        self.facts.fn_binders
     }
     fn call_bounds(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
-        self.calls.get(item)
+        self.facts.calls.get(item)
     }
     fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
-        self.ties.get(item)
-    }
-    fn sig(&self, item: tc::ItemKey) -> Option<SigLife<'_>> {
-        let at = self.sigs.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
-        self.sigs.get(at).map(|(_, s)| s.life())
+        self.facts.ties.get(item)
     }
     fn adt(&self, adt: tc::ItemKey) -> Option<AdtFacts> {
-        let at = self.adts.binary_search_by_key(&adt.0, |&(k, _)| k).ok()?;
-        self.adts.get(at).map(|&(_, f)| f)
+        let at = self.facts.adts.binary_search_by_key(&adt.0, |&(k, _)| k).ok()?;
+        self.facts.adts.get(at).map(|&(_, f)| f)
     }
     fn callee(&self, item: tc::ItemKey) -> Option<CalleeFacts> {
-        let at = self.callees.binary_search_by_key(&item.0, |&(k, _)| k).ok()?;
-        self.callees.get(at).map(|&(_, f)| f)
+        let at = self.facts.callees.binary_search_by_key(&item.0, |&(k, _)| k).ok()?;
+        self.facts.callees.get(at).map(|&(_, f)| f)
     }
     fn field(&self, adt: tc::ItemKey, variant: u32, name: tc::Name) -> Option<u32> {
-        let (first, count) = self.variant(adt, variant)?;
-        let names = self.fields.get(first as usize..(first + count) as usize)?;
+        let (first, count) = self.facts.variant(adt, variant)?;
+        let names = self.facts.fields.get(first as usize..(first + count) as usize)?;
         names.iter().position(|n| *n == name).map(|i| i as u32)
     }
     fn field_count(&self, adt: tc::ItemKey, variant: u32) -> Option<u32> {
-        self.variant(adt, variant).map(|(_, count)| count)
+        self.facts.variant(adt, variant).map(|(_, count)| count)
     }
     fn field_param(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<u32> {
-        let (first, count) = self.variant(adt, variant)?;
+        let (first, count) = self.facts.variant(adt, variant)?;
         if field >= count {
             return None;
         }
-        self.field_params.get((first + field) as usize).copied().flatten()
+        self.facts.field_params.get((first + field) as usize).copied().flatten()
     }
     fn field_lead(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<FieldLead> {
-        let (first, count) = self.variant(adt, variant)?;
+        let (first, count) = self.facts.variant(adt, variant)?;
         if field >= count {
             return None;
         }
-        self.field_leads.get((first + field) as usize).copied()
+        self.facts.field_leads.get((first + field) as usize).copied()
     }
     fn field_regions(&self, adt: tc::ItemKey, variant: u32, field: u32) -> Option<&[FieldRegion]> {
-        let (first, count) = self.variant(adt, variant)?;
+        let row = self.facts.field_regions.get(&adt)?;
+        if variant as usize >= row.variant_count {
+            return None;
+        }
+        let &(_, _, first, count) = self.facts.variants.get(row.first_variant + variant as usize)?;
         if field >= count {
             return None;
         }
-        let &(start, len) = self.field_region_at.get((first + field) as usize)?;
-        if (start, len) == fields::NO_ROW {
-            return None;
-        }
-        self.field_region_list.get(start as usize..(start + len) as usize)
+        row.regions.field(first as usize - row.first_field + field as usize)
     }
     fn copy_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
-        let at = self.copy_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
-        let &(_, start, len) = self.copy_args.get(at)?;
-        self.copy_need.get(start as usize..(start + len) as usize)
+        let at = self.facts.copy_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.copy_args.get(at)?;
+        self.facts.copy_need.get(start as usize..(start + len) as usize)
     }
-    fn param_copy(&self, _: u32) -> bool {
-        false
+    fn param_copy(&self, index: u32) -> bool {
+        self.facts.param_copy.binary_search(&index).is_ok()
     }
     fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
-        let at = self.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
-        self.shapes.get(at).map(|(_, s)| s.shape())
+        let at = self.facts.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
+        self.facts.shapes.get(at).map(|(_, s)| s.shape())
     }
     fn object_trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<bool> {
-        let at = self.object_traits.binary_search_by_key(&trait_.0, |&(k, _)| k).ok()?;
-        self.object_traits.get(at).and_then(|&(_, l)| l)
+        let at = self.facts.object_traits.binary_search_by_key(&trait_.0, |&(k, _)| k).ok()?;
+        self.facts.object_traits.get(at).and_then(|&(_, l)| l)
     }
-    fn impl_source(&self, imp: tc::ItemKey) -> Option<blaze_flow_lower::ImplSource<'_>> {
-        let at = self.impl_sources.binary_search_by_key(&imp.0, |&(k, _, _)| k).ok()?;
-        self.impl_sources.get(at).map(|&(_, text, assoc)| blaze_flow_lower::ImplSource { text, assoc })
+    fn trait_lifetimes(&self, trait_: tc::ItemKey) -> Option<u32> {
+        let at = self.facts.trait_counts.binary_search_by_key(&trait_.0, |&(k, _)| k).ok()?;
+        self.facts.trait_counts.get(at).and_then(|&(_, n)| n)
+    }
+    fn alias_lifetimes(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<u32> {
+        let at = self.facts.alias_counts.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
+        self.facts.alias_counts.get(at).and_then(|&(_, _, n)| n)
+    }
+    fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.relates_nothing.contains(&Some(trait_))
     }
     fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
-        let at = self.variance_at.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
-        let &(_, lo, hi) = self.variance_at.get(at)?;
-        self.variance_list.get(lo as usize..hi as usize)
+        let at = self.facts.variance_at.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, lo, hi) = self.facts.variance_at.get(at)?;
+        self.facts.variance_list.get(lo as usize..hi as usize)
+    }
+    // A refused answer is no answer: nothing implied beyond what `signature` reads itself, so
+    // the lowering's own unsure marks stand (stricter, never a guess).
+    fn implied_bounds(&self) -> Option<(&[(u32, tc::regions::Region)], &[(tc::regions::Region, tc::regions::Region)])> {
+        self.facts.implied().ok().flatten()
+    }
+    fn constant_initializer(&self) -> bool {
+        self.facts.constant_initializer
+    }
+    // The nested bodies are the caller's to say (borrows_nested.rs `NestedFacts` answers them
+    // for `borrows_of`, which checks each closure and async block first): these facts alone
+    // say no closure or async block body is checked, and nothing is required of one.
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: tc::ExprId) -> &[blaze_flow_lower::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    // Not gathered: whether a type implements `Future` is not answered, so an `.await` whose
+    // operand is not this body's own future is refused `Form::AwaitOperand` by name.
+    fn is_future(&self, _: tc::PTy) -> Option<bool> {
+        None
     }
 }
 
-/// Whether a head's text writes a lifetime before its body: a `'` followed by a letter or `_`
-/// before the first `{` (a stand-in for the heads' lifetime part; `'_` counts: it is written).
-fn writes_lifetime(text: &str) -> bool {
-    let head = text.split('{').next().unwrap_or(text);
-    let b = head.as_bytes();
-    (0..b.len()).any(|i| b[i] == b'\'' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') && b.get(i + 2) != Some(&b'\''))
-}
 
 /// How a field's declared type `t` (a type of the store's table) begins, for a pattern that peels
 /// references under the field (blaze-flow-lower `FieldLead`): a bare type parameter, one
@@ -490,89 +801,6 @@ fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
         },
         Ok(n) if plain(n) => FieldLead::Plain,
         _ => FieldLead::Unread,
-    }
-}
-
-/// How many lifetime parameters an ADT's head declares ([`declared_lifetimes`] of its text):
-/// one origin position each (blaze-flow-lower `AdtFacts::lifetimes`).
-fn adt_head_lifetimes<'n, S: NamesSource<'n>>(keys: &Keys, names: S, adt: tc::ItemKey) -> u32 {
-    // The head after its docs and attributes (head_text.rs): `Rc`'s docs say "'Rc' stands for ..".
-    keys.library_in(names, adt)
-        .and_then(|lib| names.text_of(lib))
-        .map_or(0, |t| declared_lifetimes(super::head_text::after_outer_trivia(t.text)))
-}
-
-/// The lifetime parameters of a `struct`, `enum` or `union` head's generics list: the entries
-/// of `<..>` right after the name that begin with a lifetime (`struct Checking<'c, 'g, M>`: 2).
-/// No generics list: 0. A `>` of a `->` (a fn pointer in a default) closes nothing.
-fn declared_lifetimes(head: &str) -> u32 {
-    let mut n = 0u32;
-    generic_entries(head, &mut |word| n += u32::from(word.starts_with('\'')));
-    n
-}
-
-/// Each entry of a `struct`, `enum` or `union` head's generics list, in order, as its first
-/// word: `'a` for a lifetime, `T` for a type parameter, `const` for a const parameter, `#` for
-/// one with an attribute (`#[may_dangle] T`), `` (empty) for anything else. The one scanner
-/// [`declared_lifetimes`] counts and borrow_fields.rs names the parameters by.
-fn generic_entries<'h>(head: &'h str, each: &mut dyn FnMut(&'h str)) {
-    let b = head.as_bytes();
-    let word_at = |i: usize, w: &str| {
-        head.get(i..).is_some_and(|s| s.starts_with(w))
-            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-            && b.get(i + w.len()).is_some_and(|c| c.is_ascii_whitespace())
-    };
-    let Some(kw) = (0..b.len()).find(|&i| ["struct", "enum", "union"].iter().any(|w| word_at(i, w))) else { return };
-    let mut i = kw;
-    while i < b.len() && !b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if b.get(i) != Some(&b'<') {
-        return;
-    }
-    let word_byte = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'\'' || c >= 0x80;
-    let (mut depth, mut entry) = (0u32, true);
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b'<' => depth += 1,
-            b'>' if i > 0 && b[i - 1] == b'-' => {}
-            b'>' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            b',' if depth == 1 => entry = true,
-            _ if c.is_ascii_whitespace() => {}
-            _ => {
-                if depth == 1 && entry {
-                    // The entry's first word, read in place (the scan itself goes on byte by
-                    // byte: a word holds no `<`, `>` or `,`).
-                    let mut end = i;
-                    while end < b.len() && word_byte(b[end]) {
-                        end += 1;
-                    }
-                    each(match c {
-                        b'#' => "#",
-                        _ => head.get(i..end).unwrap_or(""),
-                    });
-                }
-                if depth == 1 {
-                    entry = false;
-                }
-            }
-        }
-        i += 1;
     }
 }
 
@@ -635,7 +863,7 @@ fn has_impl<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: Option<t
             use core::fmt::Write;
             let mut said = Words::EMPTY;
             let _ = write!(said, "candidate {candidate:x}, header `");
-            match r.names.text_of(candidate) {
+            match r.names.signature_text_of(candidate) {
                 Some(t) => {
                     for (i, word) in t.impl_header.unwrap_or(t.text).split_whitespace().take(24).enumerate() {
                         let _ = write!(said, "{}{word}", if i == 0 { "" } else { " " });
@@ -720,8 +948,10 @@ pub enum ImplsUnknown {
 /// The facts of the body of `owner` checked as `c`, gathered before it is lowered: per ADT its
 /// record type names (asked of the store when not made yet), its fields, whether it is `Copy`
 /// and implements `Drop` (asked of the selection), whether it declares lifetimes; per callee
-/// (and the owner) its head made, whether it writes lifetimes and takes `&self`, and its
-/// signature's lifetime part read from its text. THE ONE HOME of this gathering: the command
+/// (and the owner) its head made, whether it writes lifetimes and takes `&self`, its generic
+/// shape and its clauses' outlives and ties, each over its head record's regions (D148; no
+/// fn's text is read: the lowering reads the signature column itself, [`BorrowFacts::read_by`]).
+/// THE ONE HOME of this gathering: the command
 /// ([`ProjectWorld::check_borrows`]) and the census (tests/flow_census.rs) both call it.
 pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owner: tc::ItemKey, c: &tc::Checked<'_>, langs: BorrowLangs, alloc: Alloc<'a>) -> BorrowFacts<'a> {
     gather_facts_planted(r, owner, c, langs, FactsPlant::None, alloc)
@@ -738,8 +968,10 @@ pub enum FactsPlant {
     NoFieldRegions,
     /// No `Copy` impl read (`Facts::copy_args` answers nothing).
     NoCopyArgs,
-    /// Heads read with no world (blaze-flow-lower `NoAliases`: every path the erased type's
-    /// own, no alias expanded).
+    /// The lowering given no head records' regions (blaze-flow-lower `NoRegions`): every call
+    /// and body that carries a lifetime refused `RegionsUnread`. Its name is the old control's
+    /// (heads read with no alias world): the producer now expands an alias where it lays a
+    /// head's column (D148, piece L1a), so removing the column is what removes that cause.
     NoAliases,
     /// No closure requirement filed (borrows_nested.rs `Requirements` left empty): each
     /// closure's and nested async block's outlives result is then the `NestedOutlives`
@@ -748,14 +980,23 @@ pub enum FactsPlant {
     /// No ADT's variances filed (`Facts::adt_variances` answers nothing): every parameter of
     /// every ADT is related both ways (invariant), as before piece B13.
     NoVariances,
-    /// No impl's texts given at a selected call (`Facts::impl_source` answers nothing): a
-    /// bound over a concrete type is refused `ImplUnread`, as before piece B13.
-    NoImplSources,
     /// Every lifetime a fn-pointer type's binder binds read as FREE (`Facts::fn_binders`
     /// false): the body's own a placeholder like a named lifetime, a call through a fn-pointer
     /// parameter relating it to the parameter's own position, as before lane B15 a reading that
     /// knew no binder would.
     FnBindersFree,
+    /// No trait's and no alias's lifetime count filed (`Facts::trait_lifetimes` and
+    /// `Facts::alias_lifetimes` answer nothing): the one call rule refuses each call whose
+    /// contract holds an alias or a trait reference by `Count`, and each selected impl read
+    /// for an associated value by `HeadUnread`, as before the counts reached the flows
+    /// (borrows_nested.rs `NestedFacts`). Only the census asks with it (the old paths read
+    /// neither count).
+    NoTraitCounts,
+    /// NOT a fact: every fact gathered as `None` does, and the census runs its one-rule side
+    /// without the closure-argument tie (blaze-flow-lower `CensusRule::OneUntied`, one_call.rs
+    /// `tie_closure_args`), so `x.map(|s| s.as_str())` is (b) again and its twin returned as
+    /// `'static` is accepted. Only the census asks with it (front2 call_census.rs `census_of`).
+    ClosureArgsUntied,
 }
 
 /// [`gather_facts`] with one provider turned off ([`FactsPlant`]).
@@ -770,8 +1011,32 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
 ) -> BorrowFacts<'a> {
     let mut g = BorrowFacts::new_in(alloc);
     g.fn_binders = plant != FactsPlant::FnBindersFree;
-    if let Some(f) = r.store.fns.get(&owner) {
-        g.own_text.extend_from_slice(f.text.as_bytes());
+    g.relates_nothing = langs.relates_nothing;
+    // A `const` or `static` item's body is a constant initializer: its extending borrows'
+    // temporaries live for `'static` (the Reference, "Temporary lifetime extension").
+    g.constant_initializer = r.keys.library_in(r.names, owner).is_some_and(|lib| {
+        matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Const { .. } | blaze_surface::ItemDetail::Static { .. }))
+    });
+    // The owner's `T: Copy` clauses (own and inherited, as the call bounds read them below):
+    // a value of such a parameter is copied, never moved (the Reference, "Copy types"). Its
+    // read is the owner's head row, filed with the heads' (rule 21). A bound only implied by
+    // a supertrait (`T: Tr` with `trait Tr: Copy`) is not read: the parameter stays moved,
+    // the stricter answer for a move (it can only add a finding).
+    if let Some(copy) = langs.copy
+        && let Some(p) = r.store.preds.get(&owner)
+    {
+        let tys = r.store.tys.view();
+        for c in p.clauses.iter() {
+            if let tc::PClause::Trait { trait_, args } = *c
+                && trait_ == copy
+                && let Ok(&[t]) = tys.list(args)
+                && let Ok(tc::PNode::Param(i)) = tys.node(t)
+            {
+                g.param_copy.push(i);
+            }
+        }
+        g.param_copy.sort_unstable();
+        g.param_copy.dedup();
     }
     let mut adts: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
@@ -781,6 +1046,39 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     }
     adts.sort_unstable();
     adts.dedup();
+    // The types the owner assumes well-formed (RFC 1214): its signature's and its impl's
+    // header's, laid now; the ADTs they name join the roots of the ADT facts.
+    let implied_in = owner_implied_input(r, owner, alloc);
+    let mut roots: AVec<'a, u128> = AVec::with_capacity_in(adts.len(), alloc);
+    roots.extend_from_slice(&adts);
+    roots.extend(implied_in.adts());
+    roots.sort_unstable();
+    roots.dedup();
+    // The variance of every parameter of every ADT of the body's types, and of the ADTs their
+    // fields name, and their outlives requirements (adt_facts.rs, D190 point 2): one fixed
+    // point per group, before the rows below take each answer. Each ADT it read is a row of
+    // the body's read list (rule 21).
+    let adt_facts = match plant {
+        FactsPlant::NoVariances => None,
+        _ => Some(adt_facts_of(r, &roots, alloc)),
+    };
+    if let Some(t) = &adt_facts {
+        for (k, input) in t.reads() {
+            g.reads.push(Read {
+                fact: super::reads::Fact { kind: super::reads::FactKind::BorrowAdt, key: k, detail: super::adt_facts::ADT_FACTS_DETAIL },
+                answer: Some(input),
+            });
+        }
+        // The owner's implied bounds, from the same table; what it read of the owner and its
+        // impl is a row each.
+        g.implied_state = Some(implied_in.solve(t, &mut g.implied));
+        for (k, digest) in implied_in.reads() {
+            g.reads.push(Read {
+                fact: super::reads::Fact { kind: super::reads::FactKind::BorrowHead, key: k, detail: super::adt_facts::IMPLIED_DETAIL },
+                answer: Some(digest),
+            });
+        }
+    }
     for &k in adts.iter() {
         let key = tc::ItemKey(k);
         // The store holds only the ADTs something asked for: ask. One that cannot be made stays
@@ -798,12 +1096,13 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 None => unmade = AdtUnmade::NoLibraryKey,
             }
         }
-        let Some(row) = r.store.adts.get(&key) else {
+        let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) else {
             g.unmade.push((k, unmade));
             g.reads.push(adt_read(k, AdtAnswer::NotMade));
             continue;
         };
         let kind = row.kind;
+        let lifetimes = row.lifetimes;
         let (variants_from, fields_from) = (g.variants.len(), g.fields.len());
         for (vi, v) in row.variants.iter().enumerate() {
             let first = g.fields.len() as u32;
@@ -817,27 +1116,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
             g.variants.push((k, vi as u32, first, g.fields.len() as u32 - first));
         }
-        // Each field's regions, read from its written type (borrow_fields.rs), beside `fields`;
-        // what the reading asked is this ADT's row too (rule 21).
-        let (asked_adts, asked_paths) = (AskedAdts::new_in(alloc), sig_world::AskedPaths::new_in(alloc));
-        let regions_from = g.field_region_at.len();
-        {
-            let mut field_tys: AVec<'a, tc::PTy> = AVec::new_in(alloc);
-            for v in row.variants.iter() {
-                for f in row.fields.get(v.fields.range()).unwrap_or(&[]) {
-                    field_tys.push(f.ty);
-                }
-            }
-            if plant == FactsPlant::NoFieldRegions {
-                for _ in field_tys.iter() {
-                    g.field_region_at.push(fields::NO_ROW);
-                }
-            } else {
-                let is_enum = kind == tc::AdtKind::Enum;
-                let (at, list) = (&mut g.field_region_at, &mut g.field_region_list);
-                fields::field_regions_of(r.names, &*r.keys, &*r.store, key, is_enum, &field_tys, at, list, &asked_adts, &asked_paths, alloc);
-            }
-        }
+        let regions = row.field_regions.clone();
+        let field_count = row.fields.len();
+        let variant_count = row.variants.len();
         let copy = has_impl(r, langs.copy, key);
         // A `Copy` type has no `Drop` impl: the Reference, "Special types and traits", `Copy`:
         // "Copy cannot be implemented for types that implement Drop" (rustc E0184), so YES to
@@ -867,9 +1148,9 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // The variance of each lifetime parameter (blaze-flow-lower `Facts::adt_variances`);
         // ADTs are taken in key order, so `variance_at` stays sorted. What was taken is this
         // ADT's row too (rule 21).
-        let variances = match plant {
-            FactsPlant::NoVariances => None,
-            _ => adt_variances_of(r, key, &mut g.variance_list),
+        let variances = match &adt_facts {
+            None => None,
+            Some(t) => adt_variances_in(t, k, &mut g.variance_list),
         };
         if let Some((lo, hi)) = variances {
             g.variance_at.push((k, lo, hi));
@@ -879,7 +1160,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             copy: copy_taken,
             drop_impl: drop_impl.unwrap_or(false),
             needs_drop: !copy_taken,
-            lifetimes: adt_head_lifetimes(&*r.keys, r.names, key),
+            lifetimes,
             union: kind == tc::AdtKind::Union,
             is_enum: kind == tc::AdtKind::Enum,
             is_box: Some(key) == langs.owned_box,
@@ -890,9 +1171,15 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         for &(_, _, _, count) in g.variants[variants_from..].iter() {
             variant_lens.push(count);
         }
-        let (asked_adts, asked_paths) = (asked_adts.take_sorted(), asked_paths.take_sorted());
         let copy_args = copy_need.and_then(|(start, len)| g.copy_need.get(start as usize..(start + len) as usize));
         let variances = variances.and_then(|(lo, hi)| g.variance_list.get(lo as usize..hi as usize));
+        let mut absent = AVec::new_in(alloc);
+        let spans = if plant == FactsPlant::NoFieldRegions {
+            absent.resize(field_count, NO_ROW);
+            &absent[..]
+        } else {
+            &regions.at[..]
+        };
         let read = adt_read(
             k,
             AdtAnswer::Made {
@@ -903,15 +1190,16 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 fields: &g.fields[fields_from..],
                 field_params: &g.field_params[fields_from..],
                 field_leads: &g.field_leads[fields_from..],
-                field_regions: &g.field_region_at[regions_from..],
-                region_list: &g.field_region_list,
+                field_regions: spans,
+                region_list: &regions.list,
                 copy_args,
                 variances,
-                asked_adts: &asked_adts,
-                asked_paths: &asked_paths,
             },
         );
         g.reads.push(read);
+        if plant != FactsPlant::NoFieldRegions {
+            g.field_regions.insert(key, RegionFields { first_variant: variants_from, variant_count, first_field: fields_from, regions });
+        }
     }
     let mut items: AVec<'a, u128> = AVec::new_in(alloc);
     for k in c.callees.column::<1>().iter() {
@@ -920,11 +1208,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     items.push(owner.0);
     items.sort_unstable();
     items.dedup();
-    // Each impl's texts, read once in this body for every member fn's signature and every call
-    // the type check selected the impl at (sig_impl.rs `ImplTextsMemo`).
-    let mut impl_memo = super::sig_impl::ImplTextsMemo::new_in(alloc);
     for &k in items.iter() {
-        // A callee's head is made when something asks: ask, so its signature is read and not
+        // A callee's head is made when something asks: ask, so its regions are filed and not
         // taken as unknown (a call of unknown signature is related coarsely, and cannot say
         // that the callee demands `'static`). A member is made with its impl or its trait.
         let key = tc::ItemKey(k);
@@ -963,210 +1248,379 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         };
         let tys = r.store.tys.view();
         let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-        let callee = CalleeFacts { writes_lifetimes: writes_lifetime(super::head_text::after_outer_trivia(f.text)), self_ref };
+        let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref };
         g.callees.push((k, callee));
-        let (keys, names) = (&*r.keys, r.names);
-        // Each ADT the reading asks about is part of what this head's row says (rule 21).
-        let asked = AskedAdts::new_in(alloc);
-        // Each written path the reading resolves (a type alias expanded, an ADT named) is part
-        // of it too (borrow_sig_world.rs): read from the head's module, its parameters
-        // shadowing items of their names.
-        let asked_paths = sig_world::AskedPaths::new_in(alloc);
-        let mut params: AVec<'a, tc::Name> = AVec::new_in(alloc);
-        for &(name, _) in f.params.iter() {
-            params.push(name);
-        }
-        let front = sig_world::FrontWorld::new(names, keys, &r.store.locals, f.module, &params, &asked, &asked_paths, alloc);
-        // The control's world (FactsPlant::NoAliases): the reader's own, no path resolved.
-        let counted = |a: tc::ItemKey| {
-            let lifetimes = adt_head_lifetimes(keys, names, a);
-            asked.note(a, lifetimes);
-            Some(lifetimes)
-        };
-        let unresolved = blaze_flow_lower::sig::NoAliases(&counted);
-        let world: &dyn blaze_flow_lower::sig::SigWorld = if plant == FactsPlant::NoAliases { &unresolved } else { &front };
-        let mut buf = SigBuf::new_in(alloc);
-        // An impl's member reads `Self::Name` through the impl's own `type Name` text and the
-        // impl's lifetimes through its self type (blaze-flow-lower sig/impl_life.rs); what it
-        // took of the impl's text is a row of its own (sig_impl.rs, rule 21).
-        let imp = super::sig_impl::impl_of(names, keys, key, f, &mut impl_memo, alloc);
-        g.reads.push(super::sig_impl::impl_read(k, &imp, alloc));
-        // An `async fn`'s body's value is its future's `Output` as written (blaze-flow-lower
-        // `BodyOut`): read with that type (async_output.rs, the head's one home of it).
-        let read = match (super::async_output::of(&*r.store, key), imp.text()) {
-            (Some(written), it) => read_async_signature_with(f.text, it, tys, &f.inputs[..], f.output, written, world, &mut buf, alloc),
-            (None, Some(it)) => read_impl_signature_with(f.text, it, tys, &f.inputs[..], f.output, world, &mut buf, alloc),
-            (None, None) => read_signature_with(f.text, tys, &f.inputs[..], f.output, world, &mut buf, alloc),
-        };
-        let adts = asked.take_sorted();
-        let paths = asked_paths.take_sorted();
-        match read {
-            Ok(()) => {
-                g.reads.push(head_read(k, HeadAnswer::Made { callee, sig: Ok(buf.life()), adts: &adts, paths: &paths }));
-                g.sigs.push((k, buf));
-            }
-            Err(why) => {
-                g.reads.push(head_read(k, HeadAnswer::Made { callee, sig: Err(why), adts: &adts, paths: &paths }));
-                g.sig_refused.push((k, why));
-            }
+    }
+    // Each impl a projection of the body selected (`c.selected`: a call's `T::Out` at the
+    // impl's `type Out`, blaze-flow-lower impl_call.rs), with the associated types read of it:
+    // its head made now (as a callee's above), so its regions are filed and its row below
+    // says them, not `NoHead`.
+    // Every impl the body's record selected: for a projection (`Some(name)`: the associated
+    // type is read) and for a trait bound (`None`: its header and where-clauses are related at
+    // the call, blaze-borrow relate.rs `impl_where`), so its head is made and its row filed.
+    let mut selected: AVec<'a, (u128, Option<tc::Name>)> = AVec::new_in(alloc);
+    for p in c.selected.iter() {
+        if let tc::Selected::Impl { imp, .. } = p.selected {
+            selected.push((imp.0, p.name));
         }
     }
-    // The generic shape of each head whose lifetime part was read: where its type parameters
-    // stand among its positions (blaze-flow-lower generic_call.rs). A head whose shape cannot
-    // be lined up has none, and a call of it with type arguments that carry origins keeps the
-    // one origin.
-    // A projection in a head's output stands for its normalized type's positions when its
-    // trait's text says it is closed (blaze-flow-lower generic_call.rs, "PROJECTIONS"); each
-    // trait asked is a row of the body's read list (sig_impl.rs `trait_read`, rule 21).
-    let asked_traits: core::cell::RefCell<AVec<'a, u128>> = core::cell::RefCell::new(AVec::new_in(alloc));
-    for &k in items.iter() {
-        if g.sigs.binary_search_by_key(&k, |(x, _)| *x).is_err() {
+    selected.sort_unstable_by_key(|&(k, n)| (k, n.is_some(), n.map_or(0, |n| n.0)));
+    selected.dedup();
+    let mut last_impl = None;
+    for &(k, _) in selected.iter() {
+        if last_impl == Some(k) {
             continue;
         }
-        let Some(f) = r.store.fns.get(&tc::ItemKey(k)) else { continue };
-        let tys = r.store.tys.view();
-        let (keys, names) = (&*r.keys, r.names);
-        let adt_lifetimes = |a: tc::ItemKey| Some(adt_head_lifetimes(keys, names, a));
-        let assoc = |t: tc::ItemKey, name: tc::Name| {
-            asked_traits.borrow_mut().push(t.0);
-            ties::assoc_read(names, keys, t, name, alloc)
-        };
-        let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
-        match blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &assoc, &mut shape, alloc) {
-            Ok(()) => g.shapes.push((k, shape)),
-            // Kept, never dropped (rule 3): the note of a call refused for it says why.
-            Err(why) => g.shape_refused.push((k, why)),
+        last_impl = Some(k);
+        if let Some(lib) = r.keys.library_in(r.names, tc::ItemKey(k))
+            && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl))
+        {
+            container_head(r, lib, false);
         }
     }
-    let mut asked_traits = asked_traits.into_inner();
-    // Each trait object's principal: whether it declares a lifetime decides how an unsized
-    // coercion to it is related (blaze-flow-lower `Lower::unsize_to_object`); its row is the
-    // same trait row.
-    for n in c.types.view().nodes() {
-        if let tc::PNode::ExTrait(t, _) = n {
-            g.object_traits.push((t.0, None));
+    // From here the records are only read. Each head's regions (D148) are its head record's,
+    // read in place through ONE reader (head_record.rs `RegionReader` over `Store::regions`):
+    // no fn's text is read here, and a head whose regions were not made (no record, the head
+    // refused, an old form) is named by the lowering at the call that needs them
+    // (`Form::RegionsUnread`), never related under a guess.
+    {
+        let regions = r.store.regions.reader(r.store.tys.alloc());
+        // Each head's row (rule 21): its callee facts and its signature column as read, or
+        // why it was not, so a lifetime-only edit of a callee's signature moves the body's
+        // read list (the regions digest moves with it: head_record.rs `regions_digest`).
+        for &(k, callee) in g.callees.iter() {
+            let sig = regions.sig(tc::ItemKey(k)).map(SigLife::new);
+            g.reads.push(head_read(k, HeadAnswer::Made { callee, sig }));
         }
-    }
-    g.object_traits.sort_unstable_by_key(|&(k, _)| k);
-    g.object_traits.dedup_by_key(|&mut (k, _)| k);
-    for o in g.object_traits.iter_mut() {
-        o.1 = super::sig_impl::trait_lifetimes(r.names, &*r.keys, tc::ItemKey(o.0), alloc);
-        asked_traits.push(o.0);
-    }
-    asked_traits.sort_unstable();
-    asked_traits.dedup();
-    for &t in asked_traits.iter() {
-        g.reads.push(super::sig_impl::trait_read(r.names, &*r.keys, tc::ItemKey(t), alloc));
-    }
-    // Each head's declared type-outlives bounds, from the lifetime part just read and its
-    // container's header (front2 call_generics.rs), and their read rows (rule 21).
-    for &k in items.iter() {
-        let key = tc::ItemKey(k);
-        let head = r.store.fns.get(&key);
-        let sig = g.sigs.binary_search_by_key(&k, |(x, _)| *x).ok().and_then(|i| g.sigs.get(i)).map(|(_, b)| b);
-        let container = match r.keys.origin(key) {
-            Some(Origin::Member { container, .. }) => Some(r.keys.library_in(r.names, *container).and_then(|lib| r.names.text_of(lib)).map(|t| t.text)),
-            _ => None,
+        // Each selected impl's row (rule 21): its regions as read (header, lifetimes and the
+        // value of each associated type read), so `type A = Inner<'a>` edited to
+        // `Inner<'static>` rechecks the body; the type check's reads hold only its types.
+        let mut names: AVec<'a, tc::Name> = AVec::new_in(alloc);
+        let mut i = 0;
+        while i < selected.len() {
+            let imp = selected[i].0;
+            names.clear();
+            while i < selected.len() && selected[i].0 == imp {
+                if let Some(n) = selected[i].1 {
+                    names.push(n);
+                }
+                i += 1;
+            }
+            g.reads.push(impl_read(imp, &names, &regions));
+        }
+        // The generic shape of each head whose signature regions are filed: where its type
+        // parameters stand among its positions (blaze-flow-lower generic_call.rs), counted by
+        // the one region counter. A head whose shape cannot be lined up has none, kept with why
+        // (rule 3): the note of a call refused for it says why.
+        for &k in items.iter() {
+            let key = tc::ItemKey(k);
+            if regions.sig(key).is_err() {
+                continue;
+            }
+            let Some(f) = r.store.fns.get(&key) else {
+                // Kept with why (rule 19): a call refused for it names it.
+                g.shape_refused.push((k, blaze_flow_lower::ShapeRefusal::NoHead));
+                continue;
+            };
+            // The one region counter's facts (D148) for its generic shape: each declared count
+            // the names' (D155: no ADT head is imported to count it), an opaque's captures as
+            // the head record filed them (the signature column's own count, head_record.rs
+            // `RegionReader::opaque_captures`), never the in-process maps ([`ShapeArity`]).
+            let arity = ShapeArity { declared: super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names }, regions: &regions };
+            let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
+            match blaze_flow_lower::read_shape(r.store.tys.view(), &f.inputs[..], f.output, &arity, &mut shape, alloc) {
+                Ok(()) => g.shapes.push((k, shape)),
+                Err(why) => g.shape_refused.push((k, why)),
+            }
+        }
+        // Each head's declared outlives and trait-lifetime ties, from its clauses
+        // (`Preds::clauses`, own and inherited) and its head record's regions (front2
+        // call_generics.rs, borrows_ties.rs; piece L4), and their read rows (rule 21).
+        let future = r.index.lang("future_trait");
+        for &k in items.iter() {
+            let key = tc::ItemKey(k);
+            let head = r.store.fns.get(&key);
+            let clauses = r.store.preds.get(&key).map(|p| &p.clauses[..]);
+            g.calls.gather(k, head, clauses, r.store.tys.view(), &regions, future, alloc);
+            g.ties.gather(k, head, clauses, r.store.tys.view(), &regions);
+        }
+        // Each trait object's principal: whether it declares a lifetime decides how an unsized
+        // coercion to it is related (blaze-flow-lower `Lower::unsize_to_object`). Its count is
+        // the trait's head record's (`RegionFacts::lifetime_params`), its row the ties' one
+        // trait row (borrows_ties.rs `trait_count`, rule 21); unread is `None`, never a guess.
+        for n in c.types.view().nodes() {
+            if let tc::PNode::ExTrait(t, _) = n {
+                g.object_traits.push((t.0, None));
+            }
+        }
+        g.object_traits.sort_unstable_by_key(|&(k, _)| k);
+        g.object_traits.dedup_by_key(|&mut (k, _)| k);
+        for o in g.object_traits.iter_mut() {
+            o.1 = g.ties.trait_count(tc::ItemKey(o.0), &regions).map(|n| n > 0);
+        }
+        // Each trait reference and alias of the body's types and the heads' columns, counted
+        // by the one region counter (D148, D155) for the one call rule (blaze-flow-lower
+        // one_call.rs): unknown is `None`, which that rule refuses by `Count`, never 0.
+        // An alias's trait is asked too (one_call.rs `impl_at` reads `trait_lifetimes` beside
+        // `alias_lifetimes`), and so is every row the type check selected: a trait need not
+        // stand as a trait reference in any table (`<I as IntoIterator>::IntoIter` and
+        // `<I as Iterator>::Item` of a `for` loop name `IntoIterator` and `Iterator` only as
+        // an alias's trait), and an uncounted trait made every such call `HeadUnread`.
+        // A projection bound (`ExProj`: `F: Future<Output = T>`, `I: IntoIterator<Item = X>`,
+        // in a clause column or a `dyn`) is counted as its alias (blaze-typeck regions.rs
+        // `region_arity`: `alias_lifetimes(trait_, name)`), so it is filed as one; and every
+        // projection and trait clause of the owner's and each gathered head's where-clauses
+        // (`Preds::clauses`: the contract the one rule lays as `ExTrait`/`ExProj` nodes,
+        // blaze-flow-lower one_call.rs `clause_of`), whether or not such a node was interned
+        // yet. The census (wave-1119): 54,907 `Count` refusals named an alias's lifetimes "not
+        // filed". The count itself is the one read below (rule 21).
+        for n in c.types.view().nodes().chain(r.store.tys.view().nodes()) {
+            match n {
+                tc::PNode::ExTrait(t, _) => g.trait_counts.push((t.0, None)),
+                tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
+                    g.alias_counts.push((trait_.0, *name, None));
+                    g.trait_counts.push((trait_.0, None));
+                }
+                _ => {}
+            }
+        }
+        for &k in items.iter() {
+            let Some(p) = r.store.preds.get(&tc::ItemKey(k)) else { continue };
+            for cl in p.clauses.iter() {
+                match *cl {
+                    tc::PClause::Trait { trait_, .. } => g.trait_counts.push((trait_.0, None)),
+                    tc::PClause::Projection { trait_, name, .. } => {
+                        g.alias_counts.push((trait_.0, name, None));
+                        g.trait_counts.push((trait_.0, None));
+                    }
+                    tc::PClause::Const { .. } | tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                }
+            }
+        }
+        for p in c.selected.iter() {
+            g.trait_counts.push((p.trait_.0, None));
+            if let Some(name) = p.name {
+                g.alias_counts.push((p.trait_.0, name, None));
+            }
+        }
+        // The control: nothing filed, so every count is unknown (rule 23).
+        if plant == FactsPlant::NoTraitCounts {
+            g.trait_counts.clear();
+            g.alias_counts.clear();
+        }
+        g.trait_counts.sort_unstable_by_key(|&(k, _)| k);
+        g.trait_counts.dedup_by_key(|&mut (k, _)| k);
+        g.alias_counts.sort_unstable_by_key(|&(k, n, _)| (k, n));
+        g.alias_counts.dedup_by_key(|&mut (k, n, _)| (k, n));
+        let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
+        let count = |got: tc::regions::Count| match got {
+            tc::regions::Count::Known(n) => Some(n),
+            tc::regions::Count::NotKnown => None,
         };
-        g.calls.gather(k, head, sig, container, alloc);
-        let trait_text = |lib: blaze_id::ItemKey| r.names.text_of(lib).map(|t| t.text);
-        g.ties.gather(k, head, sig, &trait_text, alloc);
-    }
-    if plant == FactsPlant::NoImplSources {
-        g.impl_text_reads = impl_memo.reads();
-    } else {
-        gather_impl_sources(&mut g, r.names, &*r.keys, c, &mut impl_memo, alloc);
+        for t in g.trait_counts.iter_mut() {
+            t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+        }
+        for a in g.alias_counts.iter_mut() {
+            a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
+        }
     }
     g.items = items;
     g
 }
 
-/// Each impl the type check selected at one of the body's calls (`Checked::selected`'s
-/// `Selected::Impl` rows): its texts for blaze-flow-lower `Facts::impl_source` (a bound over a
-/// concrete type answered by its impl, trait_ties.rs `tie_by_impl`; a hidden input read
-/// through the impl, impl_call.rs), and one read row keyed by the impl (sig_impl.rs
-/// `impl_source_read`, the same row a member's signature files: rule 21). The texts are
-/// copied once into the body's allocator, all impls in one block, so the facts own them.
-fn gather_impl_sources<'n, 'a, S: NamesSource<'n>>(
-    g: &mut BorrowFacts<'a>,
-    names: S,
-    keys: &Keys,
-    c: &tc::Checked<'_>,
-    memo: &mut super::sig_impl::ImplTextsMemo<'n, 'a>,
-    alloc: Alloc<'a>,
-) {
-    let mut imps: AVec<'a, u128> = AVec::new_in(alloc);
-    for row in c.selected.iter() {
-        if let tc::Selected::Impl { imp, .. } = row.selected {
-            imps.push(imp.0);
-        }
-    }
-    imps.sort_unstable();
-    imps.dedup();
-    // Pass one: each impl's row, and its texts laid end to end in one block (byte ranges).
-    let mut bytes: AVec<'a, u8> = AVec::new_in(alloc);
-    // (impl, text range, where its members start in `members`, how many)
-    let mut spans: AVec<'a, (u128, (u32, u32), u32, u32)> = AVec::new_in(alloc);
-    let mut members: AVec<'a, ((u32, u32), (u32, u32))> = AVec::new_in(alloc);
-    let put = |bytes: &mut AVec<'a, u8>, s: &str| {
-        let lo = bytes.len() as u32;
-        bytes.extend_from_slice(s.as_bytes());
-        (lo, bytes.len() as u32)
-    };
-    for &k in imps.iter() {
-        let imp = tc::ItemKey(k);
-        let texts = memo.get(names, keys, imp, alloc);
-        g.reads.push(super::sig_impl::impl_source_read(imp, texts, alloc));
-        let Some((text, assoc)) = texts else { continue };
-        let at = put(&mut bytes, text);
-        let first = members.len() as u32;
-        for &(name, body) in assoc {
-            let n = put(&mut bytes, name);
-            let b = put(&mut bytes, body);
-            members.push((n, b));
-        }
-        spans.push((k, at, first, assoc.len() as u32));
-    }
-    g.impl_text_reads = memo.reads();
-    if spans.is_empty() {
-        return;
-    }
-    // The block lives as long as the body's allocator (the facts are of one body): given up,
-    // never freed on its own. Texts laid end to end at char boundaries are UTF-8 whole, so
-    // `from_utf8` holds; were it ever not to, no impl has a row and each call that needs one
-    // is refused by name (`ImplUnread`), never read from a guess.
-    let Ok(block) = core::str::from_utf8(bytes.leak()) else { return };
-    let cut = |(lo, hi): (u32, u32)| block.get(lo as usize..hi as usize);
-    let mut pairs: AVec<'a, (&'a str, &'a str)> = AVec::new_in(alloc);
-    for &(n, b) in members.iter() {
-        let (Some(n), Some(b)) = (cut(n), cut(b)) else { return };
-        pairs.push((n, b));
-    }
-    let pairs: &'a [(&'a str, &'a str)] = pairs.leak();
-    for &(k, at, first, count) in spans.iter() {
-        let (Some(text), Some(assoc)) = (cut(at), pairs.get(first as usize..(first + count) as usize)) else { return };
-        g.impl_sources.push((k, text, assoc));
-    }
-}
-
-/// The variances of ADT `key`'s lifetime parameters, in head order, from its lifetime part
-/// (lifetimes.rs `AdtLife.variances`, computed from its fields' written types; one not computed
-/// is `In` already, so what is given is sound), pushed onto `list`. `None`: the part was not
-/// made (no library key, or refused): the ADT gets no row and the lowering takes every one of
-/// its parameters invariant. Type parameters are not computed by the part and get no entry
-/// (invariant too).
-fn adt_variances_of<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, key: tc::ItemKey, list: &mut AVec<'_, blaze_flow_lower::Variance>) -> Option<(u32, u32)> {
-    let lib = r.keys.library_in(r.names, key)?;
-    let life = r.store.adt_life(r.names, &*r.keys, lib).ok()?;
+/// The variances of ADT `key`'s parameters, lifetimes first then its type and const
+/// parameters in order, from the ADT facts (adt_facts.rs, every parameter computed by the
+/// fixed point over its group, std's ADTs from their definitions), pushed onto `list`.
+/// `None`: its facts were refused (its head unmade, a field's column unread, an ADT it names
+/// refused): the ADT gets no row, and the lowering records each relation through it as
+/// `Unified::VarianceUnknown` (blaze-flow-lower variance.rs), never a silent `In`.
+fn adt_variances_in(table: &super::adt_facts::AdtFactsTable<'_>, key: u128, list: &mut AVec<'_, blaze_flow_lower::Variance>) -> Option<(u32, u32)> {
+    let given = table.variances(key)?;
     let lo = list.len() as u32;
-    for v in life.variances.iter() {
-        list.push(match v.variance {
-            super::lifetimes::Variance::Co => blaze_flow_lower::Variance::Co,
-            super::lifetimes::Variance::Contra => blaze_flow_lower::Variance::Contra,
-            super::lifetimes::Variance::In => blaze_flow_lower::Variance::In,
-        });
+    for v in given.iter() {
+        list.push(v.answer());
     }
     Some((lo, list.len() as u32))
+}
+
+/// The types body owner `owner` assumes well-formed (RFC 1214, "Implied bounds"): its
+/// signature's, inputs and output, laid over its head record's column (`RegionFacts::sig`, over
+/// `FnPtr(inputs.., output)`), and, for a member of an impl, the impl header's self type and
+/// trait reference (`RegionFacts::impl_header`; a member numbers its impl's lifetimes and type
+/// parameters first, as the impl does: heads_regions.rs `impl_header_regions`). A trait's member
+/// assumes no header. Each laid by the one region counter; one not read is the answer's
+/// refusal, by name ([`super::adt_facts::ImpliedRefusal`]).
+fn owner_implied_input<'n, 'a, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: tc::ItemKey, alloc: Alloc<'a>) -> super::adt_facts::ImpliedInput<'a> {
+    let mut input = super::adt_facts::ImpliedInput::new_in(alloc);
+    let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
+    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let tys = r.store.tys.view();
+    match reader.sig(owner) {
+        Ok(sig) => input.piece(owner.0, tys, &arity, sig.col.ty(), sig.col.as_slice()),
+        Err(u) => input.unread(owner.0, u),
+    }
+    let imp = match r.keys.origin(owner) {
+        Some(Origin::Member { container, .. }) => match r.keys.library_in(r.names, *container) {
+            Some(lib) if matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Impl)) => Some(*container),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(imp) = imp {
+        match reader.impl_header(imp) {
+            Ok((self_col, trait_col)) => {
+                input.piece(imp.0, tys, &arity, self_col.ty(), self_col.as_slice());
+                if let Some(t) = trait_col {
+                    input.piece(imp.0, tys, &arity, t.ty(), t.as_slice());
+                }
+            }
+            Err(u) => input.unread(imp.0, u),
+        }
+    }
+    input
+}
+
+/// The ADT facts (adt_facts.rs) of `roots` and of every ADT their fields name, transitively:
+/// each head made first (the store holds only what something asked for), then laid with its
+/// fields' region columns (head_record.rs `RegionReader::field`, the one home of a field's
+/// regions) and solved group by group. An ADT whose head cannot be made is a typed refusal,
+/// and so is every ADT whose answer needs it.
+fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &[u128], alloc: Alloc<'a>) -> super::adt_facts::AdtFactsTable<'a> {
+    use super::adt_facts::{AdtFactsInput, AdtFactsRefusal, MOST_ADTS};
+    use super::adt_variance::{AdtLang, MOST_LAID_NODES, children};
+    let cell = r.index.lang("unsafe_cell").map(checker_of);
+    let phantom = r.index.lang("phantom_data").map(checker_of);
+    let lang_of = |key: tc::ItemKey| {
+        if Some(key) == cell {
+            AdtLang::UnsafeCell
+        } else if Some(key) == phantom {
+            AdtLang::PhantomData
+        } else {
+            AdtLang::Plain
+        }
+    };
+    // Every ADT reachable, sorted by key, with why its head was not made.
+    let mut seen: AVec<'a, (u128, Option<AdtUnmade>)> = AVec::new_in(alloc);
+    let mut todo: AVec<'a, u128> = AVec::new_in(alloc);
+    for &k in roots.iter() {
+        if let Err(at) = seen.binary_search_by_key(&k, |&(s, _)| s)
+            && seen.len() < MOST_ADTS
+        {
+            seen.insert(at, (k, None));
+            todo.push(k);
+        }
+    }
+    let mut walk: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+    let mut found: AVec<'a, u128> = AVec::new_in(alloc);
+    while let Some(k) = todo.pop() {
+        let key = tc::ItemKey(k);
+        let mut unmade = AdtUnmade::NoRow;
+        if !r.store.adts.contains_key(&key) {
+            match r.keys.library_in(r.names, key) {
+                Some(lib) => {
+                    if let Err(class) = ensure_why(r, Want::Adt(lib)) {
+                        unmade = AdtUnmade::Head(class);
+                    }
+                }
+                None => unmade = AdtUnmade::NoLibraryKey,
+            }
+        }
+        found.clear();
+        {
+            let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) else {
+                if let Ok(at) = seen.binary_search_by_key(&k, |&(s, _)| s) {
+                    seen[at].1 = Some(unmade);
+                }
+                continue;
+            };
+            // A lang ADT's variances are fixed: its fields are not read.
+            if lang_of(key) != AdtLang::Plain {
+                continue;
+            }
+            let tys = r.store.tys.view();
+            for f in row.fields.iter() {
+                walk.clear();
+                walk.push(f.ty);
+                let mut budget = MOST_LAID_NODES;
+                while let Some(t) = walk.pop() {
+                    if budget == 0 {
+                        break;
+                    }
+                    budget -= 1;
+                    let Ok(node) = tys.node(t) else { continue };
+                    if let tc::PNode::Adt(a, _) = node {
+                        found.push(a.0);
+                    }
+                    // A type the walk cannot read is the lay's refusal, by name, below.
+                    if let Ok((list, last)) = children(tys, t, node) {
+                        walk.extend_from_slice(list);
+                        if let Some(c) = last {
+                            walk.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        for &a in found.iter() {
+            if let Err(at) = seen.binary_search_by_key(&a, |&(s, _)| s)
+                && seen.len() < MOST_ADTS
+            {
+                seen.insert(at, (a, None));
+                todo.push(a);
+            }
+        }
+    }
+    // Each laid with its fields' columns, as the head record filed them.
+    let arity = super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
+    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let tys = r.store.tys.view();
+    let mut input = AdtFactsInput::new_in(alloc);
+    for &(k, unmade) in seen.iter() {
+        if let Some(u) = unmade {
+            input.refused(k, AdtFactsRefusal::Unmade(u));
+            continue;
+        }
+        let key = tc::ItemKey(k);
+        let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) else {
+            input.refused(k, AdtFactsRefusal::Unmade(AdtUnmade::NoRow));
+            continue;
+        };
+        let lang = lang_of(key);
+        input.adt(k, lang, row.lifetimes, row.generics);
+        if lang != AdtLang::Plain {
+            continue;
+        }
+        for (vi, v) in row.variants.iter().enumerate() {
+            for (j, f) in row.fields.get(v.fields.range()).unwrap_or(&[]).iter().enumerate() {
+                let col = match reader.field(key, vi as u32, j as u32) {
+                    Ok(c) if c.ty() == f.ty => Ok(c.as_slice()),
+                    Ok(_) => Err(tc::region_facts::RegionsUnread { item: key, why: tc::region_facts::UnreadWhy::Refused { what: "a field's region column is laid over another type than the field's" } }),
+                    Err(u) => Err(u),
+                };
+                input.field(tys, &arity, f.ty, col);
+            }
+        }
+        // Its declared outlives bounds (where-clauses and parameters' bounds), the seeds of its
+        // requirements (RFC 2093: explicit predicates are part of what a use requires). A bound
+        // under its own `for<..>` binds its region and is no requirement.
+        let refused = |what: &'static str| AdtFactsRefusal::Regions(tc::region_facts::RegionsUnread { item: key, why: tc::region_facts::UnreadWhy::Refused { what } });
+        match (reader.outlives(key), reader.clauses(key)) {
+            (Ok(outlives), Ok(clauses)) => {
+                for o in outlives.iter() {
+                    match *o {
+                        tc::region_facts::Outlives::Region { long, short } => input.declared_region(long, short),
+                        tc::region_facts::Outlives::Type { clause, region } => match clauses.iter().find(|c| c.nth == clause) {
+                            Some(c) if c.binders == 0 => input.declared_type(tys, &arity, c.col.ty(), Ok(c.col.as_slice()), region),
+                            Some(_) => {}
+                            None => input.outlives_refused(refused("a declared `T: 'r` of an ADT has no clause column")),
+                        },
+                    }
+                }
+            }
+            (Err(u), _) | (_, Err(u)) => input.outlives_refused(AdtFactsRefusal::Regions(u)),
+        }
+    }
+    input.solve()
 }
 
 /// A move finding's code and words: the Reference, "Moved and copied types".
@@ -1178,6 +1632,14 @@ fn move_words(kind: MoveFindingKind) -> (&'static str, &'static str) {
         MoveFindingKind::MoveOut(MoveOut::Index) => ("E0508", "a move out of an indexed place"),
         MoveFindingKind::MoveOut(MoveOut::DropField) => ("E0509", "a move out of a field of a type that implements `Drop`"),
     }
+}
+
+/// Whether finding `d` was decided by regions (a loan's liveness, an outlives result): every
+/// finding but a move's ([`move_words`]' codes), which reads only which places were moved.
+/// What a stricter relation can make falsely (`check_borrows`, blaze-flow-lower
+/// `Lowered::coarse`).
+pub(super) fn reads_regions(d: &BorrowDiagnostic) -> bool {
+    !matches!(d.code, "E0382" | "E0507" | "E0508" | "E0509")
 }
 
 /// An invalidated loan's code and words, from the statement at `at` and the access of it that
@@ -1222,27 +1684,30 @@ fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan, return
     }
 }
 
-/// A call of a head that writes lifetimes refused by the lowering (`CallWritesLifetimes`), by
-/// name (rule 19): lacking `Sig`, the head's text was not read, and why, from the facts'
-/// `sig_refused` ([`BorrowRefused::CallSigUnread`]); lacking anything else, what could not be
-/// related, with the shape's refusal from `shape_refused` when that is what it lacked
-/// ([`BorrowRefused::CallUnrelated`]). `None` for any other refusal.
+/// A call refused by the lowering for its head's lifetimes, by name (rule 19): its head regions
+/// not read (`Form::RegionsUnread`: the callee, or the body's own fn, and why, from the head
+/// records: [`BorrowRefused::RegionsUnread`]), or read and the call not related through them
+/// (`CallWritesLifetimes`: what could not be related, with the shape's refusal from
+/// `shape_refused` when that is what it lacked, [`BorrowRefused::CallUnrelated`]). `None` for
+/// any other refusal.
 fn call_refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowFacts<'_>, refusal: Refusal) -> Option<BorrowRefused> {
-    let blaze_flow_lower::Form::CallWritesLifetimes { callee, lacks } = refusal.form else {
-        return None;
-    };
-    let head = head_words(r, callee);
-    let item = r.keys.library_in(r.names, callee);
     let (start, end) = (refusal.range.start, refusal.range.end);
-    if lacks != CallLacks::Sig {
-        let shape_why = match lacks {
-            CallLacks::Shape => facts.shape_refused.binary_search_by_key(&callee.0, |&(k, _)| k).ok().map(|i| facts.shape_refused[i].1),
-            _ => None,
-        };
-        return Some(BorrowRefused::CallUnrelated { callee, item, head, lacks, shape_why, start, end });
+    match refusal.form {
+        blaze_flow_lower::Form::RegionsUnread { item: callee, why } => {
+            let (head, item) = (head_words(r, callee), r.keys.library_in(r.names, callee));
+            let unlaid = r.store.regions.unlaid_of(callee);
+            Some(BorrowRefused::RegionsUnread { callee, item, head, why, unlaid, gap: gap_words(r, callee), start, end })
+        }
+        blaze_flow_lower::Form::CallWritesLifetimes { callee, lacks } => {
+            let (head, item) = (head_words(r, callee), r.keys.library_in(r.names, callee));
+            let shape_why = match lacks {
+                CallLacks::Shape => facts.shape_refused.binary_search_by_key(&callee.0, |&(k, _)| k).ok().map(|i| facts.shape_refused[i].1),
+                _ => None,
+            };
+            Some(BorrowRefused::CallUnrelated { callee, item, head, lacks, shape_why, start, end })
+        }
+        _ => None,
     }
-    let &(_, why) = facts.sig_refused().iter().find(|(k, _)| *k == callee.0)?;
-    Some(BorrowRefused::CallSigUnread { callee, item, head, why, start, end })
 }
 
 /// The first words of `callee`'s head, up to its body (rule 19: a person reads which fn).
@@ -1256,6 +1721,51 @@ fn head_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, callee: tc::ItemKe
         }
     }
     head
+}
+
+/// The making store's detail of `callee`'s regions refusal ([`BorrowRefused::RegionsUnread`]'s
+/// `gap`): what this store's walk compared (heads.rs `RegionGap::say`), over the head's text
+/// its ranges are relative to; empty when this store did not make the head (its record's kind
+/// is the whole answer there).
+fn gap_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, callee: tc::ItemKey) -> Words {
+    let mut gap = Words::EMPTY;
+    if let (Some(g), Some(f)) = (r.store.region_gaps.get(&callee), r.store.fns.get(&callee)) {
+        // `Words` cuts what does not fit and writes `...`: it never fails.
+        let _ = g.say(f.text, &mut gap);
+    }
+    gap
+}
+
+/// The type check's own path for a stalled auto-trait goal of an async block's future, with no
+/// borrow check after it ([`ProjectWorld::check`]): each async block's WITNESS lowered
+/// (stalled_goals.rs `AsyncInteriors::witness_all`, over the facts `gather_facts` reads, their
+/// one home) and every stalled row decided on the exact interiors (`decide_stalled_goals`),
+/// exactly as `check_borrows` does before its borrow lowerings. What it read goes into `reads`
+/// (rule 21). A body whose table cannot be viewed lowers no block: each stalled row is then
+/// `FutureWitness` by `decide_stalled_goals`, never a pass (rule 3).
+pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'n>,
+    done: &tc::Checked<'_>,
+    reads: &mut AVec<'a, Read>,
+    alloc: Alloc<'a>,
+) -> Decision<'a> {
+    let mut interiors = AsyncInteriors::new_in(done, alloc);
+    if !done.stalled.is_empty() {
+        let langs = BorrowLangs::of(r.index);
+        let facts = gather_facts_planted(r, body.owner, done, langs, FactsPlant::None, alloc);
+        reads.extend_from_slice(facts.reads());
+        reads.extend_from_slice(facts.calls.reads());
+        reads.extend_from_slice(facts.ties.reads());
+        let reader = r.store.regions.reader(r.store.tys.alloc());
+        let lowering = facts.read_by(&reader, r.store.tys.view());
+        if let Ok(tys) = body.tys.view(&r.store.tys) {
+            let view = body.typeck.view(tys);
+            let requirements = Requirements::new_in(alloc);
+            interiors.witness_all(&view, done, &NestedFacts::with_requirements(lowering, &requirements), alloc);
+        }
+    }
+    decide_stalled_goals(r, body, done, &interiors, reads, alloc)
 }
 
 /// The move and borrow check of `body`, whose type check gave `done`: the facts gathered, the
@@ -1278,10 +1788,15 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     }
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts_planted(r, body.owner, done, langs, plant, alloc);
-    verdict.impl_text_reads = facts.impl_text_reads();
+    // Every fn's signature regions are its head record's, read in place (D148): the lowering's
+    // facts are the gathered ones with the head records' reader. The control
+    // (`FactsPlant::NoAliases`) gives none: every call carrying a lifetime is then refused.
+    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let regions: &dyn RegionFacts = if plant == FactsPlant::NoAliases { &NoRegions } else { &reader };
+    let lowering = facts.read_by(regions, r.store.tys.view());
     if let Some(out) = show.as_deref_mut() {
         use core::fmt::Write as _;
-        let _ = show_facts(&facts, out);
+        let _ = show_facts(lowering, out);
         let (es, ks) = (done.callees.column::<0>(), done.callees.column::<1>());
         for (e, k) in es.iter().zip(ks.iter()) {
             let _ = writeln!(out, "call at {e:?}: {:x}", k.0);
@@ -1313,23 +1828,26 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // kept; never a pass).
     let mut requirements = Requirements::new_in(alloc);
     let mut needs: AVec<'a, Requirement> = AVec::new_in(alloc);
+    // The first stricter relation any of the body's flows used, and which flow
+    // (blaze-flow-lower `Lowered::coarse`; applied after the last flow, below).
+    let mut coarse: Option<(Refusal, FlowOf)> = None;
+    // Each async block's exact interior, when a goal stalled, from its witness lowering, before
+    // and apart from the borrow lowerings below (stalled_goals.rs `witness_all`).
+    interiors.witness_all(&view, done, &NestedFacts::with_requirements(lowering, &requirements), alloc);
     for &of in nested_inner_first(&view, alloc).iter() {
         let lowered = {
-            let nested = NestedFacts::with_requirements(&facts, &requirements);
+            let nested = NestedFacts::with_requirements(lowering, &requirements);
             match of {
                 FlowOf::Closure(closure) => {
-                    closure_flow_of(&view, done, closure, &nested, alloc).map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals))
+                    closure_flow_of(&view, done, closure, &nested, alloc).map(|cf| (cf.lowered.flow, cf.lowered.params, cf.externals, cf.lowered.coarse))
                 }
-                // An async block's lowering also gives its exact interior when a goal stalled
-                // (stalled_goals.rs): lowered once, for both.
-                FlowOf::AsyncBlock(block) => blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| {
-                    interiors.keep(&la, done, block, alloc);
-                    (la.flow, AVec::new_in(alloc), la.externals)
-                }),
+                FlowOf::AsyncBlock(block) => {
+                    blaze_flow_lower::lower_async(&view, done, block, &nested, alloc).map(|la| (la.flow, AVec::new_in(alloc), la.externals, la.coarse))
+                }
                 FlowOf::Owner => continue,
             }
         };
-        let (flow, params, externals) = match lowered {
+        let (flow, params, externals, flow_coarse) = match lowered {
             Ok(x) => x,
             Err(refusal) => {
                 verdict.refused = Some(lower_refused(r, &facts, refusal));
@@ -1337,6 +1855,9 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                 break;
             }
         };
+        if coarse.is_none() {
+            coarse = flow_coarse.map(|c| (c, of));
+        }
         if let Some(out) = show.as_deref_mut() {
             let _ = show_flow(&flow, of, out);
         }
@@ -1355,7 +1876,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             requirements.add(made, n);
         }
     }
-    let nested = NestedFacts::with_requirements(&facts, &requirements);
+    let nested = NestedFacts::with_requirements(lowering, &requirements);
     let mut next = if verdict.refused.is_some() { None } else { Some(FlowOf::Owner) };
     while let Some(of) = next {
         // Checked above, innermost first: closures and every async block but an `async fn`'s
@@ -1364,9 +1885,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             next = next_nested(&view, of);
             continue;
         }
-        // An async block's lowering also gives its exact interior when a goal stalled
-        // (stalled_goals.rs): lowered once, for both.
-        let (flow, params) = match interiors.flow_of(of, &view, done, &nested, alloc) {
+        let (flow, params, flow_coarse) = match flow_of(of, &view, done, &nested, alloc) {
             Ok(f) => f,
             Err(refusal) => {
                 verdict.refused = Some(lower_refused(r, &facts, refusal));
@@ -1374,6 +1893,9 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                 break;
             }
         };
+        if coarse.is_none() {
+            coarse = flow_coarse.map(|c| (c, of));
+        }
         if let Some(out) = show.as_deref_mut() {
             let _ = show_flow(&flow, of, out);
         }
@@ -1381,6 +1903,22 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             break;
         }
         next = next_nested(&view, of);
+    }
+    // STRICT RELATIONS REFUSE ONLY ON A FINDING (blaze-flow-lower `Lowered::coarse`): a flow
+    // related by a stricter relation than Rust's (it only adds constraints) is clean under
+    // Rust's rules when clean under it, so the body stands checked; a finding of one that reads
+    // regions may be the relation's artifact, so the body is refused by the stricter step's
+    // name and those findings dropped (rule 3: never a false finding, never a pass). Move
+    // findings read no region: kept. A refusal already made stands (its findings already made
+    // are kept, as before, except these).
+    if let Some((c, of)) = coarse
+        && verdict.findings.iter().any(reads_regions)
+    {
+        verdict.findings.retain(|d| !reads_regions(d));
+        if verdict.refused.is_none() {
+            verdict.refused = Some(BorrowRefused::Stricter(c));
+            verdict.within = nested_range(&view, of);
+        }
     }
     verdict.findings.sort_unstable();
     verdict.findings.dedup();
@@ -1408,7 +1946,7 @@ fn lower_refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowF
 /// is a closure's and blaze-flow-lower `requirement` maps it) or else a `NestedOutlives`
 /// refusal. `true`: the body's check stops here (`verdict.refused` is set, `within` with it).
 #[expect(clippy::too_many_arguments, reason = "the flow, its parameters, which flow, the body's view, the closure's externals, the two outputs and the allocator")]
-fn file_flow<'a>(
+pub(super) fn file_flow<'a>(
     flow: &Flow<Alloc<'a>>,
     params: &[blaze_flow_lower::ParamOrigin],
     of: FlowOf,
@@ -1429,21 +1967,39 @@ fn file_flow<'a>(
     {
         for m in record.moves.iter() {
             let (code, text) = move_words(m.kind);
-            verdict.findings.push(BorrowDiagnostic { start: m.span.lo, end: m.span.hi, code, text });
+            verdict.findings.push(BorrowDiagnostic { start: m.span.lo, end: m.span.hi, code, text, borrowed: None, kept: None });
         }
         for b in record.borrows.iter() {
+            // An `Invalidated` finding's parts: its row of `loan_parts`, sorted by `(at, loan)`
+            // as the findings are; a finding with no row says so (`KeptAt::Unfound`).
+            let mut parts: Option<Option<blaze_flow::LoanParts>> = None;
             let (span, (code, text)) = match *b {
-                BorrowFinding::Invalidated { at, loan, span, returned } => (span, invalidated_words(flow, at, loan, returned)),
+                BorrowFinding::Invalidated { at, loan, span, returned } => {
+                    parts = Some(record.loan_parts.binary_search_by_key(&(at, loan), |p| (p.at, p.loan)).ok().map(|i| record.loan_parts[i]));
+                    (span, invalidated_words(flow, at, loan, returned))
+                }
                 // A nested body's outlives result is its owner's to prove: a closure's, between
-                // two positions of its value, is a requirement its maker's flow emits; any
-                // other is refused, never a finding (nor dropped).
+                // two positions of its value, is a requirement its maker's flow emits; a region
+                // the call chooses escaping into one the closure keeps is E0521; any other is
+                // refused (never dropped).
                 BorrowFinding::UnprovenOutlives { span, from, into, .. } if of.is_nested(view) => {
                     if let Some(req) = externals.and_then(|ext| blaze_flow_lower::requirement(ext, from, into)) {
                         needs.push(req);
-                    } else if verdict.refused.is_none() {
-                        verdict.refused = Some(BorrowRefused::NestedOutlives { start: span.lo, end: span.hi });
+                        continue;
                     }
-                    continue;
+                    // A region the expecting clause's `for<..>` binds, known to outlive no region
+                    // the owner names, that must outlive one the owner names: rustc's E0521 in
+                    // the closure (region_infer `try_propagate_universal_region_error`), never a
+                    // requirement on the owner (blaze-flow-lower closure.rs `escapes_closure`).
+                    if externals.is_some_and(|ext| blaze_flow_lower::escapes_closure(ext, &flow.known, from, into, alloc)) {
+                        (span, ("E0521", "borrowed data escapes outside of closure: a region each call chooses must outlive one the closure keeps"))
+                    } else {
+                        if verdict.refused.is_none() {
+                            let endpoint = |origin| externals?.iter().find(|(o, _)| *o == origin).map(|&(_, end)| end);
+                            verdict.refused = Some(BorrowRefused::NestedOutlives { from: endpoint(from), into: endpoint(into), start: span.lo, end: span.hi });
+                        }
+                        continue;
+                    }
                 }
                 // From a placeholder of the body's type parameter (blaze-flow-lower
                 // param_outlives.rs): E0310 when every bound on it was read; else not checked,
@@ -1464,7 +2020,13 @@ fn file_flow<'a>(
                     None => (span, ("outlives", "a lifetime must outlive another and the signature does not say so")),
                 },
             };
-            verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text });
+            let borrowed = parts.flatten().map(|p| (p.issued.lo, p.issued.hi));
+            let kept = parts.map(|row| match row.map(|p| p.kept) {
+                Some(blaze_flow::Kept::Use { span, .. }) => KeptAt::Use { start: span.lo, end: span.hi },
+                Some(blaze_flow::Kept::Signature { .. }) => KeptAt::Signature,
+                Some(blaze_flow::Kept::Unfound) | None => KeptAt::Unfound,
+            });
+            verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text, borrowed, kept });
         }
     }
     if verdict.refused.is_some() {
@@ -1515,29 +2077,31 @@ fn show_flow<A: Allocator>(flow: &Flow<A>, of: FlowOf, out: &mut dyn core::fmt::
 
 /// What the facts say of each head the body calls: its callee facts, lifetime part, generic
 /// shape and declared bounds, or why its lifetime part was not read.
-fn show_facts(facts: &BorrowFacts<'_>, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+fn show_facts(facts: ReadBy<'_, '_>, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
     use core::fmt::Write as _;
-    for &k in facts.items() {
+    for &k in facts.facts.items() {
         let key = tc::ItemKey(k);
-        writeln!(out, "head {k:x}: {:?}", Facts::callee(facts, key))?;
-        if let Some(life) = Facts::sig(facts, key) {
-            writeln!(out, "  sig {:?} ends {:?} bounds {:?} body {:?}", life.regions, life.ends, life.bounds, life.body)?;
+        writeln!(out, "head {k:x}: {:?}", Facts::callee(&facts, key))?;
+        match Facts::sig(&facts, key) {
+            Ok(life) => {
+                writeln!(out, "  sig {:?} inputs {} bounds {:?} body {:?}", life.slots(), life.inputs(), life.bounds(), life.body())?
+            }
+            Err(unread) => writeln!(out, "  sig unread {:?}", unread.why)?,
         }
-        if let Some(&(_, why)) = facts.sig_refused().iter().find(|(x, _)| *x == k) {
-            writeln!(out, "  sig refused {why:?}")?;
-        }
-        match Facts::shape(facts, key) {
+        match Facts::shape(&facts, key) {
             Some(s) => writeln!(out, "  shape {:?} ends {:?}", s.marks, s.ends)?,
             None => writeln!(out, "  no shape")?,
         }
-        match Facts::call_bounds(facts, key) {
+        match Facts::call_bounds(&facts, key) {
             Some(b) => writeln!(out, "  bounds {b:?}")?,
             None => writeln!(out, "  no call bounds")?,
         }
     }
-    for &(k, l) in facts.object_traits.iter() {
+    for &(k, l) in facts.facts.object_traits.iter() {
         writeln!(out, "object trait {k:x}: declares a lifetime {l:?}")?;
     }
+    // The owner's implied bounds (RFC 1214; `BorrowFacts::implied`), one line.
+    writeln!(out, "implied {:?}", facts.facts.implied())?;
     Ok(())
 }
 
@@ -1569,10 +2133,18 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         let mut borrows: Option<BorrowVerdict<'a>> = None;
         let mut reads: AVec<'a, Read> = AVec::new_in(alloc);
         let mut decision: Option<Decision<'a>> = None;
+        let mut typed = None;
         // The check files an auto-trait goal that fails only on an async block's superset
         // interior as a stalled row; the borrow check lowers each async body once, and the
         // rows are decided on the exact interiors of those lowerings (stalled_goals.rs).
         let mut verdict = self.check_then(body, Stalls::Decide, alloc, |r, lowered, done| {
+            // The checked record (D163 R1), encoded once here where the columns are: only of
+            // clean columns, which the record refuses otherwise (blaze-typeck checked_record.rs).
+            // A body with stalled rows (decided below, after the record) is encoded too, so its
+            // refusal (`NotClean { what: "stalled" }`) reaches tables/task.rs, which counts it.
+            if done.diags.is_empty() && done.undecided.is_empty() {
+                typed = Some(blaze_typeck::checked_record::encode(done, alloc));
+            }
             let _cost = super::tables::cost::Cost::enter(r.store.cost, super::tables::cost::Part::Borrows);
             let mut interiors = AsyncInteriors::new_in(done, alloc);
             borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, show, plant, alloc));
@@ -1581,6 +2153,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // What the borrow verdict and the decision read, in the body's read list and its
         // digest (rule 21: borrow_reads.rs, stalled_goals.rs).
         file_borrow_reads(&mut verdict, &reads, alloc);
+        verdict.typed = typed;
         if let Some(decision) = decision {
             decision.file(&mut verdict);
         }
@@ -1588,9 +2161,254 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             Some(b) => b,
             None => {
                 let why = if verdict.diagnostics.is_empty() { Untyped::TypesNotChecked } else { Untyped::TypeErrors };
-                BorrowVerdict { findings: AVec::new_in(alloc), refused: Some(BorrowRefused::Untyped(why)), within: None, impl_text_reads: 0 }
+                BorrowVerdict { findings: AVec::new_in(alloc), refused: Some(BorrowRefused::Untyped(why)), within: None }
             }
         };
         (verdict, borrows)
+    }
+}
+
+/// A fn's signature regions reach the borrow check from its head record (D148, piece L3), the
+/// whole path: the program's text, its heads made and their regions filed (L1a, L2), the body's
+/// facts gathered with no signature text read, the lowering reading the column through
+/// [`ReadBy`]. The fixture is the held test front2_w1_callee_fn_life.rs's.
+#[cfg(test)]
+mod region_record_tests {
+    use super::{BorrowRefused, FactsPlant};
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+fn f<'a, 'b>(y: &'b u8, x: &'a u8) -> &'a u8 {
+    let _ = y;
+    x
+}
+
+fn h(x: &u8, y: &u8) -> &u8 {
+    let _ = y;
+    x
+}
+
+fn order_clean() {
+    let a = 1u8;
+    let result;
+    {
+        let b = 2u8;
+        result = f(&b, &a);
+    }
+    let _used = *result;
+}
+
+fn order_control() {
+    let b = 1u8;
+    let result;
+    {
+        let a = 2u8;
+        result = f(&b, &a);
+    }
+    let _used = *result;
+}
+
+fn mention_control() {
+    let b = 1u8;
+    let result;
+    {
+        let a = 2u8;
+        result = f(&b, &a);
+    }
+    let _ = *result;
+}
+
+fn mention_no_access() {
+    let mut x = 0u8;
+    let m = &mut x;
+    let _ = x;
+    *m = 1;
+}
+
+fn mention_of_the_reference() {
+    let r;
+    {
+        let a = 0u8;
+        r = &a;
+    }
+    let _ = r;
+}
+
+fn assign_mention_control() {
+    let r;
+    {
+        let a = 0u8;
+        r = &a;
+    }
+    _ = *r;
+}
+
+fn statement_read_control() {
+    let r;
+    {
+        let a = 0u8;
+        r = &a;
+    }
+    *r;
+}
+
+fn calls_refused() {
+    let a = 1u8;
+    let r = h(&a, &a);
+    let _ = *r;
+}
+
+macro_rules! byte {
+    () => {
+        u8
+    };
+}
+
+fn m(x: &u8, _y: byte!()) -> &u8 {
+    x
+}
+
+fn calls_soft_refused() {
+    let a = 1u8;
+    let r = m(&a, 2);
+    let _ = *r;
+}
+
+fn main() {}
+"#;
+
+    /// THE FIRST CONTROL of D148 through the record path: `f<'a, 'b>(y: &'b u8, x: &'a u8) ->
+    /// &'a u8` ties its result to its SECOND argument. order_clean (`a`, the second, outlives
+    /// `result`) is clean; order_control (`a` dies in the inner block) is E0597. PLANTED
+    /// (`FactsPlant::NoAliases`: the lowering given no head records' regions): order_control is
+    /// no longer a finding but refused `RegionsUnread` naming `f`, so the E0597 came from the
+    /// record's column and from nothing else (rule 23).
+    ///
+    /// A callee whose head is a program error (`h`: two elided lifetimes in, one out, no rule
+    /// picks the output's: E0106, reported by `h`'s own check) leaves its caller untyped
+    /// (`Untyped(TypesNotChecked)`): no head, no type check, no borrow check, never a pass.
+    /// A callee whose erased head is whole but whose REGIONS the producer refused softly (`m`,
+    /// a type macro in a parameter: types.rs `regions_made`, "a type macro's expansion", a
+    /// `RegionGap` filed refused) is typed, and its call refused by name, `RegionsUnread {
+    /// item: m, why: Refused { .. } }`, never checked under a guess. Its control is order_clean:
+    /// the same call shape of a head whose regions were made is checked.
+    ///
+    /// Prints one line per body: its verdict.
+    #[test]
+    fn signature_regions_come_from_the_head_record() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/l3/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate { name: "l3", dir: "/l3/", root: "/l3/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, alloc).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let body = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        let (types, borrows) = world.check_borrows(body("order_clean"), alloc);
+        std::println!("order_clean: {borrows:?}");
+        assert!(types.is_clean(), "order_clean: {types:?}");
+        assert!(borrows.is_clean(), "order_clean is clean: {borrows:?}");
+
+        let (types, borrows) = world.check_borrows(body("order_control"), alloc);
+        std::println!("order_control: {borrows:?}");
+        assert!(types.is_clean(), "order_control: {types:?}");
+        assert!(borrows.refused.is_none(), "order_control: {borrows:?}");
+        assert!(borrows.findings.iter().any(|d| d.code == "E0597"), "order_control is E0597: {borrows:?}");
+
+        let (_, planted) = world.check_borrows_planted(body("order_control"), FactsPlant::NoAliases, alloc);
+        std::println!("order_control with no head regions: {planted:?}");
+        assert!(planted.findings.is_empty(), "CONTROL: a finding with no head regions: {planted:?}");
+        assert!(matches!(planted.refused, Some(BorrowRefused::RegionsUnread { .. })), "CONTROL: not refused by name: {planted:?}");
+
+        // `let _ = *result;` uses `result` only by MENTIONING `*result` (blaze-flow
+        // `StmtKind::Mention`): evaluating the place dereferences `result`, so `result` is live
+        // there and `a`'s loan with it: E0597. Lowered as nothing (before the statement) it
+        // was accepted with a dangling borrow; that control is blaze-flow-lower's
+        // `a_mention_through_a_dangling_reference_is_e0597` (`Plant::MentionNothing`).
+        // `_ = *r;` is the same mention, `*r;` a read (the Reference, "Expression statements").
+        for name in ["mention_control", "assign_mention_control", "statement_read_control"] {
+            let (types, mention) = world.check_borrows(body(name), alloc);
+            std::println!("{name}: {mention:?}");
+            assert!(types.is_clean(), "{name}: {types:?}");
+            assert!(mention.refused.is_none(), "{name}: {mention:?}");
+            assert!(mention.findings.iter().any(|d| d.code == "E0597"), "{name} is E0597: {mention:?}");
+        }
+        // A mention is no access (the Reference, "Wildcard pattern": it "does not copy, move or
+        // borrow the value it matches"): `let _ = x;` under a live `&mut x` invalidates
+        // nothing. And naming a reference reads nothing through it: only a `Deref` on the
+        // way makes the mention a use, so `let _ = r;` with `r` dangling is clean.
+        for name in ["mention_no_access", "mention_of_the_reference"] {
+            let (types, clean) = world.check_borrows(body(name), alloc);
+            std::println!("{name}: {clean:?}");
+            assert!(types.is_clean(), "{name}: {types:?}");
+            assert!(clean.is_clean(), "{name} is clean: {clean:?}");
+        }
+
+        // A head that is a program error: the caller is untyped, the error is the callee's.
+        let (types, refused) = world.check_borrows(body("calls_refused"), alloc);
+        std::println!("calls_refused: {types:?} {refused:?}");
+        assert!(refused.findings.is_empty(), "calls_refused is checked under a guess: {refused:?}");
+        assert!(
+            matches!(refused.refused, Some(BorrowRefused::Untyped(super::Untyped::TypesNotChecked))),
+            "calls_refused: the caller of a head in error is untyped: {refused:?}"
+        );
+        // `h`'s E0106 is its own check's (a diagnostic, or the refusal that stopped it: the
+        // verdict's text names the code either way).
+        let (h_types, _) = world.check_borrows(body("h"), alloc);
+        let h_text = std::format!("{h_types:?}");
+        std::println!("h: {h_text}");
+        assert!(h_text.contains("E0106"), "h's own check reports its E0106: {h_text}");
+
+        // A head whose regions alone were refused: typed, and the call refused by its name.
+        let (types, soft) = world.check_borrows(body("calls_soft_refused"), alloc);
+        std::println!("calls_soft_refused: {types:?} {soft:?}");
+        assert!(types.is_clean(), "calls_soft_refused is typed: {types:?}");
+        assert!(soft.findings.is_empty(), "calls_soft_refused is checked under a guess: {soft:?}");
+        match soft.refused {
+            Some(refused @ BorrowRefused::RegionsUnread { why, item, unlaid, .. }) => {
+                // Its head is filed whole: its regions are refused by their kind's name, never
+                // said as a refused head (heads.rs `file_regions`).
+                assert!(matches!(why, blaze_typeck::region_facts::UnreadWhy::Refused { .. }), "calls_soft_refused: why: {why:?}");
+                let named = item.and_then(|lib| names.item_text(lib)).and_then(|t| t.name);
+                assert_eq!(named, Some("m"), "calls_soft_refused names the callee");
+                // By its typed cause and part: `m`'s input 1 is `byte!()`, a type macro's
+                // expansion the region walk does not lay; the class is printed first and short
+                // (blaze-cli `first_refusal_class` keeps up to the first `] `).
+                use crate::front2::head_record::Unlaid;
+                use crate::front2::types::{NotLaidWhy, SigPart};
+                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::TypeMacro, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
+                let mut said = super::Words::EMPTY;
+                core::fmt::Write::write_fmt(&mut said, format_args!("{refused}")).unwrap();
+                let said = said.as_str();
+                assert!(said.starts_with("[NotLaid/TypeMacro/Input] "), "calls_soft_refused: the class is not first: {said}");
+                assert!(said.contains("input 1"), "calls_soft_refused: the input is not named: {said}");
+                // CONTROL (rule 23): the same refusal with no typed kind prints the old class,
+                // so the bracket above is the kind's, not the text's.
+                let BorrowRefused::RegionsUnread { callee, item, head, why, gap, start, end, .. } = refused else { unreachable!() };
+                let untyped = BorrowRefused::RegionsUnread { callee, item, head, why, unlaid: None, gap, start, end };
+                let mut said = super::Words::EMPTY;
+                core::fmt::Write::write_fmt(&mut said, format_args!("{untyped}")).unwrap();
+                assert!(said.as_str().starts_with("[Refused: "), "CONTROL: an untyped refusal printed a typed class: {}", said.as_str());
+            }
+            other => panic!("calls_soft_refused is not refused by the callee's name: {other:?}"),
+        }
     }
 }

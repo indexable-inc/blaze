@@ -24,11 +24,11 @@ use blaze_typeck::{
 };
 
 use super::late::Late;
-use super::{Machine, Mode, Need, NeedKind, Place, R, Repr, Stop, Val, Work, int_info, malformed, mask, unsupported};
+use super::{Machine, Mode, Need, NeedKind, R, Repr, Stop, Val, Work, int_info, malformed, mask, unsupported};
 use crate::error::Refusal;
 use crate::layout::{self, Layout};
 use crate::lit;
-use crate::mem::{PTR, Scalar};
+use crate::mem::Scalar;
 use crate::record::{ConstFn, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, FnKind, FnTraitMethod, Intrinsic, Typed};
@@ -1929,11 +1929,67 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             // The Reference, inline-assembly: "asm! ... cannot be used in const contexts".
             Expr::Asm { .. } => return Err(unsupported("inline assembly in a constant")),
             Expr::RawRef { .. } => return Err(unsupported("a raw borrow in a constant")),
-            // A field's offset is the container's layout's: `layout` gives sizes, not yet
-            // where each field sits.
-            Expr::OffsetOf { .. } => return Err(unsupported("`offset_of!` (a field's offset from the layout)")),
+            // `offset_of!(T, a.0.b)`: a `usize`, the sum of each step's offset in the layout
+            // ([`Self::offset_of`]). core's `ptr::read_unaligned` asserts
+            // `mem::offset_of!(Unaligned::<T>, 0) == 0` in a `const { .. }` block at every `T`.
+            Expr::OffsetOf { ty, fields } => {
+                let off = self.offset_of(cc, ty, fields)?;
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Imm { dst, v: Val::S(Scalar::Int(u128::from(off))) });
+                cc.rs.push(dst);
+            }
         }
         Ok(())
+    }
+
+    /// The value of `offset_of!(ty, fields..)` at this instance: the sum of each step's offset
+    /// in the layout this evaluator lays types out with (blaze-build's `Layouts`, the build's
+    /// own rows, so the value equals what blaze-build walk/strs.rs `offset_of` builds at run
+    /// time). The Reference, "Type layout": a field's offset is its container's layout's
+    /// (`repr(C)`, `packed` and `align` included); core's `mem::offset_of!`: "Expands to the
+    /// offset in bytes of a field from the beginning of the given type", nested fields allowed
+    /// (`a.0.b`). A tuple's or tuple struct's step is named by its digits (`Name::of_index`), a
+    /// struct's or union's by its field name. A step through an enum variant (unstable
+    /// `offset_of_enum`) is refused by name.
+    fn offset_of(&mut self, cc: &mut Cc<'w, '_>, ty: PTy, fields: List) -> R<'a, u64> {
+        let body = cc.typed.body;
+        let steps = body.segments.get(fields.range()).ok_or(malformed("an `offset_of!` path past the body's segments"))?;
+        if steps.is_empty() {
+            return Err(malformed("an `offset_of!` with no field"));
+        }
+        // `ty` is the body's WRITTEN type (`BodyView::types`: the checker lowers it with
+        // `lower_body_ty`, blaze-typeck rules/field.rs `expr_offset_of`), not a row of the
+        // record's table `cc.typed.types` that [`Self::cg`] grounds: an index read in the wrong
+        // table is another type (here one with no ground form). Grounded at this instance's
+        // arguments as blaze-build walk/strs.rs `offset_of` does at run time.
+        let mut t = blaze_build::ground(body.types, ty, &cc.args, self.ground, self.alloc, self.world).map_err(|e| match e {
+            blaze_build::BuildError::Projection { trait_, name } => Stop::Refused(Refusal::Projection { trait_, name }),
+            _ => unsupported("an `offset_of!` type with no ground form at the instance (an alias, an opaque type, a closure)"),
+        })?;
+        let mut total: u64 = 0;
+        for step in steps {
+            let index = match self.node(t)? {
+                PNode::Tuple(l) => {
+                    let n = self.ground.view().list(l).map_err(|_| malformed("a tuple's list past the ground table"))?.len() as u32;
+                    (0..n).find(|&i| blaze_typeck::Name::of_index(i) == step.name)
+                }
+                PNode::Adt(key, _) => {
+                    let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
+                    if adt.kind == AdtKind::Enum {
+                        return Err(unsupported("`offset_of!` through an enum variant (`offset_of_enum`)"));
+                    }
+                    let v = adt.variants.first().ok_or(malformed("a struct with no variant"))?;
+                    let own = adt.fields.get(v.fields.range()).ok_or(malformed("a variant's fields past its ADT"))?;
+                    own.iter().position(|f| f.name == step.name).map(|i| i as u32)
+                }
+                _ => return Err(unsupported("`offset_of!` through a field of a type with no fields")),
+            };
+            let index = index.ok_or(malformed("an `offset_of!` step naming a field its container lacks"))?;
+            let off = self.field_offset(t, 0, index)?;
+            total = total.checked_add(off).ok_or(malformed("an `offset_of!` past `u64`"))?;
+            t = self.field_ty(t, 0, index)?;
+        }
+        Ok(total)
     }
 
     /// Whether pattern `top` binds anything by reference (`ref`, `ref mut`).

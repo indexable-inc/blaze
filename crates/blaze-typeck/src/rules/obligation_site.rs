@@ -85,6 +85,8 @@ fn subject(clause: PClause, types: PTys<'_>, alloc: Alloc<'_>) -> Result<Option<
     let (list, term) = match clause {
         PClause::Trait { args, .. } | PClause::Const { args, .. } => (args, None),
         PClause::Projection { args, term, .. } => (args, Some(term)),
+        PClause::TypeOutlives { ty, .. } => (List::EMPTY, Some(ty)),
+        PClause::RegionOutlives { .. } => (List::EMPTY, None),
     };
     let mut stack: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     let mut budget = MAX_SEARCH_NODES;

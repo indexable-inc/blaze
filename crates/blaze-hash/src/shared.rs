@@ -26,18 +26,15 @@
 //! bytes are tracked, so a model reports a read that a publish does not order, and a read of an
 //! entry freed under a reader.
 
-use core::{
-    alloc::Allocator,
-    fmt,
-    hash::{BuildHasher, Hash},
-    marker::PhantomData,
-    ptr,
-};
+use core::{alloc::Allocator, fmt, marker::PhantomData, ptr};
 
-use blaze_own::{Box, Vec};
+use blaze_own::{
+    Box, Vec,
+    planted::{NoPlant, Planted, Plants},
+};
 use blaze_reclaim::{Guard, Horizon, Limbo};
 
-use crate::Equivalent;
+use crate::{Equivalent, KeyHash};
 
 /// Keys a batch of [`Pinned::get_many_into`] prefetches before it probes: two dependent
 /// misses a key (its slot, its boxed entry), so deeper than the owning map's pipeline.
@@ -115,18 +112,22 @@ pub unsafe trait ShardLock {
     fn lock<T>(lock: &Self::Lock<T>) -> Self::Guard<'_, T>;
 }
 
-/// A bug a model test plants, to show its model catches it.
+/// A bug a model test plants, to show its model catches it: through the seam
+/// (`blaze_own::planted`), so a write takes `impl Planted<Plant>` and shipped code passes
+/// [`NoPlant`], which folds every check to `false`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plant {
+    /// No bug: the control run.
+    #[cfg_attr(not(all(test, blaze_check)), expect(dead_code, reason = "the model tests' control"))]
     None,
     /// An entry's slot stored Relaxed: a reader that loads it is not ordered after the
     /// entry's bytes.
-    #[cfg(test)]
     RelaxedPublish,
     /// A replaced entry freed at once, not retired: a reader in it reads freed bytes.
-    #[cfg(test)]
     FreeAtOnce,
 }
+
+impl Plants for Plant {}
 
 /// One key and its value, boxed once and never moved, with the key's hash.
 struct Entry<K, V> {
@@ -475,25 +476,44 @@ impl<K, V, S, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, S, A, L> {
     }
 }
 
-impl<K, V, S: BuildHasher, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, S, A, L> {
+impl<K, V, S, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, S, A, L> {
     fn shard_of(&self, hash: u64) -> &Shard<K, V, A, L> {
         &self.map.shards[(hash >> (u64::BITS - SHARDS.trailing_zeros())) as usize]
     }
 
-    fn entry<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&Entry<K, V>> {
-        let hash = self.map.hasher.hash_one(key);
+    /// `key`'s hash, by the one seam every table hashes at ([`KeyHash`]): a `PlainKey` on
+    /// `FixedState` by its bytes, a `DigestKey` on `DigestState` its word.
+    #[inline(always)]
+    fn hash_of<Q: ?Sized>(&self, key: &Q) -> u64
+    where
+        S: KeyHash<Q>,
+    {
+        <S as KeyHash<Q>>::hash_key(&self.map.hasher, key)
+    }
+
+    fn entry<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<&Entry<K, V>>
+    where
+        S: KeyHash<Q>,
+    {
+        let hash = self.hash_of(key);
         self.shard_of(hash).current()?.find(hash, key)
     }
 
     /// The value of `key`, read with no lock.
-    pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&V> {
+    pub fn get<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<&V>
+    where
+        S: KeyHash<Q>,
+    {
         self.entry(key).map(|entry| &entry.value)
     }
 
     /// Starts loading the slot a [`Pinned::get`] of `key` reads first, for a caller that
     /// interleaves its own lookups. A hint: it reads no entry.
-    pub fn prefetch<Q: ?Sized + Hash>(&self, key: &Q) {
-        let hash = self.map.hasher.hash_one(key);
+    pub fn prefetch<Q: ?Sized>(&self, key: &Q)
+    where
+        S: KeyHash<Q>,
+    {
+        let hash = self.hash_of(key);
         if let Some(table) = self.shard_of(hash).current() {
             table.prefetch_slot(hash);
         }
@@ -504,19 +524,21 @@ impl<K, V, S: BuildHasher, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, 
     /// slot loaded, then the entry each points at, then each probed. A lookup here is two
     /// dependent misses (the slot, then its boxed entry), so a batch on tables larger than the
     /// cache waits about two misses in all rather than two per key.
-    fn each_entry<'s, 'k, Q: ?Sized + Hash + Equivalent<K> + 'k, const CHUNK: usize>(
+    fn each_entry<'s, 'k, Q: ?Sized + Equivalent<K> + 'k, const CHUNK: usize>(
         &'s self,
         count: usize,
         key: impl Fn(usize) -> &'k Q,
         mut answer: impl FnMut(usize, Option<&'s Entry<K, V>>),
-    ) {
+    ) where
+        S: KeyHash<Q>,
+    {
         let mut start = 0;
         while start < count {
             let len = (count - start).min(CHUNK);
             let mut hashes = [0u64; CHUNK];
             let mut tables = [None; CHUNK];
             for at in 0..len {
-                hashes[at] = self.map.hasher.hash_one(key(start + at));
+                hashes[at] = self.hash_of(key(start + at));
                 tables[at] = self.shard_of(hashes[at]).current();
                 if let Some(table) = tables[at] {
                     table.prefetch_slot(hashes[at]);
@@ -537,10 +559,13 @@ impl<K, V, S: BuildHasher, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, 
 
     /// [`Pinned::get`] of each of `keys`, as one batch ([`Pinned::each_entry`]'s prefetching);
     /// duplicates and absent keys are answered as `get` answers them.
-    pub fn get_many<Q: ?Sized + Hash + Equivalent<K>, const N: usize>(
+    pub fn get_many<Q: ?Sized + Equivalent<K>, const N: usize>(
         &self,
         keys: [&Q; N],
-    ) -> [Option<&V>; N] {
+    ) -> [Option<&V>; N]
+    where
+        S: KeyHash<Q>,
+    {
         let mut out = [None; N];
         self.each_entry::<Q, N>(
             N,
@@ -552,11 +577,13 @@ impl<K, V, S: BuildHasher, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, 
 
     /// [`Pinned::get_many`] of a slice, [`SHARED_BATCH`] keys a batch: `out[at]` is the
     /// value of `keys[at]`. Panics unless `out` is as long as `keys`.
-    pub fn get_many_into<'a, Q: Hash + Equivalent<K>>(
+    pub fn get_many_into<'a, Q: Equivalent<K>>(
         &'a self,
         keys: &[Q],
         out: &mut [Option<&'a V>],
-    ) {
+    ) where
+        S: KeyHash<Q>,
+    {
         assert_eq!(keys.len(), out.len(), "Pinned::get_many_into: one answer per key");
         self.each_entry::<Q, SHARED_BATCH>(
             keys.len(),
@@ -566,11 +593,17 @@ impl<K, V, S: BuildHasher, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, 
     }
 
     /// The key and value of `key`, read with no lock.
-    pub fn get_key_value<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<(&K, &V)> {
+    pub fn get_key_value<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        S: KeyHash<Q>,
+    {
         self.entry(key).map(|entry| (&entry.key, &entry.value))
     }
 
-    pub fn contains_key<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> bool {
+    pub fn contains_key<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.entry(key).is_some()
     }
 }
@@ -594,12 +627,12 @@ enum Wrote<'g, K, V> {
     Kept(&'g Entry<K, V>, V),
 }
 
-impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>
+impl<K: Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: KeyHash<K>, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>
     Pinned<'_, K, V, S, A, L>
 {
     /// Puts `value` for `key`; the value it replaced, readable while this pin lives.
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
-        match self.write(key, value, Held::Replace, Plant::None) {
+        match self.write(key, value, Held::Replace, NoPlant) {
             Wrote::Replaced(old) => Some(&old.value),
             Wrote::Inserted(_) | Wrote::Kept(..) => None,
         }
@@ -607,7 +640,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
 
     /// Puts `value` for `key` unless it is held; else what is held, and `value` back.
     pub fn try_insert(&self, key: K, value: V) -> Result<&V, OccupiedError<'_, V>> {
-        match self.write(key, value, Held::Keep, Plant::None) {
+        match self.write(key, value, Held::Keep, NoPlant) {
             Wrote::Inserted(entry) => Ok(&entry.value),
             Wrote::Kept(entry, not_inserted) => Err(OccupiedError { current: &entry.value, not_inserted }),
             Wrote::Replaced(_) => unreachable!("a write that keeps what is held replaced it"),
@@ -632,38 +665,47 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
     /// first, and both get the first's. `make` must return a key equal to `key` (checked in
     /// debug builds). A miss probes twice, without and then under the lock: another writer
     /// may have put the key between. Never allocates on a hit.
-    pub fn get_or_insert_with<Q: ?Sized + Hash + Equivalent<K>>(
+    pub fn get_or_insert_with<Q: ?Sized + Equivalent<K>>(
         &self,
         key: &Q,
         make: impl FnOnce(&Q) -> (K, V),
-    ) -> &V {
-        let hash = self.map.hasher.hash_one(key);
+    ) -> &V
+    where
+        S: KeyHash<Q>,
+    {
+        let hash = self.hash_of(key);
         if let Some(entry) = self.shard_of(hash).current().and_then(|table| table.find(hash, key)) {
             return &entry.value;
         }
         let (owned, value) = make(key);
         debug_assert!(
-            key.equivalent(&owned) && self.map.hasher.hash_one(&owned) == hash,
+            key.equivalent(&owned) && self.hash_of::<K>(&owned) == hash,
             "get_or_insert_with: `make` built a key that is not equal to the one asked"
         );
-        match self.write_hashed(hash, owned, value, Held::Keep, Plant::None) {
+        match self.write_hashed(hash, owned, value, Held::Keep, NoPlant) {
             Wrote::Inserted(entry) | Wrote::Kept(entry, _) => &entry.value,
             Wrote::Replaced(_) => unreachable!("a write that keeps what is held replaced it"),
         }
     }
 
     /// Takes `key` out; its value, readable while this pin lives.
-    pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&V> {
+    pub fn remove<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<&V>
+    where
+        S: KeyHash<Q>,
+    {
         self.remove_where(key, |_, _| true).ok().flatten().map(|(_, value)| value)
     }
 
     /// Takes `key` out if `should(key, value)`: `Ok` with what was taken (or `None` when the
     /// key is not held), `Err` with what stays.
-    pub fn remove_if<Q: ?Sized + Hash + Equivalent<K>>(
+    pub fn remove_if<Q: ?Sized + Equivalent<K>>(
         &self,
         key: &Q,
         should: impl FnOnce(&K, &V) -> bool,
-    ) -> Result<Option<(&K, &V)>, (&K, &V)> {
+    ) -> Result<Option<(&K, &V)>, (&K, &V)>
+    where
+        S: KeyHash<Q>,
+    {
         self.remove_where(key, should)
     }
 
@@ -684,7 +726,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
                         if !keep(&held.key, &held.value) {
                             slot.store(tombstone(), Ordering::Release);
                             shard.len.fetch_sub(1, Ordering::Relaxed);
-                            retire_entry(shard, &mut writer, &self.map.alloc, entry, Plant::None);
+                            retire_entry(shard, &mut writer, &self.map.alloc, entry, NoPlant);
                         }
                     }
                 }
@@ -707,7 +749,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
             for slot in unsafe { &*table }.slots.iter() {
                 let entry = slot.load(Ordering::Relaxed);
                 if live(entry) {
-                    retire_entry(shard, &mut writer, &self.map.alloc, entry, Plant::None);
+                    retire_entry(shard, &mut writer, &self.map.alloc, entry, NoPlant);
                 }
             }
             shard.len.store(0, Ordering::Relaxed);
@@ -722,12 +764,15 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
         (shard.held.load(Ordering::Relaxed) >= COLLECT_AT).then(Horizon::now)
     }
 
-    fn remove_where<Q: ?Sized + Hash + Equivalent<K>>(
+    fn remove_where<Q: ?Sized + Equivalent<K>>(
         &self,
         key: &Q,
         should: impl FnOnce(&K, &V) -> bool,
-    ) -> Result<Option<(&K, &V)>, (&K, &V)> {
-        let hash = self.map.hasher.hash_one(key);
+    ) -> Result<Option<(&K, &V)>, (&K, &V)>
+    where
+        S: KeyHash<Q>,
+    {
+        let hash = self.hash_of(key);
         let shard = self.shard_of(hash);
         if shard.current().is_none_or(|table| table.find(hash, key).is_none()) {
             return Ok(None);
@@ -749,7 +794,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
                     if should(&held.key, &held.value) {
                         table.slots[at].store(tombstone(), Ordering::Release);
                         shard.len.fetch_sub(1, Ordering::Relaxed);
-                        retire_entry(shard, &mut writer, &self.map.alloc, entry, Plant::None);
+                        retire_entry(shard, &mut writer, &self.map.alloc, entry, NoPlant);
                         Ok(Some((&held.key, &held.value)))
                     } else {
                         Err((&held.key, &held.value))
@@ -763,13 +808,20 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
     }
 
     /// Puts `key` and `value` under the shard's lock, doing `held` to a slot that holds the key.
-    fn write(&self, key: K, value: V, held: Held, plant: Plant) -> Wrote<'_, K, V> {
-        let hash = self.map.hasher.hash_one(&key);
+    fn write(&self, key: K, value: V, held: Held, plant: impl Planted<Plant>) -> Wrote<'_, K, V> {
+        let hash = self.hash_of::<K>(&key);
         self.write_hashed(hash, key, value, held, plant)
     }
 
     /// [`Pinned::write`] of a key whose hash the caller has: `hash` is `key`'s.
-    fn write_hashed(&self, hash: u64, key: K, value: V, held: Held, plant: Plant) -> Wrote<'_, K, V> {
+    fn write_hashed(
+        &self,
+        hash: u64,
+        key: K,
+        value: V,
+        held: Held,
+        plant: impl Planted<Plant>,
+    ) -> Wrote<'_, K, V> {
         let shard = self.shard_of(hash);
         let horizon = self.horizon(shard);
         let (wrote, passed) = {
@@ -783,11 +835,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
             } else {
                 let (fresh, _) = Box::into_raw_with_allocator(Box::new_in(Entry { hash, key, value }, self.map.alloc.clone()));
                 sync::wrote(fresh.cast_const());
-                let publish = match plant {
-                    #[cfg(test)]
-                    Plant::RelaxedPublish => Ordering::Relaxed,
-                    _ => Ordering::Release,
-                };
+                let publish = if plant.has(Plant::RelaxedPublish) { Ordering::Relaxed } else { Ordering::Release };
                 let old = table.slots[at].swap(fresh, publish);
                 // SAFETY: just published, and freed only once retired: this pin keeps it.
                 let fresh_ref = unsafe { &*fresh };
@@ -812,7 +860,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
 
     /// [`Pinned::insert`] with a planted bug, for the model tests.
     #[cfg(test)]
-    pub(crate) fn insert_planted(&self, key: K, value: V, plant: Plant) -> Option<&V> {
+    pub(crate) fn insert_planted(&self, key: K, value: V, plant: impl Planted<Plant>) -> Option<&V> {
         match self.write(key, value, Held::Replace, plant) {
             Wrote::Replaced(old) => Some(&old.value),
             Wrote::Inserted(_) | Wrote::Kept(..) => None,
@@ -874,20 +922,18 @@ fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator
     writer: &mut Writer,
     alloc: &A,
     entry: *mut Entry<K, V>,
-    plant: Plant,
+    plant: impl Planted<Plant>,
 ) {
     // SAFETY: unlinked under the lock, by this writer alone: the limbo is its one owner now.
     // Boxed in the map's allocator, which `alloc` is a handle of.
     let entry = unsafe { Box::from_raw_in(entry, alloc.clone()) };
     // The planted bug frees the entry at once as far as the model can tell (its bytes marked
     // freed), and leaks the box, so the test reads no memory that is really freed.
-    #[cfg(test)]
-    if plant == Plant::FreeAtOnce {
+    if plant.has(Plant::FreeAtOnce) {
         sync::freed(ptr::from_ref(&*entry));
         core::mem::forget(entry);
         return;
     }
-    _ = plant;
     writer.limbo.retire(entry);
     shard.held.fetch_add(1, Ordering::Relaxed);
 }
@@ -1000,26 +1046,38 @@ impl<K, S, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, A, L> {
     }
 }
 
-impl<K, S: BuildHasher, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, A, L> {
-    pub fn contains<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> bool {
+impl<K, S, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, A, L> {
+    pub fn contains<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.contains_key(key)
     }
 
-    pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&K> {
+    pub fn get<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<&K>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.get_key_value(key).map(|(key, ())| key)
     }
 
     /// Starts loading the slot a [`PinnedSet::get`] of `key` reads first, as
     /// [`Pinned::prefetch`].
-    pub fn prefetch<Q: ?Sized + Hash>(&self, key: &Q) {
+    pub fn prefetch<Q: ?Sized>(&self, key: &Q)
+    where
+        S: KeyHash<Q>,
+    {
         self.0.prefetch(key);
     }
 
     /// [`PinnedSet::get`] of each of `keys`, as [`Pinned::get_many`] batches them.
-    pub fn get_many<Q: ?Sized + Hash + Equivalent<K>, const N: usize>(
+    pub fn get_many<Q: ?Sized + Equivalent<K>, const N: usize>(
         &self,
         keys: [&Q; N],
-    ) -> [Option<&K>; N] {
+    ) -> [Option<&K>; N]
+    where
+        S: KeyHash<Q>,
+    {
         let mut out = [None; N];
         self.0.each_entry::<Q, N>(
             N,
@@ -1030,7 +1088,7 @@ impl<K, S: BuildHasher, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, 
     }
 }
 
-impl<K: Hash + Eq + Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>
+impl<K: Eq + Send + Sync + 'static, S: KeyHash<K>, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>
     PinnedSet<'_, K, S, A, L>
 {
     /// Puts `key`; whether it was not held.
@@ -1039,7 +1097,10 @@ impl<K: Hash + Eq + Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone 
     }
 
     /// Takes `key` out; whether it was held.
-    pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> bool {
+    pub fn remove<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.remove(key).is_some()
     }
 

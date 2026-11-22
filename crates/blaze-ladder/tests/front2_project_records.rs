@@ -45,7 +45,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, BodyVerdict, ProjectWorld};
 use blaze_ladder::front2::project_records::ChainError;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::refusal::SourceFile;
 use blaze_own::Alloc;
 use blaze_scope::resolve::{At, aligned};
@@ -107,13 +107,10 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
     /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 

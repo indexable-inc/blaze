@@ -1,13 +1,20 @@
-//! Planted bugs for the oracles' controls (rule 53): a test sets one for the length of a closure
-//! on its own thread, and the code it names misbehaves on purpose. Outside tests [`on`] is
-//! `false` and folds away.
+//! The bugs a control can plant in the codecs (D165, rule 78: a strategy is a type parameter at
+//! one seam). Each machine that holds a plant check is generic over `P: Planted<DeflatePlant>`
+//! ([`PlantedInflate`](crate::PlantedInflate), [`PlantedInflateInto`](crate::PlantedInflateInto),
+//! [`PlantedDeflate`](crate::PlantedDeflate), [`PlantedGzipDecoder`](crate::PlantedGzipDecoder));
+//! the names shipped code uses ([`Inflate`](crate::Inflate) and the rest) are those machines with
+//! `NoPlant`, whose every `has` is `false`, so each check compiles away. The tests' controls
+//! (tests.rs) pass a value.
+
+#![blaze::sans_io]
+
+use blaze_own::planted::Plants;
 
 /// A bug a control plants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    /// Nothing planted: the code as it is.
-    #[cfg(test)]
-    Clean,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeflatePlant {
+    /// The code as it is.
+    None,
     /// The inflater never holds its output to the ratio: a bomb gets through.
     RatioUnchecked,
     /// The deflater sends every match one byte farther back than it found it.
@@ -18,27 +25,4 @@ pub(crate) enum Plant {
     FastDistanceOffByOne,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static PLANTED: core::cell::Cell<Plant> = const { core::cell::Cell::new(Plant::Clean) };
-}
-
-/// Whether `plant` is planted on this thread.
-#[cfg(test)]
-pub(crate) fn on(plant: Plant) -> bool {
-    PLANTED.with(core::cell::Cell::get) == plant
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) const fn on(_plant: Plant) -> bool {
-    false
-}
-
-/// Runs `body` with `plant` planted on this thread, and puts the clean code back after.
-#[cfg(test)]
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for DeflatePlant {}

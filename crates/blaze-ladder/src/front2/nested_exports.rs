@@ -43,7 +43,10 @@
 //! blaze-scope `expanded_blocks::written`) is copied whole into that module's text, so its
 //! fns are items of the library too, listed with crate 0's items and found there by the
 //! module-level rule. With a library key ([`Top::library`]) such a block's items are counted
-//! for ordinals but neither reported nor walked into: one export is never found twice.
+//! for ordinals but neither reported nor walked into by [`walk`]: one export is never found
+//! twice. [`walk_every`] still lists such a block's fns, statics and consts by their
+//! body-local keys and walks into their bodies, because `Locals::keep` files them under those
+//! keys whatever the library also writes.
 //!
 //! A new stage: no existing producer's output changes, no key domain is bumped.
 
@@ -483,10 +486,22 @@ impl<'a, 'c> Walker<'a, 'c> {
                     };
                     let ordinal = rows.iter().filter(|r| r.0 == kind && r.1 == name).count() as u32;
                     rows.try_push((kind, name)).map_err(|_| NestedRefusal::Alloc)?;
-                    if in_written {
+                    // A fn, static or const of a block the names library writes as a module is
+                    // that module's item too, so its export is found there by the module-level
+                    // rule and `walk` passes it over (one export never found twice). Its
+                    // BODY-LOCAL key is still the one `Locals::keep` files it under: locals.rs
+                    // keys every local fn, const and static by `local_key`, a written block's
+                    // too (only a type, trait, `mod` or `extern crate` is the block module's:
+                    // `LocalKind::in_block_module`). So `walk_every`, whose locals the lazy
+                    // program's cold search matches against that key (program/lazy/locate.rs),
+                    // lists it and walks into its body. curve25519-dalek 4.1.3
+                    // backend/serial/u64/field.rs:116, `fn m` in `<&FieldElement51 as Mul>::mul`,
+                    // whose block the `debug_assert!` statements after it make written: asked
+                    // cold, it was "no fn its records hold" (tempo-primitives, 2026-11-21 15:06).
+                    if in_written && !self.every {
                         continue;
                     }
-                    let after_call = nested.calls.iter().any(|c| (c.block, c.range.start) < (item.block, item.range.start));
+                    let after_call = nested.calls.iter().any(|c| !c.expr && (c.block, c.range.start) < (item.block, item.range.start));
                     let key = match parent {
                         Ok(_) if after_call => Err(Unkeyed::AfterCall),
                         Ok((crate_key, body)) => Ok(local_key(crate_key, body, kind.tag(), name, ordinal)),
@@ -497,7 +512,7 @@ impl<'a, 'c> Walker<'a, 'c> {
                         LocalKind::Static => Some(ExportForm::Static),
                         _ => None,
                     };
-                    if let (Some(symbol), Some(form)) = (symbol, form) {
+                    if let (Some(symbol), Some(form), false) = (symbol, form, in_written) {
                         self.out.exports.try_push(NestedExport { symbol, form, name, text: item_text, key, within: at }).map_err(|_| NestedRefusal::Alloc)?;
                     }
                     if self.every {

@@ -30,7 +30,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::bytes;
 use crate::eh_out::EhSections;
 use crate::error::ExportError;
-use crate::layout::{FixTo, Fixup, Laid, Plan};
+use crate::layout::{FixTo, Laid, Plan};
 use crate::native_dylib::{DYLIB_VERSION, dylib_command};
 use crate::native_merge::{Merged, NATIVE_DATA, NATIVE_TEXT, Sect, command_room};
 use crate::plant::{self, Plant};

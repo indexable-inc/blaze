@@ -96,6 +96,9 @@ pub struct Fx {
     /// Async blocks of other bodies (`PNode::Coroutine`): owner, ordinal, output and
     /// interior (of `t`, in the owner's parameters), as the owner's check records them.
     pub coroutines: Vec<(ItemKey, u32, PTy, PTy)>,
+    /// The [`Fx::coroutines`] rows whose interior is only a superset (the producer's flow was
+    /// refused): owner and ordinal. Every other row is exact.
+    pub provisional_coroutines: Vec<(ItemKey, u32)>,
     /// Type aliases (`type A<..> = X;`): key, generics and aliased type (of `t`, over the
     /// alias's parameters), what `type_alias` answers; an item without a row is `None`.
     pub type_aliases: Vec<(ItemKey, u32, PTy)>,
@@ -178,6 +181,7 @@ impl Fx {
             closures: Vec::new(),
             hidden: Vec::new(),
             coroutines: Vec::new(),
+            provisional_coroutines: Vec::new(),
             type_aliases: Vec::new(),
             fns: Vec::new(),
             adts: Vec::new(),
@@ -1019,6 +1023,7 @@ impl World for Fx {
             output: r.2,
             interior: r.3,
             types: self.t.view(),
+            is: if self.provisional_coroutines.contains(&(owner, ordinal)) { crate::world::InteriorIs::Superset } else { crate::world::InteriorIs::Exact },
         }))
     }
     /// The [`Fx::closures`] row: the facts another body's check recorded.
@@ -1111,6 +1116,15 @@ pub struct Bb {
     /// written inside `unsafe`, so its calls of `unsafe` fns (an intrinsic, a C fn) need no
     /// block; the unsafety check's own tests are blaze-ladder's tests/front2_unsafety.rs.
     unsafe_blocks: Vec<ExprId>,
+    /// The body's edition (`BodyView::edition`), 2021 unless [`Bb::body_edition`] says.
+    edition: Edition,
+    /// The expressions [`Bb::expr_edition`] marks as written in another edition, ascending,
+    /// and the runs `BodyView::expr_editions` made of them against `edition`.
+    expr_marks: Vec<(ExprId, Edition)>,
+    expr_editions: Vec<(ExprId, Edition)>,
+    /// As `expr_marks` and `expr_editions`, for patterns ([`Bb::pat_edition`]).
+    pat_marks: Vec<(PatId, Edition)>,
+    pat_editions: Vec<(PatId, Edition)>,
     pub t: PortableTys<'static>,
 }
 
@@ -1138,8 +1152,34 @@ impl Bb {
             coroutine: None,
             call_arg_ints: Vec::new(),
             unsafe_blocks: Vec::new(),
+            edition: Edition::E2021,
+            expr_marks: Vec::new(),
+            expr_editions: Vec::new(),
+            pat_marks: Vec::new(),
+            pat_editions: Vec::new(),
             t: PortableTys::new_in(Alloc::global()),
         }
+    }
+
+    /// The body as written in edition `ed`; the marked expressions and patterns keep theirs.
+    pub fn body_edition(&mut self, ed: Edition) {
+        self.edition = ed;
+        self.expr_editions = edition_runs(&self.expr_marks, ed, |e| ExprId(e.0 + 1));
+        self.pat_editions = edition_runs(&self.pat_marks, ed, |p| PatId(p.0 + 1));
+    }
+
+    /// Marks the expression `e`'s first word as written by a macro of edition `ed`
+    /// (`BodyView::expr_editions`), in any order; a second mark of `e` replaces the first.
+    pub fn expr_edition(&mut self, e: ExprId, ed: Edition) {
+        mark(&mut self.expr_marks, e, ed);
+        self.expr_editions = edition_runs(&self.expr_marks, self.edition, |e| ExprId(e.0 + 1));
+    }
+
+    /// Marks the pattern `p`'s first word as written by a macro of edition `ed`
+    /// (`BodyView::pat_editions`), as [`Bb::expr_edition`].
+    pub fn pat_edition(&mut self, p: PatId, ed: Edition) {
+        mark(&mut self.pat_marks, p, ed);
+        self.pat_editions = edition_runs(&self.pat_marks, self.edition, |p| PatId(p.0 + 1));
     }
 
     /// An integer literal written as a call's argument, whose value `value` the lowering
@@ -1413,7 +1453,7 @@ impl Bb {
     pub fn view(&self, owner: ItemKey, root: ExprId) -> BodyView<'_> {
         BodyView {
             owner,
-            edition: Edition::E2021,
+            edition: self.edition,
             params: &self.params,
             root,
             exprs: &self.exprs,
@@ -1444,6 +1484,8 @@ impl Bb {
             asm_text: "",
             call_arg_ints: &self.call_arg_ints,
             unsafe_blocks: &self.unsafe_blocks,
+            expr_editions: &self.expr_editions,
+            pat_editions: &self.pat_editions,
         }
     }
 
@@ -1490,6 +1532,35 @@ impl Bb {
     pub fn async_fn(&mut self, output: PTy) {
         self.coroutine = Some(CoroutineKind::Async { output });
     }
+}
+
+/// Sets `id`'s mark to `ed` in `marks` (ascending by id).
+fn mark<I: Ord + Copy>(marks: &mut Vec<(I, Edition)>, id: I, ed: Edition) {
+    match marks.binary_search_by_key(&id, |&(x, _)| x) {
+        Ok(i) => marks[i] = (id, ed),
+        Err(i) => marks.insert(i, (id, ed)),
+    }
+}
+
+/// The canonical runs `BodyView::expr_editions` holds for the single-id `marks` (ascending)
+/// in a body of edition `body`: each mark starts a run where its edition changes, and the id
+/// after it returns to `body` unless the next mark is that id.
+fn edition_runs<I: Ord + Copy>(marks: &[(I, Edition)], body: Edition, after: impl Fn(I) -> I) -> Vec<(I, Edition)> {
+    let mut runs = Vec::new();
+    let mut cur = body;
+    for (k, &(id, ed)) in marks.iter().enumerate() {
+        if ed != cur {
+            runs.push((id, ed));
+            cur = ed;
+        }
+        let next = after(id);
+        let adjacent = marks.get(k + 1).is_some_and(|&(n, _)| n == next);
+        if !adjacent && cur != body {
+            runs.push((next, body));
+            cur = body;
+        }
+    }
+    runs
 }
 
 /// A record's type, printed as Rust writes it (items by their declared names; a parameter of

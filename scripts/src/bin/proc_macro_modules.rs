@@ -46,6 +46,29 @@
 
 const SCRIPT: &str = "proc_macro_modules";
 
+/// The packages of the standard library's own workspace (the pinned toolchain's
+/// `library/Cargo.lock`) that `-Zbuild-std` builds for a module, each given
+/// `[profile.release.package.<name>] debug-assertions = false` in a crate's workspace: std is
+/// a release build, while the macro crate and its dependencies keep debug assertions (identity
+/// form 4). Only names no registry crate a macro depends on can have: std's third-party
+/// dependencies (hashbrown, cfg-if, libc, memchr, ...) are left out, since an override by name
+/// would reach the macro's copies of them too. A name the build does not reach is one cargo
+/// warns about and ignores.
+const STD_RELEASE: [&str; 12] = [
+    "core",
+    "alloc",
+    "std",
+    "proc_macro",
+    "panic_abort",
+    "panic_unwind",
+    "compiler_builtins",
+    "std_detect",
+    "unwind",
+    "rustc-std-workspace-core",
+    "rustc-std-workspace-alloc",
+    "rustc-std-workspace-std",
+];
+
 /// The manifest of the shim's package, `shim/` beside each member.
 const SHIM_MANIFEST: &str = "[package]\nname = \"blaze_pm_shim\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[lib]\npath = \"shim.rs\"\n";
 
@@ -56,7 +79,7 @@ const DOC: &str = r#"proc_macro_modules: build proc-macro crates to wasm32-wasip
     checkout   the project whose Cargo.lock pins the crates and their dependencies (read only), required
     store      the store folder the records go to, required
     work       a folder the run owns: the vendored sources, workspaces and target, required
-    tree       blaze's checkout: the shim, the target JSON, harness/toolchain (".")
+    tree       blaze's checkout: the shim, the target JSON, pins/toolchain (".")
     crates     [{"name", "version", "features"}]: each proc-macro crate to build; "features" is the
                list the host side of the project's graph unifies to. Absent, the crate's own
                default features are used and the output says "assumed default", required
@@ -92,6 +115,8 @@ mod store_vendor;
 // A script workspace's `[features]` lines keep their build-dependency enables (D112 N6).
 #[path = "proc_macro_modules/script_features.rs"]
 mod script_features;
+#[path = "proc_macro_modules/member_dependencies.rs"]
+mod member_dependencies;
 
 /// What a run is given.
 struct Args {
@@ -743,7 +768,7 @@ impl Toolchain {
 }
 
 fn toolchain(tree: &Path, home: &str) -> Result<Toolchain, Failure> {
-    let name = read(&tree.join("harness/toolchain"))?.trim().to_owned();
+    let name = read(&tree.join(blaze_pins::TOOLCHAIN_PATH))?.trim().to_owned();
     let rustup = PathBuf::from(home).join(".rustup/toolchains");
     let entries = std::fs::read_dir(&rustup).map_err(io(&rustup))?;
     let mut found = None;
@@ -768,7 +793,9 @@ fn crate_name(name: &str) -> String {
 /// The member manifest made from the crate's own: everything as the crate has it, its
 /// `[lib]` pointing at its unchanged source with `proc-macro` taken out, and its targets other
 /// than the library, its dev-dependencies and its file references dropped.
-fn member_manifest(original: &str, source: &Path, path: &Path) -> Result<String, Failure> {
+fn member_manifest(original: &str, source: &Path, path: &Path, features: &[String], alloc: blaze_own::Alloc<'_>) -> Result<String, Failure> {
+    let filtered = member_dependencies::filtered_manifest(original, path, features, alloc)?;
+    let original = filtered.as_str();
     let mut out = String::with_capacity(original.len() + 256);
     let mut section = String::new();
     let mut lib_path = false;
@@ -808,8 +835,6 @@ fn member_manifest(original: &str, source: &Path, path: &Path) -> Result<String,
             }
             section = trimmed.trim_matches(|c| c == '[' || c == ']').trim().to_owned();
             skip = matches!(section.as_str(), "bin" | "test" | "bench" | "example")
-                || section.starts_with("dev-dependencies")
-                || section.contains(".dev-dependencies")
                 || section == "badges"
                 || section.starts_with("package.metadata")
                 || section == "lints"
@@ -1458,7 +1483,7 @@ impl Plan<'_> {
 
     /// Step one: `cargo vendor` of every crate asked for, with its dependencies as the lock
     /// pins them, and of std's own dependencies. The network; no code of theirs runs.
-    fn fetch(&self) -> Result<(), Failure> {
+    fn fetch(&self, alloc: blaze_own::Alloc<'_>) -> Result<(), Failure> {
         let dir = self.work.join("fetch");
         // Each macro crate with the features asked for and `more`: an optional dependency
         // deeper down that a feature turns on (`alloy-sol-macro/json` -> `alloy-json-abi`) is
@@ -1493,7 +1518,8 @@ impl Plan<'_> {
                 write(&shim.join("Cargo.toml"), SHIM_MANIFEST)?;
                 write(&shim.join("shim.rs"), &self.shim_text)?;
                 let path = dir.join("Cargo.toml");
-                write(&self.path_member(wanted).join("Cargo.toml"), member_manifest(manifest, dir, &path)?)?;
+                let features = wanted.features.clone().unwrap_or_else(|| vec!["default".to_owned()]);
+                write(&self.path_member(wanted).join("Cargo.toml"), member_manifest(manifest, dir, &path, &features, alloc)?)?;
             }
         }
         let mut manifest = manifest_with(&[]);
@@ -1537,14 +1563,18 @@ impl Plan<'_> {
     }
 
     /// Step two for one crate: its workspace, its sandboxed offline build, its record.
-    fn build(&self, at: usize) -> Result<Built, Failure> {
+    fn build(&self, at: usize, alloc: blaze_own::Alloc<'_>) -> Result<Built, Failure> {
         let (wanted, origin) = (&self.args.crates[at], self.origin(at)?);
         let assumed_default = wanted.features.is_none();
         let mut features: Vec<String> = wanted.features.clone().unwrap_or_else(|| vec!["default".to_owned()]);
         features.sort();
         features.dedup();
         let identity = format!(
-            "blaze proc-macro module 2\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nbuilder bootstrap\n",
+            // The same text as crates/blaze-proc-macro/src/module.rs `identity` (form 4: the
+            // profile is an input; this builder sets `debug-assertions = true` for the macro
+            // crate and its dependencies, `false` for std's own crates ([`STD_RELEASE`]), and
+            // `-Zub-checks=no` for every crate, below).
+            "blaze proc-macro module 4\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),
@@ -1563,11 +1593,16 @@ impl Plan<'_> {
         let original_path = source.join("Cargo.toml");
         let original = self.manifest_of(at)?;
         let ws = self.work.join("ws").join(format!("{}-{}", wanted.name, wanted.version));
-        write(
-            &ws.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"macro\", \"shim\"]\nresolver = \"2\"\n\n[profile.release]\ndebug = false\nincremental = false\npanic = \"abort\"\ncodegen-units = 16\n",
-        )?;
-        write(&ws.join("macro/Cargo.toml"), member_manifest(&original, &source, &original_path)?)?;
+        // The macro crate and its dependencies see `cfg(debug_assertions)` as cargo's dev
+        // profile gives it (form 3); std's own crates, built here by `-Zbuild-std` under this
+        // workspace's profile, get a release override each ([`STD_RELEASE`]).
+        let mut manifest =
+            String::from("[workspace]\nmembers = [\"macro\", \"shim\"]\nresolver = \"2\"\n\n[profile.release]\ndebug = false\ndebug-assertions = true\nincremental = false\npanic = \"abort\"\ncodegen-units = 16\n");
+        for package in STD_RELEASE {
+            manifest.push_str(&format!("\n[profile.release.package.{package}]\ndebug-assertions = false\n"));
+        }
+        write(&ws.join("Cargo.toml"), &manifest)?;
+        write(&ws.join("macro/Cargo.toml"), member_manifest(&original, &source, &original_path, &features, alloc)?)?;
         write(&ws.join("shim/Cargo.toml"), SHIM_MANIFEST)?;
         write(&ws.join("shim/shim.rs"), &self.shim_text)?;
         write(&ws.join("Cargo.lock"), member_lock(&read(&self.work.join("fetch/Cargo.lock"))?, &wanted.name, &wanted.version))?;
@@ -1619,6 +1654,15 @@ impl Plan<'_> {
             format!("--remap-path-prefix={}=/build", self.work.display()),
             format!("--remap-path-prefix={}=/rustc/src", self.tool.sysroot.join("lib/rustlib/src/rust").display()),
             "-Cdebuginfo=0".to_owned(),
+            // No UB checks in any crate of the module. A check is decided where its function is
+            // monomorphized (core intrinsics `ub_checks`: "evaluation is delayed until
+            // monomorphization" in a crate with UB checks on), so std's generic and `#[inline]`
+            // code inlined into the macro crate checks whenever the MACRO crate has them on, and
+            // `-Zub-checks` defaults to `-Cdebug-assertions` (the pinned nightly's option text:
+            // "emit runtime checks for Undefined Behavior (default: -Cdebug-assertions)"). So
+            // the flag is on every crate, not only std's; `cfg(debug_assertions)` is untouched.
+            // A program with no UB behaves the same either way (a check only panics on UB).
+            "-Zub-checks=no".to_owned(),
         ];
         // A path package's sources are in the checkout, wherever it is: named by the package.
         if let Origin::Path { dir, .. } = origin {
@@ -1792,18 +1836,37 @@ fn main_with(args: &Args, heap: &blaze_own::Heap) -> i32 {
     };
     println!("{SCRIPT}: toolchain {} at {}", plan.tool.name, plan.tool.sysroot.display());
     let started = Instant::now();
-    // A macro crate's member is its whole manifest: every dependency it declares is resolved.
+    // A macro crate's member starts from its whole manifest, with optional dependencies outside
+    // the requested feature closure removed before Cargo resolves it.
+    let mut refused = vec![false; args.crates.len()];
     match &args.vendor_from {
-        Some(store) => plan.vendor_from(store, |manifest| manifest.to_owned(), heap.alloc()),
-        None => plan.fetch(),
+        Some(store) => {
+            for (at, wanted) in args.crates.iter().enumerate() {
+                if let Err(failure) = plan.vendor_from_one(store, at, |manifest| manifest.to_owned(), heap.alloc()) {
+                    refused[at] = true;
+                    println!("{} {}: FAILED: {failure}", wanted.name, wanted.version);
+                }
+            }
+            Ok(())
+        }
+        None => plan.fetch(heap.alloc()),
     }
     .unwrap_or_else(|failure| fail(failure));
-    correct_vendored(&plan.work.join("vendor")).unwrap_or_else(|failure| fail(failure));
+    // A run where every store fetch was refused has no vendor directory to correct. The
+    // per-crate refusals remain the result, while a successful crate still gets the shared
+    // vendor tree checked before any build starts.
+    if args.vendor_from.is_none() || refused.iter().any(|refused| !refused) {
+        correct_vendored(&plan.work.join("vendor")).unwrap_or_else(|failure| fail(failure));
+    }
     println!("{SCRIPT}: fetched in {:.1}s", started.elapsed().as_secs_f64());
     let mut failed = 0;
     for (at, wanted) in args.crates.iter().enumerate() {
+        if refused[at] {
+            failed += 1;
+            continue;
+        }
         let started = Instant::now();
-        match plan.build(at) {
+        match plan.build(at, heap.alloc()) {
             Ok(built) => {
                 let macros: Vec<String> = built
                     .macros
@@ -1878,6 +1941,201 @@ mod tests {
         };
         assert!(made.contains("\"unwind\""), "{made}");
         assert!(made.contains("\"asm-unwind\"]"), "{made}");
+    }
+
+    const OPTIONAL_MEMBER: &str = "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\npath = \"src/lib.rs\"\n\n[dependencies]\na = \"1\"\nb = { version = \"1\", optional = true }\nc = { version = \"1\", optional = true }\n\n[features]\ndefault = [\"x\"]\nx = [\"dep:b\", \"c?/std\"]\ny = [\"c/std\"]\n";
+
+    fn generated_member(manifest: &str, features: &[&str]) -> String {
+        let requested = features.iter().map(|feature| (*feature).to_owned()).collect::<Vec<_>>();
+        let alloc = blaze_own::testing::heap().alloc();
+        let path = Path::new("/crate/Cargo.toml");
+        let made = member_manifest(manifest, Path::new("/crate"), path, &requested, alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        member_dependencies::parse(&made, path, alloc).unwrap_or_else(|failure| panic!("generated member: {failure}\n{made}"));
+        made
+    }
+
+    fn optional_member(features: &[&str]) -> String {
+        generated_member(OPTIONAL_MEMBER, features)
+    }
+
+    fn feature_line<'m>(manifest: &'m str, feature: &str) -> &'m str {
+        manifest.lines().find(|line| line.starts_with(&format!("\"{feature}\" ="))).expect("the feature line")
+    }
+
+    /// Cargo's feature closure keeps `b` through `dep:b`, leaves the weak `c?/std` disabled,
+    /// and rewrites every feature line after the removed dependency is omitted.
+    #[test]
+    fn member_manifest_drops_optional_dependencies_not_enabled_by_features() {
+        let default = optional_member(&["default"]);
+        assert!(default.contains("b = { version = \"1\", optional = true }"));
+        assert!(!default.contains("c = { version = \"1\", optional = true }"));
+        assert_eq!(feature_line(&default, "x"), "\"x\" = [\"dep:b\"]");
+        assert_eq!(feature_line(&default, "y"), "\"y\" = []");
+
+        let none = optional_member(&[]);
+        assert!(!none.contains("b = { version = \"1\", optional = true }"));
+        assert!(!none.contains("c = { version = \"1\", optional = true }"));
+        assert_eq!(feature_line(&none, "x"), "\"x\" = []");
+        assert_eq!(feature_line(&none, "y"), "\"y\" = []");
+
+        let y = optional_member(&["y"]);
+        assert!(!y.contains("b = { version = \"1\", optional = true }"));
+        assert!(y.contains("c = { version = \"1\", optional = true }"));
+        // y enables c, so x's weak forwarding edge still names a retained dependency.
+        assert_eq!(feature_line(&y, "x"), "\"x\" = [\"c?/std\"]");
+        assert_eq!(feature_line(&y, "y"), "\"y\" = [\"c/std\"]");
+        println!("member manifest closure: default keeps b, [] drops b and c, y keeps c");
+    }
+
+    /// The inline form keeps strong forwarding alongside explicit dependency activation.
+    #[test]
+    fn member_manifest_handles_clap_and_rust_embed_optional_features() {
+        let manifest = "[package]\nname = \"shape\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n\n[dependencies]\npulldown-cmark = { version = \"0.10\", optional = true }\nrust-embed-impl = { version = \"8.12\", optional = true }\n\n[features]\nunstable-markdown = [\"dep:pulldown-cmark\", \"pulldown-cmark/unsafe-autolinks\"]\ninterpolate-folder-path = [\"dep:rust-embed-impl\"]\n";
+        let made = generated_member(manifest, &["unstable-markdown"]);
+        assert!(made.contains("pulldown-cmark = { version = \"0.10\", optional = true }"));
+        assert!(!made.contains("rust-embed-impl = { version = \"8.12\", optional = true }"));
+        assert_eq!(feature_line(&made, "unstable-markdown"), "\"unstable-markdown\" = [\"dep:pulldown-cmark\", \"pulldown-cmark/unsafe-autolinks\"]");
+        assert_eq!(feature_line(&made, "interpolate-folder-path"), "\"interpolate-folder-path\" = []");
+        println!("member manifest real shapes: clap keeps pulldown-cmark, rust-embed stays disabled");
+    }
+
+    #[test]
+    fn clap_derive_normalized_dependencies_follow_unstable_markdown() {
+        let manifest = r#"[package]
+name = "clap_derive"
+version = "4.6.7"
+[features]
+default = []
+unstable-markdown = [
+    "dep:pulldown-cmark",
+    "dep:anstyle",
+]
+[lib]
+name = "clap_derive"
+path = "src/lib.rs"
+proc-macro = true
+[dependencies.anstyle]
+version = "1.0.14"
+optional = true
+[dependencies.heck]
+version = "0.5.0"
+[dependencies.proc-macro2]
+version = "1.0.106"
+[dependencies.pulldown-cmark]
+version = "0.13.3"
+optional = true
+default-features = false
+[dependencies.quote]
+version = "1.0.45"
+[dependencies.syn]
+version = "3.0.2"
+features = ["full"]
+"#;
+        let default = generated_member(manifest, &["default"]);
+        let markdown = generated_member(manifest, &["unstable-markdown"]);
+        for name in ["heck", "proc-macro2", "quote", "syn"] {
+            let header = format!("[dependencies.{name}]");
+            assert!(default.lines().any(|line| line == header), "{default}");
+            assert!(markdown.lines().any(|line| line == header), "{markdown}");
+        }
+        for name in ["anstyle", "pulldown-cmark"] {
+            assert!(!default.contains(name), "{default}");
+            assert!(markdown.contains(&format!("[dependencies.{name}]\n")), "{markdown}");
+        }
+        assert!(!default.contains("default-features = false"), "{default}");
+        assert_eq!(feature_line(&default, "unstable-markdown"), "\"unstable-markdown\" = []");
+        assert_eq!(feature_line(&markdown, "unstable-markdown"), "\"unstable-markdown\" = [\"dep:pulldown-cmark\", \"dep:anstyle\"]");
+        println!("clap_derive: default keeps heck, proc-macro2, quote, syn; unstable-markdown adds pulldown-cmark and anstyle");
+    }
+
+    #[test]
+    fn rust_embed_impl_normalized_dependencies_follow_interpolate_folder_path() {
+        let manifest = r#"[package]
+name = "rust-embed-impl"
+version = "8.12.0"
+[features]
+"include-exclude" = ["rust-embed-utils/include-exclude"]
+"interpolate-folder-path" = ["shellexpand"]
+[lib]
+name = "rust_embed_impl"
+proc-macro = true
+[dependencies.mime_guess]
+version = "2.0.4"
+[dependencies.proc-macro2]
+version = "1"
+[dependencies.quote]
+version = "1"
+[dependencies.rust-embed-utils]
+version = "8.12.0"
+[dependencies.shellexpand]
+version = "3"
+optional = true
+[dependencies.syn]
+version = "2"
+features = [
+    "derive",
+    "parsing",
+    "proc-macro",
+    "printing",
+]
+default-features = false
+[dependencies.walkdir]
+version = "2.3.1"
+"#;
+        let none = generated_member(manifest, &[]);
+        assert!(!none.contains("shellexpand"), "{none}");
+        assert_eq!(feature_line(&none, "interpolate-folder-path"), "\"interpolate-folder-path\" = []");
+        assert_eq!(feature_line(&none, "include-exclude"), "\"include-exclude\" = [\"rust-embed-utils/include-exclude\"]");
+        for name in ["mime_guess", "proc-macro2", "quote", "rust-embed-utils", "syn", "walkdir"] {
+            assert!(none.contains(&format!("[dependencies.{name}]\n")), "{none}");
+        }
+        let syn = manifest.split_once("[dependencies.syn]\n").unwrap().1.split_once("[dependencies.walkdir]").unwrap().0;
+        assert!(none.contains(syn), "{none}");
+        let enabled = generated_member(manifest, &["interpolate-folder-path"]);
+        assert!(enabled.contains("[dependencies.shellexpand]\nversion = \"3\"\noptional = true"), "{enabled}");
+        assert_eq!(feature_line(&enabled, "interpolate-folder-path"), "\"interpolate-folder-path\" = [\"shellexpand\"]");
+        println!("rust-embed-impl: [] keeps syn's feature array; interpolate-folder-path adds shellexpand");
+    }
+
+    #[test]
+    fn target_and_build_tables_are_selected_by_alias() {
+        let manifest = r#"[package]
+name = "m"
+version = "1.0.0"
+[lib]
+proc-macro = true
+[features]
+"render" = ["alias/syntax", "dep:inline"]
+[target.'cfg(target_os = "linux")'.dependencies."alias"]
+features = [
+    "only-in-alias",
+]
+optional = true # follows the array
+package = "real"
+version = "1"
+# only-in-alias, after the final setting
+[build-dependencies]
+inline = { package = "other", version = "1", optional = true }
+[build-dependencies.always]
+version = "1"
+[dev-dependencies.unit]
+version = "1"
+[target.'cfg(unix)'.dev-dependencies.only-tests]
+version = "1"
+"#;
+        let none = generated_member(manifest, &[]);
+        for fragment in ["alias", "only-in-alias", "inline", "other", "dev-dependencies"] {
+            assert!(!none.contains(fragment), "{none}");
+        }
+        let enabled = generated_member(manifest, &["render"]);
+        assert!(enabled.contains("package = \"real\""), "{enabled}");
+        assert!(enabled.contains("\"only-in-alias\""), "{enabled}");
+        assert!(enabled.contains("inline = { package = \"other\""), "{enabled}");
+        for made in [&none, &enabled] {
+            assert!(made.contains("[build-dependencies.always]"), "{made}");
+            assert!(!made.contains("dev-dependencies"), "{made}");
+        }
+        println!("render keeps the target alias and inline build dependency; both dev tables are omitted");
     }
 
     /// The drift the first run of tempo's 79 had: syn 1.0.109 compiled where the lock gives

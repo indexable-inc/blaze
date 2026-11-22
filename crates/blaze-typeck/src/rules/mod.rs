@@ -47,6 +47,7 @@ pub(crate) mod pat;
 pub(crate) mod promote;
 pub(crate) mod qpath_defaults;
 pub(crate) mod reify;
+pub(crate) mod rpitit_use;
 pub(crate) mod self_path;
 pub(crate) mod target_feature;
 pub(crate) mod unsafety;

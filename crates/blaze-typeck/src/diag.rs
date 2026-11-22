@@ -9,7 +9,7 @@ use crate::ty::{Ty, TyList};
 mod about;
 pub(crate) use about::About;
 mod node;
-pub use node::{Node, SKETCH_DEPTH, SKETCH_NODES, expr_form, node_form, pat_form, range_shared, sketch};
+pub use node::{Node, expr_form, node_form, pat_form, range_shared, sketch};
 
 /// The mark of a finding built by a constructor of src/diag/about.rs, each of which takes what
 /// the finding is about (rule 76). Private to `diag`, so no struct literal of [`Diag`] or
@@ -56,6 +56,10 @@ pub enum DiagCode {
     /// E0412: cannot find type. Filed by the front end for a written type whose path names
     /// nothing (the checker sees it as the error type): blaze-ladder front2 body.rs `TypeMiss`.
     UnresolvedType,
+    /// E0405: cannot find trait. Filed by the front end for a bound of a fn's own signature
+    /// whose trait path names nothing (the bound is dropped, the head made without it):
+    /// blaze-ladder front2 type_miss.rs `HeadMiss`.
+    UnresolvedTrait,
     /// E0423 / E0533: expected value, found a type, trait or struct name.
     NotAValue,
     /// E0574: expected struct, found something else.
@@ -66,6 +70,9 @@ pub enum DiagCode {
     NotAMethod,
     /// E0034: multiple applicable items in scope.
     AmbiguousMethod,
+    /// E0624: the only methods of the name that apply are inherent ones the body may not name
+    /// (the Reference, "Visibility and privacy"; rules/method.rs).
+    PrivateMethod,
     /// E0609: no field on type.
     NoField,
     /// E0610: a primitive type has no fields.
@@ -170,6 +177,8 @@ pub enum DiagCode {
     RequiresUnsafe,
     /// E0784: a union's struct pattern that names other than exactly one field (rules/pat.rs).
     UnionPatternFields,
+    /// E0271: an associated type resolves to a different type than a required equality.
+    ProjectionMismatch,
 }
 
 impl DiagCode {
@@ -193,13 +202,16 @@ impl DiagCode {
             DiagCode::IfWithoutElse => "E0317",
             DiagCode::AnnotationsNeeded => "E0282",
             DiagCode::CannotSatisfy => "E0283",
+            DiagCode::ProjectionMismatch => "E0271",
             DiagCode::Unsatisfied => "E0277",
             DiagCode::UnresolvedPath => "E0425",
             DiagCode::UnresolvedType => "E0412",
+            DiagCode::UnresolvedTrait => "E0405",
             DiagCode::NotAValue => "E0423",
             DiagCode::NotAStruct => "E0574",
             DiagCode::NoMethod | DiagCode::NotAMethod => "E0599",
             DiagCode::AmbiguousMethod => "E0034",
+            DiagCode::PrivateMethod => "E0624",
             DiagCode::NoField => "E0609",
             DiagCode::PrimitiveField => "E0610",
             DiagCode::NoSuchFieldInit => "E0560",
@@ -321,6 +333,209 @@ pub enum UnmetGoal {
     Projection { trait_: ItemKey, args: List, name: Name, term: PTy },
 }
 
+/// Where an inference variable was made (rule 19: an E0282 names WHAT is undecided, not only
+/// where the walk needed it). Kept per variable when it is made (machine.rs `var_origins`,
+/// [`crate::machine::Machine::fresh_from`]); a variable no rule named is [`VarOrigin::Other`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VarOrigin {
+    /// Generic parameter `index` (the item's own and its parents', parents first) of `item`, at
+    /// a use that wrote no argument for it (a path, a method call).
+    GenericArg { item: ItemKey, index: u32 },
+    /// Parameter `index` of closure `closure`: no type written, none expected.
+    ClosureParam { closure: ExprId, index: u32 },
+    /// The return type of closure `closure`: none written, none expected.
+    ClosureReturn { closure: ExprId },
+    /// What the projection `<_ as trait_<..>>::name` normalizes to, not decided yet: its
+    /// arguments still hold a variable (machine.rs `projection_for_use`, an ambiguous answer).
+    Projection { trait_: ItemKey, name: Name },
+    /// A variable a rule made for a value of its own, not named yet.
+    Other,
+}
+
+/// How many of the goals pending on an undecided variable a finding keeps ([`UndecidedVar`]).
+pub const MOST_PENDING_SHOWN: usize = 2;
+
+/// The variable an E0282 is about (the type the walk needed and found undecided): where it
+/// was made, and the goals still pending that name it, the first [`MOST_PENDING_SHOWN`] of
+/// them (trait and projection goals, in the order they were registered) and how many in all.
+/// What a person reads to fix it: which argument to annotate, and which bound did not decide
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UndecidedVar {
+    pub origin: VarOrigin,
+    pub pending: [Option<UnmetGoal>; MOST_PENDING_SHOWN],
+    /// Every pending goal naming the variable, those not kept included.
+    pub pending_count: u32,
+}
+
+/// [`UndecidedVar`] before writeback: the goals in terms of the inference table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingUndecided {
+    pub origin: VarOrigin,
+    pub pending: [Option<PendingGoal>; MOST_PENDING_SHOWN],
+    pub pending_count: u32,
+}
+
+/// Why an unmet trait goal has no solution, as the solver walked it (blaze-solve why_no.rs,
+/// `Solver::why_no`): the steps from the finding's goal down to the first goal under it that
+/// fails by itself, and why that one fails. The Reference is the spec of each step ("Auto
+/// traits": an ADT, tuple, closure or async block's future is `Send` when every field,
+/// element, capture or held value is; "Implementations": an impl holds where its where-clauses
+/// hold). Typed data, no words: the front end prints it (front2 check.rs `diag_about`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Why {
+    /// The steps' first row in the record's `why` column ([`crate::Checked::why_of`]), the
+    /// finding's own goal first ([`WhyReached::Root`]), each next one a goal of the one before.
+    pub start: u32,
+    /// How many steps (at least one: the root).
+    pub len: u32,
+    /// Why the last step's goal fails by itself.
+    pub leaf: WhyLeaf,
+}
+
+/// One step of a [`Why`]: the goal, and what it is of the step before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WhyStep {
+    /// The step's goal, `Self` first, in the record's type table: `None` where the step is no
+    /// positive trait goal (a projection, a well-formedness goal), or its goal names a type the
+    /// solver's walk left open (its variables die with the walk; never printed as a guess).
+    pub goal: Option<UnmetGoal>,
+    pub reached: WhyReached,
+}
+
+/// What a step's goal is of the step before it (blaze-solve why_no.rs `Reached`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WhyReached {
+    /// The finding's own goal.
+    Root,
+    /// Where-clause `clause` (in the impl's order) of `impl_`, the impl that applied.
+    ImplClause { impl_: ItemKey, clause: u32 },
+    /// Field `field` of the ADT `adt` (an auto trait's constituent; every variant's fields in
+    /// declaration order).
+    Field { adt: ItemKey, field: u32 },
+    /// Type argument `arg` of the ADT `adt` (its fields hold it).
+    AdtArg { adt: ItemKey, arg: u32 },
+    /// The target of a reference.
+    RefTarget,
+    /// The pointee of a raw pointer.
+    PtrTarget,
+    /// The element of an array, slice or pattern type, or `[u8]` of `str`.
+    Element,
+    /// Element `index` of a tuple.
+    TupleElement { index: u32 },
+    /// Capture `capture` of `closure`, in the closure's capture order.
+    Capture { closure: WhyDef, capture: u32 },
+    /// Slot `slot` of the interior of the async block's future `coroutine`: its captures, then
+    /// what it holds across an `.await`, in the interior's order. The check's interior is a
+    /// superset (rules/coroutine.rs `analyze_futures`) and keeps no value or `.await` per slot;
+    /// the exact one's are the flow's (blaze-flow-lower `interior`).
+    CoroutineSlot { coroutine: WhyDef, slot: u32 },
+    /// The captures of `closure` as one tuple (the next step names the capture).
+    Captures { closure: WhyDef },
+    /// The interior of `coroutine` as one tuple (the next step names the slot).
+    Interior { coroutine: WhyDef },
+    /// `T` of `PhantomData<T>`.
+    Phantom,
+    /// The hidden type of the opaque type `opaque` (an auto trait "leaks" through it).
+    Hidden { opaque: ItemKey },
+    /// The `nth` goal a candidate added for its own reason (a where-clause of the environment,
+    /// an alias's bound, a builtin's requirement); `u32::MAX` for one a nested goal handed back.
+    Other { nth: u32 },
+}
+
+/// A closure or async block a [`WhyReached`] step names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WhyDef {
+    /// This body's closure or async block, by its expression.
+    Expr(ExprId),
+    /// The `ordinal`-th closure or async block of another body, `owner`'s
+    /// (src/coroutine_id.rs).
+    Of { owner: ItemKey, ordinal: u32 },
+}
+
+/// Why the last step of a [`Why`] fails by itself (blaze-solve why_no.rs `Leaf`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WhyLeaf {
+    /// No impl names the type, no where-clause or bound says it, no builtin rule applies.
+    NoImpl,
+    /// The negative impl `impl_` names the type (`impl !Send for Rc<T>`).
+    NegativeImpl { impl_: ItemKey },
+    /// Every candidate was refused by its rule (`count` of them): `first_impl` is the first
+    /// one where it is an impl (an impl for other types), `None` where a builtin or a bound.
+    Refused { first_impl: Option<ItemKey>, count: u32 },
+    /// A builtin rule refused the goal and no other candidate came (a coroutine is never
+    /// `Unpin`).
+    BuiltinNo,
+    /// The walk met a goal already on its path: a cycle the search answered No.
+    Cycle,
+    /// The solver kept no more rows, or the chain is deeper than it walks: the chain stops
+    /// here, said (blaze-solve `MAX_WHY_ROWS`, `MAX_WHY_DEPTH`).
+    NotKept,
+    // An undecided goal's leaves (blaze-solve why_maybe.rs `Leaf`): why the last step's goal
+    // cannot be decided yet by itself.
+    /// Term `term` of the last step's goal (a trait goal's arguments, `Self` first; a
+    /// projection's alias, then its term) is a type not known yet.
+    Unresolved { term: u32 },
+    /// `count` candidates may each hold and none can be chosen (rustc's E0283), the first two
+    /// in the solver's order.
+    Ambiguous { first: WhyCand, second: WhyCand, count: u32 },
+    /// The evaluation met a limit (rustc's E0275).
+    Limit { hit: WhyLimit },
+    /// The goal looks into the hidden type of the opaque type `opaque`, not defined yet.
+    HiddenUnknown { opaque: ItemKey },
+    /// The goal looks into the interior of `coroutine`, not decided yet.
+    InteriorUnknown { coroutine: WhyDef },
+    /// The goal looks into the captures of `closure`, not decided yet.
+    CapturesUnknown { closure: WhyDef },
+    /// The projection of the associated item `alias` does not normalize yet.
+    Unnormalized { alias: ItemKey },
+    /// The rule of `cand` cannot decide the goal yet, with no unknown type in it (an
+    /// unevaluated constant, a closure kind not known yet).
+    RuleUndecided { cand: WhyCand },
+}
+
+/// A candidate a [`WhyLeaf`] names (blaze-solve `Choice`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WhyCand {
+    /// The impl `impl_`.
+    Impl { impl_: ItemKey },
+    /// A where-clause in scope (the solver's index `nth` among the environment's).
+    WhereClause { nth: u32 },
+    /// A bound of the self type's alias or opaque type.
+    AliasBound,
+    /// A rule of the language (a builtin impl, a trait object's own bounds).
+    Builtin,
+    /// Coherence: an impl a downstream or future crate may write.
+    Unknowable,
+}
+
+/// The limit a [`WhyLeaf::Limit`] met (blaze-solve why_maybe.rs `LimitHit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WhyLimit {
+    /// The goal stood `depth` deep, at the recursion limit `limit`.
+    Depth { depth: u32, limit: u32 },
+    /// A cycle's answer did not settle in `reruns` reruns.
+    Fixpoint { reruns: u32 },
+    /// A candidate's nested goals kept changing for `rounds` rounds.
+    Rounds { rounds: u32 },
+}
+
+/// [`WhyStep`] before writeback, as [`crate::TypeCtx::why_chain`] gives it: the goal
+/// (`trait_` and every argument, `Self` first) in terms of the inference table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingWhyStep {
+    pub goal: Option<(ItemKey, TyList)>,
+    pub reached: WhyReached,
+}
+
+/// A [`Why`] before writeback: its steps a range of the machine's `why_steps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingWhy {
+    pub start: u32,
+    pub len: u32,
+    pub leaf: WhyLeaf,
+}
+
 /// [`UnmetGoal`] before writeback: terms of the inference table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingGoal {
@@ -375,6 +590,11 @@ pub(crate) struct PendingDiag {
     /// An unmet goal and its leaf, exported at writeback as `Because::Unmet` (set only with
     /// `because: None`).
     pub unmet: Option<(PendingGoal, Option<PendingGoal>)>,
+    /// Why the unmet trait goal has no solution, the solver's chain (set only with `unmet`).
+    pub why: Option<PendingWhy>,
+    /// For an E0282 about a variable: where it was made and the goals pending on it
+    /// ([`PendingDiag::with_undecided`]).
+    pub undecided: Option<PendingUndecided>,
     /// Built only by a constructor of src/diag/about.rs.
     said: Said,
 }
@@ -399,6 +619,15 @@ pub struct Diag {
     /// range does not (in an expansion every node has the call's range; rule 19). `None` for a
     /// finding about the whole body or about written text that is no node.
     pub node: Option<Node>,
+    /// For an unmet trait goal (E0277, `because` is [`Because::Unmet`]): why it has no
+    /// solution, the solver's chain from the goal to the goal that fails by itself, its steps
+    /// in the record's `why` column. `None` where the check asked none (a stalled goal's
+    /// finding: the chain on the superset interior is not the exact one's).
+    pub why: Option<Why>,
+    /// For an E0282 (`AnnotationsNeeded`) about an inference variable: where the variable was
+    /// made and the goals pending on it (rule 19). `None` for every other finding, and for an
+    /// E0282 whose type held no variable the walk could name.
+    pub undecided: Option<UndecidedVar>,
     /// Built only by [`PendingDiag::export`] or [`Diag::dyn_incompatible`].
     said: Said,
 }

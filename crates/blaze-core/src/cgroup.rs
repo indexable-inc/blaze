@@ -45,7 +45,7 @@ static READYING: Lock<()> = Lock::new("core.cgroup.readying", ());
 /// The paths of cgroups that ended, each taken by one made after: a spawn's cgroup allocates
 /// nothing once as many have ended as run at once.
 // alloc: the queue's `SPARES` slots, once a process
-static SPARE: LazyLock<ArrayQueue<Vec<u8>>> = LazyLock::new(|| ArrayQueue::new(SPARES));
+static SPARE: LazyLock<ArrayQueue<Vec<u8>, std::alloc::Global>> =LazyLock::new(|| ArrayQueue::new(SPARES));
 
 /// The most paths kept in [`SPARE`].
 const SPARES: usize = 64;

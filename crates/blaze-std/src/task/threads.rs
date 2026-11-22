@@ -37,7 +37,7 @@ use core::{
     fmt,
     hint,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -53,7 +53,7 @@ use blaze_own::{Arc, Vec, VecDeque};
 use super::{
     TaskError,
     claim::{Claim, ClaimPlant, Start},
-    deque::{DEQUE, Deque, DequePlant, Steal},
+    deque::{Deque, DequePlant, Steal},
     idle::{Idle, IdlePlant, Mark, Woke},
     ring::{self, PoolPlant, RingEnd},
     seat::{Current, Named, Seats},

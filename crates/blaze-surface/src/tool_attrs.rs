@@ -73,7 +73,7 @@ const fn known(name: &'static str, planned: Stage) -> KnownAttr {
 /// Every `blaze::` attribute this build knows, sorted by name: the extensions ledger's section 3
 /// (2026-11-16), every one known and unchecked today but `args` (rule 83, 2026-11-17). A stage that starts to check one, or the
 /// verdict that removes one, changes its `state` here and nowhere else.
-pub const KNOWN: [KnownAttr; 50] = {
+pub const KNOWN: [KnownAttr; 52] = {
     use Stage::*;
     [
         known("answers_request", Effects),
@@ -91,6 +91,9 @@ pub const KNOWN: [KnownAttr; 50] = {
         known("consumes", Ownership),
         known("contract_test", Proofs),
         known("differentiable", Codegen),
+        // `#![blaze::driver]`: the thin driver over a sans-IO core, which holds the handles and
+        // does the IO the core asks for (D170 C5; blaze-lint `RootMarks`, `sans-io-core`).
+        known("driver", Effects),
         known("drop", Ownership),
         known("early_drop", Ownership),
         known("edition", Syntax),
@@ -102,6 +105,10 @@ pub const KNOWN: [KnownAttr; 50] = {
         known("invariant", Proofs),
         known("linear", Ownership),
         known("lock_checked", Effects),
+        // `#[blaze::lock_exception(tried = "published"|"gathered"|"claimed", why = "..")]` on
+        // the statement, field, static, const or item that constructs a lock: which D179 shape
+        // it was tried as and why that failed (blaze-lint `lock-without-reason` reads it).
+        known("lock_exception", Effects),
         known("mark", Comptime),
         known("may", Effects),
         known("may_suspend", Effects),

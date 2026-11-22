@@ -7,6 +7,10 @@
 //! copy from [`PAIRS`], [`LOWER`] and [`UPPER`], whose bytes are all ASCII (checked at compile
 //! time below).
 
+use blaze_own::planted::Planted;
+
+use crate::plant::TextPlant;
+
 /// `"00" "01" .. "99"`: the two digits of `r` at `2 * r`.
 pub(crate) const PAIRS: [u8; 200] = {
     let mut out = [0u8; 200];
@@ -93,11 +97,14 @@ impl<const N: usize> Ascii<N> {
         }
     }
 
-    /// The two digits of `r` (below 100) before the first, from [`PAIRS`].
+    /// The two digits of `r` (below 100) before the first, from [`PAIRS`];
+    /// [`TextPlant::DigitPairOffByOne`] reads the pair after it.
     #[inline(always)]
-    pub(crate) fn front_pair(&mut self, r: usize) {
-        #[cfg(test)]
-        let r = crate::plant::digit_pair(r);
+    pub(crate) fn front_pair(&mut self, r: usize, plant: impl Planted<TextPlant>) {
+        let r = match plant.has(TextPlant::DigitPairOffByOne) {
+            true => (r + 1) % 100,
+            false => r,
+        };
         self.start -= 2;
         self.bytes[self.start] = PAIRS[2 * r];
         self.bytes[self.start + 1] = PAIRS[2 * r + 1];

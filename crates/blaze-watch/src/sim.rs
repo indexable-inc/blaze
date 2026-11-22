@@ -7,6 +7,7 @@
 //! thread. The orderings watch.md states are the claim a weak-memory checker (blaze-check) is to
 //! take over; this simulation proves the protocol's logic, not its fences.
 
+mod helper;
 mod pack;
 mod resume;
 mod ring;
@@ -21,6 +22,53 @@ use blaze_sim::{Broke, Tape};
 
 use crate::Random;
 use crate::ring::Cells;
+
+/// One simulation test's lap, printed as one line on standard error when the test ends (passed
+/// or failed: it prints from `Drop`, so a failing test's unwind prints it too; `cargo test --
+/// --nocapture` shows it): the test's name, the cases it ran (a control's clean run and its
+/// planted one together), its wall time, and the virtual time its cases' clocks advanced in
+/// all (`not clocked` for a simulation with no clock). The profile of a slow suite: which test
+/// took the time, and whether by many cases or long ones.
+pub(crate) struct Lap {
+    name: &'static str,
+    born: std::time::Instant,
+    cases: Cell<u64>,
+    virtual_ns: Cell<u64>,
+    clocked: Cell<bool>,
+}
+
+impl Lap {
+    pub(crate) fn new(name: &'static str) -> Lap {
+        Lap { name, born: std::time::Instant::now(), cases: Cell::new(0), virtual_ns: Cell::new(0), clocked: Cell::new(false) }
+    }
+
+    /// One case ran; `result` is passed through.
+    pub(crate) fn case<R>(&self, result: R) -> R {
+        self.cases.set(self.cases.get() + 1);
+        result
+    }
+
+    /// One case ran, its clock having advanced `ns`; `result` is passed through.
+    pub(crate) fn clocked<R>(&self, ns: u64, result: R) -> R {
+        self.clocked.set(true);
+        self.virtual_ns.set(self.virtual_ns.get().saturating_add(ns));
+        self.case(result)
+    }
+}
+
+impl Drop for Lap {
+    #[expect(clippy::print_stderr, reason = "a simulation test's lap is one line on the test's own standard error, which cargo's harness captures and `--nocapture` shows")]
+    fn drop(&mut self) {
+        let wall = self.born.elapsed();
+        let cases = self.cases.get();
+        let per_case_us = if cases == 0 { 0 } else { wall.as_micros() / u128::from(cases) };
+        let virtual_time = match self.clocked.get() {
+            true => format!("{:.1} s virtual in all", self.virtual_ns.get() as f64 / 1e9),
+            false => "not clocked".to_string(),
+        };
+        eprintln!("blaze-watch sim lap: {}: {cases} cases, {:.1} ms wall ({per_case_us} us a case), {virtual_time}", self.name, wall.as_secs_f64() * 1e3);
+    }
+}
 
 /// The harness went wrong: a machine refused a call the simulation should not have made.
 pub(crate) fn harness(error: impl Display) -> Broke {
@@ -128,10 +176,11 @@ fn blaze_runs_wire_forms_keep_their_layout() {
 
 #[test]
 fn a_key_survives_base64url() {
+    let lap = Lap::new("a key survives base64url");
     blaze_sim::check(blaze_sim::Config::cases(500), |tape| {
         let mut key = [0u8; 32];
         TapeRandom(tape).fill(&mut key);
         let text = base64url(&key);
-        oracle(crate::http::key_from_base64url(&text) == Some(key), || format!("{text} did not decode to its key"))
+        lap.case(oracle(crate::http::key_from_base64url(&text) == Some(key), || format!("{text} did not decode to its key")))
     });
 }

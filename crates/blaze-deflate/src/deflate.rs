@@ -27,10 +27,13 @@
 
 use core::{alloc::Allocator, fmt};
 
-use blaze_own::{AllocFailure, Vec};
+use blaze_own::{
+    AllocFailure, Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
-    plant::{self, Plant},
+    plant::DeflatePlant,
     tables::{
         DIST_BASE, DIST_EXTRA, DIST_SYMBOLS, FIXED_DIST_LENS, FIXED_LIT_LENS, LEN_BASE, LEN_CODE,
         LEN_EXTRA, LIT_SYMBOLS, MAX_MATCH, MIN_MATCH, PRECODE_ORDER, WINDOW, dist_code, reverse,
@@ -128,8 +131,18 @@ impl Bits {
     }
 }
 
-/// A streaming deflater: see the module. Ends with [`Deflate::finish`].
-pub struct Deflate<A: Allocator> {
+/// Whether a deflater still takes input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stream {
+    /// Writes are taken.
+    Open,
+    /// The final block is out: every write and finish is [`DeflateError::Finished`].
+    Finished,
+}
+
+/// A streaming deflater: see the module. Ends with [`Deflate::finish`]. `P` is the plant seam
+/// (D165): shipped code names [`Deflate`], this with [`NoPlant`].
+pub struct PlantedDeflate<A: Allocator, P> {
     level: Level,
     params: Params,
     /// The input kept: the window behind `pos`, the block's span and what is not yet encoded.
@@ -146,13 +159,24 @@ pub struct Deflate<A: Allocator> {
     lit_freq: [u32; LIT_SYMBOLS],
     dist_freq: [u32; DIST_SYMBOLS],
     bits: Bits,
-    finished: bool,
+    stream: Stream,
+    plant: P,
 }
 
-impl<A: Allocator + Clone> Deflate<A> {
+/// The deflater as it ships: [`PlantedDeflate`] with no plant.
+pub type Deflate<A> = PlantedDeflate<A, NoPlant>;
+
+impl<A: Allocator + Clone> PlantedDeflate<A, NoPlant> {
     /// A deflater at `level`, its buffers in `alloc`.
     pub fn new_in(level: Level, alloc: A) -> Deflate<A> {
-        Deflate {
+        PlantedDeflate::new_planted(level, alloc, NoPlant)
+    }
+}
+
+impl<A: Allocator + Clone, P: Planted<DeflatePlant>> PlantedDeflate<A, P> {
+    /// [`Deflate::new_in`] with its plant seam: `plant` is a control's [`DeflatePlant`].
+    pub fn new_planted(level: Level, alloc: A, plant: P) -> PlantedDeflate<A, P> {
+        PlantedDeflate {
             level,
             params: params(level),
             data: Vec::new_in(alloc.clone()),
@@ -165,15 +189,16 @@ impl<A: Allocator + Clone> Deflate<A> {
             lit_freq: [0; LIT_SYMBOLS],
             dist_freq: [0; DIST_SYMBOLS],
             bits: Bits { value: 0, n: 0 },
-            finished: false,
+            stream: Stream::Open,
+            plant,
         }
     }
 }
 
-impl<A: Allocator> Deflate<A> {
+impl<A: Allocator, P: Planted<DeflatePlant>> PlantedDeflate<A, P> {
     /// `input` taken; whatever whole blocks it completes are appended to `out`.
     pub fn write<B: Allocator>(&mut self, input: &[u8], out: &mut Vec<u8, B>) -> Result<(), DeflateError> {
-        if self.finished {
+        if self.stream == Stream::Finished {
             return Err(DeflateError::Finished);
         }
         self.data.try_extend_from_slice(input).map_err(DeflateError::Alloc)?;
@@ -187,7 +212,7 @@ impl<A: Allocator> Deflate<A> {
 
     /// The rest encoded, the final block sent and the stream padded to a byte.
     pub fn finish<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), DeflateError> {
-        if self.finished {
+        if self.stream == Stream::Finished {
             return Err(DeflateError::Finished);
         }
         let end = self.data.len();
@@ -195,7 +220,7 @@ impl<A: Allocator> Deflate<A> {
         self.emit_block(true, out)?;
         out.try_reserve(8).map_err(DeflateError::Alloc)?;
         self.bits.align(out);
-        self.finished = true;
+        self.stream = Stream::Finished;
         self.data.clear();
         Ok(())
     }
@@ -266,7 +291,7 @@ impl<A: Allocator> Deflate<A> {
     }
 
     fn matched(&mut self, length: usize, distance: usize) {
-        let distance = match plant::on(Plant::DistanceOffByOne) && distance < WINDOW {
+        let distance = match self.plant.has(DeflatePlant::DistanceOffByOne) && distance < WINDOW {
             true => distance + 1,
             false => distance,
         };
@@ -538,7 +563,7 @@ fn stored_bits(len: usize, n: u32) -> u64 {
 /// as 16 after it is sent once. Returns how many items it wrote.
 fn run_lengths(lens: &[u8], items: &mut [(u8, u8)]) -> usize {
     let (mut n, mut i) = (0, 0);
-    let mut item = |items: &mut [(u8, u8)], n: &mut usize, it: (u8, u8)| {
+    let item = |items: &mut [(u8, u8)], n: &mut usize, it: (u8, u8)| {
         items[*n] = it;
         *n += 1;
     };

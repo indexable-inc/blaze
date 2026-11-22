@@ -56,6 +56,31 @@ pub fn may_link_lang_start(std: StdIs) -> bool {
     matches!(std, StdIs::Rust)
 }
 
+/// A proc-macro crate's `_DECLS` static as a compile-time program names it (D175,
+/// comptime-native.md "The proc_macro route"): blaze-scope task/lower.rs makes it, in the root
+/// fragment of every crate whose `Implicit::proc_macro` is set, as the expansion of the crate's
+/// harness call; its value is `&'static [proc_macro::bridge::client::Client]`, one `Client` a
+/// macro in declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcMacroDecls {
+    /// Its library key ([`blaze_scope::task::proc_macro_decls_key`]): a function of the crate's
+    /// key alone, so asked before any name is solved.
+    pub item: LibKey,
+    /// Its symbol (symbols.rs `static_symbol` of its checker key): the address the entry's
+    /// first argument points at is this static's.
+    pub symbol: blaze_code::record::Symbol,
+}
+
+/// The `_DECLS` static of proc-macro crate `krate` ([`ProcMacroDecls`]). What `run` is handed
+/// for one expansion: the entry `comptime:<symbol of the shim's `blaze_proc_macro_expand`>`
+/// (an item of the shim crate, blaze-proc-macro guest/shim.rs, not made here), and as its
+/// arguments this static's address (as `*const &'static [Client]`), the macro's index in the
+/// list, the input buffer and its length.
+pub fn proc_macro_decls(krate: blaze_id::CrateItemKey) -> ProcMacroDecls {
+    let item = blaze_scope::task::proc_macro_decls_key(krate);
+    ProcMacroDecls { item, symbol: crate::symbols::static_symbol(checker_of(item)) }
+}
+
 /// A Rust program's start: `lang_start::<returns>(main as fn() -> returns, argc, argv, 0)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RustStart {

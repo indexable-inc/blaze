@@ -18,14 +18,26 @@
 //!   krate = %k, unit)`, `warn!(%dir, "text {x}")`, `field::Empty` then `span.record(..)`), so
 //!   moving a crate here changes its import and nothing else.
 //!
+//! # What this crate is (D170, C7): the profile ring's driver, over cores
+//!
+//! The crate is the driver of the process's profile ring, the second of the three statics C3
+//! allows (the allocator, the profile ring, the signal handler; each named and capped): it holds
+//! that one static ([`record::PROFILE`], with its per-thread half [`record`]'s `THREAD`), the
+//! CPU counter read that is the ring's clock, and the C runtime's thread-exit hook that gives a
+//! lane back. Nothing else in it has state outside a value: its cores are [`ring`] (the rings'
+//! protocol and the drain's step machine, `#![blaze::sans_io]`) and the field values
+//! ([`Value`], `#![blaze::sans_io]`); [`capture`] is a sink over an allocator and a clock it
+//! is handed.
+//!
 //! # The one ambient hook
 //!
 //! Rule 75 (nothing ambient) says the clock, the environment and IO are passed in. A span site
 //! has no handle in scope (it is a line in a parser or a type checker, 300 of them), so what
-//! records it is reached ambiently, through exactly one thread-local ([`record`]'s thread
-//! state: the thread's ring producer and its own sink, when it set one with [`set_thread`])
-//! and what the program's entry installed once ([`install_rings`], [`install`], never
-//! replaced). A thread a pool or a test spawns reaches the entry's rings and sink with no step
+//! records it is reached ambiently, through the profile ring's static alone ([`record`]'s
+//! "The process's profile ring": the thread's lane producer and its own sink, when it set one
+//! with [`set_thread`], and what the program's entry installed once, [`install_rings`] and
+//! [`install`], never replaced). Every input the entry installs is a value it made: the rings
+//! from its allocator, the clock and the caps in the [`RingConfig`], the sink. A thread a pool or a test spawns reaches the entry's rings and sink with no step
 //! of its own: the flight recorder must see every thread. A task that wants its own record (a
 //! test, a simulation) sets its thread's sink and gets the entry's back when it is done
 //! ([`with_thread_sink`]). bstd's runtime has no thread-local of its own yet; when its
@@ -64,7 +76,12 @@
 
 #![no_std]
 #![feature(thread_local, allocator_api)]
+// `#![blaze::sans_io]` on the core modules (`ring`, `value`); inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 
+// Only `value`'s `ToValue` impls for `alloc`'s `String`, `Cow`, `Box`, `Arc` and `Rc` name it:
+// callers give such values as fields today (the module says when they go).
 extern crate alloc;
 
 use core::{
@@ -78,7 +95,7 @@ pub mod record;
 pub mod ring;
 mod value;
 
-pub use record::{RingConfig, RingsRefused, Site, install_rings};
+pub use record::{RingConfig, RingsRefused, Site, TraceLimits, install_rings};
 pub use value::{ToValue, Value};
 
 #[cfg(test)]
@@ -605,9 +622,6 @@ impl Sink for Off {
 
 // --- The one ambient hook ---------------------------------------------------------------
 
-/// The entry's sink: written once, then only read.
-static ENTRY: record::Once<&'static dyn Sink> = record::Once::new();
-
 /// The entry's sink was installed already: a process has one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Installed;
@@ -616,14 +630,15 @@ pub struct Installed;
 /// the rings do not. The program's entry calls it once, before it starts work; a second call
 /// is refused and changes nothing.
 pub fn install(sink: &'static dyn Sink) -> Result<(), Installed> {
-    ENTRY.set(sink)?;
+    record::PROFILE.entry.set(sink)?;
     record::decide_all();
     Ok(())
 }
 
+/// The entry's sink, kept in the profile ring's static ([`record::PROFILE`]).
 #[inline]
 fn entry() -> Option<&'static dyn Sink> {
-    ENTRY.get().copied()
+    record::PROFILE.entry.get().copied()
 }
 
 /// Sets the calling thread's own sink (`None`: the entry's again): the one it had. While any
@@ -632,12 +647,12 @@ pub fn set_thread(sink: Option<&'static dyn Sink>) -> Option<&'static dyn Sink> 
     let had = record::THREAD.sink.replace(sink);
     match (had.is_some(), sink.is_some()) {
         (false, true) => {
-            if record::THREAD_SINKS.fetch_add(1, Ordering::AcqRel) == 0 {
+            if record::PROFILE.thread_sinks.fetch_add(1, Ordering::AcqRel) == 0 {
                 record::decide_all();
             }
         }
         (true, false) => {
-            if record::THREAD_SINKS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if record::PROFILE.thread_sinks.fetch_sub(1, Ordering::AcqRel) == 1 {
                 record::decide_all();
             }
         }

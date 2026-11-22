@@ -60,12 +60,30 @@ pub enum Write<'m> {
 /// crash before it leaves the last root whole.
 pub struct Effects<'m> {
     pub serial: Serial,
-    pub writes: AVec<'m, Write<'m>>,
+    writes: AVec<'m, Write<'m>>,
+    segments: AVec<'m, SegmentRef>,
+    lines: LinesKey,
+    records: RowRecords<'m>,
 }
 
 impl<'m> Effects<'m> {
     pub fn writes(&self) -> &[Write<'m>] {
         &self.writes
+    }
+
+    /// Exactly the segments named in the new root, including carried segments.
+    pub fn segments(&self) -> &[SegmentRef] {
+        &self.segments
+    }
+
+    pub fn lines(&self) -> LinesKey {
+        self.lines
+    }
+
+    /// The payloads referenced by the rows segment in this batch of writes, and the
+    /// subset whose payloads can own expansion records.
+    pub fn row_records(&self) -> (&[Key], &[(Name, Key)]) {
+        (&self.records.keys, &self.records.scopes)
     }
 
     /// The root's bytes.
@@ -77,6 +95,26 @@ impl<'m> Effects<'m> {
                 Write::Segment { .. } => None,
             })
             .expect("every effects lists its root")
+    }
+}
+
+struct RowRecords<'m> {
+    keys: AVec<'m, Key>,
+    scopes: AVec<'m, (Name, Key)>,
+}
+
+impl<'m> RowRecords<'m> {
+    fn empty(alloc: Alloc<'m>) -> Self {
+        Self { keys: Vec::new_in(alloc), scopes: Vec::new_in(alloc) }
+    }
+
+    fn add(&mut self, name: Name, key: Key) {
+        if key != Key::default() {
+            self.keys.push(key);
+            if name.kind == blaze_drive::Kind::CrateScope {
+                self.scopes.push((name, key));
+            }
+        }
     }
 }
 
@@ -92,6 +130,7 @@ pub struct Commit<'v, 'a, 'm> {
     new_tasks: ABTreeMap<'m, Name, TaskId>,
     new_cells: ABTreeMap<'m, (TaskId, [u8; 16]), CellNo>,
     rows: RowsBuilder<'m>,
+    records: RowRecords<'m>,
     touched: ABTreeSet<'m, TaskId>,
     moved: ABTreeMap<'m, u32, u64>,
     entries: AVec<'m, (u32, u32, i32)>,
@@ -116,6 +155,7 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             new_tasks: BTreeMap::new_in(alloc),
             new_cells: BTreeMap::new_in(alloc),
             rows: RowsBuilder::new_in(alloc),
+            records: RowRecords::empty(alloc),
             touched: BTreeSet::new_in(alloc),
             moved: BTreeMap::new_in(alloc),
             entries: Vec::new_in(alloc),
@@ -335,6 +375,12 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             record: row.record.0.0,
         };
         self.rows.push(head, meta, &packed, &kept);
+        let name = if task.0 < self.dict.first_task {
+            self.last.name(task).ok_or(AnswerError::UnknownTask { task })?
+        } else {
+            self.dict.name(task)
+        };
+        self.records.add(name, row.record);
         self.index(task, old, Some((row.file, row.flags, row.findings)));
         Ok(())
     }
@@ -363,6 +409,9 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             self.known_task(TaskId(task))?;
             if cell >= self.cells() {
                 return Err(AnswerError::UnknownCell { cell: CellNo(cell) });
+            }
+            if self.plant == Plant::LastReaderRemovalDropped && sign == -1 && self.last.readers(CellNo(cell), self.alloc)?.as_slice() == [TaskId(task)] {
+                continue;
             }
             self.entries.push((cell, task, sign));
         }
@@ -437,13 +486,13 @@ impl<'v, 'a, 'm> Commit<'v, 'a, 'm> {
             return Err(AnswerError::CompactionOwed { what: "segments", count: refs.len(), cap: MAX_SEGMENTS });
         }
         let root = encode_root(serial, tree, lines, summary, &refs, alloc);
-        Ok(effects(serial, segments.len(), &refs, segments, root, self.plant, alloc))
+        Ok(effects(serial, refs, segments, root, *lines, self.records, self.plant, alloc))
     }
 }
 
 /// The writes in order: the segments, then the root (the root first under the planted bug).
-fn effects<'m>(serial: Serial, fresh: usize, refs: &[SegmentRef], segments: AVec<'m, (SegmentKind, AVec<'m, u8>)>, root: AVec<'m, u8>, plant: Plant, alloc: Alloc<'m>) -> Effects<'m> {
-    let mut writes: AVec<'m, Write<'m>> = Vec::with_capacity_in(fresh + 1, alloc);
+fn effects<'m>(serial: Serial, refs: AVec<'m, SegmentRef>, segments: AVec<'m, (SegmentKind, AVec<'m, u8>)>, root: AVec<'m, u8>, lines: LinesKey, records: RowRecords<'m>, plant: Plant, alloc: Alloc<'m>) -> Effects<'m> {
+    let mut writes: AVec<'m, Write<'m>> = Vec::with_capacity_in(segments.len() + 1, alloc);
     if plant == Plant::RootFirst {
         writes.push(Write::Root { bytes: root });
         for (at, (_, bytes)) in refs.iter().zip(segments) {
@@ -455,7 +504,7 @@ fn effects<'m>(serial: Serial, fresh: usize, refs: &[SegmentRef], segments: AVec
         }
         writes.push(Write::Root { bytes: root });
     }
-    Effects { serial, writes }
+    Effects { serial, writes, segments: refs, lines, records }
 }
 
 /// One worker's reverse entries for the rows it made: (cell, task, +1) for a cell a row reads now
@@ -534,10 +583,12 @@ pub fn compact<'m>(last: &AnswerView<'_>, plant: Plant, alloc: Alloc<'m>) -> Res
     let serial = last.serial();
     let mut dict = DictBuilder::new_in(0, 0, alloc);
     let mut rows = RowsBuilder::new_in(alloc);
+    let mut records = RowRecords::empty(alloc);
     let mut kept: AVec<'m, (u32, [u8; DIGEST_BYTES])> = Vec::new_in(alloc);
     for t in 0..last.tasks() {
         let task = TaskId(t);
-        dict.push_task(last.name(task).ok_or(AnswerError::UnknownTask { task })?);
+        let name = last.name(task).ok_or(AnswerError::UnknownTask { task })?;
+        dict.push_task(name);
         let Some(row) = last.row(task) else { continue };
         kept.clear();
         kept.extend(row.defines().map(|(cell, digest)| (cell.0, digest.0)));
@@ -554,6 +605,7 @@ pub fn compact<'m>(last: &AnswerView<'_>, plant: Plant, alloc: Alloc<'m>) -> Res
             findings: row.findings(),
             record: if plant == Plant::RecordDropped { [0; 32] } else { row.record().0.0 },
         };
+        records.add(name, Key(ContentId(head.record)));
         let (meta, packed) = row.packed();
         rows.push(head, meta, packed, &kept);
     }
@@ -600,5 +652,79 @@ pub fn compact<'m>(last: &AnswerView<'_>, plant: Plant, alloc: Alloc<'m>) -> Res
         refs.push(SegmentRef::of(*kind, bytes));
     }
     let root = encode_root(serial, &last.tree(), &last.lines(), last.summary(), &refs, alloc);
-    Ok(effects(serial, refs.len(), &refs, segments, root, plant, alloc))
+    Ok(effects(serial, refs, segments, root, last.lines(), records, plant, alloc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_drive::key::Kind;
+
+    fn segment<'a>(effects: &'a Effects<'_>, id: ContentId) -> Option<&'a [u8]> {
+        effects.writes().iter().find_map(|write| match write {
+            Write::Segment { at, bytes } if at.id == id => Some(bytes.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// An edit replaces one of the reader's producers and reorders its remaining observations.
+    /// The run has exactly the two membership changes. After restart the removed producer has
+    /// no readers, including when its value subsequently moves.
+    #[test]
+    fn reader_postings_equal_the_membership_difference() {
+        const UNCHANGED: u32 = 100_000;
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let empty = AnswerView::empty(Plant::None, heap.shared());
+        let mut first = Commit::new(&empty, Plant::None, alloc);
+        let producer = first.task(Name { kind: Kind::BodyCheck, subject: ContentId([1; 32]) }).unwrap();
+        let reader = first.task(Name { kind: Kind::BodyCheck, subject: ContentId([2; 32]) }).unwrap();
+        let row = RowIn {
+            key: Key(ContentId([1; 32])),
+            out: ContentId([2; 32]),
+            file: reader,
+            stage: 5,
+            wave: 0,
+            flags: Flags(0),
+            source: ContentId([3; 32]),
+            findings: 0,
+            record: Key(ContentId([4; 32])),
+        };
+        let cells: std::vec::Vec<_> = (0..UNCHANGED + 2)
+            .map(|i| first.cell(producer, Cell(u128::from(i).to_le_bytes())).unwrap())
+            .collect();
+        let (removed, added) = (cells[0], cells[cells.len() - 1]);
+        let mut reads = cells[..cells.len() - 1].to_vec();
+        let mut writer = RunWriter::new(first.serial(), alloc);
+        first.put_row(reader, &row, &reads, &[]).unwrap();
+        writer.row_reads(reader, None, &reads);
+        first.add_run(&writer.finish().unwrap().unwrap()).unwrap();
+        let base = first.finish(&TreeDigest([1; 32]), &[], &LinesKey([0; 32])).unwrap();
+        let last = AnswerView::open(base.root(), |at| segment(&base, at.id), Plant::None, heap.shared()).unwrap();
+        let old = last.row(reader).unwrap();
+        reads.reverse();
+        let mut reorder = RunWriter::new(Serial(2), alloc);
+        reorder.row_reads(reader, Some(old), &reads);
+        assert!(reorder.finish().unwrap().is_none(), "observation order leaves posting membership unchanged");
+        std::println!("reorder posting writes 0");
+
+        *reads.last_mut().unwrap() = added;
+        let mut next = Commit::new(&last, Plant::None, alloc);
+        let mut writer = RunWriter::new(next.serial(), alloc);
+        next.put_row(reader, &row, &reads, &[]).unwrap();
+        writer.row_reads(reader, Some(old), &reads);
+        let run = writer.finish().unwrap().unwrap();
+        let changes: std::vec::Vec<_> = RunView::open(&run, SegmentKind::Run, INPUT).unwrap().all().collect();
+        assert_eq!(changes, [(removed.0, reader.0, -1), (added.0, reader.0, 1)]);
+        std::println!("edit posting writes {}", changes.len());
+        next.add_run(&run).unwrap();
+        let edited = next.finish(&TreeDigest([2; 32]), &[], &LinesKey([0; 32])).unwrap();
+        let reopened = AnswerView::open(edited.root(), |at| segment(&edited, at.id).or_else(|| segment(&base, at.id)), Plant::None, heap.shared()).unwrap();
+        assert!(reopened.row(reader).unwrap().reads().eq(reads.iter().copied()));
+        assert_eq!(reopened.readers(added, alloc).unwrap().as_slice(), &[reader]);
+        let mut moved = Commit::new(&reopened, Plant::None, alloc);
+        moved.put_row(producer, &row, &[], &[(removed, CellDigest::of(&ContentId([7; 32])))]).unwrap();
+        assert!(moved.moved().eq([removed]));
+        assert!(reopened.readers(removed, alloc).unwrap().is_empty(), "moving the removed producer schedules no reader");
+    }
 }

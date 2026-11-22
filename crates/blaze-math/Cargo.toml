@@ -1,0 +1,28 @@
+[package]
+name = "blaze-math"
+description = "Deterministic floating-point functions on bstd: sqrt, the rounding functions, an explicit fused multiply-add, and sin, cos, tan, asin, acos, atan, atan2, exp, exp2, ln, log2, pow, hypot and cbrt in f64 and f32, each the fdlibm/musl method written once over a lane type so the scalar form and the `core::simd` form of any lane count give the same bits; exact sine and cosine of a whole fraction of a turn; Vec2, Vec3, Mat3, Affine3 (with its inverse and whether it keeps distances), Aabb3 and an outward-rounded Interval; `no_std`, no `alloc`, no dependency"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The plant seam of the interval controls (`Plants`, `Planted`, `NoPlant`).
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Properties: exact values, monotonicity and symmetry on drawn inputs, every SIMD form against
+# its scalar twin bit for bit, interval containment against exact dyadic arithmetic; with a
+# planted-bug control.
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

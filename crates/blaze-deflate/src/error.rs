@@ -123,8 +123,15 @@ impl fmt::Display for Error {
             Format::Zlib => "zlib",
             Format::Gzip => "gzip",
         };
-        write!(f, "blaze_deflate: {format} stream at byte {}: ", self.at)?;
-        match self.why {
+        write!(f, "blaze_deflate: {format} stream at byte {}: {}", self.at, self.why)
+    }
+}
+
+/// What was wrong, without where: an [`Error`]'s message after its framing and offset, and
+/// the words a test's oracle quotes for a refusal it holds only the `Why` of.
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
             Why::BlockType => f.write_str("a block of the reserved type 3"),
             Why::StoredLength { len, nlen } => {
                 write!(f, "a stored block of length {len} whose complement is {nlen}, not {}", !len)

@@ -48,9 +48,6 @@ pub const OFFERS: Offers = {
     offers
 };
 
-/// The most bytes of an escaped effect's encoding.
-const EFFECT_MOST: usize = 64;
-
 /// A call through the wire was refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WireError {
@@ -138,6 +135,9 @@ struct Later {
     /// Where the run's root task runs, and its frame (made at its first use): held by the run,
     /// so the root context ([`Cx::hosted_root`]) allocates nothing.
     placed: Placed,
+    /// The run's per-worker state (D171): caller cells only, made at the first `on_worker`
+    /// unless the program handed its own first ([`Io::on_workers`]).
+    workers: OnceCell<crate::workers::Workers>,
 }
 
 impl Drop for Run {
@@ -222,11 +222,43 @@ impl Run {
         &self.later().placed
     }
 
+    /// The run's per-worker state, made now if this is its first use: bstd's own cells only,
+    /// no simulated workers; no seed (the wire carries none).
+    pub(crate) fn workers(&self) -> &crate::workers::Workers {
+        self.later().workers.get_or_init(|| {
+            let setup = crate::workers::WorkersSetup {
+                limits: crate::workers::Limits::BARE,
+                seed: None,
+                models: 0,
+            };
+            match crate::workers::Workers::bare(setup) {
+                Ok(workers) => workers,
+                Err(error) => panic!("bstd::guest: the hosted run's workers: {error}"),
+            }
+        })
+    }
+
+    /// The run's per-worker state is `workers`, the program's.
+    ///
+    /// # Panics
+    ///
+    /// When the run's were made already (a task used its cell first).
+    pub(crate) fn set_workers(&self, workers: crate::workers::Workers) {
+        if self.later().workers.set(workers).is_err() {
+            panic!("bstd::guest: Io::on_workers after the hosted run's workers were used: hand them before the first on_worker");
+        }
+    }
+
     /// What the run makes at a first use, made in place now if this is the first.
     fn later(&self) -> &Later {
         let at = self.later.get().cast::<Later>();
         if !self.made.get() {
-            let later = Later { args: OnceCell::new(), escape: OnceCell::new(), placed: Placed::hosted_root(TASK_FRAME) };
+            let later = Later {
+                args: OnceCell::new(),
+                escape: OnceCell::new(),
+                placed: Placed::hosted_root(TASK_FRAME),
+                workers: OnceCell::new(),
+            };
             // SAFETY: not made yet, so nothing borrows it; only the run's own thread reaches
             // the run (`Run`'s invariant), and making `later` does not reach the run again.
             // The run does not move while entered (it stays in `start`'s frame).

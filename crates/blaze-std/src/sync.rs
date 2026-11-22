@@ -60,6 +60,9 @@ pub mod swap;
 mod once;
 #[cfg(test)]
 mod once_tests;
+// A value one owner fills once while readers read it in place or wait through their `Cx`
+// (D179's PUBLISHED).
+mod published;
 
 pub use atomics::{Counter, Flag, PublishOnce, Seq};
 pub use chan::{Chan, Closed, RecvError, SendError};
@@ -68,6 +71,7 @@ pub use freeze::{Building, Frozen};
 pub use home::{LocalLazy, LocalLock, LocalOnce};
 pub use ranks::{Order, Rank, RankedGuard, RankedLock, Unranked};
 pub use once::{Once, OnceError};
+pub use published::{Published, PublishedError, Publisher};
 pub use swap::Swap;
 
 pub use crate::own::{LocalShared, Released, Shared};
@@ -189,27 +193,39 @@ pub(crate) fn wait_ready<T, R>(
     if io.with_sim(|_| ()).is_some() {
         return cx.wait_for(io, || lock.0.try_lock().and_then(|mut held| ready(&mut held)));
     }
+    // The lock's own wait, if any, is the lock record's (blaze-core's slow path, the thread's
+    // lock table), never charged here as well.
     let mut held = lock.lock(cx)?;
-    let cx = cx.span(signal.name());
-    loop {
-        if let Some(got) = ready(&mut held) {
-            return Ok(got);
-        }
-        cx.check()?;
-        let Some(deadline) = cx.deadline().finite() else {
-            signal.wait(&mut held);
-            continue;
-        };
-        let now = io.now();
-        let stopped = Stopped::Deadline { span: cx.name(), at: deadline.get() };
-        if deadline.passed(now) {
-            return Err(stopped);
-        }
-        if signal.wait_for(&mut held, deadline.left(now)) {
-            // The deadline passed: one last look, then the stop.
-            return ready(&mut held).ok_or(stopped);
-        }
+    if let Some(got) = ready(&mut held) {
+        return Ok(got);
     }
+    // Not ready: the wait on `signal` is charged to the worker this task is on when it returns
+    // (D171), as the simulated branch's `wait_for` is; a ready look above charges nothing.
+    let cx = cx.span(signal.name());
+    cx.charged(io, signal.name(), None, || {
+        loop {
+            cx.check()?;
+            let Some(deadline) = cx.deadline().finite() else {
+                signal.wait(&mut held);
+                if let Some(got) = ready(&mut held) {
+                    return Ok(got);
+                }
+                continue;
+            };
+            let now = io.now();
+            let stopped = Stopped::Deadline { span: cx.name(), at: deadline.get() };
+            if deadline.passed(now) {
+                return Err(stopped);
+            }
+            if signal.wait_for(&mut held, deadline.left(now)) {
+                // The deadline passed: one last look, then the stop.
+                return ready(&mut held).ok_or(stopped);
+            }
+            if let Some(got) = ready(&mut held) {
+                return Ok(got);
+            }
+        }
+    })
 }
 
 pub use blaze_spin::SpinWait;

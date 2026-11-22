@@ -33,10 +33,18 @@
 //!   body, and a walk from outside reports all three: the resolver jumps through the word
 //!   again after a bind, and a function pointer names an entry thunk.
 
-use alloc::vec::Vec;
+use core::alloc::Allocator;
+
+use blaze_own::Vec;
+use blaze_own::planted::{NoPlant, Planted, Plants};
 
 use crate::area::Area;
-use crate::{CodeId, Error, Frame, Kept, Range, Slot, Thread, Tier, Txn};
+use crate::{CodeId, Error, Frame, Range, Slot, Thread, Tier, Txn};
+
+/// The driver's list of writes: `alloc`'s vector, in whatever allocator the driver names. Its
+/// type is the drivers' (blaze-launch-rt drive.rs fills a `std` one) until the vector seam
+/// moves them to blaze-own's (D170).
+type Out<B> = alloc::vec::Vec<Write, B>;
 
 /// What a core is made for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,11 +142,11 @@ pub struct Placed {
 }
 
 /// A safeguard taken out, for the simulation's controls (`tests/sim.rs`): each must make the
-/// oracle fail. Always `None` outside tests.
+/// oracle fail. Taken through blaze-own's seam (D165): a [`Launch`] made by [`Launch::new`]
+/// holds [`NoPlant`], and every check below compiles to `false`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
-#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
-pub(crate) enum Plant {
+pub enum LaunchPlant {
+    /// The core as it is.
     None,
     /// An edit whose binds must switch together stores its words straight to the new bodies.
     NoGate,
@@ -149,6 +157,8 @@ pub(crate) enum Plant {
     /// A return address at a range's end is taken to be outside it.
     ReturnAtEnd,
 }
+
+impl Plants for LaunchPlant {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Life {
@@ -173,15 +183,15 @@ struct Body {
 
 /// What one commit unlinked. A thread that holds any of it holds all of it: a thread inside
 /// the gate may still jump to any old body of the edit.
-struct Batch {
+struct Batch<A: Allocator> {
     /// The epoch the commit published after its unlinking stores.
     stamp: u64,
     /// Indices into `Launch::bodies`.
-    bodies: Vec<u32, Kept>,
+    bodies: Vec<u32, A>,
     gate: Option<Range>,
     /// The threads that have not cleared it: every thread known at the commit, and every
     /// thread found since that was born before the stamp.
-    waiting: Vec<Thread, Kept>,
+    waiting: Vec<Thread, A>,
 }
 
 struct Staged {
@@ -200,27 +210,39 @@ struct Known {
 }
 
 /// The launcher's core for one process. See the module's documentation.
-pub struct Launch {
+///
+/// Its tables are in `A`, the allocator its maker names (in a program, a
+/// `blaze_own::Alloc<'_>` for the process's life); `P` is its plant seam, [`NoPlant`] for every
+/// core [`Launch::new`] makes. `A` has no default (D170 C1): every user names it.
+pub struct Launch<A: Allocator + Copy, P: Planted<LaunchPlant> = NoPlant> {
     config: Config,
-    alloc: Kept,
-    area: Area,
+    alloc: A,
+    area: Area<A>,
     /// By slot: the body its word names (an index into `bodies`), or `None` for its stub.
-    slots: Vec<Option<u32>, Kept>,
-    bodies: Vec<Body, Kept>,
-    batches: Vec<Batch, Kept>,
-    threads: Vec<Known, Kept>,
+    slots: Vec<Option<u32>, A>,
+    bodies: Vec<Body, A>,
+    batches: Vec<Batch<A>, A>,
+    threads: Vec<Known, A>,
     staged: Option<Staged>,
     /// The epoch last published. A commit publishes the next.
     epoch: u64,
     /// Kept from edit to edit: the slots of the edit being staged, sorted, to find one bound
     /// twice.
-    scratch: Vec<u32, Kept>,
-    pub(crate) plant: Plant,
+    scratch: Vec<u32, A>,
+    plant: P,
 }
 
-impl Launch {
+impl<A: Allocator + Copy> Launch<A, NoPlant> {
     /// A core with no slot, no body and no thread, its tables in `alloc`.
-    pub fn new(config: Config, alloc: Kept) -> Result<Launch, Error> {
+    pub fn new(config: Config, alloc: A) -> Result<Launch<A, NoPlant>, Error> {
+        Launch::planted(config, alloc, NoPlant)
+    }
+}
+
+impl<A: Allocator + Copy, P: Planted<LaunchPlant>> Launch<A, P> {
+    /// [`Launch::new`] with its plant seam: `plant` is [`NoPlant`] where it ships and a
+    /// [`LaunchPlant`] under the simulation's controls (D165).
+    pub fn planted(config: Config, alloc: A, plant: P) -> Result<Launch<A, P>, Error> {
         if config.slots == 0 {
             return Err(Error::Config { what: "the table holds no slot", value: 0 });
         }
@@ -250,7 +272,7 @@ impl Launch {
             staged: None,
             epoch: 0,
             scratch: Vec::new_in(alloc),
-            plant: Plant::None,
+            plant,
         })
     }
 
@@ -318,7 +340,7 @@ impl Launch {
     /// Declares `count` more slots, each on its stub, and gives the first. A new function's
     /// slot is declared before the edit that binds or calls it is staged; a slot an aborted
     /// edit declared stays a stub nothing calls.
-    pub fn declare(&mut self, count: u32, out: &mut Vec<Write, Kept>) -> Result<Slot, Error> {
+    pub fn declare<B: Allocator>(&mut self, count: u32, out: &mut Out<B>) -> Result<Slot, Error> {
         let declared = self.declared();
         match declared.checked_add(count) {
             Some(all) if all <= self.config.slots => {}
@@ -337,7 +359,7 @@ impl Launch {
     ///
     /// The driver fills and checks every range, then calls [`Launch::commit`]; when it cannot
     /// (a record is missing, a hash differs), [`Launch::abort`].
-    pub fn stage(&mut self, edit: &Edit<'_>, out: &mut Vec<Write, Kept>) -> Result<(), Error> {
+    pub fn stage<B: Allocator>(&mut self, edit: &Edit<'_>, out: &mut Out<B>) -> Result<(), Error> {
         let txn = edit.txn;
         if let Some(open) = &self.staged {
             return Err(Error::Open { open: open.txn, asked: txn });
@@ -433,7 +455,7 @@ impl Launch {
     /// clear, so each still runs the old body), the flag (from this store on every call
     /// through a gate runs the new), every word to its new body. The epoch comes last, so a
     /// thread that loads it loaded it after every unlinking store.
-    pub fn commit(&mut self, txn: Txn, out: &mut Vec<Write, Kept>) -> Result<Committed, Error> {
+    pub fn commit<B: Allocator>(&mut self, txn: Txn, out: &mut Out<B>) -> Result<Committed, Error> {
         let staged = match self.staged.take() {
             Some(staged) if staged.txn == txn => staged,
             other => {
@@ -447,11 +469,12 @@ impl Launch {
         let first = staged.first as usize;
         let last = first + staged.count as usize;
 
-        if self.plant == Plant::EpochFirst {
+        let epoch_first = self.plant.has(LaunchPlant::EpochFirst);
+        if epoch_first {
             out.push(Write::Epoch { epoch });
         }
         if let Some(gate) = staged.gate
-            && self.plant != Plant::NoGate
+            && !self.plant.has(LaunchPlant::NoGate)
         {
             for (entry, body) in self.bodies[first..last].iter().enumerate() {
                 let to = Target::Gate { gate, entry: entry as u32 };
@@ -462,7 +485,7 @@ impl Launch {
         for body in &self.bodies[first..last] {
             out.push(Write::Slot { slot: body.slot, to: Target::Body(body.range) });
         }
-        if self.plant != Plant::EpochFirst {
+        if !epoch_first {
             out.push(Write::Epoch { epoch });
         }
 
@@ -490,7 +513,7 @@ impl Launch {
 
     /// Gives up the staged edit `txn`: its ranges are freed at once, since no word ever named
     /// them. The table is as it was before [`Launch::stage`].
-    pub fn abort(&mut self, txn: Txn, out: &mut Vec<Write, Kept>) -> Result<(), Error> {
+    pub fn abort<B: Allocator>(&mut self, txn: Txn, out: &mut Out<B>) -> Result<(), Error> {
         let staged = match self.staged.take() {
             Some(staged) if staged.txn == txn => staged,
             other => {
@@ -543,7 +566,7 @@ impl Launch {
         let Some(at) = self.threads.iter().position(|it| it.thread == thread) else {
             return Err(Error::NoThread { thread });
         };
-        self.threads.swap_remove(at);
+        self.threads.remove_swap(at);
         for batch in &mut self.batches {
             batch.waiting.retain(|it| *it != thread);
         }
@@ -595,7 +618,7 @@ impl Launch {
                             .any(|body| holds(bodies[*body as usize].range, *frame, plant))
                 });
             if !held {
-                batch.waiting.swap_remove(at);
+                batch.waiting.remove_swap(at);
             }
         }
         Ok(())
@@ -604,16 +627,16 @@ impl Launch {
     /// Frees every batch that every thread cleared: a [`Write::Forget`] for each range, and a
     /// [`Write::Decommit`] for the whole pages that leaves empty. Gives how many batches it
     /// freed. The driver calls [`Launch::thread_began`] for every announced birth first.
-    pub fn collect(&mut self, out: &mut Vec<Write, Kept>) -> usize {
+    pub fn collect<B: Allocator>(&mut self, out: &mut Out<B>) -> usize {
         let mut freed = 0;
         let mut at = 0;
         while at < self.batches.len() {
-            if !self.batches[at].waiting.is_empty() && self.plant != Plant::FreeEarly {
+            if !self.batches[at].waiting.is_empty() && !self.plant.has(LaunchPlant::FreeEarly) {
                 at += 1;
                 continue;
             }
             // In the order they were unlinked: the oldest batch first.
-            let batch = self.batches.remove(at);
+            let batch = self.batches.remove_shift(at);
             for body in &batch.bodies {
                 self.free_body(*body as usize, out);
             }
@@ -625,22 +648,23 @@ impl Launch {
         freed
     }
 
-    fn free_body(&mut self, index: usize, out: &mut Vec<Write, Kept>) {
+    fn free_body<B: Allocator>(&mut self, index: usize, out: &mut Out<B>) {
         self.bodies[index].life = Life::Freed;
         let range = self.bodies[index].range;
         self.free_range(range, out);
     }
 
-    fn free_range(&mut self, range: Range, out: &mut Vec<Write, Kept>) {
+    fn free_range<B: Allocator>(&mut self, range: Range, out: &mut Out<B>) {
         out.push(Write::Forget { range });
         self.area.free(range, |pages| out.push(Write::Decommit { range: pages }));
     }
 }
 
 /// [`Range::holds`], or the planted rule that forgets a return address at a range's end.
-fn holds(range: Range, frame: Frame, plant: Plant) -> bool {
-    match plant {
-        Plant::ReturnAtEnd => frame.at >= range.at && frame.at < range.end(),
-        _ => range.holds(frame),
+fn holds(range: Range, frame: Frame, plant: impl Planted<LaunchPlant>) -> bool {
+    if plant.has(LaunchPlant::ReturnAtEnd) {
+        frame.at >= range.at && frame.at < range.end()
+    } else {
+        range.holds(frame)
     }
 }

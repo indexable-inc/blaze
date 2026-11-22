@@ -24,7 +24,7 @@
 
 use std::{cell::RefCell, io::Cursor, mem::offset_of};
 
-use blaze_format::{FormatError, Persist, Slice, Spans, SpansRoot, Writer, leb, record};
+use blaze_format::{FormatError, Persist, Slice, Spans, SpansRoot, WriteBuffer, Writer, WriterIn, leb, record};
 use blaze_ids::{ContentId, radix};
 use zstd::zstd_safe::{self, CCtx, CDict, DCtx, DDict};
 
@@ -82,20 +82,30 @@ pub struct PlacedHot {
 
 /// Writes `values` to `out` at their narrowest width, straight into the buffer. A function, not
 /// a method of [`Writer`]: the writer is blaze-format-core's, and the tiers are this crate's.
-pub fn push_hot(out: &mut Writer, values: &[u32]) -> PlacedHot {
+pub fn push_hot<P: WriterIn>(out: &mut Writer<P>, values: &[u32]) -> PlacedHot {
     let width = Width::of(values);
     let at = out.pad(width.bytes());
-    out.bytes.reserve(values.len() * width.bytes());
+    // The column's bytes made once, then written in place: any writer's buffer, the same bytes.
+    let start = out.bytes.len();
+    out.bytes.resize(start + values.len() * width.bytes(), 0);
+    let place = &mut out.bytes.as_mut_slice()[start..];
     match width {
-        Width::U8 => out.bytes.extend(values.iter().map(|&it| it as u8)),
-        Width::U16 => out.bytes.extend(values.iter().flat_map(|&it| (it as u16).to_le_bytes())),
-        Width::U32 => out.bytes.extend(values.iter().flat_map(|&it| it.to_le_bytes())),
+        Width::U8 => place.iter_mut().zip(values).for_each(|(to, &it)| *to = it as u8),
+        Width::U16 => place
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(values)
+            .for_each(|(to, &it)| *to = (it as u16).to_le_bytes()),
+        Width::U32 => {
+            place.as_chunks_mut::<4>().0.iter_mut().zip(values).for_each(|(to, &it)| *to = it.to_le_bytes())
+        }
     }
     PlacedHot { width, at, len: values.len() }
 }
 
 /// Writes `values` to `out` bit-packed.
-pub fn push_warm(out: &mut Writer, values: &[u32]) -> PlacedWarm {
+pub fn push_warm<P: WriterIn>(out: &mut Writer<P>, values: &[u32]) -> PlacedWarm {
     let packed = Packed::pack(values);
     let at = out.push_slice(&packed.words);
     PlacedWarm { min: packed.min, bits: packed.bits, len: packed.len, at, words: packed.words.len() }

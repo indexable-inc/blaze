@@ -61,5 +61,5 @@ pub const GAP_CAUSE: &str = "a question the front end cannot answer yet";
 /// A body's gaps' words after its name: how many, and the first.
 pub fn gap_words(gaps: &[super::world_items::Gap]) -> Option<String> {
     let first = gaps.first()?;
-    Some(format!("{} questions the front end cannot answer yet, the first {first:?}", gaps.len()))
+    Some(std::fmt::format(format_args!("{} questions the front end cannot answer yet, the first {first}", gaps.len())))
 }

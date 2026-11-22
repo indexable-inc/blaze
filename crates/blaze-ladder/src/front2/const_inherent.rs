@@ -98,18 +98,21 @@ pub struct Entry {
     pub state: State,
 }
 
-/// The asked leaves, kept with the heads (`Maps::inherents`): a fixed table, no allocation.
+/// The asked leaves, kept with the heads (`Maps::inherents`), at most [`MOST_LEAVES`] (rule
+/// 18). In the store's allocator, never inline: a fixed array of `MOST_LEAVES` entries made
+/// the heads `Store` some 70 KB by value, and its default, built on the stack in a debug build,
+/// overflowed a test thread's stack (wave 1119, `engine_body_reads_memory_tests`).
 pub struct Table {
-    entries: [Option<Entry>; MOST_LEAVES],
-    len: usize,
+    entries: Vec<Entry, Alloc<'static>>,
     /// Each refused leaf's typed refusal, by need key: made at the first refusal, in the
     /// allocator of the store's type table (`PortableTys::alloc`), which the driver hands in.
     refusals: Option<Vec<(LibKey, InherentFail), Alloc<'static>>>,
 }
 
-impl Default for Table {
-    fn default() -> Table {
-        Table { entries: [None; MOST_LEAVES], len: 0, refusals: None }
+impl Table {
+    /// No leaf asked yet; the entries in `alloc` (the store's, `Maps::new_in`).
+    pub fn new_in(alloc: Alloc<'static>) -> Table {
+        Table { entries: Vec::new_in(alloc), refusals: None }
     }
 }
 
@@ -123,14 +126,11 @@ pub fn refusal<R>(table: &core::cell::RefCell<Table>, need: LibKey, f: impl FnOn
 
 impl Table {
     fn find(&self, need: LibKey) -> Option<&Entry> {
-        self.entries[..self.len].iter().flatten().find(|e| e.need == need)
+        self.entries.iter().find(|e| e.need == need)
     }
 
-    /// Sets the state of the asked leaf `need` (nothing when it was never asked here): its own
-    /// evaluation's, or the state another task of the request reached for it (blaze-cli
-    /// engine_heads_once.rs, lane CX27).
-    pub fn set(&mut self, need: LibKey, state: State) {
-        if let Some(e) = self.entries[..self.len].iter_mut().flatten().find(|e| e.need == need) {
+    fn set(&mut self, need: LibKey, state: State) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.need == need) {
             e.state = state;
         }
     }
@@ -150,17 +150,16 @@ impl Table {
         if self.has(entry.need) {
             return true;
         }
-        if self.len == MOST_LEAVES {
+        if self.entries.len() == MOST_LEAVES {
             return false;
         }
-        self.entries[self.len] = Some(entry);
-        self.len += 1;
+        self.entries.push(entry);
         true
     }
 
     /// The `i`th entry still [`State::Asked`] at or after slot `from`, with its slot.
     fn next_asked(&self, from: usize) -> Option<(usize, Entry)> {
-        (from..self.len).find_map(|i| self.entries[i].filter(|e| e.state == State::Asked).map(|e| (i, e)))
+        self.entries.get(from..)?.iter().enumerate().find(|(_, e)| e.state == State::Asked).map(|(j, e)| (from + j, *e))
     }
 }
 
@@ -508,7 +507,7 @@ fn find<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, e: Entry) -> Result<
 fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need: LibKey, out: Result<Option<(u128, PNode)>, InherentFail>) {
     let state = match out {
         Ok(Some((bits, ty))) => {
-            r.store.maps.const_bits.insert(need, bits);
+            r.store.maps.file_bits(need, bits);
             State::Answered(ty)
         }
         Ok(None) => State::NotLeaf,

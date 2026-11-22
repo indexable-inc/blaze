@@ -197,7 +197,15 @@ mod model {
     use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
     use super::{Condition, ConditionError, MOST_CONDITIONS, Space, Value, Var};
-    use crate::Plant;
+
+    /// The bug this test plants to show its oracle catches it.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Plant {
+        None,
+        /// A record is stored under the condition its job began at, not the one it read: an
+        /// asker that does not imply what it read is served it.
+        RanUnderCondition,
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum Step {

@@ -18,7 +18,7 @@ use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::front2::project_records::{Listing, list_with};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::{BodyFrame, BodyOut, Facts, Make, MakeRefused, SaidWhat, check_body, verdict_bytes};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
@@ -218,12 +218,10 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    /// The texts, with no origins kept.
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 
@@ -295,7 +293,7 @@ fn run(records: &'static Records<'static>, key: ItemKey) -> BodyOut<'static> {
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: LANG, reads: &unused });
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    let body = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None };
+    let body = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, census: None };
     let task = Task { planned: Planned { name: Name::new(Kind::BodyCheck, key.0), phase: Phase::new(Stage::Bodies, 0), source: ABSENT, file: Name::new(Kind::FileItems, ABSENT) }, key: Key(ABSENT) };
     check_body(tables, &task, &body, &NoEdit, blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("the body task of {key:x}: {e}"))
 }
@@ -386,9 +384,13 @@ fn a_body_reads_the_textual_scope_of_its_module_first() {
     }
     println!("{}\n{}", refused.join("\n"), lines.join("\n"));
     assert!(list.len() >= 8, "the six fns, the impl's fn and the constant's initializer are listed: {list:?}");
-    // A trait's fn with no body is still listed as a body and answers "no body" (a known hole of the
-    // body list, not of macro paths: the coordinator's log of 2026-11-17); it is set aside here by its words.
-    refused.retain(|line| !line.contains("NOT CHECKED no body"));
+    // `Tr::f` is declared with no default body: no body of the crate, so never listed (front2
+    // project_records.rs `list_in`), and never answered "no body" (was a known hole of the body
+    // list, set aside here by its words until 2026-11-20).
+    assert!(
+        !list.iter().any(|(_, body)| matches!(body, BodyRef::Member { is_trait: true, name: "f", .. })),
+        "a trait's fn with no default body is listed as a body: {list:?}"
+    );
     assert_eq!(refused.len(), 1, "only the control is refused: {refused:#?}");
     assert!(refused[0].contains("nothing_binds"), "the control's refusal names its call: {refused:#?}");
     assert_eq!(e0308, 0, "the block's own `shadowed` is expanded, not the module's: {lines:#?}");

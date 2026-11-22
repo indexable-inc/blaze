@@ -523,12 +523,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             None => self.qpath_trait_args(tr, &def, self_ty, cause)?,
         };
         if let Some(assoc) = assoc {
-            if !def.assoc_types.iter().any(|a| a.name == assoc.name) {
+            let Some(decl) = def.assoc_types.iter().find(|a| a.name == assoc.name) else {
                 self.diag(DiagCode::NoAssocItem, at, About::found_named(self_ty, assoc.name));
                 return Ok(self.common.err);
-            }
+            };
             self.register_trait(tr, trait_args, self.written_cause(anchor.ty_range, cause))?;
-            let projected = self.project(tr, trait_args, assoc.name, cause)?;
+            // The GAT's own parameters follow Self and the trait parameters. Check arity
+            // before lowering any argument against its corresponding declaration.
+            let own = assoc.generic_args.len;
+            let written = def.generics.saturating_add(own);
+            if !self.alias_arity(tr, assoc.name, written, cause)? {
+                return Ok(self.common.err);
+            }
+            let projection_args = if own == 0 {
+                trait_args
+            } else {
+                let args = self.explicit_args(at, Some(assoc), decl.item, def.generics, own)?;
+                self.concat(trait_args, args)?
+            };
+            let projected = self.project(tr, projection_args, assoc.name, cause)?;
             let projected = self.try_structurally_resolve(projected)?;
             return self.assoc_value(at, cause, projected, *seg, scope);
         }
@@ -797,10 +810,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let mut traits: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
         traits.extend_from_slice(self.reads.traits_in_scope(scope)?);
-        if let Some(parent) = self.reads.assoc_parent(self.body.owner)? {
-            if let Some(tr) = self.reads.impl_header(parent.container)?.and_then(|h| h.trait_) {
-                traits.push(tr);
-            }
+        if let Some(tr) = self.current_impl_trait()? {
+            traits.push(tr);
         }
         for tier in [&mut bounds, &mut traits] {
             // A trait reached twice (in scope and as the impl's own, say) is one candidate.

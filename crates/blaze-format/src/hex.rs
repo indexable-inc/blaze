@@ -43,17 +43,21 @@ const fn nibbles(upper: bool) -> [u8; 256] {
     table
 }
 
-/// `bytes` in lowercase hex.
+/// DEPRECATED (the `std` feature): `bytes` in lowercase hex, on the global heap. [`encode_in`]
+/// replaces it.
 // to remove: callers pass an allocator (bstd move): they call [`encode_in`].
-pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 * bytes.len());
+#[cfg(feature = "std")]
+pub fn encode(bytes: &[u8]) -> std::string::String {
+    let mut out = std::string::String::with_capacity(2 * bytes.len());
     encode_into(bytes, &mut out);
     out
 }
 
-/// Appends `bytes` to `out` in lowercase hex.
+/// DEPRECATED (the `std` feature): appends `bytes` to `out` in lowercase hex.
+/// [`encode_into_in`] replaces it.
 // to remove: callers pass an allocator (bstd move): they call [`encode_into_in`].
-pub fn encode_into(bytes: &[u8], out: &mut String) {
+#[cfg(feature = "std")]
+pub fn encode_into(bytes: &[u8], out: &mut std::string::String) {
     out.reserve(2 * bytes.len());
     each_digit(bytes, |digit| out.push(digit));
 }

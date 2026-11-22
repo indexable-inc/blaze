@@ -5,21 +5,32 @@
 //!
 //! - **A slot per key**, in a fixed open-addressed table made once ([`ClaimTable::new_in`]); it
 //!   goes empty -> reserving (its key being written) -> claimed by a task -> done with a value
-//!   (a record's ordinal, or a failure's: the table does not read it), and never back. A full
-//!   table is [`ClaimError::Full`], never a grow.
-//! - **[`ClaimTable::claim`]**: the first asker of a key owns it ([`Claimed::Mine`]) and runs it
-//!   (inline, help first); a later one finds it [`Claimed::Running`] or [`Claimed::Done`].
+//!   (a record's ordinal, or a failure's: the table does not read it) or abandoned, and never
+//!   back. A full table is [`ClaimError::Full`], never a grow.
+//! - **[`ClaimTable::claim`]**: the first asker of a key owns it ([`Claimed::Mine`], holding a
+//!   [`Claim`]) and runs it (inline, help first); a later one finds it [`Claimed::Running`],
+//!   [`Claimed::Done`] or [`Claimed::Abandoned`].
+//! - **A claim is published** (docs/v2/plan/design/states.md, 24): a [`Claim`] is linear
+//!   (`#[blaze::linear]`): the owner ends it only by [`Claim::publish`], which takes it, so a
+//!   claim cannot be published twice, by a task that does not own it, or not at all. A panic
+//!   that unwinds past one (rule 20) runs its drop: the slot is published as ABANDONED, its
+//!   waiter stack is closed and kept on the slot as orphans. The driver that caught the panic
+//!   takes them with [`ClaimTable::orphans`] and re-enters each; a re-entered waiter's claim of
+//!   the key finds [`Claimed::Abandoned`] (and a wait [`Waited::Abandoned`]) and fails its own
+//!   job with a typed error naming the slot. No waiter stays parked.
 //! - **[`ClaimTable::wait`]**: a task that found a key running publishes its edge (the slot it
 //!   waits on), then walks owner -> that owner's edge -> ... at most `tasks` steps. Reaching a
 //!   slot it owns is [`Waited::Cycle`]. Else it pushes itself on the slot's waiter stack
-//!   ([`Waited::Parked`]), or finds the stack closed and reads the value ([`Waited::Ready`]).
-//!   A parked task holds no thread: the driver re-enters it when [`ClaimTable::publish`] hands
-//!   it back.
-//! - **[`ClaimTable::publish`]** stores the value, then swaps the waiter stack for CLOSED and
-//!   returns every task that was on it ([`Woken`]), each with its edge cleared. A push before
-//!   the swap is in what it returns; a push after it sees CLOSED and reads the value: no waiter
-//!   is lost (`claims_waits_and_cycles_hold_on_drawn_schedules`; its control
-//!   `the_oracle_catches_a_close_by_load`).
+//!   ([`Waited::Parked`]), or finds the stack closed and reads the value ([`Waited::Ready`] or
+//!   [`Waited::Abandoned`]). A parked task holds no thread: the driver re-enters it when a
+//!   publish hands it back.
+//! - **[`Claim::publish`]** stores the value, then swaps the waiter stack for CLOSED and
+//!   returns every task that was on it ([`Woken`], linear too: ended only by
+//!   [`Woken::for_each`]), each with its edge cleared. A push before the swap is in what it
+//!   returns; a push after it sees CLOSED and reads the value: no waiter is lost
+//!   (`claims_waits_and_cycles_hold_on_drawn_schedules`; its control
+//!   `the_oracle_catches_a_close_by_load`). A `Woken` dropped by an unwind before it handed
+//!   every task out keeps the rest on the slot as orphans, for [`ClaimTable::orphans`].
 //! - **Two tasks closing one cycle at once**: each stores its edge before it reads the other's
 //!   (all SeqCst), so at least one of them sees the cycle (the same drawn test; its control
 //!   `the_oracle_catches_a_walk_before_the_edge`). One claim of a new key owns it (control
@@ -28,10 +39,26 @@
 //!   operations on 10 us to 10 ms tasks, and the cycle argument needs a single total order.
 //! - **Bounded** (rule 18): a probe visits at most every slot; a wait on a key still being
 //!   reserved spins at most [`SPIN_MOST`] rounds; a push retries at most [`SPIN_MOST`] times;
-//!   the walk takes at most `tasks` steps. Each bound passed is a typed error naming the slot.
+//!   the walk takes at most `tasks` steps; a take of the orphans visits each slot once. Each
+//!   bound passed is a typed error naming the slot.
 //!
-//! Sans-IO: no clock, no thread, no allocation after `new_in`. Its tests pass (green
-//! b13ac2dcb9, 2026-11-17).
+//! A slot index ([`At`]) is made only by the table: one from outside cannot be forged.
+//!
+//! ```compile_fail
+//! // A claim is published once: the publish takes it.
+//! fn twice<A: core::alloc::Allocator>(claim: blaze_core::claim_table::Claim<'_, A>) {
+//!     claim.publish(1).for_each(|_| {});
+//!     claim.publish(2).for_each(|_| {});
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! // A slot index is the table's: none is made from a number.
+//! let _ = blaze_core::claim_table::At(3);
+//! ```
+//!
+//! Sans-IO: no clock, no thread, no allocation after `new_in`. Its tests passed before the
+//! linear claim (green b13ac2dcb9, 2026-11-17); the ported tests are not yet run.
 
 #![blaze::sans_io]
 
@@ -54,19 +81,90 @@ pub struct Key(pub [u64; 4]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskId(pub u32);
 
-/// A slot's index: what [`ClaimTable::wait`] and [`ClaimTable::publish`] take.
+/// A slot's index: what [`ClaimTable::wait`] takes and a [`Claim`] holds. Made only by the
+/// table (and this crate's claim watch and tests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct At(pub u32);
+pub struct At(pub(crate) u32);
+
+impl At {
+    /// The slot's index, to print or to key a watch by.
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
 
 /// What a claim found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Claimed {
-    /// The caller owns the key: it computes the record and publishes it.
-    Mine(At),
+#[derive(Debug)]
+pub enum Claimed<'t, A: Allocator> {
+    /// The caller owns the key: it computes the record and publishes it through the claim.
+    Mine(Claim<'t, A>),
     /// Another task owns it and has not published.
     Running { at: At, owner: TaskId },
     /// Published with this value.
     Done { at: At, value: u32 },
+    /// Its owner unwound before it published (rule 20): the record will not come from this
+    /// slot, and the asker fails its own job naming it.
+    Abandoned { at: At },
+}
+
+/// A key the caller owns: ended only by [`Claim::publish`] (see the module's doc for what an
+/// unwind past one does).
+#[blaze::linear]
+#[must_use = "a claim is ended by publish(value); its waiters are parked until then"]
+pub struct Claim<'t, A: Allocator> {
+    owned: Owned<'t, A>,
+}
+
+/// A claim's slot and its abandonment path.
+struct Owned<'t, A: Allocator> {
+    table: &'t ClaimTable<A>,
+    at: At,
+    me: TaskId,
+    /// Whether the slot is still this value's to end: cleared by the publish.
+    armed: bool,
+}
+
+impl<A: Allocator> Drop for Owned<'_, A> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // An unwind past the claim: published as abandoned, its waiters kept as orphans.
+        let slot = &self.table.slots[self.at.0 as usize];
+        let head = self.table.close(slot, state(DONE, 0) | ABANDONED);
+        if is_waiter(head) {
+            slot.orphans.store(head, SeqCst);
+        }
+    }
+}
+
+impl<'t, A: Allocator> Claim<'t, A> {
+    /// The claimed slot.
+    pub fn at(&self) -> At {
+        self.owned.at
+    }
+
+    /// The owning task.
+    pub fn owner(&self) -> TaskId {
+        self.owned.me
+    }
+
+    /// Publishes `value` (a record's ordinal, or a failure's): the tasks that waited are
+    /// returned, to be re-entered. The claim is the proof of ownership (rule 74): nothing is
+    /// checked again.
+    pub fn publish(self, value: u32) -> Woken<'t, A> {
+        let Claim { mut owned } = self;
+        owned.armed = false;
+        let slot = &owned.table.slots[owned.at.0 as usize];
+        let head = owned.table.close(slot, state(DONE, value));
+        Woken { rest: Rest { table: owned.table, at: Some(owned.at), next: head, scan: None } }
+    }
+}
+
+impl<A: Allocator> fmt::Debug for Claim<'_, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Claim").field("at", &self.owned.at).field("owner", &self.owned.me).finish()
+    }
 }
 
 /// What a wait did.
@@ -76,20 +174,26 @@ pub enum Waited {
     Parked,
     /// The slot was published first: its value.
     Ready(u32),
+    /// The slot's owner unwound before it published: the waiter fails its own job naming it.
+    Abandoned { at: At },
     /// Waiting would close a cycle through a slot the caller owns; nothing was pushed and the
     /// caller's edge is cleared. [`ClaimTable::chain`] names the cycle from `at`.
     Cycle { at: At },
 }
 
-/// A broken bug-seeding plan for the tests' controls: each weakens one guard.
+/// A broken bug-seeding plan for the tests' controls: each weakens one guard. Made only by
+/// the test constructor [`ClaimTable::planted_in`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaimPlant {
+pub(crate) enum ClaimPlant {
     None,
     /// A claim reserves an empty slot by a load and a store, not a compare-exchange.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test control's plant"))]
     ReserveByStore,
     /// A wait walks the owners before it publishes its own edge.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test control's plant"))]
     WalkBeforeEdge,
     /// A publish reads the waiter stack and then stores CLOSED, not one swap.
+    #[cfg_attr(not(test), expect(dead_code, reason = "a test control's plant"))]
     CloseByLoad,
 }
 
@@ -102,11 +206,9 @@ pub enum ClaimError {
     Reserving { at: At },
     /// A push onto the slot's waiter stack lost [`SPIN_MOST`] races.
     Contended { at: At },
-    /// A publish or wait of a slot the task does not own or that is not claimed.
-    NotOwner { at: At, task: TaskId },
     /// A task id at or past the table's task rows.
     NoSuchTask { task: TaskId, tasks: u32 },
-    /// A slot index past the table.
+    /// A slot index past the table (one from another table).
     NoSuchSlot { at: At, capacity: u32 },
     /// The table's room could not be had.
     Memory { slots: u32, tasks: u32 },
@@ -118,7 +220,6 @@ impl fmt::Display for ClaimError {
             ClaimError::Full { capacity } => write!(f, "the claim table's {capacity} slots all hold other keys (rule 18: a table has a cap)"),
             ClaimError::Reserving { at } => write!(f, "claim slot {}: its key was still being written after {SPIN_MOST} rounds (rule 18)", at.0),
             ClaimError::Contended { at } => write!(f, "claim slot {}: a wait lost {SPIN_MOST} pushes onto its waiters (rule 18)", at.0),
-            ClaimError::NotOwner { at, task } => write!(f, "claim slot {}: task {} does not own it, or it is not claimed (rule 3)", at.0, task.0),
             ClaimError::NoSuchTask { task, tasks } => write!(f, "task {} is past the claim table's {tasks} task rows", task.0),
             ClaimError::NoSuchSlot { at, capacity } => write!(f, "claim slot {} is past the table's {capacity} slots", at.0),
             ClaimError::Memory { slots, tasks } => write!(f, "the claim table's room ({slots} slots, {tasks} task rows) could not be had"),
@@ -128,12 +229,14 @@ impl fmt::Display for ClaimError {
 
 impl core::error::Error for ClaimError {}
 
-// A slot's state word: the tag in the top two bits, a task or a value in the low 32.
+// A slot's state word: the tag in the top two bits, a task or a value in the low 32, and
+// ABANDONED (bit 32) on a done slot whose owner unwound.
 const TAG: u32 = 62;
 const EMPTY: u64 = 0;
 const RESERVING: u64 = 1;
 const CLAIMED: u64 = 2;
 const DONE: u64 = 3;
+const ABANDONED: u64 = 1 << 32;
 
 const fn state(tag: u64, low: u32) -> u64 {
     (tag << TAG) | low as u64
@@ -147,14 +250,25 @@ const fn low_of(word: u64) -> u32 {
     word as u32
 }
 
+const fn abandoned(word: u64) -> bool {
+    word & ABANDONED != 0
+}
+
 // A waiter stack's head: empty, closed by the publish, or a task's index plus one.
 const NO_WAITER: u64 = 0;
 const CLOSED: u64 = u64::MAX;
+
+const fn is_waiter(head: u64) -> bool {
+    head != NO_WAITER && head != CLOSED
+}
 
 struct Slot {
     key: [AtomicU64; 4],
     state: AtomicU64,
     waiters: AtomicU64,
+    /// The waiters an unwind left unhanded (an abandoned claim's, or a dropped `Woken`'s
+    /// rest), a stack head as `waiters`; taken by [`ClaimTable::orphans`].
+    orphans: AtomicU64,
 }
 
 /// A task's row, written by that task (its edge, its link) and cleared by the publisher that
@@ -182,11 +296,19 @@ impl<A: Allocator> ClaimTable<A> {
     where
         A: Clone,
     {
-        Self::planted_in(slots, tasks, ClaimPlant::None, alloc)
+        Self::made_in(slots, tasks, ClaimPlant::None, alloc)
     }
 
-    /// [`ClaimTable::new_in`] with a plant (the tests' controls).
-    pub fn planted_in(slots: u32, tasks: u32, plant: ClaimPlant, alloc: A) -> Result<ClaimTable<A>, ClaimError>
+    /// [`ClaimTable::new_in`] with a plant: the tests' controls only.
+    #[cfg(test)]
+    pub(crate) fn planted_in(slots: u32, tasks: u32, plant: ClaimPlant, alloc: A) -> Result<ClaimTable<A>, ClaimError>
+    where
+        A: Clone,
+    {
+        Self::made_in(slots, tasks, plant, alloc)
+    }
+
+    fn made_in(slots: u32, tasks: u32, plant: ClaimPlant, alloc: A) -> Result<ClaimTable<A>, ClaimError>
     where
         A: Clone,
     {
@@ -198,6 +320,7 @@ impl<A: Allocator> ClaimTable<A> {
                 key: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 state: AtomicU64::new(state(EMPTY, 0)),
                 waiters: AtomicU64::new(NO_WAITER),
+                orphans: AtomicU64::new(NO_WAITER),
             };
             slot_rows.try_push(slot).map_err(|_| refused)?;
         }
@@ -226,7 +349,7 @@ impl<A: Allocator> ClaimTable<A> {
     }
 
     /// The key's slot for `me`: taken if the key is new (`Mine`), else how it stands.
-    pub fn claim(&self, key: Key, me: TaskId) -> Result<Claimed, ClaimError> {
+    pub fn claim(&self, key: Key, me: TaskId) -> Result<Claimed<'_, A>, ClaimError> {
         self.task(me)?;
         let start = key.0[0] as u32 & self.mask;
         for probe in 0..self.capacity() {
@@ -252,7 +375,7 @@ impl<A: Allocator> ClaimTable<A> {
                             word.store(value, SeqCst);
                         }
                         slot.state.store(state(CLAIMED, me.0), SeqCst);
-                        return Ok(Claimed::Mine(at));
+                        return Ok(Claimed::Mine(Claim { owned: Owned { table: self, at, me, armed: true } }));
                     }
                     RESERVING => {
                         spins += 1;
@@ -267,6 +390,7 @@ impl<A: Allocator> ClaimTable<A> {
                         }
                         return Ok(match tag {
                             CLAIMED => Claimed::Running { at, owner: TaskId(low_of(word)) },
+                            _ if abandoned(word) => Claimed::Abandoned { at },
                             _ => Claimed::Done { at, value: low_of(word) },
                         });
                     }
@@ -325,7 +449,10 @@ impl<A: Allocator> ClaimTable<A> {
             if head == CLOSED {
                 row.waiting_on.store(0, SeqCst);
                 let word = slot.state.load(SeqCst);
-                return Ok(Waited::Ready(low_of(word)));
+                return Ok(match abandoned(word) {
+                    true => Waited::Abandoned { at },
+                    false => Waited::Ready(low_of(word)),
+                });
             }
             row.next.store(head, SeqCst);
             if slot.waiters.compare_exchange(head, u64::from(me.0) + 1, SeqCst, SeqCst).is_ok() {
@@ -336,25 +463,25 @@ impl<A: Allocator> ClaimTable<A> {
         Err(ClaimError::Contended { at })
     }
 
-    /// `me`, the owner of slot `at`, publishes `value` (a record's ordinal, or a failure's):
-    /// the tasks that waited are returned, to be re-entered.
-    pub fn publish(&self, at: At, me: TaskId, value: u32) -> Result<Woken<'_, A>, ClaimError> {
-        self.task(me)?;
-        let slot = self.slot(at)?;
-        let word = slot.state.load(SeqCst);
-        if word != state(CLAIMED, me.0) {
-            return Err(ClaimError::NotOwner { at, task: me });
-        }
-        slot.state.store(state(DONE, value), SeqCst);
-        let head = match self.plant {
+    /// Stores the slot's end (`done`), then closes its waiter stack: the head that was on it.
+    fn close(&self, slot: &Slot, done: u64) -> u64 {
+        slot.state.store(done, SeqCst);
+        match self.plant {
             ClaimPlant::CloseByLoad => {
                 let head = slot.waiters.load(SeqCst);
                 slot.waiters.store(CLOSED, SeqCst);
                 head
             }
             _ => slot.waiters.swap(CLOSED, SeqCst),
-        };
-        Ok(Woken { table: self, next: head })
+        }
+    }
+
+    /// The waiters an unwind left on any slot (an abandoned claim's, or the rest of a dropped
+    /// [`Woken`]), each taken once: the driver that caught a panic calls it and re-enters each
+    /// (their re-claim finds [`Claimed::Abandoned`] or the published value). One pass over the
+    /// slots.
+    pub fn orphans(&self) -> Woken<'_, A> {
+        Woken { rest: Rest { table: self, at: None, next: NO_WAITER, scan: Some(0) } }
     }
 
     /// The owners met walking from slot `at` (owner, its edge, ...), at most one per task row:
@@ -364,25 +491,65 @@ impl<A: Allocator> ClaimTable<A> {
     }
 }
 
-/// The tasks a publish took off a slot's waiter stack, each with its edge cleared as it is
-/// handed out (its link read first, so the task may wait again at once).
+/// The tasks a publish took off a slot's waiter stack (or [`ClaimTable::orphans`] off every
+/// slot), each with its edge cleared as it is handed out (its link read first, so the task may
+/// wait again at once). Linear: ended only by [`Woken::for_each`], so no waiter is forgotten;
+/// an unwind that drops one keeps the rest as orphans.
+#[blaze::linear]
+#[must_use = "the woken tasks are handed out by for_each; until then they stay parked"]
 pub struct Woken<'t, A: Allocator> {
-    table: &'t ClaimTable<A>,
-    next: u64,
+    rest: Rest<'t, A>,
 }
 
-impl<A: Allocator> Iterator for Woken<'_, A> {
-    type Item = TaskId;
+/// What a `Woken` has not handed out, and its drop that keeps it.
+struct Rest<'t, A: Allocator> {
+    table: &'t ClaimTable<A>,
+    /// The slot whose stack `next` is on.
+    at: Option<At>,
+    next: u64,
+    /// For the orphans' take: the next slot to look at.
+    scan: Option<u32>,
+}
 
-    fn next(&mut self) -> Option<TaskId> {
-        if self.next == NO_WAITER || self.next == CLOSED {
-            return None;
+impl<A: Allocator> Rest<'_, A> {
+    fn step(&mut self) -> Option<TaskId> {
+        loop {
+            if is_waiter(self.next) {
+                let task = TaskId((self.next - 1) as u32);
+                let row = self.table.tasks.get(task.0 as usize)?;
+                self.next = row.next.load(SeqCst);
+                row.waiting_on.store(0, SeqCst);
+                return Some(task);
+            }
+            let from = self.scan?;
+            let found = (from..self.table.capacity()).find_map(|i| {
+                let head = self.table.slots[i as usize].orphans.swap(NO_WAITER, SeqCst);
+                is_waiter(head).then_some((i, head))
+            });
+            let (i, head) = found?;
+            self.at = Some(At(i));
+            self.next = head;
+            self.scan = Some(i + 1);
         }
-        let task = TaskId((self.next - 1) as u32);
-        let row = self.table.tasks.get(task.0 as usize)?;
-        self.next = row.next.load(SeqCst);
-        row.waiting_on.store(0, SeqCst);
-        Some(task)
+    }
+}
+
+impl<A: Allocator> Drop for Rest<'_, A> {
+    fn drop(&mut self) {
+        // An unwind before every task was handed out: the rest stays on its slot.
+        if let (true, Some(at)) = (is_waiter(self.next), self.at) {
+            self.table.slots[at.0 as usize].orphans.store(self.next, SeqCst);
+        }
+    }
+}
+
+impl<A: Allocator> Woken<'_, A> {
+    /// Hands each woken task to `wake`, to be re-entered.
+    pub fn for_each(self, mut wake: impl FnMut(TaskId)) {
+        let Woken { mut rest } = self;
+        while let Some(task) = rest.step() {
+            wake(task);
+        }
     }
 }
 
@@ -418,13 +585,13 @@ impl<A: Allocator> Iterator for Chain<'_, A> {
 #[cfg(all(test, not(blaze_check)))]
 mod tests {
     //! Run: `blaze test -p blaze-core claim_table` (or cargo's). Every test prints nothing on a
-    //! pass; `cargo test` reports `test claim_table::tests::... ok` for each of the six.
+    //! pass; `cargo test` reports `test claim_table::tests::... ok` for each of the seven.
 
     use std::alloc::Global;
 
     use blaze_sim::{Broke, Config, Tape, check};
 
-    use super::{At, ClaimPlant, ClaimTable, Claimed, Key, TaskId, Waited};
+    use super::{At, ClaimPlant, ClaimTable, Claimed, Key, TaskId, Waited, Woken};
     use crate::world::threads::{self, Ended, Step};
 
     const K: Key = Key([5, 6, 7, 8]);
@@ -446,46 +613,97 @@ mod tests {
         (0..tape.int_in(0..=48u64, "steps")).map(|_| Step { second: tape.coin("the second goes"), pick: 0 }).collect()
     }
 
+    fn woken(w: Woken<'_, Global>) -> std::vec::Vec<TaskId> {
+        let mut out = std::vec::Vec::new();
+        w.for_each(|task| out.push(task));
+        out
+    }
+
+    /// How a claim stands, without its claim: what the oracles compare.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Seen {
+        Mine(At),
+        Running { at: At, owner: TaskId },
+        Done { at: At, value: u32 },
+        Abandoned { at: At },
+    }
+
+    /// `claimed` seen, its claim (if one) published with 0 so nothing is left unfinished.
+    fn seen_of(claimed: Claimed<'_, Global>) -> Seen {
+        match claimed {
+            Claimed::Mine(claim) => {
+                let at = claim.at();
+                let _ = woken(claim.publish(0));
+                Seen::Mine(at)
+            }
+            Claimed::Running { at, owner } => Seen::Running { at, owner },
+            Claimed::Done { at, value } => Seen::Done { at, value },
+            Claimed::Abandoned { at } => Seen::Abandoned { at },
+        }
+    }
+
     /// One thread: a claim, a second asker finds it running and parks, the publish hands it
     /// back, and a third asker finds it done; a colliding key takes the next slot.
     #[test]
     fn one_thread_claim_wait_publish() {
         let t = table(ClaimPlant::None);
-        let Ok(Claimed::Mine(at)) = t.claim(K, TaskId(0)) else { panic!("the first claim owns the key") };
-        assert_eq!(t.claim(K, TaskId(1)), Ok(Claimed::Running { at, owner: TaskId(0) }));
+        let Ok(Claimed::Mine(claim)) = t.claim(K, TaskId(0)) else { panic!("the first claim owns the key") };
+        let at = claim.at();
+        assert_eq!(t.claim(K, TaskId(1)).map(seen_of), Ok(Seen::Running { at, owner: TaskId(0) }));
         assert_eq!(t.wait(at, TaskId(1)), Ok(Waited::Parked));
         let Ok(Claimed::Mine(other)) = t.claim(L, TaskId(2)) else { panic!("a colliding key owns its own slot") };
-        assert_ne!(other, at);
-        let woken: std::vec::Vec<TaskId> = t.publish(at, TaskId(0), 7).expect("the owner publishes").collect();
-        assert_eq!(woken, [TaskId(1)]);
-        assert_eq!(t.claim(K, TaskId(3)), Ok(Claimed::Done { at, value: 7 }));
-        assert!(t.publish(at, TaskId(0), 8).is_err(), "a second publish is refused");
+        assert_ne!(other.at(), at);
+        assert_eq!(woken(claim.publish(7)), [TaskId(1)]);
+        assert_eq!(t.claim(K, TaskId(3)).map(seen_of), Ok(Seen::Done { at, value: 7 }));
+        assert!(woken(other.publish(1)).is_empty());
+    }
+
+    /// An unwind past a claim: the waiter is kept as an orphan, the orphans' take hands it
+    /// back once, and its re-claim and a later wait both see the slot abandoned. Its control:
+    /// the published claim is not abandoned and leaves no orphans.
+    #[test]
+    fn an_unwound_claim_wakes_its_waiters_with_an_error() {
+        let t = table(ClaimPlant::None);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(Claimed::Mine(_claim)) = t.claim(K, TaskId(0)) else { panic!("set-up claim") };
+            let Ok(Seen::Running { at, .. }) = t.claim(K, TaskId(1)).map(seen_of) else { panic!("the second asker finds it running") };
+            assert_eq!(t.wait(at, TaskId(1)), Ok(Waited::Parked));
+            panic!("the owner's job fails before it publishes");
+        }));
+        assert!(unwound.is_err(), "the owner unwound");
+        assert_eq!(woken(t.orphans()), [TaskId(1)]);
+        assert!(woken(t.orphans()).is_empty(), "an orphan is taken once");
+        let Ok(Seen::Abandoned { at }) = t.claim(K, TaskId(1)).map(seen_of) else { panic!("the re-claim sees the slot abandoned") };
+        assert_eq!(t.wait(at, TaskId(2)), Ok(Waited::Abandoned { at }));
+        // Control: a published slot reads its value and leaves no orphans.
+        let Ok(Claimed::Mine(claim)) = t.claim(L, TaskId(0)) else { panic!("claim L") };
+        let l = claim.at();
+        assert!(woken(claim.publish(4)).is_empty());
+        assert!(woken(t.orphans()).is_empty());
+        assert_eq!(t.wait(l, TaskId(2)), Ok(Waited::Ready(4)));
     }
 
     /// Two claims of one new key: when both end, exactly one owns it.
-    fn race(plant: ClaimPlant, schedule: &[Step]) -> Option<(Claimed, Claimed)> {
+    fn race(plant: ClaimPlant, schedule: &[Step]) -> Option<(Seen, Seen)> {
         let t = table(plant);
-        match threads::two(schedule, || t.claim(K, TaskId(0)), || t.claim(K, TaskId(1))) {
+        match threads::two(schedule, || t.claim(K, TaskId(0)).map(seen_of), || t.claim(K, TaskId(1)).map(seen_of)) {
             (Ended::Done(Ok(a)), Ended::Done(Ok(b))) => Some((a, b)),
             _ => None,
         }
     }
 
-    fn one_owner(got: Option<(Claimed, Claimed)>) -> bool {
-        !matches!(got, Some((Claimed::Mine(_), Claimed::Mine(_))))
+    fn one_owner(got: Option<(Seen, Seen)>) -> bool {
+        !matches!(got, Some((Seen::Mine(_), Seen::Mine(_))))
     }
 
     /// The publisher and a waiter: a waiter that parked is among those the publish returned.
     fn publish_and_wait(plant: ClaimPlant, schedule: &[Step]) -> (Option<Waited>, Option<std::vec::Vec<TaskId>>) {
         let t = table(plant);
-        let Ok(Claimed::Mine(at)) = t.claim(K, TaskId(0)) else { panic!("set-up claim") };
-        let (published, waited) = threads::two(
-            schedule,
-            || t.publish(at, TaskId(0), 7).map(|woken| woken.collect::<std::vec::Vec<TaskId>>()),
-            || t.wait(at, TaskId(1)),
-        );
+        let Ok(Claimed::Mine(claim)) = t.claim(K, TaskId(0)) else { panic!("set-up claim") };
+        let at = claim.at();
+        let (published, waited) = threads::two(schedule, || woken(claim.publish(7)), || t.wait(at, TaskId(1)));
         let woken = match published {
-            Ended::Done(Ok(woken)) => Some(woken),
+            Ended::Done(woken) => Some(woken),
             _ => None,
         };
         let waited = match waited {
@@ -499,7 +717,7 @@ mod tests {
         match got {
             (Some(Waited::Parked), Some(woken)) => woken.contains(&TaskId(1)),
             (Some(Waited::Ready(value)), _) => *value == 7,
-            (Some(Waited::Cycle { .. }), _) => false,
+            (Some(Waited::Cycle { .. } | Waited::Abandoned { .. }), _) => false,
             _ => true,
         }
     }
@@ -509,10 +727,13 @@ mod tests {
         let t = table(plant);
         let Ok(Claimed::Mine(a)) = t.claim(K, TaskId(0)) else { panic!("set-up claim of a") };
         let Ok(Claimed::Mine(b)) = t.claim(L, TaskId(1)) else { panic!("set-up claim of b") };
-        match threads::two(schedule, || t.wait(b, TaskId(0)), || t.wait(a, TaskId(1))) {
+        let (at_a, at_b) = (a.at(), b.at());
+        let got = match threads::two(schedule, || t.wait(at_b, TaskId(0)), || t.wait(at_a, TaskId(1))) {
             (Ended::Done(Ok(x)), Ended::Done(Ok(y))) => Some((x, y)),
             _ => None,
-        }
+        };
+        let _ = (woken(a.publish(0)), woken(b.publish(0)));
+        got
     }
 
     fn seen(got: Option<(Waited, Waited)>) -> bool {
@@ -566,11 +787,12 @@ mod tests {
     }
 
     /// Control: a close by load then store loses a waiter that pushes between them: the
-    /// publisher stores DONE and reads the empty stack (3 steps), the waiter publishes its edge,
-    /// sees DONE, reads the stack still open and pushes (5 steps), then the publisher closes.
+    /// publisher stores DONE and reads the empty stack (2 steps: a `Claim` is its own proof of
+    /// ownership, so `publish` loads no owner word first), the waiter publishes its edge, sees
+    /// DONE, reads the stack still open and pushes (5 steps), then the publisher closes.
     #[test]
     fn the_oracle_catches_a_close_by_load() {
-        let schedule: std::vec::Vec<Step> = s(3).chain(d(5)).chain(s(6)).chain(d(4)).collect();
+        let schedule: std::vec::Vec<Step> = s(2).chain(d(5)).chain(s(6)).chain(d(4)).collect();
         assert!(!none_lost(&publish_and_wait(ClaimPlant::CloseByLoad, &schedule)));
         assert!(none_lost(&publish_and_wait(ClaimPlant::None, &schedule)));
     }
@@ -590,9 +812,11 @@ mod tests {
         let t = table(ClaimPlant::None);
         let Ok(Claimed::Mine(a)) = t.claim(K, TaskId(0)) else { panic!("claim a") };
         let Ok(Claimed::Mine(b)) = t.claim(L, TaskId(1)) else { panic!("claim b") };
-        assert_eq!(t.wait(a, TaskId(1)), Ok(Waited::Parked));
-        assert_eq!(t.wait(b, TaskId(0)), Ok(Waited::Cycle { at: b }));
-        let chain: std::vec::Vec<(At, TaskId)> = t.chain(b).collect();
-        assert_eq!(chain, [(b, TaskId(1)), (a, TaskId(0))]);
+        let (at_a, at_b) = (a.at(), b.at());
+        assert_eq!(t.wait(at_a, TaskId(1)), Ok(Waited::Parked));
+        assert_eq!(t.wait(at_b, TaskId(0)), Ok(Waited::Cycle { at: at_b }));
+        let chain: std::vec::Vec<(At, TaskId)> = t.chain(at_b).collect();
+        assert_eq!(chain, [(at_b, TaskId(1)), (at_a, TaskId(0))]);
+        let _ = (woken(a.publish(0)), woken(b.publish(0)));
     }
 }

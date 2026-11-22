@@ -34,6 +34,8 @@
 mod fill;
 mod front_end;
 mod locate;
+/// The read side of a body's typed record and its test double (D163 part 2).
+pub mod typed;
 /// The per-fn seam rules both programs answer by (rule 30), `Front2Program`'s calls included.
 pub(in crate::front2::program) mod seam_rules;
 pub use seam_rules::PositionSource;
@@ -104,6 +106,9 @@ pub enum LazyRefusal {
     /// A `format_args!` placeholder of `function`'s body needs core's `rt::Argument`
     /// constructor, and it was not found (fill.rs `fmt_rows`).
     FmtArgument { function: Box<str>, why: crate::front2::fmt_template::ArgumentNewFail },
+    /// `function`'s checked columns were to be read from the check's record (typed.rs, the
+    /// typing seam's `FromRecord`), and were not: never checked here instead (rule 3).
+    Typed { function: Box<str>, gap: typed::TypedGap },
 }
 
 impl core::fmt::Display for LazyRefusal {
@@ -142,6 +147,7 @@ impl core::fmt::Display for LazyRefusal {
                 tabled.0
             ),
             LazyRefusal::FmtArgument { function, why } => write!(f, "front2 (lazy): `{function}`: {why}"),
+            LazyRefusal::Typed { function, gap } => write!(f, "front2 (lazy): `{function}`'s checked columns from the check's record: {gap}"),
             LazyRefusal::NoStatic { item } => write!(f, "front2 (lazy): the static {:032x} was made, and its value and kind are not both in the program's tables (fill.rs `static_value` files them together)", item.0),
         }
     }
@@ -270,6 +276,9 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     projection_why: RefCell<Option<Box<str>>>,
     /// What the instance questions' worlds asked and found unmade (the seam's `make_asked`).
     asked: RefCell<Vec<crate::front2::world_items::Fill, Global>>,
+    /// What the instance questions' worlds could not answer and no fill makes (a refused
+    /// candidate impl, by name): `make_asked`'s refusal when no fill is left (rule 19).
+    asked_gaps: RefCell<Vec<crate::front2::world_items::Gap, Global>>,
     /// Each internal-symbol declaration bound to its definition once (front_end.rs
     /// `InternalBindings`; the rule is seam_rules.rs's, shared with the whole program).
     internal_bindings: RefCell<front_end::InternalBindings<'n>>,
@@ -344,6 +353,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             entry_key: entry,
             projection_why: RefCell::new(None),
             asked: RefCell::new(Vec::new_in(Global)),
+            asked_gaps: RefCell::new(Vec::new_in(Global)),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
             member_rows: HashMap::new_in(Global),
             counts: LazyCounts::default(),

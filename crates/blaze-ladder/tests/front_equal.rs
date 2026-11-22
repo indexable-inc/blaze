@@ -444,8 +444,393 @@ fn whole_and_lazy_answer_alike() {
 }
 
 #[test]
+fn a_static_struct_calls_both_fn_fields_on_both_front_ends() {
+    on_big_stack(|| {
+        let src = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+#[lang = "pointee_sized"] trait PointeeSized {}
+#[lang = "meta_sized"] trait MetaSized: PointeeSized {}
+#[lang = "sized"] trait Sized: MetaSized {}
+#[lang = "copy"] trait Copy {}
+impl Copy for u8 {}
+#[lang = "sync"] unsafe trait Sync {}
+
+struct Ops { first: fn(u8) -> u8, second: fn(u8) -> u8 }
+unsafe impl Sync for Ops {}
+fn twice(x: u8) -> u8 { x * 2 }
+fn plus_three(x: u8) -> u8 { x + 3 }
+static OPS: Ops = Ops { first: twice, second: plus_three };
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    (OPS.second)((OPS.first)(17)) as i32
+}
+"#;
+        let files = [SourceFile { path: rungs::x::ROOT, text: src }];
+        let w = world();
+        let mut firsts = AVec::new_in(w.a);
+        let compared = compare_one(&w, "static fn fields", &files, "2024", OverflowChecks::Off, Plant::No, &mut firsts);
+        assert!(compared.built_both, "both walks must reach main, OPS, twice and plus_three");
+        assert_eq!(compared.tally.differing, 0);
+        let b = compared.bytes;
+        assert!(b.equal >= 4);
+        assert_eq!((b.differing, b.only_whole, b.only_lazy), (0, 0, 0));
+
+        use blaze_ladder::run::{FrontChoice, run_with};
+        let new = NewFront { package: rungs::x::PACKAGE, edition: "2024", shelf: None, overflow: OverflowChecks::Off };
+        for front in [FrontChoice::Old(OverflowChecks::Off), FrontChoice::New(new)] {
+            let status = run_with(&files, rungs::x::ROOT, None, front, blaze_own::testing::heap().shared())
+                .unwrap_or_else(|why| panic!("{front:?}: {why}"));
+            assert_eq!(status, 37, "the second field adds three after the first field doubles 17");
+        }
+        println!("both front ends called both static fn fields: status 37");
+    });
+}
+
+#[test]
 fn a_planted_abi_is_caught() {
     on_big_stack(planted_abi_caught);
+}
+
+/// Execute the code and data records of this walk. The fixtures have an exported
+/// C-unwind entry and no native imports.
+#[cfg(target_arch = "aarch64")]
+fn record_status(front: &impl FrontEnd, walk: &Walk<'_>, store: &MemoryStore<'_>, a: Alloc<'_>) -> i32 {
+    use blaze_code::image::{Image, ImageError, Kind, Member, lay_out_positions};
+    use blaze_code::record::{Space, Target};
+    use blaze_ladder::body_ids::RowKind;
+    use blaze_ladder::code_records::{EntryView, statics::StaticEntryView};
+    use blaze_launch_rt::sys::{Code, page};
+
+    struct Statics<'i, 'a>(&'i Image<'a>);
+    impl blaze_code::place::Words for Statics<'_, '_> {
+        fn word(&mut self, target: Target, _: bool) -> Result<u64, ImageError> {
+            Err(ImageError::Unbound { target })
+        }
+        fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+            self.0.home(target).ok_or(ImageError::Unbound { target })
+        }
+    }
+
+    let mut members = Vec::new();
+    let mut statics = Vec::new();
+    for row in 0..walk.len() {
+        let bytes = store.get(walk.key(row).expect("fixture record key")).unwrap().expect("fixture record");
+        let symbol = walk.symbol(row);
+        match walk.kind(row) {
+            RowKind::Instance => members.push(Member { symbol, record: EntryView::read(bytes).unwrap().record }),
+            RowKind::Static => statics.push((symbol, StaticEntryView::read(bytes).unwrap().datum)),
+            RowKind::ThreadLocal => panic!("unexpected thread-local in the fixture"),
+        }
+    }
+    let page = page().unwrap();
+    let segment = lay_out_positions(&members, Kind::Bundle, page as u64, a, |_, row| {
+        Ok(front.source_position(ItemKey(row.item), row.site).expect("the call in the fixture's file"))
+    }).unwrap();
+    let mut memory = Code::map(segment.size as usize).unwrap();
+    let base = memory.base() as u64;
+    let mut image = Image::new(base, page as u64, a).unwrap();
+    let mut data = Vec::new();
+    for (symbol, datum) in statics {
+        // Each mapping begins on a page, which satisfies the datum's alignment.
+        let mapping = Code::map((datum.len() as usize).next_multiple_of(page)).unwrap();
+        image.define(Target { space: Space::Static, symbol }, mapping.base() as u64).unwrap();
+        data.push((symbol, datum, mapping));
+    }
+    // WORDS points into another static, so every address must exist before filling.
+    for (symbol, datum, mapping) in &mut data {
+        let mut bytes = vec![0; datum.bytes().len()];
+        blaze_code::datum::fill(datum, *symbol, mapping.base() as u64, &mut Statics(&image), &mut bytes).unwrap();
+        mapping.write(0, &bytes).unwrap();
+    }
+    let placed = image.append(&segment).unwrap();
+    assert!(placed.outside.is_empty(), "unexpected native import in the fixture");
+    memory.write(0, &segment.code).unwrap();
+    memory.write(segment.relro_at as usize, &segment.relro).unwrap();
+    for write in placed.writes.iter() {
+        memory.write((write.at - base) as usize, &write.value.to_le_bytes()).unwrap();
+    }
+    let entry = image.home(Target { space: Space::Func, symbol: walk.symbol(0) }).expect("main");
+    // SAFETY: row zero is the exported extern "C-unwind" fn main() -> i32 in
+    // each fixture. All its imports have been bound and all mappings live across the call.
+    let main: extern "C-unwind" fn() -> i32 = unsafe { std::mem::transmute(entry as usize) };
+    main()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn check_record_status(files: &[SourceFile<'_>], expected: i32) {
+    let w = world();
+    let root = rungs::x::ROOT;
+    let tc = Toolchain::none(w.a);
+    let new = NewFront { package: rungs::x::PACKAGE, edition: "2024", shelf: None, overflow: OverflowChecks::Off };
+    let texts = ProgramTexts::new(files, root, new, &tc, blaze_build::Panic::Unwind).unwrap();
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap();
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, w.a).unwrap();
+    let whole = Front2Program::new(&names, w.frame, files, w.a).unwrap();
+    let entry = whole.function(whole.entry().expect("exported main")).key;
+    let mut lazy = LazyProgram::new(&names, w.frame, files, Some(entry), w.a).unwrap();
+    lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).unwrap();
+
+    fn execute(front: impl FrontEnd, entry: ItemKey, w: &World) -> i32 {
+        let b = builder(OverflowChecks::Off);
+        let mut maker = Over::new(Asked::new(front, None, w.a), &b, w.a);
+        let mut store = MemoryStore::new_in(w.a);
+        let (walk, _) = walk_records(entry, &EveryItem, &mut store, &b, &producer(), &mut maker, w.a).unwrap();
+        record_status(&maker.program.inner, &walk, &store, w.a)
+    }
+    assert_eq!(execute(whole, entry, &w), expected, "whole front end, {root}");
+    assert_eq!(execute(lazy, entry, &w), expected, "lazy front end, {root}");
+}
+
+/// Both record walks and both in-process runners for fixtures using the common front-end API.
+#[cfg(target_arch = "aarch64")]
+fn check_pointer_status(text: &str, expected: u8) {
+    use blaze_ladder::run::{FrontChoice, run_with};
+
+    let files = [SourceFile { path: rungs::x::ROOT, text }];
+    check_record_status(&files, i32::from(expected));
+    let overflow = OverflowChecks::Off;
+    let new = NewFront { package: rungs::x::PACKAGE, edition: "2024", shelf: None, overflow };
+    for front in [FrontChoice::Old(overflow), FrontChoice::New(new)] {
+        let status = run_with(&files, rungs::x::ROOT, None, front, blaze_own::testing::heap().shared())
+            .unwrap_or_else(|why| panic!("{front:?}: {why}"));
+        assert_eq!(status, expected, "{front:?}");
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+const POINTER_HEAD: &str = r#"#![feature(no_core, lang_items, intrinsics, rustc_attrs)]
+#![no_core]
+#![no_main]
+#[lang = "pointee_sized"] trait PointeeSized {}
+#[lang = "meta_sized"] trait MetaSized: PointeeSized {}
+#[lang = "sized"] trait Sized: MetaSized {}
+#[lang = "copy"] trait Copy {}
+impl Copy for u8 {}
+impl<T: PointeeSized> Copy for &T {}
+impl<T: PointeeSized> Copy for *const T {}
+#[repr(transparent)] struct NonNull<T: PointeeSized> { pointer: *const T }
+impl<T: PointeeSized> Copy for NonNull<T> {}
+#[rustc_intrinsic]
+const unsafe fn transmute<S, D>(s: S) -> D;
+fn bytes(s: &str) -> &[u8] {
+    // SAFETY: str and its UTF-8 byte slice have the same data, length and lifetime.
+    unsafe { transmute::<&str, &[u8]>(s) }
+}
+"#;
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn a_tracked_callers_filename_on_both_front_ends() {
+    on_big_stack(|| {
+        let main = format!("{POINTER_HEAD}{}", r#"
+mod prob;
+#[lang = "legacy_receiver"] trait LegacyReceiver: PointeeSized {}
+impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> NonNull<T> {
+    fn as_ptr(self) -> *mut T { unsafe { transmute::<Self, *mut T>(self) } }
+    unsafe fn as_ref<'a>(&self) -> &'a T { unsafe { &*self.as_ptr() } }
+}
+#[lang = "phantom_data"] struct PhantomData<T: PointeeSized>;
+#[lang = "panic_location"]
+struct Location<'a> { filename: NonNull<str>, line: u32, col: u32, marker: PhantomData<&'a str> }
+#[rustc_intrinsic]
+const fn caller_location() -> &'static Location<'static>;
+impl<'a> Location<'a> {
+    #[track_caller] fn caller() -> &'static Location<'static> { caller_location() }
+    fn file(&self) -> &'a str { unsafe { self.filename.as_ref() } }
+}
+#[unsafe(no_mangle)] pub extern "C-unwind" fn main() -> i32 { prob::probe() }
+"#);
+        let probe = r#"#[track_caller]
+pub fn probe() -> i32 {
+    match crate::bytes(crate::Location::caller().file()) {
+        [115, 114, 99, 47, 109, 97, 105, 110, 46, 114, 115] => 37, // src/main.rs
+        _ => 1,
+    }
+}
+"#;
+        let check = |probe, expected| {
+            check_record_status(&[SourceFile { path: rungs::x::ROOT, text: &main }, SourceFile { path: "src/prob.rs", text: probe }], expected);
+        };
+        check(probe, 37);
+        // Without forwarding, Location::caller() observes the call inside src/prob.rs.
+        // Its name has exactly as many bytes as src/main.rs.
+        check(probe.strip_prefix("#[track_caller]").unwrap(), 1);
+        println!("both front ends read src/main.rs: status 37; untracked probe: status 1");
+    });
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn a_static_string_slices_second_element_on_both_front_ends() {
+    on_big_stack(|| {
+        let text = format!("{POINTER_HEAD}{}", r#"
+#[lang = "sync"] unsafe trait Sync {}
+unsafe impl Sync for &[&str] {}
+#[repr(C)]
+struct Bank { first: [&'static str; 2], second: [&'static str; 2] }
+unsafe impl Sync for Bank {}
+static BANK: Bank = Bank { first: ["south", "north"], second: ["north", "south"] };
+static WORDS: &[&str] = &BANK.second;
+#[unsafe(no_mangle)] pub extern "C-unwind" fn main() -> i32 {
+    match WORDS {
+        [_, second] => match bytes(*second) {
+            [115, 111, 117, 116, 104] => 37, // south
+            _ => 1,
+        },
+        _ => 2,
+    }
+}
+"#);
+        check_pointer_status(&text, 37);
+        // An erased addend on the pointer in WORDS selects the first array in BANK.
+        let first = text.replace("&BANK.second", "&BANK.first");
+        check_pointer_status(&first, 1);
+        println!("both front ends read the second string: status 37; zero-offset array: status 1");
+    });
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn an_erased_formatter_receives_the_referents_address_on_both_front_ends() {
+    on_big_stack(|| {
+        let text = format!("{POINTER_HEAD}{}", r#"
+#[rustc_intrinsic] const fn ptr_guaranteed_cmp<T>(a: *const T, b: *const T) -> u8;
+fn address(x: &u8) -> *const u8 { x as *const u8 }
+fn apply(erased: unsafe fn(NonNull<()>) -> *const u8, x: &u8) -> *const u8 {
+    let pointer = x as *const u8 as *const ();
+    unsafe { erased(NonNull { pointer }) }
+}
+#[unsafe(no_mangle)] pub extern "C-unwind" fn main() -> i32 {
+    let value = 17u8;
+    let other = 29u8;
+    let typed: fn(&u8) -> *const u8 = address;
+    // SAFETY: the wrapper has its pointer's ABI and apply passes a pointer to a live u8.
+    // This is the function-pointer erasure in core::fmt::rt's formatting argument.
+    let erased = unsafe { transmute::<fn(&u8) -> *const u8, unsafe fn(NonNull<()>) -> *const u8>(typed) };
+    let actual = apply(erased, &value);
+    match ptr_guaranteed_cmp::<u8>(actual, &value as *const u8) { 1 => 37, _ => 1 }
+}
+"#);
+        check_pointer_status(&text, 37);
+        let other = text.replace("apply(erased, &value)", "apply(erased, &other)");
+        check_pointer_status(&other, 1);
+        // Plant the old indirect signature at the call itself. Its argument is the
+        // address of the wrapper slot. The formatter only returns that address.
+        let old = text.replace("unsafe { erased(NonNull { pointer }) }", r#"
+    let slot = NonNull { pointer };
+    let indirect = unsafe {
+        transmute::<unsafe fn(NonNull<()>) -> *const u8, unsafe fn(&NonNull<()>) -> *const u8>(erased)
+    };
+    unsafe { indirect(&slot) }
+"#);
+        check_pointer_status(&old, 1);
+        println!("erased formatter: referent 37, distinct referent 1, planted slot address 1");
+    });
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn transparent_arguments_and_results_on_both_front_ends() {
+    on_big_stack(|| {
+        let text = format!("{POINTER_HEAD}{}", r#"
+impl Copy for u64 {}
+#[repr(transparent)] struct Wrapper(u64);
+#[repr(transparent)] enum Nested { Value((), Wrapper) }
+fn id(x: Wrapper) -> Wrapper { x }
+fn nested(x: Nested) -> Nested { x }
+extern "C" fn c_id(x: Wrapper) -> Wrapper { x }
+extern "C-unwind" fn unwind_id(x: Wrapper) -> Wrapper { x }
+#[unsafe(no_mangle)] pub extern "C-unwind" fn main() -> i32 {
+    let raw: fn(Wrapper) -> Wrapper = id;
+    let deep: fn(Nested) -> Nested = nested;
+    let c: extern "C" fn(Wrapper) -> Wrapper = c_id;
+    let unwind: extern "C-unwind" fn(Wrapper) -> Wrapper = unwind_id;
+    // SAFETY: each cast preserves the calling convention of both argument and result.
+    let raw = unsafe { transmute::<fn(Wrapper) -> Wrapper, fn(u64) -> u64>(raw) };
+    let deep = unsafe { transmute::<fn(Nested) -> Nested, fn(u64) -> u64>(deep) };
+    let c = unsafe { transmute::<extern "C" fn(Wrapper) -> Wrapper, extern "C" fn(u64) -> u64>(c) };
+    let unwind = unsafe { transmute::<extern "C-unwind" fn(Wrapper) -> Wrapper, extern "C-unwind" fn(u64) -> u64>(unwind) };
+    let w = c_id(id(Wrapper(0x123456789abcdef0u64)));
+    match unwind(c(deep(raw(w.0)))) { 0x123456789abcdef0 => 37, _ => 1 }
+}
+"#);
+        check_pointer_status(&text, 37);
+        println!("direct Rust, erased Rust, C and C-unwind returned the full u64: status 37");
+    });
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn nullable_transparent_pointers_on_both_front_ends() {
+    on_big_stack(|| {
+        // A shared reference gives the no-core fixture the same non-null niche on both
+        // front ends, including the legacy reader without scalar-valid-range attributes.
+        let text = format!("{POINTER_HEAD}{}", r#"
+mod ptr {
+    #[repr(transparent)] pub struct NonNull<T: 'static>(pub &'static T);
+}
+enum Option<T> { None, Some(T) }
+#[lang = "sync"] unsafe trait Sync {}
+unsafe impl Sync for u8 {}
+static BYTE: u8 = 19;
+fn nonnull(x: ptr::NonNull<u8>) -> ptr::NonNull<u8> { x }
+fn optional(x: Option<ptr::NonNull<u8>>) -> Option<ptr::NonNull<u8>> { x }
+extern "C" fn c_optional(x: Option<ptr::NonNull<u8>>) -> Option<ptr::NonNull<u8>> { x }
+#[rustc_intrinsic] const fn ptr_guaranteed_cmp<T>(a: *const T, b: *const T) -> u8;
+#[unsafe(no_mangle)] pub extern "C-unwind" fn main() -> i32 {
+    let p = &BYTE as *const u8;
+    let null = 0usize as *const u8;
+    let n: fn(ptr::NonNull<u8>) -> ptr::NonNull<u8> = nonnull;
+    let o: fn(Option<ptr::NonNull<u8>>) -> Option<ptr::NonNull<u8>> = optional;
+    let c: extern "C" fn(Option<ptr::NonNull<u8>>) -> Option<ptr::NonNull<u8>> = c_optional;
+    // SAFETY: the transparent reference and its nullable niche carry a single pointer.
+    let n = unsafe { transmute::<fn(ptr::NonNull<u8>) -> ptr::NonNull<u8>, fn(*const u8) -> *const u8>(n) };
+    let o = unsafe { transmute::<fn(Option<ptr::NonNull<u8>>) -> Option<ptr::NonNull<u8>>, fn(*const u8) -> *const u8>(o) };
+    let c = unsafe { transmute::<extern "C" fn(Option<ptr::NonNull<u8>>) -> Option<ptr::NonNull<u8>>, extern "C" fn(*const u8) -> *const u8>(c) };
+    match ptr_guaranteed_cmp::<u8>(c(o(n(p))), p) {
+        1 => match ptr_guaranteed_cmp::<u8>(o(c(null)), null) { 1 => 37, _ => 2 },
+        _ => 1,
+    }
+}
+"#);
+        check_pointer_status(&text, 37);
+        println!("NonNull and nullable NonNull preserved the address and null: status 37");
+    });
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn transparent_wide_and_indirect_fields_on_both_front_ends() {
+    on_big_stack(|| {
+        let text = format!("{POINTER_HEAD}{}", r#"
+impl Copy for u64 {}
+#[repr(transparent)] struct Text(&'static str);
+struct Triple(u64, u64, u64);
+#[repr(transparent)] struct Wrapped(Triple);
+struct Plain(u64);
+fn text(x: Text) -> Text { x }
+fn wrapped(x: Wrapped) -> Wrapped { x }
+fn plain(x: Plain) -> Plain { x }
+#[unsafe(no_mangle)] pub extern "C-unwind" fn main() -> i32 {
+    let wide: fn(Text) -> Text = text;
+    let indirect: fn(Wrapped) -> Wrapped = wrapped;
+    // SAFETY: each transparent argument and result inherits its field's ABI.
+    let wide = unsafe { transmute::<fn(Text) -> Text, fn(&'static str) -> &'static str>(wide) };
+    let indirect = unsafe { transmute::<fn(Wrapped) -> Wrapped, fn(Triple) -> Triple>(indirect) };
+    let triple = indirect(Triple(11, 23, 67));
+    match (triple.0, triple.1, triple.2, plain(Plain(91)).0) {
+        (11, 23, 67, 91) => match bytes(wide("rust")) { [114, 117, 115, 116] => 37, _ => 2 },
+        _ => 1,
+    }
+}
+"#);
+        check_pointer_status(&text, 37);
+        println!("wide string and indirect aggregates preserved every field: status 37");
+    });
 }
 
 fn answer_alike() {

@@ -25,7 +25,7 @@ use blaze_ladder::code_records::TierName;
 use blaze_toolchain::ToolchainId;
 
 use super::{CODE_TAG, HomeCodeStore};
-use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open};
+use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx as root_cx};
 
 /// Process `n` of one boot over `sim`: the command's store as `open_for_command` opens it.
 fn process(sim: Sim, n: u64) -> Lent<Sim, StoreAlloc> {
@@ -87,7 +87,7 @@ fn entries_reach_the_next_process_and_are_read_in_place() {
         assert_eq!(store.get(code_key(&parts(n), &builder())).expect("a get"), Some(&entry(n)[..]), "entry {n} from the arena");
     }
     drop(store);
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&root_cx(), &lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 2);
     let mut store = HomeCodeStore::new(&lent);
     for n in 0..64 {
@@ -130,7 +130,7 @@ fn a_second_walk_over_the_home_store_emits_nothing() {
     };
     let lent = process(Sim::new(2, Faults::default()), 1);
     let first = walk(&mut HomeCodeStore::new(&lent));
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&root_cx(), &lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 2);
     let second = walk(&mut HomeCodeStore::new(&lent));
     let kept = HomeCodeStore::new(&lent);
@@ -200,7 +200,7 @@ fn every_covered_input_moved_alone_is_a_miss() {
     store.put(CodeClass::Program,code_key(&base_parts, &base), &entry(1)).expect("the base entry");
     store.put(CodeClass::Program,record_base, &entry(2)).expect("the record_key base entry");
     drop(store);
-    after_answer(&lent, 0).expect("the commit after the answer");
+    after_answer(&root_cx(), &lent, 0).expect("the commit after the answer");
     let lent = process(back(lent), 2);
     let store = HomeCodeStore::new(&lent);
     assert_eq!(store.get(code_key(&base_parts, &base)).expect("a get"), Some(&entry(1)[..]), "the base entry is not found: the misses below prove nothing");
@@ -238,7 +238,7 @@ fn a_key_without_an_input_is_caught_by_the_two_values_refusal() {
         let mut store = HomeCodeStore::new(&lent);
         store.put(CodeClass::Program,code_key_planted(&parts(1), &base, plant), &entry(1)).expect("the first entry");
         drop(store);
-        after_answer(&lent, 0).expect("the commit after the answer");
+        after_answer(&root_cx(), &lent, 0).expect("the commit after the answer");
         let lent = process(back(lent), 2);
         let mut store = HomeCodeStore::new(&lent);
         match store.put(CodeClass::Program,code_key_planted(&parts(1), &other, plant), &entry(2)) {

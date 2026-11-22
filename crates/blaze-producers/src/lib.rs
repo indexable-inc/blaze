@@ -1,6 +1,6 @@
 //! Each producer's source digest (decision D105, piece 2; docs/v2/plan/design/producer-id.md):
 //! the sans-IO core the entry's build step drives. Given the workspace's manifests, lock,
-//! toolchain file and source files AS VALUES (bytes the driver read), it finds each producer's
+//! pins folder and source files AS VALUES (bytes the driver read), it finds each producer's
 //! crates from the manifests (the crates whose `[package.metadata.blaze] producer` names it,
 //! and every workspace crate they depend on, transitively, by normal and build dependencies)
 //! and digests each row: never a hand-kept list.
@@ -26,7 +26,8 @@
 //! any name starting with `.` (a `.DS_Store` is the machine's, not source), each as (path,
 //! length, bytes); then the `[workspace.dependencies]` entries its crates name (each value
 //! whole), `[workspace.package] edition`, the `Cargo.lock` rows of every outside crate reached
-//! (every version of each name, and their dependencies, transitively) and `harness/toolchain`.
+//! (every version of each name, and their dependencies, transitively) and every file under `pins/` (the pinned toolchain's facts, which
+//! blaze-pins includes from outside its own directory, so its crate's files alone miss them).
 //! A lock row with no source is a path crate (a `[patch]` under vendor/, or a member): it joins
 //! the closure and is digested by its files, as a member is. A name the lock lacks (a lock of
 //! another moment than the sources) refuses that row alone ([`Digest::Refused`]); an
@@ -68,12 +69,14 @@ pub const ROWS: [Row; Row::COUNT - 1] = Row::FROM_SOURCE;
 
 const FILE_DOMAIN: &str = "blaze producers file 1";
 const CRATE_DOMAIN: &str = "blaze producers crate 1";
-const ROW_DOMAIN: &str = "blaze producers row 1";
+const ROW_DOMAIN: &str = "blaze producers row 2";
+const PINS_DOMAIN: &str = "blaze producers pins 1";
 
-/// The root manifest, the lock and the toolchain file, relative to the workspace root.
+/// The root manifest, the lock and the pins folder (pins/README.md), relative to the workspace
+/// root.
 pub const ROOT_MANIFEST: &str = "Cargo.toml";
 pub const LOCK: &str = "Cargo.lock";
-pub const TOOLCHAIN: &str = "harness/toolchain";
+pub const PINS: &str = "pins";
 
 /// A crate's top-level directories that are not in its binary.
 const NOT_BUILT: [&str; 4] = ["tests", "benches", "examples", "target"];
@@ -103,7 +106,7 @@ pub struct Digests<'a> {
     /// In [`ROWS`] order.
     pub rows: [(Row, Digest<'a>); Row::COUNT - 1],
     /// Relative to the workspace root, sorted, each once: the root manifest, the lock, the
-    /// toolchain file, every crate manifest read, and each top-level entry of each digested
+    /// pins folder, every crate manifest read, and each top-level entry of each digested
     /// crate (`src`, `build.rs`, `Cargo.toml`, ...; a directory stands for all under it).
     pub watch: Vec<Text<'a>, Alloc<'a>>,
 }
@@ -131,7 +134,7 @@ impl Digest<'_> {
 /// Why the walk stopped; each names the path or row (rule 19) and refers to the spec.
 #[derive(Debug)]
 pub enum Refused<'a> {
-    /// A file the walk needs is not there (a member's manifest, the lock, the toolchain file, a
+    /// A file the walk needs is not there (a member's manifest, the lock, the pins folder, a
     /// file listed a moment before).
     Missing { path: Text<'a> },
     /// A manifest or lock that is not UTF-8.
@@ -243,7 +246,10 @@ enum Job {
     /// A crate's manifest.
     Manifest,
     Lock,
-    Toolchain,
+    /// The pins folder, or a directory under it.
+    PinDir,
+    /// A file under the pins folder.
+    PinFile,
     /// A directory of crate `.0`; top level when `.1`.
     Dir(usize, bool),
     /// A file of crate `.0`.
@@ -270,7 +276,10 @@ pub struct Walk<'a> {
     by_dir: SortedMap<Text<'a>, usize, Alloc<'a>>,
     plans: Vec<Plan<'a>, Alloc<'a>>,
     lock: Option<Vec<LockRow<'a>, Alloc<'a>>>,
-    toolchain: Option<ContentId>,
+    /// Each file under the pins folder, with its digest (path and bytes).
+    pins: Vec<(Text<'a>, ContentId), Alloc<'a>>,
+    /// Whether the pins folder itself was listed.
+    pins_listed: bool,
     watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
@@ -289,7 +298,8 @@ impl<'a> Walk<'a> {
             by_dir: SortedMap::new_in(alloc),
             plans: Vec::new_in(alloc),
             lock: None,
-            toolchain: None,
+            pins: Vec::new_in(alloc),
+            pins_listed: false,
             watch: Vec::new_in(alloc),
         }
     }
@@ -311,7 +321,7 @@ impl<'a> Walk<'a> {
             }
         }
         Ok(match &self.asked {
-            Some((Job::Members | Job::Dir(..), path)) => Step::List(path.as_str()),
+            Some((Job::Members | Job::Dir(..) | Job::PinDir, path)) => Step::List(path.as_str()),
             Some((_, path)) => Step::Read(path.as_str()),
             None => Step::Done,
         })
@@ -321,7 +331,7 @@ impl<'a> Walk<'a> {
     pub fn read<'b>(&mut self, bytes: Option<&'b [u8]>) -> Result<(), Refused<'a>> {
         let alloc = self.alloc;
         let Some((job, path)) = self.asked.take() else { return Err(Refused::Unasked { answered: "read" }) };
-        if matches!(job, Job::Members | Job::Dir(..)) {
+        if matches!(job, Job::Members | Job::Dir(..) | Job::PinDir) {
             self.asked = Some((job, path));
             return Err(Refused::Unasked { answered: "read" });
         }
@@ -390,15 +400,15 @@ impl<'a> Walk<'a> {
                 self.lock = Some(lock::rows(utf8(bytes)?, alloc)?);
                 self.watch.push(path);
             }
-            Job::Toolchain => {
-                self.toolchain = Some(Hasher::new(FILE_DOMAIN).part(path.as_bytes()).part(bytes).finish());
-                self.watch.push(path);
+            Job::PinFile => {
+                let id = Hasher::new(FILE_DOMAIN).part(path.as_bytes()).part(bytes).finish();
+                self.pins.push((path, id));
             }
             Job::File(at) => {
                 let id = Hasher::new(FILE_DOMAIN).part(path.as_bytes()).part(bytes).finish();
                 self.crates[at].files.push((path, id));
             }
-            job @ (Job::Members | Job::Dir(..)) => {
+            job @ (Job::Members | Job::Dir(..) | Job::PinDir) => {
                 self.asked = Some((job, path));
                 return Err(Refused::Unasked { answered: "read" });
             }
@@ -442,6 +452,19 @@ impl<'a> Walk<'a> {
                     self.queue.push_back((job, full));
                 }
             }
+            // Every file under the pins folder, at any depth (`.` names are the machine's, and a
+            // `.md` file is prose about the pins, never a pin: pins/README.md).
+            Job::PinDir => {
+                for entry in sorted.iter().filter(|e| !e.name.starts_with('.') && (e.is_dir || !e.name.ends_with(".md"))) {
+                    let full = child(&path, entry.name, alloc);
+                    let job = if entry.is_dir { Job::PinDir } else { Job::PinFile };
+                    self.queue.push_back((job, full));
+                }
+                if path.as_str() == PINS {
+                    self.pins_listed = true;
+                    self.watch.push(path);
+                }
+            }
             job => {
                 self.asked = Some((job, path));
                 return Err(Refused::Unasked { answered: "listed" });
@@ -456,9 +479,18 @@ impl<'a> Walk<'a> {
         if self.phase != Phase::Done || self.asked.is_some() {
             return Err(Refused::Unasked { answered: "finish before done" });
         }
-        let (Some(root), Some(lock), Some(toolchain)) = (self.root.as_ref(), self.lock.as_ref(), self.toolchain) else {
+        let (Some(root), Some(lock), true) = (self.root.as_ref(), self.lock.as_ref(), self.pins_listed) else {
             return Err(Refused::Unasked { answered: "finish before done" });
         };
+        // The pins' digest: every file under the folder, sorted by path (each file's digest
+        // holds its path, so a move moves it).
+        self.pins.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        let mut pins = Hasher::new(PINS_DOMAIN);
+        pins.part(&(self.pins.len() as u64).to_le_bytes());
+        for (_, id) in self.pins.iter() {
+            pins.id(id);
+        }
+        let pins = pins.finish();
         // Each crate's digest: its files sorted by path.
         let mut crate_ids: Vec<ContentId, Alloc<'a>> = Vec::new_in(alloc);
         for krate in self.crates.iter_mut() {
@@ -497,7 +529,7 @@ impl<'a> Walk<'a> {
                 hasher.part(row.name.as_bytes()).part(row.version.as_bytes());
                 hasher.opt_part(row.source.as_deref()).opt_part(row.checksum.as_deref());
             }
-            hasher.id(&toolchain);
+            hasher.part(b"pins").id(&pins);
             rows[at].1 = Digest::Source(hasher.finish().0);
         }
         let mut watch = core::mem::replace(&mut self.watch, Vec::new_in(alloc));
@@ -530,7 +562,7 @@ impl<'a> Walk<'a> {
     }
 
     /// Every manifest and the lock are read: fix each row's crates and lock rows by one work
-    /// list over the dependencies, then ask for the toolchain file and every digested crate's
+    /// list over the dependencies, then ask for the pins folder and every digested crate's
     /// directory.
     fn plan(&mut self) -> Result<(), Refused<'a>> {
         let alloc = self.alloc;
@@ -658,7 +690,7 @@ impl<'a> Walk<'a> {
             }
             self.plans.push(Plan { crates, ws, locked, refused });
         }
-        self.queue.push_back((Job::Toolchain, text(TOOLCHAIN, alloc)));
+        self.queue.push_back((Job::PinDir, text(PINS, alloc)));
         for (at, krate) in self.crates.iter().enumerate() {
             if digested[at] {
                 self.queue.push_back((Job::Dir(at, true), krate.dir.clone()));

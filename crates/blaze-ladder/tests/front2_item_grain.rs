@@ -45,7 +45,7 @@ use blaze_ladder::front2::body::lower_fn;
 use blaze_ladder::front2::check::{self, BuildOrder, CheckFail, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records, SourceError};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records, SourceError};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::Front2;
 use blaze_ladder::resolve::{Ns, Paths};
@@ -129,13 +129,10 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
     /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 

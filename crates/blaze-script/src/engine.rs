@@ -107,13 +107,9 @@ pub fn root() -> PathBuf {
     std::fs::canonicalize(&here).unwrap_or(here)
 }
 
-/// The pinned nightly (`harness/toolchain`), as the Python read it at import.
+/// The pinned nightly (`pins/toolchain`, read at compile time by blaze-pins).
 pub fn toolchain() -> String {
-    let path = root().join("harness/toolchain");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => pystr::strip(&text).to_owned(),
-        Err(e) => crate::fail("engine.py", &crate::os_error(&e, &path.display().to_string())),
-    }
+    blaze_pins::TOOLCHAIN.to_owned()
 }
 
 /// What went wrong, as the Python raised it.

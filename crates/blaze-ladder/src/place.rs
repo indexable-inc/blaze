@@ -345,6 +345,9 @@ fn symbol(name: &str) -> Option<u64> {
     // SAFETY: `dlsym` reads a live NUL-terminated name and returns an address or null; the
     // handle `RTLD_DEFAULT` searches every image loaded, as a static link of the program
     // against the system's libraries would bind it.
+    #[cfg(target_os = "macos")]
+    let at = unsafe { blaze_sys::posix::thread::dlsym(blaze_sys::posix::thread::RTLD_DEFAULT, name.as_ptr()) };
+    #[cfg(not(target_os = "macos"))]
     let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
     (!at.is_null()).then_some(at as u64)
 }

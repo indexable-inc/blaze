@@ -10,15 +10,18 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::Vec;
+use blaze_own::{
+    Vec,
+    planted::{NoPlant, Planted},
+};
 
 use crate::{
     checksum::Crc32,
     deflate::{Deflate, DeflateError, Level},
     error::{Error, Format, Why},
-    inflate::{Fed, Inflate, Limits},
-    plant::{self, Plant},
-    zlib::Trailer,
+    inflate::{Fed, Limits, PlantedInflate},
+    plant::DeflatePlant,
+    zlib::{Begun, Trailer},
 };
 
 const FHCRC: u8 = 0x02;
@@ -35,12 +38,16 @@ enum Head {
     Name,
     Comment,
     Crc { have: u8, crc: u16 },
+    /// The DEFLATE stream, then the trailer, until the trailer is whole and checked.
     Body,
+    /// The trailer checked: the member is read.
+    Done,
 }
 
-/// A streaming gzip reader of one member.
-pub struct GzipDecoder<A: Allocator> {
-    inflate: Inflate<A>,
+/// A streaming gzip reader of one member. `P` is the plant seam (D165): shipped code names
+/// [`GzipDecoder`], this with [`NoPlant`].
+pub struct PlantedGzipDecoder<A: Allocator, P> {
+    inflate: PlantedInflate<A, P>,
     head: Head,
     fixed: [u8; 10],
     /// The header's bytes so far, and their CRC-32 (whose low half is the header CRC).
@@ -49,14 +56,25 @@ pub struct GzipDecoder<A: Allocator> {
     most_header: u32,
     crc: Crc32,
     trailer: Trailer<8>,
-    done: bool,
     taken: u64,
+    plant: P,
 }
 
-impl<A: Allocator + Clone> GzipDecoder<A> {
+/// The gzip reader as it ships: [`PlantedGzipDecoder`] with no plant.
+pub type GzipDecoder<A> = PlantedGzipDecoder<A, NoPlant>;
+
+impl<A: Allocator + Clone> PlantedGzipDecoder<A, NoPlant> {
     pub fn new_in(limits: Limits, alloc: A) -> GzipDecoder<A> {
-        GzipDecoder {
-            inflate: Inflate::new_in(limits, alloc),
+        PlantedGzipDecoder::new_planted(limits, alloc, NoPlant)
+    }
+}
+
+impl<A: Allocator + Clone, P: Planted<DeflatePlant>> PlantedGzipDecoder<A, P> {
+    /// [`GzipDecoder::new_in`] with its plant seam: `plant` is a control's [`DeflatePlant`], given
+    /// to the inflater inside too.
+    pub fn new_planted(limits: Limits, alloc: A, plant: P) -> PlantedGzipDecoder<A, P> {
+        PlantedGzipDecoder {
+            inflate: PlantedInflate::new_planted(limits, alloc, plant),
             head: Head::Fixed { have: 0 },
             fixed: [0; 10],
             header_len: 0,
@@ -64,15 +82,20 @@ impl<A: Allocator + Clone> GzipDecoder<A> {
             most_header: limits.most_header,
             crc: Crc32::new(),
             trailer: Trailer::EMPTY,
-            done: false,
             taken: 0,
+            plant,
         }
     }
 }
 
-impl<A: Allocator> GzipDecoder<A> {
+impl<A: Allocator, P: Planted<DeflatePlant>> PlantedGzipDecoder<A, P> {
     fn flags(&self) -> u8 {
         self.fixed[3]
+    }
+
+    /// Whether a header byte is still to come.
+    fn in_header(&self) -> bool {
+        !matches!(self.head, Head::Body | Head::Done)
     }
 
     /// The state after the part of the header `from` ends.
@@ -89,7 +112,7 @@ impl<A: Allocator> GzipDecoder<A> {
             Head::ExtraLen { .. } | Head::Extra { .. } => 1,
             Head::Name => 2,
             Head::Comment => 3,
-            Head::Crc { .. } | Head::Body => 4,
+            Head::Crc { .. } | Head::Body | Head::Done => 4,
         };
         for &(flag, part) in &order[rank..] {
             if flags & flag != 0 {
@@ -146,19 +169,20 @@ impl<A: Allocator> GzipDecoder<A> {
                 Head::Body
             }
             Head::Body => Head::Body,
+            Head::Done => Head::Done,
         };
         Ok(())
     }
 
-    /// Takes what it can of `input`, appending the output to `out`; see [`Inflate::feed`].
+    /// Takes what it can of `input`, appending the output to `out`; see [`crate::Inflate::feed`].
     pub fn feed<B: Allocator>(&mut self, input: &[u8], out: &mut Vec<u8, B>) -> Result<Fed, Error> {
         let mut at = 0;
-        while self.head != Head::Body && at < input.len() {
+        while self.in_header() && at < input.len() {
             let byte = input[at];
             self.header_byte(byte).map_err(|why| Error::new(Format::Gzip, self.taken + at as u64, why))?;
             at += 1;
         }
-        if self.head != Head::Body {
+        if self.in_header() {
             self.taken += at as u64;
             return Ok(Fed { consumed: at, done: false });
         }
@@ -171,15 +195,15 @@ impl<A: Allocator> GzipDecoder<A> {
                 self.trailer.from_tail(self.inflate.tail());
             }
         }
-        if self.inflate.is_done() && !self.done {
+        if self.inflate.is_done() && self.head != Head::Done {
             at += self.trailer.take(&input[at..]);
             if self.trailer.is_whole() {
                 self.check_trailer()?;
-                self.done = true;
+                self.head = Head::Done;
             }
         }
         self.taken += at as u64;
-        Ok(Fed { consumed: at, done: self.done })
+        Ok(Fed { consumed: at, done: self.head == Head::Done })
     }
 
     fn check_trailer(&self) -> Result<(), Error> {
@@ -187,7 +211,7 @@ impl<A: Allocator> GzipDecoder<A> {
         let fault = |why| Error::new(Format::Gzip, self.header_len + self.inflate.taken(), why);
         let stored = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
         let computed = self.crc.finish();
-        if stored != computed && !plant::on(Plant::GzipCrcUnchecked) {
+        if stored != computed && !self.plant.has(DeflatePlant::GzipCrcUnchecked) {
             return Err(fault(Why::Crc32 { stored, computed }));
         }
         let stored = u32::from_le_bytes([t[4], t[5], t[6], t[7]]);
@@ -201,9 +225,9 @@ impl<A: Allocator> GzipDecoder<A> {
 
     /// The input ended: an error unless the member did.
     pub fn finish(&self) -> Result<(), Error> {
-        match self.done {
-            true => Ok(()),
-            false => Err(Error::new(Format::Gzip, self.taken, Why::Truncated)),
+        match self.head {
+            Head::Done => Ok(()),
+            _ => Err(Error::new(Format::Gzip, self.taken, Why::Truncated)),
         }
     }
 
@@ -229,24 +253,24 @@ pub struct GzipEncoder<A: Allocator> {
     level: Level,
     crc: Crc32,
     size: u64,
-    started: bool,
+    head: Begun,
 }
 
 impl<A: Allocator + Clone> GzipEncoder<A> {
     pub fn new_in(level: Level, alloc: A) -> GzipEncoder<A> {
-        GzipEncoder { deflate: Deflate::new_in(level, alloc), level, crc: Crc32::new(), size: 0, started: false }
+        GzipEncoder { deflate: Deflate::new_in(level, alloc), level, crc: Crc32::new(), size: 0, head: Begun::No }
     }
 }
 
 impl<A: Allocator> GzipEncoder<A> {
     fn start<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), DeflateError> {
-        if !self.started {
+        if self.head == Begun::No {
             let xfl = match self.level {
                 Level::Fast => 4,
                 Level::Store | Level::Default => 0,
             };
             out.try_extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, xfl, 0xff]).map_err(DeflateError::Alloc)?;
-            self.started = true;
+            self.head = Begun::Written;
         }
         Ok(())
     }

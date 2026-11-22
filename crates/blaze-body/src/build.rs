@@ -241,6 +241,9 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
     /// the record's nodes and lists once, in `alloc`.
     pub fn new_with_types_in(record: PTys<'_>, alloc: A) -> BodyBuilder<A> {
         let mut b = BodyBuilder::new_in(alloc.clone());
+        // The table the body's handles index, named once so the kept record (kept.rs) can
+        // refuse this body written against another table of the same size.
+        b.body.table = Some(crate::kept::TableId::of(record));
         let (ty_base, list_base) = match (next(record.len(), Table::Types), next(record.lists_len(), Table::TyLists)) {
             (Ok(t), Ok(l)) => (t, l),
             (Err(e), _) | (_, Err(e)) => {
@@ -340,6 +343,7 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
                 list_base: NONE,
                 tys: Vec::new_in(alloc.clone()),
                 ty_lists: Vec::new_in(alloc.clone()),
+                table: None,
             },
             filled: Vec::new_in(alloc.clone()),
             open: None,

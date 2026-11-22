@@ -3,7 +3,24 @@
 //! boot checked whole at its first hit: `probe.rs`),
 //! reads in place with no lock and no shared write, puts into per-worker [`Batch`]es, the
 //! commit (one segment written without a lock, then the flip under the one lock), and
-//! compaction in bounded slices. It owns no IO: it hands back [`Effect`]s and takes their
+//! compaction: pruning and sweeping in bounded slices, and the size-tiered merge whose one
+//! invariant ([`Tiers`]: no tier over `K` segments after a cleanup, so a namespace of `S` bytes
+//! names at most [`segments_most`]`(S)`) the simulation checks after every cleanup. Beside it
+//! the merge's ONE bound on memory, [`merge_holds_most`]`(k)`: whatever the tier and however
+//! many records, a compaction's copy holds at most [`MERGE_BUFFER`] (8 MiB) of records in
+//! flight, ONE [`INDEX_CHUNK`] (1 MiB) of its index, and [`CURSOR_BYTES`] for each of its `k`
+//! inputs (a cursor over the input's mapped sorted run, and its place in the merge's heap),
+//! `k` the slice's rows: at most [`MERGE_INPUTS_MOST`] (26) for a namespace that kept the
+//! tier invariant, so 9 MiB and under 1.2 KiB. No merge's output passes the segment cap
+//! ([`Tiers`], THE CAP), and no manifest names a row its open would refuse (`format::Row`). Nothing of it grows with the records: the copy is a
+//! k-way merge of the inputs' runs, its records found in key order one at a time, its payloads
+//! and then its index streamed into a temporary file, renamed to its digest's name before the
+//! sync and the flip (`Plain::stream_segment`). The simulated driver checks the records and
+//! the index in flight on every compaction's writes, and the core what it built at once.
+//! Three walks of the merge (count, payloads, index) because the digest hashes the header
+//! first; one walk needs format 3 (`H(payloads) ‖ H(run) ‖ header ‖ footer head`): decided
+//! 2026-11-20 to take it with the per-worker writer (D159), so one format bump, not two. It
+//! owns no IO: it hands back [`Effect`]s and takes their
 //! [`Completion`]s, so the simulation runs this very code (`super::tests`), and
 //! [`super::Driven`] carries the effects out on a real driver.
 
@@ -24,7 +41,7 @@ use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as Ef
 use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
     kind::{Namespace, Tag},
-    store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, SegmentId, StoreError, StoreFile, TwoValues},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, RowRefused, SEGMENT_MOST, SegmentId, StoreError, StoreFile, TwoValues},
 };
 
 use super::format::{
@@ -121,13 +138,372 @@ pub const SWEEP_BYTES: u64 = 2 * SLICE_BYTES;
 /// by the refusal rather than chased. The rounds cost at most 3 x the carried bytes.
 pub const CARRY_ROUNDS: u32 = 3;
 
-/// Compaction merges the oldest segments while a generation names more than this many: the
-/// bound on index probes a miss costs.
-pub const SEGMENTS_MOST: usize = 16;
+/// The tiers' floor `B`: tier 0 holds segments under `B * G` (4 MiB), tier `t >= 1` those of
+/// `[B * G^t, B * G^(t+1))`. Why 1 MiB: the small commits of an edit loop (a cleanup commit's
+/// records and roots) share tier 0 and are merged at most 4 MiB at a time (the amortisation's
+/// `B` a commit, [`Tiers`]); a smaller floor adds a tier (`K` more segments a miss probes) for
+/// each factor `G` it goes down, a larger one more bytes merged a commit. Not measured: a
+/// choice to revisit with the profile of a real edit loop.
+pub const TIER_FLOOR_BYTES: u64 = 1 << 20;
 
-/// What one compaction slice reads and writes at most, unless one segment alone is larger
-/// (then that segment is the slice).
+/// The tiers' growth `G`: each tier's segments are `G` times the size of the one below. Why 4:
+/// with `K = G` the bound `K * log_G(S / B)` is near its least over `G` (`G / ln G` is least at
+/// `e`; 4 is within 6% of it), and a merge of `K + 1` rows of one tier always lands above it.
+pub const TIER_GROWTH: u64 = 4;
+
+/// The most segments one tier of a namespace holds after a cleanup (`K`): a tier at `K + 1`
+/// is merged.
+pub const TIER_SEGMENTS_MOST: usize = 4;
+
+/// What one namespace's offsets reach: 16 TiB (`format::OFFSET_MOST`), the tiers the
+/// amortisation counts ([`Tiers::merged_most`]).
+pub const NAMESPACE_BYTES_MOST: u64 = OFFSET_MOST;
+
+const _: () = assert!(NAMESPACE_BYTES_MOST == TIER_FLOOR_BYTES << 24, "16 TiB is B * G^12: twelve tiers, 0 to 11");
+
+/// The namespace size [`SEGMENTS_MOST`] is stated for: 256 GiB, past the stores of 25 to
+/// 100 GB a home is sized for. A larger namespace keeps the invariant as stated, with
+/// [`segments_most`] of its size (a closed row more for each GiB: [`Tiers`], THE CAP).
+pub const NAMESPACE_BYTES_STATED: u64 = 256 << 30;
+
+/// THE BOUND (the invariant's, [`Tiers`]): the most segments one namespace of `bytes` names
+/// after a cleanup completes: `K` a tier for each OPEN tier a segment of at most `bytes` can
+/// be in, one CLOSED row (at least 1 GiB) for each GiB of `bytes`, and the one segment the
+/// flip that names the cleanup commits.
+pub const fn segments_most(bytes: u64) -> usize {
+    Tiers::STORE.segments_most(bytes)
+}
+
+/// [`segments_most`] of a namespace under [`NAMESPACE_BYTES_STATED`]: 276 (five open tiers of
+/// four, 255 closed rows, and the commit's own). The one cap of a namespace's segments
+/// (blaze-cli's "compaction is behind" line counts against it, through [`Plain::named_most`],
+/// and the snapshot's table cap is a multiple of it); a miss probes at most this many segments
+/// a namespace of that size once cleanup has run (about 27 at 25 GB and 45 at 100 GB in
+/// practice: at most 20 open rows, and a split lands near the 4 GiB cap).
+pub const SEGMENTS_MOST: usize = segments_most(NAMESPACE_BYTES_STATED - 1);
+
+const _: () = assert!(SEGMENTS_MOST == 276);
+
+/// The most rows one tiered merge of a namespace that kept the invariant takes: `K + 1` in
+/// each open tier (five at 4 GiB) and the flip's commit. Closed rows are never an input.
+pub const MERGE_INPUTS_MOST: usize = (TIER_SEGMENTS_MOST + 1) * (Tiers::STORE.tier(SEGMENT_MOST) - 1) + 1;
+
+const _: () = assert!(MERGE_INPUTS_MOST == 26);
+
+/// What one pruning or sweeping slice reads and writes at most, unless one segment alone is
+/// larger (then that segment is the slice). A tiered merge (`Tiers`) is not cut by it: the
+/// invariant needs every row of a tier, and the amortisation bounds its bytes instead.
 pub const SLICE_BYTES: u64 = 64 << 20;
+
+/// THE MERGE'S MEMORY BOUND: the most bytes of copied records a compaction's copy (a tiered
+/// merge's, a pruning or sweeping slice's) holds at once, whatever its tier or size. The copy
+/// is streamed from the inputs' mappings into its file in chunks of half this
+/// ([`MERGE_CHUNKS_IN_FLIGHT`] in flight, so the next chunk is copied while the last is
+/// written); its index and footer are written after the last chunk, then the sync, then the
+/// flip. Why 8 MiB: a cleanup runs after the command's answer and must never be its peak
+/// (memory is the goal's second term), and a command's own working set is hundreds of MiB, so
+/// 8 MiB is noise beside it; and a chunk of 4 MiB is a write whose fixed cost (one effect's
+/// round trip, tens of microseconds) is under 2% of its copy into the page cache at a few
+/// GB/s, so the stream runs within 10% of one whole write's speed (the floor: the bytes
+/// copied once, at memory bandwidth, and synced once). The simulation's driver checks it
+/// (`super::tests`, the merge meter). The whole bound, the index's part included, is
+/// [`merge_holds_most`].
+pub const MERGE_BUFFER: u64 = 8 << 20;
+
+/// The most bytes of a streamed copy's index alive at once: the one chunk of entries the core
+/// builds, hashes and hands to its write, the next built only once that write completed. Why
+/// 1 MiB: 21 845 entries a write, so a merge of ten million records writes its 460 MiB index in
+/// 440 writes, each a round trip of tens of microseconds against a copy into the page cache of
+/// a few hundred, under 10% over one whole write (the floor) as for [`MERGE_BUFFER`]'s chunks;
+/// and an eighth of that buffer, so the index is never the copy's peak.
+pub const INDEX_CHUNK: u64 = 1 << 20;
+
+/// What one input of a streamed copy costs while it runs: its cursor over its mapped sorted
+/// run and its place in the merge's heap.
+pub const CURSOR_BYTES: u64 = (size_of::<Cursor>() + size_of::<u32>()) as u64;
+
+/// THE MERGE'S ONE MEMORY BOUND, for a copy of `inputs` rows: the records in flight
+/// ([`MERGE_BUFFER`]), one chunk of its index ([`INDEX_CHUNK`]), and a cursor an input
+/// ([`CURSOR_BYTES`]). `inputs` is the slice's rows: at most [`MERGE_INPUTS_MOST`] for a
+/// namespace that kept the tier invariant, and a split merge's at most what fits the segment
+/// cap (a namespace that fell behind, one row a commit since
+/// its last cleanup, still costs only 20 bytes a row). Beside it only the stream's fixed state
+/// (its digest's hasher, under 2 KiB), whatever the merge; and what a PRUNING slice keeps by
+/// (a [`Liveness::Reached`] sweep's roots, where they lie: a few words a root; a
+/// [`Liveness::Everything`] store's pruning over its cap, the set of keys its roots name, which
+/// is not bounded here). The simulated driver checks the first two on every compaction's writes
+/// and the core what it built at once (`super::tests`, the merge meter).
+pub const fn merge_holds_most(inputs: usize) -> u64 {
+    MERGE_BUFFER + INDEX_CHUNK + inputs as u64 * CURSOR_BYTES
+}
+
+const _: () = assert!(CURSOR_BYTES <= 24 && merge_holds_most(MERGE_INPUTS_MOST) <= MERGE_BUFFER + INDEX_CHUNK + 1200, "the module doc says 1.2 KiB of cursors");
+
+/// The chunks of a streamed copy in flight at once, each at most `MERGE_BUFFER / 2` bytes:
+/// two, so the core copies one while the driver writes the other.
+pub const MERGE_CHUNKS_IN_FLIGHT: u32 = 2;
+
+const _: () = assert!(MERGE_BUFFER % (MERGE_CHUNKS_IN_FLIGHT as u64 * ALIGN) == 0, "a chunk is whole multiples of ALIGN");
+
+/// The tiers a length is sorted into, at most: `G^64` is past `u64`.
+const TIERS_MOST: usize = 64;
+
+/// One row of a namespace as the tier policy sees it: its file's length, and whether a merge
+/// may take it (held here, mapped, not published, kept whole by no lease).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TierRow {
+    pub len: u64,
+    pub mergeable: bool,
+}
+
+/// What the tier policy merges: the rows (indices into the list it was given, in its order),
+/// the output's length if nothing is dropped, and whether a tier would still be over `K` after
+/// it (another slice has work: [`Sliced::more`]). The store reads the rows; the simulation all.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TierMerge<A: Allocator> {
+    pub rows: Vec<usize, A>,
+    pub out_len: u64,
+    pub more: bool,
+}
+
+/// The planted bug of the tier policy's control (`super::tests`): outside tests, none.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TierPlant {
+    None,
+    /// Today's (before D159) refusal: a merge whose second segment would carry it past
+    /// [`SLICE_BYTES`] is thrown away, so once a namespace's oldest pair passes 64 MiB nothing
+    /// is merged again.
+    RefusedPastSlice,
+    /// The policy as it was until 2026-11-20 (the cold tempo check's store): blind to the
+    /// segment cap, so a namespace behind by many large rows is planned as ONE merge whose
+    /// output passes [`Tiers::segment_most`], and a row at the cap is merged again (tests,
+    /// `the_cap_oracle_catches_a_merge_past_the_cap`).
+    PastCap,
+}
+
+/// THE MERGE POLICY: size-tiered, with one invariant (rule 53).
+///
+/// THE INVARIANT. Tier `t` of a namespace holds its segments of length in
+/// `[B * G^t, B * G^(t+1))` (tier 0 from 0): `B` = [`TIER_FLOOR_BYTES`] (1 MiB), `G` =
+/// [`TIER_GROWTH`] (4). After a cleanup completes (the flip that names its slice has landed,
+/// the slice not refused), no tier of the namespace it merged (of every namespace, when it
+/// merged none) holds more than `K` =
+/// [`TIER_SEGMENTS_MOST`] (4) mergeable segments, apart from the segment that same flip
+/// commits there; a cleanup that stopped with a slice still to run (on its work budget or
+/// slice count, or after a pruning slice, which ends a cleanup: [`Plain::cleanup_goes_on`])
+/// leaves what is over to the next. A [`Liveness::Reached`] store plans the merge before any
+/// sweep, and goes on to it after a sweep that left a namespace over, and after a first slice
+/// that replaced nothing because the command's own lease kept its rows (the answer's commit
+/// lets the lease go), so neither leaves a remainder. A store that writes one namespace (every machine but a trusted writer:
+/// `Settings::writes`) so keeps it for every namespace after every cleanup. So a namespace of
+/// `S` bytes names at most `K * (tier(S) + 1) + 1` segments ([`segments_most`]; 49 under the
+/// 16 TiB of [`NAMESPACE_BYTES_MOST`], 33 at 20 GiB), what a miss probes. Rows a merge may not
+/// take (published, not held here, kept whole by a live lease) are outside the count: a lease
+/// ends with its command, and the next cleanup counts them.
+///
+/// THE MERGE. When a tier is over `K`, every tier from the lowest that holds `K` (`lo`: a copy
+/// that drops much may land under the tier over, and must find room) to the highest over `K`
+/// (`hi`) is merged whole, all its mergeable rows, into ONE segment; when it may land in a
+/// tier above `hi` that already holds `K` (any tier up to its estimate's: a copy only drops),
+/// that tier joins the merge (and those between), until every tier it may land in has room.
+/// One slice so restores the invariant for its namespace however far behind it was (a crashed
+/// command's commits, a cold check's hundred), and one slice a command (blaze-cli
+/// `AFTER_ANSWER_SLICES`) keeps it. A slice writes one namespace's segment: with
+/// several namespaces over, the one whose merge starts at the oldest row is planned first, so
+/// each is restored within one cleanup for each namespace over before it.
+///
+/// THE AMORTISATION (bytes merged against bytes committed, `W`, over `C` commits). Let a byte's
+/// potential be `11 - its tier` (twelve tiers). A merge's input is at least `5 * B * G^hi`, a
+/// fourth past `B * G^(hi + 1)`: `K + 1` rows of tier `hi`, or, when the cascade made `hi` the
+/// tier it joined, that tier's `K` rows and a lower part whose estimate reached it. So
+/// unless it drops more than a fifth of its input (a pointer's older values, a duplicate), its
+/// output lands above `hi` and every byte it keeps climbs a tier, so its kept bytes cost at
+/// most the potential they spend (`11 W` over all merges). Its dropped bytes, and every byte of
+/// a merge that drops over a fifth (at most five times what that merge dropped), cost at most
+/// `5 W` together: a byte is dropped once. Tier 0 starts at 0: five rows there can total under
+/// `B * G`, so a merge of tier 0 alone may stay in it dropping under a fifth; its input is then
+/// under `5/4 B G`, and it removes `K` of the rows commits add one at a time, so such merges
+/// cost under `5/4 B G / K` = `5/4 B` a commit. So bytes merged <= 16 W + 1.25 MiB * C
+/// ([`Tiers::merged_most`]), all in the cleanup after the answer (`Plain::fold_slice`): no
+/// answer waits on a merge.
+///
+/// THE CAP (2026-11-20; the cold tempo check's store, whose one merge of ~88 commit segments
+/// of 256 MiB wrote a 22 GiB segment that every later open refused). A segment is at most `C`
+/// = [`Tiers::segment_most`] bytes ([`SEGMENT_MOST`], 4 GiB; the format's, checked by
+/// `format::Row::new` at every commit and open). So:
+/// - A row of tier `tier(C) - 1` or above (at least `C / G`, 1 GiB: [`Tiers::closed`]) is
+///   CLOSED: never merged again and outside every tier's count, as a published row is. Five
+///   rows of that tier could not fit one segment.
+/// - NO MERGE IS PLANNED WHOSE OUTPUT CAN PASS `C`: its output's estimate (the most it can be:
+///   a copy only drops) is computed from its inputs before it starts; over `C`, the merge is
+///   SPLIT: its rows taken oldest first while the estimate stays at most `C` (first fit), the
+///   rest left for the next slice ([`TierMerge::more`]). Two open rows always fit (each under
+///   `C / G`), and a split's output with nothing dropped is past `C - C / G`, so it lands in a
+///   closed tier: every byte it keeps climbs, and the amortisation above holds.
+/// - THE BOUND becomes `K * (open tiers used) + S / closed_from + 1` ([`Tiers::segments_most`]):
+///   the open tiers, `tier(C) - 1` of them (five at 4 GiB: 0 to 4, under 1 GiB), keep `K`
+///   each, and the closed rows are each at least `closed_from` (1 GiB). At 4 GiB: 25 GiB names
+///   at most 20 + 25 + 1 = 46 (a split lands near `C`, so about 7 closed rows in practice),
+///   100 GiB at most 121 (about 25 closed), 256 GiB at most 276 ([`SEGMENTS_MOST`]).
+/// - [`merge_holds_most`] is unchanged in form: a split takes fewer rows, never more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Tiers {
+    floor: u64,
+    growth: u64,
+    most: usize,
+    /// `C`: the most bytes one segment may be.
+    cap: u64,
+    plant: TierPlant,
+}
+
+impl Tiers {
+    /// The store's geometry: `B`, `G`, `K` as above, `C` the format's [`SEGMENT_MOST`].
+    pub(crate) const STORE: Tiers = Tiers { floor: TIER_FLOOR_BYTES, growth: TIER_GROWTH, most: TIER_SEGMENTS_MOST, cap: SEGMENT_MOST, plant: TierPlant::None };
+
+    /// A test's geometry: the store's `G` and `K` over another floor (a simulation of real
+    /// bytes reaches several tiers in KiBs), the format's cap, with `plant`.
+    #[cfg(test)]
+    pub(crate) const fn planted(floor: u64, plant: TierPlant) -> Tiers {
+        Tiers::capped(floor, SEGMENT_MOST, plant)
+    }
+
+    /// A test's geometry with its own segment cap `cap` (a simulation drives merges into a
+    /// 64 KiB cap within a few hundred commits). At least one open tier: `cap >= B * G^2`.
+    #[cfg(test)]
+    pub(crate) const fn capped(floor: u64, cap: u64, plant: TierPlant) -> Tiers {
+        assert!(cap >= floor * TIER_GROWTH * TIER_GROWTH, "a cap leaves one open tier at least");
+        Tiers { floor, growth: TIER_GROWTH, most: TIER_SEGMENTS_MOST, cap, plant }
+    }
+
+    /// `C`: the most bytes one segment of this store may be, what `format::Row::new` checks.
+    pub(crate) const fn segment_most(self) -> u64 {
+        self.cap
+    }
+
+    /// The least length of a CLOSED row: `B * G^(tier(C) - 1)`, at most `C / G`.
+    pub(crate) const fn closed_from(self) -> u64 {
+        let mut at = self.floor;
+        let mut tier = 1;
+        while tier < self.tier(self.cap) {
+            at = at.saturating_mul(self.growth);
+            tier += 1;
+        }
+        at
+    }
+
+    /// A row of `len` bytes is closed: never merged again, outside the tiers' counts.
+    pub(crate) const fn closed(self, len: u64) -> bool {
+        len >= self.closed_from()
+    }
+
+    /// The most a copy of `n` rows of `bytes` bytes in all can be, nothing dropped: the
+    /// payloads (each padded alone) and entries carry over, one header and footer replace each
+    /// input's, and the index's padding is at most one `ALIGN`.
+    const fn estimate(bytes: u64, n: u64) -> u64 {
+        bytes.saturating_sub(n.saturating_sub(1) * (HEADER + FOOTER) as u64).saturating_add(ALIGN)
+    }
+
+    /// `K`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn most(self) -> usize {
+        self.most
+    }
+
+    /// The tier of a segment of `len` bytes.
+    pub(crate) const fn tier(self, len: u64) -> usize {
+        let mut tier = 0;
+        let mut top = self.floor.saturating_mul(self.growth);
+        while tier + 1 < TIERS_MOST && len >= top {
+            tier += 1;
+            top = top.saturating_mul(self.growth);
+        }
+        tier
+    }
+
+    /// The invariant's bound for a namespace of `bytes`: `K` a tier for each OPEN tier up to
+    /// that of `bytes`, a closed row for each [`Tiers::closed_from`] of `bytes`, and the flip's
+    /// own commit.
+    pub(crate) const fn segments_most(self, bytes: u64) -> usize {
+        let open = self.tier(self.cap) - 1;
+        let used = if self.tier(bytes) + 1 < open { self.tier(bytes) + 1 } else { open };
+        self.most * used + (bytes / self.closed_from()) as usize + 1
+    }
+
+    /// The amortisation's bound: the most bytes merges may have taken after commits of
+    /// `written` bytes in `commits` commits (`(tiers - 1 + 5) W + 5/4 B G / K C`).
+    pub(crate) const fn merged_most(self, written: u64, commits: u64) -> u64 {
+        let tiers = self.tier(NAMESPACE_BYTES_MOST - 1) as u64 + 1;
+        let tier_zero = self.floor * self.growth * 5 / (4 * self.most as u64) + 1;
+        (tiers - 1 + 5).saturating_mul(written).saturating_add(tier_zero.saturating_mul(commits))
+    }
+
+    /// The merge that restores the invariant over `rows` (one namespace's, in the manifest's
+    /// order), none when it holds: see [`Tiers`]. The list in `alloc`, the caller's.
+    pub(crate) fn merge<A: Allocator>(self, rows: &[TierRow], alloc: A) -> TierMerge<A> {
+        let none = |alloc: A| TierMerge { rows: Vec::new_in(alloc), out_len: 0, more: false };
+        // A closed row is outside the merge and the counts ([`Tiers`], THE CAP); the planted
+        // policy of before is blind to the cap.
+        let blind = self.plant == TierPlant::PastCap;
+        let open = move |it: &TierRow| it.mergeable && (blind || !self.closed(it.len));
+        let mut count = [0usize; TIERS_MOST];
+        for row in rows.iter().filter(|it| open(it)) {
+            count[self.tier(row.len)] += 1;
+        }
+        let Some(over) = (0..TIERS_MOST).find(|&t| count[t] > self.most) else { return none(alloc) };
+        // From the lowest FULL tier: a copy that drops much may land under `over`, in a tier
+        // that must then have room.
+        let lo = (0..=over).find(|&t| count[t] >= self.most).expect("the tier over is full");
+        let mut hi = (0..TIERS_MOST).rev().find(|&t| count[t] > self.most).expect("a tier is over");
+        let taken = |lo: usize, hi: usize| rows.iter().filter(move |it| open(it) && (lo..=hi).contains(&self.tier(it.len)));
+        // The output, nothing dropped ([`Tiers::estimate`]).
+        let out_of = |lo: usize, hi: usize| {
+            let (bytes, n) = taken(lo, hi).fold((0u64, 0u64), |(bytes, n), it| (bytes.saturating_add(it.len), n + 1));
+            Tiers::estimate(bytes, n)
+        };
+        // The estimate is the most the output can be (a copy drops a pointer's older values and
+        // re-lays one index, never adds), so the output lands in a tier at or under the
+        // estimate's: every tier above `hi` up to it must have room, and the highest full one
+        // joins the merge (with every tier under it) until all have.
+        let mut out_len = out_of(lo, hi);
+        while let Some(full) = (hi + 1..=self.tier(out_len)).rev().find(|&t| count[t] + 1 > self.most) {
+            hi = full;
+            out_len = out_of(lo, hi);
+        }
+        let mut picked = Vec::new_in(alloc);
+        picked.extend(rows.iter().enumerate().filter(|(_, it)| open(it) && (lo..=hi).contains(&self.tier(it.len))).map(|(i, _)| i));
+        if self.plant == TierPlant::RefusedPastSlice && picked.len() >= 2 && rows[picked[0]].len + rows[picked[1]].len > SLICE_BYTES {
+            picked.clear();
+            return TierMerge { rows: picked, out_len: 0, more: false };
+        }
+        if !blind && out_len > self.cap {
+            // SPLIT ([`Tiers`], THE CAP): the planned rows oldest first, each taken while the
+            // estimate stays at most `C` (first fit); the rest is the next slice's. Every open
+            // row is under `C / G`, so the first two always fit and the split makes progress.
+            let (mut bytes, mut n) = (0u64, 0u64);
+            picked.retain(|&i| {
+                let with = bytes.saturating_add(rows[i].len);
+                if Tiers::estimate(with, n + 1) > self.cap {
+                    return false;
+                }
+                bytes = with;
+                n += 1;
+                true
+            });
+            debug_assert!(n >= 2, "two open rows always fit one segment");
+            return TierMerge { rows: picked, out_len: Tiers::estimate(bytes, n), more: true };
+        }
+        let mut after = count;
+        for slot in after.iter_mut().take(hi + 1).skip(lo) {
+            *slot = 0;
+        }
+        if blind || !self.closed(out_len) {
+            after[self.tier(out_len)] += 1;
+        }
+        let more = after.iter().any(|&c| c > self.most);
+        TierMerge { rows: picked, out_len, more }
+    }
+}
 
 /// A manifest log takes no more manifests past this; the next flip starts another.
 #[cfg(not(test))]
@@ -435,7 +811,36 @@ pub struct Sliced {
     pub aborted: bool,
     /// There is more to do: another slice would do it.
     pub more: bool,
+    /// It was a tiered merge (`Tiers`), not a pruning or sweeping run: only a merge carries a
+    /// cleanup past its first slice ([`Plain::cleanup_goes_on`]).
+    pub merged: bool,
 }
+
+impl Sliced {
+    /// One command's slices as one: their counts summed, `next`'s abort, `more` and `merged`.
+    pub fn and(self, next: Sliced) -> Sliced {
+        Sliced {
+            segments: self.segments + next.segments,
+            kept: self.kept + next.kept,
+            dropped: self.dropped + next.dropped,
+            bytes_in: self.bytes_in + next.bytes_in,
+            bytes_out: self.bytes_out + next.bytes_out,
+            orphans: self.orphans + next.orphans,
+            removed: self.removed + next.removed,
+            aborted: next.aborted,
+            more: next.more,
+            merged: next.merged,
+        }
+    }
+}
+
+/// The most slices one command's cleanup runs ([`Plain::cleanup_goes_on`]; rule 18, a loop has
+/// a count). Why 8: one tiered merge restores a namespace's invariant whole, and a store writes
+/// a handful of namespaces (this machine's, the public one, an organisation's), so a cleanup
+/// needs one slice a namespace over its bound; the rest is room, which the byte budget bounds
+/// first. Only merges go on: a pruning slice ends the cleanup it runs in, and so does a sweep
+/// unless a merge is due next.
+pub const CLEANUP_SLICES_MOST: u32 = 8;
 
 /// A bug planted for the oracle's controls (`super::tests`): each removes one safeguard.
 /// Outside tests a store is always [`Plant::None`].
@@ -503,6 +908,29 @@ pub(crate) enum Plant {
     /// Reach takes an indexed root's record as a plain root's: the indexes it names are live,
     /// the keys they hold are not (index_tests).
     IndexNotFollowed,
+    /// Durable: a MERGE's segment is handed to the flip before its sync, which comes after the
+    /// flip (a commit's segments are synced first, as they should be): a power cut between them
+    /// leaves a generation naming a torn merge whose inputs it retired (tests,
+    /// `the_crash_oracle_catches_a_merge_flipped_before_its_sync`).
+    MergeFlipsBeforeSync,
+    /// A compaction's copy is held whole, as the old copy into one `Batch` did: its payloads
+    /// written as one chunk, every record of the merge in memory at once, whatever its size
+    /// (tests, `the_merge_meter_catches_a_whole_batch_copy`).
+    MergeWholeBatch,
+    /// A compaction's index is held whole, as the stream before the k-way merge did (every
+    /// entry built and sorted in memory, then written at once): its index written as one
+    /// chunk, O(records) of index alive (tests, `the_merge_meter_catches_a_whole_index`).
+    MergeWholeIndex,
+    /// A [`Liveness::Reached`] slice plans a sparse row's sweep BEFORE the tiered merge, and a
+    /// cleanup never goes on after a sweep (it still goes on after a first slice its lease
+    /// emptied), as before 2026-11-20: a sparse row always present
+    /// takes every cleanup's one slice and the merge starves (tests,
+    /// `the_tier_oracle_catches_a_sweep_that_starves_the_merge`).
+    SweepBeforeMerge,
+    /// [`Plain::cleanup_goes_on`] stops after the first slice, as a cleanup of one namespace
+    /// a command did: a namespace still behind with budget left (tests,
+    /// `the_tier_oracle_catches_a_cleanup_of_one_namespace`).
+    CleanupOneSlice,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -615,6 +1043,14 @@ const BARRIER: u8 = 20;
 /// open; durable: a commit's segments and its log, before the slot that names them) survive a
 /// power cut, as a file's own sync does not make its name do.
 const DIR_SYNC: u8 = 21;
+/// A streamed copy's temporary file renamed to its digest's name, before its sync.
+const SEG_RENAME: u8 = 22;
+/// A streamed copy's temporary file removed: its bytes are a segment named already.
+const SEG_UNWRITE: u8 = 23;
+/// A streamed copy's writes, by their [`SEG_PIECE`] index: 0 its header, then a payload chunk
+/// each from 1, an index chunk each from this, and its footer at [`FOOTER_PIECE`].
+const INDEX_PIECE: u32 = 1 << 30;
+const FOOTER_PIECE: u32 = u32::MAX;
 /// The index the planted [`Plant::UnlinkEarly`]'s unlinks start at, apart from a flip's own.
 const EARLY_REMOVE: u32 = 1 << 30;
 
@@ -665,14 +1101,355 @@ struct Laid<A: Allocator + Clone> {
     namespace: Namespace,
 }
 
+/// A compaction's copy planned and not yet read ([`Plain::copy_live`]): its k-way merge over
+/// the inputs' sorted runs, and what its first walk counted, all its header says (the count,
+/// where the payloads end, the lowest and the highest key). O(inputs): no record is held.
+struct Copied<A: Allocator + Clone> {
+    merge: Merge<A>,
+    count: u32,
+    index_at: u64,
+    lowest: ContentId,
+    highest: ContentId,
+}
+
+/// One input of a streamed copy: a cursor over its proved, mapped sorted run, read in place.
+#[derive(Clone, Copy)]
+struct Cursor {
+    /// The index into `Plain::maps`, which only grows (a mapping is never dropped while the
+    /// store lives), so it names the same proved file for the whole copy.
+    map: u32,
+    /// The next entry, of `count`.
+    next: u32,
+    count: u32,
+    /// Younger than [`WINDOW`]: a pruning slice keeps all of it.
+    young: bool,
+}
+
+/// What a slice's copy keeps. Owned (it borrows nothing of the store), so a streamed copy
+/// carries it across its writes.
+enum Keep<A: Allocator + Clone> {
+    /// Everything (a merge of a [`Liveness::Everything`] store).
+    All,
+    /// What roots name, or younger than [`WINDOW`] (its pruning over the cap).
+    Rooted(BTreeSet<ContentId>),
+    /// What reaches from an unexpired root ([`Liveness::Reached`]): where each root's record,
+    /// and each index's an indexed root names, lies.
+    Reached(Vec<RootPlace, A>),
+}
+
+/// A root's record, or an index's an indexed root names, where it lies in this process's
+/// mappings: its key, the mapping, its entry there.
+#[derive(Clone, Copy)]
+struct RootPlace {
+    key: ContentId,
+    map: u32,
+    entry: Entry,
+}
+
+impl<A: Allocator + Clone> Keep<A> {
+    fn keeps(&self, maps: &[Verified], key: &ContentId, young: bool) -> bool {
+        match self {
+            Keep::All => true,
+            Keep::Rooted(set) => young || set.contains(key),
+            Keep::Reached(roots) => roots.iter().any(|root| root.key == *key || sorted_holds(maps[root.map as usize].payload(&root.entry), key)),
+        }
+    }
+}
+
+/// A compaction's copy as a K-WAY MERGE of its inputs' sorted runs, read in place where they
+/// are mapped: each step takes the least key at any cursor (a tie to the input first in the
+/// slice's order, the manifest's), decides its liveness as it is met, and keeps the first live
+/// value of a key (a later input's is the same record: one key names one value, rule 21; a
+/// pointer's only at its newest row). Its records so come in key order, which is the copy's
+/// index order: its payloads are laid out in that order too, so payloads and index are one
+/// order and both are streamed. It holds its cursors and a heap of them ([`CURSOR_BYTES`] an
+/// input) and what it keeps by ([`Keep`]); no record. A walk is deterministic, so a second
+/// ([`Merge::rewind`]) meets the same records: a copy walks three times, to count (its header),
+/// to place its payloads, to write its index (the digest takes every payload byte before the
+/// first index byte).
+struct Merge<A: Allocator + Clone> {
+    keep: Keep<A>,
+    namespace: Namespace,
+    cursors: Vec<Cursor, A>,
+    /// The cursors with entries left, a binary min-heap by (the key at the cursor, its index).
+    heap: Vec<u32, A>,
+    /// The key last kept: a later input's value of it is a duplicate.
+    last: Option<ContentId>,
+    /// The entries this walk let go of (dead, or a pointer's older value).
+    dropped: u64,
+}
+
+impl<A: Allocator + Clone> Merge<A> {
+    fn key_at<'m>(&self, maps: &'m [Verified], cursor: u32) -> &'m [u8] {
+        let cursor = &self.cursors[cursor as usize];
+        let at = cursor.next as usize * ENTRY;
+        &maps[cursor.map as usize].run()[at..at + 32]
+    }
+
+    fn before(&self, maps: &[Verified], a: u32, b: u32) -> bool {
+        (self.key_at(maps, a), a) < (self.key_at(maps, b), b)
+    }
+
+    fn sift_down(&mut self, maps: &[Verified], mut at: usize) {
+        loop {
+            let mut least = at;
+            for child in [2 * at + 1, 2 * at + 2] {
+                if child < self.heap.len() && self.before(maps, self.heap[child], self.heap[least]) {
+                    least = child;
+                }
+            }
+            if least == at {
+                return;
+            }
+            self.heap.swap(at, least);
+            at = least;
+        }
+    }
+
+    /// Back to every input's first entry: a walk from the start.
+    fn rewind(&mut self, maps: &[Verified]) {
+        self.heap.clear();
+        self.last = None;
+        self.dropped = 0;
+        for (i, cursor) in self.cursors.iter_mut().enumerate() {
+            cursor.next = 0;
+            if cursor.count > 0 {
+                self.heap.push(i as u32);
+            }
+        }
+        for at in (0..self.heap.len() / 2).rev() {
+            self.sift_down(maps, at);
+        }
+    }
+
+    /// The next record the copy keeps, in key order: its input's mapping and its entry there;
+    /// `None` once every input is walked. O(log k) a record, nothing allocated.
+    fn next(&mut self, store: &Plain<A>) -> Option<(u32, Entry)> {
+        let maps = &store.maps;
+        while let Some(&top) = self.heap.first() {
+            let cursor = self.cursors[top as usize];
+            let at = cursor.next as usize * ENTRY;
+            // A proved segment's entry: read, not checked (decision 18).
+            let entry = Entry::read(&maps[cursor.map as usize].run()[at..at + ENTRY]);
+            self.cursors[top as usize].next += 1;
+            if cursor.next + 1 == cursor.count {
+                self.heap.swap_remove(0);
+            }
+            self.sift_down(maps, 0);
+            let keep = self.keep.keeps(maps, &entry.key, cursor.young);
+            // A pointer keeps only its newest value: the one in the newest row holding its
+            // name (in this slice or after it); an older value is let go.
+            let newest = entry.tag != POINTER_TAG || store.newest_mapped(self.namespace, &Key(entry.key)).is_some_and(|(at, _)| at == cursor.map as usize);
+            if !keep || !newest {
+                self.dropped += 1;
+                continue;
+            }
+            if self.last == Some(entry.key) {
+                continue;
+            }
+            self.last = Some(entry.key);
+            return Some((cursor.map, entry));
+        }
+        None
+    }
+}
+
+/// The BLAKE3 domain of a streamed copy's temporary file's id.
+const MERGE_TEMP_DOMAIN: &str = "blaze plain store merge temporary 1";
+
 /// A segment being written, before its flip.
 struct Writing<A: Allocator + Clone> {
+    /// Its row. A streamed copy's, while it streams, has no digest (zero) and so no id yet:
+    /// [`Plain::named_copy`] makes its row once the stream sealed it.
     seg: Segment,
+    /// Its file: a streamed copy's temporary one while it streams.
     file: FileName,
-    /// The writes at offsets, laid out by [`Plain::commit`], each moved into its effect.
+    /// The writes at offsets, laid out by [`Plain::commit`] (a streamed copy's: its header),
+    /// each moved into its effect.
     pieces: Vec<(u64, Vec<u8>), A>,
+    /// The writes in flight.
     left: u32,
+    /// A compaction's copy, streamed from the inputs' mappings after `pieces`: `None` for a
+    /// commit's segment, whose payloads are its own batches'.
+    stream: Option<Stream<A>>,
 }
+
+/// One record of a streamed copy: where its payload lies in a mapping of this process.
+#[derive(Clone, Copy)]
+struct Pick {
+    /// The index into `Plain::maps` (its [`Cursor::map`]).
+    map: u32,
+    len: u32,
+    /// The payload's offset in that file.
+    from: u64,
+}
+
+/// Which part of a streamed copy its next writes are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Leg {
+    /// Its payloads, from [`HEADER`] to `index_at`, a chunk at a time, as the merge walks.
+    Payloads,
+    /// Its index, from `index_at`, a chunk at a time, as the merge walks again.
+    Index,
+    /// Its footer asked: its digest, and so its name, known.
+    Sealed,
+}
+
+/// A compaction's copy being streamed into its temporary file ([`Plain::stream_segment`]).
+/// What it holds at once is its merge's cursors and the chunks in flight, at most
+/// [`MERGE_BUFFER`] of records and one [`INDEX_CHUNK`] of index: [`merge_holds_most`]; and its
+/// fixed state, the digest's hasher among it (under 2 KiB).
+struct Stream<A: Allocator + Clone> {
+    merge: Merge<A>,
+    /// The digest of every byte asked so far, in the file's order ([`format::seal_parts`]'s:
+    /// the header, the payloads, the index, the footer's head).
+    hasher: blaze_ids::Hasher,
+    leg: Leg,
+    /// The record the next payload chunk goes on with, and how far into its padded span.
+    current: Option<(Pick, u64)>,
+    /// Where the next write starts.
+    at: u64,
+    /// The index leg: where the next entry's payload lies in the copy.
+    placed: u64,
+    index_at: u64,
+    count: u32,
+    /// The index leg's entries asked.
+    indexed: u32,
+    /// The most bytes one payload chunk takes: `MERGE_BUFFER / MERGE_CHUNKS_IN_FLIGHT`.
+    chunk: u64,
+    /// The most entries one index chunk takes: `INDEX_CHUNK / ENTRY`.
+    index_entries: u32,
+    /// Payload chunks asked (each its effect's tag index past the header's), and in flight.
+    asked: u32,
+    flying: u32,
+    /// Index chunks asked, and whether one is in flight (the next is built only once it
+    /// completed: one chunk of index alive).
+    index_asked: u32,
+    index_flying: bool,
+    /// What its footer says, once sealed.
+    sealed: Option<format::Described>,
+}
+
+impl<A: Allocator + Clone> Stream<A> {
+    /// The next payload chunk: its offset and its bytes (the process heap: the effect owns
+    /// them), copied in place from the proved mappings of `store` as the merge meets each
+    /// record, each padded to [`ALIGN`], and hashed; `None` once every payload byte was asked.
+    fn next_chunk(&mut self, store: &Plain<A>) -> Option<(u64, Vec<u8>)> {
+        if self.at == self.index_at {
+            return None;
+        }
+        let take = (self.index_at - self.at).min(self.chunk);
+        let mut bytes = Vec::with_capacity_in(take as usize, Global);
+        while (bytes.len() as u64) < take {
+            let (pick, within) = match self.current.take() {
+                Some(it) => it,
+                None => {
+                    let (map, entry) = self.merge.next(store).expect("a copy's second walk meets the records its first counted: the store does nothing else while it streams");
+                    (Pick { map, len: entry.len, from: entry.at }, 0)
+                }
+            };
+            let span = aligned(u64::from(pick.len));
+            let step = (span - within).min(take - bytes.len() as u64);
+            let real = u64::from(pick.len).min(within + step).saturating_sub(within);
+            if real > 0 {
+                let from = (pick.from + within) as usize;
+                bytes.extend_from_slice(&store.maps[pick.map as usize].bytes()[from..from + real as usize]);
+            }
+            bytes.resize(bytes.len() + (step - real) as usize, 0);
+            if within + step < span {
+                self.current = Some((pick, within + step));
+            }
+        }
+        self.hasher.update(&bytes);
+        let at = self.at;
+        self.at += take;
+        self.asked += 1;
+        Some((at, bytes))
+    }
+
+    /// The next index chunk: its offset and at most `index_entries` entries (every one left,
+    /// `whole`, under [`Plant::MergeWholeIndex`]), each placing its payload where the payload
+    /// leg laid it, its CRC as recorded (nothing is checked or computed again), hashed; `None`
+    /// once every entry was asked.
+    fn next_index(&mut self, store: &Plain<A>, whole: bool) -> Option<(u64, Vec<u8>)> {
+        let left = self.count - self.indexed;
+        if left == 0 {
+            return None;
+        }
+        let fit = if whole { left } else { left.min(self.index_entries) };
+        let mut bytes = Vec::with_capacity_in(fit as usize * ENTRY, Global);
+        for _ in 0..fit {
+            let (_, entry) = self.merge.next(store).expect("a copy's third walk meets the records its first counted: the store does nothing else while it streams");
+            Entry { at: self.placed, ..entry }.encode_into(&mut bytes);
+            self.placed = aligned(self.placed + u64::from(entry.len));
+        }
+        self.hasher.update(&bytes);
+        let at = self.at;
+        self.at += bytes.len() as u64;
+        self.indexed += fit;
+        self.index_asked += 1;
+        Some((at, bytes))
+    }
+
+    /// The footer, its digest of every byte before it: the copy sealed, its row known.
+    fn seal(&mut self) -> (u64, Vec<u8>) {
+        debug_assert!(self.at == self.index_at + u64::from(self.count) * ENTRY as u64 && self.placed == self.index_at, "the index follows the payloads it places");
+        let foot = format::footer_head(self.count, self.index_at);
+        self.hasher.update(&foot);
+        let digest: ContentId = self.hasher.finish();
+        let mut footer = Vec::with_capacity_in(FOOTER, Global);
+        footer.extend_from_slice(&foot);
+        footer.extend_from_slice(&digest.0);
+        self.sealed = Some(format::Described { namespace: self.merge.namespace, count: self.count, index_at: self.index_at, digest });
+        self.leg = Leg::Sealed;
+        (self.at, footer)
+    }
+}
+
+/// The proof a written segment reaches its flip with (states.md item 21).
+mod proof {
+    use std::alloc::Allocator;
+
+    use super::Writing;
+
+    /// A segment every piece of which was written, and, in a durable store, whose sync
+    /// completed: what [`super::Plain::segment_written`] takes, so no path hands a flip a
+    /// durable store's segment before its sync. Made by [`Synced::by_sync`] at the sync's
+    /// completion, by [`Synced::not_durable`] at the last write's when the store syncs nothing,
+    /// by [`Synced::already_named`] for bytes a row names already, and by
+    /// [`Synced::for_a_plant`] for a planted control alone.
+    pub(super) struct Synced<A: Allocator + Clone>(Writing<A>);
+
+    impl<A: Allocator + Clone> Synced<A> {
+        /// The segment's sync completed (its failure was taken first).
+        pub(super) fn by_sync(writing: Writing<A>) -> Synced<A> {
+            Synced(writing)
+        }
+
+        /// Bytes a row of this generation names already, under this name, so nothing is
+        /// written: the row's own write was synced before the flip that named it.
+        pub(super) fn already_named(writing: Writing<A>) -> Synced<A> {
+            debug_assert!(writing.pieces.is_empty() && writing.stream.is_none(), "nothing of a named segment is written again");
+            Synced(writing)
+        }
+
+        /// Every piece is written and the store is not durable: no sync is owed.
+        pub(super) fn not_durable(writing: Writing<A>, durable: bool) -> Result<Synced<A>, Writing<A>> {
+            if durable { Err(writing) } else { Ok(Synced(writing)) }
+        }
+
+        /// A planted control's segment, handed on before (or without) its sync: reached only
+        /// when [`super::Plain::plant`] names one, which is never outside tests.
+        pub(super) fn for_a_plant(writing: Writing<A>) -> Synced<A> {
+            Synced(writing)
+        }
+
+        pub(super) fn into_writing(self) -> Writing<A> {
+            self.0
+        }
+    }
+}
+use proof::Synced;
 
 /// What a flip adds to the generation it builds on.
 enum Change<A: Allocator + Clone> {
@@ -744,6 +1521,10 @@ enum Phase<A: Allocator + Clone> {
     CheckMaps { then: Then },
     Ready,
     Writing(Box<Writing<A>>, Box<Why<A>>),
+    /// A streamed copy's temporary file renamed to its digest's name, before its sync.
+    Renaming(Box<Writing<A>>, Box<Why<A>>),
+    /// A streamed copy's temporary file (`temp`) removed: its bytes are named already.
+    Unwriting { writing: Box<Writing<A>>, why: Box<Why<A>>, temp: FileName },
     /// The segment's sync, before the flip.
     SyncingSegment(Box<Writing<A>>, Box<Why<A>>),
     Flipping(Box<Flip<A>>),
@@ -774,6 +1555,19 @@ pub struct Plain<A: Allocator + Clone> {
     cfg: PlainConfig<A>,
     #[cfg(test)]
     plant: Plant,
+    /// A test's merge geometry ([`Tiers::planted`]); outside tests, [`Tiers::STORE`].
+    #[cfg(test)]
+    tiers: Tiers,
+    /// A test's merge buffer; outside tests, [`MERGE_BUFFER`].
+    #[cfg(test)]
+    merge_buffer: u64,
+    /// A test's index chunk; outside tests, [`INDEX_CHUNK`].
+    #[cfg(test)]
+    index_chunk: u64,
+    /// The most bytes a streamed copy built at once, its index chunk and its cursors: what the
+    /// merge meter checks beside the writes in flight (tests).
+    #[cfg(test)]
+    merge_held_most: u64,
     head: FileName,
     flip: FileName,
     phase: Phase<A>,
@@ -891,6 +1685,10 @@ pub struct Plain<A: Allocator + Clone> {
     carry_rounds: u32,
     /// Records carried forward by this process's commits, ever ([`Plain::carried`]).
     carried: u64,
+    /// The bytes of the segments this process's commits named, and how many: what its
+    /// cleanup's budget is ([`Plain::cleanup_goes_on`]).
+    written_here: u64,
+    segments_here: u64,
     /// The indexes this process made, with how many keys each holds: what an indexed root
     /// that names one counts ([`Plain::named`]).
     indexes_made: Vec<(Key, u64), A>,
@@ -995,6 +1793,15 @@ fn io(doing: &'static str, file: &FileName, done: &Done) -> Option<StoreError> {
     failed(done).map(|error| StoreError::Io { doing, file: store_file(file), error })
 }
 
+/// Whether `leaf` is the name of one of a plain store's own files, the cache tag apart: its
+/// head, its flip lock, a segment (`seg-<16 hex>`, a merge's temporary copy too) or a log
+/// (`manifests-<16 hex>`). What a folder of another form is told by (blaze-cli's note of other
+/// forms, and the legacy layout of format 4 and before, whose files lay directly in the
+/// store's root).
+pub fn store_leaf(leaf: &str) -> bool {
+    leaf == HEAD || leaf == FLIP || parse_leaf(leaf).is_some()
+}
+
 /// The id of a file named `seg-<16 hex>` or `manifests-<16 hex>`, and whether it is a log.
 fn parse_leaf(leaf: &str) -> Option<(u64, bool)> {
     let (hex, log) = match (leaf.strip_prefix("seg-"), leaf.strip_prefix("manifests-")) {
@@ -1024,6 +1831,120 @@ impl<A: Allocator + Clone> Plain<A> {
         Plant::None
     }
 
+    /// A store merging by `tiers` (a test's geometry, or its planted policy), its copies
+    /// streamed through a buffer of `merge_buffer` bytes and their indexes in chunks of
+    /// `index_chunk` (a test's, so KiB merges take many chunks).
+    #[cfg(test)]
+    pub(crate) fn tiered(cfg: PlainConfig<A>, alloc: A, plant: Plant, tiers: Tiers, merge_buffer: u64, index_chunk: u64) -> Plain<A> {
+        let mut it = Plain::planted(cfg, alloc, plant);
+        it.tiers = tiers;
+        it.merge_buffer = merge_buffer;
+        it.index_chunk = index_chunk;
+        it
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_buffer(&self) -> u64 {
+        self.merge_buffer
+    }
+
+    /// The bytes of records a compaction's copy holds at once: [`MERGE_BUFFER`].
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn merge_buffer(&self) -> u64 {
+        MERGE_BUFFER
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_chunk(&self) -> u64 {
+        self.index_chunk
+    }
+
+    /// The most bytes of index a compaction's copy holds at once: [`INDEX_CHUNK`].
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn index_chunk(&self) -> u64 {
+        INDEX_CHUNK
+    }
+
+    /// The most bytes a streamed copy built at once since the last call (its index chunk and
+    /// its cursors), cleared: what the merge meter checks beside the writes in flight.
+    #[cfg(test)]
+    pub(crate) fn take_merge_held_most(&mut self) -> u64 {
+        std::mem::take(&mut self.merge_held_most)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tiers(&self) -> Tiers {
+        self.tiers
+    }
+
+    /// The merge policy's geometry: [`Tiers::STORE`].
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn tiers(&self) -> Tiers {
+        Tiers::STORE
+    }
+
+    /// The most segments this generation may name once cleanup has run: [`SEGMENTS_MOST`]
+    /// (the invariant's bound at [`NAMESPACE_BYTES_STATED`]) for each namespace it names. What
+    /// blaze-cli's "its compaction is behind" line counts against.
+    pub fn named_most(&self) -> u32 {
+        let mut namespaces: Vec<Namespace, A> = Vec::new_in(self.alloc.clone());
+        for seg in &self.manifest.segments {
+            if !namespaces.contains(&seg.namespace) {
+                namespaces.push(seg.namespace);
+            }
+        }
+        (namespaces.len().max(1) * SEGMENTS_MOST) as u32
+    }
+
+    /// Whether one command's cleanup runs another slice after `so_far` (its slices summed,
+    /// [`Sliced::and`]) of `slices` slices, the last of which was `last`: the last was a TIERED
+    /// MERGE ([`Sliced::merged`]: a pruning or sweeping run ends it, so a cold build's thousands
+    /// of dead records never buy a long cleanup after the answer, each command sweeping one
+    /// slice), replaced something and was not aborted (a slice that finds nothing to do ends
+    /// it, and so does another process's), fewer than [`CLEANUP_SLICES_MOST`] ran, and the bytes they read are
+    /// under THE WORK BUDGET: the amortisation's bound (`Tiers::merged_most`) of what this
+    /// process committed, the bytes of its commits' segments and their count. So the first
+    /// slice always runs (what a command did before, amortised over the history), and the
+    /// slices after it read at most the budget and one slice more; what is left over, a
+    /// namespace still over its bound, is the next command's. One namespace's invariant is
+    /// restored by one merge, so a command that commits enough restores every namespace.
+    ///
+    /// Under [`Liveness::Reached`] it also goes on whenever a MERGE IS DUE next (a namespace
+    /// breaks the invariant over the rows a slice may take; `plan_reached` plans that merge
+    /// first): after a sweep whose copy landed in a full tier, and after a FIRST slice that
+    /// replaced nothing because the command's own rows were still leased when it was planned
+    /// (the answer's commit, which named that slice, let the lease go: `release_lease`), so the
+    /// command's own commits are merged in its own cleanup. A slice that replaced nothing goes
+    /// on only while the cleanup has read nothing at all (`so_far.bytes_in == 0`: every
+    /// planned slice reads its candidates), so a merge planned and then found to change nothing
+    /// ends it (rule 18: no loop of empty slices). Still only merges go on, and the invariant
+    /// holds after every cleanup in sweep mode too.
+    pub fn cleanup_goes_on(&self, so_far: &Sliced, slices: u32, last: &Sliced) -> bool {
+        if self.plant() == Plant::CleanupOneSlice {
+            return false;
+        }
+        let merge_due = || self.cfg.liveness == Liveness::Reached && !self.plan_tiered(|it| self.sweepable(it, self.now_ns)).is_empty();
+        let replaced = last.segments > 0;
+        // The planted starvation keeps the old stop after a sweep, not the lease's case.
+        let after_sweep = replaced && self.plant() != Plant::SweepBeforeMerge;
+        let on = (last.merged && replaced) || ((after_sweep || so_far.bytes_in == 0) && merge_due());
+        on && !last.aborted && slices < CLEANUP_SLICES_MOST && so_far.bytes_in < self.cleanup_budget()
+    }
+
+    /// The budget [`Plain::cleanup_goes_on`] holds a cleanup to, in bytes read.
+    pub fn cleanup_budget(&self) -> u64 {
+        self.tiers().merged_most(self.written_here, self.segments_here)
+    }
+
+    /// The rows this generation names, in its order: what the tier oracle counts.
+    #[cfg(test)]
+    pub(crate) fn named_rows(&self) -> &[Segment] {
+        &self.manifest.segments
+    }
+
     /// The store `cfg` names, what it keeps in `alloc` (the caller's: rule 75).
     pub fn new(cfg: PlainConfig<A>, alloc: A) -> Plain<A> {
         assert!(cfg.writes.contains(&Namespace::LOCAL), "a plain store writes the local namespace: its roots live there");
@@ -1044,6 +1965,14 @@ impl<A: Allocator + Clone> Plain<A> {
             cfg,
             #[cfg(test)]
             plant: Plant::None,
+            #[cfg(test)]
+            tiers: Tiers::STORE,
+            #[cfg(test)]
+            merge_buffer: MERGE_BUFFER,
+            #[cfg(test)]
+            index_chunk: INDEX_CHUNK,
+            #[cfg(test)]
+            merge_held_most: 0,
             phase: Phase::New,
             slot: None,
             manifest: Manifest::default(),
@@ -1087,6 +2016,8 @@ impl<A: Allocator + Clone> Plain<A> {
             carrying: Vec::new_in(alloc.clone()),
             carry_rounds: 0,
             carried: 0,
+            written_here: 0,
+            segments_here: 0,
             indexes_made: Vec::new_in(alloc.clone()),
             named: Named::default(),
             alloc,
@@ -1230,12 +2161,6 @@ impl<A: Allocator + Clone> Plain<A> {
 
     // ---- reads: no lock, no write to anything shared ----
 
-    /// Whether a lookup that names `spaces` may answer from a segment of `namespace`: only
-    /// when it names it (the planted bug answers from any).
-    fn asks(&self, spaces: &[Namespace], namespace: Namespace) -> bool {
-        self.plant() == Plant::IgnoresNamespace || spaces.contains(&namespace)
-    }
-
     /// The newest committed entry of `key` in the mapped segments of `spaces`, asked in the
     /// order given (each namespace's segments newest first): one probe of each segment's index
     /// until one holds it. Each segment here is proved ([`Verified`]): the probe reads the entry
@@ -1258,10 +2183,6 @@ impl<A: Allocator + Clone> Plain<A> {
     fn probe(&self, at: usize, key: &Key) -> Option<(usize, Entry)> {
         let run = self.maps[at].run();
         format::find(run, &key.0).map(|i| (at, Entry::read(&run[i * ENTRY..(i + 1) * ENTRY])))
-    }
-
-    fn find_committed(&self, key: &Key) -> Option<(usize, Entry)> {
-        self.find_in(&self.cfg.reads, key)
     }
 
     /// [`Plain::get`] in `spaces` alone, asked in their order (the caller's, never more): for
@@ -1388,12 +2309,6 @@ impl<A: Allocator + Clone> Plain<A> {
 
     pub fn locate(&self, key: &Key) -> Option<Placed> {
         self.locate_in(&self.cfg.reads, key)
-    }
-
-    /// Where `key` is in `spaces`: its proved segment's index in this process's maps and its
-    /// entry, for the store handle's lock-free read.
-    pub(crate) fn find_mapped(&self, spaces: &[Namespace], key: &Key) -> Option<(usize, Entry)> {
-        self.find_in(spaces, key)
     }
 
     pub fn has(&self, key: &Key) -> bool {
@@ -1722,6 +2637,15 @@ impl<A: Allocator + Clone> Plain<A> {
                 continue;
             }
             let index_at = HEADER as u64 + bytes.len() as u64;
+            // THE CAP, before a byte is written: a commit's segment past it would be a row
+            // every later open refuses (`format::Row`), so the commit is refused here, naming
+            // its namespace and the lengths. (Alignment and the index's end are the layout's
+            // own, `seal_parts`; the row's whole check is at the flip, `Manifest::encode`.)
+            let len = index_at.saturating_add(entries.len() as u64 * ENTRY as u64 + FOOTER as u64);
+            let most = self.tiers().segment_most();
+            if len > most {
+                return Err(StoreError::Shape { namespace, why: RowRefused::TooLong { len, most } });
+            }
             let mut pieces: Vec<(u64, Vec<u8>), A> = Vec::with_capacity_in(1, self.alloc.clone());
             if !bytes.is_empty() {
                 pieces.push((HEADER as u64, bytes));
@@ -1744,7 +2668,7 @@ impl<A: Allocator + Clone> Plain<A> {
             Phase::Mapping { .. } | Phase::CheckMaps { .. } | Phase::Removing { .. } => "mapping a new generation",
             Phase::Ready => "ready",
             Phase::Listing => "compacting",
-            Phase::Writing(..) | Phase::SyncingSegment(..) => "writing a segment",
+            Phase::Writing(..) | Phase::Renaming(..) | Phase::Unwriting { .. } | Phase::SyncingSegment(..) => "writing a segment",
             Phase::Flipping(_) => "flipping its head",
             Phase::Sealing { .. } => "sealing the exit tail",
             Phase::Broken => "broken",
@@ -1757,13 +2681,189 @@ impl<A: Allocator + Clone> Plain<A> {
     /// made at its length, then each piece written at its offset, in parallel. A segment of the
     /// same bytes already here is not written again (a published file is never rewritten).
     fn write_segment(&mut self, laid: Laid<A>, why: Why<A>, effects: &mut Vec<Effect>) {
-        let Laid { mut pieces, index_at, run, namespace } = laid;
+        let Laid { pieces, index_at, run, namespace } = laid;
         debug_assert!(pieces.iter().scan(HEADER as u64, |at, (piece_at, bytes)| {
             let ok = *piece_at == *at;
             *at += bytes.len() as u64;
             Some(ok)
         }).all(|it| it), "pieces lie end to end");
         let sealed = format::seal_parts(namespace, &run, index_at, pieces.iter().map(|(_, bytes)| bytes.as_slice()));
+        self.start_write(sealed, pieces, run, why, effects);
+    }
+
+    /// A streamed copy's next writes ([`Plain::stream_segment`]): payload chunks while fewer
+    /// than [`MERGE_CHUNKS_IN_FLIGHT`] are in flight; once the last is asked, index chunks,
+    /// each built only once the one before completed (one [`INDEX_CHUNK`] alive); once the last
+    /// is asked, the footer. Nothing for a commit's segment. The effects' tag indices:
+    /// [`INDEX_PIECE`] and [`FOOTER_PIECE`].
+    fn stream_on(&mut self, effects: &mut Vec<Effect>) {
+        let tags = self.cfg.tags;
+        let whole_index = self.plant() == Plant::MergeWholeIndex;
+        let Phase::Writing(writing, _) = &mut self.phase else { return };
+        let Some(mut stream) = writing.stream.take() else { return };
+        let file = writing.file.clone();
+        let (mut asked, mut built) = (0u32, 0u64);
+        loop {
+            match stream.leg {
+                Leg::Payloads if stream.flying < MERGE_CHUNKS_IN_FLIGHT => match stream.next_chunk(self) {
+                    Some((at, bytes)) => {
+                        effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: tag_of(tags, SEG_PIECE, stream.asked) });
+                        stream.flying += 1;
+                        asked += 1;
+                    }
+                    None => {
+                        stream.leg = Leg::Index;
+                        stream.merge.rewind(&self.maps);
+                    }
+                },
+                Leg::Index if !stream.index_flying => match stream.next_index(self, whole_index) {
+                    Some((at, bytes)) => {
+                        built = built.max(bytes.len() as u64);
+                        effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: tag_of(tags, SEG_PIECE, INDEX_PIECE + stream.index_asked) });
+                        stream.index_flying = true;
+                        asked += 1;
+                    }
+                    None => {
+                        let (at, bytes) = stream.seal();
+                        effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: tag_of(tags, SEG_PIECE, FOOTER_PIECE) });
+                        asked += 1;
+                    }
+                },
+                _ => break,
+            }
+        }
+        #[cfg(test)]
+        {
+            self.merge_held_most = self.merge_held_most.max(built + stream.merge.cursors.len() as u64 * CURSOR_BYTES);
+        }
+        #[cfg(not(test))]
+        let _ = built;
+        let Phase::Writing(writing, _) = &mut self.phase else { unreachable!("streaming keeps the phase") };
+        writing.left += asked;
+        writing.stream = Some(stream);
+    }
+
+    /// A compaction's copy as a segment, STREAMED within [`merge_holds_most`]: its header from
+    /// its merge's first walk ([`Plain::copy_live`]); a TEMPORARY file made at the copy's
+    /// length in the store's directory, `seg-<id>` with an id of this process's nonce, its
+    /// sequence and the clock (fresh for each copy: no other copy's name, and no name a
+    /// generation names or retired); its header written; its payloads copied into it from the
+    /// inputs' mappings chunk by chunk as the merge walks again ([`Stream::next_chunk`], at
+    /// most [`MERGE_CHUNKS_IN_FLIGHT`] in flight); its index a chunk at a time as the merge
+    /// walks a third time ([`Stream::next_index`], one in flight); every byte hashed as it is
+    /// asked, in the file's order; then its footer, which holds the digest. The digest names the
+    /// segment and the header it hashes first needs the count and the keys, so the name is
+    /// known only after the last byte: once every write completed the file is RENAMED to
+    /// `seg-<digest id>`, then synced, then flipped, as a commit's segment
+    /// ([`Plain::named_copy`]).
+    ///
+    /// A crash before the rename leaves the temporary file, which no generation names: an
+    /// ORPHAN, as every segment file no generation names is (the next open's listing,
+    /// `Phase::Orphans`, reports it and its flip retires it in [`Plain::build`]; or the next
+    /// slice's listing, [`Plain::listed_compact`], hands it to its flip, which retires it
+    /// there), unlinked past [`GRACE_NS`]. A crash after the rename and before the flip leaves
+    /// the renamed file, the same kind of orphan. A copy whose bytes are a named segment's, or
+    /// one of its own inputs', removes its temporary file and writes nothing more.
+    fn stream_segment(&mut self, copied: Copied<A>, why: Why<A>, now_ns: u64, effects: &mut Vec<Effect>) {
+        let Copied { mut merge, count, index_at, lowest, highest } = copied;
+        let namespace = merge.namespace;
+        let header = format::header_of(namespace, count, lowest, highest, index_at);
+        let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
+        self.seq += 1;
+        let temp = format::id_of(MERGE_TEMP_DOMAIN, &[&self.cfg.nonce.to_le_bytes(), &self.seq.to_le_bytes(), &now_ns.to_le_bytes()]);
+        if self.by_id.contains_key(&temp) || self.manifest.segments.iter().any(|it| it.id == temp) || self.manifest.retired.iter().any(|it| it.id == temp && !it.log) {
+            return self.stop(StoreError::Unfinished { what: "a merge's copy, whose fresh temporary name a named or retired segment holds (one 64-bit id met twice)" });
+        }
+        let file = self.segment_file(temp);
+        merge.rewind(&self.maps);
+        let mut hasher = blaze_ids::Hasher::new(format::SEGMENT_DIGEST);
+        hasher.update(&header);
+        let chunk = if self.plant() == Plant::MergeWholeBatch { index_at } else { self.merge_buffer() / u64::from(MERGE_CHUNKS_IN_FLIGHT) };
+        let index_entries = (self.index_chunk() / ENTRY as u64).max(1) as u32;
+        let stream = Stream {
+            merge,
+            hasher,
+            leg: Leg::Payloads,
+            current: None,
+            at: HEADER as u64,
+            placed: HEADER as u64,
+            index_at,
+            count,
+            indexed: 0,
+            chunk: chunk.max(ALIGN),
+            index_entries,
+            asked: 0,
+            flying: 0,
+            index_asked: 0,
+            index_flying: false,
+            sealed: None,
+        };
+        // Its row until the stream seals it: no digest yet, so no id.
+        let mut seg = Segment::of(&format::Described { namespace, count, index_at, digest: ContentId([0; 32]) }, len);
+        seg.boot = self.cfg.boot;
+        let mut head = Vec::with_capacity_in(HEADER, Global);
+        head.extend_from_slice(&header);
+        let mut pieces = Vec::with_capacity_in(1, self.alloc.clone());
+        pieces.push((0, head));
+        effects.push(Effect::Truncate { file: file.clone(), len, tag: self.tag(SEG_TRUNCATE, 0) });
+        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: Some(stream) }), Box::new(why));
+    }
+
+    /// A streamed copy every write of which completed ([`Plain::stream_segment`]): its row
+    /// made from what its footer says. Bytes one of its own inputs holds (the slice would write
+    /// back what it read) or a named segment holds are here already: its temporary file is
+    /// removed, nothing else written ([`Phase::Unwriting`]). Else the file is renamed to its
+    /// digest's name ([`Phase::Renaming`]), then synced and flipped as a commit's segment
+    /// ([`Plain::segment_done`]).
+    fn named_copy(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+        let Writing { seg: unnamed, file: temp, stream, .. } = writing;
+        let described = stream.and_then(|it| it.sealed).expect("a copy's writes all completed only once its footer, which seals it, did");
+        let mut seg = Segment::of(&described, unnamed.file_len());
+        seg.boot = self.cfg.boot;
+        let file = self.segment_file(seg.id);
+        let back = matches!(&why, Why::Compact { candidates, .. } if candidates.contains(&seg.id));
+        let named = Writing { seg, file: file.clone(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None };
+        if back || self.by_id.contains_key(&seg.id) {
+            effects.push(Effect::Remove { file: temp.clone(), tag: self.tag(SEG_UNWRITE, 0) });
+            self.phase = Phase::Unwriting { writing: Box::new(named), why: Box::new(why), temp };
+            return;
+        }
+        // Unsynced: its bytes are made durable by its own sync next, and its name by the
+        // flip's sync of the directory before the slot that names it (`DIR_SYNC`), as a
+        // commit's segment's are; a durable rename would flush the drive a second time. A
+        // crash before that may put it back under its temporary name: an orphan either way.
+        effects.push(Effect::RenameUnsynced { from: temp, to: file, tag: self.tag(SEG_RENAME, 0) });
+        self.phase = Phase::Renaming(Box::new(named), Box::new(why));
+    }
+
+    /// A segment every byte of which is written under its name: synced, then flipped; or,
+    /// not durable, flipped (the planted controls hand some to the flip before their sync).
+    fn segment_done(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+        // The planted controls: a segment handed to the flip before its sync (every
+        // segment's, or a merge's alone), or never synced.
+        let merge_early = self.plant() == Plant::MergeFlipsBeforeSync && matches!(why, Why::Compact { .. });
+        let planted = self.plant() == Plant::SkipDataSync || self.plant() == Plant::FlipBeforeSync || merge_early;
+        let writing = match Synced::not_durable(writing, self.cfg.durable) {
+            Ok(synced) => synced,
+            Err(writing) if planted => {
+                if self.plant() != Plant::SkipDataSync {
+                    self.late_sync.push(writing.file.clone());
+                }
+                Synced::for_a_plant(writing)
+            }
+            Err(writing) => {
+                effects.push(Effect::Sync { file: writing.file.clone(), tag: self.tag(SEG_SYNC, 0) });
+                self.phase = Phase::SyncingSegment(Box::new(writing), Box::new(why));
+                return;
+            }
+        };
+        self.segment_written(writing, why, effects);
+    }
+
+    /// The write of a segment `sealed` describes (a commit's, or a carry's): `pieces` (its
+    /// payloads), then `run` and the footer.
+    fn start_write(&mut self, sealed: format::Sealed, mut pieces: Vec<(u64, Vec<u8>), A>, run: Vec<u8>, why: Why<A>, effects: &mut Vec<Effect>) {
+        let index_at = sealed.described.index_at;
         let (count, len) = (sealed.described.count, sealed.len);
         let mut seg = Segment::of(&sealed.described, len);
         seg.boot = self.cfg.boot;
@@ -1778,8 +2878,10 @@ impl<A: Allocator + Clone> Plain<A> {
             return;
         }
         if self.by_id.contains_key(&seg.id) {
-            // These bytes are here already, under this name: flip without writing them.
-            self.segment_written(Writing { seg, file, pieces: Vec::new_in(self.alloc.clone()), left: 0 }, why, effects);
+            // These bytes are here already, under this name: flip without writing them. They
+            // are a named segment's, proved as its row is (synced before the flip that named
+            // them, when durable): nothing of them is written here, so no sync is owed.
+            self.segment_written(Synced::already_named(Writing { seg, file, pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None }), why, effects);
             return;
         }
         let mut header = Vec::with_capacity_in(HEADER, Global);
@@ -1787,10 +2889,11 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut footer = Vec::with_capacity_in(FOOTER, Global);
         footer.extend_from_slice(&sealed.footer);
         pieces.insert(0, (0, header));
+        let footer_at = index_at + u64::from(count) * ENTRY as u64;
         pieces.push((index_at, run));
-        pieces.push((index_at + u64::from(count) * ENTRY as u64, footer));
+        pieces.push((footer_at, footer));
         effects.push(Effect::Truncate { file: file.clone(), len, tag: self.tag(SEG_TRUNCATE, 0) });
-        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0 }), Box::new(why));
+        self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0, stream: None }), Box::new(why));
     }
 
     /// Names segments fetched from a source (their files already written here, unchanged,
@@ -1823,8 +2926,9 @@ impl<A: Allocator + Clone> Plain<A> {
     // ---- compaction ----
 
     /// Starts one compaction slice: the directory looked at for files no generation names,
-    /// then at most [`SLICE_BYTES`] of the oldest segments copied (what is live of them) into
-    /// one new segment, with no lock, and a flip that names it in their place. Returns whether
+    /// then the segments `Plain::plan` picks (a pruning run of at most [`SLICE_BYTES`], or a
+    /// namespace's tiered merge) copied (what is live of them) into one new segment, with no
+    /// lock, and a flip that names it in their place. Returns whether
     /// it started; the outcome is [`Plain::take_sliced`]'s once the store is ready again.
     pub fn compact(&mut self, effects: &mut Vec<Effect>) -> bool {
         if !self.ready() {
@@ -1864,29 +2968,26 @@ impl<A: Allocator + Clone> Plain<A> {
         self.folding.is_some()
     }
 
-    /// Which segments a slice replaces, and whether it prunes.
+    /// Which segments a slice replaces, and whether it prunes: over the cap, a pruning run from
+    /// the oldest prunable row (bounded by [`SLICE_BYTES`]); else, or when nothing is old
+    /// enough to prune, the tiered merge ([`Tiers`]) of the first namespace that needs one.
     fn plan(&self) -> (Vec<Segment, A>, bool) {
         let current = self.manifest.generation;
-        let over = self.manifest.bytes() > self.cfg.cap_bytes;
-        let local = self.manifest.segments.iter().filter(|it| it.local).count();
-        let wanted = if over {
-            1
-        } else if local > SEGMENTS_MOST {
-            2
-        } else {
-            return (Vec::new_in(self.alloc.clone()), false);
-        };
+        // Merging never reads a published segment, nor one not here.
+        let merge = || (self.plan_tiered(|it| it.local && !it.published), false);
+        if self.manifest.bytes() <= self.cfg.cap_bytes {
+            return merge();
+        }
         // Pruning reads published segments too (it lets go of this machine's copy, rewriting
-        // nothing); merging never does. One namespace a slice: no segment mixes two.
-        let eligible = |it: &&Segment| it.local && (if over { it.generation + WINDOW <= current } else { !it.published });
+        // nothing). One namespace a slice: no segment mixes two.
+        let eligible = |it: &&Segment| it.local && it.generation + WINDOW <= current;
         let Some(namespace) = self.manifest.segments.iter().find(eligible).map(|it| it.namespace) else {
-            return (Vec::new_in(self.alloc.clone()), false);
+            return merge();
         };
         let mut out = Vec::new_in(self.alloc.clone());
         let mut bytes = 0u64;
-        // A CONTIGUOUS run of the namespace's rows held here: the copy takes the first one's
-        // place, so a row the slice skipped would move from before a pointer's newest value
-        // to after it, and its older value would read as the newest.
+        // A CONTIGUOUS run of the namespace's rows held here: a pruned copy keeps a row's
+        // records whole, so a row the slice skipped stays where it was against the copy.
         for seg in self.manifest.segments.iter().filter(|it| it.local && it.namespace == namespace) {
             if !eligible(&seg) {
                 if out.is_empty() {
@@ -1900,23 +3001,63 @@ impl<A: Allocator + Clone> Plain<A> {
             bytes += seg.file_len();
             out.push(*seg);
         }
-        if out.len() < wanted {
-            out.clear();
-        }
-        (out, over)
+        (out, true)
     }
 
-    /// Which segments a [`Liveness::Reached`] slice replaces: a contiguous run of one
+    /// The tiered merge, over the rows `mergeable` admits, of the namespace whose merge starts
+    /// at the oldest row (so a namespace left over by one slice is the next slice's before any
+    /// namespace that went over since); none when every namespace keeps the invariant.
+    /// (Whether another slice has work is planned again after the flip: [`Sliced::more`].) A
+    /// merge's rows need not be contiguous: its copy takes the NEWEST one's place
+    /// ([`Plain::build`]) and holds a pointer only at its newest value (`copy_live`), so no row
+    /// the merge skipped moves past a pointer's newest value.
+    fn plan_tiered(&self, mergeable: impl Fn(&Segment) -> bool) -> Vec<Segment, A> {
+        let tiers = self.tiers();
+        let segs = &self.manifest.segments;
+        let mut out = Vec::new_in(self.alloc.clone());
+        let mut oldest = usize::MAX;
+        let mut looked: Vec<Namespace, A> = Vec::new_in(self.alloc.clone());
+        for first in segs {
+            if looked.contains(&first.namespace) {
+                continue;
+            }
+            looked.push(first.namespace);
+            let namespace = first.namespace;
+            let mut rows: Vec<TierRow, A> = Vec::new_in(self.alloc.clone());
+            let mut at: Vec<usize, A> = Vec::new_in(self.alloc.clone());
+            for (i, seg) in segs.iter().enumerate().filter(|(_, it)| it.namespace == namespace) {
+                rows.push(TierRow { len: seg.file_len(), mergeable: mergeable(seg) });
+                at.push(i);
+            }
+            let merge = tiers.merge(&rows, self.alloc.clone());
+            let Some(&start) = merge.rows.first() else { continue };
+            if at[start] < oldest {
+                oldest = at[start];
+                out.clear();
+                out.extend(merge.rows.iter().map(|&row| segs[at[row]]));
+            }
+        }
+        out
+    }
+
+    /// Which segments a [`Liveness::Reached`] slice replaces: the tiered merge ([`Tiers`]) of
+    /// the first namespace that breaks the invariant, FIRST, so the invariant holds after every
+    /// cleanup in sweep mode too (a sparse row always present would else take every first
+    /// slice, and only merges go on: [`Plain::cleanup_goes_on`]); else a contiguous run of one
     /// namespace's rows, from the first found under half live (over the cap: holding any dead
     /// record) among at most [`SWEEP_BYTES`] of rows looked at from a place that moves with the
-    /// generation, up to [`SLICE_BYTES`]; else, while more than [`SEGMENTS_MOST`] are named, a
-    /// merge of two or more from the oldest. A row a live lease keeps, a published row and one
-    /// not here are never in a run (a run stops at one).
-    fn plan_reached(&self, now_ns: u64) -> Result<Vec<Segment, A>, StoreError> {
+    /// generation, up to [`SLICE_BYTES`]. A row a live lease keeps, a published row and one
+    /// not here are never in a run (a run stops at one) nor in a merge. And whether it is the
+    /// tiered merge ([`Sliced::merged`]).
+    fn plan_reached(&self, now_ns: u64) -> Result<(Vec<Segment, A>, bool), StoreError> {
+        let segs = &self.manifest.segments;
+        let eligible = |it: &Segment| self.sweepable(it, now_ns);
+        let merge = self.plan_tiered(eligible);
+        if !merge.is_empty() && self.plant() != Plant::SweepBeforeMerge {
+            return Ok((merge, true));
+        }
         let roots = self.live_roots(now_ns)?;
         let over = self.manifest.bytes() > self.cfg.cap_bytes;
-        let segs = &self.manifest.segments;
-        let eligible = |it: &Segment| it.local && !it.published && self.by_id.contains_key(&it.id) && !self.leased(it, now_ns);
         let mut sparse = None;
         if !segs.is_empty() {
             let start = (self.manifest.generation % segs.len() as u64) as usize;
@@ -1937,18 +3078,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             }
         }
-        let from = match sparse {
-            Some(i) => i,
-            None if segs.iter().filter(|it| it.local).count() > SEGMENTS_MOST => match segs.iter().position(|it| eligible(it)) {
-                Some(i) => i,
-                None => return Ok(Vec::new_in(self.alloc.clone())),
-            },
-            None => return Ok(Vec::new_in(self.alloc.clone())),
-        };
+        // No sparse row: the tiered merge (empty here unless planted to sweep first).
+        let Some(from) = sparse else { return Ok((merge, true)) };
         let namespace = segs[from].namespace;
         let mut out = Vec::new_in(self.alloc.clone());
         let mut bytes = 0u64;
-        // Contiguous, as [`Plain::plan`]'s: the copy takes the first one's place.
+        // A contiguous run from the sparse row: its copy takes the newest one's place, past no
+        // row it skipped.
         for seg in segs[from..].iter().filter(|it| it.local && it.namespace == namespace) {
             if !eligible(seg) || (!out.is_empty() && bytes + seg.file_len() > SLICE_BYTES) {
                 break;
@@ -1956,10 +3092,13 @@ impl<A: Allocator + Clone> Plain<A> {
             bytes += seg.file_len();
             out.push(*seg);
         }
-        if sparse.is_none() && out.len() < 2 {
-            out.clear();
-        }
-        Ok(out)
+        Ok((out, false))
+    }
+
+    /// A [`Liveness::Reached`] slice may take `seg`, in a sweep's run or a merge: held here,
+    /// not published, mapped, and kept whole by no live lease.
+    fn sweepable(&self, seg: &Segment, now_ns: u64) -> bool {
+        seg.local && !seg.published && self.by_id.contains_key(&seg.id) && !self.leased(seg, now_ns)
     }
 
     /// A live lease keeps `seg` whole: it is of the lease's generation or newer.
@@ -1968,8 +3107,19 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// Each unexpired root's key and its record's sorted keys, read in place: what
-    /// [`reached`] searches. A root whose record no segment holds stops the slice by name.
+    /// [`reached`] searches ([`Plain::root_places`], each resolved in its mapping).
     fn live_roots(&self, now_ns: u64) -> Result<Vec<(ContentId, &[u8]), A>, StoreError> {
+        let places = self.root_places(now_ns)?;
+        let mut out = Vec::with_capacity_in(places.len(), self.alloc.clone());
+        out.extend(places.iter().map(|it| (it.key, self.maps[it.map as usize].payload(&it.entry))));
+        Ok(out)
+    }
+
+    /// Where each unexpired root's record lies (its sorted keys), and each index's an indexed
+    /// root names: what [`Keep::Reached`] holds across a streamed copy, and
+    /// [`Plain::live_roots`] reads. A root whose record no segment holds stops the slice by
+    /// name.
+    fn root_places(&self, now_ns: u64) -> Result<Vec<RootPlace, A>, StoreError> {
         let mut out = Vec::with_capacity_in(self.manifest.roots.len(), self.alloc.clone());
         for (i, root) in self.manifest.roots.iter().enumerate() {
             if root.expires_ns <= now_ns || (i == 0 && self.plant() == Plant::ReachSkipsRoot) {
@@ -1978,21 +3128,20 @@ impl<A: Allocator + Clone> Plain<A> {
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
             };
-            let named = self.maps[at].payload(&entry);
-            out.push((root.key, named));
+            out.push(RootPlace { key: root.key, map: at as u32, entry });
             if entry.tag == INDEXED_ROOT_TAG && self.plant() != Plant::IndexNotFollowed {
-                self.follow(root.key, named, &mut out)?;
+                self.follow(root.key, self.maps[at].payload(&entry), &mut out)?;
             }
         }
         Ok(out)
     }
 
     /// Each index the indexed root `root` names (`named`, its record's sorted keys), pushed as
-    /// `(its key, its sorted keys)`: what [`reached`] searches as it searches a root's, so the
+    /// where its record lies: what [`reached`] searches as it searches a root's, so the
     /// index's own record and every key it holds are live. One level: what an index names is
     /// not looked into. An index no segment holds, or a record there of another tag, stops the
     /// slice by name, as a root's missing record does.
-    fn follow<'s>(&'s self, root: ContentId, named: &[u8], out: &mut Vec<(ContentId, &'s [u8]), A>) -> Result<(), StoreError> {
+    fn follow(&self, root: ContentId, named: &[u8], out: &mut Vec<RootPlace, A>) -> Result<(), StoreError> {
         for index in named.chunks_exact(32) {
             let index = ContentId(index.try_into().expect("32 bytes"));
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
@@ -2001,7 +3150,7 @@ impl<A: Allocator + Clone> Plain<A> {
             if entry.tag != INDEX_TAG {
                 return Err(StoreError::NotAnIndex { root, key: index, tag: entry.tag });
             }
-            out.push((index, self.maps[at].payload(&entry)));
+            out.push(RootPlace { key: index, map: at as u32, entry });
         }
         Ok(())
     }
@@ -2111,15 +3260,16 @@ impl<A: Allocator + Clone> Plain<A> {
                 orphans.push((id, log));
             }
         }
+        // The candidates, whether the copy prunes, and whether it is the tiered merge.
         let planned = match self.cfg.liveness {
-            Liveness::Everything => Ok(self.plan()),
-            Liveness::Reached => self.plan_reached(now_ns).map(|it| (it, true)),
+            Liveness::Everything => Ok(self.plan()).map(|(it, prune)| (it, prune, !prune)),
+            Liveness::Reached => self.plan_reached(now_ns).map(|(it, merged)| (it, true, merged)),
         };
-        let (candidates, prune) = match planned {
+        let (candidates, prune, merged) = match planned {
             Ok(it) => it,
             Err(why) => return self.stop(why),
         };
-        let mut stats = Sliced { orphans: orphans.len() as u32, ..Sliced::default() };
+        let mut stats = Sliced { orphans: orphans.len() as u32, merged, ..Sliced::default() };
         let expired = self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns);
         if candidates.is_empty() {
             if orphans.is_empty() && !expired {
@@ -2136,17 +3286,13 @@ impl<A: Allocator + Clone> Plain<A> {
             Ok(it) => it,
             Err(why) => return self.stop(why),
         };
-        if out.is_empty() {
+        if out.count == 0 {
             self.slice_ready(None, ids, orphans, stats, effects);
             return;
         }
-        let laid = match laid_of(out, self.alloc.clone()) {
-            Ok(laid) => laid,
-            Err(why) => return self.stop(why),
-        };
-        stats.bytes_out = laid.index_at + laid.run.len() as u64 + FOOTER as u64;
+        stats.bytes_out = out.index_at + u64::from(out.count) * ENTRY as u64 + FOOTER as u64;
         self.orphans_for_compact = orphans;
-        self.write_segment(laid, Why::Compact { candidates: ids, stats }, effects);
+        self.stream_segment(out, Why::Compact { candidates: ids, stats }, now_ns, effects);
     }
 
     /// A slice's change is ready: parked for the next commit's flip when
@@ -2160,63 +3306,79 @@ impl<A: Allocator + Clone> Plain<A> {
         self.start_flip(Change::Compact { seg, candidates, orphans, stats }, effects);
     }
 
-    /// What of `candidates` a slice keeps, copied into one batch, and the candidates it
-    /// replaces (a published one only when it holds nothing live: it is let go of whole, or
-    /// kept whole, never rewritten).
-    fn copy_live(&self, candidates: Vec<Segment, A>, prune: bool, now_ns: u64, stats: &mut Sliced) -> Result<(Batch, Vec<u64, A>), StoreError> {
-        let live = match (prune, self.cfg.liveness) {
-            (false, _) => Live::All,
-            (true, Liveness::Everything) => Live::Rooted(self.rooted(now_ns)?),
-            (true, Liveness::Reached) => Live::Reached(self.live_roots(now_ns)?),
+    /// What of `candidates` a slice keeps, as its copy's k-way merge ([`Merge`]) over their
+    /// mapped sorted runs, walked once here to count it (its header: the count, where its
+    /// payloads end, its lowest and highest key), holding nothing of a record: no payload byte
+    /// is copied and no entry kept ([`Plain::stream_segment`] walks it again for both). And the
+    /// candidates it replaces (a published one only when it holds nothing live: it is let go
+    /// of whole, or kept whole, never rewritten).
+    fn copy_live(&self, candidates: Vec<Segment, A>, prune: bool, now_ns: u64, stats: &mut Sliced) -> Result<(Copied<A>, Vec<u64, A>), StoreError> {
+        let keep = match (prune, self.cfg.liveness) {
+            (false, _) => Keep::All,
+            (true, Liveness::Everything) => Keep::Rooted(self.rooted(now_ns)?),
+            (true, Liveness::Reached) => Keep::Reached(self.root_places(now_ns)?),
         };
         let current = self.manifest.generation;
         let holds_live = |seg: &Segment| -> bool {
-            if matches!(live, Live::All) {
+            if matches!(keep, Keep::All) {
                 return true;
             }
             let Some(&at) = self.by_id.get(&seg.id) else { return true };
             let run = self.maps[at].run();
-            (0..seg.count as usize).any(|i| live.keeps(&format::key_at(run, i), false))
+            (0..seg.count as usize).any(|i| keep.keeps(&self.maps, &format::key_at(run, i), false))
         };
         let mut kept_candidates = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
         kept_candidates.extend(candidates.into_iter().filter(|seg| !seg.published || !holds_live(seg)));
         let candidates = kept_candidates;
         let namespace = candidates.first().map_or(Namespace::LOCAL, |it| it.namespace);
-        let mut out = Batch::new(namespace);
-        let mut seen = BTreeSet::new();
+        let mut cursors = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
         for seg in &candidates {
-            let mapped = &self.maps[self.by_id[&seg.id]];
             stats.bytes_in += seg.file_len();
             if seg.published {
                 stats.dropped += u64::from(seg.count);
                 continue;
             }
-            let young = seg.generation + WINDOW > current;
-            let run = mapped.run();
-            for i in 0..seg.count as usize {
-                // A proved segment's entry: read, not checked (decision 18).
-                let entry = Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]);
-                let keep = live.keeps(&entry.key, young);
-                // A pointer keeps only its newest value: the one in the newest row holding its
-                // name (in this slice or after it); an older value is let go.
-                let newest = entry.tag != POINTER_TAG || self.newest_mapped(seg.namespace, &Key(entry.key)).is_some_and(|(at, _)| at == self.by_id[&seg.id]);
-                if !keep || !newest {
-                    stats.dropped += 1;
-                    continue;
-                }
-                if !seen.insert(entry.key) {
-                    continue;
-                }
-                // Copied from a proved segment with its CRC as recorded: nothing is checked
-                // or computed again.
-                out.put_known(&entry, mapped.payload(&entry)).map_err(|error| error.into_store(entry.tag))?;
-                stats.kept += 1;
-            }
+            cursors.push(Cursor { map: self.by_id[&seg.id] as u32, next: 0, count: seg.count, young: seg.generation + WINDOW > current });
         }
+        let heap = Vec::with_capacity_in(cursors.len(), self.alloc.clone());
+        let mut merge = Merge { keep, namespace, cursors, heap, last: None, dropped: 0 };
+        merge.rewind(&self.maps);
+        let (mut count, mut index_at) = (0u32, HEADER as u64);
+        let (mut lowest, mut highest) = (ContentId([0; 32]), ContentId([0; 32]));
+        while let Some((_, entry)) = merge.next(self) {
+            // Where the stream will place it: the payloads end to end from [`HEADER`] in key
+            // order, each at a multiple of [`ALIGN`].
+            let end = index_at + u64::from(entry.len);
+            if end > OFFSET_MOST {
+                return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: end });
+            }
+            // A segment's count is a u32: the record past it would be one more than its
+            // index can say, refused by name as a payload past its offsets is.
+            let Some(more) = count.checked_add(1) else {
+                return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: u64::from(u32::MAX) + 1 });
+            };
+            if count == 0 {
+                lowest = entry.key;
+            }
+            highest = entry.key;
+            count = more;
+            index_at = aligned(end);
+        }
+        // THE CAP, before a byte of the copy is written: its [`format::shape`] is what its row
+        // will be checked against at the flip and at every open. The policy never plans past it
+        // ([`Tiers`], THE CAP); a copy that would pass it is that policy's bug, so the store
+        // stops here naming the namespace and the lengths, and the command that ran the slice
+        // fails, before the manifest could name a row no open reads.
+        if count > 0 {
+            let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
+            format::shape(len, index_at, count, self.tiers().segment_most()).map_err(|why| StoreError::Shape { namespace, why })?;
+        }
+        stats.kept += u64::from(count);
+        stats.dropped += merge.dropped;
         stats.segments = candidates.len() as u32;
         let mut ids: Vec<u64, A> = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
         ids.extend(candidates.iter().map(|it| it.id));
-        Ok((out, ids))
+        Ok((Copied { merge, count, index_at, lowest, highest }, ids))
     }
 
     // ---- the flip: the one lock, held for it alone ----
@@ -2238,6 +3400,16 @@ impl<A: Allocator + Clone> Plain<A> {
             deferred: None,
         }));
         effects.push(Effect::Lock { file: self.flip.clone(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
+    }
+
+    /// A built generation whose manifest would not encode (`why`: a row `format::Row::new`
+    /// refuses): not flipped, nothing written, the lock let go; [`Plain::flipped`] then
+    /// refuses the change and stops the store with `why`.
+    fn refuse_built(&mut self, mut flip: Box<Flip<A>>, folded: Option<Folded<A>>, why: StoreError, effects: &mut Vec<Effect>) {
+        self.folding = folded;
+        flip.refused = Some(why);
+        self.phase = Phase::Flipping(flip);
+        self.unlock(effects);
     }
 
     /// The new generation, built on `base` (read under the lock): the change, what the open
@@ -2303,7 +3475,14 @@ impl<A: Allocator + Clone> Plain<A> {
             if let Some(copy) = copy {
                 m.segments.retain(|it| it.published || it.id != copy || candidates.contains(&it.id));
             }
-            let first = m.segments.iter().position(|it| candidates.first() == Some(&it.id));
+            // The copy takes the NEWEST candidate's place: a tiered merge's candidates need not
+            // be contiguous, and a row it skipped must stay on its side of every pointer's
+            // newest value. The copy holds a pointer only at its newest value (`copy_live`), so
+            // no row after the newest candidate holds a newer one, and a skipped row before it
+            // stays before it. (At the first candidate's place, a skipped row's older value
+            // would move after the copy's newer one and read as the newest.)
+            let newest = m.segments.iter().rposition(|it| candidates.contains(&it.id));
+            let place = newest.map(|at| m.segments[..at].iter().filter(|it| it.published || !candidates.contains(&it.id)).count());
             // A published candidate stays named, as not here: a source has it.
             for it in m.segments.iter_mut().filter(|it| it.published && candidates.contains(&it.id)) {
                 it.local = false;
@@ -2316,7 +3495,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 // not the slice's, and no lease taken since keeps it.
                 let oldest = self.manifest.segments.iter().filter(|it| candidates.contains(&it.id)).map(|it| it.generation).min();
                 seg.generation = oldest.unwrap_or(generation);
-                m.segments.insert(first.unwrap_or(0).min(m.segments.len()), *seg);
+                m.segments.insert(place.unwrap_or(0).min(m.segments.len()), *seg);
             }
             for id in candidates.iter().filter(|id| copy != Some(**id)) {
                 retire(m, *id, false);
@@ -2517,7 +3696,16 @@ impl<A: Allocator + Clone> Plain<A> {
             keep
         });
         // The log: a new one past its bound, the old one retired.
-        let estimate = m.encode().len() as u64 + 24;
+        //
+        // Every segment row goes through `format::Row::new`, the check every later open reads
+        // it through: a manifest no open would read is never written. The flip is refused
+        // before the log or the slot is touched, and the store stops naming the segment
+        // ([`Plain::flipped`]): the command that built it fails, not the next one.
+        let most = self.tiers().segment_most();
+        let estimate = match m.encode(most) {
+            Ok(bytes) => bytes.len() as u64 + 24,
+            Err(why) => return self.refuse_built(flip, folded, why, effects),
+        };
         // A log no generation's manifest was read from may be gone: never appended to.
         let appendable = !self.log_lost || self.plant() == Plant::AppendToLostLog;
         let (log, at) = match base.slot {
@@ -2532,7 +3720,10 @@ impl<A: Allocator + Clone> Plain<A> {
                 (id, 0)
             }
         };
-        let bytes = m.encode();
+        let bytes = match m.encode(most) {
+            Ok(bytes) => bytes,
+            Err(why) => return self.refuse_built(flip, folded, why, effects),
+        };
         let slot = Slot { generation, log, manifest_at: at, manifest_len: bytes.len() as u32, manifest_crc: crc32c::crc32c(&bytes) };
         flip.log = self.log_file(log);
         flip.fresh = fresh;
@@ -2615,7 +3806,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 Change::Commit { roots, .. } => roots,
                 _ => Vec::new_in(self.alloc.clone()),
             };
-            self.commit_refused(why, roots);
+            // A row no open would read is a bug of this blaze, not of the change: the store
+            // stops, so every later ask of this command (its cleanup, its seal) fails with it.
+            let stops = matches!(why, StoreError::Row { .. });
+            self.commit_refused(why.clone(), roots);
+            if stops {
+                self.stop(why);
+            }
             return;
         }
         if flip.carry {
@@ -2663,7 +3860,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
         // The slot names the log this flip wrote its manifest to.
         self.log_lost = false;
-        if self.cfg.durable && self.plant() == Plant::FlipBeforeSync {
+        if self.cfg.durable && (self.plant() == Plant::FlipBeforeSync || self.plant() == Plant::MergeFlipsBeforeSync) {
             for (i, file) in std::mem::replace(&mut self.late_sync, Vec::new_in(self.alloc.clone())).into_iter().enumerate() {
                 effects.push(Effect::Sync { file, tag: self.tag(LATE_SYNC, i as u32) });
             }
@@ -3036,13 +4233,19 @@ impl<A: Allocator + Clone> Plain<A> {
         match then {
             Then::Commit => {
                 let segments = std::mem::replace(&mut self.committing, Vec::new_in(self.alloc.clone()));
+                for id in segments.iter() {
+                    if let Some(row) = self.manifest.segments.iter().find(|it| it.id == *id) {
+                        self.written_here += row.file_len();
+                        self.segments_here += 1;
+                    }
+                }
                 self.committed = Some(Ok(Committed { generation: self.manifest.generation, segments }));
                 self.sealed.clear();
             }
             Then::Compact(mut stats) => {
                 let next = match self.cfg.liveness {
                     Liveness::Everything => Ok(self.plan().0),
-                    Liveness::Reached => self.plan_reached(self.now_ns),
+                    Liveness::Reached => self.plan_reached(self.now_ns).map(|it| it.0),
                 };
                 match next {
                     Ok(next) => stats.more = !next.is_empty(),
@@ -3133,7 +4336,15 @@ impl<A: Allocator + Clone> Plain<A> {
                         HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn,
                         HeadRead::Refused(_) | HeadRead::Version { .. } => None,
                     };
-                    effects.push(Effect::Truncate { file: self.head.clone(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 0) });
+                    // THE FOLDERS FIRST (the module's "Durable names"): the cache directory tag
+                    // written durably, which makes the store's folder and every folder above it
+                    // that is missing, each one's name synced into its parent (blaze-core
+                    // `Effect::Write`, `make_parent_durably`), before anything else is made in
+                    // it. The head is made after, so its Truncate makes no folder.
+                    let tag_file = self.name(CACHEDIR_TAG);
+                    let bytes = CACHEDIR_SIGNATURE.to_vec();
+                    let tag = self.tag(HEAD_MAKE, 0);
+                    effects.push(Effect::Write { file: tag_file, bytes, tag });
                     self.phase = Phase::MakeHead;
                     return Ok(());
                 }
@@ -3190,8 +4401,9 @@ impl<A: Allocator + Clone> Plain<A> {
                         return Ok(());
                     }
                 };
+                let most = self.tiers().segment_most();
                 let manifest = (bytes.len() == slot.manifest_len as usize && crc32c::crc32c(&bytes) == slot.manifest_crc)
-                    .then(|| Manifest::decode(&bytes))
+                    .then(|| Manifest::decode(&bytes, most))
                     .transpose();
                 match manifest {
                     Ok(Some(manifest)) if manifest.generation == slot.generation => {
@@ -3207,22 +4419,30 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             }
             (HEAD_MAKE, Phase::MakeHead) => {
+                let tag_file = self.name(CACHEDIR_TAG);
                 let (doing, file) = match index {
-                    0 => ("making the head at its length", &self.head),
-                    1 => ("syncing the head made", &self.head),
+                    0 => ("writing the cache directory tag, which makes the store's folders durably", &tag_file),
+                    1 => ("making the head at its length", &self.head),
+                    2 => ("syncing the head made", &self.head),
                     _ => ("syncing the store's directory after making the head", &self.cfg.dir),
                 };
                 if let Some(why) = fail(doing, file, &done) {
                     return Err(why);
                 }
                 if index == 0 {
+                    // The folders are durable: the head now, a Truncate that keeps what a cut
+                    // head holds and extends it with zeros (never a whole-file write: another
+                    // process may have made the head and flipped since this one read it short,
+                    // and a Truncate to the length it has is no change).
+                    effects.push(Effect::Truncate { file: self.head.clone(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 1) });
+                } else if index == 1 {
                     // Synced once in the store's life, before its first segment: so an empty or
                     // short head never stands beside segments a power cut kept.
-                    effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_MAKE, 1) });
-                } else if index == 1 {
+                    effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_MAKE, 2) });
+                } else if index == 2 {
                     // And its name with it: a power cut never keeps a segment's name and loses
                     // the head's.
-                    effects.push(Effect::SyncDir { dir: self.cfg.dir.clone().into(), tag: self.tag(HEAD_MAKE, 2) });
+                    effects.push(Effect::SyncDir { dir: self.cfg.dir.clone().into(), tag: self.tag(HEAD_MAKE, 3) });
                 } else {
                     self.phase = Phase::ReadHead(Ctx::Open);
                     effects.push(Effect::ReadAll { file: self.head.clone(), tag: self.tag(HEAD_READ, 0) });
@@ -3371,6 +4591,8 @@ impl<A: Allocator + Clone> Plain<A> {
                 for (i, (at, bytes)) in pieces.into_iter().enumerate() {
                     effects.push(Effect::WriteAt { file: file.clone(), at, bytes, tag: self.tag(SEG_PIECE, i as u32) });
                 }
+                // A streamed copy's first chunks, behind its header.
+                self.stream_on(effects);
                 Ok(())
             }
             (SEG_PIECE, Phase::Writing(writing, _)) => {
@@ -3378,19 +4600,56 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(why);
                 }
                 writing.left -= 1;
+                if let Some(stream) = &mut writing.stream {
+                    match index {
+                        0 | FOOTER_PIECE => {}
+                        index if index >= INDEX_PIECE => stream.index_flying = false,
+                        _ => stream.flying -= 1,
+                    }
+                }
+                // A streamed copy's next chunk, as one completes; its index chunks once every
+                // payload chunk is asked, its footer after the last.
+                self.stream_on(effects);
+                let Phase::Writing(writing, _) = &self.phase else { unreachable!("streaming keeps the phase") };
                 if writing.left > 0 {
                     return Ok(());
                 }
                 let Phase::Writing(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
-                if self.cfg.durable && self.plant() != Plant::SkipDataSync && self.plant() != Plant::FlipBeforeSync {
-                    effects.push(Effect::Sync { file: writing.file.clone(), tag: self.tag(SEG_SYNC, 0) });
-                    self.phase = Phase::SyncingSegment(writing, why);
+                if writing.stream.is_some() {
+                    // A copy, under its temporary name: named by its digest now.
+                    self.named_copy(*writing, *why, effects);
+                } else {
+                    self.segment_done(*writing, *why, effects);
+                }
+                Ok(())
+            }
+            (SEG_RENAME, Phase::Renaming(writing, _)) => {
+                if let Some(why) = fail("renaming a merge's copy to its digest's name", &writing.file, &done) {
+                    return Err(why);
+                }
+                let Phase::Renaming(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
+                self.segment_done(*writing, *why, effects);
+                Ok(())
+            }
+            (SEG_UNWRITE, Phase::Unwriting { temp, .. }) => {
+                if let Some(why) = fail("removing a merge's copy whose bytes are named already", temp, &done) {
+                    return Err(why);
+                }
+                let Phase::Unwriting { writing, why, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
+                if let Why::Compact { candidates, stats } = &*why
+                    && candidates.contains(&writing.seg.id)
+                {
+                    // The slice would write back what it read: nothing to do.
+                    self.fold_asked = false;
+                    self.sliced = Some(Sliced { segments: 0, ..*stats });
+                    self.phase = Phase::Ready;
                     return Ok(());
                 }
-                if self.cfg.durable && self.plant() == Plant::FlipBeforeSync {
-                    self.late_sync.push(writing.file.clone());
-                }
-                self.segment_written(*writing, *why, effects);
+                // These bytes are here already, under this name: flipped without writing them.
+                // They are a named segment's, proved as its row is (synced before the flip that
+                // named them, when durable): nothing of them was written under it, so no sync
+                // is owed.
+                self.segment_written(Synced::already_named(*writing), *why, effects);
                 Ok(())
             }
             (SEG_SYNC, Phase::SyncingSegment(writing, _)) => {
@@ -3398,7 +4657,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(why);
                 }
                 let Phase::SyncingSegment(writing, why) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
-                self.segment_written(*writing, *why, effects);
+                self.segment_written(Synced::by_sync(*writing), *why, effects);
                 Ok(())
             }
             (LOCK, Phase::Flipping(flip)) => match done {
@@ -3590,7 +4849,8 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// A segment is written (and synced, when durable): a commit's next is written, or, with
     /// none left, the flip names them all.
-    fn segment_written(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+    fn segment_written(&mut self, synced: Synced<A>, why: Why<A>, effects: &mut Vec<Effect>) {
+        let writing = synced.into_writing();
         let seg = (writing.seg, writing.file);
         match why {
             Why::Commit { started_ns, roots, mut rest, mut done } => {
@@ -3610,7 +4870,8 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 }
 
-/// A batch of copied records (a slice's, a carry's: each payload at a multiple of [`ALIGN`]
+/// A batch of copied records (a carry's, bounded by the records its commit's roots reuse; a
+/// slice's copy is streamed instead, [`Plain::stream_segment`]: each payload at a multiple of [`ALIGN`]
 /// of its bytes) as a segment's layout: its entries placed after the [`HEADER`] and sorted.
 /// The list of pieces in `alloc`, the store's.
 fn laid_of<A: Allocator + Clone>(mut out: Batch, alloc: A) -> Result<Laid<A>, StoreError> {
@@ -3657,26 +4918,6 @@ fn sorted_holds(keys: &[u8], key: &ContentId) -> bool {
         }
     }
     false
-}
-
-/// What a slice's copy keeps.
-enum Live<'a, A: Allocator + Clone> {
-    /// Everything (a merge of a [`Liveness::Everything`] store).
-    All,
-    /// What roots name, or younger than [`WINDOW`] (its pruning over the cap).
-    Rooted(BTreeSet<ContentId>),
-    /// What reaches from an unexpired root ([`Liveness::Reached`]).
-    Reached(Vec<(ContentId, &'a [u8]), A>),
-}
-
-impl<A: Allocator + Clone> Live<'_, A> {
-    fn keeps(&self, key: &ContentId, young: bool) -> bool {
-        match self {
-            Live::All => true,
-            Live::Rooted(set) => young || set.contains(key),
-            Live::Reached(roots) => reached(roots, key),
-        }
-    }
 }
 
 fn lost_orphan() -> String {

@@ -46,7 +46,7 @@ let
   checkout = lib.fileset.unions ([
     (lib.fileset.fileFilter (f: f.name == "Cargo.toml") repo)
     (repo + "/${all.dir}/Cargo.lock")
-    (repo + "/harness/toolchain")
+    (repo + "/pins")
     (repo + "/vendor/llvm-sys/pin.rs")
     (repo + "/library/proc_macro/src/bridge")
   ]
@@ -56,7 +56,8 @@ let
 
   # The manifest directory of a workspace-local package, cut down to what the crate reads so that
   # editing anything else in the repo does not change the unit.
-  # crates/blaze-cargo include_str!s harness/toolchain and library/{DIGEST,UPSTREAM}.
+  # crates/blaze-pins include_str!s the files of pins/ (every crate is given the folder: any may
+  # depend on blaze-pins); crates/blaze-cargo included library/{DIGEST,UPSTREAM}.
   # crates/blaze-inproc-rt's root mounts library/blaze_inproc_rt/src with `#[path]`.
   pathSource = p:
     let
@@ -69,7 +70,7 @@ let
       root = repo;
       fileset =
         if d == "crates/blaze-engine" then checkout
-        else lib.fileset.unions ([ (repo + "/${d}") (repo + "/harness/toolchain") ] ++ library);
+        else lib.fileset.unions ([ (repo + "/${d}") (repo + "/pins") ] ++ library);
     }}/${d}";
 
   pkgSrc = lib.mapAttrs

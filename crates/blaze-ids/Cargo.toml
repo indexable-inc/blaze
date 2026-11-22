@@ -24,14 +24,16 @@ serde = ["dep:serde"]
 [dependencies]
 # By path, not `.workspace`: the workspace entries turn on the adapter features the crates above
 # need, which a member's entry cannot turn off, so this crate's own graph would hold them.
-blaze-blake3 = { path = "../blaze-blake3" }
+blaze-blake3.workspace = true
 # The IDs' `ToValue`/`FromValue` (src/data.rs); on blaze-own alone.
-blaze-data = { path = "../blaze-data" }
-blaze-own = { path = "../blaze-own" }
-blaze-hash = { path = "../blaze-hash" }
-blaze-radix = { path = "../blaze-radix" }
-blaze-rng = { path = "../blaze-rng" }
-blaze-swiss = { path = "../blaze-swiss" }
+blaze-data.workspace = true
+blaze-own.workspace = true
+blaze-hash.workspace = true
+# D169's meter: bytes hashed and digests made, on the thread that hashed them.
+blaze-meter.workspace = true
+blaze-radix.workspace = true
+blaze-rng.workspace = true
+blaze-swiss.workspace = true
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]

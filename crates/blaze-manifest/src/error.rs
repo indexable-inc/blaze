@@ -255,7 +255,6 @@ impl fmt::Display for Head<'_> {
 impl core::error::Error for ManifestError {
     // dyn: std's error chain, read only on an error path.
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        use core::error::Error as _;
         match self {
             ManifestError::Read { error, .. } => Some(error),
             ManifestError::Context { source, .. } => Some(&**source),

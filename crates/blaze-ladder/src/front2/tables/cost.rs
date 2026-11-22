@@ -82,6 +82,27 @@ pub struct Spent {
     pub again_for: [u64; QUESTION_KINDS.len()],
     /// Every hole of those rounds, by kind (speculative ones included).
     pub holes: [u64; QUESTION_KINDS.len()],
+    /// D161's census (blaze-ask `Census`): every fact met after entry by kind, round 0
+    /// included (blaze-typeck `Tally::late_holes` counts rounds past the first only), the
+    /// gate's gaps, entries into the check and those again, the solver goals solved again
+    /// after a fill, and head steps whose work is redone after a need.
+    pub census: blaze_ask::Census,
+}
+
+/// The fact a checker question asks, in blaze-ask's words (by `QUESTION_KINDS` index):
+/// every item fact a head, but scope (`TraitsInScope`, an outline's), lang items, impl and
+/// inherent lookups, and the two body facts (an opaque's hidden type, a constant's value).
+pub fn fact_of_kind(kind: usize) -> blaze_ask::Fact {
+    use blaze_ask::Fact;
+    match QUESTION_KINDS.get(kind).copied() {
+        Some("ImplsOf") => Fact::ImplsOf,
+        Some("Inherent") => Fact::Inherent,
+        Some("TraitsInScope") => Fact::Outline,
+        Some("Lang" | "LangPath") => Fact::Lang,
+        Some("Const" | "ConstHolds") => Fact::ConstValue,
+        Some("Opaque") => Fact::HiddenType,
+        _ => Fact::Head,
+    }
 }
 
 use blaze_typeck::QUESTION_KINDS;
@@ -105,6 +126,7 @@ impl Spent {
             out.again_for[i] = self.again_for[i] - before.again_for[i];
             out.holes[i] = self.holes[i] - before.holes[i];
         }
+        out.census = self.census.since(&before.census);
         out
     }
 
@@ -125,6 +147,7 @@ impl Spent {
             self.again_for[i] += other.again_for[i];
             self.holes[i] += other.holes[i];
         }
+        self.census.add(&other.census);
     }
 }
 
@@ -192,6 +215,7 @@ impl<'g> Cost<'g> {
         spent.steps += 1;
         if stopped {
             spent.stopped += 1;
+            spent.census.made_again += 1;
             spent.stopped_ns += cost.gauge.now_ns().saturating_sub(start);
         }
         cost.spent.set(spent);
@@ -228,18 +252,27 @@ impl<'g> Cost<'g> {
         let mut spent = self.spent.get();
         spent.solve.add(solve);
         spent.rounds += 1;
+        spent.census.entered += 1;
+        spent.census.restarted_goals += solve.refills;
         self.spent.set(spent);
     }
 
-    /// A check round ended in `needs`: one round more, for its first hole.
-    pub fn again(&self, needs: &blaze_typeck::Needs<'_>) {
+    /// A check round ended in `needs`: one round more, for its first hole. Each hole is classed
+    /// by the body's `gate` (front2 asks.rs `Gate`, its set from the syntactic prefetch).
+    pub fn again(&self, needs: &blaze_typeck::Needs<'_>, gate: &super::super::asks::Gate) {
         let mut spent = self.spent.get();
         if let Some(first) = needs.first {
             spent.again_for[blaze_typeck::question_kind(first)] += 1;
         }
         for &q in needs.missing.iter() {
-            spent.holes[blaze_typeck::question_kind(q)] += 1;
+            let kind = blaze_typeck::question_kind(q);
+            spent.holes[kind] += 1;
+            // Every hole is met after entry (round 0's too): an item fact the gate's set names
+            // is `Named` (not settled before entry), one it misses is its gap (blaze-ask `After`).
+            let need = super::super::asks::need_of_question(q);
+            spent.census.met_after_entry(need.fact, gate.class(&need));
         }
+        spent.census.entered_again += 1;
         self.spent.set(spent);
     }
 

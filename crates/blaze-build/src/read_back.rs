@@ -243,10 +243,10 @@ pub fn read_back<A: Allocator + Clone>(
         }
     }
     b.ret(&[]);
-    let func = b.finish_checked().map_err(ReadBackError::Build)?;
+    let func = b.finish_verified().map_err(ReadBackError::Build)?;
     let mut code = Code::new_in(Global);
     // Every Apple M-series core implements FEAT_LSE; the function has no atomics anyway.
-    emit(func.view(), &[], Isa { lse: true, os: Os::MacOs }, &mut code).map_err(ReadBackError::Emit)?;
+    emit(func.verified(), &[], Isa { lse: true, os: Os::MacOs }, &mut code).map_err(ReadBackError::Emit)?;
     if !code.fixups.is_empty() || !code.relocs.is_empty() {
         return Err(ReadBackError::Record { why: "a read-back function with words to place (it calls nothing)" });
     }

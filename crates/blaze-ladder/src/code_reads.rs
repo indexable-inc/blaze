@@ -33,7 +33,7 @@
 //! `future_poll`, `async_items`, `deref_fn`, `index_fn`, `lang_adt`, `fmt_argument_new`,
 //! `fmt_argument_adt`, `location_adt`, `panic`, `overflow_checks`, `type_names`); the
 //! signature attributes `c_variadic`, `legacy_const_generics` and `intrinsic`; instance keys
-//! (`promoted_fn_key`, `const_fn_instance`); and the closure and coroutine facts (`closure`,
+//! (`const_fn_instance`); and the closure and coroutine facts (`closure`,
 //! `coroutine`, `coroutine_state`, `coroutine_niche`). A lang item or attribute edited in a
 //! crate of the workspace (a `no_core` program's) is not caught by the list; neither is a
 //! closure built in an owner's body other than the instance's own fn.
@@ -825,10 +825,6 @@ impl Adts for Recorded<'_> {
         let answer = self.world.promoted_value(owner, borrow, args);
         self.log.ask(ReadKind::Promoted, owner, u64::from(borrow.0), args, Ok(data_answer(answer)));
         answer
-    }
-
-    fn promoted_fn_key(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<InstanceKey> {
-        self.world.promoted_fn_key(instance, ground)
     }
 
     fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {

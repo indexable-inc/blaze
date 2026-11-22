@@ -17,16 +17,29 @@
 //!
 //! Every [`Error`] names its byte offset; [`Error::line_col`] turns it into a line and column
 //! from the text. Writers are deterministic and state their key order ([`KeyOrder`]).
+//!
+//! The reader is a pull reader over one whole text already in memory, not a `feed`/`finish`
+//! codec (D170 C5): its state is the grammar's place and a bit stack, and every caller has the
+//! whole text (a file, an agent message, an index line). A text arriving in pieces would need a
+//! partial token (a string or number cut mid-way) kept beside that state; it is not written
+//! until a caller needs it.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 use core::fmt;
 
+mod plant;
 mod read;
 mod stack;
 mod tree;
@@ -34,25 +47,15 @@ mod typed;
 mod write;
 
 #[cfg(test)]
-mod plant;
-#[cfg(test)]
 mod tests;
 
-/// The planted bug the round-trip control asks for, compiled away outside tests.
-#[cfg(not(test))]
-mod plant {
-    #[inline(always)]
-    pub(crate) fn escape_quote() -> bool {
-        true
-    }
-}
-
+pub use plant::JsonPlant;
 pub use read::{Event, Item, Reader, Str};
 pub use tree::read_in;
 pub use typed::{FromJsonError, from_slice, from_slice_in, to_string, to_string_of_in, to_string_pretty};
 pub use write::{
     BytesAs, KeyOrder, Style, StreamError, StreamWhat, Unwritable, WriteError, WriteOptions, Writer, to_string_in,
-    write_into,
+    write_into, write_into_planted,
 };
 
 /// What to do with a key an object already has.
@@ -64,28 +67,37 @@ pub enum Duplicates {
     LastWins,
 }
 
-/// The bounds a read holds untrusted text to.
+/// The bounds a read holds untrusted text to (D165: every cap the reader enforces is a field
+/// here, taken as a value, and drawn by the simulation down to its least legal value), and the
+/// one choice of what a duplicate key means.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
-    /// The most bytes of text.
+    /// The most bytes of text ([`What::TooLarge`] past it); at least 1.
     pub most_bytes: usize,
-    /// The most lists and maps open at once. Any limit is held: nothing recurses on depth, and
-    /// the open levels cost a bit each in the reader and a slot each in [`read_in`]'s build.
+    /// The most lists and maps open at once ([`What::TooDeep`] past it); at least 1. Any limit
+    /// is held: nothing recurses on depth, and the open levels cost a bit each in the reader and
+    /// a slot each in [`read_in`]'s build.
     pub most_depth: usize,
-    /// The most bytes of one number as written.
+    /// The most bytes of one number as written ([`What::NumberTooLong`] past it); at least 1.
     pub most_number_len: usize,
     pub duplicates: Duplicates,
 }
 
 impl Limits {
-    /// For blaze's own inputs (agent requests, profiles, rustc-format diagnostics): 256 MiB,
-    /// 128 deep, numbers of up to 100 bytes, duplicates refused.
-    pub const DEFAULT: Limits = Limits {
+    /// What the crate ships with, for blaze's own inputs (agent requests, profiles,
+    /// rustc-format diagnostics): 256 MiB, 128 deep, numbers of up to 100 bytes, duplicates
+    /// refused.
+    pub const SHIPPED: Limits = Limits {
         most_bytes: 256 << 20,
         most_depth: 128,
         most_number_len: 100,
         duplicates: Duplicates::Refuse,
     };
+    /// The least legal value of each cap: what a simulation draws them down to.
+    pub const SMALLEST: Limits =
+        Limits { most_bytes: 1, most_depth: 1, most_number_len: 1, duplicates: Duplicates::Refuse };
+    /// [`Limits::SHIPPED`] under its older name, which callers outside the crate still use.
+    pub const DEFAULT: Limits = Limits::SHIPPED;
 }
 
 /// What a reader wanted where it found something else.

@@ -156,11 +156,9 @@ pub fn asked_key<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey) -
 
 /// A member's key: a function of its container, kind and name alone.
 fn member_key(container: ItemKey, kind: MemberKind, name: &str) -> ItemKey {
-    let mut bytes = std::vec::Vec::with_capacity(17 + name.len());
-    bytes.extend_from_slice(&container.0.to_be_bytes());
-    bytes.push(kind as u8);
-    bytes.extend_from_slice(name.as_bytes());
-    let id = ContentId::of("blaze-ladder front2 member key 1", &bytes);
+    // The bytes `ContentId::of` hashed from one buffer, fed in three updates: BLAKE3's output is
+    // a function of the bytes fed, not of how they are split, so the key is unchanged.
+    let id = blaze_ids::Hasher::new("blaze-ladder front2 member key 1").update(&container.0.to_be_bytes()).update(&[kind as u8]).update(name.as_bytes()).finish();
     // The container's crate prefix, then 64 bits of the member's hash.
     let mut first = [0u8; 16];
     first[..8].copy_from_slice(&container.0.to_be_bytes()[..8]);
@@ -254,6 +252,7 @@ impl Keys {
         let mut matches = 0;
         names.each_member(owner, &mut |m| {
             if m.kind == kind && m.name == Some(name.as_ref()) {
+                names.read_member_body(m.key, m.written_by);
                 first.get_or_insert(m);
                 count += 1;
                 if m.text == text {

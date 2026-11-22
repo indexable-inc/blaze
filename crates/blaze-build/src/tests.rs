@@ -242,6 +242,9 @@ impl BodyBuf {
             asm_text: self.asm_text,
             call_arg_ints: &self.call_arg_ints,
             unsafe_blocks: &self.unsafe_blocks,
+            // A test body is one edition's text: no word of it was written by another's macro.
+            expr_editions: &[],
+            pat_editions: &[],
         }
     }
 }
@@ -307,8 +310,6 @@ struct TestWorld {
     param_names: Vec<(Name, u32), Global>,
     /// What `Adts::const_fn_instance` answers: the instance a constant's fn relocation names.
     const_fns: Vec<(crate::InstanceKey, Instance), Global>,
-    /// What `Adts::promoted_fn_key` answers: the key of a fn item a promoted operand names.
-    promoted_fns: Vec<(Instance, crate::InstanceKey), Global>,
     /// `#[lang = "deref"] trait Deref { type Target; }` (`DEREF`) and its one impl (`DEREF_IMPL`):
     /// `impl Deref for <self> { type Target = <target>; }`, both types of this world's table.
     deref: Option<(PTy, PTy)>,
@@ -391,7 +392,6 @@ impl TestWorld {
             const_params: Vec::new_in(Global),
             param_names: Vec::new_in(Global),
             const_fns: Vec::new_in(Global),
-            promoted_fns: Vec::new_in(Global),
             deref: None,
             deref_defs: Vec::new_in(Global),
             deref_assoc: Vec::new_in(Global),
@@ -848,10 +848,6 @@ impl Adts for TestAdts<'_> {
         self.world.const_fns.iter().find(|(k, _)| *k == key).map(|&(_, i)| i)
     }
 
-    fn promoted_fn_key(&self, instance: Instance, _: &mut PortableTys<'_>) -> Option<crate::InstanceKey> {
-        self.world.promoted_fns.iter().find(|(i, _)| *i == instance).map(|&(_, k)| k)
-    }
-
     fn int_lit(&self, _: ItemKey, expr: ExprId) -> Option<u128> {
         self.body.lits.iter().find(|(e, _)| *e == expr).map(|&(_, v)| v)
     }
@@ -1025,7 +1021,7 @@ fn emits(built: &Built<Global>, refused: &[blaze_lir::Op]) {
     vias.resize(built.refs.len(), blaze_emit::Via::Address);
     let mut code = blaze_emit::Code::new_in(Global);
     let isa = blaze_emit::Isa { lse: true, os: blaze_emit::Os::MacOs };
-    match blaze_emit::emit(built.func.view(), &vias, isa, &mut code) {
+    match blaze_emit::emit(built.func.verified(), &vias, isa, &mut code) {
         Ok(()) => {}
         Err(blaze_emit::EmitError::Unsupported { op, .. }) if refused.contains(&op) => {}
         Err(error) => panic!("the baseline tier refused the walk's function: {error}\n{}", blaze_lir::print(built.func.view())),
@@ -2315,7 +2311,7 @@ fn pointer_intrinsics_run() {
     let w_e = b.local(wl);
     let m_init = b.call("ptr_metadata", &[w_e]);
     let (x_init, y_init) = (b.int(7, SU32), b.int(7, SU32));
-    let mut addr = |b: &mut BodyBuf, l| {
+    let addr = |b: &mut BodyBuf, l| {
         let e = b.local(l);
         b.e(Expr::Ref { mutbl: Mutbl::Not, operand: e })
     };
@@ -2331,7 +2327,7 @@ fn pointer_intrinsics_run() {
     let rt = b.e(Expr::Path(rt_path));
     let r_init = b.call("const_eval_select", &[pair, cf, rt]);
     // n * 10000 + m * 1000 + e1 * 100 + e2 * 10 + w[1] + r
-    let mut term = |b: &mut BodyBuf, l, k: u128| {
+    let term = |b: &mut BodyBuf, l, k: u128| {
         let e = b.local(l);
         let c = b.e(Expr::Cast { operand: e, ty: usize_ty });
         let k = b.int(k, None);
@@ -2734,7 +2730,7 @@ fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<
         vias.resize(built.refs.len(), blaze_emit::Via::Address);
         let mut code = blaze_emit::Code::new_in(Global);
         let isa = blaze_emit::Isa { lse: true, os: blaze_emit::Os::MacOs };
-        blaze_emit::emit(built.func.view(), &vias, isa, &mut code).unwrap_or_else(|e| panic!("{e}"));
+        blaze_emit::emit(built.func.verified(), &vias, isa, &mut code).unwrap_or_else(|e| panic!("{e}"));
         let mut table_at: Vec<(u32, u64), Global> = Vec::new_in(Global);
         for r in code.relocs.iter() {
             if let RelocTo::Vtable(p) = r.to {
@@ -3830,6 +3826,8 @@ mod box_moves;
 
 #[cfg(target_arch = "aarch64")]
 mod closures;
+/// A closure environment's layout alone, per place (stage 2 of captures as places).
+mod capture_env;
 
 mod forms;
 mod projections;

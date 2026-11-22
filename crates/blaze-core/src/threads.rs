@@ -764,10 +764,18 @@ impl Threads {
     #[cfg(target_os = "linux")]
     fn watch(
         &mut self,
-        dir: crate::FileName,
+        dir: crate::DirName,
         since: Option<crate::Cursor>,
         tag: Tag,
     ) -> io::Result<()> {
+        // The inotify walk names each folder under a named one; bstd asks no journal on Linux
+        // (it keeps none), so the root is refused by name ([`crate::journal::root_not_journaled`]'s rule).
+        let crate::DirName::Named(dir) = dir else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a journal of the driver's root: the threads driver journals named directories only on Linux",
+            ));
+        };
         if let Some(old) = self.watches.remove(tag) {
             old.control.stop();
             self.in_flight -= 1;
@@ -779,7 +787,7 @@ impl Threads {
             None => linux::Control::new()?,
         };
         control.reset();
-        let first = since.as_ref().map(|since| crate::journal::first_on_linux(&dir, since));
+        let first = since.as_ref().map(crate::journal::first_on_linux);
         // clone: the watch's control, kept by the driver.
         let (watch, _) = self.watches.insert(tag, Watching { control: control.clone() });
         #[cfg(test)]
@@ -867,7 +875,7 @@ impl Threads {
     #[cfg(target_os = "macos")]
     fn watch(
         &mut self,
-        dir: crate::FileName,
+        dir: crate::DirName,
         since: Option<crate::Cursor>,
         tag: Tag,
     ) -> io::Result<()> {
@@ -877,7 +885,7 @@ impl Threads {
         let watch = match self.spare.pop() {
             Some(watch) => watch,
             // clone: once per watch made, the state its sink tells into.
-            None => crate::fsevents::Watch::new(Sink(Arc::clone(&self.shared)))?,
+            None => crate::fsevents::Watch::new(Sink(Arc::clone(&self.shared)), &self.shared.root)?,
         };
         let (id, _) = self.watches.insert(tag, Watching(watch));
         let (_, Watching(watch)) = self.watches.by_id_mut(id).expect("inserted above");
@@ -957,7 +965,7 @@ impl Threads {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn watch(
         &mut self,
-        _: crate::FileName,
+        _: crate::DirName,
         since: Option<crate::Cursor>,
         _: Tag,
     ) -> io::Result<()> {
@@ -1582,7 +1590,7 @@ enum Stage {
     /// Not yet started, and a kill came first: killed as it starts.
     Killed,
     /// Started and not yet reaped: its pid is no one else's.
-    Running(libc::pid_t),
+    Running(blaze_sys::posix::types::pid_t),
     /// Exited, or never started: nothing to kill.
     Exited,
 }
@@ -1599,7 +1607,7 @@ impl Life {
     }
 
     /// `pid` started: killed at once where a kill came first.
-    fn started(&self, pid: libc::pid_t) {
+    fn started(&self, pid: blaze_sys::posix::types::pid_t) {
         let mut stage = lock(&self.0);
         if let Stage::Killed = *stage {
             crate::process::kill(pid);
@@ -1893,13 +1901,14 @@ fn accept_until_stopped(
     listen: Id<Listening>,
     tag: Tag,
 ) -> Option<Done> {
+    use blaze_sys::posix::io::PollEvents;
     use std::os::fd::AsRawFd as _;
     // alloc: an error path.
     let failed = |error: io::Error| Some(Done::Failed(IoError(error.to_string())));
     loop {
         let mut fds = [
-            libc::pollfd { fd: listener.fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: listener.fd(), events: PollEvents::IN.bits(), revents: 0 },
+            libc::pollfd { fd: stop.as_raw_fd(), events: PollEvents::IN.bits(), revents: 0 },
         ];
         match crate::raw::poll(&mut fds, -1) {
             Ok(_) => {}
@@ -1967,6 +1976,7 @@ struct Starting {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use blaze_sys::{Errno, linux::PollEvents};
     use std::{
         io,
         os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
@@ -2126,13 +2136,13 @@ mod linux {
         let (stop, wake) = (control.stop.as_raw_fd(), control.wake.as_raw_fd());
         loop {
             let mut fds = [
-                libc::pollfd { fd: tree.raw(), events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: stop, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: tree.raw(), events: PollEvents::IN.bits(), revents: 0 },
+                libc::pollfd { fd: stop, events: PollEvents::IN.bits(), revents: 0 },
+                libc::pollfd { fd: wake, events: PollEvents::IN.bits(), revents: 0 },
             ];
             match crate::raw::poll(&mut fds, -1) {
                 Ok(_) => {}
-                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) if error.raw_os_error() == Some(i32::from(Errno::Intr.raw())) => continue,
                 // alloc: an error path.
                 Err(error) => return Some(Done::Failed(IoError(error.to_string()))),
             }
@@ -2250,7 +2260,7 @@ impl Driver for Threads {
                     self.timers.insert(now.saturating_add(wheel::ticks(after)), tag);
                 }
                 Effect::Watch { dir, tag } => {
-                    if let Err(error) = self.watch(dir, None, tag) {
+                    if let Err(error) = self.watch(crate::DirName::Named(dir), None, tag) {
                         // alloc: an error path.
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }

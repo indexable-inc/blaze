@@ -523,7 +523,7 @@ pub fn for_each_giving_way(
     // dyn: a panic's payload, as `catch_unwind` gives it
     gave_way: impl Fn(&(dyn Any + Send)) -> bool + Sync,
 ) -> Vec<usize> {
-    let again: SegQueue<usize> = SegQueue::new();
+    let again: SegQueue<usize, std::alloc::Global> =SegQueue::new();
     // dyn: as above
     let other: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.par.giving_way_panic", None);
     let next = AtomicUsize::new(0);
@@ -726,7 +726,7 @@ fn split_on<St>(
     let failed = AtomicBool::new(false);
     // dyn: a panic's payload, as `catch_unwind` gives it
     let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new("graph.par.split_panic", None);
-    let gave: SegQueue<usize> = SegQueue::new();
+    let gave: SegQueue<usize, std::alloc::Global> =SegQueue::new();
     let claim = || {
         let mut state = None;
         while !failed.load(Ordering::Relaxed) {

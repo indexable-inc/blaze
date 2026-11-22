@@ -49,14 +49,12 @@ pub fn mono_ns() -> i64 {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     {
         #[cfg(target_os = "linux")]
-        const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+        const CLOCK: blaze_sys::posix::io::ClockId = blaze_sys::posix::io::ClockId::Monotonic;
         #[cfg(target_vendor = "apple")]
-        const CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
-        let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: `at` is a timespec to write; the clock exists on every version of the OS.
-        let read = unsafe { libc::clock_gettime(CLOCK, &mut at) };
-        assert_eq!(read, 0, "the monotonic clock is always readable");
-        at.tv_sec as i64 * 1_000_000_000 + at.tv_nsec as i64
+        const CLOCK: blaze_sys::posix::io::ClockId = blaze_sys::posix::io::ClockId::UptimeRaw;
+        let at = blaze_sys::posix::io::clock_gettime(CLOCK)
+            .expect("the monotonic clock is always readable");
+        at.sec * 1_000_000_000 + at.nsec
     }
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     {
@@ -265,18 +263,8 @@ fn read_boot() -> Option<String> {
 #[cfg(target_vendor = "apple")]
 fn read_boot() -> Option<String> {
     let mut buf = [0u8; 64];
-    let mut len = buf.len();
-    // SAFETY: the name is NUL-terminated, `buf` is `len` bytes to write, and no new value is set.
-    let read = unsafe {
-        libc::sysctlbyname(
-            c"kern.bootsessionuuid".as_ptr(),
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if read != 0 || len == 0 || len > buf.len() {
+    let len = blaze_sys::posix::thread::sysctl_bytes(c"kern.bootsessionuuid", &mut buf).ok()??;
+    if len == 0 || len > buf.len() {
         return None;
     }
     let id = std::str::from_utf8(&buf[..len]).ok()?.trim_end_matches('\0').trim();

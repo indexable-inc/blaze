@@ -14,8 +14,11 @@
 //! Variable time throughout (the crate's doc says why that is sound here).
 
 use crate::field::{D, D2, Fe, SQRT_M1, bytes_eq};
-use crate::scalar;
+use crate::{Plant, scalar};
 use blaze_int::Cast;
+#[cfg(test)]
+use blaze_own::planted::NoPlant;
+use blaze_own::planted::Planted;
 
 /// Why 32 bytes are not the canonical encoding of a point (RFC 8032, section 5.1.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,19 +207,31 @@ impl Point {
     /// Whether this is the neutral element: X = 0 and Y = Z, compared as values. (0 : 0 : 0),
     /// which no correct arithmetic makes, passes too: step 7's comparison refuses it
     /// (`same_point`).
-    pub(crate) fn is_identity(&self) -> bool {
-        if crate::planted(crate::Plant::IdentityByXOnly) {
+    pub(crate) fn is_identity_planted(&self, plant: impl Planted<Plant>) -> bool {
+        if plant.has(Plant::IdentityByXOnly) {
             return self.x.is_zero();
         }
         self.x.is_zero() && self.y.equals(&self.z)
     }
 
     /// Whether two points are equal: X1 Z2 = X2 Z1 and Y1 Z2 = Y2 Z1, compared as values.
-    pub(crate) fn equals(&self, other: &Point) -> bool {
-        if crate::planted(crate::Plant::EqualsByXOnly) {
+    pub(crate) fn equals_planted(&self, other: &Point, plant: impl Planted<Plant>) -> bool {
+        if plant.has(Plant::EqualsByXOnly) {
             return self.x.mul(&other.z).equals(&other.x.mul(&self.z));
         }
         self.x.mul(&other.z).equals(&other.x.mul(&self.z)) && self.y.mul(&other.z).equals(&other.y.mul(&self.z))
+    }
+
+    /// [`Point::is_identity_planted`] with no plant: the tests' algebra.
+    #[cfg(test)]
+    pub(crate) fn is_identity(&self) -> bool {
+        self.is_identity_planted(NoPlant)
+    }
+
+    /// [`Point::equals_planted`] with no plant: the tests' algebra.
+    #[cfg(test)]
+    pub(crate) fn equals(&self, other: &Point) -> bool {
+        self.equals_planted(other, NoPlant)
     }
 
     /// Whether Z is zero: no point (every correct operation keeps Z nonzero).
@@ -230,7 +245,6 @@ impl Point {
 
     /// The coordinates as held, X, Y and Z, each as its canonical bytes: not normalised by Z.
     /// Only the planted bug that compares points this way uses it.
-    #[cfg(test)]
     pub(crate) fn unnormalised(&self) -> ([u8; 32], [u8; 32]) {
         (self.x.to_bytes(), self.y.to_bytes())
     }
@@ -269,17 +283,29 @@ impl Point {
     }
 
     /// Whether [8]P is the identity: P is one of the eight points of small order.
-    pub(crate) fn is_small_order(&self) -> bool {
-        self.mul_by_cofactor().is_identity()
+    pub(crate) fn is_small_order_planted(&self, plant: impl Planted<Plant>) -> bool {
+        self.mul_by_cofactor().is_identity_planted(plant)
     }
 
     /// Whether [L]P is the identity: P lies in the subgroup the base point generates (which,
     /// with `is_small_order` false, excludes the identity too: P has order exactly L).
-    pub(crate) fn is_torsion_free(&self) -> bool {
-        if crate::planted(crate::Plant::TorsionBy4L) {
-            return double_scalar_mul_basepoint(&scalar::L, self, &[0; 4]).double().double().is_identity();
+    pub(crate) fn is_torsion_free_planted(&self, plant: impl Planted<Plant>) -> bool {
+        if plant.has(Plant::TorsionBy4L) {
+            return double_scalar_mul_basepoint(&scalar::L, self, &[0; 4]).double().double().is_identity_planted(plant);
         }
-        double_scalar_mul_basepoint(&scalar::L, self, &[0; 4]).is_identity()
+        double_scalar_mul_basepoint(&scalar::L, self, &[0; 4]).is_identity_planted(plant)
+    }
+
+    /// [`Point::is_small_order_planted`] with no plant: the tests'.
+    #[cfg(test)]
+    pub(crate) fn is_small_order(&self) -> bool {
+        self.is_small_order_planted(NoPlant)
+    }
+
+    /// [`Point::is_torsion_free_planted`] with no plant: the tests'.
+    #[cfg(test)]
+    pub(crate) fn is_torsion_free(&self) -> bool {
+        self.is_torsion_free_planted(NoPlant)
     }
 
     /// P, 3P, 5P, ..., (2N - 1)P, each ready to be added.

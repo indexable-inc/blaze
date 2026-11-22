@@ -415,8 +415,8 @@ pub enum KindGap {
     /// An opaque type whose fn's head is made but holds no bounds for it (a head record
     /// restored the opaque without its predicates).
     OpaqueWithoutBounds { opaque: ItemKey, fn_: ItemKey, index: u32, path: Shown },
-    /// A trait's associated type with its own generic parameters (a GAT): which of them are
-    /// const parameters, with what types, is not filed (`Maps::assoc_generics` counts them).
+    /// A trait's associated type with its own generic parameters (a GAT) has no derived
+    /// checker-indexed const-parameter row, even though its declaration count is filed.
     GatConstParams { key: ItemKey, own: u32, path: Shown },
 }
 
@@ -439,7 +439,7 @@ impl core::fmt::Display for KindGap {
                 write!(f, "opaque type {index} ({:#034x}) of {path} ({:#034x}): its fn's head is made and holds no bounds for it", opaque.0, fn_.0)
             }
             KindGap::GatConstParams { key, own, path } => {
-                write!(f, "{path} ({:#034x}): an associated type with {own} generic parameters of its own; their const parameters are not filed (front2 by_origin)", key.0)
+                write!(f, "{path} ({:#034x}): an associated type with {own} generic parameters of its own has no checker-indexed const-parameter row (front2 by_origin)", key.0)
             }
         }
     }
@@ -520,8 +520,9 @@ pub fn predicates_unmade<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, stor
 /// variant's and a constructor's are its ADT's; an opaque type's are its fn's (the Reference,
 /// "Impl trait", "Capturing": a return-position `impl Trait` "automatically captures all in-scope
 /// type and const generic parameters"); a trait's associated type with no parameters of its own
-/// has its trait's; a head not made yet is wanted; anything else is refused by name. Never "no
-/// parameters" for a head that is not made (the old `.unwrap_or(&[])`).
+/// has its trait's, while a GAT uses its stored row with own parameters shifted after the trait's;
+/// a head not made yet is wanted; anything else is refused by name. Never "no parameters" for a
+/// head that is not made (the old `.unwrap_or(&[])`).
 pub fn const_params_of<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &'s Store<'n>, item: ItemKey) -> Result<&'s [(u32, PTy)], Unmade<'s>> {
     let lib_row = |key: ItemKey| keys.library_in(names, key).and_then(|lib| store.maps.const_params.get(&lib)).map(|c| &c[..]);
     if let Some(params) = lib_row(item) {
@@ -567,7 +568,10 @@ pub fn const_params_of<'s, 'n, S: NamesSource<'n>>(names: S, keys: &Keys, store:
             };
             match own {
                 0 => Ok(&params[..]),
-                own => Err(Unmade::Refused(Refusal::Kind(KindGap::GatConstParams { key: item, own, path: path(names, keys, store, item) }))),
+                _ => match store.gat_const_params.get(&item) {
+                    Some(c) => Ok(&c[..]),
+                    None => Err(Unmade::Refused(Refusal::Kind(KindGap::GatConstParams { key: item, own, path: path(names, keys, store, item) }))),
+                },
             }
         }
         WorldKind::Key(KeyKind::Anon { .. }) => Err(Unmade::Refused(Refusal::Kind(KindGap::AnonUnfiled { key: item, path: path(names, keys, store, item) }))),

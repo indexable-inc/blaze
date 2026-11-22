@@ -1,8 +1,16 @@
 //! A field's value: a number as itself, text borrowed, anything else borrowed as `Display` or
 //! `Debug` and formatted only by a sink that wants its text.
+//!
+//! [`ToValue`] is implemented for blaze-own's `String`, `Box`, `Arc` and `Rc` over any allocator,
+//! and still for `alloc`'s `String`, `Cow<str>`, `Box`, `Arc` and `Rc`: those impls name the types
+//! only (nothing here allocates), and exist because crates give such values as plain fields
+//! today. They go when no caller gives one (each caller's crate on blaze-own's types).
+
+// A core: a value borrowed from the site, read by a visitor; no allocation, no clock, no IO.
+#![blaze::sans_io]
 
 use alloc::{borrow::Cow, boxed::Box, rc::Rc, string::String, sync::Arc};
-use core::{fmt, num};
+use core::{alloc::Allocator, fmt, num};
 
 use crate::field::{Field, Visit};
 
@@ -181,6 +189,30 @@ impl<T: ToValue + ?Sized> ToValue for Arc<T> {
 }
 
 impl<T: ToValue + ?Sized> ToValue for Rc<T> {
+    fn to_value(&self) -> Option<Value<'_>> {
+        (**self).to_value()
+    }
+}
+
+impl<A: Allocator> ToValue for blaze_own::String<A> {
+    fn to_value(&self) -> Option<Value<'_>> {
+        Some(Value::Str(self))
+    }
+}
+
+impl<T: ToValue + ?Sized, A: Allocator> ToValue for blaze_own::Box<T, A> {
+    fn to_value(&self) -> Option<Value<'_>> {
+        (**self).to_value()
+    }
+}
+
+impl<T: ToValue + ?Sized, A: Allocator> ToValue for blaze_own::Arc<T, A> {
+    fn to_value(&self) -> Option<Value<'_>> {
+        (**self).to_value()
+    }
+}
+
+impl<T: ToValue + ?Sized, A: Allocator> ToValue for blaze_own::Rc<T, A> {
     fn to_value(&self) -> Option<Value<'_>> {
         (**self).to_value()
     }

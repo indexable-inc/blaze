@@ -60,14 +60,30 @@ what leaves the directory, `ENOSYS` before Linux 5.6, and nothing else opens ben
 `clone3_process` makes only a child with a copy of the caller's memory and refuses `CLONE_VM`
 before any call: a thread's child returns on a new stack, which needs an assembly entry and is
 `rt`'s. `rt_sigaction` offers `SIG_DFL` and `SIG_IGN` only: a handler needs the `rt_sigreturn`
-restorer on x86-64, also `rt`'s. `accept4` and `recvmsg` carry no peer address and no control
-message yet.
+restorer on x86-64: `linux::signal::set_action` now has blaze-sys's own (`restore_rt`, one per
+architecture), and `rt_sigaction` and the sampler go through it. `accept4` carries no peer
+address; `linux::sock`'s whole-header `sendmsg`/`recvmsg` carry control messages.
 
-**The clock.** `clock_gettime` is the system call in slice 1, not the vDSO: a known cost (rule
-slow-is-p0-traced), about 100 ns a read against about 20 ns (to measure, not measured: 10
-million reads of `Monotonic`, blaze-sys against libc). Nothing hot reads it yet: blaze-core's
-clock stays `std::time::Instant` until slice 5, which parses the vDSO (`AT_SYSINFO_EHDR`;
-`__vdso_clock_gettime`, on aarch64 `__kernel_clock_gettime`) before the clock moves.
+**No C library (2026-11-20).** On Linux blaze-sys references no C-library symbol: `posix::`
+there is the kernel's forms (`linux::{signal, host, fdctl, sock, task}`), errors come back in
+the return value (no `errno`), and what has no kernel form (`dlsym`, `pthread_*`, `getpwuid_r`,
+`localtime_r`) is macOS-only. The check is `scripts/src/bin/sys_imports.rs` over the rlib's
+undefined symbols; on macOS the imported libSystem set is the ratchet
+`tools/ratchets/blaze-sys-libsystem.txt`.
+
+**The process's facts (D185).** Page size, clock ticks, `AT_HWCAP` and the vDSO's base are one
+value, `facts::Aux`, handed in, with one source per kind of process: `from_entry` (blaze's own
+`_start`), `from_parent` (a child blaze starts; no addresses, which `execve` moves),
+`for_top_level` (the transition's std-entered process: `PR_GET_AUXV` where the probed
+`KernelFacts` says the kernel has it, else `/proc/self/auxv`, chosen by the fact), and macOS's
+`from_system`. Kernel features are `linux::probe::KernelFacts`, probed once, and each operation
+with several forms is a slot chosen from it.
+
+**The clock.** `linux::vdso::Vdso::find(&Aux)` parses the vDSO (`AT_SYSINFO_EHDR`;
+`__vdso_clock_gettime`, on aarch64 `__kernel_clock_gettime`), and `clock_gettime_vdso` calls it;
+where the kernel has no vDSO the system call is the stated path. The plain `clock_gettime` stays
+the system call until the drivers hold a `Vdso`. About 100 ns a read against about 20 ns: to
+measure, not measured (10 million reads of `Monotonic`, the two forms).
 
 ## macOS: libSystem, private calls where they do more
 
@@ -91,8 +107,37 @@ target }`, a refusal naming itself (`macos::UNBUILT` lists them).
 
 ## Windows: ntdll and kernel32
 
-Imports are declared directly, with no `windows-sys`. Slice 1 specifies the table (in
-`windows.rs`) and builds typed refusals only.
+Imports are declared directly, with no `windows-sys` (D180). `blaze_sys::windows` holds every
+Win32 item the tree uses, under its Win32 name, by area (`foundation`, `fs`, `io`, `memory`,
+`net`, `security`, `threading`), each linked `kind = "raw-dylib"` so a build needs no import
+library and no SDK. A handle is a `Handle`, a `BOOL` a `Bool`, a socket a `Socket`; failures
+are a `WinError` (the last error, or an `NTSTATUS` mapped by `RtlNtStatusToDosError`).
+`windows.rs` keeps sys.md's typed operations as refusals (`UNBUILT`) beside them.
+
+What a Windows build still lacks, by reading the tree on 2026-11-20 (none of it run):
+
+- bstd's driver. blaze-core's IOCP driver (`iocp.rs` and `iocp/`, the USN journal reader, the
+  waits in `wait/windows.rs`) is written against these declarations; bstd's sans-IO effects
+  have no Windows driver turning them into the calls, and the typed operations above are
+  refusals.
+- The launcher. blaze-launch-rt's fault report and thread-local paths have Linux and macOS
+  bodies only (`run_mode/fault_report.rs` returns no stack bounds elsewhere); nothing maps or
+  enters a program's code records on Windows.
+- The sandbox. Build scripts and proc macros run sandboxed by Seatbelt (macOS) and Landlock with
+  seccomp (Linux); Windows has none (a restricted token, an AppContainer or a job), so rule 9
+  stops a Windows build at its first build script.
+- The journal's watcher. The change journal's `Cursor::Usn` exists and the IOCP side reads USN
+  records, but no `blaze-watch` path follows a Windows volume.
+- The build-script runner. blaze-script (`child.rs`, `lib.rs`) uses Unix-only std
+  (`std::os::unix`, `Command::process_group`, `OsStr::as_bytes`) with no cfg, so it does not
+  compile for Windows (4 errors, `cargo check --target x86_64-pc-windows-msvc`, 2026-11-20).
+- Third-party build scripts. blake3, psm, stacker and zstd-sys want a C compiler for msvc, so a
+  Windows check from a Mac stops at them and cannot reach any crate above them. Those packages
+  are on D180's list; until they are gone the Windows check covers blaze-sys, blaze-mem,
+  blaze-core, blaze-check, blaze-profile, blaze-graph and blaze-inproc-rt only.
+- The toolchain shelf. The pinned nightly's answers are recorded for `x86_64-pc-windows-msvc`
+  and `aarch64-pc-windows-msvc` (blaze-toolchain `side.rs`), but no shelf entry, linker or CRT
+  is fetched for a Windows host.
 
 ## Runtime: what a `no_std` world must own
 
@@ -157,6 +202,90 @@ types become the flat op records of std.md's boundary.
 | 4 | Windows: the imports, then `iocp` | `iocp/*` |
 | 5 | `bstd::rt`: entry, panic handler, threads, unwinding, the vDSO clock; `threads`, `signal`, `cores`, `busy` move; bstd's `rt.rs` is deleted | the rest of blaze-core and bstd |
 | S3 | every other crate, onto capabilities | the crate rows |
+
+## Wave 4: the users' std on blaze-sys (design, not started; 2026-11-20)
+
+The owner, 2026-11-20: "port EVERYTHING to blaze sys", which includes the toolchain's own library
+(`library/std`, 1,484 `libc::` sites, with `library/backtrace` 58, `library/std_detect` 50, the
+vendored `unwinding` 19, `panic_abort` 3). It is the library every USER program is compiled
+with, so it is a platform backend, not a search and replace, and rule 4 binds it: every program
+the pinned nightly accepts behaves the same. Nothing in `library/` is edited until this design is
+accepted.
+
+**The shape: a `libc`-named crate in the tree, not a new `pal`.** std reaches the system through
+the `libc` crate's paths (`libc::open`, `libc::stat64`, `libc::EINTR`), by Rust path, not by
+symbol. So the smallest change that moves all 1,484 sites is in one manifest line:
+`library/std/Cargo.toml`'s `libc = { version = "0.2.191", ... }` becomes
+`libc = { path = "../blaze_libc", package = "blaze-libc" }`, a crate of the same names and
+signatures (only the ones std and its four parts use: the list is the compiler's, it fails to
+build on a missing one) whose bodies are blaze-sys. std's source is unchanged, so the next nightly's
+library merges as it does today, and the parity argument is per function, against the libc crate
+it replaces, not over std's whole system layer. A new `sys/pal/blaze` would be the better shape
+only if std's Unix backend had to change its logic; it does not, and a fork of `pal/unix` (some
+30,000 lines across `sys/`) would diverge from upstream with every nightly. The shim crate is
+`no_std` on blaze-sys alone, every item `/// replaces libc::X`, its types checked against the libc
+crate once (the same comparison tests blaze-sys has).
+
+**What the shim must be on each system.**
+- macOS: libSystem stays the floor (above); the shim's functions are blaze-sys's typed
+  declarations of the same libSystem symbols, so behaviour is libSystem's by construction. The
+  gain is one declared, ratcheted set of imports; the risk is none beyond a wrong signature, which
+  the comparison test catches.
+- Linux: there is no libSystem to forward to, so a shim of raw calls is a C runtime, and it must
+  own what glibc did beyond system calls: `errno` (std's `io::Error::last_os_error` reads it, so
+  the shim keeps one per thread and sets it from the raw call's `-errno`); the program's start
+  (`_start`, the auxiliary vector, `environ`, the static TLS block and the thread pointer, since
+  no `ld.so` sets them); threads (`pthread_create` is `clone3` plus a stack and a TLS block,
+  `pthread_join`, keys, `pthread_getattr_np` for std's stack guard); the allocator (std's
+  `System` calls `malloc`, `posix_memalign`, `free`); `dl_iterate_phdr` for `backtrace` (the
+  image's program headers are `AT_PHDR`/`AT_PHNUM`, and a static program has one image);
+  `getaddrinfo` (a resolver of `/etc/hosts` and `/etc/resolv.conf`); `getpwuid_r` for
+  `home_dir`'s last resort; `__cxa_thread_atexit_impl` for TLS destructors. This is the Eyra
+  design (c-ward and origin: std on rustix with a libc ABI in Rust); it is real work, about the
+  size of origin plus c-scape's used subset, and it is where rule 4 is at risk.
+
+**What breaks if user programs on Linux have no C library, and the decision it needs.** A program
+built this way is static, starts at its own entry and has no dynamic loader. Then:
+- C code linked into it (any `-sys` crate built by `cc`, C imports under D174: openssl, zstd,
+  sqlite, rocksdb) calls glibc's names: `malloc`/`free` across the boundary, `stdio`, `pthread_*`,
+  `locale`, `getaddrinfo`. Those would bind to nothing, or to a second runtime: Rust threads made
+  by the shim's `clone3` would call C code expecting glibc's thread descriptor at the thread
+  pointer, and crash. A Rust-only shim and C code in one process cannot be mixed.
+- `dlopen` of plugins, `LD_PRELOAD`, sanitizers' interposition and tools that expect `ld.so`
+  (valgrind's default mode, `ltrace`) stop working.
+- Name service: glibc's NSS (mDNS, LDAP, systemd-resolved, `sss`) is not consulted, so host and
+  user lookups can answer differently: a behaviour change for `ToSocketAddrs` and `home_dir`.
+- Locale and `iconv` are not offered (std uses neither).
+So the backend is a FACT of the program, chosen before its build and stated in its profile line:
+a program whose link closure holds no C object and no `dlopen` gets the no-C-library backend
+(static, own entry); one with C code links glibc exactly as today. That is selection, not a
+fallback (rule 3). Whether the no-C-library backend is the default for Rust-only programs, an
+opt-in, or blaze's own binaries only, is the owner's decision; my proposal is blaze's own binaries
+first (they leave std anyway), then Rust-only user programs by default once the oracle below is
+green.
+
+**The compile-time seam (D175, comptime-native.md) moves with it.** Today a compile-time child's
+unchanged std imports C names and the launcher binds 265 of them (blaze-comptime-sys `NAMES`) to
+blaze's answers at placement; a missing one is a `BindRefused`. With std on the shim, std imports
+no C names: its system calls are the shim's functions, and the shim's backend is a slot (D185)
+filled once at the child's entry: `Real` (blaze-sys) for a program run, `Guest` (one protocol
+`Call` per function, today's `child.rs` bodies) for a compile-time child. The table becomes the
+shim's own function set, typed and complete by construction (a function std needs and the shim
+lacks fails std's build, not a placement), and binding by symbol remains only for C objects in a
+compile-time closure, which comptime-native already treats apart. One std build serves both (no
+second set of std records): the slot costs an indirect call per system call. The two designs
+change in one piece: the shim's `Guest` backend is `child.rs` moved, and `NAMES` shrinks to what C
+objects import.
+
+**The oracle.** std's own test suite (`library/std` tests, `alloctests`, `coretests` where they
+touch `sys`) and the three acceptance projects' tests (reth, tempo, blaze), each run twice: on the
+libc crate and on the shim, on Linux x86-64 and aarch64 and on macOS, with every difference a
+finding. The shim's types are compared with the libc crate's once, as blaze-sys's are. Only
+then does the manifest line change by default.
+
+**Order.** (1) the shim crate on macOS (forwarding: proves the names and the oracle); (2) Linux
+for blaze's own helper binaries (static, own entry: the runtime pieces of "Runtime" above);
+(3) the program-is-Rust-only fact and user programs; (4) the comptime seam's `Guest` backend.
 
 ## Proof
 

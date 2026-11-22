@@ -12,8 +12,8 @@ use blaze_own::{AVec, Vec};
 
 use super::*;
 
-const TODAY: Certificate = Certificate([0x7a; 32]);
-const OTHER: Certificate = Certificate([0x7b; 32]);
+const TODAY: Certificate = Certificate::for_tests([0x7a; 32]);
+const OTHER: Certificate = Certificate::for_tests([0x7b; 32]);
 
 const HEAD_OF: StartHead = StartHead { line: EntryLine { form: EntryForm::Hosted, symbol: blaze_code::record::Symbol([0x5e; 32]) }, personality: None };
 
@@ -41,9 +41,27 @@ fn model() -> std::vec::Vec<Line> {
     ]
 }
 
+/// `lines` as a list under [`TODAY`], row by row (the planted writer, `encode_lines`): it
+/// writes malformed groups too, for the reader's refusals.
 fn bytes_of(lines: &[Line], alloc: Alloc<'_>) -> std::vec::Vec<u8> {
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    encode(TODAY, HEAD_OF, lines, &mut bytes).expect("the model fits");
+    encode_lines(&TODAY, HEAD_OF, lines, &mut bytes).expect("the model fits");
+    bytes.as_slice().to_vec()
+}
+
+/// The model's groups as the run writes them ([`encode`] over [`Group`]s): whole by type.
+fn groups_bytes(alloc: Alloc<'_>) -> std::vec::Vec<u8> {
+    let (one, six) = (Symbol([0x51; 32]), Symbol([0x61; 32]));
+    let (two_data, three_data) = ([datum(0x51)], [datum(0x61)]);
+    let (two_named, three_named) = ([one], [one, six]);
+    let groups = [
+        Group::code(code(1)),
+        Group { data: &two_data, named: &two_named, values: &[], code: code(2) },
+        Group { data: &three_data, named: &three_named, values: &[], code: code(3) },
+        Group::code(code(4)),
+    ];
+    let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
+    encode(&TODAY, HEAD_OF, &groups, &mut bytes).expect("the model fits");
     bytes.as_slice().to_vec()
 }
 
@@ -63,16 +81,21 @@ fn groups_round_trip_and_another_certificate_yields_code_symbols_only() {
     let lines: std::vec::Vec<Line> = view.lines().collect();
     assert_eq!(lines, model, "the rows read are not the rows written");
     assert_eq!(bytes_of(&lines, alloc), bytes, "a rewrite of the rows read is other bytes");
+    // Finding 10: the groups' writer and the row-by-row writer lay equal bytes.
+    assert_eq!(groups_bytes(alloc), bytes, "encoding the groups is other bytes than encoding their rows");
     let codes: std::vec::Vec<Row> = view.iter().collect();
     assert_eq!(codes, [code(1), code(2), code(3), code(4)]);
-    match view.under(TODAY) {
+    let read_groups: std::vec::Vec<std::vec::Vec<Line>> = view.groups().map(|group| group.lines().collect()).collect();
+    assert_eq!(read_groups.len(), 4, "the reader's groups are not one per code row: {read_groups:?}");
+    assert_eq!(read_groups.concat(), model, "the reader's groups are not the rows in order");
+    match view.under(&TODAY) {
         Held::Today(today) => {
             assert_eq!(today.lines().collect::<std::vec::Vec<_>>(), model);
             assert_eq!(today.head(), HEAD_OF);
         }
         Held::Other(_) => panic!("today's certificate read as another"),
     }
-    match view.under(OTHER) {
+    match view.under(&OTHER) {
         Held::Other(symbols) => {
             let got: std::vec::Vec<Symbol> = symbols.iter().collect();
             assert_eq!(got, [Symbol([1; 32]), Symbol([2; 32]), Symbol([3; 32]), Symbol([4; 32])], "another certificate's list handed out a static or lost a fn");
@@ -98,11 +121,11 @@ fn a_group_past_the_cap_is_refused_whole() {
         symbol[31] = 0xcc;
         rows.push(Row { symbol: Symbol(symbol), key: CodeKey(ContentId(symbol)), record: RecordId(symbol) }).expect("under the cap");
     }
-    let before = rows.as_slice().len();
-    let big = rows.push_answer(&[datum(0x51), datum(0x61)], &[Symbol([0x51; 32])], code(9));
+    let before = rows.len();
+    let big = rows.push_answer(&[datum(0x51), datum(0x61)], &[Symbol([0x51; 32])], &[], code(9));
     assert_eq!(big, Err(CapError::Full { symbol: code(9).symbol }), "a group past the cap was taken, or refused without its row's name");
-    assert_eq!(rows.as_slice().len(), before, "a refused group left rows behind");
-    rows.push_answer(&[datum(0x51)], &[Symbol([0x51; 32])], code(8)).expect("a group of exactly the room left fits");
+    assert_eq!(rows.len(), before, "a refused group left rows behind");
+    rows.push_answer(&[datum(0x51)], &[Symbol([0x51; 32])], &[], code(8)).expect("a group of exactly the room left fits");
     assert!(rows.is_full());
     std::println!("start list v4: a group past the cap refused whole by its row's symbol");
 }

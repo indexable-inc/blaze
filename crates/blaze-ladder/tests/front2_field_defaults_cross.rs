@@ -7,7 +7,7 @@
 //! The ADT's head record (front2/head_record.rs, form 8) carries those defaults: the record of
 //! `opts::Opts` decodes to a head equal to the store's (`same`), its field defaults the store's
 //! keys, each a fn record of its own (the anonymous constant `const _: TY = EXPR;`). A record
-//! of the old form 7 is refused as another version, never read.
+//! of a previous record version is refused as another version, never read.
 //!
 //! Expected lines (test `an_options_struct_from_another_crate`):
 //! `cross: made: clean`, `cross: sum: clean`, `cross: missing: diags [..MissingFields..]` (E0063), then
@@ -23,7 +23,7 @@ use blaze_ladder::crates::{DirShelf, Inputs, Texts, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::lower_fn;
 use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body};
-use blaze_ladder::front2::head_record::{HeadAt, HeadRecordError, decode, encode, from_store, same};
+use blaze_ladder::front2::head_record::{self, HeadAt, HeadRecordError, decode, encode, from_store, same};
 use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::spell::Spelling;
@@ -157,13 +157,13 @@ fn an_options_struct_from_another_crate() {
         let fn_bytes = encode(head, store.tys.view(), alloc).unwrap_or_else(|e| panic!("the default {k:?} not encoded: {e}"));
         decode(&fn_bytes, Some(text), &store.tys, alloc).unwrap_or_else(|e| panic!("the default {k:?} not decoded: {e}"));
     }
-    // A record of the old form (7: no field defaults) is another version: refused, never read.
+    // A record of the previous version is another version: refused, never read.
     let mut old = bytes.to_vec();
-    old[4..8].copy_from_slice(&7u32.to_le_bytes());
+    old[4..8].copy_from_slice(&(head_record::VERSION - 1).to_le_bytes());
     match decode(&old, None, &store.tys, alloc) {
-        Err(HeadRecordError::Version { found: 7 }) => {}
-        Err(e) => panic!("a form-7 record: refused, but not as another version: {e}"),
-        Ok(_) => panic!("a form-7 record was read"),
+        Err(HeadRecordError::Version { found }) if found == head_record::VERSION - 1 => {}
+        Err(e) => panic!("a previous-version record: refused, but not as another version: {e}"),
+        Ok(_) => panic!("a previous-version record was read"),
     }
     println!("record: opts::Opts round-trips with 2 field defaults");
 }

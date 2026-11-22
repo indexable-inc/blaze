@@ -14,7 +14,6 @@
 //!
 //! NOT RUN by the writer (a write-only lane, uncompiled).
 
-use core::fmt::Write as _;
 
 use super::engine_check_tests::{engine_from, profile};
 use super::*;

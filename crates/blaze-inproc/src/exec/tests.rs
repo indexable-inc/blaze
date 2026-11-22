@@ -35,6 +35,8 @@ fn code_at(at: u64, len: usize) -> Vec<u8> {
 /// executable, with the cache maintenance by hand.
 #[cfg(unix)]
 mod reference {
+    use blaze_sys::posix::io::{self, MapFlags, Prot};
+
     pub(super) struct Code {
         pub(super) at: *mut u8,
         len: usize,
@@ -43,7 +45,7 @@ mod reference {
     impl Drop for Code {
         fn drop(&mut self) {
             // SAFETY: the mapping `new` made; no code of it runs once the test drops it.
-            unsafe { libc::munmap(self.at.cast(), self.len) };
+            let _ = unsafe { io::munmap(std::ptr::NonNull::new_unchecked(self.at), self.len) };
         }
     }
 
@@ -51,17 +53,16 @@ mod reference {
         pub(super) fn new(bytes: &[u8]) -> Code {
             let len = bytes.len().next_multiple_of(1 << 16);
             let (protection, flags) =
-                (libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON);
+                (Prot::READ | Prot::WRITE, MapFlags::PRIVATE | MapFlags::ANONYMOUS);
             // SAFETY: an anonymous mapping at no fixed address; the result is checked.
-            let at = unsafe { libc::mmap(std::ptr::null_mut(), len, protection, flags, -1, 0) };
-            assert_ne!(at, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-            let code = Code { at: at.cast(), len };
+            let at = unsafe { io::mmap(None, len, protection, flags, None, 0) }
+                .unwrap_or_else(|errno| panic!("mmap: {}", std::io::Error::from_raw_os_error(errno.raw().into())));
+            let code = Code { at: at.as_ptr(), len };
             // SAFETY: the fresh mapping of `len >= bytes.len()` writable bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), code.at, bytes.len()) };
             // SAFETY: the whole mapping made above, which nothing writes from here on.
-            let sealed =
-                unsafe { libc::mprotect(code.at.cast(), len, libc::PROT_READ | libc::PROT_EXEC) };
-            assert_eq!(sealed, 0, "mprotect: {}", std::io::Error::last_os_error());
+            unsafe { io::mprotect(at, len, Prot::READ | Prot::EXEC) }
+                .unwrap_or_else(|errno| panic!("mprotect: {}", std::io::Error::from_raw_os_error(errno.raw().into())));
             #[cfg(target_os = "macos")]
             // SAFETY: the instruction cache sees the bytes in the fresh mapping.
             unsafe {
@@ -210,6 +211,8 @@ fn a_write_that_panics_leaves_the_others_running() {
 #[cfg(unix)]
 #[test]
 fn a_child_forked_after_a_write_runs_the_code() {
+    use blaze_sys::posix::{proc, signal};
+
     for round in 0..16 {
         let exec = Executable::written(FORTY_TWO.len(), 0, |code, _| {
             code.copy_from_slice(FORTY_TWO);
@@ -220,24 +223,28 @@ fn a_child_forked_after_a_write_runs_the_code() {
             wait::sleep_until("a millisecond, mid-write", until, &clock).unwrap();
         })
         .unwrap();
+        #[cfg(target_os = "linux")]
         // SAFETY: the child only calls the code (no allocation, no lock) and `_exit`s.
         let pid = unsafe { libc::fork() };
+        #[cfg(target_os = "macos")]
+        // SAFETY: the child only calls the code (no allocation, no lock) and exits immediately.
+        let pid = unsafe { proc::fork() };
         assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
             let got = call(exec.code_address());
-            // SAFETY: leaves the child at once, running nothing of the parent's.
-            unsafe { libc::_exit(got as i32) };
+            signal::exit_now(got as i32);
         }
-        let mut status = 0;
-        // SAFETY: waits for the child just forked.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert_eq!(waited, pid, "waitpid: {}", std::io::Error::last_os_error());
+        let (waited, status) = proc::wait_pid(pid, proc::WaitFlags::NONE)
+            .unwrap_or_else(|errno| panic!("waitpid: {}", std::io::Error::from_raw_os_error(errno.raw().into())))
+            .expect("blocking waitpid returned no child");
+        assert_eq!(waited, pid);
         assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 42,
-            "round {round}: the child forked after writing an Executable at {:#x} ended with status {status:#x} \
+            status.exit_code() == Some(42),
+            "round {round}: the child forked after writing an Executable at {:#x} ended with status {:#x} \
              (signal {}) instead of returning 42 from its code",
             exec.code_address(),
-            if libc::WIFSIGNALED(status) { libc::WTERMSIG(status) } else { 0 },
+            status.0,
+            status.signal().unwrap_or(0),
         );
     }
 }

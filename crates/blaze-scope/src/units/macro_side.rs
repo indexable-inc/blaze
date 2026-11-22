@@ -30,7 +30,7 @@
 #![blaze::sans_io]
 
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_manifest::lock::{Lock, LockId};
+use blaze_manifest::lock::Lock;
 use blaze_own::{AVec, Alloc};
 use blaze_toolchain::{Role, ToolchainView, UnitKind as ToolchainKind, UnitRow};
 use blaze_unit_graph::{StdIs, Text, UnitGraph, UnitId, UnitKind, implicit};
@@ -173,8 +173,9 @@ pub(super) fn add_macro_side<'a>(
         add_side_externs(&mut deps, side, implicit.std);
         let mut features = AVec::with_capacity_in(u.features.len(), alloc);
         features.extend(u.features.iter().map(|f| f.as_str()));
-        let mut cfg = AVec::with_capacity_in(target_cfg.len() + features.len() + 1, alloc);
+        let mut cfg = AVec::with_capacity_in(target_cfg.len() + PROFILE.len() + features.len() + 1, alloc);
         cfg.extend(target_cfg.iter().copied());
+        cfg.extend(PROFILE.iter().copied());
         cfg.extend(features.iter().map(|f| ("feature", Some(*f))));
         if u.kind == UnitKind::ProcMacro {
             cfg.push(("proc_macro", None));
@@ -208,8 +209,11 @@ pub(super) fn add_macro_side<'a>(
         let u = &units[at];
         let flag = |name: &str| u.cfg.iter().any(|a| a.name.as_str() == name && a.value.is_none());
         let own = &crates[at_of[at]];
-        let mut cfg = AVec::with_capacity_in(target_cfg.len() + own.features.len() + 2, alloc);
+        // The proc macro's own cfg controls which tokens its expansion contains. Keep the
+        // workspace profile here, so a dev macro evaluates `#[cfg(debug_assertions)]` as cargo does.
+        let mut cfg = AVec::with_capacity_in(target_cfg.len() + PROFILE.len() + own.features.len() + 2, alloc);
         cfg.extend(target_cfg.iter().copied());
+        cfg.extend(PROFILE.iter().copied());
         cfg.extend(own.features.iter().map(|f| ("feature", Some(*f))));
         for name in ["proc_macro", "test"] {
             if flag(name) {

@@ -3,41 +3,101 @@
 //! hard cases, and read back; random decimal text against `str::parse`; parse offsets; the
 //! fixed buffer's bound; escapes; human units; the adapter.
 
+use core::fmt;
 use std::{
-    alloc::Global,
     fmt::{Binary, Display, LowerHex, UpperHex},
     format,
     string::{String as StdString, ToString},
     vec::Vec as StdVec,
 };
 
-use blaze_own::{FixedString, Overflow, ParseIn, String, Vec};
-use blaze_sim::{Broke, Config, Tape};
+use blaze_own::{Alloc, FixedString, Overflow, ParseIn, String, Vec, planted::Planted};
+use blaze_sim::{Broken, Config, NoPlant, Tape, controls};
 
 use crate::{
-    Count, Fixed, Float, IntSyntax, Integer, Parse, ParseError, Put, Show, Shown, Unquoted, Writes,
+    Count, Fixed, Float, IntSyntax, Integer, Parse, ParseError, Put, Show, Shown, TextPlant, Unquoted, Writes,
     parse::{opt, sep_by, tag, take_while},
     parse_all, parse_int, parse_quoted_in,
-    plant::{self, Plant},
 };
 
-fn text(write: impl FnOnce(&mut String<Global>)) -> StdString {
-    let mut out = String::new_in(Global);
+/// The tests' allocator: blaze-own's test heap.
+type Heap = Alloc<'static>;
+
+fn heap() -> Heap {
+    blaze_own::testing::heap().alloc()
+}
+
+/// What an oracle saw blaze-text get wrong.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum TextBroken {
+    /// A writer's text is not `core::fmt`'s (or `format!`'s) for the same value.
+    Wrote { what: &'static str, value: StdString, got: StdString, want: StdString },
+    /// A finite float's text did not read back as the same bits.
+    ReadBack { value: StdString, written: StdString, read: StdString },
+    /// Decimal text read as other float bits than core reads.
+    FloatRead { text: StdString, got: Option<u64>, want: Option<u64> },
+    /// `decimal_u64` took another length than the digit run.
+    DecimalLength { at: usize },
+    /// `decimal_u64` read another value than core.
+    DecimalRead { at: usize, got: Option<u64>, want: Option<u64> },
+    /// The vector `next_special` is not its scalar twin.
+    NextSpecial { from: usize, at: usize, vector: usize, scalar: usize },
+    /// The vector `hex16` is not its scalar twin.
+    Hex16 { at: usize, vector: StdString, scalar: StdString },
+    /// An integer read as another value than core reads.
+    IntRead { text: StdString, got: Option<i128>, want: Option<i128> },
+    /// The debug form is not `{:?}`'s.
+    Debug { ours: StdString, core: StdString },
+    /// `text_exact_in` kept more bytes than the text.
+    NotExact { capacity: usize, len: usize },
+}
+
+impl fmt::Display for TextBroken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TextBroken::Wrote { what, value, got, want } => {
+                write!(f, "{what} of {value}: blaze-text wrote {got:?}, core::fmt {want:?}")
+            }
+            TextBroken::ReadBack { value, written, read } => {
+                write!(f, "{value} wrote {written:?}, which read back as {read}")
+            }
+            TextBroken::FloatRead { text, got, want } => write!(f, "{text:?} read as bits {got:?}; core reads {want:?}"),
+            TextBroken::DecimalLength { at } => write!(f, "decimal_u64 at {at}: wrong length"),
+            TextBroken::DecimalRead { at, got, want } => write!(f, "decimal_u64 at {at}: read {got:?}, core {want:?}"),
+            TextBroken::NextSpecial { from, at, vector, scalar } => {
+                write!(f, "next_special from {from} at {at}: vector {vector}, scalar {scalar}")
+            }
+            TextBroken::Hex16 { at, vector, scalar } => write!(f, "hex16 at {at}: vector {vector}, scalar {scalar}"),
+            TextBroken::IntRead { text, got, want } => write!(f, "{text:?}: blaze-text read {got:?}, core {want:?}"),
+            TextBroken::Debug { ours, core } => write!(f, "blaze-text's debug form wrote {ours:?}, `{{:?}}` {core:?}"),
+            TextBroken::NotExact { capacity, len } => write!(f, "text_exact_in kept {capacity} bytes for {len}"),
+        }
+    }
+}
+
+fn text(write: impl FnOnce(&mut String<Heap>)) -> StdString {
+    let mut out = String::new_in(heap());
     write(&mut out);
     StdString::from(out.as_str())
 }
 
-fn same(what: &str, shown: &dyn Display, got: StdString, want: StdString) -> Result<(), Broke> {
+fn same(what: &'static str, shown: &dyn Display, got: StdString, want: StdString) -> Result<(), Broken<TextBroken>> {
     match got == want {
         true => Ok(()),
-        false => Err(Broke::Oracle(format!("{what} of {shown}: blaze-text wrote {got:?}, core::fmt {want:?}"))),
+        false => Err(Broken::Oracle(TextBroken::Wrote { what, value: format!("{shown}"), got, want })),
     }
 }
 
 // Integers.
 
-fn one_int<I: Integer + Show + Display + LowerHex + UpperHex + Binary>(x: I) -> Result<(), Broke> {
+fn one_int<I: Integer + Show + Display + LowerHex + UpperHex + Binary>(
+    x: I,
+    plant: impl Planted<TextPlant>,
+) -> Result<(), Broken<TextBroken>> {
     let full = crate::int::nibbles::<I>();
+    // First, the path every decimal writer takes, under the control's plant.
+    let planted = StdString::from(crate::int::decimal_planted(x, plant).as_str());
+    same("planted decimal", &x, planted, format!("{x}"))?;
     same("decimal", &x, text(|o| _ = o.int(x)), format!("{x}"))?;
     same("hex", &x, text(|o| _ = o.hex(x)), format!("{x:x}"))?;
     same("upper hex", &x, text(|o| _ = o.hex_upper(x)), format!("{x:X}"))?;
@@ -63,42 +123,64 @@ macro_rules! from_bits {
 }
 
 macro_rules! ints {
-    ($tape:ident; $($t:ident)*) => {$(
+    ($tape:ident, $plant:ident; $($t:ident)*) => {$(
         // The boundaries: MIN, MAX, and each power of ten and its neighbours.
         for x in [$t::MIN, $t::MAX, $t::MIN.wrapping_add(1), $t::MAX.wrapping_sub(1)] {
-            one_int(x)?;
+            one_int(x, $plant)?;
         }
         let ten = $t::try_from(10u8).unwrap_or($t::MAX);
         let mut power = Some(ten);
         while let Some(p) = power {
             for x in [p.wrapping_sub(1), p, p.wrapping_add(1)] {
-                one_int(x)?;
-                one_int(x.wrapping_neg())?;
+                one_int(x, $plant)?;
+                one_int(x.wrapping_neg(), $plant)?;
             }
             power = p.checked_mul(ten);
         }
         // Random values of every length.
         for _ in 0..8 {
             let bits = $tape.u128("bits") >> $tape.below(128, "shift");
-            one_int(from_bits!($t, bits))?;
+            one_int(from_bits!($t, bits), $plant)?;
         }
     )*};
 }
 
-fn int_oracle(tape: &Tape) -> Result<(), Broke> {
-    ints!(tape; u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
+/// Every integer writer against `core::fmt`; the decimal path takes `plant` ([`NoPlant`] for
+/// the clean run).
+fn int_oracle<P: Planted<TextPlant>>(tape: &Tape, plant: P) -> Result<(), Broken<TextBroken>> {
+    ints!(tape, plant; u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
     Ok(())
+}
+
+blaze_sim::plants! {
+    /// The bug planted in the integer path, with the invariant of the integer oracle that must
+    /// catch it.
+    enum IntControl breaks TextBroken {
+        /// The writers as they are.
+        None,
+        /// The two-digit table read one pair off: the planted decimal path is not `{}`.
+        DigitPairOffByOne => TextBroken::Wrote { what: "planted decimal", .. },
+    }
+}
+
+impl IntControl {
+    /// The crate's plant this control plants.
+    fn planted(self) -> TextPlant {
+        match self {
+            IntControl::None => TextPlant::None,
+            IntControl::DigitPairOffByOne => TextPlant::DigitPairOffByOne,
+        }
+    }
 }
 
 #[test]
 fn every_integer_writer_matches_core_fmt() {
-    blaze_sim::check(Config::cases(200), int_oracle);
+    blaze_sim::check(Config::cases(200), |tape| int_oracle(tape, NoPlant));
 }
 
 #[test]
-fn the_oracle_catches_a_digit_pair_off_by_one() {
-    let run = |tape: &Tape, p: Plant| plant::with(p, || int_oracle(tape));
-    blaze_sim::control(Config::cases(50), Plant::Clean, Plant::DigitPairOffByOne, "blaze-text wrote", run);
+fn every_integer_plant_is_caught_by_its_invariant() {
+    controls(Config::cases(50), |tape, plant: IntControl| int_oracle(tape, plant.planted()));
 }
 
 // Floats.
@@ -130,7 +212,7 @@ fn debug_text<F: Float>(x: F) -> StdString {
     text(|o| _ = o.float_debug(x))
 }
 
-fn check_f64(x: f64) -> Result<(), Broke> {
+fn check_f64(x: f64) -> Result<(), Broken<TextBroken>> {
     same("shortest f64", &x, debug_text(x), format!("{x:?}"))?;
     same("display f64", &x, display_text(x), format!("{x}"))?;
     same("Show f64", &x, text(|o| _ = o.show(&x)), format!("{x}"))?;
@@ -138,7 +220,10 @@ fn check_f64(x: f64) -> Result<(), Broke> {
         for written in [display_text(x), debug_text(x)] {
             match parse_all::<f64>(&written) {
                 Ok(back) if back.to_bits() == x.to_bits() => {}
-                other => return Err(Broke::Oracle(format!("{x:?} wrote {written:?}, which read back as {other:?}"))),
+                other => {
+                    let (value, read) = (format!("{x:?}"), format!("{other:?}"));
+                    return Err(Broken::Oracle(TextBroken::ReadBack { value, written, read }));
+                }
             }
         }
     }
@@ -149,7 +234,7 @@ fn check_f64(x: f64) -> Result<(), Broke> {
     Ok(())
 }
 
-fn check_f32(x: f32) -> Result<(), Broke> {
+fn check_f32(x: f32) -> Result<(), Broken<TextBroken>> {
     same("shortest f32", &x, debug_text(x), format!("{x:?}"))?;
     same("display f32", &x, display_text(x), format!("{x}"))?;
     same("Show f32", &x, text(|o| _ = o.show(&x)), format!("{x}"))?;
@@ -157,7 +242,10 @@ fn check_f32(x: f32) -> Result<(), Broke> {
         for written in [display_text(x), debug_text(x)] {
             match parse_all::<f32>(&written) {
                 Ok(back) if back.to_bits() == x.to_bits() => {}
-                other => return Err(Broke::Oracle(format!("{x:?} wrote {written:?}, which read back as {other:?}"))),
+                other => {
+                    let (value, read) = (format!("{x:?}"), format!("{other:?}"));
+                    return Err(Broken::Oracle(TextBroken::ReadBack { value, written, read }));
+                }
             }
         }
     }
@@ -271,7 +359,7 @@ fn random_decimal_text_reads_as_core_reads_it() {
             (exact::<f32>(&s).map(|x| u64::from(x.to_bits())), core32),
         ] {
             if got != want {
-                return Err(Broke::Oracle(format!("{s:?} read as bits {got:?}; core reads {want:?}")));
+                return Err(Broken::Oracle(TextBroken::FloatRead { text: s.clone(), got, want }));
             }
         }
         Ok(())
@@ -298,22 +386,23 @@ fn vector_routines_equal_their_scalar_twins() {
             let want = core::str::from_utf8(&window[..run]).ok().and_then(|t| t.parse::<u64>().ok());
             let got = match crate::parse::decimal_u64(window) {
                 crate::parse::Decimal64::Value(v, n) if n == run => Some(v),
-                crate::parse::Decimal64::Value(..) => return Err(Broke::Oracle(format!("decimal_u64 at {at}: wrong length"))),
+                crate::parse::Decimal64::Value(..) => return Err(Broken::Oracle(TextBroken::DecimalLength { at })),
                 _ => None,
             };
             if got != want {
-                return Err(Broke::Oracle(format!("decimal_u64 at {at} of {window:?}: read {got:?}, core {want:?}")));
+                return Err(Broken::Oracle(TextBroken::DecimalRead { at, got, want }));
             }
             let window = &mixed[at..];
             for from in [0, 1, 7, 17] {
                 let (v, s) = (crate::simd::next_special(window, from), crate::simd::next_special_scalar(window, from));
                 if v != s {
-                    return Err(Broke::Oracle(format!("next_special from {from} at {at}: vector {v}, scalar {s}")));
+                    return Err(Broken::Oracle(TextBroken::NextSpecial { from, at, vector: v, scalar: s }));
                 }
             }
             let (v, s) = (crate::simd::hex16(window), crate::simd::hex16_scalar(window));
             if v != s {
-                return Err(Broke::Oracle(format!("hex16 at {at}: vector {v:?}, scalar {s:?}")));
+                let (vector, scalar) = (format!("{v:?}"), format!("{s:?}"));
+                return Err(Broken::Oracle(TextBroken::Hex16 { at, vector, scalar }));
             }
         }
         Ok(())
@@ -342,7 +431,7 @@ fn integer_parse_matches_core_on_random_text() {
             ];
             for (got, want) in pairs.into_iter().chain(whole) {
                 if got != want {
-                    return Err(Broke::Oracle(format!("{text:?}: blaze-text read {got:?}, core {want:?}")));
+                    return Err(Broken::Oracle(TextBroken::IntRead { text: text.clone(), got, want }));
                 }
             }
         }
@@ -386,25 +475,25 @@ fn quoted_strings_borrow_unless_escaped() {
         Err(ParseError { at: 3, expected: "a string without escapes (read it with `parse_quoted_in`)" })
     );
     assert_eq!(<&str>::parse("\"abc"), Err(ParseError { at: 4, expected: "the closing `\"`" }));
-    match parse_quoted_in("\"abc\"!", Global) {
+    match parse_quoted_in("\"abc\"!", heap()) {
         Ok((unquoted, rest)) => {
             assert!(unquoted.is_borrowed());
             assert_eq!((unquoted.as_str(), rest), ("abc", "!"));
         }
         Err(_) => panic!("refused"),
     }
-    match parse_quoted_in("\"a\\n\\u{e9}\\x41\\\"z\" tail", Global) {
+    match parse_quoted_in("\"a\\n\\u{e9}\\x41\\\"z\" tail", heap()) {
         Ok((Unquoted::Owned(owned), rest)) => assert_eq!((owned.as_str(), rest), ("a\néA\"z", " tail")),
         _ => panic!("not unescaped"),
     }
-    match parse_quoted_in("\"a\\q\"", Global) {
+    match parse_quoted_in("\"a\\q\"", heap()) {
         Err(ParseIn::Invalid(error)) => assert_eq!(error.at, 2),
         _ => panic!("a bad escape read"),
     }
     // What `escaped` writes reads back.
     let original = "tab\t \"quote\" \\ nul\0 esc\u{1b} é";
     let written = text(|o| _ = o.escaped(original));
-    match parse_quoted_in(&written, Global) {
+    match parse_quoted_in(&written, heap()) {
         Ok((unquoted, "")) => assert_eq!(unquoted.as_str(), original),
         _ => panic!("{written:?} did not read back"),
     }
@@ -412,11 +501,11 @@ fn quoted_strings_borrow_unless_escaped() {
 
 #[test]
 fn combinators_compose() {
-    let mut out: Vec<u32, Global> = Vec::new_in(Global);
+    let mut out: Vec<u32, Heap> = Vec::new_in(heap());
     let rest = sep_by("1, 2, 3]", ", ", &mut out, u32::parse);
     assert!(matches!(rest, Ok("]")));
     assert_eq!(out.as_slice(), &[1, 2, 3]);
-    let mut out: Vec<u32, Global> = Vec::new_in(Global);
+    let mut out: Vec<u32, Heap> = Vec::new_in(heap());
     match sep_by("1, x", ", ", &mut out, u32::parse) {
         Err(ParseIn::Invalid(error)) => assert_eq!(error, ParseError { at: 3, expected: "a digit" }),
         _ => panic!("accepted"),
@@ -454,7 +543,7 @@ fn fixed_string_refuses_at_its_bound_and_stays_refused() {
 fn rust_escapes_match_debug_on_ascii() {
     blaze_sim::check(Config::cases(500), |tape: &Tape| {
         let bytes: StdVec<u8> = (0..tape.below(40, "len")).map(|_| u8::try_from(tape.below(128, "byte")).unwrap_or(0)).collect();
-        let s = StdString::from_utf8(bytes).map_err(|e| Broke::Harness(format!("{e}")))?;
+        let s = StdString::from_utf8(bytes).map_err(|e| Broken::Harness(format!("{e}")))?;
         same("escaped", &s, text(|o| _ = o.escaped(&s)), format!("{s:?}"))
     });
 }
@@ -487,7 +576,7 @@ fn human_units() {
 
 #[test]
 fn show_and_columns() {
-    let mut v: Vec<u32, Global> = Vec::new_in(Global);
+    let mut v: Vec<u32, Heap> = Vec::new_in(heap());
     for x in [1, 2, 3] {
         v.push(x);
     }
@@ -591,12 +680,19 @@ const SHAPES: [Shape; 4] = [
     Shape::Many(65_535, i64::MIN, '\''),
 ];
 
-fn debug_oracle<T: core::fmt::Debug>(x: &T) -> Result<(), Broke> { let ours = text(|o| _ = o.debug(x));
-let core = format!("{x:?}");
-match ours == core {
-    true => Ok(()),
-    false => Err(Broke::Oracle(format!("blaze-text's debug form wrote {ours:?}, `{{:?}}` {core:?}"))),
-} }
+fn debug_oracle<T: core::fmt::Debug>(x: &T) -> Result<(), Broken<TextBroken>> {
+    debug_oracle_planted(x, NoPlant)
+}
+
+/// The debug form against `{:?}`; the walk takes `plant` ([`NoPlant`] for the clean run).
+fn debug_oracle_planted<T: core::fmt::Debug>(x: &T, plant: impl Planted<TextPlant>) -> Result<(), Broken<TextBroken>> {
+    let ours = text(|o| crate::debug::debug_planted(x, o, plant));
+    let core = format!("{x:?}");
+    match ours == core {
+        true => Ok(()),
+        false => Err(Broken::Oracle(TextBroken::Debug { ours, core })),
+    }
+}
 
 fn everything(tape: &Tape) -> Everything {
     static SLICES: [&[i16]; 3] = [&[], &[-1], &[1, -32768, 32767]];
@@ -669,10 +765,32 @@ fn debug_form_matches_derive_debug() {
     blaze_sim::check(Config::cases(1000), |tape: &Tape| debug_oracle(&everything(tape)));
 }
 
+blaze_sim::plants! {
+    /// The bug planted in the debug walk, with the invariant of the debug oracle that must catch
+    /// it.
+    enum DebugControl breaks TextBroken {
+        /// The walk as it is.
+        None,
+        /// Every named field written as `field`: the form is not `{:?}`'s.
+        DebugFieldNameLost => TextBroken::Debug { .. },
+    }
+}
+
+impl DebugControl {
+    /// The crate's plant this control plants.
+    fn planted(self) -> TextPlant {
+        match self {
+            DebugControl::None => TextPlant::None,
+            DebugControl::DebugFieldNameLost => TextPlant::DebugFieldNameLost,
+        }
+    }
+}
+
 #[test]
-fn the_debug_oracle_catches_a_lost_field_name() {
-    let run = |tape: &Tape, p: Plant| plant::with(p, || debug_oracle(&everything(tape)));
-    blaze_sim::control(Config::cases(50), Plant::Clean, Plant::DebugFieldNameLost, "blaze-text's debug form wrote", run);
+fn every_debug_plant_is_caught_by_its_invariant() {
+    controls(Config::cases(50), |tape, plant: DebugControl| {
+        debug_oracle_planted(&everything(tape), plant.planted())
+    });
 }
 
 struct Celsius(f64);
@@ -689,10 +807,10 @@ fn debug_form_takes_a_types_own_and_owned_collections() {
     struct Reading {
         at: u32,
     }
-    let mut v: Vec<Reading, Global> = Vec::new_in(Global);
+    let mut v: Vec<Reading, Heap> = Vec::new_in(heap());
     v.push(Reading { at: 1 });
     v.push(Reading { at: 2 });
-    let mut s = String::new_in(Global);
+    let mut s = String::new_in(heap());
     s.push_str("hi\n");
     assert_eq!(text(|o| _ = o.debug(&v)), "[Reading { at: 1 }, Reading { at: 2 }]");
     assert_eq!(text(|o| _ = o.debug(&s)), "\"hi\\n\"");
@@ -713,17 +831,18 @@ fn text_in_and_show_with_match_format() {
         let x = tape.f64("x");
         let name = *tape.one_of(&["", "a", "naïve", "tab\t"], "name");
         let want = format!("{name}: {n} of {x} ({:?})", name);
-        let grown = crate::text_in(Global, |out| out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
-        let exact = crate::text_exact_in(Global, |out| out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
+        let grown = crate::text_in(heap(), |out| out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
+        let exact = crate::text_exact_in(heap(), |out| out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
         let later = crate::show_with(|out| _ = out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
         let shown = text(|o| _ = o.show(&later));
         for (what, got) in [("text_in", grown.as_str()), ("text_exact_in", exact.as_str()), ("show_with", shown.as_str())] {
             if got != want {
-                return Err(Broke::Oracle(format!("{what} wrote {got:?}, format! {want:?}")));
+                let (value, got, want) = (format!("{n}, {x}, {name:?}"), StdString::from(got), want.clone());
+                return Err(Broken::Oracle(TextBroken::Wrote { what, value, got, want }));
             }
         }
         if exact.capacity() != exact.len() {
-            return Err(Broke::Oracle(format!("text_exact_in kept {} bytes for {}", exact.capacity(), exact.len())));
+            return Err(Broken::Oracle(TextBroken::NotExact { capacity: exact.capacity(), len: exact.len() }));
         }
         Ok(())
     });

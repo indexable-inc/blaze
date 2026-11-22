@@ -96,7 +96,8 @@ ever stale. The three strings are deleted in one batch:
 **What a row is.** The digest of the source of the crates the producer is made of: its root
 crates and every workspace crate they depend on, transitively (normal and build dependencies;
 dev-dependencies are not in the binary); for a dependency from outside the workspace, its name,
-version and checksum from `Cargo.lock`; the pinned toolchain file (`harness/toolchain`).
+version and checksum from `Cargo.lock`; every file under the pins folder (`pins/`, the pinned toolchain's facts, which blaze-pins
+includes from outside its own directory).
 
 **Which crates are roots.** Declared in the root crate's own manifest, never in a list kept
 elsewhere:
@@ -133,7 +134,7 @@ top-level `tests/`, `benches/`, `examples/` and `target/` and any name starting 
 root, length, bytes); then the `[workspace.dependencies]` entries the closure names (each value
 whole, so a header-form entry counts), `[workspace.package] edition`, the lock rows (name,
 version, source, checksum) of every outside crate reached and, transitively, of theirs, and the
-toolchain file. A lock row with no source is a path crate (a `[patch]` under vendor/, which the
+files under `pins/`. A lock row with no source is a path crate (a `[patch]` under vendor/, which the
 walk reads like a path dependency): it joins the closure and is digested by its files. An
 `optional = true` dependency the lock lacks is one no feature turned on: not built, not an input.
 A name a closure reaches that the lock lacks (the lock and the sources of different moments, as
@@ -144,7 +145,7 @@ step stops the build; nothing in it panics. Nothing of the machine (rule 25). Th
 for a file or a listing by workspace-relative path, the driver answers), tested on an in-memory
 tree. It writes `$OUT_DIR/producer_sources.rs` (a `Sources` value of row names and digests,
 rewritten only when its bytes change) and `cargo::rerun-if-changed` for the root manifest, the
-lock, the toolchain file, every crate manifest it read, and each top-level entry (`src`,
+lock, the pins folder, every crate manifest it read, and each top-level entry (`src`,
 `build.rs`, ...) of each crate in a closure, never their `tests/`. The entry includes it
 (blaze-cli `src/producers.rs`) and calls `Producers::of_sources(build_id, &SOURCES)`.
 

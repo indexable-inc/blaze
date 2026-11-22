@@ -19,7 +19,7 @@ use blaze_consteval::{
 };
 use blaze_ids::ContentId;
 use blaze_typeck::{Checked, ConstHolds, Fetch, PTys};
-use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, StaticItem, Subst, instance_key};
+use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, StaticItem, Subst};
 /// The profile's overflow setting every build entry here takes (D101), for callers that do not
 /// name blaze-build.
 pub use blaze_build::OverflowChecks;
@@ -28,11 +28,11 @@ use blaze_emit::{Code, EmitError, Isa, Os, Via};
 use blaze_own::Alloc;
 use blaze_typeck::{
     Adt, CheckError, DiagCode, ExprId, InferCtx, ItemKey, LangItem, List, Mutbl, Needs, Outcome, PNode, PTy, PatId, PortableTys,
-    ResolveError, resolve_instance, select_impl,
+    ResolveError,
 };
 
 use crate::front::{At, BlazeAttrs, FnKind, FnLang, Front, HOSTED_START};
-use crate::crates::{CratesError, Inputs, Toolchain};
+use crate::crates::{CratesError, Inputs};
 use crate::program_texts::ProgramTexts;
 use crate::front2::program::{Front2Program, Front2Refusal};
 use crate::seam::FrontEnd;
@@ -688,9 +688,14 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
 
 /// Every `const` item's value, evaluated once each with what it reads settled first, as the
 /// build reads it: the record's bytes in the build's allocator.
-fn eval_consts<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> Result<Vec<(ItemKey, DataRecord<Global>), Global>, RunError> {
+fn eval_consts<P: FrontEnd>(
+    program: &P,
+    checked: &[Option<Checked<'static>>],
+    ground: &mut PortableTys<'_>,
+    static_instances: &mut blaze_hash::HashMap<InstanceKey, Instance, Alloc<'static>>,
+    alloc: Alloc<'static>,
+) -> Result<Vec<(ItemKey, DataRecord<Global>), Global>, RunError> {
     let mut world = FrontConsts { program, checked, store: Vec::new_in(Global) };
-    let mut ground = PortableTys::new_in(alloc);
     let mut layout = Layouts::new_in(alloc);
     let mut codes = Codes::new_in(alloc);
     let mut out = Vec::new_in(Global);
@@ -704,7 +709,7 @@ fn eval_consts<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], a
         let mut settle = Settle::new(Need { kind: NeedKind::Value, item: function.key, args: List::EMPTY }, 64, alloc);
         let mut last = None;
         while let Some(n) = settle.next() {
-            let step = match value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc) {
+            let step = match value_of(&world, &mut layout, &mut codes, n.item, n.args, ground, Limits::DEFAULT, alloc) {
                 Ok(Answer::Done(record)) => {
                     last = Some(record.key);
                     if !world.store.iter().any(|r| r.key == record.key) {
@@ -725,6 +730,9 @@ fn eval_consts<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], a
                 range: None,
             });
         };
+        if matches!(function.kind, FnKind::Static) {
+            static_instances.extend(record.fns.iter().map(|named| (named.key, named.instance)));
+        }
         let mut allocs = Vec::with_capacity_in(record.data.allocs.len(), Global);
         for a in record.data.allocs.iter() {
             let mut bytes = Vec::with_capacity_in(a.bytes.len(), Global);
@@ -1145,20 +1153,6 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// `ConstNeed::Promoted`), as a const block's is.
     fn promoted_value(&self, owner: ItemKey, borrow: blaze_typeck::ExprId, args: &[PTy]) -> Option<&DataRecord<Global>> {
         self.4.const_at.get(crate::front2::const_at::ConstNeed::Promoted { owner, borrow }, args)
-    }
-
-    /// A plain fn item's instance key exactly as the build loop keys it (`key_of` in
-    /// [`build_from`]: the item's code identity, `FrontEnd::code_of`, the identity the
-    /// evaluator's fn pointers take, consts.rs `item_code_id`; then the arguments and what the
-    /// fn's projections normalize to there). A promoted operand names only fn items by path
-    /// (blaze-build walk/promote.rs), never a closure's or a shim's instance.
-    fn promoted_fn_key(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<InstanceKey> {
-        let c = self.0.fn_index(instance.item)?;
-        if self.0.function(c).key != instance.item {
-            return None;
-        }
-        let from = self.4.checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
-        blaze_build::instance_key_normalized(self.0.code_of(c), instance.args, from, ground, self, self.4.alloc).ok()
     }
 
     /// The fn instance a constant's record names by key (`DataTarget::Fn(key)`: `const F: fn()
@@ -2093,14 +2087,15 @@ fn build_from<P: FrontEnd>(
     // borrow of it, taken again in each step of the loop and after it.
     let program_mut = program;
     let program = &*program_mut;
-    let consts = eval_consts(program, &checked, alloc)?;
+    let mut ground = PortableTys::new_in(alloc);
+    let mut static_instances = blaze_hash::HashMap::new_in(alloc);
+    let consts = eval_consts(program, &checked, &mut ground, &mut static_instances, alloc)?;
     let langs = BackLangs::of(program)?;
     // `Clone::clone` at a tuple, closure, fn item or fn pointer: built (clone_shim.rs).
     let clones = crate::clone_shim::Clones::of(program).map_err(RunError::Lang)?;
-    let (image, mut tls_vars) = static_image(program, &consts, survey.survey.as_deref_mut())?;
+    let (mut image, mut tls_vars) = static_image(program, &consts, survey.survey.as_deref_mut())?;
     // The rows the descriptor holds: a thread-local first numbered past them has none.
     let tls_rows = tls_vars.as_ref().map_or(0, TlsVars::len);
-    let mut ground = PortableTys::new_in(alloc);
     // The program's compiler_builtins soft-float routines (front2/builtins_shim.rs), found once
     // a build and bound in every instance as the record walk's maker binds them
     // (run/make_one.rs `Work::routines`): one rule for both paths. A front end that does not
@@ -2158,7 +2153,6 @@ fn build_from<P: FrontEnd>(
         blaze_build::instance_key_normalized(code, args, from, ground, facts, alloc).map_err(fail)
     };
     let key_of = |program: &P, c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| key_with(program, program.code_of(c), c, instance, ground, facts);
-    let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
     // Slot `n` is the `n`th instance reached; `keys[n]` its key, by which instances are told apart.
     let mut reached = Reached {
         instances: Vec::with_capacity_in(program.fn_count(), Global),
@@ -2223,38 +2217,35 @@ fn build_from<P: FrontEnd>(
         }
     }
     // A build that runs: each fn a static points at is reached as the entry is (a static's fn
-    // pointer is called through the static, which no walk step sees). The image names it by
-    // its instance key alone; a fn with no generics is found by that key, in the program's fn
-    // order, only while a key is unfound. A generic instance is not found here: its slot is a
-    // stub ([`static_fn_slots`], [`RunError::StaticFn`]).
+    // pointer is called through the static, which no walk step sees). The transient image's key
+    // is the evaluator's key, so resolve it to the instance and normalize it exactly as the
+    // build's own slot key before placement. A missing descriptor or untabled body remains a
+    // static-fn stub and keeps the named first-call refusal in [`static_fn_slots`].
     if survey.stubs.is_some()
-        && let Some(image) = image.as_ref()
+        && let Some(image) = image.as_mut()
     {
-        let mut wanted: Vec<InstanceKey, Global> = Vec::new_in(Global);
-        wanted.extend(image.relocs.iter().filter_map(|r| match r.target {
-            ImageTarget::Fn(key) => Some(key),
-            ImageTarget::Image(_) => None,
-        }));
-        wanted.sort_unstable();
-        wanted.dedup();
-        wanted.retain(|key| !reached.keys.contains(&Some(*key)));
-        for c in 0..program.fn_count() {
-            if wanted.is_empty() {
-                break;
-            }
-            if program.function(c).body.is_none() || checked[c].is_none() || generic(program, c) {
-                continue;
-            }
-            let instance = Instance { item: program.function(c).key, args: List::EMPTY };
-            // A fn whose key cannot be made is no static's target: the evaluator made a key for
-            // each target, and a key this walk cannot make is refused when a call reaches it.
-            let Ok(key) = key_of(program, c, instance, &mut ground, &keyer) else { continue };
-            if let Ok(i) = wanted.binary_search(&key) {
-                wanted.remove(i);
-                reached.instances.push(instance);
-                reached.tabled.push(c);
-                reached.keys.push(Some(key));
-            }
+        let mut canonical = blaze_hash::HashMap::new_in(alloc);
+        for reloc in &mut image.relocs {
+            let ImageTarget::Fn(key) = reloc.target else { continue };
+            let reached_key = match canonical.get(&key) {
+                Some(&known) => known,
+                None => {
+                    let target = if program.evaluates_at_args() {
+                        program.const_fn_instance(key, &mut ground, alloc)
+                    } else {
+                        static_instances.get(&key).copied()
+                    };
+                    let Some(instance) = target else { continue };
+                    let tabled = make_one::static_fn_tabled(program, instance, ground.view());
+                    let Some(c) = program.fn_index(tabled) else { continue };
+                    let facts = FrontAdts(program, c, &consts, &langs, &checked_bodies);
+                    let normalized = key_of(program, c, instance, &mut ground, &facts)?;
+                    reached.slot(instance, c, normalized)?;
+                    canonical.insert(key, normalized);
+                    normalized
+                }
+            };
+            reloc.target = ImageTarget::Fn(reached_key);
         }
     }
     let mut bodies = Vec::with_capacity_in(program.fn_count(), Global);
@@ -2972,7 +2963,7 @@ fn build_from<P: FrontEnd>(
             // which emits them itself; no record is made. The walk goes on to the slots it filled.
             if let Some(seen) = run.seen.as_deref_mut() {
                 let function = format!("{}", name());
-                seen.seen(&function, parts.symbol, &built.func, &names);
+                seen.seen(&function, parts.symbol, built.func.verified(), &names);
                 run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: function.into_boxed_str(), found: false });
                 continue;
             }
@@ -2987,7 +2978,7 @@ fn build_from<P: FrontEnd>(
                 run.reads.ask_resolve(called, resolved, ground.view(), alloc);
             }
             let reads = run.reads.seal(&mut ground, alloc).map_err(|e| fail(CodeRecordError::Reads(e)))?;
-            let entry = crate::code_records::make_entry_reading(&built.func, &names, routines, &mut declared, &reads, run.builder.isa, alloc)
+            let entry = crate::code_records::make_entry_reading(built.func.verified(), &names, routines, &mut declared, &reads, run.builder.isa, alloc)
                 .map_err(fail)?;
             // Put under its content key, and its code key pointed at it: an entry built again
             // after a stale one replaces the pointer, never the bytes under a key.
@@ -3029,7 +3020,7 @@ fn build_from<P: FrontEnd>(
             }
         }
         let mut code = Code::new_in(Global);
-        if let Err(error) = blaze_emit::emit_with_routines(built.func.view(), &via, &places, isa(), &mut code) {
+        if let Err(error) = blaze_emit::emit_with_routines(built.func.verified(), &via, &places, isa(), &mut code) {
             let refusal = match error {
                 blaze_emit::EmitError::Legalize(blaze_lir::legalize::LegalizeError::NoRoutine(routine)) => RunError::CodeRecord {
                     function: name(),
@@ -3128,7 +3119,7 @@ fn build_from<P: FrontEnd>(
                     targets.push(Target::Symbol((*name).into()));
                 }
                 let mut code = Code::new_in(Global);
-                blaze_emit::emit(func.view(), &via, isa(), &mut code).map_err(|error| RunError::Emit { function: named(), error })?;
+                blaze_emit::emit(func.verified(), &via, isa(), &mut code).map_err(|error| RunError::Emit { function: named(), error })?;
                 bodies.push(Body {
                     code,
                     targets,

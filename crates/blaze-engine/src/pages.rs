@@ -8,35 +8,59 @@
 //! Every field little-endian and fixed-width; a name is its kind byte and its 32-byte subject.
 //!
 //! ```text
-//! root = "BER1" | serial u64 | bits u8 | bytes u64 | pages u32 (= 1 << bits) | pages x key [32]
-//!        (a page with nothing on it: the zero key, no record)
-//! page = "BEP2" | bits u8 | index u32 | 7 x count u32 | the seven sections, in this order:
+//! root = "BER3" | serial u64 | bits u8 | bytes u64 | pages u32 (= 1 << bits) | pages x key [32]
+//!        | outline count | file plan digests | file places | units | findings | owed tasks
+//!        | owed cells
+//! file places = count u32 | count x (file | unit | edition u8 | flags u8), by file, strictly
+//!        ([`FilePlace`]: one a source file the driver planned, each file of the plan digests)
+//! page = "BEP5" | bits u8 | index u32 | 8 x count u32 | (n + 1) x start u32 | the eight
+//!        sections, where n is the counts' sum, start j is entry j's first byte in the page
+//!        (entries numbered across the sections in order) and start n is the page's length;
+//!        the sections, in this order:
 //!   rows        name | key | stage u8 | wave u16 | file | source | out | serial u64 |
-//!               findings u32 | flags u8 (1 inline, 2 failed) | defines u32 | reads u32 |
-//!               defines x (cell [16], digest) | reads x (cell id, digest)
+//!               findings u32 | flags u8 (1 inline, 2 failed, 4 indexed) | defines u32 | reads u32 |
+//!               defines x (cell [16], digest) | reads x (cell id, digest) | if indexed: reads x u32
 //!   cells       cell id | digest | gen u64
 //!   owed cells  cell id | gen u64
 //!   owed tasks  name | stage u8 | wave u16 | source | file
-//!   files       file | names u32 | names x name
+//!   files       file | members u32 | members x (name | standing u8 | key | phase | source)
 //!   causes      name | gen u64 | tag u8 | cell id | was | now   (tag: new, key moved,
 //!               read moved, owed, inline; the cell and digests zero but for a moved read)
 //!   records     name | key   (the store key of the record the row's last entry made: the
 //!               driver's, which a later request reads a row that stands by)
+//!   readers     cell id | count u32 | count x reader name
 //! cell id = name (its task) | cell [16]
 //! ```
 //!
 //! Each section sorted by its first field, strictly; an entry is on the page of its first
-//! field's name (a cell's: its task's). So everything about one task is on one page, and an edit
-//! rewrites the pages of the tasks it entered and nothing else ([`encode`] puts only pages whose
-//! key is not the last root's). The reverse index ([`Answer::readers`]) and the rows with
-//! findings are the rows' own facts and are made again on [`decode`], never stored twice.
+//! field's name (a cell's: its task's), but for a readers entry, which is on its cell's own
+//! page ([`readers_slot`]). So everything about one task but who reads its cells is on one page,
+//! and an edit rewrites the pages of the tasks it entered and of the cells whose readers it
+//! moved, and nothing else ([`encode`] puts only pages whose key is not the last root's).
+//! [`encode_changes`] merges the request's overlay into only the affected pages and carries
+//! every other key forward. The reverse index is keyed by cell so the engine finds a moved
+//! cell's readers directly after a restart, one page a cell, and a reader added to one list of
+//! a task that many read rewrites that list's page, not the page of every list the task has.
 //!
 //! # Checked once (rule 74)
 //!
-//! [`decode`] checks each page's bytes against the key that named it (a flipped bit or a cut
-//! write is [`PagesError::Digest`]), then every count, kind byte, order and page membership. A
-//! refusal names the page and the section (rule 19); the caller reports it and answers fresh
-//! (rule 3: a stated path, never a quiet one).
+//! The threat is a write torn by a crash or a disk's error, not an attacker. Every record the
+//! pages read comes as a [`Sealed`]: its bytes with how they are known to be the ones put under
+//! their key. [`Sealed::by_store`] takes the store's proof ([`StoreProof`]: blaze-cli
+//! plain_place.rs `Checked`), which the store earns once a boot for a whole segment (blaze-cas
+//! plain verified.rs: written or checked whole in this boot, sealed by a barrier before the flip
+//! that named it, or checked whole at its first read after a reboot, BLAKE3 over every byte),
+//! so a page read through it hashes nothing. [`Sealed::hashed`] hashes every byte against the
+//! key: for bytes with no store behind them (the simulations, a `--verify` read), and a
+//! mismatch is [`PagesError::Digest`]. A fetched record keeps its own check at its fetch.
+//!
+//! The structure is covered by the same proof: the writer puts each entry's start in the page's
+//! head, so [`VerifiedPage::open`] checks the head alone (form, bits, index, that the start table
+//! fits and ends at the page's length) and walks nothing. [`VerifiedPage::open_whole`] walks
+//! every entry (each count, kind byte, order, page membership, and each start against the walk)
+//! for an explicit verify and for [`decode`]'s exhaustive read. A refusal names the page and the
+//! section (rule 19); the caller reports it and answers fresh (rule 3: a stated path, never a
+//! quiet one).
 //!
 //! # Durable order (rule 43; simulated in pages_sim.rs)
 //!
@@ -55,16 +79,66 @@ use blaze_own::{BTreeMap, BTreeSet, SharedAlloc, Vec};
 
 use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Row, SMap, SVec, Stage};
 
-/// A page's form. A page of another form is never read: it is a [`PagesError::Magic`].
-pub const PAGE_MAGIC: &[u8; 4] = b"BEP2";
-/// The root's form.
-pub const ROOT_MAGIC: &[u8; 4] = b"BER1";
+mod view;
+mod changes;
+mod headers;
+pub use headers::{Header, HeaderPages, Headers, HeadersPlant, IndexedHeaders, Writer};
+pub use changes::{encode_changes, plan_digest};
+pub use view::{StoredDefines, StoredNames, StoredReads, StoredRow, VerifiedPage};
+
+/// A page's form. A page of another form is never read: it is a [`PagesError::Magic`]. `BEP3`
+/// had no start table: each open walked every entry to find them. `BEP4` kept a cell's readers
+/// on its task's page, so every cell of a task many read (a std crate's names) shared one page
+/// of every reader of them all, and a body that gained or lost one read of one such cell put
+/// that whole page again (tempo, a refused body's read list moved: 7 pages, 68 MB hashed, the
+/// commit 108 ms against the phase path's 15). `BEP5` places it by [`readers_slot`].
+pub const PAGE_MAGIC: &[u8; 4] = b"BEP5";
+
+/// The name whose page ([`page_of`]) holds `id`'s readers entry: a placement key, never a task's
+/// name. Its subject is the task's with its first eight bytes replaced by a mix of the task's
+/// first word, its kind and the cell's two words (splitmix64's finalizer over a fold, part of the
+/// form: two builders place one cell on one page, rule 25), so the cells of one task are spread
+/// over the pages like the tasks are, and a change to one cell's readers rewrites the page of
+/// that one list and not of every list its task defines.
+pub fn readers_slot(id: &CellId) -> Name {
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+    let mut subject = id.of.subject.0;
+    let mut h = word(&subject[..8]) ^ (id.of.kind as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^= word(&id.cell.0[..8]).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= word(&id.cell.0[8..]).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    subject[..8].copy_from_slice(&h.to_be_bytes());
+    Name::new(id.of.kind, ContentId(subject))
+}
+/// The root's form. `BER2` had no file places ([`FilePlace`]): a root of it is a
+/// [`PagesError::Magic`], reported, and the answer made again (D160), never read as this one.
+pub const ROOT_MAGIC: &[u8; 4] = b"BER3";
+
+/// Where the driver found a source file of its plan, kept beside the file's plan digest in the
+/// root ([`Root::places`]) so an edit of the file re-plans it alone (D187): the file's own walk
+/// from its crate's root, which the driver made to reach it, is not made again. The engine keeps
+/// it and never reads it: its fields are the driver's (blaze-cli engine_check.rs `plan`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FilePlace {
+    /// The root file of the crate target whose module tree reached it first.
+    pub unit: Name,
+    /// The edition byte its crate's part gave it.
+    pub edition: u8,
+    /// The driver's own flags of it.
+    pub flags: u8,
+}
+
+const FILE_PLACE: usize = NAME + NAME + 2;
 
 const NAME: usize = 1 + 32;
 const ID: usize = 32;
 const CELL: usize = 16;
 const CELL_ID: usize = NAME + CELL;
-const SECTIONS: usize = 7;
+const SECTIONS: usize = 8;
 const ROWS: usize = 0;
 const CELLS: usize = 1;
 const OWED_CELLS: usize = 2;
@@ -72,7 +146,8 @@ const OWED_TASKS: usize = 3;
 const FILES: usize = 4;
 const CAUSES: usize = 5;
 const RECORDS: usize = 6;
-const SECTION_NAMES: [&str; SECTIONS] = ["rows", "cells", "owed cells", "owed tasks", "files", "causes", "records"];
+const READERS: usize = 7;
+const SECTION_NAMES: [&str; SECTIONS] = ["rows", "cells", "owed cells", "owed tasks", "files", "causes", "records", "readers"];
 const HEAD: usize = 4 + 1 + 4 + 4 * SECTIONS;
 const ROW_FIXED: usize = NAME + ID + 1 + 2 + NAME + ID + ID + 8 + 4 + 1 + 4 + 4;
 const DEFINE: usize = CELL + ID;
@@ -80,6 +155,7 @@ const READ: usize = CELL_ID + ID;
 const CELL_ENTRY: usize = CELL_ID + ID + 8;
 const OWED_CELL: usize = CELL_ID + 8;
 const OWED_TASK: usize = NAME + 1 + 2 + ID + NAME;
+const FILE_MEMBER: usize = NAME + 1 + ID + 3 + ID;
 const CAUSE: usize = NAME + 8 + 1 + CELL_ID + ID + ID;
 const ROOT_HEAD: usize = 4 + 8 + 1 + 8 + 4;
 /// The page index a root's own errors name.
@@ -87,6 +163,87 @@ pub const ROOT_PAGE: u32 = u32::MAX;
 
 const INLINE: u8 = 1;
 const FAILED: u8 = 2;
+const INDEXED: u8 = 4;
+
+/// What a store's read returns beside a record's bytes as its proof that they are the bytes put
+/// under the key asked, whole (rule 74, rule 76): earned once a boot for the segment holding
+/// them, never per read (the module docs, "Checked once"). Implemented by the one store proof a
+/// driver holds (blaze-cli plain_place.rs `Checked`, made only there) and by the simulations'.
+/// Its meaning is the implementor's promise: nothing here can check it, so nothing else
+/// implements it.
+pub trait StoreProof: Copy {}
+
+/// How a [`Sealed`] record's bytes are known to be its key's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Check {
+    /// The store's proof ([`Sealed::by_store`]): no byte read.
+    Store,
+    /// Every byte hashed here ([`Sealed::hashed`]).
+    Hashed,
+}
+
+/// A record's bytes that are the ones put under `key`, and how that is known: the one input of
+/// [`decode_root`], [`VerifiedPage::open`] and [`IndexedHeaders::open`]. Made only by
+/// [`Sealed::by_store`] (a store's proof) or [`Sealed::hashed`] (a hash of every byte).
+#[derive(Clone, Copy, Debug)]
+pub struct Sealed<'b> {
+    key: Key,
+    bytes: &'b [u8],
+    check: Check,
+}
+
+/// Bytes that are not their key's: a write a crash cut short or a disk's flipped bit, found by
+/// [`Sealed::hashed`]. [`Torn::at`] names the page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Torn {
+    pub want: Key,
+    pub got: Key,
+}
+
+impl Torn {
+    /// The refusal of page `page` ([`ROOT_PAGE`] for the root).
+    pub fn at(self, page: u32) -> PagesError {
+        PagesError::Digest { page, want: self.want, got: self.got }
+    }
+}
+
+impl<'b> Sealed<'b> {
+    /// `bytes` as a store's read returned them for `key`, with its proof: nothing is hashed.
+    pub fn by_store<P: StoreProof>(key: Key, bytes: &'b [u8], _proof: P) -> Sealed<'b> {
+        Sealed { key, bytes, check: Check::Store }
+    }
+
+    /// `bytes` hashed whole against `key` (BLAKE3, the key's own form): for bytes no store
+    /// proves, and for an explicit verify.
+    pub fn hashed(key: Key, bytes: &'b [u8]) -> Result<Sealed<'b>, Torn> {
+        let got = content_key(bytes);
+        if got != key {
+            return Err(Torn { want: key, got });
+        }
+        Ok(Sealed { key, bytes, check: Check::Hashed })
+    }
+
+    pub fn key(&self) -> Key {
+        self.key
+    }
+
+    pub fn bytes(&self) -> &'b [u8] {
+        self.bytes
+    }
+
+    pub fn check(&self) -> Check {
+        self.check
+    }
+
+    /// The bytes this record's making hashed: all of them for [`Sealed::hashed`], none for the
+    /// store's proof (the profile's `pages: N read, M bytes, K hashed`).
+    pub fn hashed_bytes(&self) -> usize {
+        match self.check {
+            Check::Store => 0,
+            Check::Hashed => self.bytes.len(),
+        }
+    }
+}
 
 /// What a request keeps: the engine's answer, and why each row's task was last entered and in
 /// which request (`blaze why` walks these back to the edit).
@@ -96,11 +253,15 @@ pub struct Kept<'a> {
     /// Each row's record in the store, by the key the driver put it under (one a row that
     /// stands is read by); the engine never reads it. One whose row went is not stored.
     pub records: SMap<'a, Name, Key>,
+    /// The places of the source files this request planned ([`FilePlace`]): every one the
+    /// phase path walked, or only the edited ones on the ready path. A file not here keeps the
+    /// last root's place ([`encode_changes`]); a file the root no longer plans keeps none.
+    pub places: SMap<'a, Name, FilePlace>,
 }
 
 impl<'a> Kept<'a> {
     pub fn new_in(alloc: SharedAlloc<'a>) -> Kept<'a> {
-        Kept { answer: Answer::new_in(alloc), causes: BTreeMap::new_in(alloc), records: BTreeMap::new_in(alloc) }
+        Kept { answer: Answer::new_in(alloc), causes: BTreeMap::new_in(alloc), records: BTreeMap::new_in(alloc), places: BTreeMap::new_in(alloc) }
     }
 
     /// The request's answer kept with its causes over the last ones: each entered task's cause
@@ -109,7 +270,8 @@ impl<'a> Kept<'a> {
         for one in entered.iter() {
             causes.insert(one.name, (answer.serial, one.cause));
         }
-        Kept { answer, causes, records }
+        let places = BTreeMap::new_in(*causes.allocator());
+        Kept { answer, causes, records, places }
     }
 }
 
@@ -119,6 +281,10 @@ impl<'a> Kept<'a> {
 pub enum PagesError {
     /// The store has no record of the key the root names.
     Missing { page: u32, key: Key },
+    /// The page key selected a CAS pointer instead of a record.
+    PageRecord { page: u32, key: Key },
+    Base { serial: Gen },
+    Reach { owner: Key, index: Key, what: &'static str },
     /// The bytes are not the key's: a flipped bit, or a write a crash cut short.
     Digest { page: u32, want: Key, got: Key },
     /// Another form's magic, or a page another root's (its bits or index not the root's).
@@ -135,6 +301,17 @@ pub enum PagesError {
     Misplaced { page: u32, section: &'static str, name: Name },
     /// A root whose page count is not `1 << bits`, or whose bits pass the most.
     Count { page: u32, count: u32 },
+    /// A row's observations exceed the engine's supported limit.
+    Reads { page: u32, at: u32, count: u32 },
+    /// Applying a page edit would overflow or underflow the claimed directory total.
+    Total { page: u32, field: &'static str },
+    /// A page's start table does not delimit its entries: entry `entry`'s start is not where
+    /// the one before it ends (or the table does not begin after itself or end at the page's
+    /// length).
+    Starts { page: u32, entry: u32 },
+    /// Producer header shard `page` was asked of an answer whose index is
+    /// [`Headers::Absent`] (headers.rs): a lookup that should have read the row's page.
+    HeadersAbsent { page: u32, since: Gen },
 }
 
 impl fmt::Display for PagesError {
@@ -144,6 +321,12 @@ impl fmt::Display for PagesError {
             page => write!(f, "the stored answer's page {page}"),
         };
         match self {
+            PagesError::Base { serial } => write!(f, "answer {:?} needs its stored base and request changes for incremental publication", serial),
+            PagesError::Reach { owner, index, what } => write!(f, "answer record {owner:?}, reach index {index:?}: {what}"),
+            PagesError::PageRecord { page: p, key } => {
+                page(f, *p)?;
+                write!(f, " ({key:?}) names a store pointer where a page record is required")
+            }
             PagesError::Missing { page: p, key } => {
                 page(f, *p)?;
                 write!(f, " ({key:?}) is not in the store (blaze-engine pages.rs `decode`)")
@@ -180,6 +363,21 @@ impl fmt::Display for PagesError {
                 page(f, *p)?;
                 write!(f, " names {count} pages, not 1 << its bits (pages.rs `decode`)")
             }
+            PagesError::Reads { page: p, at, count } => {
+                page(f, *p)?;
+                write!(f, " has a row at {at} with {count} reads, past the limit {}", crate::READS_CAP)
+            }
+            PagesError::Total { page: p, field } => {
+                page(f, *p)?;
+                write!(f, " contradicts the answer directory's {field}")
+            }
+            PagesError::Starts { page: p, entry } => {
+                page(f, *p)?;
+                write!(f, ": its start table does not delimit entry {entry} (pages.rs `VerifiedPage::open`)")
+            }
+            PagesError::HeadersAbsent { page, since } => {
+                write!(f, "producer header shard {page} was asked, and the answer has no current shards since request {} (headers.rs `Headers::Absent`): the row's page answers it", since.0)
+            }
         }
     }
 }
@@ -195,10 +393,26 @@ pub struct Encoded<'a> {
     pub pages: SVec<'a, Key>,
     /// The records not under the last root, every page before the root (the durable order).
     pub puts: SVec<'a, (Key, SVec<'a, u8>)>,
+    pub files: u32,
+    pub findings: u32,
+    pub owed: u32,
+    /// Of a commit folded into the last directory ([`encode_changes`]): the entries its delta
+    /// wrote (rows, records, causes, cells, readers, obligations and file plans, each one key
+    /// of one section), and the pages they fell on, each read once as its witness
+    /// (`Ask::Witness`). The pages touched are at most the entries: as the directory grows by
+    /// the world (`bits_kept`), the same entries spread over more pages, never past their
+    /// count, so the witness reads are bounded by the edit's own writes. 0 for a whole encode.
+    pub changed_entries: u32,
+    pub changed_pages: u32,
+    records: SVec<'a, (Key, SVec<'a, (Name, Key)>)>,
     plant: PagesPlant,
 }
 
 impl<'a> Encoded<'a> {
+    /// The complete payload index of each newly written page, for CAS reach.
+    pub fn page_records(&self) -> impl Iterator<Item = (Key, &[(Name, Key)])> {
+        self.records.iter().map(|(key, rows)| (*key, rows.as_slice()))
+    }
     /// The keys the checkout's root names after the puts: the root, then every page with
     /// anything on it, so compaction keeps the whole answer the root reaches.
     pub fn pins(&self, alloc: SharedAlloc<'a>) -> SVec<'a, Key> {
@@ -218,6 +432,15 @@ pub struct Root<'a> {
     pub bits: u8,
     pub bytes: u64,
     pub pages: SVec<'a, Key>,
+    /// File membership and the digest of its standing plan, when every member has a row.
+    pub files: SMap<'a, Name, Option<ContentId>>,
+    /// The place of each source file of `files` the driver planned ([`FilePlace`]).
+    pub places: SMap<'a, Name, FilePlace>,
+    pub units: SVec<'a, Name>,
+    pub findings: SMap<'a, Name, u32>,
+    pub owed_tasks: SMap<'a, Name, Planned>,
+    pub owed_cells: SMap<'a, CellId, Gen>,
+    pub outlines: u32,
 }
 
 fn put_id(out: &mut SVec<'_, u8>, id: &ContentId) {
@@ -243,10 +466,108 @@ fn put_u32(out: &mut SVec<'_, u8>, value: usize) {
     out.extend_from_slice(&u32::try_from(value).expect("a page's counts fit u32 (a page holds about PAGE_BYTES)").to_le_bytes());
 }
 
-/// A page being written: each section's bytes and count.
+fn put_row(out: &mut SVec<'_, u8>, name: Name, row: &Row<'_>) {
+    put_name(out, name);
+    put_id(out, &row.key.0);
+    put_phase(out, row.phase);
+    put_name(out, row.file);
+    put_id(out, &row.source);
+    put_id(out, &row.out);
+    out.extend_from_slice(&row.serial.0.to_le_bytes());
+    out.extend_from_slice(&row.findings.to_le_bytes());
+    // Preserve observation order. Canonically sorted reads are their own index.
+    let indexed = row.by_cell.iter().enumerate().any(|(i, &at)| i != at as usize);
+    out.push(u8::from(row.inline) * INLINE | u8::from(row.failed) * FAILED | u8::from(indexed) * INDEXED);
+    put_u32(out, row.defines.len());
+    put_u32(out, row.reads.len());
+    for (cell, digest) in row.defines.iter() {
+        out.extend_from_slice(&cell.0);
+        put_id(out, digest);
+    }
+    for (id, digest) in row.reads.iter() {
+        put_cell_id(out, id);
+        put_id(out, digest);
+    }
+    if indexed {
+        for at in &row.by_cell { out.extend_from_slice(&at.to_le_bytes()); }
+    }
+}
+
+fn put_cause(out: &mut SVec<'_, u8>, name: Name, serial: Gen, cause: Cause) {
+    put_name(out, name);
+    out.extend_from_slice(&serial.0.to_le_bytes());
+    let (tag, read, was, now) = match cause {
+        Cause::New => (0, None, ContentId([0; 32]), ContentId([0; 32])),
+        Cause::KeyMoved => (1, None, ContentId([0; 32]), ContentId([0; 32])),
+        Cause::ReadMoved { read, was, now } => (2, Some(read), was, now),
+        Cause::Owed => (3, None, ContentId([0; 32]), ContentId([0; 32])),
+        Cause::Inline => (4, None, ContentId([0; 32]), ContentId([0; 32])),
+    };
+    out.push(tag);
+    match read { Some(id) => put_cell_id(out, &id), None => out.extend_from_slice(&[0; CELL_ID]) }
+    put_id(out, &was);
+    put_id(out, &now);
+}
+
+/// A page being written: each section's bytes, and each entry's start in its section's bytes
+/// (an entry's count is its starts'). [`encode`] fills the sections in any order of pages;
+/// [`changes`]' merge fills one page's sections in order. Both finish by [`PageBuf::finish`].
 struct PageBuf<'a> {
-    counts: [usize; SECTIONS],
     parts: [SVec<'a, u8>; SECTIONS],
+    starts: [SVec<'a, usize>; SECTIONS],
+}
+
+impl<'a> PageBuf<'a> {
+    fn new_in(alloc: SharedAlloc<'a>) -> PageBuf<'a> {
+        PageBuf { parts: core::array::from_fn(|_| Vec::new_in(alloc)), starts: core::array::from_fn(|_| Vec::new_in(alloc)) }
+    }
+
+    /// The bytes of a new entry of `section`, appended by the caller.
+    fn entry(&mut self, section: usize) -> &mut SVec<'a, u8> {
+        self.starts[section].push(self.parts[section].len());
+        &mut self.parts[section]
+    }
+
+    fn entries(&self) -> usize {
+        self.starts.iter().map(|starts| starts.len()).sum()
+    }
+
+    /// The page in its form: its head, its start table, its sections. `None` when it holds
+    /// nothing (a root names no page there).
+    fn finish(&self, bits: u8, index: u32, alloc: SharedAlloc<'a>) -> Option<SVec<'a, u8>> {
+        let entries = self.entries();
+        if entries == 0 {
+            return None;
+        }
+        let body_at = starts_end(entries);
+        let len = body_at + self.parts.iter().map(|part| part.len()).sum::<usize>();
+        let mut page: SVec<'a, u8> = Vec::with_capacity_in(len, alloc);
+        page.extend_from_slice(PAGE_MAGIC);
+        page.push(bits);
+        page.extend_from_slice(&index.to_le_bytes());
+        for starts in self.starts.iter() {
+            put_u32(&mut page, starts.len());
+        }
+        let mut at = body_at;
+        for (part, starts) in self.parts.iter().zip(self.starts.iter()) {
+            for start in starts.iter() {
+                put_u32(&mut page, at + start);
+            }
+            at += part.len();
+        }
+        put_u32(&mut page, len);
+        for part in self.parts.iter() {
+            page.extend_from_slice(part);
+        }
+        debug_assert_eq!(page.len(), len, "a page's start table ends at its length");
+        Some(page)
+    }
+}
+
+/// Where a page of `entries` entries in all has its first section: after its head and its
+/// start table of `entries + 1` words.
+fn starts_end(entries: usize) -> usize {
+    HEAD + 4 * (entries + 1)
 }
 
 /// A bug the simulations plant to show their oracles catch it. Always `None` outside the tests.
@@ -279,7 +600,10 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
     }
     total += (CELL_ENTRY * answer.cells.len() + OWED_CELL * answer.owed_cells.len() + OWED_TASK * answer.owed_tasks.len()) as u64;
     for names in answer.by_file.values().filter(|_| files_kept) {
-        total += (NAME + 4 + NAME * names.len()) as u64;
+        total += (NAME + 4 + FILE_MEMBER * names.len()) as u64;
+    }
+    for names in answer.readers.values() {
+        total += (CELL_ID + 4 + NAME * names.len()) as u64;
     }
     total += (CAUSE * kept.causes.keys().filter(|name| has_row(*name)).count()) as u64;
     total += ((NAME + ID) * kept.records.keys().filter(|name| has_row(*name)).count()) as u64;
@@ -287,34 +611,14 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
     let count = 1usize << bits;
     let mut bufs: SVec<'a, PageBuf<'a>> = Vec::with_capacity_in(count, alloc);
     for _ in 0..count {
-        bufs.push(PageBuf { counts: [0; SECTIONS], parts: core::array::from_fn(|_| Vec::new_in(alloc)) });
+        bufs.push(PageBuf::new_in(alloc));
     }
     fn at<'b, 'a>(bufs: &'b mut [PageBuf<'a>], bits: u8, name: Name, section: usize) -> &'b mut SVec<'a, u8> {
-        let buf = &mut bufs[page_of(name, bits) as usize];
-        buf.counts[section] += 1;
-        &mut buf.parts[section]
+        bufs[page_of(name, bits) as usize].entry(section)
     }
     for (name, row) in answer.rows.iter() {
         let out = at(&mut bufs, bits, *name, ROWS);
-        put_name(out, *name);
-        put_id(out, &row.key.0);
-        put_phase(out, row.phase);
-        put_name(out, row.file);
-        put_id(out, &row.source);
-        put_id(out, &row.out);
-        out.extend_from_slice(&row.serial.0.to_le_bytes());
-        out.extend_from_slice(&row.findings.to_le_bytes());
-        out.push(if row.inline { INLINE } else { 0 } | if row.failed { FAILED } else { 0 });
-        put_u32(out, row.defines.len());
-        put_u32(out, row.reads.len());
-        for (cell, digest) in row.defines.iter() {
-            out.extend_from_slice(&cell.0);
-            put_id(out, digest);
-        }
-        for (id, digest) in row.reads.iter() {
-            put_cell_id(out, id);
-            put_id(out, digest);
-        }
+        put_row(out, *name, row);
     }
     for (id, (digest, moved)) in answer.cells.iter() {
         let out = at(&mut bufs, bits, id.of, CELLS);
@@ -334,35 +638,28 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
         put_id(out, &planned.source);
         put_name(out, planned.file);
     }
+    let mut directory = changes::directory(kept, alloc);
     for (file, names) in answer.by_file.iter().filter(|_| files_kept) {
         let out = at(&mut bufs, bits, *file, FILES);
+        let start = out.len();
         put_name(out, *file);
         put_u32(out, names.len());
+        let mut standing = true;
         for name in names.iter() {
-            put_name(out, *name);
+            let claim = answer.rows.get(name).and_then(|row| changes::claim(row, *file, answer.owed_tasks.contains_key(name)));
+            standing &= claim.is_some();
+            changes::put_member(out, *name, claim);
         }
+        directory.files.insert(*file, standing.then(|| changes::file_digest(&out[start..])));
     }
+    // Each planned file's place beside its digest; a place of no file the root plans is not kept.
+    directory.places.extend(kept.places.iter().filter(|(file, _)| directory.files.contains_key(*file)).map(|(&file, &place)| (file, place)));
     for (name, (serial, cause)) in kept.causes.iter() {
         if !has_row(name) {
             continue;
         }
         let out = at(&mut bufs, bits, *name, CAUSES);
-        put_name(out, *name);
-        out.extend_from_slice(&serial.0.to_le_bytes());
-        let (tag, read, was, now) = match cause {
-            Cause::New => (0, None, ContentId([0; 32]), ContentId([0; 32])),
-            Cause::KeyMoved => (1, None, ContentId([0; 32]), ContentId([0; 32])),
-            Cause::ReadMoved { read, was, now } => (2, Some(*read), *was, *now),
-            Cause::Owed => (3, None, ContentId([0; 32]), ContentId([0; 32])),
-            Cause::Inline => (4, None, ContentId([0; 32]), ContentId([0; 32])),
-        };
-        out.push(tag);
-        match read {
-            Some(id) => put_cell_id(out, &id),
-            None => out.extend_from_slice(&[0; CELL_ID]),
-        }
-        put_id(out, &was);
-        put_id(out, &now);
+        put_cause(out, *name, *serial, *cause);
     }
     for (name, key) in kept.records.iter() {
         if !has_row(name) {
@@ -372,47 +669,39 @@ pub fn encode_planted<'a>(kept: &Kept<'_>, last: Option<&Root<'_>>, plant: Pages
         put_name(out, *name);
         put_id(out, &key.0);
     }
+    for (id, names) in &answer.readers {
+        let out = at(&mut bufs, bits, readers_slot(id), READERS);
+        put_cell_id(out, id);
+        put_u32(out, names.len());
+        for &name in names { put_name(out, name); }
+    }
     // Each page whole, keyed by its bytes; put when the last root did not name it.
     let same_paging = last.filter(|root| root.bits == bits);
     let mut pages: SVec<'a, Key> = Vec::with_capacity_in(count, alloc);
     let mut puts: SVec<'a, (Key, SVec<'a, u8>)> = Vec::new_in(alloc);
+    let mut records = Vec::new_in(alloc);
     let mut bytes = 0u64;
     for (index, buf) in bufs.into_iter().enumerate() {
-        if buf.counts.iter().all(|count| *count == 0) {
+        let index32 = u32::try_from(index).expect("a root's pages are 1 << bits, bits at most MOST_BITS");
+        let Some(page) = buf.finish(bits, index32, alloc) else {
             pages.push(Key::default());
             continue;
-        }
-        let len = HEAD + buf.parts.iter().map(|part| part.len()).sum::<usize>();
-        let mut page: SVec<'a, u8> = Vec::with_capacity_in(len, alloc);
-        page.extend_from_slice(PAGE_MAGIC);
-        page.push(bits);
-        put_u32(&mut page, index);
-        for count in buf.counts.iter() {
-            put_u32(&mut page, *count);
-        }
-        for part in buf.parts.iter() {
-            page.extend_from_slice(part);
-        }
+        };
         bytes += page.len() as u64;
         let key = content_key(&page);
         pages.push(key);
         if same_paging.is_none_or(|root| root.pages.get(index) != Some(&key)) {
+            records.push((key, view::page_records(&buf.parts[RECORDS], alloc)));
             puts.push((key, page));
         }
     }
-    let mut root_bytes: SVec<'a, u8> = Vec::with_capacity_in(ROOT_HEAD + ID * count, alloc);
-    root_bytes.extend_from_slice(ROOT_MAGIC);
-    root_bytes.extend_from_slice(&answer.serial.0.to_le_bytes());
-    root_bytes.push(bits);
-    root_bytes.extend_from_slice(&bytes.to_le_bytes());
-    put_u32(&mut root_bytes, count);
-    for key in pages.iter() {
-        put_id(&mut root_bytes, &key.0);
-    }
-    let root = content_key(&root_bytes);
-    puts.push((root, root_bytes));
-    Encoded { serial: answer.serial, bits, bytes, root, pages, puts, plant }
+    directory.serial = answer.serial;
+    directory.bits = bits;
+    directory.bytes = bytes;
+    directory.pages = pages;
+    directory.finish(puts, records, plant, alloc)
 }
+
 
 /// Bytes read in order, each refusal naming its page and offset.
 struct Rd<'b> {
@@ -494,13 +783,10 @@ impl<'b> Rd<'b> {
     }
 }
 
-/// The root's bytes, checked against the key that named it.
-pub fn decode_root<'a>(key: Key, bytes: &[u8], alloc: SharedAlloc<'a>) -> Result<Root<'a>, PagesError> {
-    let got = content_key(bytes);
-    if got != key {
-        return Err(PagesError::Digest { page: ROOT_PAGE, want: key, got });
-    }
-    let mut r = Rd { bytes, at: 0, page: ROOT_PAGE };
+/// The root's bytes, known to be its key's ([`Sealed`]), read whole: a root is one small
+/// record whose every field the request uses, so it is walked, never hashed here.
+pub fn decode_root<'a>(root: Sealed<'_>, alloc: SharedAlloc<'a>) -> Result<Root<'a>, PagesError> {
+    let mut r = Rd { bytes: root.bytes(), at: 0, page: ROOT_PAGE };
     if r.take(4)? != ROOT_MAGIC {
         return Err(PagesError::Magic { page: ROOT_PAGE });
     }
@@ -515,214 +801,49 @@ pub fn decode_root<'a>(key: Key, bytes: &[u8], alloc: SharedAlloc<'a>) -> Result
     for _ in 0..count {
         pages.push(Key(r.id()?));
     }
-    if r.at != bytes.len() {
-        return Err(PagesError::Trailing { page: ROOT_PAGE, at: r.at as u32 });
-    }
-    Ok(Root { serial, bits, bytes: total, pages })
+    changes::read_directory(r, serial, bits, total, pages, alloc)
 }
 
-/// The answer the root `key` names, every record through `get`; each checked once against its
-/// key, then whole (the module docs, "Checked once").
-pub fn decode<'a, 'g>(key: Key, mut get: impl FnMut(Key) -> Option<&'g [u8]>, alloc: SharedAlloc<'a>) -> Result<Kept<'a>, PagesError> {
-    let root_bytes = get(key).ok_or(PagesError::Missing { page: ROOT_PAGE, key })?;
-    let root = decode_root(key, root_bytes, alloc)?;
+
+/// What [`decode`] asks for a key: `None` when the store has no record of it; else the record
+/// as [`Sealed`], or the [`Torn`] that [`Sealed::hashed`] found.
+pub type Got<'g> = Option<Result<Sealed<'g>, Torn>>;
+
+/// The answer the root `key` names, every record through `get`, each known once to be its
+/// key's ([`Sealed`]), then walked whole (the module docs, "Checked once").
+pub fn decode<'a, 'g>(key: Key, mut get: impl FnMut(Key) -> Got<'g>, alloc: SharedAlloc<'a>) -> Result<Kept<'a>, PagesError> {
+    let root = get(key).ok_or(PagesError::Missing { page: ROOT_PAGE, key })?.map_err(|torn| torn.at(ROOT_PAGE))?;
+    let root = decode_root(root, alloc)?;
+    decode_at(&root, get, alloc)
+}
+
+/// Exhaustive read for inspection and tooling that explicitly asks for every row: each page
+/// walked whole ([`VerifiedPage::open_whole`]), as it restores every entry anyway.
+pub fn decode_at<'a, 'g>(root: &Root<'_>, mut get: impl FnMut(Key) -> Got<'g>, alloc: SharedAlloc<'a>) -> Result<Kept<'a>, PagesError> {
     let mut kept = Kept::new_in(alloc);
     kept.answer.serial = root.serial;
-    for (index, key) in root.pages.iter().enumerate() {
-        if *key == Key::default() {
-            continue;
-        }
-        let page = index as u32;
-        let bytes = get(*key).ok_or(PagesError::Missing { page, key: *key })?;
-        let got = content_key(bytes);
-        if got != *key {
-            return Err(PagesError::Digest { page, want: *key, got });
-        }
-        decode_page(bytes, page, root.bits, &mut kept, alloc)?;
+    kept.places.extend(root.places.iter().map(|(&file, &place)| (file, place)));
+    for (index, &key) in root.pages.iter().enumerate() {
+        if key == Key::default() { continue; }
+        let index = index as u32;
+        let sealed = get(key).ok_or(PagesError::Missing { page: index, key })?.map_err(|torn| torn.at(index))?;
+        let page = VerifiedPage::open_whole(sealed, index, root.bits)?;
+        page.restore(&mut kept, alloc);
     }
-    // The reverse index was made again from the rows' reads as they were decoded: each cell's
-    // readers are a set, in order whatever the order the pages came in.
     Ok(kept)
 }
 
-/// One page decoded alone, for the tests of its form's own checks.
+/// The simulations' read of a root they hold as bytes: hashed against its key (no store proves
+/// it), then read.
 #[cfg(test)]
-pub(crate) fn decode_page_for_test(bytes: &[u8], page: u32, bits: u8) -> Result<(), PagesError> {
-    let alloc = blaze_own::testing::heap().shared();
-    let mut kept = Kept::new_in(alloc);
-    decode_page(bytes, page, bits, &mut kept, alloc)
+pub(crate) fn decode_root_hashed<'a>(key: Key, bytes: &[u8], alloc: SharedAlloc<'a>) -> Result<Root<'a>, PagesError> {
+    decode_root(Sealed::hashed(key, bytes).map_err(|torn| torn.at(ROOT_PAGE))?, alloc)
 }
 
-fn decode_page<'a>(bytes: &[u8], page: u32, bits: u8, kept: &mut Kept<'a>, alloc: SharedAlloc<'a>) -> Result<(), PagesError> {
-    let mut r = Rd { bytes, at: 0, page };
-    if r.take(4)? != PAGE_MAGIC || r.u8()? != bits || r.u32()? != page {
-        return Err(PagesError::Magic { page });
-    }
-    let mut counts = [0usize; SECTIONS];
-    for count in counts.iter_mut() {
-        *count = r.u32()? as usize;
-    }
-    let placed = |section: usize, name: Name| match page_of(name, bits) == page {
-        true => Ok(()),
-        false => Err(PagesError::Misplaced { page, section: SECTION_NAMES[section], name }),
-    };
-    let unsorted = |section: usize, at: usize| PagesError::Unsorted { page, section: SECTION_NAMES[section], at: at as u32 };
-    let answer = &mut kept.answer;
-    let mut last: Option<Name> = None;
-    for _ in 0..counts[ROWS] {
-        let start = r.at;
-        let name = r.name()?;
-        if last.is_some_and(|last| last >= name) {
-            return Err(unsorted(ROWS, start));
-        }
-        last = Some(name);
-        placed(ROWS, name)?;
-        let key = Key(r.id()?);
-        let phase = r.phase()?;
-        let file = r.name()?;
-        let source = r.id()?;
-        let out = r.id()?;
-        let serial = Gen(r.u64()?);
-        let findings = r.u32()?;
-        let flags = r.u8()?;
-        if flags & !(INLINE | FAILED) != 0 {
-            return Err(r.tag(flags));
-        }
-        let n_defines = r.u32()? as usize;
-        let n_reads = r.count(0)?;
-        if n_defines.checked_mul(DEFINE).zip(n_reads.checked_mul(READ)).is_none_or(|(d, e)| d.saturating_add(e) > bytes.len() - r.at) {
-            return Err(PagesError::Short { page, at: bytes.len() as u32 });
-        }
-        let mut defines: SVec<'a, (Cell, ContentId)> = Vec::with_capacity_in(n_defines, alloc);
-        for _ in 0..n_defines {
-            let at = r.at;
-            let one = (r.cell()?, r.id()?);
-            if defines.last().is_some_and(|prev| prev.0 > one.0) {
-                return Err(unsorted(ROWS, at));
-            }
-            defines.push(one);
-        }
-        let mut reads: SVec<'a, (CellId, ContentId)> = Vec::with_capacity_in(n_reads, alloc);
-        // Strictly by cell (each cell once, engine.rs invariant 9): the order by cell a search
-        // takes (`Row::by_cell`) is then the list's own.
-        let mut by_cell: SVec<'a, u32> = Vec::with_capacity_in(n_reads, alloc);
-        for at_read in (0u32..).take(n_reads) {
-            let at = r.at;
-            let one = (r.cell_id()?, r.id()?);
-            if reads.last().is_some_and(|prev| prev.0 >= one.0) {
-                return Err(unsorted(ROWS, at));
-            }
-            reads.push(one);
-            by_cell.push(at_read);
-        }
-        for (id, _) in reads.iter() {
-            answer.readers.entry(*id).or_insert_with(|| BTreeSet::new_in(alloc)).insert(name);
-        }
-        let failed = flags & FAILED != 0;
-        if findings > 0 || failed {
-            answer.with_findings.insert(name);
-        }
-        answer.rows.insert(name, Row { key, phase, file, source, out, serial, defines, reads, by_cell, findings, inline: flags & INLINE != 0, failed });
-    }
-    let mut last: Option<CellId> = None;
-    for _ in 0..counts[CELLS] {
-        let start = r.at;
-        let id = r.cell_id()?;
-        if last.is_some_and(|last| last >= id) {
-            return Err(unsorted(CELLS, start));
-        }
-        last = Some(id);
-        placed(CELLS, id.of)?;
-        let digest = r.id()?;
-        answer.cells.insert(id, (digest, Gen(r.u64()?)));
-    }
-    let mut last: Option<CellId> = None;
-    for _ in 0..counts[OWED_CELLS] {
-        let start = r.at;
-        let id = r.cell_id()?;
-        if last.is_some_and(|last| last >= id) {
-            return Err(unsorted(OWED_CELLS, start));
-        }
-        last = Some(id);
-        placed(OWED_CELLS, id.of)?;
-        answer.owed_cells.insert(id, Gen(r.u64()?));
-    }
-    let mut last: Option<Name> = None;
-    for _ in 0..counts[OWED_TASKS] {
-        let start = r.at;
-        let name = r.name()?;
-        if last.is_some_and(|last| last >= name) {
-            return Err(unsorted(OWED_TASKS, start));
-        }
-        last = Some(name);
-        placed(OWED_TASKS, name)?;
-        let phase = r.phase()?;
-        let source = r.id()?;
-        let file = r.name()?;
-        answer.owed_tasks.insert(name, Planned { name, phase, source, file });
-    }
-    let mut last: Option<Name> = None;
-    for _ in 0..counts[FILES] {
-        let start = r.at;
-        let file = r.name()?;
-        if last.is_some_and(|last| last >= file) {
-            return Err(unsorted(FILES, start));
-        }
-        last = Some(file);
-        placed(FILES, file)?;
-        let n = r.count(NAME)?;
-        let mut names: SVec<'a, Name> = Vec::with_capacity_in(n, alloc);
-        for _ in 0..n {
-            let at = r.at;
-            let name = r.name()?;
-            if names.last().is_some_and(|prev| *prev >= name) {
-                return Err(unsorted(FILES, at));
-            }
-            names.push(name);
-        }
-        answer.by_file.insert(file, names);
-    }
-    let mut last: Option<Name> = None;
-    for _ in 0..counts[CAUSES] {
-        let start = r.at;
-        let name = r.name()?;
-        if last.is_some_and(|last| last >= name) {
-            return Err(unsorted(CAUSES, start));
-        }
-        last = Some(name);
-        placed(CAUSES, name)?;
-        let serial = Gen(r.u64()?);
-        let tag = r.u8()?;
-        let tag_error = r.tag(tag);
-        let read = r.take(CELL_ID)?;
-        let was = r.id()?;
-        let now = r.id()?;
-        let cause = match tag {
-            0 => Cause::New,
-            1 => Cause::KeyMoved,
-            2 => {
-                let mut cell = Rd { bytes: read, at: 0, page };
-                Cause::ReadMoved { read: cell.cell_id()?, was, now }
-            }
-            3 => Cause::Owed,
-            4 => Cause::Inline,
-            _ => return Err(tag_error),
-        };
-        kept.causes.insert(name, (serial, cause));
-    }
-    let mut last: Option<Name> = None;
-    for _ in 0..counts[RECORDS] {
-        let start = r.at;
-        let name = r.name()?;
-        if last.is_some_and(|last| last >= name) {
-            return Err(unsorted(RECORDS, start));
-        }
-        last = Some(name);
-        placed(RECORDS, name)?;
-        kept.records.insert(name, Key(r.id()?));
-    }
-    if r.at != bytes.len() {
-        return Err(PagesError::Trailing { page, at: r.at as u32 });
-    }
-    Ok(())
+/// A page's own structure walked whole, its bytes taken as its key's: what the cut-page test
+/// refuses by the form alone.
+#[cfg(test)]
+pub(crate) fn decode_page_for_test(bytes: &[u8], page: u32, bits: u8) -> Result<(), PagesError> {
+    let sealed = Sealed { key: content_key(bytes), bytes, check: Check::Hashed };
+    VerifiedPage::open_whole(sealed, page, bits).map(|_| ())
 }

@@ -384,7 +384,8 @@ pub use macos::{FINDER_SYMBOL, install};
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use core::ffi::{c_char, c_int, c_void};
+    use blaze_sys::posix::thread::{RTLD_DEFAULT, dlsym};
+    use core::ffi::{c_int, c_void};
     use core::sync::atomic::{AtomicPtr, Ordering};
 
     use super::{RegError, Registry};
@@ -424,7 +425,7 @@ mod macos {
             return Err(RegError::AlreadyInstalled);
         }
         // SAFETY: `dlsym` with `RTLD_DEFAULT` and a NUL-ended name only reads the name.
-        let symbol: *mut c_void = unsafe { libc::dlsym(libc::RTLD_DEFAULT, FINDER_C.as_ptr().cast::<c_char>()) };
+        let symbol = unsafe { dlsym(RTLD_DEFAULT, FINDER_C.as_ptr()) };
         if symbol.is_null() {
             INSTALLED.store(core::ptr::null_mut(), Ordering::Release);
             return Err(RegError::Missing { symbol: FINDER_SYMBOL });

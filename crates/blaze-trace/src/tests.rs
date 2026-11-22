@@ -8,10 +8,53 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     Attributes, Event, Id, Level, Metadata, Off, Record, Sink,
-    capture::{Capture, Captured, Counter, Kept},
+    capture::{self, Capture, Counter},
     field::Empty,
     record,
 };
+
+/// The allocator every test hands what it makes: the test's root capability (D102).
+type Heap = blaze_own::SharedAlloc<'static>;
+type Kept = capture::Kept<Heap>;
+type Captured = capture::Captured<Heap>;
+
+fn heap() -> Heap {
+    blaze_own::testing::heap().shared()
+}
+
+/// A capture that lives as long as the test binary, in the test's heap: what a sink must be.
+fn capture() -> &'static Capture<Counter, Heap> {
+    blaze_own::Box::leak(blaze_own::Box::new_in(Capture::new(Counter::new(), heap()), heap()))
+}
+
+/// A field's text as the capture keeps it.
+fn text(it: &str) -> Kept {
+    Kept::Text(blaze_own::String::from_str_in(it, heap()))
+}
+
+/// Whether two kept values hold the same thing. `Kept`'s derived `PartialEq` asks its allocator
+/// to be `PartialEq` too, and `SharedAlloc` is not, so the tests compare the contents.
+fn same(a: &Kept, b: &Kept) -> bool {
+    match (a, b) {
+        (Kept::I64(a), Kept::I64(b)) => a == b,
+        (Kept::U64(a), Kept::U64(b)) => a == b,
+        (Kept::F64(a), Kept::F64(b)) => a.to_bits() == b.to_bits(),
+        (Kept::Bool(a), Kept::Bool(b)) => a == b,
+        (Kept::I128(a), Kept::I128(b)) => a == b,
+        (Kept::U128(a), Kept::U128(b)) => a == b,
+        (Kept::Text(a), Kept::Text(b)) => a.as_str() == b.as_str(),
+        _ => false,
+    }
+}
+
+/// Asserts `got` keeps `want`'s fields: the same names in the same order, each with the same
+/// contents.
+#[track_caller]
+fn assert_fields(got: &[(&str, Kept)], want: &[(&str, Kept)], why: &str) {
+    let all_same =
+        got.len() == want.len() && got.iter().zip(want).all(|((gn, gk), (wn, wk))| gn == wn && same(gk, wk));
+    assert!(all_same, "{why}\n got: {got:?}\nwant: {want:?}");
+}
 
 /// The oracle of nesting: every span or event lies inside its parent's time (from the
 /// parent's start to its end, or to now while it is open), and its parent began before it.
@@ -50,15 +93,15 @@ fn nest() {
 /// in its time and by its parent; `parent: None` is a root.
 #[test]
 fn spans_nest_as_the_thread_entered_them() {
-    static CAPTURE: Capture<Counter> = Capture::new(Counter::new());
-    crate::with_thread_sink(&CAPTURE, nest);
-    let records = CAPTURE.records();
+    let capture = capture();
+    crate::with_thread_sink(capture, nest);
+    let records = capture.records();
     nested(&records).unwrap();
     let id = |name: &str| records.iter().find(|it| it.name == name).map(|it| it.id);
     let parent_of_event = |message: &str| {
         records
             .iter()
-            .find(|it| it.event && it.field("message") == Some(&Kept::Text(message.into())))
+            .find(|it| it.event && it.field("message").and_then(|kept| kept.text()) == Some(message))
             .and_then(|it| it.parent)
     };
     assert_eq!(records.iter().find(|it| it.name == "outer").unwrap().parent, None);
@@ -72,7 +115,7 @@ fn spans_nest_as_the_thread_entered_them() {
 
 /// A sink with a planted bug: it never leaves a span, so the thread stays inside every span it
 /// entered.
-struct NeverLeaves(Capture<Counter>);
+struct NeverLeaves(Capture<Counter, Heap>);
 
 impl Sink for NeverLeaves {
     fn enabled(&self, meta: &'static Metadata<'static>) -> bool {
@@ -106,9 +149,10 @@ impl Sink for NeverLeaves {
 /// `inner` ended is put inside `inner`, after its end, and the oracle says so.
 #[test]
 fn the_oracle_catches_a_sink_that_never_leaves_a_span() {
-    static CAPTURE: NeverLeaves = NeverLeaves(Capture::new(Counter::new()));
-    crate::with_thread_sink(&CAPTURE, nest);
-    let found = nested(&CAPTURE.0.records()).unwrap_err();
+    let never: &'static NeverLeaves =
+        blaze_own::Box::leak(blaze_own::Box::new_in(NeverLeaves(Capture::new(Counter::new(), heap())), heap()));
+    crate::with_thread_sink(never, nest);
+    let found = nested(&never.0.records()).unwrap_err();
     assert!(found.contains("after inner") || found.contains("event "), "{found}");
 }
 
@@ -125,9 +169,9 @@ impl core::fmt::Display for Shown {
 /// shorthands by their names, and an event's message formatted with its arguments.
 #[test]
 fn every_field_is_given_as_written() {
-    static CAPTURE: Capture<Counter> = Capture::new(Counter::new());
+    let capture = capture();
     let (krate, list, shown) = ("app", [1, 2], Shown);
-    crate::with_thread_sink(&CAPTURE, || {
+    crate::with_thread_sink(capture, || {
         let span = crate::info_span!(
             target: "blaze",
             "fields",
@@ -150,11 +194,10 @@ fn every_field_is_given_as_written() {
         crate::warn!(target: "blaze", step = 2u64, "made {} of {krate}", 3);
         crate::debug!(?list);
     });
-    let span = CAPTURE.named("fields").unwrap();
-    let text = |it: &str| Kept::Text(it.into());
-    assert_eq!(
-        span.fields,
-        [
+    let span = capture.named("fields").unwrap();
+    assert_fields(
+        &span.fields,
+        &[
             ("n", Kept::I64(-3)),
             ("count", Kept::U64(7)),
             ("ratio", Kept::F64(0.5)),
@@ -169,15 +212,15 @@ fn every_field_is_given_as_written() {
             ("list", text("[1, 2]")),
             ("later", Kept::U64(9)),
         ],
-        "in the order given, `later` last as it was recorded, `none` and the unknown field never"
+        "in the order given, `later` last as it was recorded, `none` and the unknown field never",
     );
     assert_eq!((span.target, span.level, span.event), ("blaze", Level::INFO, false));
-    let events: Vec<_> = CAPTURE.records().into_iter().filter(|it| it.event).collect();
-    assert_eq!(events[0].fields, [("step", Kept::U64(2)), ("message", text("made 3 of app"))]);
+    let events: Vec<_> = capture.records().into_iter().filter(|it| it.event).collect();
+    assert_fields(&events[0].fields, &[("step", Kept::U64(2)), ("message", text("made 3 of app"))], "the event's");
     assert_eq!(events[0].level, Level::WARN);
     assert!(events[0].name.starts_with("event ") && events[0].name.contains("tests.rs:"), "{}", events[0].name);
     assert_eq!(events[1].target, module_path!(), "a site's target is its module unless it names one");
-    assert_eq!(events[1].fields, [("list", text("[1, 2]"))]);
+    assert_fields(&events[1].fields, &[("list", text("[1, 2]"))], "the debug event's");
 }
 
 /// Counts one evaluation in `count`.
@@ -215,9 +258,9 @@ fn no_sink_evaluates_no_field() {
 #[test]
 fn the_oracle_catches_fields_evaluated_for_a_sink() {
     static COUNT: AtomicU64 = AtomicU64::new(0);
-    static CAPTURE: Capture<Counter> = Capture::new(Counter::new());
-    std::thread::spawn(|| {
-        assert!(!crate::with_thread_sink(&CAPTURE, || counted_sites(&COUNT)));
+    let capture = capture();
+    std::thread::spawn(move || {
+        assert!(!crate::with_thread_sink(capture, || counted_sites(&COUNT)));
         assert_eq!(COUNT.load(Ordering::Relaxed), 4);
     })
     .join()
@@ -276,12 +319,15 @@ fn edges_nest(entries: &[record::Entry]) -> Result<(), String> {
 /// written: a number as its raw word, text as its bytes.
 #[test]
 fn the_rings_hold_each_edge_and_field_as_written() {
-    use alloc::alloc::Global;
-    use alloc::boxed::Box;
-
-    let rings: &'static record::Rings = Box::leak(Box::new(record::Rings::new_in(8, 256, Global).unwrap()));
-    crate::install_rings(crate::RingConfig { rings, wants: |meta| meta.target() == RING_TARGET, clock: record::Clock::Sim(ring_clock) })
-        .unwrap();
+    let rings: &'static record::Rings =
+        blaze_own::Box::leak(blaze_own::Box::new_in(record::Rings::new_in(8, 256, heap()).unwrap(), heap()));
+    crate::install_rings(crate::RingConfig {
+        rings,
+        wants: |meta| meta.target() == RING_TARGET,
+        clock: record::Clock::Sim(ring_clock),
+        limits: crate::TraceLimits::SHIPPED,
+    })
+    .unwrap();
     std::thread::spawn(move || {
         let outer = crate::info_span!(target: RING_TARGET, "outer").entered();
         {

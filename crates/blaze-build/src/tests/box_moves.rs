@@ -443,3 +443,5 @@ fn a_call_that_unwinds_after_a_box_move_frees_the_box_alone() {
     assert!(whole > 0, "control: the moved-out box dropped whole names its glue:\n{text}");
     println!("cleanup after a box move: Box::drop {frees} calls, drop_in_place::<G> {contents}, the box's glue none");
 }
+
+mod scrutinee;

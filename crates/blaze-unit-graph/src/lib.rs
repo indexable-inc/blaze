@@ -8,9 +8,26 @@
 //!
 //! The function is sans-IO ([`Resolution`]): it is handed the lock ([`blaze_manifest::lock`]),
 //! the workspace members' facts, two platform descriptions and the [`Ask`]; each
-//! [`Resolution::pass`] answers [`Pass::Done`] or [`Pass::Need`] with the locked packages whose
-//! manifests it must read next, which the driver answers with [`Resolution::package`] (`None`:
-//! the manifest is not on disk: listed in [`UnitGraph::unavailable`], never guessed).
+//! [`Resolution::pass`] answers [`Pass::Need`] with the locked packages whose manifests it must
+//! read next, which the driver answers with [`Resolution::package`] (`None`: the manifest is not
+//! on disk, never guessed); at the end, [`Pass::Done`] with the whole graph, or
+//! [`Pass::Partial`] when a manifest it reached was answered `None`: a [`PartialGraph`] names
+//! the missing packages and holds no units, so nothing compiles a graph that lacks a
+//! dependency (docs/v2/plan/design/states.md, 35).
+//!
+//! ```compile_fail
+//! // A partial graph has no units to compile.
+//! fn units<'a>(partial: &blaze_unit_graph::PartialGraph<'a>) -> usize {
+//!     partial.units().len()
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! // A whole graph holds no "unavailable" list: a graph that lacks a package is not one.
+//! fn lacking<'a>(graph: &blaze_unit_graph::UnitGraph<'a>) -> usize {
+//!     graph.unavailable.len()
+//! }
+//! ```
 //!
 //! # The rules (the specification)
 //!
@@ -128,7 +145,7 @@ pub use blaze_manifest::layout::{PackageMeta, PackageMetaVars};
 pub use extra::{Extra, ExtraUnit};
 pub use implicit::{Implicit, Prelude, StdIs, Sysroot, ToolchainUnit, implicit};
 pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
-pub use resolve::Resolution;
+pub use resolve::{Resolution, ignores_profile_panic};
 pub use sources::{Open, Records, SourceError, StoreSources};
 
 /// Text in the caller's allocator.
@@ -148,7 +165,32 @@ impl UnitId {
 pub enum Pass<'a> {
     /// The locked packages whose facts are needed next (sorted).
     Need(AVec<'a, LockId>),
+    /// The graph, whole: every package it reached was read.
     Done(UnitGraph<'a>),
+    /// No graph: packages it reached have no manifest. The caller refuses, naming them.
+    Partial(PartialGraph<'a>),
+}
+
+/// A resolution that reached packages whose manifests were answered `None`: the missing
+/// packages, sorted, each once, never empty. It offers no units: a graph without a dependency
+/// is not compiled (states.md, 35).
+#[derive(Debug)]
+pub struct PartialGraph<'a> {
+    missing: AVec<'a, LockId>,
+}
+
+impl<'a> PartialGraph<'a> {
+    /// `missing` sorted and deduplicated; `None` when it is empty (the graph is whole).
+    pub(crate) fn of(mut missing: AVec<'a, LockId>) -> Option<PartialGraph<'a>> {
+        missing.sort_unstable();
+        missing.dedup();
+        (!missing.is_empty()).then_some(PartialGraph { missing })
+    }
+
+    /// The packages whose manifests are missing: sorted, each once, at least one.
+    pub fn missing(&self) -> &[LockId] {
+        &self.missing
+    }
 }
 
 /// Which target of a package a unit compiles.
@@ -201,15 +243,12 @@ pub struct Unit<'a> {
     /// The package's `links` (a build script's `CARGO_MANIFEST_LINKS`, and the `DEP_<LINKS>_*`
     /// its dependents' build scripts are given).
     pub links: Option<Text<'a>>,
-    /// A dependency's manifest was not available: the unit lacks it.
-    pub incomplete: bool,
 }
 
-/// The graph a request compiles.
+/// The graph a request compiles: whole, every package it reached read ([`Pass::Partial`] is
+/// the one that is not).
 pub struct UnitGraph<'a> {
     pub units: AVec<'a, Unit<'a>>,
-    /// Locked packages whose manifests were not available (sorted).
-    pub unavailable: AVec<'a, LockId>,
     pub resolver: Resolver,
     /// Each package of a unit with its `[package]` metadata (`CARGO_PKG_*`, blaze-manifest
     /// meta.rs), sorted by id, each id once. A package with no row is one whose metadata this

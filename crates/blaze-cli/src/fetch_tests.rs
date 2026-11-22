@@ -69,6 +69,7 @@ fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
     FetchEnv {
         clock: io.need_clock().expect("a clock"),
         checkout,
+        served: crate::engine_script_reads::Served::Simulated,
         cert_file: None,
         cert_dir: None,
         home: Some(HOME),

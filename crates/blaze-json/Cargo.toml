@@ -24,6 +24,8 @@ blaze-own.workspace = true
 # Properties: write then read gives the value back, and the event stream copied through the
 # writer gives the compact text back; with a planted-bug control.
 blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@
 #
 # A change runs `cargo` only when it touches a file it reads: the crates, the vendored crates,
 # astlog (tools/astlog), the workspace's manifest, lock file, cargo config, .rustfmt.toml and
-# .clippy.toml, the pinned nightly (harness/toolchain), and these workflows and the actions they
+# .clippy.toml, the pinned toolchain (pins/), and these workflows and the actions they
 # use. scripts/src/bin/gate_changes.rs has the list and why each path is on it. It names what is
 # code, so a new directory is not: any other change runs the script checks alone, and a list of
 # files that cannot be had counts as code. `ci` is the one check that says whether everything
@@ -74,7 +74,8 @@ jobs:
             /.cargo/
             /scripts/
             /crates/blaze-script/
-            /harness/toolchain
+            /crates/blaze-pins/
+            /pins/
             /Cargo.toml
             /Cargo.lock
       - uses: ./.github/actions/script
@@ -106,25 +107,7 @@ jobs:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
           enable-cache: false
-      - run: uv run --frozen ruff check
-      - run: uv run --frozen pyright
-      # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
-      # the workspace's Python, which has its helpers (tools/typed-input) for the scripts that use them.
-      - run: uv run --frozen python harness/imports.py
-      # The list of tests that may fail holds together and is as its recorder writes it, and the
-      # comparison and the recording do what they say on made-up results.
-      - run: uv run --frozen python harness/failures.py selftest
-      # A row or a test run counts only with proof that it ran (harness/v2/ran.py): each rule
-      # beside the planted bug it refuses, and the count of checks the self-test expects of itself.
-      - run: uv run --frozen python harness/v2/ran.py selftest
-      # library/DIGEST is the digest of library/ as it is (a stale one stops every fresh home).
-      - run: uv run --frozen python harness/library.py check '{}'
-      # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
       - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile --cwd site
-      # Under bun: tsc's script asks for node, which ix's runner image does not have.
-      - run: bun site/node_modules/.bin/tsc -p tools/agents
-      - run: bun tools/agents/rules.ts --check
       # The repository's Rust scripts (scripts/, docs/v2/plan/design/scripts.md), built by the
       # release .github/blaze-version names, never by the blaze this tree builds: a tree whose
       # compiler does not build must still be checked (the stage-0 rule). From the Actions cache
@@ -132,140 +115,21 @@ jobs:
       - uses: ./.github/actions/script
         with:
           job: scripts
-      # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
-      # their index (scripts/src/bin/docs.rs). And no Python file is added: tools/python-allowed.txt
-      # lists the ones left and only shrinks (docs/v2/plan/design/scripts.md).
-      - run: |
-          "$BLAZE_SCRIPTS/docs" selftest
-          "$BLAZE_SCRIPTS/docs" check
-      # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md,
-      # scripts/src/bin/rustcsites.rs).
-      - run: '"$BLAZE_SCRIPTS/rustcsites"'
-      # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
-      - run: |
-          "$BLAZE_SCRIPTS/ledger" selftest
-          "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
-      # Which packages a change touches (scripts/src/bin/changed.rs).
-      - run: '"$BLAZE_SCRIPTS/changed" selftest'
-      # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
-      # (scripts/src/bin/invariants.rs).
-      - run: |
-          "$BLAZE_SCRIPTS/invariants" selftest
-          "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
-      # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
-      # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
-      # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
-      # pinned Mathlib, and docs/v2/plan/proofs.md is current. The `lean` job builds them.
-      - run: |
-          uv run --frozen python harness/v2/lean_gate.py selftest
-          uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
-      # blaze's registry of rustc's lints (crates/blaze-lint-defs/src/rustc.rs) is the one written
-      # from rustc's source at the commit library/UPSTREAM pins, unedited: a toolchain bump that
-      # does not write it again fails here (scripts/src/bin/lint_table.rs).
-      - run: |
-          "$BLAZE_SCRIPTS/lint_table" selftest
-          "$BLAZE_SCRIPTS/lint_table" '{"command": "check"}'
-      # Each hash domain in crates/ is written once outside tests, and is under a cache of
-      # docs/v2/plan/design/caches.md with the grain of its key; each hasher that is not BLAKE3
-      # has its class there (scripts/src/bin/domains.rs).
-      - run: |
-          "$BLAZE_SCRIPTS/domains" '{"root": "."}'
-      # What is left of the global heap only goes down (AGENTS.md bump-allocate): per crate,
-      # outside tests, the `// alloc:` lines left to convert, the `expect`s of
-      # `blaze::implicit_allocator`, the lines naming `Global` and the function signatures that
-      # fix the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text) equal their crate's row of
-      # tools/ratchets/alloc-sites.txt, a crate with no row is held to 0, and no
-      # row is above the base's (`global` may rise while `// alloc:` lines are left); a crate
-      # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
-      # checks the workspace. Against the base itself: the checkout is shallow.
-      - name: global-heap allocations only go down
+      # The gate: every row of tools/gate.txt, the one list `just lint` runs too, through the one
+      # runner (scripts/src/bin/gate.rs), which first checks that this job runs no check beside it
+      # (each step but this one is a `uses:` or a row of its CI_ONLY_STEPS). The Python and bun
+      # checks, the docs, the ledger and the ratchets are its rows, each with its timeout; a ratchet
+      # row is held to the base's rows too. Against the base itself: the checkout is shallow.
+      - name: the gate (tools/gate.txt, as `just lint`)
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          "$BLAZE_SCRIPTS/allocs" selftest
           if [ -n "$BASE" ]; then
             git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/allocs" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+            "$BLAZE_SCRIPTS/gate" "{\"command\": \"run\", \"scripts\": \"$BLAZE_SCRIPTS\", \"base\": \"$BASE\"}"
           else
             echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/allocs" '{"command": "check"}'
-          fi
-      # Untyped errors only go down (AGENTS.md errors-name-the-thing): per crate, outside tests,
-      # the function signatures whose error is a `String`, a `&str`, a `Box<dyn Error>` or
-      # `anyhow`'s (`blaze::untyped_error`'s rule, read from the text), and the type aliases of
-      # such a `Result`, equal their crate's row of tools/ratchets/untyped-errors.txt,
-      # a crate with no row is held to 0, and no row is above the base's; a crate over its row
-      # has its new sites named from the base's diff (scripts/src/bin/untyped.rs). It needs no
-      # compiler, where the lint needs a blaze that checks the workspace. Against the base
-      # itself: the checkout is shallow.
-      - name: untyped errors only go down
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/untyped" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/untyped" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/untyped" '{"command": "check"}'
-          fi
-      # Third-party dependencies only go down, to none (docs/v2/plan/design/bottom.md, "Also
-      # decided on 2026-11-15"): per workspace crate, the third-party packages in its normal and
-      # build dependencies, in its dev-dependencies only, and in its closure through the
-      # workspace's manifests and Cargo.lock equal its row of tools/ratchets/third-party.txt, a
-      # crate with no row is held to 0, and no row is above the base's; a count over its row has
-      # its new packages named with the manifest line they came in by, from the base's manifests
-      # and lock (scripts/src/bin/thirdparty.rs). It reads the TOML itself and starts no cargo. Against
-      # the base itself: the checkout is shallow.
-      - name: third-party dependencies only go down
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/thirdparty" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/thirdparty" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/thirdparty" '{"command": "check"}'
-          fi
-      # `std` and `alloc` only go down, to none (docs/v2/plan/design/bottom.md: blaze's own code
-      # uses no `std`, no `alloc` and no third-party crate): per crate under crates/, outside
-      # tests, the lines naming `std` and `alloc` as a path's first segment, whether its root
-      # lacks `#![no_std]`, and the lines naming a `std` or `alloc` collection (`Vec`, `Box`,
-      # `String`, `HashMap`, ..) not imported from blaze's own crates equal its row of
-      # tools/ratchets/std-alloc.txt, a crate with no row is held to 0, and no row is above the
-      # base's; a crate over its row has its new sites named from the base's diff
-      # (scripts/src/bin/ambient.rs, whose usage says what the text scan misses). It needs no
-      # compiler. Against the base itself: the checkout is shallow.
-      - name: std and alloc only go down
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/ambient" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/ambient" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/ambient" '{"command": "check"}'
-          fi
-      # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
-      # scripts/layouts.txt, and a persisted one whose value changed against the base names its
-      # crate's test of the previous layout (rule persisted-state-round-trips;
-      # scripts/src/bin/layouts.rs).
-      - name: a changed persisted layout has a previous-layout test
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/layouts" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/layouts" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): the list is checked, no value is compared"
-            "$BLAZE_SCRIPTS/layouts" '{"command": "check"}'
+            "$BLAZE_SCRIPTS/gate" "{\"command\": \"run\", \"scripts\": \"$BLAZE_SCRIPTS\"}"
           fi
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
       # (.github/scripts/explore_page.py).
@@ -360,7 +224,7 @@ jobs:
 
   # The buildable workspace (every crate but those parked, docs/v2/plan/parked.md, and
   # blaze-std, its own world) type-checks with its test targets, and its unit tests pass, with
-  # cargo and the pinned nightly (harness/toolchain): cargo builds blaze in the dev loop until
+  # cargo and the pinned nightly (pins/toolchain): cargo builds blaze in the dev loop until
   # blaze builds blaze again (AGENTS.md rule blaze-builds-blaze). No LLVM: no buildable crate
   # links it. The runner's snapshot keeps ~/.rustup and target/ from main's last green run.
   cargo:
@@ -371,11 +235,37 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+      # llvm-tools and the two other targets for blaze-sys's imports step below: core and
+      # compiler_builtins come precompiled with each target, so nothing builds a standard library.
       - uses: ./.github/actions/toolchain
+        with:
+          components: llvm-tools
+          targets: x86_64-unknown-linux-gnu aarch64-apple-darwin
       - name: cargo check --workspace --exclude blaze-std --all-targets
-        run: cargo +"$(cat harness/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
+        run: cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
       - name: cargo test --workspace --exclude blaze-std
-        run: cargo +"$(cat harness/toolchain)" test --locked --workspace --exclude blaze-std --no-fail-fast
+        run: cargo +"$(cat pins/toolchain)" test --locked --workspace --exclude blaze-std --no-fail-fast
+      - uses: ./.github/actions/script
+        with:
+          job: cargo
+      # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
+      # architectures), and on macOS only the libSystem symbols of
+      # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,
+      # no_std: an rlib per target (nothing links, so the Mac target builds here too).
+      - name: blaze-sys imports, per target
+        run: |
+          tc="$(cat pins/toolchain)"
+          sysroot="$(rustc +"$tc" --print sysroot)"
+          nm="$sysroot/lib/rustlib/aarch64-unknown-linux-gnu/bin/llvm-nm"
+          for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            timeout 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
+            builtins=$(echo "$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
+            case "$triple" in
+              *-linux-*) extra='' ; os=linux ;;
+              *) extra=', "ratchet": "tools/ratchets/blaze-sys-libsystem.txt"' ; os=macos ;;
+            esac
+            timeout 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
+          done
 
   ci:
     name: ci

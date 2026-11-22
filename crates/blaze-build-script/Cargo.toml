@@ -29,6 +29,10 @@ blaze-git-fetch.workspace = true
 blaze-spawn.workspace = true
 # `lang_features`: what `#![feature(name)]` of a language feature is (probe_ask's decider).
 blaze-surface.workspace = true
+# The pinned nightly's version answers and the clang pin table (pins/, read at compile time).
+blaze-pins.workspace = true
+# `c_tasks_probe`: pins/answers/clang.json read with the no_std pull reader (no tree built).
+blaze-json.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()` in the tests and the census; `testing::heap()`, a test's root allocator (D102).

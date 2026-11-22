@@ -34,7 +34,7 @@ use std::{
 
 use blaze_core::{
     Command, Sandbox,
-    linked::{Ended, Link, LinkedChild, start_linked},
+    linked::{Exit, Link, LinkedChild, Piped, Waited, start_linked},
     wait::{Clock as _, Deadline},
 };
 use blaze_ids::ContentId;
@@ -429,25 +429,30 @@ impl HvboxExecutor<'_> {
     }
 
     /// Waits for the helper by `self.deadline` on its own clock, reading its pipes every
-    /// [`DRAIN_EVERY`]: how it ended. At the deadline it is still running (the caller kills it).
-    /// The loop is bounded by the deadline: each turn waits until the next slice or the deadline.
-    fn wait_draining(&self, child: &LinkedChild, pipes: &mut Pipes) -> Result<Ended, WaitFailed> {
+    /// [`DRAIN_EVERY`]: how it ended, or the child back still running at the deadline (the
+    /// caller kills it). The loop is bounded by the deadline: each turn waits until the next
+    /// slice or the deadline.
+    fn wait_draining(&self, mut child: LinkedChild, pipes: &mut Pipes) -> Result<Waited<LinkedChild>, WaitFailed> {
         loop {
-            pipes.drain_both().map_err(|(what, os)| WaitFailed::Pipe { what, os })?;
+            if let Err((what, os)) = pipes.drain_both() {
+                return Err(WaitFailed::Pipe { what, os, child });
+            }
             let now = child.clock().now();
             let slice = now.saturating_add(DRAIN_EVERY).min(self.deadline);
-            match child.wait_until(Deadline::at(slice)) {
-                Ok(Ended::Deadline) if slice < self.deadline => {}
-                Ok(ended) => return Ok(ended),
+            child = match child.wait_until(Deadline::at(slice)) {
+                Ok(Waited::Running(child)) if slice < self.deadline => child,
+                Ok(waited) => return Ok(waited),
+                // The child dropped with the failed wait: killed and reaped.
                 Err(error) => return Err(WaitFailed::Link(error)),
-            }
+            };
         }
     }
 }
 
-/// Why waiting for the helper failed (not how it ended).
+/// Why waiting for the helper failed (not how it ended). A failed read of its pipes gives the
+/// child back, still running, for its group's kill.
 enum WaitFailed {
-    Pipe { what: &'static str, os: i32 },
+    Pipe { what: &'static str, os: i32, child: LinkedChild },
     Link(blaze_core::linked::LinkError),
 }
 
@@ -539,12 +544,10 @@ impl Executor for HvboxExecutor<'_> {
         };
 
         let span = tracing::info_span!("wait: sandbox spawn", program = %program).entered();
-        let mut child = start_linked(&command, &Link { inherit: &[], own_group: true }).map_err(|e| {
-            Self::refused(program, alloc, format_args!("starting the hvbox helper {helper}: {e}"))
-        })?;
-        let Some((out, err)) = child.take_outputs() else {
-            return Err(Self::refused(program, alloc, format_args!("the hvbox helper's pipes were taken before its wait")));
-        };
+        let Piped { child, stdout: out, stderr: err } =
+            start_linked(&command, &Link { inherit: &[], own_group: true }).map_err(|e| {
+                Self::refused(program, alloc, format_args!("starting the hvbox helper {helper}: {e}"))
+            })?;
         for (fd, what) in [(&out, "its standard output"), (&err, "its standard error")] {
             non_blocking(fd).map_err(|os| {
                 Self::refused(
@@ -556,16 +559,17 @@ impl Executor for HvboxExecutor<'_> {
         }
         let mut pipes = Pipes { out, err, tail: Tail::new(), out_bytes: 0 };
 
-        let ended = match self.wait_draining(&child, &mut pipes) {
+        let ended = match self.wait_draining(child, &mut pipes) {
             Ok(ended) => ended,
             Err(failed) => {
-                // Nothing is left running when the wait itself failed.
-                let killed = child.kill_group();
-                let why = match failed {
-                    WaitFailed::Pipe { what, os } => {
-                        words(alloc, format_args!("reading {what}: {}", std::io::Error::from_raw_os_error(os)))
-                    }
-                    WaitFailed::Link(error) => words(alloc, format_args!("{error}")),
+                // Nothing is left running when the wait itself failed: a failed read gives the
+                // child back for its group's kill; a failed wait dropped it (killed, reaped).
+                let (why, killed) = match failed {
+                    WaitFailed::Pipe { what, os, child } => (
+                        words(alloc, format_args!("reading {what}: {}", std::io::Error::from_raw_os_error(os))),
+                        child.kill_group().map(|_exit| ()),
+                    ),
+                    WaitFailed::Link(error) => (words(alloc, format_args!("{error}")), Ok(())),
                 };
                 return Err(Self::refused(
                     program,
@@ -582,7 +586,7 @@ impl Executor for HvboxExecutor<'_> {
             }
         };
         let (code, signal) = match ended {
-            Ended::Deadline => {
+            Waited::Running(child) => {
                 child.kill_group().map_err(|e| {
                     Self::refused(program, alloc, format_args!("killing the hvbox helper at its deadline: {e}"))
                 })?;
@@ -591,8 +595,8 @@ impl Executor for HvboxExecutor<'_> {
                     after_ms: millis(self.deadline),
                 });
             }
-            Ended::Exited(code) => (Some(code), None),
-            Ended::Signaled(signal) => (None, Some(signal)),
+            Waited::Ended(Exit::Exited(code)) => (Some(code), None),
+            Waited::Ended(Exit::Signaled(signal)) => (None, Some(signal)),
         };
 
         // The helper has ended and been reaped: its pipes end once what it wrote is read. Bounded

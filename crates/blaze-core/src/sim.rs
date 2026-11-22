@@ -79,6 +79,7 @@
 //! on some seeds: a watch that is ending is still told some of the changes made meanwhile, as a
 //! system that queued them before it saw the unwatch.
 
+pub mod block;
 mod every_cut;
 mod host;
 mod journal;
@@ -124,6 +125,9 @@ pub type Program = Box<dyn FnMut(&Command, &mut Rng) -> Ran + Send>;
 
 /// The signal a kill or a passed memory limit ends a process with.
 pub const KILLED: i32 = 9;
+
+/// The simulated process's user: the one uid its Unix listens answer ([`Sim::dial_as`]).
+pub const SIM_USER: u32 = 501;
 
 /// The most ends of connections at once: their slab's reservation, committed as used.
 const MAX_ENDS: u32 = 1 << 20;
@@ -598,7 +602,8 @@ struct Spawning {
 }
 
 struct Watching {
-    dir: FileName,
+    /// A watch's named directory, or a journal's directory: named, or the root.
+    dir: crate::DirName,
     /// Told as [`Done::Journaled`] from the disk's journal of changes.
     journal: bool,
     /// Unwatched: its end is told, and it is no longer in flight as a watch.
@@ -964,10 +969,25 @@ impl Sim {
     /// A peer outside the simulation connects to `at`: the listen there accepts the end this
     /// returns, which the test plays the other side of.
     pub fn dial(&mut self, at: &Address) -> Result<Conn, IoError> {
+        self.dial_as(at, SIM_USER)
+    }
+
+    /// [`Sim::dial`] by a peer of user `uid`. A Unix listen answers [`SIM_USER`] alone, as a
+    /// real one answers the uid that made it (net.rs `peer_is`): a dial of another uid is
+    /// refused at its accept, closed unread, and the listen is told nothing; the real accept
+    /// loop goes on past it the same way (kqueue.rs, threads.rs: `ConnectionAborted`). A TCP
+    /// peer has no uid to check.
+    pub fn dial_as(&mut self, at: &Address, uid: u32) -> Result<Conn, IoError> {
         let Some(listen) = self.listening_at(at) else {
             // alloc: an error's message.
             return Err(IoError(format!("{at:?}: nothing listens there: connection refused")));
         };
+        if !matches!(at, Address::Tcp(_)) && uid != SIM_USER {
+            // alloc: an error's message.
+            return Err(IoError(format!(
+                "{at:?}: a connection of uid {uid} refused unread: this socket answers uid {SIM_USER} alone"
+            )));
+        }
         let conn = self.new_end(None);
         self.tell(listen, Done::Accepted { conn }, Of::Op);
         Ok(conn)
@@ -1248,12 +1268,17 @@ impl Sim {
         self.names.push(NameChange { named, epoch });
     }
 
-    /// `file` made where no file is: a change of its name.
-    fn made(&mut self, file: &FileName) {
-        if !self.files.contains_key(file) {
-            // clone: the log's own name of the file, a refcount.
-            self.named(Named::Put { file: file.clone(), was: None });
+    /// `file` made where no file is: a change of its name, after the making of each directory
+    /// above it that is not there ([`Sim::make_parents`]), as a driver makes them. How many
+    /// directories were made.
+    fn made(&mut self, file: &FileName) -> usize {
+        if self.files.contains_key(file) {
+            return 0;
         }
+        let dirs = self.make_parents(file, host::Maker::Effect);
+        // clone: the log's own name of the file, a refcount.
+        self.named(Named::Put { file: file.clone(), was: None });
+        dirs
     }
 
     /// A write-back ([`Effect::WriteBack`]) of a file under `dir` is held and released as a
@@ -1481,6 +1506,7 @@ impl Sim {
     /// The file made to hold `bytes`, durably, by something outside the state machine (a
     /// person's editor): watches of it hear of it.
     pub fn change(&mut self, file: &FileName, bytes: &[u8]) {
+        self.make_parents(file, host::Maker::Outside);
         // alloc: the world changed by the test, not an op.
         *file_mut(&mut self.files, file) = SimFile::whole(bytes.to_vec());
         self.outside_named(file);
@@ -1492,6 +1518,7 @@ impl Sim {
     /// until something reads it. Not durable: a crash takes the change back. For a file larger
     /// than a test can hold (one past the 4 GiB a VFS file may be).
     pub fn grow(&mut self, file: &FileName, len: u64) {
+        self.make_parents(file, host::Maker::Outside);
         file_mut(&mut self.files, file).push_op(Op::Cut(len));
         self.changed(file);
     }
@@ -1499,6 +1526,7 @@ impl Sim {
     /// `file` made a symbolic link to `target`, durably, by something outside the state
     /// machine (a checkout): watches of it hear of it.
     pub fn symlink(&mut self, file: &FileName, target: &str) {
+        self.make_parents(file, host::Maker::Outside);
         // alloc: the world changed by the test, not an op.
         *file_mut(&mut self.files, file) =
             SimFile { mode: 0o777, link: true, ..SimFile::whole(target.into()) };
@@ -1536,6 +1564,19 @@ impl Sim {
     /// in a loop. Only the last name is followed; a link among a path's directories is not
     /// modelled.
     fn followed(&self, file: &FileName) -> Result<Option<FileName>, IoError> {
+        let led = self.led_to(file)?;
+        if let Some(at) = &led
+            && self.is_dir(at)
+        {
+            // alloc: an error's message.
+            return Err(IoError(format!("{file}: Is a directory (os error 21)")));
+        }
+        Ok(led)
+    }
+
+    /// Where the symbolic link `file` leads, as [`Sim::followed`] says, a directory there
+    /// too: what a stat that follows links ([`Effect::Stat`], `stat(2)`) describes.
+    fn led_to(&self, file: &FileName) -> Result<Option<FileName>, IoError> {
         if !self.files.get(file).is_some_and(|it| it.link) {
             return Ok(None);
         }
@@ -1543,10 +1584,6 @@ impl Sim {
         let mut at = file.clone();
         for _ in 0..40 {
             let Some(sim) = self.files.get(&at).filter(|it| it.link) else {
-                if !self.files.contains_key(&at) && self.files.keys().any(|it| it.is_under(&at)) {
-                    // alloc: an error's message.
-                    return Err(IoError(format!("{file}: Is a directory (os error 21)")));
-                }
                 return Ok(Some(at));
             };
             let target = String::from_utf8_lossy(&sim.contents()).into_owned();
@@ -1717,7 +1754,8 @@ impl Sim {
             // clone: a name of the listing.
             names.push((made.clone(), 0, true));
         }
-        if names.is_empty() && !dir.name().is_none_or(|name| self.was_made(name)) {
+        // Every directory is in `host.made` (`sim/host.rs`): one not there fails, empty or not.
+        if !dir.name().is_none_or(|name| self.is_dir(name)) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: no such directory")));
         }
@@ -1809,10 +1847,10 @@ impl Sim {
     }
 
     fn changed(&mut self, file: &FileName) {
-        self.disk.touched(file, &self.files);
+        self.disk.touched(file, journal::Tree { files: &self.files, dirs: &self.host.made });
         self.tell_journals();
         for (id, tag, watch) in self.watches.iter() {
-            if watch.journal || !file.is_under(&watch.dir) {
+            if watch.journal || !watch.dir.holds(file) {
                 continue;
             }
             if watch.ending && !self.rng.one_in(RACE_ONE_IN) {
@@ -1883,7 +1921,7 @@ impl Sim {
 
     /// What `name` is on the simulated disk now.
     pub fn stamp(&mut self, name: &FileName) -> crate::Stamp {
-        self.disk.stamp(name, &self.files)
+        self.disk.stamp(name, journal::Tree { files: &self.files, dirs: &self.host.made })
     }
 
     /// The file's permission bits set by something outside the state machine: its change time
@@ -1916,6 +1954,7 @@ impl Sim {
             self.orphan_kept(from);
         }
         if let Some(sim) = self.files.remove(from) {
+            self.make_parents(to, host::Maker::Outside);
             // clone: the world changed by the test, not an op.
             self.files.insert(to.clone(), sim);
             self.outside_named(from);
@@ -2354,6 +2393,11 @@ impl Sim {
         if let Some(done) = self.refused_write(&effect) {
             return Completion { tag, done };
         }
+        // A file's name made under a file, or where a directory is: refused by the kernel
+        // before anything is opened, so before any fault too.
+        if let Some(done) = self.cannot_make(&effect) {
+            return Completion { tag, done };
+        }
         // A batched read's faults are drawn a part at a time, each failing its part alone.
         if !matches!(effect, Effect::Timer { .. } | Effect::ReadMany { .. })
             && self.rng.one_in(u64::from(self.faults.fail_one_in))
@@ -2527,8 +2571,11 @@ impl Sim {
             // Made beside it and renamed over it: a lock of the file it replaced is of that one.
             // Its directory synced after the rename (`fs.rs`'s `write_atomically`): the new
             // name is durable, with every change of a name in that directory.
+            // The directories it is made in are made too, durably, as every effect makes
+            // them ([`Sim::make_parents`]): the write is durable from the root down.
             Effect::Write { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;
+                self.make_parents(&file, host::Maker::Effect);
                 *file_mut(&mut self.files, &file) = SimFile::whole(bytes);
                 self.sync_names(parent_of(&file));
                 self.flushed();
@@ -2557,6 +2604,9 @@ impl Sim {
                 };
                 let mut new = new;
                 new.allocate(0, new.len());
+                // Its directories made with it, durably as every effect makes them; the file's
+                // own name and bytes are not synced.
+                self.make_parents(&file, host::Maker::Effect);
                 // clone: the log's own name of the file, a refcount.
                 self.named(Named::Put { file: file.clone(), was });
                 *file_mut(&mut self.files, &file) = new;
@@ -2578,6 +2628,9 @@ impl Sim {
             // under `from` and what `to` held back under `to`.
             Effect::RenameUnsynced { from, to, .. } => match self.files.remove(&from) {
                 Some(sim) => {
+                    // The new name's directories made with it, durably as every effect makes
+                    // them; the new name itself is not synced.
+                    self.make_parents(&to, host::Maker::Effect);
                     let was = self.files.remove(&to);
                     // clone: the log's own names of the files, refcounts.
                     self.named(Named::Moved { from: from.clone(), to: to.clone(), was });
@@ -2599,9 +2652,11 @@ impl Sim {
                     if !self.planted(host::Plant::RenameFlushesOthers) {
                         sim.flushed();
                     }
+                    self.make_parents(&to, host::Maker::Effect);
                     *file_mut(&mut self.files, &to) = sim;
                     // Both directories synced after it (`fs.rs`'s `rename`, the ring's chain):
-                    // the new name is durable, and the old one's going.
+                    // the new name is durable, and the old one's going; the directories it made
+                    // for the new name are durable as every effect makes them.
                     self.sync_names(parent_of(&to));
                     if parent_of(&from) != parent_of(&to) {
                         self.sync_names(parent_of(&from));
@@ -2632,7 +2687,7 @@ impl Sim {
                 }
             }
             Effect::Times { file, modified_ns, .. } => {
-                match self.disk.times(&file, modified_ns, &self.files) {
+                match self.disk.times(&file, modified_ns, journal::Tree { files: &self.files, dirs: &self.host.made }) {
                     true => {
                         self.tell_journals();
                         Done::Timed
@@ -2721,11 +2776,35 @@ impl Sim {
                 let bytes = self.contents(&from);
                 self.made(&to);
                 *file_mut(&mut self.files, &to) = SimFile { mode, link, blocks, ..SimFile::whole(bytes) };
-                self.disk.linked(&from, &to, &self.files);
+                self.disk.linked(&from, &to, journal::Tree { files: &self.files, dirs: &self.host.made });
                 self.changed(&to);
                 Done::Linked
             }
-            // A link is a file of its own length either way: the simulated disk follows none.
+            // A stat follows a link as `stat(2)` does: what it leads to, or not there where it
+            // dangles (the suite's `a_link_is_followed_by_stat_alone`, `conform/fs.rs`; until
+            // 2026-11-20 the simulated disk followed none, so a stat of a link saw the link's
+            // own length where every real disk sees its target's).
+            Effect::Stat { file, .. } if self.files.get(&file).is_some_and(|it| it.link) => {
+                match self.led_to(&file) {
+                    Ok(Some(at)) if self.files.contains_key(&at) => {
+                        Done::Stat(Some(self.meta(&at, false)))
+                    }
+                    Ok(Some(at)) if self.is_dir(&at) => Done::Stat(Some(self.meta(&at, true))),
+                    Ok(_) => Done::Stat(None),
+                    Err(error) => Done::Failed(error),
+                }
+            }
+            // A name under a file: `ENOTDIR` from `stat(2)` and `statx`, a failure on every
+            // native driver, never "not there" (the suite's `a_name_under_a_file`; until
+            // 2026-11-20 the simulated disk answered `Stat(None)`, more than the real disk).
+            Effect::Stat { file, .. } | Effect::Lstat { file, .. }
+                if self.file_above(&file).is_some() =>
+            {
+                let above = self.file_above(&file).expect("looked up in the guard");
+                // alloc: an error's message.
+                Done::Failed(IoError(format!("{file}: {above} {}", host::NOT_A_DIRECTORY)))
+            }
+            // A link is a file of its own length to an lstat: it follows none.
             Effect::Stat { file, .. } | Effect::Lstat { file, .. } => Done::Stat({
                 match self.files.contains_key(&file) {
                     true => Some(self.meta(&file, false)),
@@ -2746,17 +2825,17 @@ impl Sim {
                     .map(|name| {
                         // alloc: a name of the batch as the simulated disk keys it.
                         let name = FileName::new(name).expect("a Names entry is a name");
-                        self.disk.stamp(&name, &self.files)
+                        self.disk.stamp(&name, journal::Tree { files: &self.files, dirs: &self.host.made })
                     })
                     // alloc: the stamps, which the completion carries.
                     .collect(),
             ),
-            Effect::Entries { dir, .. } => match self.disk.entries(&dir, &self.files) {
+            Effect::Entries { dir, .. } => match self.disk.entries(&dir, journal::Tree { files: &self.files, dirs: &self.host.made }) {
                 Some(entries) => Done::Entries(Box::new(entries)),
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{dir}: no such directory"))),
             },
-            Effect::Remove { file, .. } if self.was_made(&file) => self.remove_made(&file),
+            Effect::Remove { file, .. } if self.is_dir(&file) => self.remove_made(&file),
             Effect::Remove { file, .. } => {
                 if let Some(was) = self.files.remove(&file) {
                     // clone: the log's own name of the file, a refcount.
@@ -2845,7 +2924,7 @@ impl Sim {
         Completion { tag, done }
     }
 
-    fn watch(&mut self, tag: Tag, dir: FileName, journal: bool) -> Id<Watching> {
+    fn watch(&mut self, tag: Tag, dir: crate::DirName, journal: bool) -> Id<Watching> {
         let (id, old) = self.watches.insert(tag, Watching { dir, journal, ending: false });
         if old.is_some_and(|it| it.ending) {
             self.ending -= 1;
@@ -2938,7 +3017,7 @@ impl Driver for Sim {
         for effect in effects.drain(..) {
             match effect {
                 Effect::Watch { dir, tag } => {
-                    self.watch(tag, dir, false);
+                    self.watch(tag, crate::DirName::Named(dir), false);
                     continue;
                 }
                 Effect::Journal { dir, since, tag } => {
@@ -3631,7 +3710,9 @@ mod tests {
         let rounds = 1 + sim.rng.below(6);
         let crash_after = sim.rng.below(rounds * 3 + 1);
         // Both files made and their names synced before the log starts: what is tested is
-        // the order of their bytes, not whether a crash keeps their names.
+        // the order of their bytes, not whether a crash keeps their names. The folder `log` is
+        // durable as the first truncate makes it ([`Sim::make_parents`]); the sync of `log`
+        // keeps the names in it.
         ran(&mut sim, vec![Effect::Truncate { file: data.clone(), len: 0, tag: Tag(4) }]);
         ran(&mut sim, vec![Effect::Truncate { file: commits.clone(), len: 0, tag: Tag(5) }]);
         ran(&mut sim, vec![Effect::SyncDir { dir: name("log").into(), tag: Tag(6) }]);
@@ -3720,7 +3801,8 @@ mod tests {
     fn what_a_barrier_covers_is_durable_once_a_later_sync_of_any_file_completes() {
         let (data, other) = (name("log/data"), name("log/other"));
         let mut lost = false;
-        // The file made and its name synced first: what is tested is its bytes.
+        // The file made and its name synced first (its folder durable as the truncate makes
+        // it): what is tested is its bytes.
         let made = |sim: &mut Sim| {
             ran(sim, vec![Effect::Truncate { file: data.clone(), len: 0, tag: Tag(4) }]);
             ran(sim, vec![Effect::SyncDir { dir: name("log").into(), tag: Tag(5) }]);
@@ -4827,6 +4909,55 @@ mod tests {
         }
     }
 
+    /// A dial of another user at a Unix listen is refused before any byte of it is read and
+    /// the listen is told nothing; the listen goes on, and a dial of its own user next is
+    /// accepted and read. The control: the same foreign dial at a TCP listen, which has no uid
+    /// to check, is accepted (the check is the Unix socket's, as net.rs `peer_is` is).
+    #[test]
+    fn a_dial_of_another_user_is_refused_unread_and_the_listen_goes_on() {
+        let at = Address::Unix(name("helper.sock"));
+        for seed in 0..64 {
+            let mut sim = Sim::new(seed, Faults::default());
+            sim.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
+            let refused = sim.dial_as(&at, SIM_USER + 1).expect_err("a foreign dial was taken");
+            assert!(refused.0.contains(&format!("uid {}", SIM_USER + 1)) && refused.0.contains("unread"), "seed {seed}: {}", refused.0);
+            let ours = sim.dial(&at).expect("the listen goes on after a refusal");
+            sim.peer_send(ours, b"ask");
+            let mut accepted = Vec::new();
+            let mut out = Vec::new();
+            for _ in 0..64 {
+                sim.poll(&mut out, Deadline::NEVER);
+                accepted.extend(out.drain(..).filter_map(|it| match it.done {
+                    Done::Accepted { conn } => Some(conn),
+                    _ => None,
+                }));
+                if !accepted.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(accepted, vec![ours], "seed {seed}: only the own user's dial reaches the listen");
+            let mut seen = BTreeMap::new();
+            // The receive alone first, polled to its answer while the listen stays open: a
+            // hang-up in the same batch may race it (`a_hang_up_racing_a_receive_tells_it_empty`).
+            sim.submit(&mut vec![Effect::Recv { conn: ours, most: 16, into: Vec::new(), tag: Tag(2) }]);
+            for _ in 0..64 {
+                if seen.contains_key(&Tag(2)) {
+                    break;
+                }
+                sim.poll(&mut out, Deadline::NEVER);
+                seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
+            }
+            assert_eq!(seen.get(&Tag(2)), Some(&Done::Read(b"ask".to_vec())), "seed {seed}");
+            let mut effects = vec![Effect::Hangup { conn: ours, tag: Tag(3) }, Effect::Unlisten { tag: Tag(1) }];
+            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag, it.done)).expect("the effects end");
+            sim.peer_hangup(ours);
+        }
+        let tcp = Address::Tcp("127.0.0.1:8081".parse().unwrap());
+        let mut sim = Sim::new(0, Faults::default());
+        sim.submit(&mut vec![Effect::Listen { at: tcp.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
+        assert!(sim.dial_as(&tcp, SIM_USER + 1).is_ok(), "a TCP peer has no uid to refuse");
+    }
+
     #[test]
     fn a_connect_to_nothing_and_a_second_listen_fail() {
         let mut sim = Sim::new(2, Faults::default());
@@ -5085,7 +5216,7 @@ mod tests {
     fn reads_into_memory_are_held_failed_cut_short_and_see_rot() {
         let file = name("pool/pack-1");
         let mut sim = Sim::new(9, Faults::default());
-        let mut memory = memory(4096);
+        let memory = memory(4096);
         sim.change(&file, b"abcdefgh");
         sim.hold_reads(name("pool"));
         sim.submit(&mut vec![read_into(&file, 0, memory.span(0, 8), 1)]);

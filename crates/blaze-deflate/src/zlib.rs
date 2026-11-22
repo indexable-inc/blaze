@@ -53,38 +53,67 @@ impl<const N: usize> Trailer<N> {
     }
 }
 
+/// Whether an encoder has written its frame's header yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Begun {
+    /// Nothing written.
+    No,
+    /// The header is out.
+    Written,
+}
+
+/// Where a zlib frame is: one state, no flags beside it (C5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stage {
+    /// `have` of the header's two bytes taken.
+    Header { have: u8 },
+    /// The DEFLATE stream, then the trailer, until the trailer is whole and checked.
+    Stream,
+    /// The trailer checked: the stream is read.
+    Done,
+}
+
 /// The zlib frame around either inflater: the header, the running Adler-32 and the trailer.
 struct Frame {
     header: [u8; 2],
-    header_have: usize,
+    stage: Stage,
     adler: Adler32,
     trailer: Trailer<4>,
-    done: bool,
     /// Bytes of input taken, the frame's included.
     taken: u64,
 }
 
 impl Frame {
-    const NEW: Frame =
-        Frame { header: [0; 2], header_have: 0, adler: Adler32::new(), trailer: Trailer::EMPTY, done: false, taken: 0 };
+    const NEW: Frame = Frame {
+        header: [0; 2],
+        stage: Stage::Header { have: 0 },
+        adler: Adler32::new(),
+        trailer: Trailer::EMPTY,
+        taken: 0,
+    };
 
     /// The header's bytes taken from `input`; whether it is whole and good.
     fn head(&mut self, input: &[u8], at: &mut usize) -> Result<bool, Error> {
-        while self.header_have < 2 && *at < input.len() {
-            self.header[self.header_have] = input[*at];
-            self.header_have += 1;
+        while let Stage::Header { have } = self.stage
+            && *at < input.len()
+        {
+            self.header[usize::from(have)] = input[*at];
             *at += 1;
-            if self.header_have == 2 {
-                check_header(self.header[0], self.header[1]).map_err(|why| Error::new(Format::Zlib, 0, why))?;
+            match have {
+                0 => self.stage = Stage::Header { have: 1 },
+                _ => {
+                    self.stage = Stage::Stream;
+                    check_header(self.header[0], self.header[1]).map_err(|why| Error::new(Format::Zlib, 0, why))?;
+                }
             }
         }
-        Ok(self.header_have == 2)
+        Ok(!matches!(self.stage, Stage::Header { .. }))
     }
 
     /// After the stream ended (`inflated` its input bytes): the trailer's bytes taken and
     /// checked once whole.
     fn tail(&mut self, input: &[u8], at: &mut usize, inflated: u64) -> Result<(), Error> {
-        if self.done {
+        if self.stage == Stage::Done {
             return Ok(());
         }
         *at += self.trailer.take(&input[*at..]);
@@ -94,15 +123,19 @@ impl Frame {
             if stored != computed {
                 return Err(Error::new(Format::Zlib, HEADER + inflated, Why::Adler32 { stored, computed }));
             }
-            self.done = true;
+            self.stage = Stage::Done;
         }
         Ok(())
     }
 
+    fn is_done(&self) -> bool {
+        self.stage == Stage::Done
+    }
+
     fn finish(&self) -> Result<(), Error> {
-        match self.done {
-            true => Ok(()),
-            false => Err(Error::new(Format::Zlib, self.taken, Why::Truncated)),
+        match self.stage {
+            Stage::Done => Ok(()),
+            Stage::Header { .. } | Stage::Stream => Err(Error::new(Format::Zlib, self.taken, Why::Truncated)),
         }
     }
 
@@ -146,7 +179,7 @@ impl<A: Allocator> ZlibDecoder<A> {
             }
         }
         self.frame.taken += at as u64;
-        Ok(Fed { consumed: at, done: self.frame.done })
+        Ok(Fed { consumed: at, done: self.frame.is_done() })
     }
 
     /// The input ended: an error unless the stream did.
@@ -200,7 +233,7 @@ impl ZlibInto {
             }
         }
         self.frame.taken += at as u64;
-        Ok(Fed { consumed: at, done: self.frame.done })
+        Ok(Fed { consumed: at, done: self.frame.is_done() })
     }
 
     pub fn finish(&self) -> Result<(), Error> {
@@ -239,24 +272,24 @@ pub struct ZlibEncoder<A: Allocator> {
     deflate: Deflate<A>,
     level: Level,
     adler: Adler32,
-    started: bool,
+    head: Begun,
 }
 
 impl<A: Allocator + Clone> ZlibEncoder<A> {
     pub fn new_in(level: Level, alloc: A) -> ZlibEncoder<A> {
-        ZlibEncoder { deflate: Deflate::new_in(level, alloc), level, adler: Adler32::new(), started: false }
+        ZlibEncoder { deflate: Deflate::new_in(level, alloc), level, adler: Adler32::new(), head: Begun::No }
     }
 }
 
 impl<A: Allocator> ZlibEncoder<A> {
     fn start<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), DeflateError> {
-        if !self.started {
+        if self.head == Begun::No {
             let flg = match self.level {
                 Level::Store | Level::Fast => 0x01,
                 Level::Default => 0x9c,
             };
             out.try_extend_from_slice(&[0x78, flg]).map_err(DeflateError::Alloc)?;
-            self.started = true;
+            self.head = Begun::Written;
         }
         Ok(())
     }

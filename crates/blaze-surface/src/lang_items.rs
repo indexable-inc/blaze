@@ -21,7 +21,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
+use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, WriterOpts, schema_of};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 
@@ -187,7 +187,7 @@ pub fn build_lang_items<'a, 't>(
         names.extend_from_slice(name.0.as_bytes());
         rows.push(LangEntry { item: item.0, name_at: at, name_len: len });
     }
-    let mut out = Writer::new_in(LANG_SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: LANG_SCHEMA, alloc: alloc, capacity: None });
     let entries_at = out.push_slice(&rows);
     let names_at = out.push_slice(&names);
     let at = out.next::<LangRoot>();

@@ -38,6 +38,7 @@ pub enum Question {
     Adt(Def),
     FnSig(Def),
     Assoc(Def),
+    /// An opaque type read for its bounds and generics (an alias-bound candidate, coherence).
     Opaque(Def),
     Lang(Lang),
     IsLocal(Def),
@@ -47,11 +48,16 @@ pub enum Question {
     ConstHolds(Def, List),
     /// Whether the first impl specializes the second (`Facts::specializes`).
     Specializes(Def, Def),
+    /// An opaque type read for its HIDDEN type (an auto trait's leak, structural.rs
+    /// `step_auto`; the reveal after type checking, alias.rs): the same fact as
+    /// [`Question::Opaque`], a separate kind so a stall is named only by an opaque whose
+    /// hidden type was asked ([`Ask::first_hidden_unknown`]), never by one read for its bounds.
+    OpaqueHidden(Def),
 }
 
 /// The names of [`Question`]'s kinds, in [`Question::kind`]'s order.
-pub const QUESTION_KIND_NAMES: [&str; 11] =
-    ["trait_def", "impls", "impl_header", "adt", "fn_sig", "assoc", "opaque", "lang", "is_local", "const_holds", "specializes"];
+pub const QUESTION_KIND_NAMES: [&str; 12] =
+    ["trait_def", "impls", "impl_header", "adt", "fn_sig", "assoc", "opaque", "lang", "is_local", "const_holds", "specializes", "opaque_hidden"];
 
 impl Question {
     /// The question's kind, an index into [`QUESTION_KIND_NAMES`] (a measurement's bucket).
@@ -68,6 +74,7 @@ impl Question {
             Question::IsLocal(_) => 8,
             Question::ConstHolds(..) => 9,
             Question::Specializes(..) => 10,
+            Question::OpaqueHidden(_) => 11,
         }
     }
 }
@@ -494,6 +501,12 @@ impl<'f, F: Facts> Ask<'f, F> {
         Self::note(log, Question::Opaque(d), got, |a| a.digest)
     }
 
+    /// [`Ask::opaque`] read for its hidden type ([`Question::OpaqueHidden`]).
+    pub fn opaque_hidden<L: Log + ?Sized>(&self, log: &mut L, d: Def) -> Result<OpaqueDef<'f>, Stop> {
+        let got = self.facts.opaque(Self::seal(), d);
+        Self::note(log, Question::OpaqueHidden(d), got, |a| a.digest)
+    }
+
     pub fn lang<L: Log + ?Sized>(&self, log: &mut L, l: Lang) -> Result<Option<Def>, Stop> {
         let got = self.facts.lang(Self::seal(), l);
         Self::note(log, Question::Lang(l), got, |a| lang_digest(*a))
@@ -509,6 +522,28 @@ impl<'f, F: Facts> Ask<'f, F> {
         Self::note(log, Question::Specializes(a, b), got, |s| u64::from(*s))
     }
 
+    /// The typed cause of an undecided answer that stalled on an opaque type: the first opaque
+    /// of `reads` (a root's read list as [`crate::Solver::evaluate_from`] appends it, in the
+    /// order of first reads: rule 25) whose hidden type these facts do not give, `skip`'s aside.
+    /// The auto-trait rule reads that opaque's fact the moment it stalls on it
+    /// (structural.rs `step_auto`, "ambiguous until it does"), and a cached, shared or
+    /// provisional answer carries its read list whole, so the cause survives every reuse of
+    /// the answer at no cost on the `Yes` and `No` paths: the caller asks only after a
+    /// `Maybe`. Only a read for the hidden type ([`Question::OpaqueHidden`]) is a cause: an
+    /// opaque read for its bounds alone (`+ Send` written on it answers `Send` by the
+    /// alias-bound candidate) was the superset's misattribution (tempo c0255wave87: seven
+    /// bodies named a required trait fn's `+ Send` future, hiding their real cause).
+    /// Noted nowhere: each read is in the list already.
+    pub fn first_hidden_unknown(&self, reads: &[Read], mut skip: impl FnMut(Def) -> bool) -> Option<Def> {
+        reads.iter().find_map(|r| match r.question {
+            Question::OpaqueHidden(d) if !skip(d) => match self.facts.opaque(Self::seal(), d) {
+                Ok(o) if o.hidden.is_none() => Some(d),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     /// The digest `q` answers today, asked again (a shared goal's read list checked against a
     /// body's facts: eval.rs `share_replay`). Noted nowhere: the caller notes the list whole
     /// once every digest is equal. `Stop::Need(q)` when the facts lack it.
@@ -521,7 +556,7 @@ impl<'f, F: Facts> Ask<'f, F> {
             Question::Adt(d) => self.facts.adt(s(), d).map(|a| a.digest),
             Question::FnSig(d) => self.facts.fn_sig(s(), d).map(|a| a.digest),
             Question::Assoc(d) => self.facts.assoc(s(), d).map(|a| a.digest),
-            Question::Opaque(d) => self.facts.opaque(s(), d).map(|a| a.digest),
+            Question::Opaque(d) | Question::OpaqueHidden(d) => self.facts.opaque(s(), d).map(|a| a.digest),
             Question::Lang(l) => self.facts.lang(s(), l).map(lang_digest),
             Question::IsLocal(d) => self.facts.is_local(s(), d).map(u64::from),
             Question::Specializes(a, b) => self.facts.specializes(s(), a, b).map(u64::from),

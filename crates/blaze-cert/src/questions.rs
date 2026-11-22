@@ -106,6 +106,7 @@ impl<'a> Questions<'a> {
                 Question::FnSig(d) => ask.fn_sig(&mut log, d).map(drop),
                 Question::Assoc(d) => ask.assoc(&mut log, d).map(drop),
                 Question::Opaque(d) => ask.opaque(&mut log, d).map(drop),
+                Question::OpaqueHidden(d) => ask.opaque_hidden(&mut log, d).map(drop),
                 Question::Lang(l) => ask.lang(&mut log, l).map(drop),
                 Question::IsLocal(d) => ask.is_local(&mut log, d).map(drop),
                 Question::Specializes(a, b) => ask.specializes(&mut log, a, b).map(drop),

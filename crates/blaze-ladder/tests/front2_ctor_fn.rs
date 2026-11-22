@@ -330,11 +330,7 @@ impl blaze_ladder::front2::source::Load<'static> for Kept {
     }
 
     /// The program writes no macro call: no expansion is asked.
-    fn expansion(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<&'static str> {
-        None
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<(&'static [u8], &'static [u8])> {
+    fn expansion(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'static>> {
         None
     }
 }

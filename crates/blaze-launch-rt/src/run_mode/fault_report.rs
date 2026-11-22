@@ -49,8 +49,17 @@ use blaze_launch::wire::fault::{AROUND, Around, Callers, Fault, MOST_CALLERS, NA
 #[cfg(target_arch = "aarch64")]
 use blaze_launch::wire::fault::Arm64;
 use blaze_launch::wire::run::{Symbol as WireSymbol, Up};
+use blaze_sys::posix::{io, signal as os, types::sighandler_t};
+use blaze_sys::{Errno, Fd, Timespec};
 
 use super::RunModeError;
+
+#[cfg(target_os = "macos")]
+type SignalInfo = os::siginfo_t;
+// This handler also reports signals sent by a process. The kernel-form si_addr accessor
+// requires a fault delivery, whereas the existing Linux report reads the word for either.
+#[cfg(target_os = "linux")]
+type SignalInfo = libc::siginfo_t;
 
 /// What a placement row holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,7 +124,7 @@ static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static EDGES: [AtomicU64; REGION_NAMES.len() + 1] = [const { AtomicU64::new(0) }; REGION_NAMES.len() + 1];
 /// The signals reported, and the action each had before [`install`]: its handler word and
 /// flags (stored before the handler is installed, never changed after).
-const SIGNALS: [c_int; 4] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP];
+const SIGNALS: [c_int; 4] = [os::SIGSEGV, os::SIGBUS, os::SIGILL, os::SIGTRAP];
 static PREVIOUS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static PREVIOUS_FLAGS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
@@ -130,36 +139,31 @@ pub unsafe fn install(regions: Regions) -> Result<(), RunModeError> {
     let bytes = MOST_ROWS * core::mem::size_of::<Row>();
     // SAFETY: an anonymous private mapping; the kernel picks the address. Its pages are made
     // as rows are written, so the cap costs address space, not memory.
-    let rows = unsafe { libc::mmap(ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
-    if rows == libc::MAP_FAILED {
-        return Err(RunModeError::Sys(crate::sys::SysError { call: "mmap (the run's placement table for crash reports)", errno: super::errno(), at: 0, len: bytes }));
-    }
+    let rows = unsafe {
+        io::mmap(None, bytes, io::Prot::READ | io::Prot::WRITE, io::MapFlags::PRIVATE | io::MapFlags::ANONYMOUS, None, 0)
+    }.map_err(|error| RunModeError::Sys(crate::sys::SysError {
+        call: "mmap (the run's placement table for crash reports)", errno: i32::from(error.raw()), at: 0, len: bytes,
+    }))?;
     for (i, edge) in regions.edges.iter().enumerate() {
         EDGES[i].store(*edge, Ordering::Relaxed);
     }
     // Release: a handler that acquires the table's pointer sees the edges.
-    ROWS.store(rows.cast(), Ordering::Release);
+    ROWS.store(rows.as_ptr().cast(), Ordering::Release);
     for (i, &sig) in SIGNALS.iter().enumerate() {
-        // SAFETY: an all-zero `sigaction` is a valid value of the C struct.
-        let mut before: libc::sigaction = unsafe { core::mem::zeroed() };
-        // SAFETY: reads the current action into a live local.
-        if unsafe { libc::sigaction(sig, ptr::null(), &mut before) } != 0 {
-            return Err(RunModeError::Sys(crate::sys::SysError { call: "sigaction (reading an action before the crash report)", errno: super::errno(), at: 0, len: 0 }));
-        }
+        let before = os::get_action(sig).map_err(|error| RunModeError::Sys(crate::sys::SysError {
+            call: "sigaction (reading an action before the crash report)", errno: i32::from(error.raw()), at: 0, len: 0,
+        }))?;
         PREVIOUS[i].store(before.sa_sigaction, Ordering::Relaxed);
         PREVIOUS_FLAGS[i].store(before.sa_flags as usize, Ordering::Relaxed);
-        // SAFETY: an all-zero `sigaction` is a valid value of the C struct.
-        let mut ours: libc::sigaction = unsafe { core::mem::zeroed() };
-        ours.sa_sigaction = on_signal as extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) as libc::sighandler_t;
+        let mut ours = os::sigaction::DEFAULT;
+        ours.sa_sigaction = on_signal as extern "C" fn(c_int, *mut SignalInfo, *mut c_void) as sighandler_t;
         // SA_ONSTACK: a thread with an alternate stack (the launcher's std gives its threads
         // one) reports a stack overflow too; a thread without one runs the handler on its own.
-        ours.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        // SAFETY: empties a live local mask.
-        unsafe { libc::sigemptyset(&mut ours.sa_mask) };
+        ours.sa_flags = os::SA_SIGINFO | os::SA_ONSTACK;
         // SAFETY: `on_signal` is async-signal-safe and a function of this binary.
-        if unsafe { libc::sigaction(sig, &ours, ptr::null_mut()) } != 0 {
-            return Err(RunModeError::Sys(crate::sys::SysError { call: "sigaction (installing the crash report)", errno: super::errno(), at: 0, len: 0 }));
-        }
+        unsafe { os::set_action(sig, &ours) }.map_err(|error| RunModeError::Sys(crate::sys::SysError {
+            call: "sigaction (installing the crash report)", errno: i32::from(error.raw()), at: 0, len: 0,
+        }))?;
     }
     Ok(())
 }
@@ -184,7 +188,7 @@ pub fn note(row: Row) {
 }
 
 /// The handler (the module's doc).
-extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
+extern "C" fn on_signal(sig: c_int, info: *mut SignalInfo, ctx: *mut c_void) {
     // SAFETY: the kernel hands an SA_SIGINFO handler a live `siginfo_t` and `ucontext_t`.
     let (address, (pc, write)) = unsafe { ((*info).si_addr() as u64, regs(ctx)) };
     // SAFETY: as above: the same live `ucontext_t`.
@@ -217,16 +221,14 @@ extern "C" fn on_signal(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void
     if let Err(why) = told {
         let mut line = Line::new();
         report(&mut line, struck, placed, &Regions { edges }, DROPPED.load(Ordering::Relaxed));
-        // SAFETY: `at` live bytes of the buffer to descriptor 2; `write` is async-signal-safe.
-        unsafe { libc::write(2, line.bytes.as_ptr().cast(), line.at) };
+        let _ = io::write(Fd::STDERR, &line.bytes[..line.at]);
         let mut said = Line::new();
         said.put(b"blaze run: (the parent was not told where: ");
         said.put(why.as_bytes());
         said.put(b")\n");
-        // SAFETY: as the write above.
-        unsafe { libc::write(2, said.bytes.as_ptr().cast(), said.at) };
+        let _ = io::write(Fd::STDERR, &said.bytes[..said.at]);
     }
-    hand_on(sig, info, ctx);
+    hand_on(sig, info.cast(), ctx);
 }
 
 /// The parent's socket, once [`channel`] named it (-1 before: no frame is sent).
@@ -262,7 +264,7 @@ impl Drop for ChannelHeld {
 pub fn hold_channel() -> Result<ChannelHeld, RunModeError> {
     match take_channel() {
         true => Ok(ChannelHeld(())),
-        false => Err(RunModeError::Socket { call: "the parent's socket, held by a crash report past 2 s (rule 18)", errno: libc::ETIMEDOUT }),
+        false => Err(RunModeError::Socket { call: "the parent's socket, held by a crash report past 2 s (rule 18)", errno: i32::from(Errno::TimedOut.raw()) }),
     }
 }
 
@@ -273,8 +275,7 @@ fn take_channel() -> bool {
         if CHANNEL_HELD.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             return true;
         }
-        // SAFETY: no descriptors, a 1 ms timeout: a sleep; `poll` is async-signal-safe.
-        unsafe { libc::poll(ptr::null_mut(), 0, 1) };
+        let _ = io::poll(&mut [], Some(Timespec { sec: 0, nsec: 1_000_000 }));
     }
     false
 }
@@ -283,10 +284,10 @@ fn take_channel() -> bool {
 /// not report. Pure, so it is tested without a signal.
 pub fn fault_of(struck: Struck, rows: &[Row]) -> Option<Fault> {
     let signal = match struck.sig {
-        libc::SIGSEGV => Signal::Segv,
-        libc::SIGBUS => Signal::Bus,
-        libc::SIGILL => Signal::Ill,
-        libc::SIGTRAP => Signal::Trap,
+        os::SIGSEGV => Signal::Segv,
+        os::SIGBUS => Signal::Bus,
+        os::SIGILL => Signal::Ill,
+        os::SIGTRAP => Signal::Trap,
         _ => return None,
     };
     // The registers and the code bytes are read from the delivery by the handler (`on_signal`):
@@ -381,10 +382,10 @@ fn callers_of(regs: &Regs, rows: &[Row]) -> Option<Callers> {
 /// `pthread_self` is it. `None` when `sp` is not inside the stack (an overflow into the guard).
 #[cfg(target_os = "macos")]
 fn stack_bounds(sp: u64) -> Option<(u64, u64)> {
-    // SAFETY: `pthread_self` is always a live thread, this one; the two reads take its fields.
+    let me = blaze_sys::posix::thread::pthread_self();
+    // SAFETY: `me` is the calling thread, live for both reads of its stack bounds.
     let (top, size) = unsafe {
-        let me = libc::pthread_self();
-        (libc::pthread_get_stackaddr_np(me) as u64, libc::pthread_get_stacksize_np(me) as u64)
+        (blaze_sys::posix::thread::pthread_get_stackaddr_np(me) as u64, blaze_sys::posix::thread::pthread_get_stacksize_np(me) as u64)
     };
     let bottom = top.checked_sub(size)?;
     (sp >= bottom && sp < top).then_some((sp, top))
@@ -427,13 +428,11 @@ fn read_stack_word(at: u64) -> Option<u64> {
 /// a fault in the handler (`process_vm_readv` is a system call, async-signal-safe).
 #[cfg(target_os = "linux")]
 fn read_stack_word(at: u64) -> Option<u64> {
-    let mut word = 0u64;
-    let local = libc::iovec { iov_base: (&mut word as *mut u64).cast(), iov_len: 8 };
-    let remote = libc::iovec { iov_base: at as *mut c_void, iov_len: 8 };
-    // SAFETY: `local` is a live 8-byte buffer on this stack; `remote` is only read, by the
-    // kernel, which checks it.
-    let n = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
-    (n == 8).then_some(word)
+    use blaze_sys::linux::{IoSliceMut, getpid, task::{RemoteSlice, process_vm_readv}};
+    let mut word = [0; 8];
+    let remote = RemoteSlice { base: at as usize, len: word.len() };
+    let n = process_vm_readv(getpid(), &mut [IoSliceMut::new(&mut word)], &[remote]);
+    (n == Ok(8)).then_some(u64::from_ne_bytes(word))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -454,7 +453,7 @@ pub fn code_window(struck: Struck, rows: &[Row]) -> Option<(u64, usize)> {
     let pc = struck.pc?;
     let row = holding(pc, rows).filter(|row| row.kind == Kind::Code)?;
     let page = pc & !(SMALLEST_PAGE - 1);
-    let fetch = matches!(struck.sig, libc::SIGSEGV | libc::SIGBUS) && struck.address & !(SMALLEST_PAGE - 1) == page;
+    let fetch = matches!(struck.sig, os::SIGSEGV | os::SIGBUS) && struck.address & !(SMALLEST_PAGE - 1) == page;
     if fetch {
         return None;
     }
@@ -483,7 +482,7 @@ fn code_around(struck: Struck, rows: &[Row]) -> Option<Around> {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 unsafe fn thread_state(ctx: *mut c_void) -> Option<Regs> {
     // SAFETY: the caller's contract; `uc_mcontext` points at the state the kernel saved.
-    let ss = unsafe { &(*(*ctx.cast::<libc::ucontext_t>()).uc_mcontext).__ss };
+    let ss = unsafe { &(*(*ctx.cast::<os::ucontext_t>()).uc_mcontext).__ss };
     let mut x = [0u64; 31];
     x[..29].copy_from_slice(&ss.__x);
     x[29] = ss.__fp;
@@ -494,7 +493,7 @@ unsafe fn thread_state(ctx: *mut c_void) -> Option<Regs> {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 unsafe fn thread_state(ctx: *mut c_void) -> Option<Regs> {
     // SAFETY: the caller's contract; Linux's `ucontext_t` holds the saved registers inline.
-    let mc = unsafe { &(*ctx.cast::<libc::ucontext_t>()).uc_mcontext };
+    let mc = unsafe { &(*ctx.cast::<os::ucontext_t>()).uc_mcontext };
     Some(Regs::Arm64(Arm64 { x: mc.regs, sp: mc.sp, pc: mc.pc, pstate: mc.pstate }))
 }
 
@@ -537,6 +536,7 @@ fn tell_parent(fault: &Fault) -> Result<(), &'static str> {
     if fd < 0 {
         return Err("no socket named");
     }
+    let fd = Fd::new(fd);
     let room = blaze_own::Inline::<FRAME_ROOM>::new();
     let mut frame: std::vec::Vec<u8, &blaze_own::Inline<FRAME_ROOM>> = match std::vec::Vec::try_with_capacity_in(FRAME_ROOM, &room) {
         Ok(frame) => frame,
@@ -556,23 +556,15 @@ fn tell_parent(fault: &Fault) -> Result<(), &'static str> {
         if tries > 64 {
             break Err("the socket took no more bytes in 64 tries");
         }
-        // SAFETY: `bytes` is live for the call; `write` is async-signal-safe.
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if n > 0 {
-            bytes = &bytes[n as usize..];
-            continue;
+        match io::write(fd, bytes) {
+            Ok(n) if n > 0 => bytes = &bytes[n..],
+            Err(Errno::Again) => {
+                let mut poll = [io::PollFd::new(fd, io::PollEvents::OUT)];
+                let _ = io::poll(&mut poll, Some(Timespec { sec: 0, nsec: 100_000_000 }));
+            }
+            Err(Errno::Intr) => continue,
+            _ => break Err("the socket refused the frame"),
         }
-        let errno = super::errno();
-        if n < 0 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
-            let mut poll = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-            // SAFETY: one live pollfd, a 100 ms bound; `poll` is async-signal-safe.
-            unsafe { libc::poll(&mut poll, 1, 100) };
-            continue;
-        }
-        if n < 0 && errno == libc::EINTR {
-            continue;
-        }
-        break Err("the socket refused the frame");
     };
     CHANNEL_HELD.store(false, Ordering::Release);
     wrote
@@ -580,16 +572,16 @@ fn tell_parent(fault: &Fault) -> Result<(), &'static str> {
 
 /// Hands the signal to the action before ours, or puts the default back: a fault then repeats
 /// under it and the process ends by the signal.
-fn hand_on(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
+fn hand_on(sig: c_int, info: *mut os::siginfo_t, ctx: *mut c_void) {
     let Some(i) = SIGNALS.iter().position(|&s| s == sig) else { return };
     let handler = PREVIOUS[i].load(Ordering::Relaxed);
     let flags = PREVIOUS_FLAGS[i].load(Ordering::Relaxed) as c_int;
-    if handler != libc::SIG_DFL && handler != libc::SIG_IGN {
-        if flags & libc::SA_SIGINFO != 0 {
+    if handler != os::SIG_DFL && handler != os::SIG_IGN {
+        if flags & os::SA_SIGINFO != 0 {
             // SAFETY: the previous action was installed with SA_SIGINFO, so its word is a
             // three-argument handler; it gets this delivery's own `info` and `ctx`. Its mask is
             // not applied around the call (the signal itself is blocked while this runs).
-            let previous = unsafe { core::mem::transmute::<usize, extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void)>(handler) };
+            let previous = unsafe { core::mem::transmute::<usize, extern "C" fn(c_int, *mut os::siginfo_t, *mut c_void)>(handler) };
             previous(sig, info, ctx);
         } else {
             // SAFETY: installed without SA_SIGINFO: a one-argument handler.
@@ -598,10 +590,8 @@ fn hand_on(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
         }
         return;
     }
-    // SAFETY: an all-zero `sigaction` is SIG_DFL with no flags and an empty mask.
-    let dfl: libc::sigaction = unsafe { core::mem::zeroed() };
-    // SAFETY: async-signal-safe; the fault repeats under the default when this returns.
-    unsafe { libc::sigaction(sig, &dfl, ptr::null_mut()) };
+    // SAFETY: installs SIG_DFL, with no handler pointer or alternate-stack requirement.
+    let _ = unsafe { os::set_action(sig, &os::sigaction::DEFAULT) };
 }
 
 /// The interrupted pc, and whether the fault was a write (macOS: the exception syndrome's WnR
@@ -609,7 +599,7 @@ fn hand_on(sig: c_int, info: *mut libc::siginfo_t, ctx: *mut c_void) {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 unsafe fn regs(ctx: *mut c_void) -> (Option<u64>, Option<bool>) {
     // SAFETY: the caller's contract; `uc_mcontext` points at the state the kernel saved.
-    let mc = unsafe { &*(*ctx.cast::<libc::ucontext_t>()).uc_mcontext };
+    let mc = unsafe { &*(*ctx.cast::<os::ucontext_t>()).uc_mcontext };
     let esr = mc.__es.__esr;
     // ESR_EL1.EC (bits 26..32): 0x24/0x25 a data abort; then bit 6, WnR, is a write.
     let ec = esr >> 26;
@@ -620,7 +610,7 @@ unsafe fn regs(ctx: *mut c_void) -> (Option<u64>, Option<bool>) {
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 unsafe fn regs(ctx: *mut c_void) -> (Option<u64>, Option<bool>) {
     // SAFETY: the caller's contract; Linux's `ucontext_t` holds the saved registers inline.
-    let mc = unsafe { &(*ctx.cast::<libc::ucontext_t>()).uc_mcontext };
+    let mc = unsafe { &(*ctx.cast::<os::ucontext_t>()).uc_mcontext };
     (Some(mc.pc), None)
 }
 
@@ -705,10 +695,10 @@ pub fn describe(line: &mut Line, at: u64, rows: &[Row], regions: &Regions) {
 
 fn signal_name(sig: c_int) -> &'static [u8] {
     match sig {
-        libc::SIGSEGV => b"SIGSEGV".as_slice(),
-        libc::SIGBUS => b"SIGBUS".as_slice(),
-        libc::SIGILL => b"SIGILL".as_slice(),
-        libc::SIGTRAP => b"SIGTRAP".as_slice(),
+        os::SIGSEGV => b"SIGSEGV".as_slice(),
+        os::SIGBUS => b"SIGBUS".as_slice(),
+        os::SIGILL => b"SIGILL".as_slice(),
+        os::SIGTRAP => b"SIGTRAP".as_slice(),
         _ => b"a signal".as_slice(),
     }
 }
@@ -812,15 +802,15 @@ mod tests {
         let area = BASE + 0x6000;
         let f = Row::new(Kind::Code, area + 0x100, 0x80, CodeSymbol([0xf1; 32]), RecordId([0xc1; 32]));
         let s = Row::new(Kind::ReadOnlyDatum, area + 0x40, 0x10, CodeSymbol([0x51; 32]), RecordId([0x77; 32]));
-        let line = said(libc::SIGBUS, Some(area + 0x140), area + 0x48, Some(true), &[s, f]);
+        let line = said(os::SIGBUS, Some(area + 0x140), area + 0x48, Some(true), &[s, f]);
         assert_eq!(
             line,
             "blaze run: the program was killed by SIGBUS: pc 0x7000006140 is +0x40 in the code of function f1f1f1f1f1f1f1f1.. (record c1c1c1c1c1c1c1c1..); it wrote 0x7000006048, which is +0x8 in the read-only datum of static 5151515151515151.. (record 7777777777777777..)\n"
         );
-        let stub = said(libc::SIGSEGV, Some(area + 0x200), BASE + 0x3008, None, &[s, f]);
+        let stub = said(os::SIGSEGV, Some(area + 0x200), BASE + 0x3008, None, &[s, f]);
         assert!(stub.contains("pc 0x7000006200 is in the code area, in no placed record (+0x200)"), "{stub}");
         assert!(stub.contains("the address 0x7000003008, which is in the statics' words (+0x8)"), "{stub}");
-        let outside = said(libc::SIGILL, None, BASE + 0x9000, Some(false), &[]);
+        let outside = said(os::SIGILL, None, BASE + 0x9000, Some(false), &[]);
         assert!(outside.contains("SIGILL: pc unknown; it read 0x7000009000, which is outside the run's reservation"), "{outside}");
         std::println!("{}", line.trim_end());
     }

@@ -13,7 +13,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Writer};
+use blaze_format::{FormatError, Writer, WriterOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc};
 
@@ -325,7 +325,7 @@ impl<'a, 'b> MacroDef<'a, 'b> {
             *text = strings.moved(&self.staging, *text, "MacroDef strings")?;
         }
         let mut out =
-            Writer::new_in(<MacroDefRoot as blaze_format::Record>::SCHEMA, self.alloc);
+            Writer::new(WriterOpts { schema: <MacroDefRoot as blaze_format::Record>::SCHEMA, alloc: self.alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let helpers = Column::push(&mut out, &self.helpers);
         let head = self.head;

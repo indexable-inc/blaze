@@ -15,8 +15,9 @@ use blaze_build_script::{
     key::{self, CMode, HostToolKey, KeyInputs, RunLimits, RunnerKey},
     native::{self, Runner},
     probe::Table,
-    toolchain::{self, CInputs, Mode, PIN, Shelf, Sysroot},
+    toolchain::{self, CInputs, Mode, Shelf, Sysroot},
 };
+use blaze_pins::{CLANG_JSON, CLANG_PATH};
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_unit_graph::{UnitGraph, UnitId};
@@ -37,9 +38,10 @@ use crate::{
     script_unit::module_of_native,
 };
 
-/// The deployment target every native script compiles for: a constant, so the key's domain
-/// covers it (the interim builder links the scripts for the same).
-pub const MACOS_MIN: &str = "11.0";
+/// The deployment target every native script compiles for: its one home is blaze-build-script
+/// toolchain.rs, which the keyed environment gives every script (the interim builder links the
+/// scripts for the same).
+pub use blaze_build_script::toolchain::MACOS_MIN;
 
 /// Where `script` (a build-script unit) runs for `mode`: the closure's verdict
 /// ([`native::runner`]) placed by the mode ([`toolchain::placement`], D69 (3)).
@@ -98,14 +100,14 @@ pub enum NativeUnitError {
     NoNativeSetting { package: String, because: String },
     /// No native module record (`script.bin`) of the package with exactly these features.
     NoModule { package: String, features: std::vec::Vec<String>, store: String },
+    /// The module store could not answer the lookup.
+    Lookup(crate::script_unit::ModuleLookupError),
     /// A file blaze reads to make the run (the module, the SDK's settings, a host tool).
     Read { path: String, why: String },
     /// The pin table does not say what the run needs.
     PinTable { package: String, why: String },
     /// A host tool's path in the pin table is not its resolved real path (D71).
     ToolNotReal { package: String, tool: String, path: String, real: String },
-    /// The SDK's `SDKSettings.json` has no `Version`.
-    SdkVersion { sdk: String },
     /// The shelf's folder is not named by a SHA-256.
     Shelf { shelf: String },
     /// The package's or the run's folder could not be made or read.
@@ -132,14 +134,14 @@ impl std::fmt::Display for NativeUnitError {
                 "no native build-script binary of {package} with features [{}] in {store}/build-script/modules: build it with proc_macro_modules' build-script mode and `native` (D69)",
                 features.join(",")
             ),
+            NativeUnitError::Lookup(error) => write!(f, "{error}"),
             NativeUnitError::Read { path, why } => write!(f, "{path}: {why}"),
             NativeUnitError::PinTable { package, why } => write!(f, "the native build script of {package}: {why}"),
             NativeUnitError::ToolNotReal { package, tool, path, real } => write!(
                 f,
                 "{}: host tool `{tool}` of {package}'s build script is at {path}, whose real path is {real}: the grant takes only a resolved path (D71)",
-                toolchain::PIN_PATH
+                CLANG_PATH
             ),
-            NativeUnitError::SdkVersion { sdk } => write!(f, "{sdk}/SDKSettings.json: no `Version`, which a native script's key holds (D69)"),
             NativeUnitError::Shelf { shelf } => write!(f, "{shelf}: the C toolchain's shelf folder is not named by its SHA-256 (D69)"),
             NativeUnitError::Files { package, folder, why } => write!(f, "{folder} (the native build script of {package}): {why}"),
             NativeUnitError::Run(error) => write!(f, "{error}"),
@@ -251,7 +253,7 @@ pub fn native_outputs<'a>(
 
     // The host binary the interim builder made with exactly the unit's features.
     let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of_native(setting.store, name, version, &features, setting.host).ok_or_else(|| NativeUnitError::NoModule {
+    let module = module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
         package: package.clone(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.display().to_string(),
@@ -280,7 +282,7 @@ pub fn native_outputs<'a>(
 
     // D71: the host tools the table grants this package, each at its real path, by digest.
     let pin = |why: String| NativeUnitError::PinTable { package: package.clone(), why };
-    let table = host_tools::host_tools(PIN, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
+    let table = host_tools::host_tools(CLANG_JSON, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
     let tools: AVec<'a, HostTool<'_>> = host_tools::granted(&table, name, alloc);
     // Every granted program is keyed at its real path: the tool under its name, then each
     // program it starts under `<tool>+<path>` (sorted after the tool's own name, in the table's
@@ -309,13 +311,17 @@ pub fn native_outputs<'a>(
     }
 
     // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.
-    match toolchain::sysroot(PIN, setting.host) {
+    match toolchain::sysroot(CLANG_JSON, setting.host) {
         Ok(Sysroot::MacosSdk) => {}
-        Ok(Sysroot::Pinned { .. }) => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", toolchain::PIN_PATH, setting.host))),
+        Ok(Sysroot::Pinned { .. }) => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
         Err(error) => return Err(pin(error.to_string())),
     }
-    let settings = String::from_utf8(read_file(native.sdk, "SDKSettings.json")?).map_err(|_| NativeUnitError::SdkVersion { sdk: native.sdk.to_owned() })?;
-    let sysroot_key = format!("macos-sdk {}", sdk_version(&settings).ok_or_else(|| NativeUnitError::SdkVersion { sdk: native.sdk.to_owned() })?);
+    let text = |file: &str| -> Result<String, NativeUnitError> {
+        String::from_utf8(read_file(native.sdk, file)?).map_err(|_| NativeUnitError::Read { path: format!("{}/{file}", native.sdk), why: "it is not UTF-8".to_owned() })
+    };
+    let (settings, built) = (text(blaze_apple_sdk::SETTINGS)?, text(blaze_apple_sdk::SYSTEM_VERSION)?);
+    let (_, id) = blaze_apple_sdk::identity_of(&settings, &built).map_err(|why| NativeUnitError::Read { path: native.sdk.to_owned(), why: format!("{why}, which a native script's key holds (D69)") })?;
+    let sysroot_key = format!("macos-sdk {id}");
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
     let parts = NativeKeyParts { compiler, target: setting.host, sysroot: &sysroot_key, host_tools: &tool_keys };
     let inputs = KeyInputs {
@@ -333,9 +339,10 @@ pub fn native_outputs<'a>(
     // under its key) and an empty `OUT_DIR`.
     let key_hex = hex(&base.0);
     let (package_dir, listed): (String, std::vec::Vec<String>) = match &tree {
+        // Already the resolved root (`RealRoot`, the edge's one realpath, as Seatbelt matches
+        // paths): not resolved again.
         Tree::Dir(dir) => {
-            let real = std::fs::canonicalize(dir).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: dir.display().to_string(), why: e.to_string() })?;
-            let real = real.to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            let real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
             let names = listed_under(&real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: real.clone(), why: e.to_string() })?;
             let names = names.into_iter().map(|listed| listed.name).collect();
             (real, names)
@@ -346,7 +353,7 @@ pub fn native_outputs<'a>(
         }
     };
     let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &package)?;
-    let clang_major = toolchain::clang_major(PIN).map_err(|e| pin(e.to_string()))?;
+    let clang_major = toolchain::clang_major(CLANG_JSON).map_err(|e| pin(e.to_string()))?;
     let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     // N7: the fact shim the command placed in its work folder, and this run's facts folder.
     // A native run's probes are answered from the pins through the fact shim; the questions
@@ -379,6 +386,7 @@ pub fn native_outputs<'a>(
     let area = std::fs::canonicalize(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = area.to_str().ok_or_else(|| area_failed("not UTF-8".to_owned()))?.to_owned();
     let run = NativeScript {
+        key: base,
         files: &area,
         program: &program,
         c,
@@ -451,7 +459,6 @@ mod tests {
             deps: d,
             build_script: build_script.map(UnitId),
             links: None,
-            incomplete: false,
         }
     }
 
@@ -471,7 +478,7 @@ mod tests {
         units.push(unit("autocfg", UnitKind::Lib, &[], None)); // 3
         units.push(unit("zstd-sys", UnitKind::Lib, &[], Some(0))); // 4
         units.push(unit("pure", UnitKind::Lib, &[], Some(2))); // 5
-        let graph = UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3, meta: AVec::new_in(alloc) };
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc) };
 
         let native = placed(&graph, UnitId(0), Mode::Build, alloc);
         let wasm = placed(&graph, UnitId(2), Mode::Build, alloc);

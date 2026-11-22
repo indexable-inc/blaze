@@ -7,10 +7,10 @@
 //! modules' paths, its cfg atoms, edition and files. Written when the crate is solved; read back
 //! per crate, on demand ([`RecordItems`]).
 //!
-//! The record holds WHERE a text is, never its bytes: a file by its path with the digest the
-//! solve saw, an expansion by its call's key with the digest of its text. A reader gets the
-//! text from its loader and the record hashes it once per text per reader against that digest:
-//! a text that changed under the record is [`ItemsRecordError::Stale`], never the old range.
+//! The record holds WHERE a text is, never its bytes: a file by its path with the surface digest
+//! the solve saw, an expansion by its call's key with the digest of its text. A reader gets file
+//! ranges and body hashes from the current `FileItems` view, while expansion ranges remain in
+//! this record. A surface change is [`ItemsRecordError::Stale`].
 //!
 //! Nothing here is resolved: an impl's trait and self type are kept as written (resolving them
 //! at write would ask other crates questions the crate's read list does not hold); the reader
@@ -29,24 +29,28 @@
 //! 29 and 30), by which "which enum is this variant of" is one search; then the bucket index
 //! ([`buckets`]: the impls filed by resolved (trait or inherent, self type's head), header
 //! fields 31 and 32, and the impls the writer could not resolve, fields 33 and 34), by which
-//! one impl question reads one bucket of the crate and no other impl's row.
+//! one impl question reads one bucket of the crate and no other impl's row; then, only when the
+//! crate writes a `link_name`/`export_name` value as a macro call, the value table ([`values`]:
+//! each such value as the solve expanded it at its item, header fields 27 and 28), by which a
+//! reader over the record names a foreign fn's symbol without expanding anything again.
 
 pub mod buckets;
 pub mod grain;
 pub mod owners;
+pub mod values;
 pub mod variants;
 
 pub mod members;
 
-pub use grain::{ItemNow, ItemPieces, ItemToday};
+pub use grain::{ItemNow, ItemPieces};
 pub use members::Members;
 
 use core::cell::{Cell, OnceCell, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{AVec, Alloc};
-use blaze_surface::{CallShape, Edition, ImplFlags, ItemDetail, ItemIndex, ItemKind, ProcKind, RecordBytes};
+use blaze_own::{ABox, ARc, AVec, Alloc, Box, Rc};
+use blaze_surface::{CallShape, Edition, FileItemsView, ImplFlags, ItemDetail, ItemIndex, ItemKind, ProcKind, RecordBytes};
 
 use crate::package_path::{NotPackagePath, PackagePath};
 use crate::resolve::{At, CrateNames};
@@ -66,8 +70,15 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// bytes); a version-7 record is refused the same way. 9: an item row keeps the ABI of the
 /// `extern` block that declares it ([`ItemRow::foreign`], flag [`FOREIGN`]; row 80 bytes),
 /// whoever wrote the item (a file or a macro call's expansion); a version-8 record is refused
-/// the same way.
-const VERSION: u32 = 9;
+/// the same way. 10: file positions and body hashes come from the current FileItems record.
+/// 11: an item row and a member row keep the lifetime parameters the item's own generics
+/// declare ([`ItemIdentity::lifetimes`], [`MemberRow::lifetimes`]; D155: the one home of a
+/// declared count, stored plus one so 0 is "declares none here"; the rows' layouts are stated
+/// at [`ITEM_ROW`] and [`MEMBER_ROW`]); a version-10 record is refused the same way.
+/// 12: the attribute value table ([`values`]: each `link_name`/`export_name` written as a macro
+/// call, as the solve expanded it; header fields 27 and 28, both 0 for a crate with none); a
+/// version-11 record is refused the same way.
+const VERSION: u32 = 12;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -75,11 +86,26 @@ const NONE: u32 = u32::MAX;
 /// In an `at` field: the text is an expansion's, and the low bits are its row.
 const EXPANSION: u32 = 1 << 31;
 
-const FILE_ROW: usize = 56;
+const FILE_ROW: usize = 48;
 const EXPANSION_ROW: usize = 72;
-const ITEM_ROW: usize = 80;
+/// An item row, the one statement of its layout (u32 and u16 little-endian): +0 the item's key
+/// (32 bytes); +32 its module's row, +36 its text's code (a file's row, or [`EXPANSION`] and an
+/// expansion's row), +40 the text's start, +44 its length, +48 its index in the text's
+/// outline, +52 its name's place in the strings (u32), +56 the name's length (u16); +58 its
+/// kind's byte, +59 its flags ([`NAMED`], [`BODY_HOLDS_ITEMS`], [`CTOR_OR_WRITTEN_BY`],
+/// [`FOREIGN`]); +60 its impl header's start in the same text ([`NONE`]: no impl), +64 the
+/// header's length, +68 its impl row ([`NONE`]: none), +72 its block ABI's place in the strings,
+/// +76 the ABI's length; +80 its declared lifetimes ([`lifetimes_field`]: the count plus one,
+/// 0 for a kind that declares none here), u16; +82 zeros to 96.
+const ITEM_ROW: usize = 96;
 const OWNER_ROW: usize = 40;
-const MEMBER_ROW: usize = 56;
+/// A member row, the one statement of its layout: +0 the member's key (32 bytes); +32 its
+/// text's code, +36 the text's start, +40 its length, +44 its index in the text's outline, +48
+/// its name's place in the strings (u32), +52 the name's length (u16); +54 its kind's byte, +55
+/// its flags ([`NAMED`], [`BODY_HOLDS_ITEMS`], [`CTOR_OR_WRITTEN_BY`]: an expansion wrote it);
+/// +56 its declared lifetimes (an associated type's own, a GAT's; [`lifetimes_field`], as in
+/// [`ITEM_ROW`]), u16; +58 zeros to 64.
+const MEMBER_ROW: usize = 64;
 const IMPL_ROW: usize = 128;
 /// An impl row's roots word (+60): the trait path's root key is held (+64).
 const ROOT_TRAIT: u32 = 1;
@@ -179,7 +205,7 @@ pub enum TextOf<'r> {
 }
 
 /// Why an items record was not written or not read.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ItemsRecordError {
     /// A section's size does not fit its u32 field.
     TooBig { what: &'static str },
@@ -221,6 +247,13 @@ pub enum ItemsRecordError {
     /// (`extern "abi"`, or a bare `extern`): the row's ABI cannot be written, so the record is
     /// not written.
     ForeignAbi { item: ItemKey },
+    /// The text of `item` (a struct, enum, union, trait, alias or associated type) does not
+    /// read as one whose generics' lifetimes can be counted (D155): its row's count cannot be
+    /// written, so the record is not written.
+    Generics { item: ItemKey, why: blaze_file_items::GenericsError },
+    FileItemsUnavailable { file: u32, what: &'static str },
+    FileItemsBuild { file: u32, why: blaze_surface::BuildError },
+    FileItemsRead { file: u32, why: blaze_format::FormatError },
 }
 
 /// Header field [`F_STD`]: 0 for Rust's `std`, 1 + the edition's discriminant for bstd under a
@@ -254,6 +287,46 @@ fn put32(out: &mut RecordBytes<'_>, n: u32) {
 
 fn put16(out: &mut RecordBytes<'_>, n: u16) {
     out.extend_from_slice(&n.to_le_bytes());
+}
+
+/// The lifetimes field of the row of `item`, of kind `detail` and whole text `text` (D155):
+/// the count its own generics declare ([`blaze_file_items::declared_lifetimes`]) PLUS ONE for
+/// a struct, enum, union, trait, trait alias or type alias (a trait's or impl's associated type
+/// is a `TypeAlias` member); 0 for any other kind (a fn's lifetimes are its head's, an impl's
+/// its header's, a module's none). So a zeroed or unwritten field reads as "declares none
+/// here", never as "0 lifetimes".
+fn lifetimes_field(item: ItemKey, detail: ItemDetail, text: &str, edition: Edition) -> Result<u16, ItemsRecordError> {
+    match detail {
+        ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union | ItemDetail::Trait | ItemDetail::TraitAlias | ItemDetail::TypeAlias => {
+            let n = blaze_file_items::declared_lifetimes(text, edition).map_err(|why| ItemsRecordError::Generics { item, why })?;
+            n.checked_add(1).ok_or(ItemsRecordError::Generics { item, why: blaze_file_items::GenericsError::TooMany })
+        }
+        _ => Ok(0),
+    }
+}
+
+/// [`lifetimes_field`] read back: `None` for 0, the count for any other.
+fn lifetimes_of(field: u16) -> Option<u16> {
+    field.checked_sub(1)
+}
+
+/// [`ItemsRecord::declared_lifetimes`] of a solved crate, before (or without) its record: the
+/// same count from the same text by the same function, so a source over the solved names
+/// answers as one over records (D155).
+pub fn solved_lifetimes(names: &CrateNames<'_>, key: ItemKey) -> Result<Option<u16>, ItemsRecordError> {
+    let Some((it, at)) = names.tables.texts.get(&key) else { return Ok(None) };
+    let (_, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: key })?;
+    let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: key })?;
+    Ok(lifetimes_of(lifetimes_field(key, entry.detail, it.text, names.edition)?))
+}
+
+/// [`ItemsRecord::assoc_lifetimes`] of a solved crate (D155).
+pub fn solved_assoc_lifetimes(names: &CrateNames<'_>, owner: ItemKey, named: impl Fn(&str) -> bool) -> Result<Option<u16>, ItemsRecordError> {
+    let Some(list) = names.tables.members.get(&owner) else { return Ok(None) };
+    match list.iter().find(|m| m.name.is_some_and(&named) && matches!(m.detail, ItemDetail::TypeAlias)) {
+        Some(m) => Ok(lifetimes_of(lifetimes_field(m.key, m.detail, m.text, names.edition)?)),
+        None => Ok(None),
+    }
 }
 
 /// The planted bugs of the record's oracle (tests/items_record.rs). Set on the test's thread.
@@ -570,105 +643,53 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
     let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     let tables = &names.tables;
 
-    // Files, by index; expansions that made a text, by call key.
+    // Files, by index; expansions that made a text, by call key. A file row keeps its
+    // surface digest and paths. Its whole digest and length are supplied by FileItems when
+    // a reader asks for the file.
     let mut file_rows = RecordBytes::new_in(alloc);
     for f in names.files.iter() {
         let (path, shown) = (strings.put(f.package.as_str())?, strings.put(f.shown)?);
-        file_rows.extend_from_slice(&f.id.0);
-        for n in [path.0, path.1, shown.0, shown.1, u32_of(f.text.len(), "a file's text")?, 0] {
+        file_rows.extend_from_slice(&f.outline.surface().0);
+        for n in [path.0, path.1, shown.0, shown.1] {
             put32(&mut file_rows, n);
         }
     }
     if names.files.len() >= EXPANSION as usize {
         return Err(ItemsRecordError::TooBig { what: "a crate's files" });
     }
-    let mut calls: AVec<'b, (ItemKey, &'n str)> = AVec::new_in(alloc);
-    calls.extend(names.expansions.iter().filter_map(|(k, e)| e.made.map(|m| (*k, m.text))));
+    let mut calls = AVec::new_in(alloc);
+    calls.extend(names.expansions.iter().filter_map(|(k, e)| e.made.map(|m| (*k, m))));
     calls.sort_unstable_by_key(|c| c.0);
     if calls.len() >= EXPANSION as usize {
         return Err(ItemsRecordError::TooBig { what: "a crate's expansions" });
     }
     let mut expansion_rows = RecordBytes::new_in(alloc);
-    for (call, text) in calls.iter() {
+    for (call, made) in calls.iter() {
         expansion_rows.extend_from_slice(&call.0.0);
-        expansion_rows.extend_from_slice(&expansion_id(text).0);
-        put32(&mut expansion_rows, u32_of(text.len(), "an expansion's text")?);
+        expansion_rows.extend_from_slice(&made.id.0);
+        put32(&mut expansion_rows, u32_of(made.text.len(), "an expansion's text")?);
         put32(&mut expansion_rows, 0);
     }
     // A text's code in a row and its bytes, when the record has a row for it.
     let text_of = |at: At| -> Option<(u32, &'n str)> {
         match at {
             At::File(i) => names.files.get(i as usize).map(|f| (i, f.text)),
-            At::Expansion(call) => calls.binary_search_by_key(&call, |c| c.0).ok().map(|i| (EXPANSION | i as u32, calls[i].1)),
+            At::Expansion(call) => calls.binary_search_by_key(&call, |c| c.0).ok().map(|i| (EXPANSION | i as u32, calls[i].1.text)),
         }
     };
     // Where `part` is: its text's code, start and length; all `NONE`/0 when it is in no text
     // the record has a row for (a reader is refused by name: `NoPlace`).
     let place = |at: Option<At>, part: &str| -> (u32, u32, u32) {
-        at.and_then(|at| text_of(at)).and_then(|(code, base)| span_in(base, part).map(|(start, len)| (code, start, len))).unwrap_or((NONE, 0, 0))
+        match at {
+            Some(At::File(file)) => (file, 0, 0),
+            _ => at.and_then(text_of).and_then(|(code, base)| span_in(base, part).map(|(start, len)| (code, start, len))).unwrap_or((NONE, 0, 0)),
+        }
     };
 
     // The impls, read from their headers and sorted by what the index files them by.
     let mut impls: AVec<'b, ImplOut<'n>> = AVec::with_capacity_in(tables.impls.len(), alloc);
     for i in tables.impls.iter() {
-        let out = match blaze_file_items::impl_header(i.header, names.edition, alloc) {
-            Err(_) => ImplOut {
-                key: i.key,
-                module: i.module,
-                trait_path: "",
-                self_path: "",
-                flags: 0,
-                head: SelfHead::Other,
-                marks: HEADER_UNREAD,
-                filing: buckets::Filing::Not(buckets::NotFiled::HeaderUnread),
-                trait_root: None,
-                self_root: None,
-            },
-            Ok(h) => {
-                let (head, self_path) = self_head(h.self_ty, h.params.as_slice());
-                let (trait_path, marks) = match h.trait_ {
-                    None => ("", 0),
-                    Some(t) => {
-                        let (path, bare) = path_and_bare(t);
-                        // A plain path, or one that reads as a simple path by its tokens: an
-                        // expansion's text writes `:: core :: clone :: Clone` (a derive's impl),
-                        // which is kept as written (a reader trims each segment). Measured
-                        // 2026-11-16 (front2_records, 70 crates): 8,774 of 28,719 impls had
-                        // their trait unread here and were filed from their header's text.
-                        if plain_path(path) || crate::task::parse_path(path, names.key, alloc).is_some() {
-                            (path, HAS_TRAIT | if bare { BARE } else { 0 })
-                        } else {
-                            ("", HAS_TRAIT | TRAIT_UNREAD)
-                        }
-                    }
-                };
-                let negative = h.flags.bits() & ImplFlags::NEGATIVE.bits() != 0;
-                // token-mark-2 R2: a path an expansion wrote with another crate's root keeps it;
-                // the row's text alone would read `crate` as this crate.
-                let trait_root = match h.trait_ {
-                    Some(t) => root_of_path(i.marks, path_and_bare(t).0, names.key, i.key)?,
-                    None => None,
-                };
-                let self_root = match self_path {
-                    Some(p) => root_of_path(i.marks, p, names.key, i.key)?,
-                    None => None,
-                };
-                let filing = buckets::filing(heads, names.key, i.module, h.trait_, negative, head, self_path, trait_root, self_root, alloc);
-                ImplOut {
-                    key: i.key,
-                    module: i.module,
-                    trait_path,
-                    self_path: self_path.unwrap_or(""),
-                    flags: h.flags.bits(),
-                    head,
-                    marks,
-                    filing,
-                    trait_root,
-                    self_root,
-                }
-            }
-        };
-        impls.push(out);
+        impls.push(impl_out(heads, names.key, names.edition, i, alloc)?);
     }
     impls.sort_by(|a, b| (a.trait_path.as_bytes(), a.module, a.key).cmp(&(b.trait_path.as_bytes(), b.module, b.key)));
     #[cfg(test)]
@@ -779,8 +800,9 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             None => (0, 0),
         };
         // The header's place in the same text; `NONE` for no impl (or a header out of it).
-        let header = match it.impl_header {
-            Some(h) if code != NONE => text_of(*at).and_then(|(_, base)| span_in(base, h)).unwrap_or((NONE, 0)),
+        let header = match (it.impl_header, at) {
+            (Some(_), At::File(_)) => (0, 0),
+            (Some(h), _) if code != NONE => text_of(*at).and_then(|(_, base)| span_in(base, h)).unwrap_or((NONE, 0)),
             _ => (NONE, 0),
         };
         item_rows.extend_from_slice(&key.0.0);
@@ -792,6 +814,9 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         for n in [header.0, header.1, impl_row_of.get(key).copied().unwrap_or(NONE), abi.0, abi.1] {
             put32(&mut item_rows, n);
         }
+        // +80: the lifetimes its generics declare, plus one (D155; [`ITEM_ROW`]), then zeros.
+        put16(&mut item_rows, lifetimes_field(*key, detail, it.text, names.edition)?);
+        item_rows.extend_from_slice(&[0; ITEM_ROW - 82]);
     }
 
     // Each trait's and impl's members, in the solve's (declaration) order.
@@ -840,6 +865,10 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             }
             put16(&mut member_rows, u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?);
             member_rows.extend_from_slice(&[m.detail.kind().byte(), flags]);
+            // +56: an associated type's own (GAT) lifetimes, plus one (D155; [`MEMBER_ROW`]),
+            // then zeros.
+            put16(&mut member_rows, lifetimes_field(m.key, m.detail, m.text, names.edition)?);
+            member_rows.extend_from_slice(&[0; MEMBER_ROW - 58]);
             if m.name.is_some() {
                 // Both rows are whole here: the owner's was pushed before its members, this
                 // member's just above.
@@ -900,7 +929,11 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             put32(&mut macro_rows, n);
         }
         macro_rows.extend_from_slice(&[kind, flags, sub, 0]);
-        put32(&mut macro_rows, 0);
+        let outline = match at {
+            Some(At::File(_)) => tables.texts[key].0.item.0,
+            _ => 0,
+        };
+        put32(&mut macro_rows, outline);
     }
 
     // The cfg atoms, in `Cfg::atoms`' own (sorted) order.
@@ -928,7 +961,7 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         at += s.len();
     }
     offsets[TABLES] = at;
-    let root_is_marked = names.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"));
+    let root_is_marked = root_may_write_incoherent(names);
     let mut flags = 0;
     if names.implicit.proc_macro {
         flags |= CRATE_PROC_MACRO;
@@ -968,7 +1001,68 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
     // In the impl table's order: row `i`'s filing at index `i`.
     let filings: AVec<'b, buckets::Filing> = AVec::from_iter_in(impls.iter().map(|i| i.filing), alloc);
     buckets::append(&mut out, &filings, alloc)?;
+    // The value table last: a crate with no value written as a call writes nothing here.
+    values::append(&mut out, &names.values, alloc)?;
     Ok(out)
+}
+
+/// The impl `i` of the crate `krate` (edition `edition`) as its row is written: its header
+/// read, and where the bucket index files it, resolved by `heads` ([`buckets::filing`]).
+fn impl_out<'n, 'x: 'n, H: buckets::HeadNames>(heads: &H, krate: CrateItemKey, edition: Edition, i: &crate::task::ImplSrc<'x>, alloc: Alloc<'_>) -> Result<ImplOut<'n>, ItemsRecordError> {
+    let h = match blaze_file_items::impl_header(i.header, edition, alloc) {
+        Ok(h) => h,
+        Err(_) => {
+            return Ok(ImplOut {
+                key: i.key,
+                module: i.module,
+                trait_path: "",
+                self_path: "",
+                flags: 0,
+                head: SelfHead::Other,
+                marks: HEADER_UNREAD,
+                filing: buckets::Filing::Not(buckets::NotFiled::HeaderUnread),
+                trait_root: None,
+                self_root: None,
+            });
+        }
+    };
+    let (head, self_path) = self_head(h.self_ty, h.params.as_slice());
+    let (trait_path, marks) = match h.trait_ {
+        None => ("", 0),
+        Some(t) => {
+            let (path, bare) = path_and_bare(t);
+            // A plain path, or one that reads as a simple path by its tokens: an expansion's
+            // text writes `:: core :: clone :: Clone` (a derive's impl), which is kept as written
+            // (a reader trims each segment). Measured 2026-11-16 (front2_records, 70 crates):
+            // 8,774 of 28,719 impls had their trait unread here and were filed from their
+            // header's text.
+            if plain_path(path) || crate::task::parse_path(path, krate, alloc).is_some() {
+                (path, HAS_TRAIT | if bare { BARE } else { 0 })
+            } else {
+                ("", HAS_TRAIT | TRAIT_UNREAD)
+            }
+        }
+    };
+    let negative = h.flags.bits() & ImplFlags::NEGATIVE.bits() != 0;
+    // token-mark-2 R2: a path an expansion wrote with another crate's root keeps it; the row's
+    // text alone would read `crate` as this crate.
+    let trait_root = match h.trait_ {
+        Some(t) => root_of_path(i.marks, path_and_bare(t).0, krate, i.key)?,
+        None => None,
+    };
+    let self_root = match self_path {
+        Some(p) => root_of_path(i.marks, p, krate, i.key)?,
+        None => None,
+    };
+    let filing = buckets::filing(heads, krate, i.module, h.trait_, negative, head, self_path, trait_root, self_root, alloc);
+    Ok(ImplOut { key: i.key, module: i.module, trait_path, self_path: self_path.unwrap_or(""), flags: h.flags.bits(), head, marks, filing, trait_root, self_root })
+}
+
+/// Where the bucket index files the impl `i` of crate `krate`, its header's paths resolved by
+/// `heads`: the one filing [`encode_with`] writes (D189 step 4's impl-table differential reads
+/// it for a body's impls, `crate::body_scope::impl_table`).
+pub fn impl_filing<H: buckets::HeadNames>(heads: &H, krate: CrateItemKey, edition: Edition, i: &crate::task::ImplSrc<'_>, alloc: Alloc<'_>) -> Result<buckets::Filing, ItemsRecordError> {
+    Ok(impl_out(heads, krate, edition, i, alloc)?.filing)
 }
 
 fn le32(bytes: &[u8], at: usize) -> u32 {
@@ -991,8 +1085,14 @@ fn key_at(bytes: &[u8], at: usize) -> ItemKey {
     ItemKey(id_at(bytes, at))
 }
 
-/// A stretch of one of a crate's texts: where an item's, a member's or an impl header's text is.
-/// Valid only in the text whose digest the record holds ([`ItemsRecord::slice`] checks it).
+/// The standard-library coherence opt-in is a property of the crate root's attributes.
+pub fn root_may_write_incoherent(names: &CrateNames<'_>) -> bool {
+    names.crate_root.features.contains(&"rustc_attrs") || names.files.first().is_none_or(|file| {
+        file.outline.file_attrs().iter().any(|attr| crate::task::strip_attr(attr.range.of(file.text)) == "rustc_coherence_is_core")
+    })
+}
+
+/// An absolute byte range in the current file or in the expansion's own text.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TextSpan {
     pub at: At,
@@ -1000,18 +1100,96 @@ pub struct TextSpan {
     pub len: u32,
 }
 
-/// A file of the crate, as the solve read it.
-///
-/// Row, 56 bytes, by file index (an [`At::File`]'s): digest 32 (what proves a text handed to a
-/// reader is the one the ranges were made in: question 7), path at/len u32 (the file's
-/// [`PackagePath`]: what the loader is asked for with the crate, 7, 19), shown path at/len u32
-/// (what a finding prints: 19), text length u32, pad.
+/// The columns that can be read without opening the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FileSurface<'a> {
+    pub path: PackagePath<'a>,
+    pub shown: &'a str,
+    pub surface: ContentId,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileRow<'a> {
     pub path: PackagePath<'a>,
     pub shown: &'a str,
     pub id: ContentId,
     pub len: u32,
+}
+
+/// A FileItems view and the matching file text and surface from the same snapshot.
+#[derive(Clone, Copy)]
+pub struct CurrentFile<'a> {
+    pub view: FileItemsView<'a>,
+    pub text: &'a str,
+    pub surface: ContentId,
+}
+
+/// The row of `rows` (`width` bytes each, sorted by the 32-byte key each begins with, one row a
+/// key) whose key is `key`, by the tree's one search of rows sorted by a digest, blaze-format's
+/// `rows::find_row`, which interpolates on the first eight bytes of what it compares.
+///
+/// An item key's first eight bytes are its crate's (blaze-id's `ItemKey`), so a crate's tables
+/// share them, and interpolating on them guesses nothing: the binary search this replaced, word
+/// first, tied on that word at every probe and compared the other 24 bytes each time (sixteen
+/// probes among 50,000 rows, most on pages of their own; it held 285 self samples in the
+/// 2026-11-18 `engine-check` stack sample). So where the first row and the last both begin
+/// with `key`'s eight bytes, every row between does too (the rows are sorted), the order of the
+/// rows is the order of bytes 8..32, and the search runs on those: the hash bits after the
+/// crate's (byte 8's top bit, `ItemKey::INNER`, splits them in two runs, each even), a few
+/// probes on about two pages. Otherwise (a key of another crate, a table of mixed prefixes) it
+/// runs on all 32 bytes. Either way the row found is the row of the key, as the binary
+/// search's was: the same answers (`twins::find_answers_what_the_halving_did`).
+fn find_keyed(rows: &[u8], width: usize, key: &[u8; 32]) -> Option<usize> {
+    let count = rows.len() / width;
+    let head = &key[..8];
+    let shared = count > 0 && rows[..8] == *head && rows[(count - 1) * width..(count - 1) * width + 8] == *head;
+    let (key_at, sought) = if shared { (8, &key[8..]) } else { (0, &key[..]) };
+    blaze_format::rows::find_row(rows, width, key_at, sought).ok()
+}
+
+/// The content domain of the FileItems producer (blaze-vfs FILE_DOMAIN). The solve's
+/// `DigestedText::id` is another domain's (`resolve::file_id`), so it is not this digest.
+const FILE_ITEMS_DOMAIN: &str = "blaze v2 vfs file 1";
+
+/// A file text's digest in [`FILE_ITEMS_DOMAIN`], the `file` a FileItems record names. Made
+/// only here, from the text it is paired with, so a digest of another domain or text cannot
+/// reach `CurrentFile::from_digested`.
+#[derive(Clone, Copy)]
+struct FileItemsId(ContentId);
+
+impl FileItemsId {
+    fn of(text: &str) -> FileItemsId {
+        FileItemsId(ContentId::of(FILE_ITEMS_DOMAIN, text.as_bytes()))
+    }
+
+    /// The digests of `texts`, in order, by blake3's many-message path: one batch for a crate's
+    /// files where the loop hashed them one by one. Equal to [`FileItemsId::of`] of each.
+    fn of_each<'b>(texts: &[&[u8]], alloc: Alloc<'b>) -> AVec<'b, FileItemsId> {
+        let mut ids: AVec<'b, ContentId> = AVec::with_capacity_in(texts.len(), alloc);
+        ids.resize(texts.len(), ContentId([0; 32]));
+        ContentId::of_each(FILE_ITEMS_DOMAIN, texts, &mut ids).expect("`ids` is sized to `texts`");
+        let mut out: AVec<'b, FileItemsId> = AVec::with_capacity_in(ids.len(), alloc);
+        out.extend(ids.iter().map(|&id| FileItemsId(id)));
+        out
+    }
+}
+
+impl<'a> CurrentFile<'a> {
+    pub fn from_outline(file: u32, text: &'a str, outline: &blaze_file_items::Outline<'_>, alloc: Alloc<'a>) -> Result<Self, ItemsRecordError> {
+        Self::from_digested(file, text, FileItemsId::of(text), outline, alloc)
+    }
+
+    /// [`CurrentFile::from_outline`] with the text's digest made already (in a batch).
+    fn from_digested(file: u32, text: &'a str, digest: FileItemsId, outline: &blaze_file_items::Outline<'_>, alloc: Alloc<'a>) -> Result<Self, ItemsRecordError> {
+        let bytes = outline.to_file_items(text, digest.0, alloc).map_err(|why| ItemsRecordError::FileItemsBuild { file, why })?;
+        let view = FileItemsView::read(crate::resolve::aligned(&bytes, alloc)).map_err(|why| ItemsRecordError::FileItemsRead { file, why })?;
+        Ok(Self { view, text, surface: outline.surface() })
+    }
+
+    pub fn from_text(file: u32, text: &'a str, edition: Edition, alloc: Alloc<'a>) -> Result<Self, ItemsRecordError> {
+        let outline = blaze_file_items::outline(text, edition, alloc);
+        Self::from_outline(file, text, &outline, alloc)
+    }
 }
 
 /// An expansion that made a text: the record that holds the text of the items a macro call
@@ -1041,22 +1219,38 @@ pub struct ExpansionRow {
 /// [`FOREIGN`] is, else zero).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ItemRow<'a> {
+    pub identity: ItemIdentity<'a>,
+    pub text: Option<TextSpan>,
+    pub impl_header: Option<TextSpan>,
+}
+
+impl<'a> core::ops::Deref for ItemRow<'a> {
+    type Target = ItemIdentity<'a>;
+
+    fn deref(&self) -> &Self::Target { &self.identity }
+}
+
+/// Surface facts available without reading a file's current outline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ItemIdentity<'a> {
     pub key: ItemKey,
     pub kind: ItemKind,
     pub module: ItemKey,
-    /// `None`: the record has no place for its text.
-    pub text: Option<TextSpan>,
+    pub at: Option<At>,
     pub outline: ItemIndex,
     pub name: Option<&'a str>,
     pub body_holds_items: bool,
     pub ctor: bool,
-    pub impl_header: Option<TextSpan>,
     pub impl_row: Option<u32>,
     /// `Some(abi)`: an `extern` block declares it (a foreign fn or static), and `abi` is the
     /// block's string unquoted as written, `"C"` for a bare `extern`; `None`: no block does.
     /// Written by the names task from the outline of the text the item is in, a file's or an
     /// expansion's alike, so a reader never outlines a text again to ask it.
     pub foreign: Option<&'a str>,
+    /// The lifetime parameters its own generics declare (D155: the one home of the count the
+    /// region walk reads, in any store): `Some` for a struct, enum, union, trait, trait alias
+    /// and type alias, `None` for a kind that declares none here.
+    pub lifetimes: Option<u16>,
 }
 
 /// A member of a trait or an impl.
@@ -1076,6 +1270,9 @@ pub struct MemberRow<'a> {
     pub text: Option<TextSpan>,
     /// The call whose expansion it is in; `None` when written in its owner's body.
     pub written_by: Option<ItemKey>,
+    /// An associated type's own (GAT) lifetime parameters (D155); `None` for a fn, a const or
+    /// a macro call.
+    pub lifetimes: Option<u16>,
 }
 
 /// An impl of the crate, with what an impl index files it by, read from its header when the
@@ -1182,6 +1379,8 @@ enum Seen<'a> {
     Gone,
 }
 
+type FileSource<'a> = dyn Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a;
+
 /// One crate's items record, read in place (D114 rule 1, a record is its own index): a row, a
 /// file's rows, an owner's members ([`Members`]) and an expansion are each found by binary search
 /// and read from the bytes each time asked. Opening allocates nothing. The cfg atoms are made
@@ -1201,11 +1400,20 @@ pub struct ItemsRecord<'a> {
     /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
     /// the first text is asked.
     seen: RefCell<HashMap<At, Seen<'a>, Alloc<'a>>>,
+    source: Option<ABox<'a, FileSource<'a>>>,
+    current: RefCell<HashMap<u32, Result<CurrentFile<'a>, ItemsRecordError>, Alloc<'a>>>,
     decoded: Cell<ItemsDecoded>,
     alloc: Alloc<'a>,
 }
 
 impl<'a> ItemsRecord<'a> {
+    /// Open a reader that can answer file positions and text from the caller's snapshot.
+    pub fn open_with_files(bytes: &'a [u8], alloc: Alloc<'a>, source: impl Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a) -> Result<Self, ItemsRecordError> {
+        let mut record = Self::open(bytes, alloc)?;
+        record.source = Some(Box::new_in(source, alloc));
+        Ok(record)
+    }
+
     /// Checks the header and that every section lies inside `bytes`; parses nothing else.
     pub fn open(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<ItemsRecord<'a>, ItemsRecordError> {
         if bytes.as_ptr() as usize % ALIGN != 0 {
@@ -1248,6 +1456,8 @@ impl<'a> ItemsRecord<'a> {
             strings,
             atoms: OnceCell::new(),
             seen: RefCell::new(HashMap::new_in(alloc)),
+            source: None,
+            current: RefCell::new(HashMap::new_in(alloc)),
             decoded: Cell::new(ItemsDecoded { crates: 1, bytes: bytes.len(), string_checks: 1, ..ItemsDecoded::default() }),
             alloc,
         })
@@ -1318,27 +1528,11 @@ impl<'a> ItemsRecord<'a> {
         self.offsets[t] + i * WIDTHS[t]
     }
 
-    /// Binary search of table `t`'s rows, keyed by their first 32 bytes. A step compares the
-    /// first 8 bytes as one big-endian word (the same order as the bytes'), and the 32 only
-    /// when those are equal: a key is a digest, so the word decides nearly every step with no
-    /// call to `memcmp` (285 self samples in the 2026-11-18 `engine-check` stack sample).
+    /// The row of table `t` keyed `key` (its first 32 bytes): [`find_keyed`] over the table's
+    /// rows, which `open` checked lie inside the bytes (`counts[t]` rows of `WIDTHS[t]`).
     fn find(&self, t: usize, key: ItemKey) -> Option<usize> {
-        let (mut lo, mut hi) = (0usize, self.counts[t]);
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&key.0.0[..8]);
-        let want = u64::from_be_bytes(word);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let row = self.row(t, mid);
-            word.copy_from_slice(&self.bytes[row..row + 8]);
-            let order = u64::from_be_bytes(word).cmp(&want).then_with(|| self.bytes[row + 8..row + 32].cmp(&key.0.0[8..]));
-            match order {
-                core::cmp::Ordering::Less => lo = mid + 1,
-                core::cmp::Ordering::Greater => hi = mid,
-                core::cmp::Ordering::Equal => return Some(mid),
-            }
-        }
-        None
+        let start = self.offsets[t];
+        find_keyed(&self.bytes[start..start + self.counts[t] * WIDTHS[t]], WIDTHS[t], &key.0.0)
     }
 
     fn module_key(&self, index: u32) -> Result<ItemKey, ItemsRecordError> {
@@ -1377,19 +1571,70 @@ impl<'a> ItemsRecord<'a> {
     }
 
     /// File `index` of the crate.
-    pub fn file(&self, index: u32) -> Result<Option<FileRow<'a>>, ItemsRecordError> {
+    pub fn file_surface(&self, index: u32) -> Result<Option<FileSurface<'a>>, ItemsRecordError> {
         if index as usize >= self.counts[T_FILES] {
             return Ok(None);
         }
         let r = self.row(T_FILES, index as usize);
         let b = self.bytes;
-        Ok(Some(FileRow {
-            id: id_at(b, r),
+        Ok(Some(FileSurface {
+            surface: id_at(b, r),
             path: PackagePath::new(self.str_at("a file's path", le32(b, r + 32), le32(b, r + 36))?)
                 .map_err(|why| ItemsRecordError::NotPackagePath { at: index as usize, why })?,
             shown: self.str_at("a file's shown path", le32(b, r + 40), le32(b, r + 44))?,
-            len: le32(b, r + 48),
         }))
+    }
+
+    pub fn file(&self, index: u32) -> Result<Option<FileRow<'a>>, ItemsRecordError> {
+        let Some(row) = self.file_surface(index)? else { return Ok(None) };
+        let file = self.current_file(index)?;
+        Ok(Some(FileRow { path: row.path, shown: row.shown, id: file.view.file(), len: u32_of(file.text.len(), "a file's length")? }))
+    }
+
+    fn current_file(&self, index: u32) -> Result<CurrentFile<'a>, ItemsRecordError> {
+        if let Some(file) = self.current.borrow().get(&index) {
+            return file.clone();
+        }
+        let row = self.file_surface(index)?.ok_or(ItemsRecordError::Short { what: "a file row", at: index as usize })?;
+        let gone = || ItemsRecordError::Gone { krate: self.key, file: Some(index), call: None };
+        let answer = (|| {
+            let source = self.source.as_ref().ok_or_else(gone)?;
+            let current = source(index, row.path, row.surface, self.edition())?.ok_or_else(gone)?;
+            let mut decoded = self.decoded.get();
+            decoded.texts += 1;
+            decoded.text_bytes += current.text.len();
+            self.decoded.set(decoded);
+            self.check_file(index, row.surface, current)
+        })();
+        self.current.borrow_mut().insert(index, answer.clone());
+        answer
+    }
+
+    fn check_file(&self, index: u32, saw: ContentId, file: CurrentFile<'a>) -> Result<CurrentFile<'a>, ItemsRecordError> {
+        #[cfg(test)]
+        if plant::is(plant::Plant::SkipDigest) { return Ok(file); }
+        if saw != file.surface {
+            return Err(ItemsRecordError::Stale { krate: self.key, file: Some(index), call: None, saw, found: file.surface });
+        }
+        Ok(file)
+    }
+
+    fn file_entry(&self, file: u32, index: ItemIndex) -> Result<(CurrentFile<'a>, blaze_surface::Item), ItemsRecordError> {
+        let current = self.current_file(file)?;
+        let entry = current.view.item(index).ok_or(ItemsRecordError::Short { what: "an entry of the current FileItems record", at: index.0 as usize })?;
+        Ok((current, entry.item))
+    }
+
+    fn item_span(&self, at: Option<At>, index: ItemIndex, start: u32, len: u32) -> Result<Option<TextSpan>, ItemsRecordError> {
+        Ok(match at {
+            Some(at @ At::File(file)) => {
+                let (_, entry) = self.file_entry(file, index)?;
+                let range = entry.range;
+                Some(TextSpan { at, start: range.start, len: range.len() })
+            }
+            Some(at) => Some(TextSpan { at, start, len }),
+            None => None,
+        })
     }
 
     /// How many expansions made a text.
@@ -1410,28 +1655,47 @@ impl<'a> ItemsRecord<'a> {
         self.expansion_at(self.find(T_EXPANSIONS, call)?)
     }
 
+    /// Reuse the solve's surface and file ranges when building cells from its records.
+    pub(super) fn use_solved_texts(&mut self, names: &CrateNames<'a>) {
+        let checked = |saw, found, text| if saw == found { Seen::Fresh(text) } else { Seen::Stale(found) };
+        let files = &names.files[..names.files.len().min(self.files())];
+        let mut texts: AVec<'_, &[u8]> = AVec::with_capacity_in(files.len(), self.alloc);
+        texts.extend(files.iter().map(|file| file.text.as_bytes()));
+        let digests = FileItemsId::of_each(&texts, self.alloc);
+        for (index, (file, &digest)) in files.iter().zip(digests.iter()).enumerate() {
+            let saw = id_at(self.bytes, self.row(T_FILES, index));
+            let index = index as u32;
+            let result = CurrentFile::from_digested(index, file.text, digest, &file.outline, self.alloc)
+                .and_then(|current| self.check_file(index, saw, current));
+            self.current.get_mut().insert(index, result);
+        }
+        for index in 0..self.expansions() {
+            let row = self.row(T_EXPANSIONS, index);
+            let call = key_at(self.bytes, row);
+            if let Some(made) = names.expansions.get(&call).and_then(|expansion| expansion.made) {
+                let saw = id_at(self.bytes, row + 32);
+                self.seen.get_mut().insert(At::Expansion(call), checked(saw, made.id, made.text));
+            }
+        }
+    }
+
     /// The whole text `at`, from `read`, checked against the digest its row holds the first
     /// time it is asked. A text that is not the one the record saw is refused
     /// ([`ItemsRecordError::Stale`]) every time it is asked.
     pub fn whole(&self, at: At, read: &dyn Fn(TextOf<'_>) -> Option<&'a str>) -> Result<&'a str, ItemsRecordError> {
-        let (saw, ask, id_of, file, call): (ContentId, TextOf<'_>, fn(&str) -> ContentId, _, _) = match at {
-            At::File(index) => {
-                let row = self.file(index)?.ok_or(ItemsRecordError::Short { what: "a file row", at: index as usize })?;
-                (row.id, TextOf::File { index, path: row.path }, crate::resolve::file_id, Some(index), None)
-            }
-            At::Expansion(call) => {
-                let i = self.find(T_EXPANSIONS, call).ok_or(ItemsRecordError::Gone { krate: self.key, file: None, call: Some(call) })?;
-                let row = self.expansion_at(i).ok_or(ItemsRecordError::Short { what: "an expansion row", at: i })?;
-                (row.id, TextOf::Expansion { call }, expansion_id, None, Some(call))
-            }
+        let call_key = match at {
+            At::File(file) => return Ok(self.current_file(file)?.text),
+            At::Expansion(call) => call,
         };
+        let row = self.expansion(call_key).ok_or(ItemsRecordError::Gone { krate: self.key, file: None, call: Some(call_key) })?;
+        let (saw, ask, file, call) = (row.id, TextOf::Expansion { call: call_key }, None, Some(call_key));
         // The one check of the text, the first time it is asked. No borrow of the memo is held
         // across `read`.
         let known = self.seen.borrow().get(&at).copied();
         let seen = match known {
             Some(seen) => seen,
             None => {
-                let seen = self.check(read(ask), saw, id_of);
+                let seen = self.check(read(ask), saw, expansion_id);
                 self.seen.borrow_mut().insert(at, seen);
                 seen
             }
@@ -1473,30 +1737,77 @@ impl<'a> ItemsRecord<'a> {
         self.counts[T_ITEMS]
     }
 
-    /// Item row `i`, in key order.
-    pub fn item_at(&self, i: usize) -> Result<Option<ItemRow<'a>>, ItemsRecordError> {
-        if i >= self.counts[T_ITEMS] {
-            return Ok(None);
-        }
+    /// Surface facts of item row `i`, in key order.
+    pub fn identity_at(&self, i: usize) -> Result<Option<ItemIdentity<'a>>, ItemsRecordError> {
+        if i >= self.counts[T_ITEMS] { return Ok(None); }
         let (b, r) = (self.bytes, self.row(T_ITEMS, i));
-        let key = key_at(b, r);
         let flags = b[r + 59];
-        let code = le32(b, r + 36);
-        let header_start = le32(b, r + 60);
         let impl_row = le32(b, r + 68);
-        Ok(Some(ItemRow {
-            key,
+        Ok(Some(ItemIdentity {
+            key: key_at(b, r),
             kind: ItemKind::from_byte(b[r + 58]).ok_or(ItemsRecordError::Byte { what: "an item kind", byte: b[r + 58] })?,
             module: self.module_key(le32(b, r + 32))?,
-            text: self.span(code, le32(b, r + 40), le32(b, r + 44))?,
+            at: self.at_of(le32(b, r + 36))?,
             outline: ItemIndex(le32(b, r + 48)),
             name: if flags & NAMED != 0 { Some(self.str_at("an item's name", le32(b, r + 52), u32::from(le16(b, r + 56)))?) } else { None },
             body_holds_items: flags & BODY_HOLDS_ITEMS != 0,
             ctor: flags & CTOR_OR_WRITTEN_BY != 0,
-            impl_header: if header_start == NONE { None } else { self.span(code, header_start, le32(b, r + 64))? },
             impl_row: (impl_row != NONE).then_some(impl_row),
             foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", le32(b, r + 72), le32(b, r + 76))?) } else { None },
+            lifetimes: lifetimes_of(le16(b, r + 80)),
         }))
+    }
+
+    pub fn identity(&self, key: ItemKey) -> Result<Option<ItemIdentity<'a>>, ItemsRecordError> {
+        match self.find(T_ITEMS, key) {
+            Some(i) => self.identity_at(i),
+            None => Ok(None),
+        }
+    }
+
+    /// The lifetime parameters item `key`'s own generics declare (D155), read in place from
+    /// its row; `None` for a key the record does not hold or a kind that declares none.
+    pub fn declared_lifetimes(&self, key: ItemKey) -> Result<Option<u16>, ItemsRecordError> {
+        Ok(self.identity(key)?.and_then(|i| i.lifetimes))
+    }
+
+    /// The own (GAT) lifetime parameters of the associated type of the trait `owner` whose
+    /// name `named` accepts (D155: the front end asks by its name's hash, so the name is a
+    /// test, not a string); `None` when the record holds no such member, or it is no
+    /// associated type.
+    pub fn assoc_lifetimes(&self, owner: ItemKey, named: impl Fn(&str) -> bool) -> Result<Option<u16>, ItemsRecordError> {
+        let Some(members) = self.members(owner)? else { return Ok(None) };
+        for m in members.iter() {
+            let m = m?;
+            if m.kind == ItemKind::TypeAlias && m.name.is_some_and(&named) {
+                return Ok(m.lifetimes);
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn item_at(&self, i: usize) -> Result<Option<ItemRow<'a>>, ItemsRecordError> {
+        let Some(identity) = self.identity_at(i)? else { return Ok(None) };
+        let (b, r) = (self.bytes, self.row(T_ITEMS, i));
+        let header_start = le32(b, r + 60);
+        let (text, impl_header) = match identity.at {
+            Some(at @ At::File(file)) => {
+                let (current, entry) = self.file_entry(file, identity.outline)?;
+                let header = if header_start == NONE { None } else {
+                    let start = current.view.outer_attrs(&entry).end.min(entry.signature.end);
+                    let header = entry.text(current.text, blaze_surface::Range::new(start, entry.signature.end)).trim();
+                    let (start, len) = span_in(current.text, header).ok_or(ItemsRecordError::NoPlace { key: identity.key })?;
+                    Some(TextSpan { at, start, len })
+                };
+                (Some(TextSpan { at, start: entry.range.start, len: entry.range.len() }), header)
+            }
+            Some(at) => (
+                Some(TextSpan { at, start: le32(b, r + 40), len: le32(b, r + 44) }),
+                (header_start != NONE).then(|| TextSpan { at, start: header_start, len: le32(b, r + 64) }),
+            ),
+            None => (None, None),
+        };
+        Ok(Some(ItemRow { identity, text, impl_header }))
     }
 
     /// The item `key`: its kind, module, name and where its text is (questions 7 to 12);
@@ -1594,11 +1905,32 @@ impl<'a> ItemsRecord<'a> {
         let (b, r) = (self.bytes, self.row(T_MACROS, i));
         let (kind, flags, sub) = (b[r + 64], b[r + 65], b[r + 66]);
         let code = le32(b, r + 44);
-        let first = self.span(code, le32(b, r + 48), le32(b, r + 52))?;
         let (second_at, second_len) = (le32(b, r + 56), le32(b, r + 60));
+        let (first, params) = match self.at_of(code)? {
+            Some(at @ At::File(file)) => {
+                let (current, item) = self.file_entry(file, ItemIndex(le32(b, r + 68)))?;
+                let missing = || ItemsRecordError::NoPlace { key: def };
+                let range = item.body.ok_or_else(missing)?;
+                let span = |part: &str| {
+                    let (start, len) = span_in(current.text, part).ok_or_else(missing)?;
+                    Ok::<_, ItemsRecordError>(TextSpan { at, start, len })
+                };
+                let body = span(crate::task::inside(item.text(current.text, range)))?;
+                let params = if flags & HAS_PARAMS != 0 {
+                    let start = item.name.ok_or_else(missing)?.end;
+                    let between = item.text(current.text, blaze_surface::Range::new(start, range.start)).trim();
+                    Some(span(crate::task::inside(between))?)
+                } else { None };
+                (Some(body), params)
+            }
+            _ => (
+                self.span(code, le32(b, r + 48), le32(b, r + 52))?,
+                if flags & HAS_PARAMS != 0 { self.span(code, second_at, second_len)? } else { None },
+            ),
+        };
         let body = match kind {
             BODY_RULES => MacroBodyAt::Rules(first),
-            BODY_MACRO2 => MacroBodyAt::Macro2 { params: if flags & HAS_PARAMS != 0 { self.span(code, second_at, second_len)? } else { None }, body: first },
+            BODY_MACRO2 => MacroBodyAt::Macro2 { params, body: first },
             BODY_BUILTIN_FN => MacroBodyAt::BuiltinFn(self.str_at("a builtin macro's name", second_at, second_len)?),
             BODY_BUILTIN_OTHER => MacroBodyAt::BuiltinOther(CallShape::from_byte(sub).ok_or(ItemsRecordError::Byte { what: "a macro call shape", byte: sub })?),
             BODY_PROC => MacroBodyAt::Proc {
@@ -1690,7 +2022,7 @@ impl<'a> ItemsRecord<'a> {
 
 /// Where a reader gets a crate's items record and the texts its rows point into: through the
 /// caller's effect layer (a kept file, the store), the first time each is asked.
-pub trait LoadItems<'a> {
+pub trait LoadItems<'a>: 'a {
     /// The items record of the crate at `krate` (an index of the keys the reader was given),
     /// 16-aligned, or `None` when none is kept.
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
@@ -1705,12 +2037,10 @@ pub trait LoadItems<'a> {
     /// record.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'a str>;
 
-    /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`
-    /// ([`grain::item_chain`]): what a row whose file changed is checked against, item by item
-    /// ([`ItemsRecord::item_now`]). This one outlines the file's text now in `alloc`; a loader
-    /// that holds the file's `FileItems` record answers from that instead, with equal entries.
-    fn item(&self, krate: usize, path: PackagePath<'_>, chain: ContentId, edition: Edition, alloc: Alloc<'a>) -> Option<ItemToday<'a>> {
-        grain::outline_today(self.file(krate, path)?, chain, edition, alloc)
+    /// Return the FileItems and surface for this file of the snapshot. A text-backed loader
+    /// produces the view once per file. A record-backed loader lends its already opened view.
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: ContentId, edition: Edition, alloc: Alloc<'a>) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> {
+        self.file(krate, path).map(|text| CurrentFile::from_text(index, text, edition, alloc)).transpose()
     }
 }
 
@@ -1723,7 +2053,7 @@ pub struct RecordItems<'a, L> {
     keys: AVec<'a, CrateItemKey>,
     by_prefix: HashMap<[u8; 8], usize, Alloc<'a>>,
     open: AVec<'a, OnceCell<Option<ItemsRecord<'a>>>>,
-    load: L,
+    load: ARc<'a, L>,
     alloc: Alloc<'a>,
 }
 
@@ -1736,7 +2066,7 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
         }
         let mut open = AVec::with_capacity_in(keys.len(), alloc);
         open.resize_with(keys.len(), OnceCell::new);
-        RecordItems { keys: AVec::from_slice_in(keys, alloc), by_prefix, open, load, alloc }
+        RecordItems { keys: AVec::from_slice_in(keys, alloc), by_prefix, open, load: Rc::new_in(load, alloc), alloc }
     }
 
     /// The crate whose key `key` (any item of it) begins with (question 4): no record is opened.
@@ -1753,7 +2083,10 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
             .get(krate)?
             .get_or_init(|| {
                 let bytes = self.load.load(krate)?;
-                Some(ItemsRecord::open(bytes, self.alloc).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
+                let load = self.load.clone();
+                let alloc = self.alloc;
+                let source = move |index, path, surface, edition| load.file_items(krate, index, path, surface, edition, alloc);
+                Some(ItemsRecord::open_with_files(bytes, alloc, source).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
             })
             .as_ref()
     }
@@ -1785,9 +2118,36 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
         }
     }
 
+    pub fn identity(&self, key: ItemKey) -> Result<Option<ItemIdentity<'a>>, ItemsRecordError> {
+        match self.of(key) {
+            Some((_, record)) => record.identity(key),
+            None => Ok(None),
+        }
+    }
+
+    /// [`ItemsRecord::declared_lifetimes`] in the crate that holds `key` (D155).
+    pub fn declared_lifetimes(&self, key: ItemKey) -> Result<Option<u16>, ItemsRecordError> {
+        match self.of(key) {
+            Some((_, record)) => record.declared_lifetimes(key),
+            None => Ok(None),
+        }
+    }
+
+    /// [`ItemsRecord::assoc_lifetimes`] in the crate that holds the trait `owner` (D155).
+    pub fn assoc_lifetimes(&self, owner: ItemKey, named: impl Fn(&str) -> bool) -> Result<Option<u16>, ItemsRecordError> {
+        match self.of(owner) {
+            Some((_, record)) => record.assoc_lifetimes(owner, named),
+            None => Ok(None),
+        }
+    }
+
+    pub fn file_now(&self, krate: usize, file: u32) -> Result<&'a str, ItemsRecordError> {
+        self.whole(krate, At::File(file))
+    }
+
     /// The module an item is declared in (question 8): `Names::module_of`.
     pub fn module_of(&self, item: ItemKey) -> Result<Option<ItemKey>, ItemsRecordError> {
-        Ok(self.item(item)?.map(|row| row.module))
+        Ok(self.identity(item)?.map(|row| row.module))
     }
 
     /// The stretch `span` of a text of crate `krate`, the text asked of the loader and checked
@@ -1813,8 +2173,8 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
     /// An item's whole text (question 7): `Names::item_text(key).text`. `Ok(None)` for no such
     /// item; an item the record has no place for is [`ItemsRecordError::NoPlace`].
     pub fn item_text(&self, key: ItemKey) -> Result<Option<&'a str>, ItemsRecordError> {
-        let Some((krate, r)) = self.of(key) else { return Ok(None) };
-        let Some(row) = r.item(key)? else { return Ok(None) };
+        let Some((krate, record)) = self.of(key) else { return Ok(None) };
+        let Some(row) = record.item(key)? else { return Ok(None) };
         self.text(krate, row.text.ok_or(ItemsRecordError::NoPlace { key })?).map(Some)
     }
 
@@ -1846,5 +2206,138 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
             Some((_, r)) => r.module(key),
             None => Ok(None),
         }
+    }
+}
+
+/// `find` and the file digests against their scalar twins, the code they replaced.
+#[cfg(test)]
+mod twins {
+    use std::vec::Vec as StdVec;
+
+    use blaze_id::{ContentId, ItemKey};
+    use blaze_sim::{Broke, Config};
+
+    use super::FileItemsId;
+
+    /// The width of an item row (`T_ITEMS`'s), with its 32-byte key first.
+    const WIDTH: usize = 80;
+
+    /// The twin of `find`: the binary search it was, word first, over `count` rows of `WIDTH`.
+    fn find_by_halving(bytes: &[u8], count: usize, key: &[u8; 32]) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, count);
+        let want = u64::from_be_bytes(*key.first_chunk::<8>().expect("32 bytes"));
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let row = mid * WIDTH;
+            let word = u64::from_be_bytes(*bytes[row..].first_chunk::<8>().expect("a row is 80 bytes"));
+            match word.cmp(&want).then_with(|| bytes[row + 8..row + 32].cmp(&key[8..])) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    /// Over drawn tables of distinct keys, `find_keyed`, which `find` calls, finds each held key
+    /// where the halving does and refuses each absent one as it does: tables of one crate's
+    /// keys (one head, as a record's are, byte 8's `INNER` bit drawn), of two heads, of spread
+    /// keys, and keys sought of the table's crate and of others (one ending a few rows in).
+    /// Prints nothing.
+    #[test]
+    fn find_answers_what_the_halving_did() {
+        blaze_sim::check(Config::cases(400), |tape| {
+            let heads: [[u8; 8]; 3] = [*b"cratehd1", *b"cratehd2", *b"cratehd0"];
+            let shape = tape.index(3, "shape");
+            let draw = |tape: &blaze_sim::Tape| {
+                let mut key = [0u8; 32];
+                tape.fill(&mut key, "key");
+                match shape {
+                    0 => key[..8].copy_from_slice(&heads[0]),
+                    1 => key[..8].copy_from_slice(&heads[tape.index(2, "head")]),
+                    _ => {}
+                }
+                if tape.coin("inner") {
+                    key[8] |= ItemKey::INNER;
+                }
+                key
+            };
+            let foreign = |tape: &blaze_sim::Tape| {
+                let mut key = draw(tape);
+                key[..8].copy_from_slice(&heads[tape.index(3, "foreign head")]);
+                key
+            };
+            let mut keys: StdVec<[u8; 32]> = tape.vec(0..=300, "keys", draw);
+            keys.sort_unstable();
+            keys.dedup();
+            let mut bytes = StdVec::with_capacity(keys.len() * WIDTH);
+            for key in &keys {
+                bytes.extend_from_slice(key);
+                bytes.extend_from_slice(&[0x5a; WIDTH - 32]);
+            }
+            let mut sought = keys.clone();
+            sought.extend(tape.vec(0..=30, "absent", draw));
+            sought.extend(tape.vec(0..=10, "of other crates", foreign));
+            for key in &sought {
+                let (new, old) = (super::find_keyed(&bytes, WIDTH, key), find_by_halving(&bytes, keys.len(), key));
+                if new != old {
+                    return Err(Broke::Oracle(std::format!("{key:x?}: find_keyed {new:?}, halving {old:?}")));
+                }
+                if new.is_some() != keys.contains(key) {
+                    return Err(Broke::Oracle(std::format!("{key:x?}: held is not found, or absent is")));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// The batch of file digests is the digest of each file alone, for drawn crates of files of
+    /// every size class blake3 treats apart (empty, under a block, a chunk, many chunks).
+    /// Prints nothing.
+    #[test]
+    fn file_digests_in_a_batch_are_each_files() {
+        let heap = blaze_own::testing::heap().alloc();
+        blaze_sim::check(Config::cases(200), |tape| {
+            // Every size class blake3 treats apart, and a byte either side of 1, 2, 4, 8 and 16
+            // chunks (and on them), where the tree changes shape.
+            const SIZES: [usize; 25] = [
+                0, 1, 63, 64, 65, 1023, 1024, 1025, 2047, 2048, 2049, 3072, 4095, 4096, 4097, 5121, 8191,
+                8192, 8193, 9000, 16383, 16384, 16385, 17 * 1024 + 3, 33 * 1024 + 1,
+            ];
+            let files: StdVec<StdVec<u8>> = tape.vec(0..=20, "files", |tape| {
+                let len = SIZES[tape.index(SIZES.len(), "size")];
+                let mut text = std::vec![0u8; len];
+                tape.fill(&mut text, "text");
+                text
+            });
+            let texts: StdVec<&[u8]> = files.iter().map(|file| file.as_slice()).collect();
+            let batch = FileItemsId::of_each(&texts, heap);
+            for (text, got) in texts.iter().zip(batch.iter()) {
+                if got.0 != ContentId::of(super::FILE_ITEMS_DOMAIN, text) {
+                    return Err(Broke::Oracle(std::format!("the batch digest of a {}-byte file differs", text.len())));
+                }
+                // And the same bytes streamed in drawn pieces (the hasher's lazily merged
+                // stack, another path of blaze-blake3 than the batch's one-shot tree).
+                let mut streamed = blaze_ids::Hasher::new(super::FILE_ITEMS_DOMAIN);
+                let mut at = 0;
+                while at < text.len() {
+                    let take = match tape.below(3, "piece kind") {
+                        0 => tape.range(0..70, "a block or so") as usize,
+                        1 => (1usize << tape.below(5, "chunks")) * 1024,
+                        _ => text.len() - at,
+                    }
+                    .min(text.len() - at);
+                    streamed.update(&text[at..at + take]);
+                    at += take;
+                }
+                if got.0 != streamed.finish() {
+                    return Err(Broke::Oracle(std::format!("the batch digest of a {}-byte file differs from it streamed", text.len())));
+                }
+            }
+            if batch.len() != texts.len() {
+                return Err(Broke::Oracle("the batch gave another count of digests".into()));
+            }
+            Ok(())
+        });
     }
 }

@@ -12,7 +12,6 @@
 use blaze_id::ContentId;
 
 use crate::key::{ABSENT, KINDS, Kind, Name};
-use crate::table::{Hashed, spread};
 use crate::wire::{Reader, WireError, Writer};
 
 /// One cell of a record: what a reader looked up in it (a module's (namespace, name), an
@@ -73,9 +72,8 @@ pub struct CellRefused {
 /// A kind's cell lookup: pure over its record's payload (rule 14), a search in the bytes.
 pub type CellOf = fn(payload: &[u8], cell: Cell) -> Result<Seen, CellRefused>;
 
-/// Which kinds have cells, and each one's lookup: given once to the request
-/// ([`crate::Request::with_cells`]). A cell read of a kind with none is
-/// [`crate::DriveError::NoCells`].
+/// Which kinds have cells, and each one's lookup: given once to the command. A cell read of a
+/// kind with none is refused by the caller, naming the record and its reader.
 #[derive(Clone, Copy, Debug)]
 pub struct Cells {
     of: [Option<CellOf>; KINDS],
@@ -92,20 +90,6 @@ impl Cells {
 
     pub fn of(&self, kind: Kind) -> Option<CellOf> {
         self.of[kind.index()]
-    }
-}
-
-/// A name's cell, as a table key: the request's cache of today's cell digests.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct CellAt {
-    pub(crate) name: Name,
-    pub(crate) cell: Cell,
-}
-
-impl Hashed for CellAt {
-    fn hash(&self) -> u64 {
-        let low = u64::from_le_bytes([self.cell.0[0], self.cell.0[1], self.cell.0[2], self.cell.0[3], self.cell.0[4], self.cell.0[5], self.cell.0[6], self.cell.0[7]]);
-        self.name.hash() ^ spread(low)
     }
 }
 

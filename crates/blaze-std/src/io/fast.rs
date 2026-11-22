@@ -28,9 +28,20 @@ use core::time::Duration;
 use blaze_core::{
     Done, Driver, Effect, FileName, Tag,
     lock::LockGuard,
-    threads::inline::{Inline, Lent, Now, inline_op},
+    threads::inline::{Inline, Lent, LentRead, Now, inline_op},
     wait::Monotonic,
 };
+
+/// What [`Io::read_all_lent`] read: the bytes added, or a length that moved, or the driver's
+/// failure (an allocator's refusal is the call's `Stopped`).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an outcome with an error's text
+pub(crate) enum ReadAllLent {
+    /// This many bytes added to `into`: the whole file.
+    Read(usize),
+    /// The file's length moved between its `fstat` and its read (blaze-core `LentRead::Moved`).
+    Moved { stated: u64, read: u64 },
+    Failed(blaze_core::IoError),
+}
 
 use super::{Backend, Ends, Io, Reach, World, change, touch};
 use crate::{Stopped, cx::Cx};
@@ -106,6 +117,8 @@ pub(super) fn stamp(world: &mut World, effect: impl FnOnce(Tag) -> Effect) -> Ef
     let tag = Tag(world.next);
     world.next += 1;
     let effect = effect(tag);
+    // The meter (D169): every effect, on its asker's thread, by kind (its time: `Io::call`).
+    blaze_meter::call(effect.metered());
     if world.record {
         touch(&mut world.touched, &effect);
         // clone: a test's record of what was asked.
@@ -235,6 +248,73 @@ impl Io {
         #[cfg(test)]
         self.counted(|seen| &seen.inline);
         Ok(done)
+    }
+
+    /// The whole of `file` read straight into `into`, which grows once by the file's length
+    /// and one byte (`Bytes::grow_zeroed`) and is cut back to what the file holds: on a native
+    /// world with inline calls ([`Inline::read_all_lent`]), with no `Vec` made and no copy.
+    /// `None`: this world has no inline calls (the simulation, which keeps every effect on its
+    /// queue to reorder, fail and crash; a guest's escape): the caller asks `Effect::ReadAll`,
+    /// the other instantiation of the seam, as before. On every outcome but `Read`, `into` is
+    /// as it was. The effect it stands for is stamped as `ReadAll` (the meter, a test's
+    /// record), as `write_lent` stamps its own.
+    pub(crate) fn read_all_lent(&self, cx: &Cx, file: &FileName, into: &mut crate::mem::Bytes<'_>) -> Option<Result<ReadAllLent, Stopped>> {
+        let files = self.inline_files()?;
+        let began = self.now();
+        if let Err(stopped) = cx.stopped_by(began) {
+            return Some(Err(stopped));
+        }
+        let kind = {
+            let mut world = self.world().lock();
+            // clone: the effect's name, a refcount.
+            let named = file.clone();
+            stamp(&mut world, |tag| Effect::ReadAll { file: named, tag }).metered()
+        };
+        let start = into.len();
+        let mut refused: Option<Stopped> = None;
+        // Both moved into the closure, which is called once and returns a borrow of `room`.
+        let (room, refused_at) = (&mut *into, &mut refused);
+        let read = files.read_all_lent(file, move |len| {
+            let asked = usize::try_from(len).ok().and_then(|len| len.checked_add(1));
+            let Some(asked) = asked else {
+                *refused_at = Some(Stopped::OutOfMemory { arena: "bstd::fs read_all", asked: usize::MAX });
+                return None;
+            };
+            match room.grow_zeroed(asked) {
+                Ok(room) => Some(room),
+                Err(stopped) => {
+                    *refused_at = Some(stopped);
+                    None
+                }
+            }
+        });
+        #[cfg(test)]
+        self.counted(|seen| &seen.inline);
+        // The meter (D169): the call's time by its kind, as `Io::call` takes it.
+        let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        cx.on_worker(|w| w.meter().call_took(kind, ns));
+        Some(Ok(match read {
+            LentRead::Read { len } => {
+                // `len` fit the room asked above (`usize`), so it fits here.
+                into.truncate(start + len as usize);
+                ReadAllLent::Read(len as usize)
+            }
+            LentRead::NoRoom { len } => {
+                into.truncate(start);
+                // The closure sets `refused` whenever it gives no room; the second form names
+                // the same refusal by the length, never a silent empty read.
+                let asked = usize::try_from(len).unwrap_or(usize::MAX);
+                return Some(Err(refused.unwrap_or(Stopped::OutOfMemory { arena: "bstd::fs read_all", asked })));
+            }
+            LentRead::Moved { stated, read } => {
+                into.truncate(start);
+                ReadAllLent::Moved { stated, read }
+            }
+            LentRead::Failed(error) => {
+                into.truncate(start);
+                ReadAllLent::Failed(error)
+            }
+        }))
     }
 
     /// One more of what `which` names, in this world's tests' counts.

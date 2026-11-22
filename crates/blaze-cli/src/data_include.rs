@@ -10,19 +10,34 @@
 //! file a literal call names is known from the calling file's path and the literal alone: the
 //! outline lists it as it lists a `mod x;` file, before any name is resolved.
 //!
-//! What is listed: each `include_str!` / `include_bytes!` (any path before it: `core::`,
-//! `::std::`) whose one argument is a plain or raw string literal with no suffix, anywhere in
-//! the file's text (an item, an attribute, a body), with `(..)`, `[..]` or `{..}` and an
-//! optional trailing comma. A call whose path is made by another macro
+//! An `include!` in a body is data too. core `include!`: "Parses a file as an expression or an
+//! item according to the context"; in a body (expression or statement position) the file is
+//! one expression, a block whose items are the body's, so its whole text is what a reader
+//! (the names' block module, the body's lowering) reads: no module `Surface`, and an outline
+//! of it as items would report its expression as syntax errors. Both readers read it as data
+//! (blaze-scope resolve.rs `Host::include`, blaze-ladder body_host.rs). An item-position
+//! `include!` in the file's modules is a module file, listed by the outline (work.rs
+//! `included_file`) before this list, which then skips it (one part a file).
+//!
+//! What is listed: each `include_str!` / `include_bytes!` / `include!` (any path before it:
+//! `core::`, `::std::`) whose one argument is a plain or raw string literal with no suffix,
+//! anywhere in the file's text (an item, an attribute, a body), with `(..)`, `[..]` or `{..}`
+//! and an optional trailing comma. A call whose path is made by another macro
 //! (`include_str!(concat!(env!("CARGO_MANIFEST_DIR"), ".."))`) or written by a `macro_rules!`
 //! expansion is not listed: its read is a part no record lists, and the drive refuses it by name
 //! ("a part its file's record does not list", rule 3), never quietly.
 //!
 //! A listed file is opened as the one path it names (`module: false`): its `FileItems` task
-//! reads its bytes and its out is their content id ([`data_out`]); a file that is not there is
-//! a record with no finding (blaze-drive `absent_module`, [`DATA_FILE`]): the call that reads
-//! it is the one that reports it, as the expansion's own diagnostic; a call in code the cfg
-//! turns off reads nothing and reports nothing, as rustc's.
+//! reads its bytes and its out is their content id ([`data_out`]). A file that is not there is
+//! an ANSWER, not a stop of the plan: its record's out is [`absent_out`], a digest of its own,
+//! with no finding ([`DATA_FILE`]). The call that reads it is the one that reports it, as the
+//! expansion's own diagnostic ("including `gen.in`: no such file", blaze-expand failed.rs), and
+//! everything else is still checked, as rustc's one error at the call ("couldn't read
+//! `src/gen.in`: No such file or directory") leaves the rest of the crate checked. Creating
+//! the file moves the sweep's slot, so its task's key, so its out from [`absent_out`] to
+//! [`data_out`], and every reader of that cell is entered again. A call in code the cfg turns
+//! off reads nothing and reports nothing, as rustc's. The same seam as a module found at both
+//! its places (work.rs `MODULE_AT_BOTH`): the file's situation is its record.
 
 use blaze_drive::record::DATA_FILE;
 use blaze_ids::ContentId;
@@ -50,9 +65,10 @@ enum At<'t> {
     Comma { place: u32, close: TokenKind, literal: &'t str },
 }
 
-/// Each literal `include_str!` / `include_bytes!` call of `text`, in text order. Comments and
-/// string contents are tokens of their own (blaze-lex, rustc_lexer's tokens), so a call
-/// written inside a comment or a string is not listed. One pass, no recursion.
+/// Each literal `include_str!` / `include_bytes!` / `include!` call of `text`, in text order
+/// (an item-position `include!` too: the caller skips a file it already lists as a module).
+/// Comments and string contents are tokens of their own (blaze-lex, rustc_lexer's tokens), so
+/// a call written inside a comment or a string is not listed. One pass, no recursion.
 pub(crate) fn data_includes<'t, 'f>(text: &'t str, frame: &'f Frame) -> Vec<DataInclude<'t>, &'f Frame> {
     let mut found = Vec::new_in(frame);
     let mut at = At::Idle;
@@ -80,7 +96,7 @@ pub(crate) fn data_includes<'t, 'f>(text: &'t str, frame: &'f Frame) -> Vec<Data
             }
             // Anything else ends the call being read; the token may start the next one.
             _ => match kind {
-                TokenKind::Ident if word == "include_str" || word == "include_bytes" => At::Name { place: start as u32 },
+                TokenKind::Ident if matches!(word, "include_str" | "include_bytes" | "include") => At::Name { place: start as u32 },
                 _ => At::Idle,
             },
         };
@@ -99,6 +115,17 @@ fn path_literal(kind: LiteralKind) -> bool {
 /// `CrateScope` that read it is asked again.
 pub(crate) fn data_out(bytes: &[u8]) -> ContentId {
     ContentId::of(crate::sweep::FILE_DOMAIN, bytes)
+}
+
+/// The domain of [`absent_out`]: no file's bytes are hashed in it.
+const ABSENT_DOMAIN: &str = "blaze-cli an included data file that is not there 1";
+
+/// The out of a listed data file that is not there: an answer of its own. It is no
+/// [`data_out`] (another domain, so an empty file is not an absent one) and not
+/// `blaze_drive::key::ABSENT` (a cell no record defines, which a reader is refused on). The
+/// task is named by the file's path, so the path is not in it.
+pub(crate) fn absent_out() -> ContentId {
+    ContentId::of(ABSENT_DOMAIN, b"")
 }
 
 /// Whether a `Locate::File` part's byte says its file is read as data ([`DATA_FILE`]), not as
@@ -152,6 +179,31 @@ mod tests {
         );
     }
 
+    /// core `include!`: in a body its file "is parsed as an expression": a literal call there is
+    /// listed as data (the names' block module and the body's lowering read it whole), as
+    /// `include_str!`'s is; an item-position one is listed here too and skipped by work.rs,
+    /// which lists it as a module first. `include!(concat!(..))` is no literal and not listed.
+    ///
+    /// Prints nothing; passes as `data_include::tests::a_literal_include_in_a_body_is_listed ... ok`.
+    #[test]
+    fn a_literal_include_in_a_body_is_listed() {
+        let text = concat!(
+            "mod gen { include!(\"rules_gen.rs\"); }\n",
+            "fn f() -> u32 { let v = include!(\"gen.in\"); std::include!(\"more.in\"); v }\n",
+            "fn g() { include!(concat!(env!(\"OUT_DIR\"), \"/x.rs\")); }\n",
+            "fn h() { my_include!(\"not.in\"); }\n",
+        );
+        let at = |needle: &str| u32::try_from(text.find(needle).expect("in the text")).expect("small");
+        assert_eq!(
+            listed(text),
+            [
+                ("\"rules_gen.rs\"".into(), at("include!(\"rules_gen")),
+                ("\"gen.in\"".into(), at("include!(\"gen.in")),
+                ("\"more.in\"".into(), at("include!(\"more.in")),
+            ]
+        );
+    }
+
     /// [`DATA_FILE`] is no edition byte (blaze-surface `Edition`: 0 to 3), so a data part is
     /// never outlined as Rust and a Rust file never read as data.
     ///
@@ -160,5 +212,16 @@ mod tests {
     fn the_data_byte_is_no_edition() {
         assert!(blaze_surface::Edition::from_byte(DATA_FILE).is_none());
         assert!(is_data(DATA_FILE) && !is_data(blaze_surface::Edition::E2024.byte()));
+    }
+
+    /// A data file that is not there answers [`absent_out`]: not an empty file's out (creating
+    /// an empty file moves the cell) and not the drive's ABSENT (a cell no record defines, on
+    /// which a body's read is refused: engine_bodies.rs `missing_data`).
+    ///
+    /// Prints nothing; passes as `data_include::tests::an_absent_file_has_an_out_of_its_own ... ok`.
+    #[test]
+    fn an_absent_file_has_an_out_of_its_own() {
+        assert_ne!(absent_out(), data_out(b""));
+        assert_ne!(absent_out(), blaze_drive::key::ABSENT);
     }
 }

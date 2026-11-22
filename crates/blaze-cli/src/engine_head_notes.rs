@@ -33,7 +33,6 @@ use blaze_ladder::front2::types::Why;
 use blaze_own::Alloc;
 use bstd::Cx;
 use bstd::mem::Frame;
-use bstd::out::Out;
 use std::alloc::Global;
 
 use crate::engine_heads::HeadsStage;
@@ -264,7 +263,7 @@ fn parse(words: &str) -> Option<(Option<Cell>, RootKind, &str, &str, Option<&str
 }
 
 /// The closing lines (module docs): every head note of `blocks`, grouped by reason.
-pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b [u8])>, shown: &print::Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
+pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b [u8])>, shown: &print::Shown<'_>, frame: &Frame, out: &impl print::RenderOutput) -> Result<(), CliError> {
     // (why, head) of every note.
     let mut all: std::vec::Vec<(&'b str, &'b str), &Frame> = std::vec::Vec::new_in(frame);
     for (name, block) in blocks {
@@ -298,27 +297,26 @@ pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b
     }
     groups.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
     for (count, why, run) in groups.iter().take(MOST_GROUPS) {
-        let mut line = bstd::mem::format_in!(frame, "heads: {count} head(s) failed: {why}: first ");
-        // The run is sorted by head: a head of two cells (one path) is named once.
-        let mut last: Option<&str> = None;
-        let mut named = 0;
-        for (_, head) in run.iter() {
-            if last == Some(*head) {
-                continue;
+        let first = &run[..NAMED.min(run.len())];
+        print::note_from(cx, shown, frame, out, || {
+            let mut h = blaze_ids::Hasher::new("blaze-cli rendered head group 1");
+            h.update(&(*count as u64).to_le_bytes()).part(why.as_bytes());
+            for (_, head) in first {
+                h.part(head.as_bytes());
             }
-            if named == NAMED {
-                break;
+            h.finish()
+        }, || {
+            let mut line = bstd::mem::format_in!(frame, "heads: {count} head(s) failed: {why}: first ");
+            for (i, (_, head)) in first.iter().enumerate() {
+                if i != 0 {
+                    line.push_str(", ");
+                }
+                line.push('`');
+                line.push_str(head);
+                line.push('`');
             }
-            if named > 0 {
-                line.push_str(", ");
-            }
-            line.push('`');
-            line.push_str(head);
-            line.push('`');
-            last = Some(*head);
-            named += 1;
-        }
-        print::note(cx, line.as_str(), shown, frame, out)?;
+            Ok(line)
+        })?;
     }
     if groups.len() > MOST_GROUPS {
         print::note(cx, bstd::mem::format_in!(frame, "heads: and {} more reason(s)", groups.len() - MOST_GROUPS).as_str(), shown, frame, out)?;
@@ -571,12 +569,14 @@ fn why_words(why: &Why, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Why::PatternType(what, _) => write!(f, "a pattern type refused: {what}"),
         Why::ConstPath(what, _) => write!(f, "a constant expression in a type: `{what}`"),
         Why::NeedConst(..) => write!(f, "a constant its type names was not evaluated"),
+        Why::Regions(why) => write!(f, "its lifetimes were refused: {why}"),
     }
 }
 
 fn const_words(fail: &ConstFail, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match fail {
         ConstFail::Body { .. } => write!(f, "a body its value needs could not be lowered"),
+        ConstFail::RequiredBody { .. } => write!(f, "{fail}"),
         ConstFail::Spelling { why, .. } => why_words(why, f),
         ConstFail::Check { .. } => write!(f, "a body its value needs did not check"),
         ConstFail::Diag { code, .. } => write!(f, "a body its value needs has error {code}"),

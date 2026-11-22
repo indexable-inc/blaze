@@ -154,8 +154,12 @@ fn world() -> Fx {
 
 /// `fn <owner>(..) -> Pin<Box<dyn Future<Output = ..> + Send>> { box_pin(async { 7u8 }) }`, or
 /// with `take_local`, `fn <owner>(r: Local) -> .. { box_pin(async move { r; 7u8 }) }`: the
-/// call's id (the coercion site: the body's tail) and the check.
-fn async_case(fx: &Fx, owner: &str, take_local: bool) -> (ExprId, Checked<'static>) {
+/// call (the coercion site), the async block (the source of the output), and the check.
+fn async_case(fx: &Fx, owner: &str, take_local: bool) -> (ExprId, ExprId, Checked<'static>) {
+    async_case_with_output(fx, owner, take_local, UintTy::U8)
+}
+
+fn async_case_with_output(fx: &Fx, owner: &str, take_local: bool, output: UintTy) -> (ExprId, ExprId, Checked<'static>) {
     let mut b = Bb::new();
     let r = if take_local { Some(b.param("r")) } else { None };
     let callee = b.path(&["box_pin"]);
@@ -164,13 +168,13 @@ fn async_case(fx: &Fx, owner: &str, take_local: bool) -> (ExprId, Checked<'stati
         let e = b.local(r);
         stmts.push(b.semi(e));
     }
-    let seven = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let seven = b.int(Some(IntSuffix::Uint(output)));
     let body = b.block(&stmts, Some(seven));
     let fut = b.async_block(body, if take_local { Capture::Move } else { Capture::Ref });
     let call = b.call(callee, &[fut]);
     let root = b.block(&[], Some(call));
     let c = check_body(fx, &b, fx.key_of(owner), root, Plant::None, InferPlant::None);
-    (call, c)
+    (call, fut, c)
 }
 
 /// `fn <owner>(x: ..) -> .. { x }`: the tail's id and the check.
@@ -209,7 +213,7 @@ fn goal_shown(fx: &Fx, types: PTys<'_>, g: UnmetGoal) -> String {
 #[test]
 fn a_boxed_async_block_coerces_to_a_pinned_boxed_object() {
     let fx = world();
-    let (call, c) = async_case(&fx, "a_send_future", false);
+    let (call, _, c) = async_case(&fx, "a_send_future", false);
     assert!(c.diags.is_empty(), "{:?}", c.diags);
     let got = adjusts(&fx, &c, call);
     assert!(got.starts_with("unsize -> Pin<Box<dyn ") && got.matches("unsize").count() == 1, "adjustments `{got}`");
@@ -223,7 +227,7 @@ fn a_boxed_async_block_coerces_to_a_pinned_boxed_object() {
 #[test]
 fn a_boxed_async_block_holding_a_non_send_value_is_refused_naming_send() {
     let fx = world();
-    let (_, c) = async_case(&fx, "b_local_future", true);
+    let (_, _, c) = async_case(&fx, "b_local_future", true);
     assert_eq!(codes(&c), std::vec![DiagCode::Unsatisfied], "{:?}", c.diags);
     let d = &c.diags[0];
     let why = match d.because {
@@ -242,18 +246,34 @@ fn a_boxed_async_block_holding_a_non_send_value_is_refused_naming_send() {
 
 /// (c) `Output = u16` expected, a `u8` block: "Unsized Coercions" needs the object's projection
 /// `<{async} as Future>::Output == u16`, and it is `u8` ("Async blocks"), so no unsizing; the
-/// coercion is refused (E0308) with the expected type naming the output `u16`, and no unsize is
-/// recorded. Passes with or without the fix (the wider question must still refuse it).
+/// coercion is refused (E0271) at the async block, and no unsize is
+/// recorded. This catches a hint being used as the block's output instead of being checked
+/// against it.
 /// Should print: "test suite::pin_unsize::a_boxed_async_block_with_another_output_is_refused ... ok".
+/// The matching `u16` body is accepted by the same object projection.
 #[test]
 fn a_boxed_async_block_with_another_output_is_refused() {
     let fx = world();
-    let (call, c) = async_case(&fx, "c_output_u16", false);
-    assert_eq!(codes(&c), std::vec![DiagCode::Mismatch], "{:?}", c.diags);
-    let expected = c.diags[0].expected.map(|t| show(&fx, c.types.view(), t)).unwrap_or_default();
-    assert!(expected.contains("u16"), "the finding's expected type does not name the output: `{expected}`");
+    let (call, block, c) = async_case(&fx, "c_output_u16", false);
+    assert_eq!(codes(&c), std::vec![DiagCode::ProjectionMismatch], "{:?}", c.diags);
+    let d = &c.diags[0];
+    assert_eq!(d.code.code(), "E0271");
+    assert_eq!(d.node, Some(crate::diag::Node::Expr(block)));
+    assert_eq!(show(&fx, c.types.view(), d.expected.expect("required Output")), "u16");
+    assert_eq!(show(&fx, c.types.view(), d.found.expect("block Output")), "u8");
+    assert!(matches!(d.because, Some(Because::Unmet {
+        goal: UnmetGoal::Projection { trait_, name, term, .. }, leaf: None,
+    }) if trait_ == fx.key_of("Future") && name == Name::of("Output") && Some(term) == d.expected));
+    assert!(!c.adjusts.column::<1>().contains(&crate::columns::AdjustKind::Unsize), "{}", adjusts(&fx, &c, call));
+}
+
+#[test]
+fn a_boxed_async_block_with_matching_output_is_accepted() {
+    let fx = world();
+    let (call, _, c) = async_case_with_output(&fx, "c_output_u16", false, UintTy::U16);
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
     let got = adjusts(&fx, &c, call);
-    assert!(!got.contains("unsize"), "adjustments `{got}`");
+    assert!(got.starts_with("unsize -> Pin<Box<dyn ") && got.matches("unsize").count() == 1, "adjustments `{got}`");
 }
 
 /// (d) `fn d_pin_rc(x: Pin<Rc<Foo>>) -> Pin<Rc<dyn Tr>> { x }`: pin.rs's impl over rc.rs's

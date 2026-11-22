@@ -34,7 +34,6 @@ use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::program_texts::ProgramTexts;
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, build_stubbed};
-use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 use blaze_typeck::ItemKey;
@@ -137,7 +136,7 @@ fn ctors_without_rows_and_a_missing_fact() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
-    let mut front = Front2::new(&names, &frame, &files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let front = Front2::new(&names, &frame, &files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let heap = blaze_own::testing::heap();
     let root = names.root(0);
@@ -149,24 +148,22 @@ fn ctors_without_rows_and_a_missing_fact() {
             .unwrap_or_else(|| panic!("`{name}` from the crate root"))
     };
     let (p, e) = (lib("P"), lib("E"));
-    let alloc: Alloc<'_> = heap.alloc();
-
     // `P(..)`: the struct's `Ctor` member, as heads.rs files it, with no ctor row.
     let pk = front.keys.item(p).expect("P's key");
     let ctor = front.keys.member(pk, MemberKind::Ctor, "").expect("P's ctor key");
     assert!(store.ctors.get(&ctor).is_none(), "the fresh store holds no ctor row for P");
-    assert_eq!(fn_fact(&names, &front.keys, &front.index, &store, ctor, alloc), FnKind::Ctor { adt: pk, variant: 0 });
+    assert_eq!(fn_fact(&names, &front.keys, &front.index, &store, ctor), FnKind::Ctor { adt: pk, variant: 0 });
 
     // `E::A(..)`: the variant's own key, with no ctor row.
     let a = NamesSource::variants(&names, e).and_then(|vs| vs.iter().find(|v| v.name == "A")).map(|v| v.key).expect("E::A in the names library");
     let ak = front.keys.item(a).expect("E::A's key");
     assert!(store.ctors.get(&ak).is_none(), "the fresh store holds no ctor row for E::A");
-    assert_eq!(fn_fact(&names, &front.keys, &front.index, &store, ak, alloc), FnKind::Ctor { adt: checker_of(e), variant: 0 });
+    assert_eq!(fn_fact(&names, &front.keys, &front.index, &store, ak), FnKind::Ctor { adt: checker_of(e), variant: 0 });
     note("ctor rows absent: struct P and variant E::A answered as ctors");
 
     // A key in no crate's prefix and in no row: nothing files it.
     let nobody = ItemKey(0xffff_ffff_ffff_ffff_0000_0000_0000_0001);
-    let got = fn_fact(&names, &front.keys, &front.index, &store, nobody, alloc);
+    let got = fn_fact(&names, &front.keys, &front.index, &store, nobody);
     assert_eq!(got, FnKind::Missing(Fact::Origin), "a key nothing files is the gap Origin, never `NotConst`");
     note(&format!("gap: {got:?}: {}", Fact::Origin));
 }

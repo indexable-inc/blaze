@@ -47,6 +47,11 @@ goal Wrap<[u8]>: Sized => no
 case sized_adt_sized_tail_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
 goal Wrap<u8>: Sized => yes
 
+case owner_sized_tail_args = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+struct TailPair<H, T: ?Sized>(H, T)
+goal TailPair<u8, u16>: Sized => yes
+goal TailPair<u8, [u16]>: Sized => no
+
 case sized_adt_str_tail_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
 struct Tail(u8, str)
 goal Tail: Sized => no

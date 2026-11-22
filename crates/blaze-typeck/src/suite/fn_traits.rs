@@ -28,7 +28,7 @@ use super::{Want, adjusts, check_body, expect};
 use crate::diag::DiagCode;
 use crate::fixture::{Bb, Fx};
 use crate::ids::{Abi, ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, Name, PatId, Safety, UintTy};
-use crate::infer::{InferPlant, assoc_def};
+use crate::infer::InferPlant;
 use crate::machine::Plant;
 use crate::portable::PNode;
 

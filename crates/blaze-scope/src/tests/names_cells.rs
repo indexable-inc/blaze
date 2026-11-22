@@ -103,10 +103,10 @@ impl Side {
             let record = side.record_of(bytes);
             side.tables.push(table(&record, None, &[], g).unwrap_or_else(|e| panic!("crate {i}'s cell table: {e:?}")).to_vec());
             let items_bytes = aligned(&items_encode(s.names, g).unwrap_or_else(|e| panic!("items encode: {e:?}")), g);
-            let items = ItemsRecord::open(items_bytes, g).unwrap_or_else(|e| panic!("crate {i}'s items record: {e:?}"));
+            let text: &'static str = texts.0[i][0].1;
+            let items = super::items_record::one_file(items_bytes, text, g);
             side.items.push(items_bytes);
             let wholes = [(Section::Items, items_bytes)];
-            let text: &'static str = texts.0[i][0].1;
             let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
             side.with_items.push(table(&record, Some((&items, &read)), &wholes, g).unwrap_or_else(|e| panic!("crate {i}'s items cells: {e:?}")).to_vec());
             side.keys.push(s.names.key);
@@ -242,7 +242,7 @@ fn a_private_fn_added_moves_its_own_binding_cell_alone() {
     // `mod a { .. }` as an item of the items record: its row's key, not its scope's.
     let a_item = {
         let g = blaze_own::testing::heap().alloc();
-        let items = ItemsRecord::open(after.items[0], g).unwrap_or_else(|e| panic!("{e:?}"));
+        let items = super::items_record::one_file(after.items[0], K0_ADDED, g);
         (0..items.items()).filter_map(|i| items.item_at(i).ok().flatten()).find(|row| row.kind == ItemKind::Module && row.name == Some("a")).map(|row| row.key)
     };
     let a_item = a_item.unwrap_or_else(|| panic!("k0's items record has no row of `mod a`"));
@@ -256,7 +256,7 @@ fn a_private_fn_added_moves_its_own_binding_cell_alone() {
     assert!(!items_moved.contains(&NameCell::Item { key: a_item }.key()), "the row of `mod a` moved with an item added inside it");
     let mut candidates: Vec<(std::string::String, [u8; 16])> = std::vec![("Item(added)".into(), NameCell::Item { key: z }.key()), ("Beginning(added)".into(), NameCell::Beginning { first: first_16(z) }.key())];
     let g = blaze_own::testing::heap().alloc();
-    let items_after = ItemsRecord::open(after.items[0], g).unwrap_or_else(|e| panic!("{e:?}"));
+    let items_after = super::items_record::one_file(after.items[0], K0_ADDED, g);
     for i in 0..items_after.items() {
         if let Ok(Some(row)) = items_after.item_at(i) {
             candidates.push((format!("Item({:?} {:?})", row.kind, row.name), NameCell::Item { key: row.key }.key()));
@@ -376,8 +376,8 @@ fn the_items_search_cells_agree_with_the_record() {
     let g = blaze_own::testing::heap().alloc();
     let (mut members, mut variants, mut beginnings, mut absent) = (0usize, 0usize, 0usize, 0usize);
     for krate in 0..side.keys.len() {
-        let items = ItemsRecord::open(side.items[krate], g).unwrap_or_else(|e| panic!("crate {krate}'s items record: {e:?}"));
         let text: &'static str = MEMBERS.0[krate][0].1;
+        let items = super::items_record::one_file(side.items[krate], text, g);
         let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
         let record = side.record(krate);
         let wholes = [(Section::Items, side.items[krate])];
@@ -501,8 +501,8 @@ fn a_foreign_items_block_abi_is_in_its_row() {
     let g = blaze_own::testing::heap().alloc();
     let (names_before, items_before) = foreign_side(&FOREIGN_BEFORE);
     let (names_after, items_after) = foreign_side(&FOREIGN_AFTER);
-    let before = ItemsRecord::open(items_before, g).unwrap_or_else(|e| panic!("items record: {e:?}"));
-    let after = ItemsRecord::open(items_after, g).unwrap_or_else(|e| panic!("items record: {e:?}"));
+    let before = super::items_record::one_file(items_before, FOREIGN, g);
+    let after = super::items_record::one_file(items_after, FOREIGN_EDITED, g);
     let rows = foreign_rows(&before);
     let find = |rows: &[(&'static str, ItemKey, bool, Option<&'static str>)], name: &str| -> (ItemKey, bool, Option<&'static str>) {
         rows.iter().find(|r| r.0 == name).map(|r| (r.1, r.2, r.3)).unwrap_or_else(|| panic!("no item row named `{name}` among {rows:?}"))
@@ -525,7 +525,7 @@ fn a_foreign_items_block_abi_is_in_its_row() {
     assert_eq!(sys_after, Some("C-unwind"), "`sys` after its block's string was edited");
     let (own_key_after, ..) = find(&rows_after, "own");
     let digest = |names: &'static [u8], items_bytes: &'static [u8], text: &'static str, key: ItemKey| -> Option<ContentId> {
-        let items = ItemsRecord::open(items_bytes, g).unwrap_or_else(|e| panic!("items record: {e:?}"));
+        let items = super::items_record::one_file(items_bytes, text, g);
         let record = NamesRecord::open(Verified::check(names).unwrap_or_else(|e| panic!("a record does not check: {e:?}")));
         let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
         let wholes = [(Section::Items, items_bytes)];

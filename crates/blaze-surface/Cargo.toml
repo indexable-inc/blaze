@@ -24,7 +24,7 @@ testing = []
 blaze-id.workspace = true
 # `record!`, `Writer`, `open`, `Slice`, `Aligned`: each record is a flat buffer read in place.
 # By path: the workspace entry turns on its `serde`, which would bring serde.
-blaze-format = { path = "../blaze-format" }
+blaze-format.workspace = true
 # `HashMap`: a task's table from item keys to its local numbers.
 blaze-hash.workspace = true
 # `Vec`: every builder's rows, in the allocator its caller names.

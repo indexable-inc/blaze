@@ -1,9 +1,13 @@
 //! `blaze clean [dir] [--store]` (engine.md E12: a user is never stuck on the store).
 //!
-//! With no flag it removes the checkout's own state, `<dir>/.blaze/v2`; `--store` also removes
-//! the home's store, `<HOME>/.blaze/v2/store`. Everything it removes is derived: the next command
-//! makes it again. It removes only what it can show is blaze's, and refuses by name otherwise
-//! (rule 3, rule 19):
+//! With no flag it removes the checkout's own state, `<dir>/.blaze/v2`, and the home's stores of
+//! OTHER FORMS (D160: `<HOME>/.blaze/v2/store/f<N>s<M>` of forms not this blaze's, and the
+//! legacy layout's files directly in `v2/store`: store/forms.rs), which this blaze never reads;
+//! `--store` removes the home's whole store root, `<HOME>/.blaze/v2/store`, every form in it.
+//! The cleanup after a command's answer removes a store of another form once it is unused for
+//! forms.rs `EXPIRY_DAYS` ([`sweep_other_forms`]). Everything it removes is derived: the next
+//! command makes it again. It removes only what it can show is blaze's, and refuses by name
+//! otherwise (rule 3, rule 19):
 //!
 //! - the checkout's `.blaze` and `.blaze/v2` must be folders, not links, and `.blaze/v2` must hold
 //!   only names blaze writes there ([`CHECKOUT_ENTRIES`]): a folder that holds anything else (a
@@ -32,15 +36,77 @@ use bstd::mem::{Bytes, Frame};
 use bstd::path::{Path, PathError};
 use bstd::Cx;
 
-/// The names blaze writes under a checkout's `.blaze/v2`: `profile.txt` (print.rs `PROFILE`),
-/// and the forms before the one store (`last`, `leaves`, `packs`, `records`, and `at`: store.rs
-/// `OLD_CHECKOUT`). Any other name there is not blaze's, and the clean is refused.
-pub const CHECKOUT_ENTRIES: [&str; 6] = ["at", "last", "leaves", "packs", "profile.txt", "records"];
+/// THE ONE LIST of what blaze writes under a checkout's `.blaze/v2` ([`CHECKOUT_STATE`]). Each
+/// writer names its file from here ([`CheckoutEntry::path`]: print.rs `PROFILE`, engine_start.rs
+/// `START_PROFILE`, store.rs `OLD_CHECKOUT`), and `clean` accepts exactly these names
+/// ([`CHECKOUT_ENTRIES`]), so a file a writer names is one `clean` knows: a new one is a new
+/// variant, which the exhaustive `name` match makes the writer and `clean` agree on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CheckoutEntry {
+    /// `profile.txt`: the check's profile (print.rs `PROFILE`).
+    Profile,
+    /// `start.txt`: the start's profile, written after every `run` and `test` (engine_start.rs
+    /// `START_PROFILE`).
+    Start,
+    /// `at`: the old pointer folder (blaze-drive pointers.rs `FOLDER`; store.rs `OLD_CHECKOUT`).
+    At,
+    /// `packs`: the checkout store before the one store (store.rs `OLD_CHECKOUT`).
+    Packs,
+    /// `last`, `leaves`, `records`: older forms a checkout may still hold.
+    Last,
+    Leaves,
+    Records,
+}
+
+impl CheckoutEntry {
+    pub const ALL: [CheckoutEntry; 7] =
+        [CheckoutEntry::At, CheckoutEntry::Last, CheckoutEntry::Leaves, CheckoutEntry::Packs, CheckoutEntry::Profile, CheckoutEntry::Records, CheckoutEntry::Start];
+
+    /// Its name in `.blaze/v2`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            CheckoutEntry::Profile => "profile.txt",
+            CheckoutEntry::Start => "start.txt",
+            CheckoutEntry::At => "at",
+            CheckoutEntry::Packs => "packs",
+            CheckoutEntry::Last => "last",
+            CheckoutEntry::Leaves => "leaves",
+            CheckoutEntry::Records => "records",
+        }
+    }
+
+    /// Its path beneath the checkout: [`CHECKOUT_STATE`], `/`, [`CheckoutEntry::name`] (a test
+    /// holds every one so).
+    pub const fn path(self) -> &'static str {
+        match self {
+            CheckoutEntry::Profile => ".blaze/v2/profile.txt",
+            CheckoutEntry::Start => ".blaze/v2/start.txt",
+            CheckoutEntry::At => ".blaze/v2/at",
+            CheckoutEntry::Packs => ".blaze/v2/packs",
+            CheckoutEntry::Last => ".blaze/v2/last",
+            CheckoutEntry::Leaves => ".blaze/v2/leaves",
+            CheckoutEntry::Records => ".blaze/v2/records",
+        }
+    }
+}
+
+/// The names [`CheckoutEntry::ALL`] gives: any other name under a checkout's `.blaze/v2` is not
+/// blaze's, and the clean is refused.
+pub const CHECKOUT_ENTRIES: [&str; CheckoutEntry::ALL.len()] = {
+    let mut names = [""; CheckoutEntry::ALL.len()];
+    let mut i = 0;
+    while i < names.len() {
+        names[i] = CheckoutEntry::ALL[i].name();
+        i += 1;
+    }
+    names
+};
 
 /// The checkout's state, beneath the checkout.
 pub const CHECKOUT_STATE: &str = ".blaze/v2";
 
-/// The store, beneath the home: `.blaze/` and store.rs `STORE_DIR` (a test holds them equal).
+/// The store root, beneath the home: `.blaze/` and plain_place.rs `STORE_ROOT` (a test holds
+/// them equal); this blaze's store is the folder of its forms in it (`STORE_DIR`).
 pub const HOME_STORE: &str = ".blaze/v2/store";
 
 /// How deep a removed tree may go below the folder removed.
@@ -163,6 +229,40 @@ impl fmt::Display for Said<'_> {
     }
 }
 
+/// The line `blaze clean` prints for a store of another form removed (D160): a folder's
+/// "removed <lead>v2/store/f4s2, a store of another blaze's forms: <n> files, <bytes> bytes
+/// freed"; the legacy layout's "removed the format 4 store's files directly in <lead>v2/store:
+/// ...".
+pub struct SaidOther<'a> {
+    pub lead: &'a str,
+    pub legacy: bool,
+    pub removed: &'a Removed,
+}
+
+impl fmt::Display for SaidOther<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Removed { path, files, bytes, .. } = self.removed;
+        let noun = if *files == 1 { "file" } else { "files" };
+        match self.legacy {
+            true => write!(f, "removed the format 4 store's files directly in {}{path}: {files} {noun}, {bytes} bytes freed", self.lead),
+            false => write!(f, "removed {}{path}, a store of another blaze's forms: {files} {noun}, {bytes} bytes freed", self.lead),
+        }
+    }
+}
+
+/// The line `blaze clean` (no `--store`) prints when the home's store root is not shown
+/// blaze's: the checkout was cleaned, the root was not looked into.
+pub struct NotLooked<'a> {
+    pub path: &'a Path,
+    pub why: &'static str,
+}
+
+impl fmt::Display for NotLooked<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the home's {} {}, so it is not shown to be blaze's store: no store in it was looked at or removed", self.path, self.why)
+    }
+}
+
 /// What `blaze clean` prints when no folder was there to remove.
 pub const NOTHING: &str = "nothing to remove";
 
@@ -197,16 +297,35 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
     };
     // Both folders are checked before either is removed: a refusal removes nothing.
     let state = checkout_state(cx, &root).map_err(crate::CliError::Clean)?;
-    let held = match with_store {
-        false => None,
-        true => {
-            let Some(home) = home else { return Err(crate::CliError::Clean(CleanError::NoHome)) };
+    let mut not_blazes = None;
+    // The home's store root, when HOME names one and it is blaze's (its cache directory tag):
+    // `--store` removes it whole; without it, only its stores of other forms go (D160: they
+    // are cleanup's, never read by this blaze). No HOME and no `--store`: no home to clean.
+    let held = match home {
+        None if with_store => return Err(crate::CliError::Clean(CleanError::NoHome)),
+        None => None,
+        // A home that does not exist (HOME names a folder never made) holds no store: nothing
+        // of it to remove, and no failure, as for a home with no store root (below). It is
+        // looked at in the file system's root before it is opened as a tree, whose listing of a
+        // missing folder is an error.
+        Some(home) if fs.root().stat(cx, &Path::new(home.trim_matches('/'))?)?.is_none() => None,
+        Some(home) => {
             // The home as a folder of the filesystem's root as a second tree (as roster.rs
             // opens a binary's folder), so its `.blaze` is listed before it is entered.
             let below = home.trim_matches('/');
             let dir = fs.home(cx, "/", &Path::new(below)?).map_err(|error| crate::CliError::Clean(CleanError::Home(error)))?;
-            let found = store(cx, &dir, frame).map_err(crate::CliError::Clean)?;
-            found.map(|found| (dir, bstd::mem::format_in!(frame, "/{below}/"), found))
+            // A home with no store root (a new user, one who never ran blaze) is `None`:
+            // nothing of it to remove, and no failure. A root not shown blaze's (no tag, or
+            // another tool's) is refused with `--store`; without it, the checkout is still
+            // cleaned and the line below says the home's root was not looked into.
+            match store(cx, &dir, frame) {
+                Ok(found) => found.map(|found| (dir, bstd::mem::format_in!(frame, "/{below}/"), found)),
+                Err(refusal @ CleanError::NotTheStore { .. }) if !with_store => {
+                    not_blazes = Some(refusal);
+                    None
+                }
+                Err(refusal) => return Err(crate::CliError::Clean(refusal)),
+            }
         }
     };
     let mut any = false;
@@ -215,10 +334,22 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
         out.line(cx, format_args!("{}", Said { lead: lead.as_str(), removed: &removed }))?;
         any = true;
     }
-    if let Some((blaze, lead, found)) = held {
-        let removed = remove(cx, &blaze, found).map_err(crate::CliError::Clean)?;
-        out.line(cx, format_args!("{}", Said { lead: lead.as_str(), removed: &removed }))?;
-        any = true;
+    if let Some((home_dir, lead, found)) = held {
+        if with_store {
+            let removed = remove(cx, &home_dir, found).map_err(crate::CliError::Clean)?;
+            out.line(cx, format_args!("{}", Said { lead: lead.as_str(), removed: &removed }))?;
+            any = true;
+        } else {
+            let at = found.path;
+            for form in crate::store::plain_place::forms::list(cx, &home_dir, &at)?.iter() {
+                let removed = remove_other(cx, &home_dir, &at, form, SweepPlant::None).map_err(crate::CliError::Clean)?;
+                out.line(cx, format_args!("{}", SaidOther { lead: lead.as_str(), legacy: matches!(form.kind, crate::store::plain_place::forms::FormKind::Legacy), removed: &removed }))?;
+                any = true;
+            }
+        }
+    }
+    if let Some(CleanError::NotTheStore { path, why }) = &not_blazes {
+        out.line(cx, format_args!("{}", NotLooked { path, why }))?;
     }
     if !any {
         out.line(cx, format_args!("{NOTHING}"))?;
@@ -334,6 +465,86 @@ fn tree(cx: &Cx, dir: &Dir<ReadWrite>, path: &Path, depth: u32, removed: &mut Re
     }
     dir.remove_dir(cx, path, bstd::fs::Durable::No)?;
     Ok(())
+}
+
+// ---- stores of other forms (D160): `blaze clean`'s, and the sweep's once unused ----
+
+/// The store of another form `form` (as store/forms.rs `list` found it in `dir` under the
+/// store root `root`) removed: a folder of another form whole; the legacy layout's own files
+/// alone (`head`, `flip`, `seg-*`, `manifests-*` directly in the root: never this blaze's
+/// folder beside them, nor the cache directory tag, nor a name of no store's shape).
+pub(crate) fn remove_other(cx: &Cx, dir: &Dir<ReadWrite>, root: &Path, form: &crate::store::plain_place::forms::OtherForm, plant: SweepPlant) -> Result<Removed, CleanError> {
+    use crate::store::plain_place::forms::FormKind;
+    match form.kind {
+        FormKind::Folder(name) => {
+            let path = root.join(&Path::new(name.as_str())?);
+            remove(cx, dir, Found { place: Place::Home, path })
+        }
+        FormKind::Legacy => {
+            let blaze = dir;
+            let mut removed = Removed { place: Place::Home, path: root.clone(), files: 0, bytes: 0 };
+            let Some(entries) = blaze.entries(cx, root)? else { return Ok(removed) };
+            for i in 0..entries.len() {
+                let name = entries.name(i);
+                let ours = blaze_cas::plain::store_leaf(name) || (plant == SweepPlant::LegacyTakesTheTag && name == blaze_cas::plain::CACHEDIR_TAG);
+                if entries.kind(i) == EntryKind::File && ours {
+                    blaze.remove(cx, &entries.path(i)?, bstd::fs::Durable::No)?;
+                    removed.files += 1;
+                    removed.bytes += entries.len_of(i);
+                }
+            }
+            Ok(removed)
+        }
+    }
+}
+
+/// A planted bug of the sweep, for its controls (clean_tests.rs): `None` in every build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SweepPlant {
+    None,
+    /// Takes this blaze's own folder for another form's.
+    TakesItsOwn,
+    /// Removes a store of another form whatever its last use.
+    IgnoresUse,
+    /// Takes the store root's cache directory tag for a legacy file.
+    LegacyTakesTheTag,
+}
+
+/// THE SWEEP OF OTHER FORMS, run in the cleanup after a command's answer (never before it):
+/// every store of another form under `blaze` (the home's `.blaze`; its store root
+/// plain_place.rs `STORE_ROOT`) whose last use is more than store/forms.rs `EXPIRY_DAYS`
+/// before `now_ns` removed (`expired`), each said on `err` with what it freed. This blaze's
+/// folder is never one of them: `list` skips the folder of its own forms, and nothing of
+/// another shape is listed. How many it removed.
+pub(crate) fn sweep_other_forms(cx: &Cx, blaze: &Dir<ReadWrite>, now_ns: u64, err: &bstd::out::Out, plant: SweepPlant) -> Result<u32, crate::CliError> {
+    use crate::store::plain_place::forms::{self, FormKind, OtherForm};
+    let root = Path::new(crate::store::plain_place::STORE_ROOT)?;
+    let mut found = forms::list(cx, blaze, &root)?;
+    let own = blaze_cas::plain::PlaceName::THIS;
+    let own_path = Path::new(crate::store::plain_place::STORE_DIR)?;
+    if plant == SweepPlant::TakesItsOwn && blaze.stat(cx, &own_path).map_err(|error| crate::CliError::Clean(CleanError::Fs(error)))?.is_some() {
+        found = forms::OtherForms::with(found, OtherForm { kind: FormKind::Folder(own), files: 0, bytes: 0, used_ns: 0 })?;
+    }
+    let mut removed = 0;
+    for form in found.iter() {
+        if !(forms::expired(form, now_ns) || plant == SweepPlant::IgnoresUse) {
+            continue;
+        }
+        let gone = remove_other(cx, blaze, &root, form, plant).map_err(crate::CliError::Clean)?;
+        err.line(
+            cx,
+            format_args!(
+                "blaze: removed a store of another blaze's forms, unused for {} days: the home's .blaze/{}{}: {} files, {} bytes freed",
+                forms::EXPIRY_DAYS,
+                gone.path,
+                if matches!(form.kind, FormKind::Legacy) { " (its format 4 files)" } else { "" },
+                gone.files,
+                gone.bytes
+            ),
+        )?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

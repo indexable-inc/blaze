@@ -1,40 +1,21 @@
-//! The planted bug for the integer oracle's control (rule 53).
+//! The bugs a control can plant in the writers (rule 53; D165, "a control is typed"). The
+//! integer path takes one as a type ([`Planted<TextPlant>`](blaze_own::planted::Planted)), so
+//! the shipped [`NoPlant`](blaze_own::planted::NoPlant) instantiation is the table read alone;
+//! the debug walk crosses vtables and takes it as a value.
 
-use std::cell::Cell;
+#![blaze::sans_io]
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    Clean,
+use blaze_own::planted::Plants;
+
+/// A bug a control plants in blaze-text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextPlant {
+    /// The writers as they are.
+    None,
     /// The two-digit table is read one pair off: `r` writes the digits of `r + 1`.
     DigitPairOffByOne,
     /// The debug walk writes every named field as `field`.
     DebugFieldNameLost,
 }
 
-/// The name the debug walk writes for a field.
-#[inline]
-pub(crate) fn field_name(name: &'static str) -> &'static str {
-    match PLANTED.with(Cell::get) {
-        Plant::DebugFieldNameLost => "field",
-        _ => name,
-    }
-}
-
-std::thread_local! {
-    static PLANTED: Cell<Plant> = const { Cell::new(Plant::Clean) };
-}
-
-/// The pair index the table path reads for `r`.
-#[inline]
-pub(crate) fn digit_pair(r: usize) -> usize {
-    match PLANTED.with(Cell::get) {
-        Plant::DigitPairOffByOne => (r + 1) % 100,
-        _ => r,
-    }
-}
-
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for TextPlant {}

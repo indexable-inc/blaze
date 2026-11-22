@@ -6,7 +6,13 @@ pub mod plant;
 mod cost;
 mod dyn_undecided;
 mod head_shape;
+mod hidden_cause;
+mod member_not_filed;
+mod overflow_cache;
 mod share;
+mod specialized_equal;
+mod why_maybe;
+mod why_no;
 
 use std::format;
 use std::string::String;
@@ -17,9 +23,11 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::assembly::Goal;
 use crate::eval::Solver;
+use crate::facts::Portable;
+use crate::fold::Scratch;
 use crate::fulfill::{Fulfill, Rescan, State, Strategy, Wake};
 use crate::prefilter::{self, Columns, Fingerprint, WIDTH};
-use crate::term::TypingMode;
+use crate::term::{children, Children, List, Mutbl, Ty, TyKind, TypingMode};
 use crate::testing::run::{Report, run_all};
 use crate::testing::stagger::staggered;
 use crate::tys::Tys;
@@ -46,6 +54,30 @@ fn solve_cases() {
     print(&r);
     assert!(r.cases >= 150 || !want.is_empty(), "fewer than 150 cases: {}", r.cases);
     assert!(r.failures.is_empty(), "{} of {} goals failed", r.failures.len(), r.goals);
+}
+
+/// Each declaration must see the arguments of its own application. Losing its final slot
+/// refuses the same program at that declaration, with the goal and the missing slot intact.
+#[test]
+fn control_missing_owner_argument() {
+    for (case, head, emitter) in [
+        ("owner_impl_and_gat_args", "ImplValue", "alias.rs"),
+        ("owner_alias_bound_args", "AliasBound", "alias.rs"),
+        ("owner_sized_tail_args", "SizedTail", "builtin.rs"),
+        ("owner_summary_field_args", "Field", "structural.rs"),
+        ("owner_adt_field_args", "Field", "builtin.rs"),
+    ] {
+        let run = || run_all(&|n| n == case).expect("solver cases parse");
+        let good = run();
+        assert_eq!(good.cases, 1, "{case}");
+        assert_eq!(good.passed, 2, "{case}: {:?}", good.failures);
+        let corrupt = plant::with(Plant::MissingHeadArgument, run);
+        assert_eq!(corrupt.failures.len(), 2, "{case}: {:?}", corrupt.failures);
+        for failure in corrupt.failures {
+            assert!(failure.contains(&format!("head: Some({head}")), "{failure}");
+            assert!(failure.contains(emitter) && failure.contains("goal: Some("), "{failure}");
+        }
+    }
 }
 
 /// The truth the prefilter must keep: impl `i` survives iff at every set goal byte its byte is
@@ -87,7 +119,7 @@ fn prefilter_case(t: &Tape) -> Result<(), Broke> {
     buf.extend_from_slice(&cols);
     let c = Columns { bytes: &buf[off..], stride, len: len as u32 };
     let want = truth(&g, c);
-    let mut got = |f: &dyn Fn(&mut blaze_own::Vec<u32, Alloc<'_>>)| -> Vec<u32> {
+    let got = |f: &dyn Fn(&mut blaze_own::Vec<u32, Alloc<'_>>)| -> Vec<u32> {
         let mut out = blaze_own::Vec::new_in(alloc);
         f(&mut out);
         out.iter().copied().collect()
@@ -114,6 +146,151 @@ fn control_prefilter_drops_wildcard() {
     blaze_sim::control(Config::cases(200), Plant::None, Plant::PrefilterDropsWildcard, "the prefilter", |t, p| {
         plant::with(p, || prefilter_case(t))
     });
+}
+
+/// The former whole-prefix reachability walk, retained as the property oracle for the
+/// worklist implementation. It deliberately scans only through the largest root, just as the
+/// old production code did, and therefore has the same malformed-index outcomes.
+fn old_params_reached(
+    p: Portable<'_>,
+    roots: &[Ty],
+    which: fn(TyKind) -> Option<u32>,
+    out: &mut [bool],
+) -> Result<(), crate::error::SolveError> {
+    let len = p.nodes.len();
+    let Some(top) = roots.iter().map(|t| t.0 as usize).max() else { return Ok(()) };
+    if top >= len {
+        return Err(crate::error::SolveError::Malformed(crate::error::Malformed::PortableIndex {
+            node: top as u32,
+            len: len as u32,
+        }));
+    }
+    let mut reach = std::vec![false; top + 1];
+    for t in roots {
+        reach[t.0 as usize] = true;
+    }
+    for i in (0..=top).rev() {
+        if !reach[i] {
+            continue;
+        }
+        let k = p.nodes[i];
+        if let Some(x) = which(k)
+            && let Some(slot) = out.get_mut(x as usize)
+        {
+            *slot = true;
+        }
+        let mut mark = |c: Ty| -> Result<(), crate::error::SolveError> {
+            let ci = c.0 as usize;
+            if ci >= i {
+                return Err(crate::error::SolveError::Malformed(crate::error::Malformed::PortableIndex {
+                    node: c.0,
+                    len: i as u32,
+                }));
+            }
+            reach[ci] = true;
+            Ok(())
+        };
+        let list = |l: List, mark: &mut dyn FnMut(Ty) -> Result<(), crate::error::SolveError>| {
+            for j in 0..l.len {
+                let at = (l.start + j) as usize;
+                let Some(&c) = p.lists.get(at) else {
+                    return Err(crate::error::SolveError::Malformed(crate::error::Malformed::PortableIndex {
+                        node: at as u32,
+                        len: p.lists.len() as u32,
+                    }));
+                };
+                mark(c)?;
+            }
+            Ok(())
+        };
+        match children(k) {
+            Children::None => {}
+            Children::One(a) => mark(a)?,
+            Children::Two(a, b) => {
+                mark(a)?;
+                mark(b)?;
+            }
+            Children::List(l) => list(l, &mut mark)?,
+            Children::ListThen(l, t) => {
+                list(l, &mut mark)?;
+                mark(t)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn params_reached_case(t: &Tape, plant: Plant) -> Result<(), Broke> {
+    plant::with(plant, || {
+        let len = 1 + t.below(48, "portable nodes") as usize;
+        let mut nodes = Vec::with_capacity(len);
+        let mut lists = Vec::new();
+        for i in 0..len {
+            let kind = if i == 0 || t.below(5, "portable kind") == 0 {
+                match t.below(4, "portable leaf") {
+                    0 => TyKind::Bool,
+                    1 => TyKind::Param(t.below(8, "type parameter") as u32),
+                    2 => TyKind::ConstParam(t.below(8, "const parameter") as u32),
+                    _ => TyKind::Never,
+                }
+            } else {
+                let child = || Ty(t.below(i as u64, "portable child") as u32);
+                match t.below(3, "portable pair") {
+                    0 => TyKind::Ref(child(), child(), Mutbl::Not),
+                    1 => TyKind::Array(child(), child()),
+                    _ => {
+                        let start = lists.len() as u32;
+                        let count = t.below(3, "portable list length") as u32;
+                        for _ in 0..count {
+                            lists.push(child());
+                        }
+                        TyKind::Tuple(List { start, len: count })
+                    }
+                }
+            };
+            nodes.push(kind);
+        }
+        let roots_len = 1 + t.below(4, "portable roots") as usize;
+        let roots: Vec<Ty> = (0..roots_len).map(|_| Ty(t.below(len as u64, "portable root") as u32)).collect();
+        let p = Portable { nodes: &nodes, lists: &lists };
+        let which = |k: TyKind| match k {
+            TyKind::Param(x) | TyKind::ConstParam(x) => Some(x),
+            _ => None,
+        };
+        let mut expected = std::vec![false; 8];
+        let old = old_params_reached(p, &roots, which, &mut expected);
+        let mut actual = std::vec![false; 8];
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut scratch = Scratch::new_in(alloc);
+        let new = crate::builtin::params_reached(p, &roots, which, &mut actual, scratch.params_work());
+        if format!("{old:?}") != format!("{new:?}") || old.is_ok() && expected != actual {
+            return Err(Broke::Oracle(format!("portable reachability differs: old {old:?} {expected:?}, new {new:?} {actual:?}")));
+        }
+
+        let bad = [Ty(len as u32)];
+        let old_bad = old_params_reached(p, &bad, which, &mut expected);
+        let new_bad = crate::builtin::params_reached(p, &bad, which, &mut actual, scratch.params_work());
+        if format!("{old_bad:?}") != format!("{new_bad:?}") {
+            return Err(Broke::Oracle(format!("malformed portable index differs: old {old_bad:?}, new {new_bad:?}")));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn params_reached_equals_old_oracle_on_portable_dags() {
+    blaze_sim::check(Config::cases(300), |t: &Tape| params_reached_case(t, Plant::None));
+}
+
+#[test]
+fn control_params_reached_drops_child() {
+    blaze_sim::control(
+        Config::cases(300),
+        Plant::None,
+        Plant::ParamsReachedDropsChild,
+        "portable reachability differs",
+        params_reached_case,
+    );
 }
 
 /// Runs the staggered load under strategy `S`; returns each obligation's state and every

@@ -1,6 +1,6 @@
 //! The whole path of an auto trait on an async block's future (async plan P13 over P2): the
 //! type checker files the goal that failed on its superset interior as a stalled row
-//! (`blaze_typeck::check_deferring`), the block is lowered as its own flow ([`lower_async`]), its
+//! (`blaze_typeck::check_deferring`), the block is lowered as its own flow ([`crate::lower_async`]), its
 //! exact interior computed ([`interior`]), and the row decided on it
 //! (`blaze_typeck::decide_stalled`).
 //!
@@ -19,8 +19,9 @@ use blaze_typeck::{
     check_deferring, decide_stalled,
 };
 
-use super::{AsyncFacts, live_across, moved_before};
-use crate::{interior, lower_async};
+use super::{AsyncFacts, declare, live_across, moved_before};
+use crate::region_fixture::{Decls, WithRegions};
+use crate::{Region, interior};
 
 /// A temporary made in a statement after the `.await` (the `format!` class).
 mod after_await;
@@ -30,7 +31,7 @@ mod after_await;
 /// `impl<T: ?Sized, A: Allocator> !Send for Rc<T, A> {}`, written as an impl whose
 /// where-clause never holds: the fixture has no negative impls, and an impl that may apply
 /// disqualifies the auto impl), and `fn spawn<F: Send>(_: F)`.
-fn send_world() -> (Fx, ItemKey, ItemKey) {
+fn send_world() -> (Fx, ItemKey, ItemKey, Decls) {
     let mut fx = Fx::new();
     let (p0, unit) = (fx.param(0), fx.unit());
     let i32_ = fx.ty(PNode::Int(IntTy::I32));
@@ -65,23 +66,32 @@ fn send_world() -> (Fx, ItemKey, ItemKey) {
     let rc_never = fx.bound(never, &[rc_p0]);
     fx.imp("impl<T> Send for Rc<T> where Rc<T>: Never", 1, rc_p0, Some((send, &[])), &[], vec![rc_never]);
     let rc_i32 = fx.adt(rc, &[i32_]);
-    fx.func("ready", 0, &[], ready_t, vec::Vec::new());
-    fx.func("make_rc", 0, &[], rc_i32, vec::Vec::new());
-    fx.func("drop_rc", 0, &[rc_i32], unit, vec::Vec::new());
+    let ready_f = fx.func("ready", 0, &[], ready_t, vec::Vec::new());
+    let make_rc = fx.func("make_rc", 0, &[], rc_i32, vec::Vec::new());
+    let drop_rc = fx.func("drop_rc", 0, &[rc_i32], unit, vec::Vec::new());
     let r_rc = fx.r(Mutbl::Not, rc_i32);
-    fx.func("take", 0, &[r_rc, unit], unit, vec::Vec::new());
+    let take = fx.func("take", 0, &[r_rc, unit], unit, vec::Vec::new());
     let is_send = fx.bound(send, &[p0]);
-    fx.func("spawn", 1, &[p0], unit, vec![is_send]);
+    let spawn = fx.func("spawn", 1, &[p0], unit, vec![is_send]);
     let owner = fx.func("owner", 0, &[], unit, vec::Vec::new());
     fx.finish();
-    (fx, owner, ready)
+    // The heads as written above: `take(_: &Rc<i32>, _: ())` one elided input lifetime,
+    // `Param(0)`, no output borrowing; the others none (`F: Send` names no lifetime).
+    let mut decls = Decls::new();
+    declare(&mut decls, ready_f, &[], ready_t, &[]);
+    declare(&mut decls, make_rc, &[], rc_i32, &[]);
+    declare(&mut decls, drop_rc, &[rc_i32], unit, &[]);
+    declare(&mut decls, take, &[r_rc, unit], unit, &[Region::Param(0)]);
+    declare(&mut decls, spawn, &[p0], unit, &[]);
+    declare(&mut decls, owner, &[], unit, &[]);
+    (fx, owner, ready, decls)
 }
 
 /// `fn owner() { spawn(async { inner }); }` through the whole path: the stalled rows' count
 /// and the findings `decide_stalled` gives on the exact interior.
 fn send_findings(inner: fn(&mut Bb) -> ExprId) -> (usize, vec::Vec<DiagCode>) {
     let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
-    let (fx, owner, _) = send_world();
+    let (fx, owner, _, decls) = send_world();
     let mut b = Bb::new();
     let e0 = b.path(&["spawn"]);
     let body = inner(&mut b);
@@ -91,14 +101,16 @@ fn send_findings(inner: fn(&mut Bb) -> ExprId) -> (usize, vec::Vec<DiagCode>) {
     let root = b.block(&[s], None);
     let view = b.view(owner, root);
     let mut cx = InferCtx::new_in(alloc);
-    let c: Checked<'static> = match check_deferring(&view, &fx, &mut cx, &Needs::new_in(alloc), alloc) {
+    let mut c: Checked<'static> = match check_deferring(&view, &fx, &mut cx, &Needs::new_in(alloc), alloc) {
         Ok(Outcome::Done(c)) => c,
         Ok(Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
         Err(e) => panic!("check_deferring refused: {e:?}"),
     };
     assert!(c.diags.is_empty(), "nothing is decided before the flow: {:?}", c.diags);
-    let facts = AsyncFacts;
-    let lowered = match lower_async(&view, &c, block, &facts, alloc) {
+    // The heads laid in the record's own table, as the lowering reads them.
+    let regions = decls.lay(fx.t.view(), &mut c.types);
+    let facts = WithRegions { base: &AsyncFacts, regions: &regions };
+    let lowered = match crate::oracle::lower_async_checked(&view, &c, block, &facts, alloc) {
         Ok(l) => l,
         Err(r) => panic!("lower_async refused: {r:?}"),
     };

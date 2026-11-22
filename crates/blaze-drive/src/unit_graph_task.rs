@@ -9,8 +9,8 @@
 //! [`Records`] the driver passes (the records of the `Fetch` jobs it was handed, mapped); a
 //! package whose record it was not handed is asked of `Fetch` ([`Entry::Need`]), so only what
 //! the roots reach is ever fetched. One whose `Fetch` failed this command leaves no graph
-//! ([`Entry::NotFetched`]); one whose sources are refused for good is unavailable in the graph,
-//! with its finding.
+//! ([`Entry::NotFetched`]); one whose sources are refused for good, when the graph reaches it,
+//! leaves no graph either: [`UnitGraphTaskError::Missing`] names it with its finding.
 //!
 //! The record's bytes are a function of the graph alone: an edit to a member's manifest that
 //! changes no resolution gives byte-equal bytes, so every task keyed by the record's digest is
@@ -22,7 +22,7 @@ use blaze_id::ContentId;
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{AVec, Alloc};
 use blaze_unit_graph::record::{self, NotItsCfg, Source};
-use blaze_unit_graph::{Ask, Open, Package, Pass, Records, Resolution, Resolver, SourceError, StoreSources, TargetDesc, UnitError};
+use blaze_unit_graph::{Ask, Open, Package, Pass, Records, Resolution, Resolver, SourceError, StoreSources, TargetDesc, Text, UnitError};
 
 /// The most passes of the resolution: each pass asks for the packages one level deeper, so the
 /// count is the graph's depth (tempo: 9). Past it, [`UnitGraphTaskError::Passes`] (rule 18).
@@ -60,6 +60,11 @@ pub enum UnitGraphTaskError<'a> {
     Resolve(UnitError<'a>),
     Cfg(NotItsCfg),
     Passes,
+    /// The graph reached packages whose sources are refused for good (a checksum that is not
+    /// the lock's, an archive that does not unpack, no manifest): no graph is made from the
+    /// rest (blaze-unit-graph's `Pass::Partial`; states.md 35). Each `name version`, sorted
+    /// by lock id, with the findings that say why, in the order asked.
+    Missing { packages: AVec<'a, Text<'a>>, findings: AVec<'a, SourceError<'a>> },
 }
 
 impl fmt::Display for UnitGraphTaskError<'_> {
@@ -69,14 +74,24 @@ impl fmt::Display for UnitGraphTaskError<'_> {
             UnitGraphTaskError::Resolve(e) => write!(f, "{e}"),
             UnitGraphTaskError::Cfg(e) => write!(f, "{e}"),
             UnitGraphTaskError::Passes => write!(f, "the unit graph did not settle in {MOST_PASSES} passes"),
+            UnitGraphTaskError::Missing { packages, findings } => {
+                write!(f, "the unit graph reached {} package(s) whose sources could not be read, so no graph is made (rule 3):", packages.len())?;
+                for (i, package) in packages.iter().enumerate() {
+                    write!(f, "{} {package}", if i == 0 { "" } else { "," })?;
+                }
+                for finding in findings.iter() {
+                    write!(f, "; {finding}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
 /// What the task made: the graph's record bytes (blaze-unit-graph's `record` form), and one
 /// finding a dependency whose sources could not be read (not fetched, refused, no manifest),
-/// in the order asked. Such a package is in the graph's `unavailable` and the units that need
-/// it are `incomplete`; the task maps each finding to a finding record naming the package.
+/// in the order asked: a package the graph never reached (a graph that reaches one is
+/// [`UnitGraphTaskError::Missing`]); the task maps each finding to a finding record naming it.
 pub struct UnitGraphMade<'a> {
     pub record: AVec<'a, u8>,
     pub findings: AVec<'a, SourceError<'a>>,
@@ -103,7 +118,7 @@ pub struct Unheld<'s> {
     /// Failed this command, with no record (the network's or the store's fault): no graph.
     pub failed: &'s [ContentId],
     /// Refused for good, a record saying so (a checksum that is not the lock's, an archive
-    /// that does not unpack): the package is unavailable in the graph, which is kept.
+    /// that does not unpack): a graph that reaches it is refused naming it.
     pub refused: &'s [ContentId],
 }
 
@@ -133,6 +148,21 @@ pub fn run<'b, 'a, R: Records<'b>>(
                 }
                 let record = record::encode(&graph, inputs.target, inputs.host, alloc).map_err(UnitGraphTaskError::Cfg)?;
                 return Ok(Entry::Made(UnitGraphMade { record, findings }));
+            }
+            Pass::Partial(partial) => {
+                // A package not fetched this command is asked again by the next one.
+                if not_fetched > 0 {
+                    return Ok(Entry::NotFetched { count: not_fetched });
+                }
+                // Refused for good: no graph is made without them (states.md 35), each named.
+                let mut packages = AVec::with_capacity_in(partial.missing().len(), alloc);
+                for id in partial.missing() {
+                    let locked = lock.package(*id);
+                    let mut named = Text::new_in(alloc);
+                    let _ = fmt::Write::write_fmt(&mut named, format_args!("{} {}", locked.name, locked.version));
+                    packages.push(named);
+                }
+                return Err(UnitGraphTaskError::Missing { packages, findings });
             }
             Pass::Need(needs) => {
                 let mut asks = AVec::new_in(alloc);

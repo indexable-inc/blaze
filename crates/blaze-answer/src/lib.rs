@@ -49,9 +49,9 @@
 //!                 source [n] 32 B | findings [n] u32 | record [n] 32 B (the store key of the
 //!                 record the row's last entry made; zeros for a plan never made)
 //!   lists:        tomb [t] u32 (ascending) | reads [r] bytes | define_cell [d] u32 |
-//!                 define_digest [d] 20 B
+//!                 define_digest [d] 32 B
 //!                 (a row's reads: base u32, then its CellNos less base, `width` bits each, in
-//!                 READ ORDER; its defines sorted by CellNo, 24 B each)
+//!                 READ ORDER; its defines sorted by CellNo, 36 B each)
 //!
 //! cells (kind 3)  cells n | cell [n] u32 (ascending) | moved [n] u64     (12 B a moved cell)
 //!
@@ -80,14 +80,12 @@
 //! What things cost (the size test in sim.rs prints them for 24,000 rows of 300 reads over
 //! 60,000 cells): a row's fixed part 96 B ([`ROW_FIXED_BYTES`]) plus 68 B cold; a read
 //! `width / 8` B plus 4 B a row (2.01 B at 300 reads over 200 distinct cells of 60,000: 16 bits);
-//! a defined cell 24 B in its row ([`DEFINE_BYTES`]) and 12 B in a cells segment when it moves;
+//! a defined cell 36 B in its row ([`DEFINE_BYTES`]) and 12 B in a cells segment when it moves;
 //! a reader 4 B in a run plus 8 B per distinct cell of the run.
 //!
 //! Where the brief's points are met differently, in one line each:
 //! - A cell's current digest is not in the cells segment: it is its definer's row's define entry
 //!   (the definer is the dictionary's; the digest is read where the merge reads it anyway).
-//! - A cell digest is the first 20 bytes of the engine's 32-byte digest ([`CellDigest`]): two
-//!   different digests of one cell compare equal with probability 2^-160.
 //! - The row's source and findings count are a cold column outside the 96 B: the brief's fixed
 //!   fields (key, out, serial, wave, flags, counts and offsets) and the task and file ids fill it.
 //! - Opening a segment checks every bound an accessor indexes by (each rows segment's three list
@@ -168,20 +166,21 @@ use core::fmt;
 
 use blaze_id::ContentId;
 
-pub use crate::answer::{AnswerView, Health, SegmentRef, nothing_changed, summary_of};
+pub use crate::answer::{AnswerView, Health, RootView, SegmentRef, nothing_changed, summary_of};
 pub use crate::commit::{Commit, Effects, RowIn, RunWriter, Write, compact, has_findings};
 pub use crate::segment::{Reads, RowView, RowsBytes, SegmentKind};
 
 /// The form's version: a segment or root of another is refused ([`AnswerError::Format`]); an old
 /// home is reported and rebuilt, never migrated (rule 26).
 /// 2: the record key in the cold column and kinds 5 to 8.
-pub const FORMAT: u32 = 2;
+/// 3: each definition stores the full content ID a task observes.
+pub const FORMAT: u32 = 3;
 /// A segment's first bytes.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"BAS1";
 /// A root's first bytes.
 pub const ROOT_MAGIC: [u8; 4] = *b"BAR1";
 /// The bytes of a cell digest kept in the answer.
-pub const DIGEST_BYTES: usize = 20;
+pub const DIGEST_BYTES: usize = 32;
 /// A row's fixed part: task, key, out, serial, file, phase and flags, and its lists' offsets.
 pub const ROW_FIXED_BYTES: usize = 4 + 32 + 32 + 8 + 4 + 4 + 4 + 4 + 4;
 /// A row's cold part: its source, its findings count and its record's key.
@@ -221,8 +220,7 @@ pub struct CellNo(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct Serial(pub u64);
 
-/// What a cell holds, as the answer keeps it: the first [`DIGEST_BYTES`] of the engine's digest
-/// (zero: absent, as the engine's `ABSENT`).
+/// The content ID a task observes when reading this cell. All zeros represent absence.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CellDigest(pub [u8; DIGEST_BYTES]);
 
@@ -232,9 +230,7 @@ impl CellDigest {
 
     /// The answer's form of the engine's digest of a cell.
     pub fn of(digest: &ContentId) -> CellDigest {
-        let mut out = [0u8; DIGEST_BYTES];
-        out.copy_from_slice(&digest.0[..DIGEST_BYTES]);
-        CellDigest(out)
+        CellDigest(digest.0)
     }
 }
 
@@ -267,6 +263,10 @@ pub struct LinesKey(pub [u8; 32]);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Plant {
     None,
+    /// Discard the final twelve bytes of each definition before writing the row.
+    PrefixPadded,
+    /// Drop the removal of a cell's last reader from the posting delta.
+    LastReaderRemovalDropped,
     /// A lookup skips tombstones, so a retired task's row in an older segment is found again.
     TombstoneIgnored,
     /// Compaction keeps a cancelled (+1, -1) pair as a reader.
@@ -305,6 +305,10 @@ pub enum AnswerError {
     MissingSegment { segment: u32, id: ContentId },
     /// A segment's bytes are not as long as the root says.
     SegmentLength { segment: u32, expected: u64, found: u64 },
+    /// A scrub found bytes different from the immutable child named by the root.
+    SegmentDigest { segment: u32, expected: ContentId, found: ContentId },
+    /// A dictionary's filter rejects a key present in its own column.
+    FilterMissing { segment: u32, section: &'static str, at: usize },
     /// A segment's kind is not the one the root lists, or no kind.
     SegmentKind { segment: u32, found: u8 },
     /// A segment's sections do not add up to its length.
@@ -361,6 +365,8 @@ impl fmt::Display for AnswerError {
             AnswerError::RootTrailing { at } => write!(f, "the answer's root has bytes past its last segment, at {at}"),
             AnswerError::MissingSegment { segment, id } => write!(f, "the answer's root names segment {segment} ({id:?}), which the store does not have"),
             AnswerError::SegmentLength { segment, expected, found } => write!(f, "answer segment {segment}: {found} bytes, the root says {expected}"),
+            AnswerError::SegmentDigest { segment, expected, found } => write!(f, "answer segment {segment} has digest {found:x}, its root names {expected:x}"),
+            AnswerError::FilterMissing { segment, section, at } => write!(f, "answer segment {segment}: the {section} filter rejects its own entry {at}"),
             AnswerError::SegmentKind { segment, found } => write!(f, "answer segment {segment}: kind {found} is not the one its root lists"),
             AnswerError::SegmentSize { segment, section } => write!(f, "answer segment {segment}: its {section} do not add up to its length"),
             AnswerError::Bounds { segment, section, at } => write!(f, "answer segment {segment}: {section} entry {at} is out of bounds"),

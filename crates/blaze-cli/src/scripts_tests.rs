@@ -49,7 +49,6 @@ fn unit(package: u32, name: &str, kind: UnitKind<'static>, deps: &[u32], build_s
         deps: d,
         build_script: build_script.map(UnitId),
         links: links.map(t),
-        incomplete: false,
     }
 }
 
@@ -70,7 +69,7 @@ fn links_graph(a_reaches_c: bool) -> UnitGraph<'static> {
     units.push(unit(2, "c", UnitKind::Lib, &[], Some(1), Some("c"))); // 5
     units.push(unit(3, "e", UnitKind::Lib, &[5], Some(7), None)); // 6
     units.push(unit(3, "e", UnitKind::BuildScript, &[], None, None)); // 7
-    UnitGraph { units, unavailable: AVec::new_in(alloc), resolver: Resolver::V3, meta: AVec::new_in(alloc) }
+    UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc) }
 }
 
 /// D115 piece 3: the `Script` records a run Needs are its `links` closure: each direct `links`
@@ -171,16 +170,25 @@ fn scripts_a_native_runs_key_holds_the_sdks_version_not_its_folder() {
 
     use super::{RanAs, parts};
 
-    let sdk = |folder: &'static str, settings: &'static str| -> Sdk<'static> {
-        resolve(Some(folder), || -> Result<&'static str, XcrunFailed<'static>> { panic!("SDKROOT is set") }, |_| -> Result<&'static str, Unread<'static>> { Ok(settings) }).expect("an SDK")
+    let sdk = |folder: &'static str, settings: &'static str, build: &'static str| -> Sdk<'static> {
+        resolve(
+            Some(folder),
+            || -> Result<&'static str, XcrunFailed<'static>> { panic!("SDKROOT is set") },
+            |_| -> Result<&'static str, Unread<'static>> { Ok(settings) },
+            |_| -> Result<&'static str, Unread<'static>> { Ok(build) },
+        )
+        .expect("an SDK")
     };
-    let xcode = sdk("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#);
-    let tools = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#);
-    let older = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#);
+    let b118 = "<key>ProductBuildVersion</key><string>26B118</string>";
+    let xcode = sdk("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#, b118);
+    let tools = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#, b118);
+    let older = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#, "<key>ProductBuildVersion</key><string>25F70</string>");
+    let beta = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk", r#"{"Version":"27.2"}"#, "<key>ProductBuildVersion</key><string>26B5044k</string>");
     let key = |ran_as: RanAs, sdk: Option<&Sdk<'_>>| parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk.map(|sdk| sdk.identity()))[0].1;
 
     assert_eq!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&tools)), "one SDK version in two folders keyed two native runs");
     assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&older)), "two SDK versions keyed one native run");
+    assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&beta)), "two builds of one SDK version keyed one native run");
     assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, None), "a native run with no SDK keyed as one with an SDK");
     assert_eq!(key(RanAs::Wasm, Some(&xcode)), key(RanAs::Wasm, Some(&older)), "a wasm run's key moved with the SDK");
     assert_eq!(key(RanAs::Wasm, Some(&xcode)), key(RanAs::Wasm, None), "a wasm run's key moved with the SDK's presence");

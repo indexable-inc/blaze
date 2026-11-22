@@ -3,6 +3,12 @@
 //! Ported from front.rs's `bound` and `predicates` (whose copies go at the switch). A
 //! `where const` condition is not passed over silently: it is collected for the caller
 //! ([`Preds::conds`]), which makes its clause from the condition's own item.
+//!
+//! Lifetimes (D148, piece L1b). A lifetime bound is a clause: `T: 'a` is
+//! [`PClause::TypeOutlives`] and `'a: 'b` [`PClause::RegionOutlives`], each region resolved
+//! here by the item's [`Scope`] ([`heads_regions::lifetime`]). Beside each clause [`Preds`]
+//! keeps what it was written as ([`Src`]: its `Self`, its bound's path, its `for<..>`
+//! binders), which heads_regions.rs lays the clause's region column from.
 
 use std::alloc::Global;
 use std::format;
@@ -10,10 +16,16 @@ use std::vec::Vec;
 
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::{View, form as lf, head};
+use blaze_scope::names::PathError;
+use blaze_own::{Alloc, Vec as OwnVec};
 use blaze_surface::Range;
 use blaze_typeck::{List, Name, PClause, PNode, PTy, PortableTys};
 
+use super::heads_regions::{self, Binders, On, Scope, Src};
 use super::types::{Bounded, Bounds, Builder, Env, Heads, ParamBound, SelfTy, Why, intern, intern_list, path_texts, path_texts_of, subst_clause};
+
+/// The allocator a head's clause sources are kept in: the store's.
+type Mem = Alloc<'static>;
 
 /// What one bound says of its type's sizedness ([`Builder::bound`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,22 +38,119 @@ pub enum Sizing {
     NoTrait,
 }
 
-/// What [`Builder::predicates`] found besides clauses: the item's `where const` conditions, by
-/// their const ids in the item's text, for the caller to key and evaluate.
+/// An item's clauses, and what [`Builder::predicates`] found besides them: the item's `where
+/// const` conditions, by their const ids in the item's text, for the caller to key and
+/// evaluate. `sources[i]` is what `clauses[i]` was written as (one each, kept in step by
+/// [`Preds::push`] and [`Preds::remove_clause`]); `scope` names the item's lifetimes.
 pub struct Preds {
     pub clauses: Vec<PClause, Global>,
     pub conds: Vec<lf::ConstIdx, Global>,
+    pub sources: OwnVec<Src, Mem>,
+    pub scope: Scope,
+    /// Why the sources could not all be read as written (a bound's arguments the regions'
+    /// reader refuses, bindings that do not line up with them): the clauses are whole and the
+    /// head is made, and its regions are refused with this, by name (heads_regions.rs
+    /// `fill_clauses`). The first such refusal is kept.
+    pub regions_gap: Option<heads_regions::RegionsRefusal>,
+    /// A fn head's bounds whose trait path the names library decided names nothing (E0405):
+    /// each such bound's library refusal and its path's range, the bound dropped, for the head
+    /// to keep as its own finding (heads.rs `fn_head`, type_miss.rs `TypeMiss::of_trait`).
+    /// `None` (every item but a fn, which has no body to say it) keeps such a bound the
+    /// head's error, as before.
+    pub trait_misses: Option<OwnVec<(PathError, Range), Mem>>,
 }
 
 impl Preds {
-    pub fn new() -> Preds {
-        Preds { clauses: Vec::new_in(Global), conds: Vec::new_in(Global) }
+    /// No clause yet, the item's lifetimes named by `scope` (heads_regions.rs
+    /// [`Scope::item`]).
+    pub fn new_in(scope: Scope) -> Preds {
+        let alloc = scope.alloc();
+        Preds { clauses: Vec::new_in(Global), conds: Vec::new_in(Global), sources: OwnVec::new_in(alloc), scope, regions_gap: None, trait_misses: None }
     }
-}
 
-impl Default for Preds {
-    fn default() -> Self {
-        Preds::new()
+    /// A fn head's: a bound whose trait names nothing is kept in [`Preds::trait_misses`] and
+    /// dropped, not the head's error.
+    pub fn keep_trait_misses(&mut self) {
+        let alloc = self.alloc();
+        self.trait_misses.get_or_insert_with(|| OwnVec::new_in(alloc));
+    }
+
+    /// The regions of these clauses cannot be laid, for `why` ([`Preds::regions_gap`]).
+    pub fn refuse_regions(&mut self, why: heads_regions::RegionsRefusal) {
+        self.regions_gap.get_or_insert(why);
+    }
+
+    /// The clauses of a filed head (head_record.rs): their region columns were filed beside
+    /// them, so each one's source is [`Src::Derived`] and its scope names nothing.
+    pub fn decoded(clauses: Vec<PClause, Global>, conds: Vec<lf::ConstIdx, Global>, alloc: Mem) -> Preds {
+        let mut sources = OwnVec::with_capacity_in(clauses.len(), alloc);
+        for _ in 0..clauses.len() {
+            sources.push(Src::Derived);
+        }
+        Preds { clauses, conds, sources, scope: Scope::new_in(alloc), regions_gap: None, trait_misses: None }
+    }
+
+    /// The allocator the sources are kept in.
+    pub fn alloc(&self) -> Mem {
+        *self.sources.allocator()
+    }
+
+    /// `c`, written as `src`.
+    pub fn push(&mut self, c: PClause, src: Src) {
+        self.clauses.push(c);
+        self.sources.push(src);
+    }
+
+    /// The container's clauses a member inherits (an impl's, a trait's), each the
+    /// container's clause of the same index ([`Src::Inherited`]).
+    pub fn inherit(&mut self, inherited: &[PClause]) {
+        for (i, &c) in inherited.iter().enumerate() {
+            let nth = u32::try_from(i).unwrap_or(u32::MAX);
+            self.push(c, Src::Inherited { nth });
+        }
+    }
+
+    /// Removes clause `at`, and moves every link past it ([`Src::Binding::of`],
+    /// [`On::Nested::of`]) down by one. A link to the removed clause itself cannot be: only an
+    /// implied sizedness clause ([`Src::Derived`]) is removed, and no clause links to one.
+    pub fn remove_clause(&mut self, at: usize) {
+        self.clauses.remove(at);
+        self.sources.remove_shift(at);
+        let at = u32::try_from(at).unwrap_or(u32::MAX);
+        let down = |of: &mut u32| {
+            if *of > at {
+                *of -= 1;
+            }
+        };
+        for s in self.sources.iter_mut() {
+            match s {
+                Src::Binding { of, .. } => down(of),
+                Src::Trait { on: On::Nested { of, .. }, .. } | Src::TypeOutlives { on: On::Nested { of, .. }, .. } => down(of),
+                _ => {}
+            }
+        }
+    }
+
+    /// `other`'s clauses, conditions and sources after these, its links moved past them.
+    pub fn append(&mut self, other: Preds) {
+        let by = u32::try_from(self.clauses.len()).unwrap_or(u32::MAX);
+        self.clauses.extend_from_slice(&other.clauses);
+        self.conds.extend_from_slice(&other.conds);
+        for &s in other.sources.iter() {
+            let s = match s {
+                Src::Binding { of, term, gat } => Src::Binding { of: of + by, term, gat },
+                Src::Trait { on: On::Nested { of, gat }, bound, binders } => Src::Trait { on: On::Nested { of: of + by, gat }, bound, binders },
+                Src::TypeOutlives { on: On::Nested { of, gat }, lifetime, binders } => Src::TypeOutlives { on: On::Nested { of: of + by, gat }, lifetime, binders },
+                s => s,
+            };
+            self.sources.push(s);
+        }
+        if let Some(theirs) = other.trait_misses {
+            self.keep_trait_misses();
+            if let Some(mine) = self.trait_misses.as_mut() {
+                mine.extend(theirs.iter().copied());
+            }
+        }
     }
 }
 
@@ -70,9 +179,11 @@ fn place(v: &View<'_>, r: Result<blaze_lower::BodyRange, lf::BadRow>) -> Result<
 }
 
 /// A `for<..>` binder (on a bound, a where clause, a `dyn` bound, a fn pointer type): the
-/// Reference, "Higher-ranked trait bounds" and "Function pointer types": it binds lifetimes,
-/// and this checker erases every lifetime (`&'a T` is `Ref(T)`), so the binder goes with them.
-/// A type or const in it (`for<T>`, the unstable non-lifetime binders) is refused by name.
+/// Reference, "Higher-ranked trait bounds" and "Function pointer types": it binds lifetimes.
+/// The types stay erased (`&'a T` is `Ref(T)`); the binder is kept beside the clause
+/// ([`Src`]'s [`Binders`]) and its variables are `Late { binder: 0, .. }` in the clause's
+/// region column (heads_regions.rs, D148). A type or const in it (`for<T>`, the unstable
+/// non-lifetime binders) is refused by name.
 pub(super) fn lifetimes_only(v: &View<'_>, binder: lf::List, r: Range) -> Result<(), Why> {
     for &n in v.rows(binder)? {
         if !matches!(lf::GenericParam::decode(n)?, lf::GenericParam::Lifetime { .. }) {
@@ -139,25 +250,27 @@ pub(super) fn segment_args<'t>(tys: &mut PortableTys<'t>, v: &View<'_>, seg: &lf
 
 // `'n` is the lowered text's (`View<'n>`); `'s` the names source's.
 impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
-    /// The bound `b` on `self_ty` as clauses into `out`: the trait's, and a projection for each
-    /// `Name = Type` argument; what it says of sizedness (`sized` is the `sized` lang trait).
+    /// The bound `b` on `self_ty` (written as `on`, under the where predicate's `binders`) as
+    /// clauses into `out`: the trait's, a projection for each `Name = Type` argument, and
+    /// `self_ty: 'a` for a lifetime bound; what it says of sizedness (`sized` is the `sized`
+    /// lang trait).
     #[expect(clippy::too_many_arguments, reason = "the bound, where it is written, and the out list")]
-    pub fn bound(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, self_ty: PTy, sized: Option<LibKey>, out: &mut Vec<PClause, Global>) -> Result<Sizing, Why> {
+    pub fn bound(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, (self_ty, on, binders): (PTy, On, Binders), sized: Option<LibKey>, out: &mut Preds) -> Result<Sizing, Why> {
         // The bound, then each associated type bound written in it, in writing order (a work
         // list: `Tr<A: B<C: D>>` nests). The Reference, "Trait and lifetime bounds" (associated
         // item constraints, RFC 2289): `T: Tr<Assoc: Bounds>` is `T: Tr` and
         // `<T as Tr>::Assoc: Bounds`; core: `R: [const] Try<Output = T, Residual: Residual<..>>`.
         const MOST_NESTED: usize = 256;
-        let mut todo: Vec<(lf::Bound, PTy), Global> = Vec::new_in(Global);
-        let first = self.one_bound(tys, env, v, b, self_ty, sized, out, &mut todo)?;
+        let mut todo: OwnVec<(lf::Bound, PTy, On, Binders), Mem> = OwnVec::new_in(out.alloc());
+        let first = self.one_bound(tys, env, v, b, (self_ty, on, binders), sized, out, &mut todo)?;
         let mut i = 0;
         while i < todo.len() {
             if i == MOST_NESTED {
                 let lf::Bound::Trait { ty, .. } = b else { break };
                 return Err(Why::Unsupported("associated type bounds nested past 256", place(v, v.type_range(ty))?));
             }
-            let (nb, on) = todo[i];
-            if self.one_bound(tys, env, v, nb, on, sized, out, &mut todo)? == Sizing::Relaxed {
+            let (nb, nty, non, nbinders) = todo[i];
+            if self.one_bound(tys, env, v, nb, (nty, non, nbinders), sized, out, &mut todo)? == Sizing::Relaxed {
                 let lf::Bound::Trait { ty, .. } = nb else { break };
                 return Err(Why::Program("`?Sized` on an associated type bound (`?` relaxes a type parameter's or an associated type's implied `Sized` only where it is declared)".into(), place(v, v.type_range(ty))?));
             }
@@ -169,10 +282,45 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     /// One bound of [`Builder::bound`]: its clauses into `out`, its associated type bounds
     /// (each on its projection) into `todo`.
     #[expect(clippy::too_many_arguments, reason = "the bound, where it is written, and the out lists")]
-    fn one_bound(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, self_ty: PTy, sized: Option<LibKey>, out: &mut Vec<PClause, Global>, todo: &mut Vec<(lf::Bound, PTy), Global>) -> Result<Sizing, Why> {
-        let lf::Bound::Trait { ty, binder, mods } = b else { return Ok(Sizing::NoTrait) };
+    fn one_bound(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'n>,
+        b: lf::Bound,
+        (self_ty, on, outer): (PTy, On, Binders),
+        sized: Option<LibKey>,
+        out: &mut Preds,
+        todo: &mut OwnVec<(lf::Bound, PTy, On, Binders), Mem>,
+    ) -> Result<Sizing, Why> {
+        let (ty, binder, mods) = match b {
+            lf::Bound::Trait { ty, binder, mods } => (ty, binder, mods),
+            // `T: 'a` (the Reference, "Trait and lifetime bounds": "`T: 'a` means that all
+            // lifetime parameters of `T` outlive `'a`").
+            // A lifetime the regions' reader does not name here (`'_` where a name is required,
+            // E0637; a return opaque's `+ '_` the output rule gives no candidate) is a regions
+            // refusal, never the head's (D148: the erased clause holds no region the type
+            // check reads): the clause is left out and the head's regions are refused by name
+            // ([`Preds::refuse_regions`], heads_regions.rs `fill_clauses`). A name no scope
+            // declares stays the program's error (E0261), and E0106 is the signature's own
+            // (heads.rs `output_rule`).
+            lf::Bound::Lifetime(n) => {
+                match heads_regions::lifetime(v, &out.scope, outer, n) {
+                    Ok(region) => out.push(PClause::TypeOutlives { ty: self_ty, region }, Src::TypeOutlives { on, lifetime: n, binders: outer }),
+                    Err(why @ heads_regions::RegionsRefusal::Undeclared { .. }) => return Err(Why::Regions(why)),
+                    Err(why) => out.refuse_regions(why),
+                }
+                return Ok(Sizing::NoTrait);
+            }
+            // `use<..>` is an opaque type's capture list (heads_regions.rs `captures`), no clause.
+            lf::Bound::Use(_) => return Ok(Sizing::NoTrait),
+        };
         let r = place(v, v.type_range(ty))?;
         lifetimes_only(v, binder, r)?;
+        let binders = outer.with(binder).map_err(|e| match e {
+            heads_regions::RegionsRefusal::Unsupported { what, .. } => Why::Unsupported(what, r),
+            e => Why::Regions(e),
+        })?;
         // `const Trait` and `[const] Trait` hold for typing exactly when `Trait` does (the
         // Reference's const trait RFC 3762: const-ness is checked only in const contexts); that
         // check is a const checker's, which reads `mods` again when it exists. So the clause is
@@ -187,7 +335,15 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
         // What the path names comes first: the trait's head says which of the written
         // arguments are constants (`Uint<LO>: Concat<HI>`; const_args_in_bounds.rs).
-        let target = self.bound_target(env, v, p, abs, &texts, pr)?;
+        // A fn head's bound whose trait the library decided names nothing is its E0405: kept,
+        // the bound dropped (no clause, no sizedness), the head made without it.
+        let target = match (self.bound_target(env, v, p, abs, &texts, pr), out.trait_misses.as_mut()) {
+            (Err(Why::Resolve(crate::resolve::ResolveError::Path(e), at)), Some(misses)) if super::type_miss::decided(e) => {
+                misses.push((e, at));
+                return Ok(Sizing::NoTrait);
+            }
+            (target, _) => target?,
+        };
         let (given, binds, nested) = match segs.last() {
             Some(last) => self.bound_segment_args(tys, env, v, target, last, pr)?,
             None => (Vec::new_in(Global), Vec::new_in(Global), Vec::new_in(Global)),
@@ -204,7 +360,13 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 if !binds.is_empty() || !nested.is_empty() {
                     return Err(Why::Unsupported("an associated type binding on a trait alias (`Alias<Name = T>`)", pr));
                 }
-                self.alias_clauses(tys, alias, pr, self_ty, &given, out)?;
+                // Its clauses have no text here: each a `Src::Derived` (an empty column, or
+                // refused by name when its types carry lifetimes).
+                let from = out.clauses.len();
+                self.alias_clauses(tys, alias, pr, self_ty, &given, &mut out.clauses)?;
+                for _ in from..out.clauses.len() {
+                    out.sources.push(Src::Derived);
+                }
                 return Ok(Sizing::NoTrait);
             }
         };
@@ -215,32 +377,55 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             }
             return Ok(Sizing::Relaxed);
         }
-        out.push(PClause::Trait { trait_: self.heads.checker(key), args });
+        let of = u32::try_from(out.clauses.len()).map_err(|_| Why::Unsupported("a head with more than 2^32 clauses", r))?;
+        out.push(PClause::Trait { trait_: self.heads.checker(key), args }, Src::Trait { on, bound: ty, binders });
+        // What each `Name = T` and `Name: Bounds` is written as: its term's type and the
+        // lifetimes written on its name, in the order `segment_args` gives them.
+        let alloc = out.alloc();
+        let read = match segs.last() {
+            Some(last) => heads_regions::binding_terms(v, last, alloc).and_then(|t| heads_regions::nested_gats(v, last, alloc).map(|g| (t, g))),
+            None => Ok((OwnVec::new_in(alloc), OwnVec::new_in(alloc))),
+        };
+        let read = read.and_then(|(t, g)| if t.len() != binds.len() || g.len() != nested.len() { Err(heads_regions::RegionsRefusal::Unaligned { nth: of }) } else { Ok((t, g)) });
+        // What the regions' reader refuses here refuses the head's regions, not its clauses:
+        // each binding is then written as nothing (no term, no lifetimes) and never laid.
+        let (terms, gats) = match read {
+            Ok(tg) => tg,
+            Err(why) => {
+                out.refuse_regions(why);
+                let mut t = OwnVec::with_capacity_in(binds.len(), alloc);
+                t.resize(binds.len(), (None, List::EMPTY));
+                let mut g = OwnVec::with_capacity_in(nested.len(), alloc);
+                g.resize(nested.len(), List::EMPTY);
+                (t, g)
+            }
+        };
         // `Name = T` is a projection on the trait among `key` and its supertraits that declares
         // `Name` (`Fn(A) -> B`'s `Output` is `FnOnce`'s).
-        for (name, term) in binds {
+        for (&(name, term), &(written, gat)) in binds.iter().zip(terms.iter()) {
             let shown = v.text_at(v.path_range(p)?)?;
             let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
-            out.push(PClause::Projection { trait_: self.heads.checker(owner), args: oargs, name, term });
+            out.push(PClause::Projection { trait_: self.heads.checker(owner), args: oargs, name, term }, Src::Binding { of, term: written, gat });
         }
         // `Name<T> = X` (a generic associated type's binding with type arguments): the
         // projection's list is the owner's arguments then the binding's own (gat.rs).
         if let Some(last) = segs.last() {
             let shown = v.text_at(v.path_range(p)?)?;
-            self.gat_bindings(tys, env, v, last, key, args, pr, shown, &mut |c| out.push(c))?;
+            self.gat_bindings(tys, env, v, last, key, args, pr, shown, &mut |c| out.push(c, Src::Derived))?;
             // `Name<T>: Bounds` (an associated type bound on a generic associated type with
             // type or const arguments): each bound on `<self_ty as Owner>::Name<T>`, into the
-            // same work list as `Name: Bounds` below (gat_bounds.rs).
-            self.gat_bounds(tys, env, v, last, key, args, pr, shown, &mut |b, on| todo.push((b, on)))?;
+            // same work list as `Name: Bounds` below (gat_bounds.rs). Its `Self` has type
+            // arguments of its own: a column is laid only where it has no regions (`On::Made`).
+            self.gat_bounds(tys, env, v, last, key, args, pr, shown, &mut |b, on_ty| todo.push((b, on_ty, On::Made, binders)))?;
         }
         // `Name: Bounds`: each bound on `<self_ty as Owner>::Name`, the owner found as for
         // `Name = T`.
-        for (name, list) in nested {
+        for (&(name, list), &gat) in nested.iter().zip(gats.iter()) {
             let shown = v.text_at(v.path_range(p)?)?;
             let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
             let proj = intern(tys, PNode::Alias { trait_: self.heads.checker(owner), name, args: oargs })?;
             for &row in v.rows(list)? {
-                todo.push((lf::Bound::decode(row)?, proj));
+                todo.push((lf::Bound::decode(row)?, proj, On::Nested { of, gat }, binders));
             }
         }
         Ok(Sizing::Trait(key))
@@ -308,13 +493,27 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     /// before it in scope. Only the trait and its arguments are read here; the bound's other
     /// parts (`Name = Type`, `?Sized`, `!Trait`) are [`Builder::predicates`]'s to take or refuse.
     pub fn param_bounds(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, base: u32, out: &mut Vec<ParamBound, Global>) -> Result<(), Why> {
+        self.param_bounds_kept(tys, env, v, base, out, None)
+    }
+
+    /// [`Builder::param_bounds`] for a fn head: a bound whose trait the library decided names
+    /// nothing is pushed on `misses` (as [`Preds::trait_misses`]) and declares nothing.
+    pub fn param_bounds_kept(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'n>,
+        base: u32,
+        out: &mut Vec<ParamBound, Global>,
+        mut misses: Option<&mut OwnVec<(PathError, Range), Mem>>,
+    ) -> Result<(), Why> {
         let mut i = base;
         for &n in v.rows(v.list(head::GENERICS))? {
             // A const parameter takes an index too (`heads::param_names`), and has no bounds.
             match lf::GenericParam::decode(n)? {
                 lf::GenericParam::Type { bounds, .. } => {
                     for &b in v.rows(bounds)? {
-                        self.param_bound(tys, env, v, lf::Bound::decode(b)?, i, out)?;
+                        self.param_bound(tys, env, v, lf::Bound::decode(b)?, i, out, misses.as_deref_mut())?;
                     }
                     i += 1;
                 }
@@ -338,13 +537,14 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 None => continue,
             };
             for &b in v.rows(bounds)? {
-                self.param_bound(tys, env, v, lf::Bound::decode(b)?, param, out)?;
+                self.param_bound(tys, env, v, lf::Bound::decode(b)?, param, out, misses.as_deref_mut())?;
             }
         }
         Ok(())
     }
 
-    fn param_bound(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, param: u32, out: &mut Vec<ParamBound, Global>) -> Result<(), Why> {
+    #[expect(clippy::too_many_arguments, reason = "one bound, where it is written, and the out lists")]
+    fn param_bound(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, b: lf::Bound, param: u32, out: &mut Vec<ParamBound, Global>, misses: Option<&mut OwnVec<(PathError, Range), Mem>>) -> Result<(), Why> {
         let lf::Bound::Trait { ty, mods, .. } = b else { return Ok(()) };
         // `?Sized` and `!Trait` declare no associated type of the parameter.
         if mods.maybe || mods.negative {
@@ -353,7 +553,15 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
         let e = Env { bounds: Bounds::Building(out), ..*env };
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
-        let target = self.bound_target(&e, v, p, abs, &texts, pr)?;
+        // A fn head's bound whose trait names nothing (decided): kept, declaring nothing; its
+        // predicates walk keeps the same bound's miss, the head says it once (heads.rs).
+        let target = match (self.bound_target(&e, v, p, abs, &texts, pr), misses) {
+            (Err(Why::Resolve(crate::resolve::ResolveError::Path(pe), at)), Some(misses)) if super::type_miss::decided(pe) => {
+                misses.push((pe, at));
+                return Ok(());
+            }
+            (target, _) => target?,
+        };
         let given = match segs.last() {
             Some(last) => self.bound_segment_args(tys, &e, v, target, last, pr)?.0,
             None => Vec::new_in(Global),
@@ -398,13 +606,13 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             };
             let (mut stated, mut relaxed) = (false, false);
             for &b in v.rows(bounds)? {
-                let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
+                let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Made, Binders::NONE), sized, out)?;
                 relaxed |= s == Sizing::Relaxed;
                 stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
             }
             if let Some(s) = self.implied_size(stated, relaxed, sized)? {
                 let args = intern_list(tys, &[me])?;
-                out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
+                out.push(PClause::Trait { trait_: self.heads.checker(s), args }, Src::Derived);
             }
         }
         Ok(())
@@ -429,13 +637,13 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         // `type X: ?Sized;` keeps `<Self as Tr>::X: MetaSized` ([`Self::implied_size`]).
         let (mut stated, mut relaxed) = (false, false);
         for &b in v.rows(v.list(head::BOUNDS))? {
-            let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
+            let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Made, Binders::NONE), sized, out)?;
             relaxed |= s == Sizing::Relaxed;
             stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
         }
         if let Some(s) = self.implied_size(stated, relaxed, sized)? {
             let args = intern_list(tys, &[me])?;
-            out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
+            out.push(PClause::Trait { trait_: self.heads.checker(s), args }, Src::Derived);
         }
         self.assoc_own_clauses(tys, env, v, me, sized, out)
     }
@@ -478,17 +686,22 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             .ok()
             .and_then(|l| l.checked_sub(own))
             .ok_or_else(|| Why::Program("an associated type's alias lists fewer arguments than its own parameters".into(), Range::new(0, 0)))?;
-        let mut mine = Preds::new();
+        // In the associated type's scope (its own lifetimes after its trait's: the caller's).
+        let mut mine = Preds::new_in(out.scope.clone());
         self.predicates(tys, env, v, base, None, sized, &mut mine)?;
         if !mine.conds.is_empty() {
             return Err(Why::Unsupported("a `where const` condition on an associated type", Range::new(0, 0)));
         }
         for c in mine.clauses.iter() {
-            let args = match *c {
-                PClause::Trait { args, .. } | PClause::Projection { args, .. } => args,
+            let first = match *c {
+                PClause::Trait { args, .. } | PClause::Projection { args, .. } => {
+                    tys.view().list(args).map_err(|_| Why::Program("an own clause's list is past the type table".into(), Range::new(0, 0)))?.first().copied()
+                }
+                // `T: 'a` on the alias itself is a clause on the alias as much as a trait bound.
+                PClause::TypeOutlives { ty, .. } => Some(ty),
+                PClause::RegionOutlives { .. } => None,
                 PClause::Const { .. } => return Err(Why::Unsupported("a `where const` condition on an associated type", Range::new(0, 0))),
             };
-            let first = tys.view().list(args).map_err(|_| Why::Program("an own clause's list is past the type table".into(), Range::new(0, 0)))?.first().copied();
             if let Some(s) = first
                 && reaches_alias(tys, s, me)?
             {
@@ -498,7 +711,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 ));
             }
         }
-        out.clauses.extend_from_slice(&mine.clauses);
+        out.append(mine);
         Ok(())
     }
 
@@ -546,11 +759,16 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                 i += 1;
                 continue;
             }
+            // `'a: 'b + 'c` (a lifetime parameter takes no index among the types).
+            if let lf::GenericParam::Lifetime { name, bounds } = lf::GenericParam::decode(n)? {
+                self.region_outlives(v, name, bounds, out)?;
+                continue;
+            }
             if let lf::GenericParam::Type { bounds, .. } = lf::GenericParam::decode(n)? {
                 let me = intern(tys, PNode::Param(i))?;
                 let (mut stated, mut relaxed) = (false, false);
                 for &b in v.rows(bounds)? {
-                    let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
+                    let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Made, Binders::NONE), sized, out)?;
                     relaxed |= s == Sizing::Relaxed;
                     stated |= s != Sizing::Relaxed && self.states_size(s, sized)?;
                 }
@@ -561,7 +779,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                     if relaxed {
                         relax.push(out.clauses.len());
                     }
-                    out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
+                    out.push(PClause::Trait { trait_: self.heads.checker(s), args }, Src::Derived);
                 }
                 own.push((me, at));
                 i += 1;
@@ -570,16 +788,20 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         if let Some(me) = self_bounds {
             for &b in v.rows(v.list(head::BOUNDS))? {
                 let b = lf::Bound::decode(b)?;
-                if let lf::Bound::Trait { ty, .. } = b {
-                    let from = out.clauses.len();
-                    if self.bound(tys, env, v, b, me, sized, &mut out.clauses)? == Sizing::Relaxed {
-                        // The Reference, "Trait and lifetime bounds": `?` relaxes the implied
-                        // bound of a type parameter or associated type only; `Self` has none.
-                        return Err(Why::Unsupported("`?Sized` on a trait's `Self`", place(v, v.type_range(ty))?));
-                    }
-                    for &c in &out.clauses[from..] {
-                        implied(c);
-                    }
+                // `trait Tr: Super` and `trait Tr: 'a` (`Self: 'a` is implied as a supertrait
+                // is: the Reference, "Traits", "Supertraits" and "Trait and lifetime bounds").
+                if let lf::Bound::Use(_) = b {
+                    continue;
+                }
+                let from = out.clauses.len();
+                if self.bound(tys, env, v, b, (me, On::Made, Binders::NONE), sized, out)? == Sizing::Relaxed {
+                    // The Reference, "Trait and lifetime bounds": `?` relaxes the implied
+                    // bound of a type parameter or associated type only; `Self` has none.
+                    let lf::Bound::Trait { ty, .. } = b else { return Err(Why::Program("`?` on a lifetime bound".into(), Range::new(0, 0))) };
+                    return Err(Why::Unsupported("`?Sized` on a trait's `Self`", place(v, v.type_range(ty))?));
+                }
+                for &c in &out.clauses[from..] {
+                    implied(c);
                 }
             }
         }
@@ -587,7 +809,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         for &n in v.rows(v.list(head::WHERE))? {
             match lf::WherePred::decode(n)? {
                 lf::WherePred::Const { cond } => out.conds.push(cond),
-                lf::WherePred::Lifetime { .. } => {}
+                lf::WherePred::Lifetime { name, bounds } => self.region_outlives(v, name, bounds, out)?,
                 lf::WherePred::Type { binder, ty, bounds } => {
                     let r = place(v, v.type_range(ty))?;
                     lifetimes_only(v, binder, r)?;
@@ -596,7 +818,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
                     let on_self = self_bounds == Some(me);
                     for &b in v.rows(bounds)? {
                         let from = out.clauses.len();
-                        let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
+                        let s = self.bound(tys, env, v, lf::Bound::decode(b)?, (me, On::Written(ty), Binders::outer(binder)), sized, out)?;
                         if on_self {
                             for &c in &out.clauses[from..] {
                                 implied(c);
@@ -638,7 +860,29 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             dropped.sort_unstable();
         }
         for &at in dropped.iter().rev() {
-            out.clauses.remove(at);
+            out.remove_clause(at);
+        }
+        Ok(())
+    }
+
+    /// `'long: 's1 + 's2` (a lifetime parameter's bounds, or a `where` lifetime predicate): one
+    /// [`PClause::RegionOutlives`] per bound, each region by the item's scope.
+    /// A lifetime the regions' reader does not name (`'_: 'a`, E0637) is a regions refusal by
+    /// name, the clause left out (as `T: '_` in `one_bound`), never the head's error; an
+    /// undeclared one stays the program's (E0261).
+    fn region_outlives(&self, v: &View<'n>, long: lf::NameIdx, bounds: lf::List, out: &mut Preds) -> Result<(), Why> {
+        let l = heads_regions::lifetime(v, &out.scope, Binders::NONE, long);
+        for &b in v.rows(bounds)? {
+            let lf::Bound::Lifetime(short) = lf::Bound::decode(b)? else {
+                return Err(Why::Program("a lifetime bounded by something other than a lifetime".into(), place(v, v.name_range(long))?));
+            };
+            let s = heads_regions::lifetime(v, &out.scope, Binders::NONE, short);
+            match (l, s) {
+                (Ok(l), Ok(s)) => out.push(PClause::RegionOutlives { long: l, short: s }, Src::RegionOutlives { long, short }),
+                // A name no scope declares stays the program's error (E0261).
+                (Err(why @ heads_regions::RegionsRefusal::Undeclared { .. }), _) | (_, Err(why @ heads_regions::RegionsRefusal::Undeclared { .. })) => return Err(Why::Regions(why)),
+                (Err(why), _) | (_, Err(why)) => out.refuse_regions(why),
+            }
         }
         Ok(())
     }

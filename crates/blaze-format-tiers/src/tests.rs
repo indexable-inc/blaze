@@ -28,7 +28,7 @@ record! {
 }
 
 fn hot_buffer(values: &[u32]) -> Aligned {
-    let mut out = Writer::new(HotRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(HotRoot::SCHEMA);
     let placed = push_hot(&mut out, values);
     let at = out.next::<HotRoot>();
     let root = HotRoot { column: HotColumn::new(at + offset_of!(HotRoot, column) as u64, placed) };
@@ -37,7 +37,7 @@ fn hot_buffer(values: &[u32]) -> Aligned {
 }
 
 fn warm_buffer(values: &[u32]) -> Aligned {
-    let mut out = Writer::new(WarmRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(WarmRoot::SCHEMA);
     let placed = push_warm(&mut out, values);
     let at = out.next::<WarmRoot>();
     let root =
@@ -101,7 +101,7 @@ fn a_hot_column_is_at_its_narrowest_width() {
 
 #[test]
 fn a_hot_column_of_two_widths_is_refused() {
-    let mut out = Writer::new(HotRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(HotRoot::SCHEMA);
     let u8s = push_hot(&mut out, &[1, 2, 3]);
     let u16s = push_hot(&mut out, &[1000, 2000]);
     let at = out.next::<HotRoot>();
@@ -194,7 +194,7 @@ fn a_warm_column_takes_the_bits_of_its_range() {
 #[test]
 fn a_warm_column_that_does_not_fit_its_words_is_refused() {
     let corrupt = |edit: fn(&mut WarmColumn)| {
-        let mut out = Writer::new(WarmRoot::SCHEMA);
+        let mut out = Writer::on_the_global_heap_until_ported(WarmRoot::SCHEMA);
         let placed = push_warm(&mut out, &[5, 6, 7, 1000]);
         let at = out.next::<WarmRoot>();
         let mut column = WarmColumn::new(at + offset_of!(WarmRoot, column) as u64, placed);
@@ -480,7 +480,7 @@ record! {
 /// A tree of `nodes` nodes from `rng`, and where its word tables are: the nodes (six words a
 /// row), each node's words that are not empty, `sizes`, and `wide`.
 fn tree_buffer(rng: &mut Rng, nodes: usize) -> (Aligned, Vec<WordTable>) {
-    let mut out = Writer::new(Tree::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(Tree::SCHEMA);
     let mut expected = Vec::new();
     let mut placed = Vec::new();
     for n in 0..nodes {

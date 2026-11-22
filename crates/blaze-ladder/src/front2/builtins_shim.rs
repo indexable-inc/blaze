@@ -370,7 +370,8 @@ mod tests {
         let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
         let mut declared: AVec<'_, Declared<'_>> = AVec::new_in(alloc);
         let isa = Isa { lse: true, os: Os::MacOs };
-        let entry = make_entry(&add_f128(), &names, routines, &mut declared, isa, alloc)
+        let func = add_f128();
+        let entry = make_entry(blaze_lir::verify(func.view()).expect("the f128 add is valid LIR"), &names, routines, &mut declared, isa, alloc)
             .unwrap_or_else(|why| panic!("an f128 add with every routine bound makes an entry: {why}"));
         let view = EntryView::read(&entry).unwrap_or_else(|why| panic!("the entry reads: {why}"));
         let mut tabled: std::vec::Vec<ItemKey> = std::vec::Vec::new();

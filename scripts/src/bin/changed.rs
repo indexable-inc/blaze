@@ -67,7 +67,7 @@ use serde_json::json;
 
 const SCRIPT: &str = "changed.py";
 /// What every package's check reads besides its own files.
-const EVERYTHING: [&str; 6] = ["Cargo.toml", "Cargo.lock", ".clippy.toml", ".rustfmt.toml", "harness/toolchain", ".cargo/"];
+const EVERYTHING: [&str; 6] = ["Cargo.toml", "Cargo.lock", ".clippy.toml", ".rustfmt.toml", "pins/", ".cargo/"];
 const TABLES: [&str; 3] = ["dependencies", "build-dependencies", "dev-dependencies"];
 
 struct Args {
@@ -475,7 +475,7 @@ fn selftest() {
         affected_or_fail(&packages, &["tools/lint/cli/src/main.rs"], true).order == ["lint-cli"],
         "a member outside crates/",
     );
-    for file in ["Cargo.lock", ".clippy.toml", "harness/toolchain", ".cargo/config.toml"] {
+    for file in ["Cargo.lock", ".clippy.toml", "pins/toolchain", ".cargo/config.toml"] {
         let whole = affected_or_fail(&packages, &[file, "crates/lone/src/lib.rs"], true);
         expect(
             whole.all

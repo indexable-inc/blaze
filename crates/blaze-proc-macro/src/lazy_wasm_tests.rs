@@ -74,5 +74,6 @@ fn reader_in_kept(dir: &std::path::Path, module: &crate::module::ModuleRecord) -
         macros: module.macros.clone(),
         decls: module.decls.clone(),
         dir: dir.to_owned(),
+        compiled: module.compiled.clone(),
     }
 }

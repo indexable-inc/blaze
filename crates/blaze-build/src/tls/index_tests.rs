@@ -120,7 +120,7 @@ fn place(code: &Code<Global>, import: impl Fn(u32) -> u64, reloc: impl Fn(RelocT
 fn placed_getter() -> u64 {
     let get = getter(Global).expect("the getter builds");
     let mut code = Code::new_in(Global);
-    emit(get.view(), &[Via::Address; 6], ISA, &mut code).expect("the getter emits");
+    emit(get.verified(), &[Via::Address; 6], ISA, &mut code).expect("the getter emits");
     let exec = place(&code, |p| libc_symbol(GETTER_IMPORTS[p as usize]), |o| panic!("the getter names {o:?}"));
     let at = exec.code_address();
     std::mem::forget(exec);
@@ -131,7 +131,7 @@ fn placed_getter() -> u64 {
 fn placed_ender(import: impl Fn(u32) -> u64) -> u64 {
     let end = ender(Global).expect("the ender builds");
     let mut code = Code::new_in(Global);
-    emit(end.view(), &[Via::Address; 3], ISA, &mut code).expect("the ender emits");
+    emit(end.verified(), &[Via::Address; 3], ISA, &mut code).expect("the ender emits");
     let exec = place(&code, import, |o| panic!("the ender names {o:?}"));
     let at = exec.code_address();
     std::mem::forget(exec);
@@ -168,7 +168,7 @@ fn by_index(places: u32, ret: Ty, then: impl Fn(&mut Builder<Global, Full>, Valu
 /// thread-local place `k` has index `k`. Its address.
 fn placed_access(func: &Func<Global>, desc: u64, getter_at: u64) -> usize {
     let mut code = Code::new_in(Global);
-    emit(func.view(), &[], ISA, &mut code).expect("the access emits");
+    emit(blaze_lir::verify(func.view()).expect("the access is LIR"), &[], ISA, &mut code).expect("the access emits");
     let exec = place(&code, |p| panic!("the access names fixup {p}"), |o| match o {
         RelocTo::TlsDesc => desc,
         RelocTo::TlsGetter => getter_at,

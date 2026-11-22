@@ -46,13 +46,15 @@ use std::collections::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate, syntax_of};
 use blaze_ladder::front2::Front2;
-use blaze_ladder::front2::body::{lower_fn, lower_member};
-use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records as Check, check_body};
-use blaze_ladder::front2::heads::{Store, Want};
+use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
+use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records as Check, check_body, eval_len};
+use blaze_ladder::front2::consts::Consts;
+use blaze_ladder::front2::heads::{HeadError, Store, Want};
 use blaze_ladder::front2::index::Index;
 use blaze_ladder::front2::keys::{Keys, MemberKind, checker_of};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::spell::Spelling;
+use blaze_ladder::front2::types::Why;
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::resolve::{Ns, Paths};
 use blaze_lower::scoped::Prepares;
@@ -101,13 +103,16 @@ dep::outer_item!(stmt by_item_stmt);
 const ROOT_PATH: &str = "/marks/src/main.rs";
 const DEP_PATH: &str = "/dep/src/lib.rs";
 
-struct Files;
+struct Files<'t> {
+    root: &'t str,
+    dep: &'t str,
+}
 
-impl<'t> SourceTexts<'t> for Files {
+impl<'t> SourceTexts<'t> for Files<'t> {
     fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
         match (krate, path) {
-            (0, ROOT_PATH) => Some(ROOT),
-            (1, DEP_PATH) => Some(DEP),
+            (0, ROOT_PATH) => Some(self.root),
+            (1, DEP_PATH) => Some(self.dep),
             _ => None,
         }
     }
@@ -140,18 +145,18 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        let bytes = self.origins.get(krate)?.get(&call).copied()?;
-        // The fixture keeps the joined form: its two parts, cut where the column starts (empty:
-        // the text keeps none).
-        if bytes.is_empty() {
-            return Some((&[], &[]));
-        }
-        Some(blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}")))
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        // The fixture keeps the origins in the joined form: its two parts, cut where the column
+        // starts (empty: the text keeps none). None kept for the call: none served.
+        let origins = self.origins.get(krate).and_then(|by_call| by_call.get(&call)).copied().map(|bytes| {
+            if bytes.is_empty() {
+                (&[][..], &[][..])
+            } else {
+                blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e}"))
+            }
+        });
+        Some(LoadedExpansion { text, origins })
     }
 }
 
@@ -244,18 +249,10 @@ fn rows<'n, S: NamesSource<'n> + Copy>(names: S, index: &Index<'n>, keys: &mut K
     said.join("; ")
 }
 
-/// (i) and (ii) over the solved names, then over the records of the same solve.
-///
-/// Prints `front2_token_mark_bodies names: in_body: clean; by_item: clean; by_item_stmt: clean`,
-/// the same line for `records`, and `test macro_written_bodies_resolve_by_their_marks ... ok`.
-#[test]
-fn macro_written_bodies_resolve_by_their_marks() {
-    let tc = Toolchain::none(Alloc::global());
-    let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
+fn marks_crates<'a>(cfg: &'a [(&'a str, Option<&'a str>)]) -> [CrateInput<'a>; 2] {
     let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
     let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
-    let deps: [(&str, usize); 1] = [("dep", 1)];
-    let crates = [
+    [
         CrateInput {
             name: "marks",
             key: CrateItemKey(ContentId::of("front2_token_mark_bodies program", b"marks")),
@@ -264,8 +261,8 @@ fn macro_written_bodies_resolve_by_their_marks() {
             root: ROOT_PATH,
             shown_from: "/marks/",
             features: &[],
-            deps: &deps,
-            cfg: &cfg,
+            deps: &[("dep", 1)],
+            cfg,
             script: None,
         },
         CrateInput {
@@ -277,14 +274,26 @@ fn macro_written_bodies_resolve_by_their_marks() {
             shown_from: "/dep/",
             features: &[],
             deps: &[],
-            cfg: &cfg,
+            cfg,
             script: None,
         },
-    ];
+    ]
+}
+
+/// (i) and (ii) over the solved names, then over the records of the same solve.
+///
+/// Prints `front2_token_mark_bodies names: in_body: clean; by_item: clean; by_item_stmt: clean`,
+/// the same line for `records`, and `test macro_written_bodies_resolve_by_their_marks ... ok`.
+#[test]
+fn macro_written_bodies_resolve_by_their_marks() {
+    let tc = Toolchain::none(Alloc::global());
+    let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
+    let crates = marks_crates(&cfg);
     let crate_names: &'static [&'static str] = &["marks", "dep"];
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
     let alloc = blaze_own::testing::heap().alloc();
-    let names = resolve_crates(&crates, Sysroot::default(), &Files, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let files = Files { root: ROOT, dep: DEP };
+    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let fn_of = |name: &str| Paths { names: &names }.path(names.root(0), false, &[name], Ns::Value).unwrap_or_else(|e| panic!("`{name}` from the program's root: {e:?}")).key;
     let fns = [("in_body", Asked::Free(fn_of("in_body"))), ("by_item", Asked::Free(fn_of("by_item"))), ("by_item_stmt", Asked::Free(fn_of("by_item_stmt")))];
     let mut failed = Vec::new();
@@ -304,6 +313,199 @@ fn macro_written_bodies_resolve_by_their_marks() {
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "the records filed {errors:?}");
     assert!(failed.is_empty(), "bodies that did not check clean: {failed:?}");
+}
+
+/// [`Kept`] with each expansion read counted by (crate, call).
+struct Counted {
+    kept: Kept,
+    reads: std::cell::RefCell<HashMap<(usize, ItemKey), u32>>,
+}
+
+impl Load<'static> for Counted {
+    fn names(&self, krate: usize) -> Option<&'static [u8]> {
+        self.kept.names(krate)
+    }
+
+    fn items(&self, krate: usize) -> Option<&'static [u8]> {
+        self.kept.items(krate)
+    }
+
+    fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'static str> {
+        self.kept.file(krate, path)
+    }
+
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        *self.reads.borrow_mut().entry((krate, call)).or_insert(0) += 1;
+        self.kept.expansion(krate, call)
+    }
+}
+
+/// (ii)'s two macro-written bodies checked over one records opening on a counting loader: the
+/// reads of each expansion, the origin columns opened, and what each body said.
+fn counted_reads(planted: bool) -> (Vec<((usize, ItemKey), u32)>, u64, String) {
+    let tc = Toolchain::none(Alloc::global());
+    let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
+    let crates = marks_crates(&cfg);
+    let crate_names: &'static [&'static str] = &["marks", "dep"];
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let files = Files { root: ROOT, dep: DEP };
+    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let fn_of = |name: &str| Paths { names: &names }.path(names.root(0), false, &[name], Ns::Value).unwrap_or_else(|e| panic!("`{name}` from the program's root: {e:?}")).key;
+    let fns = [("by_item", Asked::Free(fn_of("by_item"))), ("by_item_stmt", Asked::Free(fn_of("by_item_stmt")))];
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the records reader's frame")));
+    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(crate_names, Alloc::global())));
+    let load: &'static Counted = Box::leak(Box::new(Counted { kept: kept_of(&names), reads: std::cell::RefCell::new(HashMap::new()) }));
+    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(keys, load, log, frame, Alloc::global())));
+    if planted {
+        records.plant_reread_origins();
+    }
+    let mut front = Front2::from_records(records, frame, &[0, 1]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
+    let mut failed = Vec::new();
+    let said = rows(records, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &fns, &mut failed);
+    assert!(failed.is_empty(), "bodies that did not check clean: {failed:?}");
+    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "the records filed {errors:?}");
+    let reads: Vec<((usize, ItemKey), u32)> = load.reads.borrow().iter().map(|(at, n)| (*at, *n)).collect();
+    (reads, records.opened().origins, said)
+}
+
+/// F4 (rule 77, work once): ONE read of an expansion's record serves its text and its origins.
+/// The records' loader keeps the origin parts each text read brought (front2 source.rs
+/// `OriginParts`) and `text_marks` takes them there, so each expansion a body or its marks read
+/// is read once per records opening, however many of its texts' marks are asked.
+///
+/// THE CONTROL (rule 23, the cause removed): `Records::plant_reread_origins` puts back the second
+/// read F4 removed (`text_marks` asks the loader again for the parts); every expansion whose
+/// marks were asked is then read twice (at least the `opened` ones), and the bodies still check
+/// clean, so only the count tells the two apart.
+///
+/// Prints `text and marks: N expansions read once each, M origin columns opened; planted: M read
+/// twice` and ok.
+#[test]
+fn an_expansion_s_text_and_its_marks_are_one_read() {
+    let (reads, opened, said) = counted_reads(false);
+    assert_eq!(said, "by_item: clean; by_item_stmt: clean");
+    assert!(opened >= 1, "the macro-written bodies resolve by their marks, so at least one origin column is opened: {opened}");
+    assert!(!reads.is_empty(), "the bodies' expansions are read through the loader");
+    assert!(reads.iter().all(|(_, n)| *n == 1), "one read per expansion per records opening: {reads:?}");
+
+    let (planted, planted_opened, planted_said) = counted_reads(true);
+    assert_eq!(planted_said, said, "the plant changes no answer, only the reads");
+    assert_eq!(planted_opened, opened);
+    let twice = planted.iter().filter(|(_, n)| *n == 2).count() as u64;
+    // Every marks ask reads again under the plant, a text with no column too, and an opened
+    // column is one marks ask: at least the opened ones are read twice.
+    assert!(twice >= opened, "control: with the second read planted, each expansion whose marks were opened is read twice: {planted:?}");
+    assert!(planted.iter().all(|(_, n)| *n <= 2), "control: no read past the planted one: {planted:?}");
+    println!("text and marks: {} expansions read once each, {opened} origin columns opened; planted: {twice} read twice", reads.len());
+}
+
+const WIDTH_DEP: &str = r#"#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = "pointee_sized"] pub trait PointeeSized {}
+#[lang = "meta_sized"] pub trait MetaSized: PointeeSized {}
+#[lang = "sized"] pub trait Sized: MetaSized {}
+
+pub struct Width<const N: usize>;
+pub fn width<const N: usize>() -> Width<N> { Width }
+pub struct Make;
+impl Make {
+    pub fn width<const N: usize>(self) -> Width<N> { Width }
+}
+pub const fn measure(n: usize) -> usize { n }
+#[macro_export]
+macro_rules! width {
+    ($n:literal) => {{
+        const INPUT: usize = $n;
+        $crate::width::<{ $crate::measure(INPUT) }>()
+    }};
+}
+"#;
+
+const WIDTH_ROOT: &str = "#![feature(no_core)]
+#![no_core]
+const INPUT: usize = 11;
+const fn measure(_: usize) -> usize { 7 }
+fn widths() -> (dep::Width<3>, dep::Width<5>) {
+    (dep::width!(3), dep::width!(5))
+}
+";
+
+/// The ordinary body-const driver: evaluate each requested constant, then check the
+/// instantiated types. A refusal or a lowerer gap must fail both the test and its controls.
+fn width_diagnostics<'n, S: NamesSource<'n>>(front: &mut Front2<'n, S>, item: ItemKey) -> Vec<&'static str> {
+    let names = front.names;
+    let prepared = Prepares::new_in(Alloc::global());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut buckets = None;
+    let mut consts = Consts::default();
+    let mut records = Check { names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+    // At most one fresh request per width plus the final lowering.
+    for _ in 0..3 {
+        match lower_fn(names, prepared, records.keys, records.store, item) {
+            Ok(body) => {
+                let view = body.lowered.view();
+                let spell = Spelling::of(&view).expect("the widths body's spelling");
+                let scope = body.scope(&spell);
+                return match check_body(&mut records, &body, &scope) {
+                    Ok(done) => done.diags.iter().map(|d| d.code.code()).collect(),
+                    Err(CheckFail::Diags { diags, .. }) => diags.iter().map(|(code, _, _)| code.code()).collect(),
+                    Err(error) => panic!("checking the two widths: {error}"),
+                };
+            }
+            Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. } | BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) => {
+                eval_len(&mut records, c).unwrap_or_else(|error| panic!("evaluating the length {c:x}: {error}"));
+            }
+            Err(error) => panic!("lowering the two widths: {error}"),
+        }
+    }
+    panic!("lowering did not finish after evaluating both widths")
+}
+
+fn check_widths(dep: &str, planted: bool) {
+    let tc = Toolchain::none(Alloc::global());
+    let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
+    let crates = marks_crates(&cfg);
+    let files = Files { root: WIDTH_ROOT, dep };
+    let heap = blaze_own::testing::heap();
+    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, heap.alloc()).expect("resolve marks and dep");
+    let item = Paths { names: &names }.path(names.root(0), false, &["widths"], Ns::Value).expect("the widths function").key;
+    let sources = [SourceFile { path: "src/main.rs", text: WIDTH_ROOT }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the widths frame");
+    let mut front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let from_names = width_diagnostics(&mut front, item);
+    let keys = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let (records, frame) = reader(keys, &["marks", "dep"], kept_of(&names));
+    let mut front = Front2::from_records(records, frame, &[0, 1]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
+    let from_records = width_diagnostics(&mut front, item);
+    assert_eq!(from_names, from_records, "both sources must agree on the widths");
+    assert!(records.errors().is_empty(), "the scope and mark records must be readable");
+    if planted {
+        assert!(!from_names.is_empty() && from_names.iter().all(|&d| d == "E0308"), "wrong widths must be type mismatches: {from_names:?}");
+    } else {
+        assert!(from_names.is_empty(), "the dependency's measure yields the two block-local widths 3 and 5: {from_names:?}");
+    }
+}
+
+#[test]
+fn an_expanded_anonymous_const_keeps_its_crate_and_block() {
+    check_widths(WIDTH_DEP, false);
+    println!("anonymous const: widths 3 and 5 check over names and records");
+}
+
+#[test]
+fn a_method_const_argument_keeps_the_expansion_block() {
+    check_widths(&WIDTH_DEP.replace("$crate::width::<", "$crate::Make.width::<"), false);
+    println!("method const arguments: widths 3 and 5 check over names and records");
+}
+
+#[test]
+fn the_oracle_catches_the_callers_measure_and_the_module_input() {
+    // Simulate discarding the definition-site root, then resolving INPUT outside its block.
+    // Every other token, including the generic call and its expansion sites, stays the same.
+    check_widths(&WIDTH_DEP.replace("$crate::measure(INPUT)", "crate::measure(INPUT)"), true);
+    check_widths(&WIDTH_DEP.replace("$crate::measure(INPUT)", "$crate::measure(crate::INPUT)"), true);
+    println!("anonymous const: caller measure and module input each give E0308");
 }
 
 const LOCAL_DEP: &str = "#![feature(no_core, lang_items)]

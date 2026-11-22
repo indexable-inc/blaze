@@ -62,8 +62,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // `Copy` of it when the program declares none: clone_shim.rs `Clones::note`).
         let copy = copy || held.is_none();
         self.ret = self.repr(me).map_err(sig_err)?;
-        self.ret_pass = Self::rust_pass(self.ret)?;
-        let me_pass = Self::rust_pass(Repr::Ptr)?;
+        self.ret_pass = self.rust_pass(self.ret)?;
+        let me_pass = self.rust_pass(Repr::Ptr)?;
         let (params, rets) = self.sig_of(&[me_pass], self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
@@ -110,7 +110,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let lh = if fields.is_empty() { None } else { Some(self.layout(held).map_err(sig_err)?) };
         let mut offs: Vec<(u32, Repr), A> = Vec::with_capacity_in(fields.len(), self.alloc.clone());
         let mark = self.vals.len();
-        let ptr_pass = Self::rust_pass(Repr::Ptr)?;
+        let ptr_pass = self.rust_pass(Repr::Ptr)?;
         for (j, &ft) in fields.iter().enumerate() {
             let l = lh.ok_or(malformed("a field of a type with no layout"))?;
             let off = base + self.field_offset(l, j)?;
@@ -118,7 +118,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let field = self.address((at, off as i32));
             self.push_val(V::Scalar(field), None);
             let args = self.ground.intern_list(&[ft]).map_err(full)?;
-            let rpass = Self::rust_pass(frepr)?;
+            let rpass = self.rust_pass(frepr)?;
             self.call_instance(None, Instance { item: clone, args }, &[Repr::Ptr], &[ptr_pass], None, frepr, rpass)?;
             let v = self.pop()?;
             let owned = self.owned_arg(frepr);

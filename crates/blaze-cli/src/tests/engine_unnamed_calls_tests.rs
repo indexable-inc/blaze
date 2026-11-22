@@ -46,8 +46,8 @@ fn two_macro_calls_side_by_side_are_two_bodies() {
         assert_eq!(error_lines(&said).len(), wrong, "each wrong written body is one error (p wrong {p_wrong}, q wrong {q_wrong}):\n{said}");
         assert_eq!(
             checked.stages[blaze_engine::Stage::Bodies.index()].entered,
-            2,
-            "both calls' bodies are entered, each as its own task (p wrong {p_wrong}, q wrong {q_wrong}): {}",
+            4,
+            "both calls' bodies are entered, each as its own task, in its 2 units' rows (D191: the library's and its test build's) (p wrong {p_wrong}, q wrong {q_wrong}): {}",
             entries(&checked)
         );
     }

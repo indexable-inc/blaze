@@ -59,7 +59,7 @@ fn again_words_lose_the_constant_reason() {
             Some(Step::End(root, Cause::new(RootKind::of(&typed), words)))
         };
         let said: Said<&str> = unmade_head(outer, step, |want| if want == outer { "Outer" } else { "A" }, &mut tally, g, g);
-        let Said::Unchecked(note) = said else { panic!("a body note: {said:?}") };
+        let Said::Unchecked { why: note, calls: [] } = said else { panic!("a body note under no refused call: {said:?}") };
         assert!(note.contains("`Outer`") && note.contains("needs `A`"), "{note}");
         assert_eq!(note.contains("no constant evaluator"), expected, "{note}");
         assert_eq!(tally.refused_const, 1, "the same typed root in both runs");

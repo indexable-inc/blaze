@@ -43,7 +43,7 @@ runs no rustc wrapper, so a build where `build.rustc-workspace-wrapper` or
 - **Platforms.** macOS on Apple silicon and Linux ARM64 first; Linux x86-64 is covered by CI.
   Intel Macs and Windows are not supported.
 - **One Rust version, the latest nightly.** blaze builds with the dated nightly it pins
-  (`harness/toolchain`, bumped daily) whatever toolchain the project pins. Stable code and
+  (`pins/toolchain`, bumped daily) whatever toolchain the project pins. Stable code and
   `#![feature(...)]` code both build; code that needs what that nightly lacks, such as a feature
   it removed, fails with rustc's error (see [install.md](install.md#what-you-need) and
   [support.md](support.md#toolchain)).

@@ -35,13 +35,75 @@ use blaze_typeck::{
     decide_stalled,
 };
 
-use super::adt_ty;
-use crate::{AdtFacts, CalleeFacts, Facts, Form, interior, lower_async};
+use super::{adt_ty, declare};
+use crate::region_fixture::{Decls, WithRegions};
+use crate::{AdtFacts, CalleeFacts, Facts, Form, Region, interior};
 
 /// Plain structs needing drop; nothing said of any future.
 struct LibFacts;
 
 impl Facts for LibFacts {
+    // Every other fact not known here, written out: `Facts` has no default answer.
+    fn regions(&self) -> &dyn crate::RegionFacts {
+        &crate::NoRegions
+    }
+    fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+        None
+    }
+    fn adt_variances(&self, _: blaze_typeck::ItemKey) -> Option<&[crate::Variance]> {
+        None
+    }
+    fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+        None
+    }
+    fn constant_initializer(&self) -> bool {
+        false
+    }
+    fn fn_binders(&self) -> bool {
+        true
+    }
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
+    fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+        &[]
+    }
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+        None
+    }
+    fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+        None
+    }
+    fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+        None
+    }
+    fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+        None
+    }
+    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+        None
+    }
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+        None
+    }
+    fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+        None
+    }
+    fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+        None
+    }
+    fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+        None
+    }
+    fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+        None
+    }
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
@@ -68,7 +130,7 @@ struct Lib {
 }
 
 /// The module doc's world.
-fn lib_world() -> (Fx, Lib) {
+fn lib_world() -> (Fx, Lib, Decls) {
     let mut fx = Fx::new();
     let (p0, unit, u8_) = (fx.param(0), fx.unit(), fx.u8());
     let sized = fx.tr("Sized", 1, vec::Vec::new(), &[]);
@@ -105,8 +167,8 @@ fn lib_world() -> (Fx, Lib) {
     fx.imp("impl Future for Local", 0, local_t, Some((future, &[])), &[("Output", unit)], vec::Vec::new());
     let local_never = fx.bound(never, &[local_t]);
     fx.imp("impl Send for Local where Local: Never", 0, local_t, Some((send, &[])), &[], vec![local_never]);
-    fx.func("sleep", 0, &[], sleep_t, vec::Vec::new());
-    fx.func("local", 0, &[], local_t, vec::Vec::new());
+    let sleep_f = fx.func("sleep", 0, &[], sleep_t, vec::Vec::new());
+    let local_f = fx.func("local", 0, &[], local_t, vec::Vec::new());
     // `async fn fetch(x: &u8) -> u8` of another module, as the front end files it. The input
     // is a reference: the lowering gives an opaque one origin position (it may capture a
     // lifetime), and a call's elided output takes its one input lifetime (the Reference,
@@ -125,10 +187,21 @@ fn lib_world() -> (Fx, Lib) {
     fx.hidden.push((fetch_opaque, hidden));
     fx.coroutines.push((fetch, 0, u8_, fetch_interior));
     let is_send = fx.bound(send, &[p0]);
-    fx.func("spawn", 1, &[p0], unit, vec![is_send]);
+    let spawn = fx.func("spawn", 1, &[p0], unit, vec![is_send]);
     let owner = fx.func("owner", 0, &[], unit, vec::Vec::new());
     fx.finish();
-    (fx, Lib { owner, sleep, local, fetch_opaque })
+    // The heads as written above. `async fn fetch(x: &u8) -> u8` is `fn fetch<'a>(x: &'a u8)
+    // -> impl Future<Output = u8>` whose opaque captures the input's one elided lifetime (the
+    // Reference, "Async functions": the returned future captures every input lifetime): one
+    // lifetime, `Param(0)`, for the input and the opaque's one capture. The others name none.
+    let mut decls = Decls::new();
+    decls.opaque(fetch_opaque, 1);
+    declare(&mut decls, sleep_f, &[], sleep_t, &[]);
+    declare(&mut decls, local_f, &[], local_t, &[]);
+    declare(&mut decls, fetch, &[ref_u8], opaque, &[Region::Param(0), Region::Param(0)]);
+    declare(&mut decls, spawn, &[p0], unit, &[]);
+    declare(&mut decls, owner, &[], unit, &[]);
+    (fx, Lib { owner, sleep, local, fetch_opaque }, decls)
 }
 
 /// `sleep().await`.
@@ -138,11 +211,20 @@ fn sleep_awaited(b: &mut Bb) -> ExprId {
     b.await_(e1)
 }
 
-/// `local().await`.
+/// `let x = 2u8; local().await;`. Not the bare `local().await`: a block that is only one
+/// forwarding await has its exact state at the check (captures plus the awaited future, the
+/// Reference's "async blocks": a future stores what is held across its awaits), so the check
+/// itself decides `Local: !Send` there (rules/coroutine.rs `forwarded_await`). A block with a
+/// further statement needs the flow's saved-local analysis: the stalled path this test covers.
 fn local_awaited(b: &mut Bb) -> ExprId {
-    let e0 = b.path(&["local"]);
-    let e1 = b.call(e0, &[]);
-    b.await_(e1)
+    let e0 = b.int(Some(blaze_typeck::IntSuffix::Uint(blaze_typeck::UintTy::U8)));
+    let x = b.bind("x");
+    let s0 = b.let_(x, None, e0);
+    let e1 = b.path(&["local"]);
+    let e2 = b.call(e1, &[]);
+    let e3 = b.await_(e2);
+    let s1 = b.semi(e3);
+    b.block(&[s0, s1], None)
 }
 
 /// `let x = 2u8; fetch(&x).await;` (the block's value is `()`, as `spawn`'s other blocks).
@@ -172,7 +254,7 @@ struct Run {
 /// missing row). `Err` is the lowering's refusal.
 fn run(lib_body: fn(&mut Bb) -> ExprId, drop_rows: bool) -> (Lib, Result<Run, Form>) {
     let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
-    let (fx, lib) = lib_world();
+    let (fx, lib, decls) = lib_world();
     let mut b = Bb::new();
     let e0 = b.path(&["spawn"]);
     let body = lib_body(&mut b);
@@ -192,7 +274,10 @@ fn run(lib_body: fn(&mut Bb) -> ExprId, drop_rows: bool) -> (Lib, Result<Run, Fo
     if drop_rows {
         c.awaited.clear();
     }
-    let lowered = match lower_async(&view, &c, block, &LibFacts, alloc) {
+    // The heads laid in the record's own table, as the lowering reads them.
+    let regions = decls.lay(fx.t.view(), &mut c.types);
+    let facts = WithRegions { base: &LibFacts, regions: &regions };
+    let lowered = match crate::oracle::lower_async_checked(&view, &c, block, &facts, alloc) {
         Ok(l) => l,
         Err(r) => return (lib, Err(r.form)),
     };
@@ -234,7 +319,7 @@ fn a_library_future_struct_is_held_and_send() {
     std::println!("library future awaited: Sleep held, Send");
 }
 
-/// `spawn(async { local().await })`: `Local` is held across its own `.await` and is not
+/// `spawn(async { let x = 2u8; local().await; })`: `Local` is held across its own `.await` and is not
 /// `Send`: the stalled goal fails on the exact interior, one E0277.
 /// Prints "non-Send library future across the await: E0277".
 #[test]

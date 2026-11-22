@@ -133,9 +133,9 @@ impl Column {
 /// path or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Call {
-    prev: Option<&'static str>,
-    word: &'static str,
-    column: Column,
+    pub(super) prev: Option<&'static str>,
+    pub(super) word: &'static str,
+    pub(super) column: Column,
 }
 
 const fn call(prev: &'static str, word: &'static str, column: Column) -> Call {
@@ -148,10 +148,12 @@ const fn any(word: &'static str, column: Column) -> Call {
 
 /// `Os::process()`, the OS root (bstd-capabilities.md P2); [`reach_uses`] marks it inside a
 /// top-level `fn main` as [`ReachUse::MainOs`].
-static OS_PROCESS: Call = call("Os", "process", Column::World);
+pub(super) static OS_PROCESS: Call = call("Os", "process", Column::World);
 
-/// Every call read, but [`OS_PROCESS`]. Each `(prev, word)` once (the selftest holds it).
-static CALLS: [Call; 60] = [
+/// Every call read, but [`OS_PROCESS`]. Each `(prev, word)` once (the selftest holds it). The
+/// sans-IO gate (sansio.rs) reads the same table over the tree's tokens: one list of the calls
+/// that reach an ambient authority.
+pub(super) static CALLS: [Call; 60] = [
     call("Instant", "now", Column::Clock),
     call("SystemTime", "now", Column::Clock),
     call("Monotonic", "new", Column::Clock),

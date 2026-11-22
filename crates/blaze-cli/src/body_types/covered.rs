@@ -144,19 +144,24 @@ fn placed_by(body: BodyRef<'_>) -> ItemKey {
     }
 }
 
-/// Walks the call `call` of a crate whose expansion texts are `texts` up to the file entry it
-/// is at: its own origins' calling text when that is a file, else its caller's. `each` is
-/// given each call's macro path as written, innermost first. Bounded by the crate's count of
-/// calls: a chain longer than it is a loop, refused by name. The one walk: a body's root
-/// ([`written_by`]) and a head a macro wrote (heads.rs `make_expanded`) both take it. A kept
-/// item's text (`#[derive(..)] #[helper(..)] struct S`) names its entry, the item itself
-/// (blaze-scope expansion_origins.rs `kept`).
-pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut dyn FnMut(&'n str)) -> Result<(u32, ItemIndex), &'static str> {
-    match walk_up(texts, call, &mut |_, view| each(view.macro_name), &|_| false)? {
-        Up::File(top) => Ok(top),
-        // `stop` stops at no key.
-        Up::Stopped(_) => Err("a macro call's walk stopped at no file (body_types/covered.rs `callers`)"),
+/// Each listed body's block text key ([`block_key`]) beside the body's own key ([`body_key`]),
+/// sorted by the block key: the keys a walk up from a body of a block's module stops at
+/// ([`walk_up`]). THE ONE STOP LIST of [`written_by`] and [`in_blocks`]: a body whose walk stops
+/// at one is a block's, and only [`in_blocks`] holds it, so the two lists are apart and each
+/// body is checked once (rule 77). A block's module text of a body a macro wrote keeps its
+/// writer's origins (blaze-scope resolve.rs `make_blocks`), so a walk that did not stop there
+/// went on to the writer's file entry and listed the block's bodies a second time, as written
+/// bodies (`{the expansion of `std::main!`}::MANIFEST` beside `{a block of `main`}::MANIFEST`,
+/// 2026-11-21).
+fn block_stops<'n>(records: &'n Records<'n>, krate: CrateItemKey, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, (ItemKey, ItemKey)> {
+    let mut blocks: AVec<'n, (ItemKey, ItemKey)> = AVec::with_capacity_in(listed.len(), alloc);
+    for l in listed.iter() {
+        if let Some(key) = body_key(records, l.body) {
+            blocks.push((block_key(krate, key), key));
+        }
     }
+    blocks.sort_unstable();
+    blocks
 }
 
 /// Where [`walk_up`] ended: at the file entry the outermost call is at, or at the first key of
@@ -288,10 +293,19 @@ pub(crate) fn written_path<'n>(
 }
 
 /// Every listed body of crate 0 a macro wrote at module level, each with the entry its call is
-/// at ([`WrittenBy`]): by call, each call's chain walked once. A fn of an impl written in a
-/// file that a macro call inside the impl block wrote is not here (its container's place is
-/// the file): NAMED, not covered yet (heads.rs says the same of its head).
+/// at ([`WrittenBy`]): by call, each call's chain walked once ([`walk_up`]), innermost macro
+/// first. A body whose walk stops at a listed body's block ([`block_stops`]) is that block's
+/// and [`in_blocks`]'s alone: not here. A fn of an impl written in a file that a macro call
+/// inside the impl block wrote is not here (its container's place is the file): NAMED, not
+/// covered yet (heads.rs says the same of its head). With no crate key there is no stop list:
+/// [`in_blocks`] is then refused (`NoCrateKey`), and every entry with it (engine_bodies.rs
+/// `groups`), so no body is checked twice.
 pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
+    let blocks = match NamesSource::crate_key(records, 0) {
+        Some(krate) => block_stops(records, krate, listed, alloc),
+        None => AVec::new_in(alloc),
+    };
+    let stop = |at: ItemKey| blocks.binary_search_by(|b| b.0.cmp(&at)).is_ok();
     let mut calls: AVec<'n, (ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
         // From the items row alone (front2 source.rs `Records::text_at`): `place_of` reads the
@@ -304,19 +318,30 @@ pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n
     }
     calls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.body.cmp(&b.1.body)));
     let mut out: AVec<'n, WrittenBy<'n>> = AVec::with_capacity_in(calls.len(), alloc);
-    let mut last: Option<(ItemKey, &'n str, Result<(u32, ItemIndex), &'static str>)> = None;
+    let mut last: Option<(ItemKey, &'n str, Result<Up, &'static str>)> = None;
     for (call, l) in calls.iter().copied() {
-        let (by, top) = match last {
-            Some((was, by, top)) if was == call => (by, top),
+        let (by, up) = match last {
+            Some((was, by, up)) if was == call => (by, up),
             _ => {
                 let mut first: Option<&'n str> = None;
-                let top = callers(texts, call, &mut |name| {
-                    first.get_or_insert(name);
-                });
+                let up = walk_up(
+                    texts,
+                    call,
+                    &mut |_, view| {
+                        first.get_or_insert(view.macro_name);
+                    },
+                    &stop,
+                );
                 let by = first.unwrap_or("?");
-                last = Some((call, by, top));
-                (by, top)
+                last = Some((call, by, up));
+                (by, up)
             }
+        };
+        let top = match up {
+            Ok(Up::File(top)) => Ok(top),
+            // A block's body: [`in_blocks`] lists it, under the body whose block it is.
+            Ok(Up::Stopped(_)) => continue,
+            Err(why) => Err(why),
         };
         out.push(WrittenBy { listed: l, call, by, top });
     }
@@ -369,29 +394,76 @@ pub(crate) struct InBlock<'n> {
     pub(crate) owner: ItemKey,
 }
 
-/// Every listed body of crate 0 written in a block's module ([`InBlock`]), sorted by (owner,
-/// key), each once. A body is a block's when the walk up from where it is placed (its own place,
-/// or its container's: [`placed_by`]) through the calls that wrote it stops at a listed body's
-/// [`block_key`]; the walk is [`callers`]'s ([`walk_up`]). A body whose walk ends in a file, or
-/// cannot be walked, is no block's and is not here ([`written_by`] says where it is).
-pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> Result<AVec<'n, InBlock<'n>>, &'static str> {
-    let krate = NamesSource::crate_key(records, 0).ok_or("its crate has no key in its own records (front2 source.rs `crate_key`)")?;
-    // Each listed body's block text key beside the body, sorted by the block key.
-    let mut blocks: AVec<'n, (ItemKey, ItemKey)> = AVec::with_capacity_in(listed.len(), alloc);
-    for l in listed.iter() {
-        if let Some(key) = body_key(records, l.body) {
-            blocks.push((block_key(krate, key), key));
+/// Why [`in_blocks`] could not tell a crate's bodies of blocks apart: typed, so a stored row
+/// (engine_member_rows.rs) keeps the cause by its [`InBlocksError::code`] and says the same
+/// words when read back ([`InBlocksError::words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InBlocksError {
+    /// The crate has no key in its own records.
+    NoCrateKey,
+    /// A body of a block's module has no key of its own in its crate's records.
+    NoBodyKey,
+    /// Bodies of blocks' modules name each other as the body whose block they are in.
+    Loop,
+}
+
+impl InBlocksError {
+    /// Every cause, in [`InBlocksError::code`] order.
+    pub(crate) const ALL: [InBlocksError; 3] = [InBlocksError::NoCrateKey, InBlocksError::NoBodyKey, InBlocksError::Loop];
+
+    /// What the refusal of a body says (rule 19: the thing and the rule's home).
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            InBlocksError::NoCrateKey => "its crate has no key in its own records (front2 source.rs `crate_key`)",
+            InBlocksError::NoBodyKey => "a body of a block's module has no key of its own in its crate's records (body_types/covered.rs `in_blocks`)",
+            InBlocksError::Loop => "bodies of blocks' modules name each other as the body whose block they are in, in a loop (body_types/covered.rs `in_blocks`)",
         }
     }
-    blocks.sort_unstable();
+
+    /// Its stable byte in a stored row: its index in [`InBlocksError::ALL`].
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            InBlocksError::NoCrateKey => 0,
+            InBlocksError::NoBodyKey => 1,
+            InBlocksError::Loop => 2,
+        }
+    }
+
+    /// The cause of the stored byte `code`; `None` for a byte no cause has.
+    pub(crate) fn of_code(code: u8) -> Option<InBlocksError> {
+        InBlocksError::ALL.get(usize::from(code)).copied()
+    }
+}
+
+/// Every listed body of crate 0 written in a block's module ([`InBlock`]) but its free fns
+/// (each its body's local fn, checked by that body's check), sorted by (owner, key), each once.
+/// A body is a block's when the walk up from where it is placed (its own place, or its
+/// container's: [`placed_by`]) through the calls that wrote it stops at a listed body's
+/// [`block_key`] ([`block_stops`], [`walk_up`]). A body whose walk ends in a file, or
+/// cannot be walked, is no block's and is not here ([`written_by`] says where it is).
+pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> Result<AVec<'n, InBlock<'n>>, InBlocksError> {
+    let krate = NamesSource::crate_key(records, 0).ok_or(InBlocksError::NoCrateKey)?;
+    let blocks = block_stops(records, krate, listed, alloc);
     let stop = |at: ItemKey| blocks.binary_search_by(|b| b.0.cmp(&at)).is_ok();
     // Each body of a block: (its key, the body whose block it is in, it).
     let mut links: AVec<'n, (ItemKey, ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
+        // A free fn of a block's module is a local fn of the body whose block it is: that
+        // body's check checks it, at any depth, named `<body>::<fn>` (front2 tables/task.rs
+        // `Said::within`, every_body.rs `each_from`). Listed here too it was checked twice, and
+        // its finding printed under two names (`{a block of `main`}::main` beside `{the
+        // expansion of `std::main!`}::main::main`, the fn D104's `main!` writes inside the
+        // launcher, 2026-11-21): one body, one check (rule 77). A block's impl and trait
+        // members and its `const` and `static` initializers are no body's locals: here.
+        if let BodyRef::Free(key) = l.body
+            && NamesSource::kind_of_item(records, key) == Some(ItemKind::Function)
+        {
+            continue;
+        }
         let Some(At::Expansion(call)) = records.text_at(placed_by(l.body)) else { continue };
         let Ok(Up::Stopped(block)) = walk_up(texts, call, &mut |_, _| {}, &stop) else { continue };
         let Ok(at) = blocks.binary_search_by(|b| b.0.cmp(&block)) else { continue };
-        let key = body_key(records, l.body).ok_or("a body of a block's module has no key of its own in its crate's records (body_types/covered.rs `in_blocks`)")?;
+        let key = body_key(records, l.body).ok_or(InBlocksError::NoBodyKey)?;
         links.push((key, blocks[at].1, *l));
     }
     links.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -405,7 +477,7 @@ pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>
             owner = links[at].1;
             steps += 1;
             if steps > links.len() {
-                return Err("bodies of blocks' modules name each other as the body whose block they are in, in a loop (body_types/covered.rs `in_blocks`)");
+                return Err(InBlocksError::Loop);
             }
         }
         out.push(InBlock { listed, key, within, owner });

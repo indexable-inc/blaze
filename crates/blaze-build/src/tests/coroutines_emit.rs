@@ -493,6 +493,7 @@ fn forward3(to: ItemKey) -> Built<Global> {
     let mut refs = StdVec::new_in(Global);
     refs.push(Instance { item: to, args: List::EMPTY });
     let traps = StdVec::new_in(*refs.allocator());
+    let func = blaze_lir::VerifiedFunc::new(func).unwrap_or_else(|e| panic!("the forwarder does not verify: {e}"));
     Built { func, refs, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global), traps }
 }
 
@@ -523,6 +524,7 @@ fn main_lir(state: StateShape, refs: [Instance; 4]) -> Built<Global> {
     let mut all = StdVec::new_in(Global);
     all.extend(refs);
     let traps = StdVec::new_in(*all.allocator());
+    let func = blaze_lir::VerifiedFunc::new(func).unwrap_or_else(|e| panic!("main does not verify: {e}"));
     Built { func, refs: all, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global), traps }
 }
 
@@ -566,8 +568,12 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
     let mut rows = StdVec::new();
     for ((p, view), c) in progs.iter().zip(views.iter()).zip(checked.iter()) {
         let s = w.fx.sig_of(p.item).expect("the fn's signature");
-        let blocks: StdVec<(u32, ExprId)> = crate::coroutines_in(view).collect();
-        assert_eq!(blocks.len(), 1, "each `async fn` of these tests is one async block");
+        // The root (the fn's own block) first: `opaque_hidden` takes an owner's first row as its
+        // fn's future. A body may hold more `async` blocks, nested in the root.
+        let mut blocks: StdVec<(u32, ExprId)> = crate::coroutines_in(view).collect();
+        let root_at = blocks.iter().position(|c| c.1 == p.root).expect("the body's root is its async block");
+        let root = blocks.remove(root_at);
+        blocks.insert(0, root);
         for &(ordinal, _) in blocks.iter() {
             let (env, output) = crate::coroutine_facts(view, c, ordinal, s.parent_count + s.own_count, &mut table, Alloc::global())
                 .unwrap_or_else(|e| panic!("coroutine {ordinal}'s facts: {e}"));
@@ -605,6 +611,22 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
     let mut driven = None;
     for (i, p) in progs.iter().enumerate() {
         let ordinal = crate::coroutines_in(&views[i]).find(|c| c.1 == p.root).map(|c| c.0).expect("the body's root is its async block");
+        // Each NESTED block first, by ascending expression id: a fixture body makes an inner
+        // block before the block holding it, so a state held by value in another's is laid
+        // out and built before it (as `progs` orders awaited fns first). Its poll, resume and
+        // drop are placed like a fn's future's: the root polls it by `.await`.
+        let mut nested: StdVec<(u32, ExprId)> = crate::coroutines_in(&views[i]).filter(|c| c.1 != p.root).collect();
+        nested.sort_by_key(|c| c.1.0);
+        for &(inner, _) in nested.iter() {
+            let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+            let co = crate::build_coroutine(&views[i], &checked[i], inner, &mut subst, &adts, None, Global)?;
+            states.borrow_mut().push((p.item, inner, co.state));
+            let ty = crate::coroutine_identity(&mut ground, p.item, inner, none).unwrap_or_else(|e| panic!("the nested coroutine's type: {e}"));
+            let at = ground.intern_list(&[ty]).expect("a list");
+            bodies.push((w.resume, at, co.resume));
+            bodies.push((w.poll_fn, at, co.poll));
+            bodies.push((w.dip, at, co.drop));
+        }
         let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
         let plan = laid.filter(|_| i + 1 == progs.len()).map(state_names::Laid::plan);
         let co = crate::build_coroutine(&views[i], &checked[i], ordinal, &mut subst, &adts, plan, Global)?;
@@ -863,6 +885,183 @@ fn an_async_fn_awaits_another_async_fn() {
     let ran = run(&w, &progs, Script::Complete);
     assert_eq!(ran, Ran { value: 42, polls: 3, drops: 0, made: 1 });
     println!("coroutine emit 4: ready({}) at poll {} through two coroutines, twice() called {} time", ran.value, ran.polls, ran.made);
+}
+
+// Captured PLACES in an `async move` block (RFC 2229, "Capture precision"; walk/moves/
+// env_places.rs): a nested block captures `p.0` alone, its body owns that field
+// (`Held::EnvPlace`), and the owner keeps `p.1`. Ignored until the stage-2 switch sets
+// blaze-typeck env_fields.rs `ActiveEnv` to `Places`; the switch removes each `ignore`. Under
+// `WholeBindings` the block moves `p` whole and the owner's `p.1.x` is a use after the move
+// (E0382).
+
+/// `base.index`, a tuple's field.
+fn tuple_field(b: &mut Bb, base: ExprId, index: u32) -> ExprId {
+    let at = b.int(None);
+    b.exprs[at.ix()] = Expr::TupleField { base, index };
+    at
+}
+
+/// `base.name`, a struct's field.
+fn named_field(b: &mut Bb, base: ExprId, name: &str) -> ExprId {
+    let at = b.int(None);
+    b.exprs[at.ix()] = Expr::Field { base, name: Name::of(name) };
+    at
+}
+
+/// `async fn owner() -> u64 { let mut k: u64 = 0; let inner = { let p = (mk_d(), mk_d()); let
+/// blk = async move { <inner> }; k = p.1.x; blk }; let v: u64 = inner.await; v + k }`, the
+/// inner block's body `{ let e = p.0; let r: u64 = twice().await; r + e.x }` (`late`: false)
+/// or `{ let r: u64 = twice().await; let e = p.0; r + e.x }` (`late`: true: the field is still
+/// the environment's at the suspension). `p` ends before the outer `.await` (its field word is
+/// read at its block's end, never after a suspension). Returns the root.
+fn place_moving_owner(b: &mut Bb, lits: &mut StdVec<(ExprId, u128)>, late: bool) -> ExprId {
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    let k = b.bind_mut("k");
+    let zero = lit(b, lits, 0);
+    let s0 = b.let_(k, Some(u64_), zero);
+    // The inner block.
+    let p = b.bind("p");
+    let (m0, m1) = (b.path(&["mk_d"]), b.path(&["mk_d"]));
+    let (d0, d1) = (b.call(m0, &[]), b.call(m1, &[]));
+    let pair = b.tuple(&[d0, d1]);
+    let sp = b.let_(p, None, pair);
+    let pe = b.local(p);
+    let p0 = tuple_field(b, pe, 0);
+    let e = b.bind("e");
+    let se = b.let_(e, None, p0);
+    let awaited = call_await(b, "twice");
+    let (sr, r) = let_u64(b, "r", awaited);
+    let (re, ee) = (b.local(r), b.local(e));
+    let ex = named_field(b, ee, "x");
+    let sum = bin(b, BinOp::Add, re, ex);
+    let stmts = if late { [sr, se] } else { [se, sr] };
+    let inner_body = b.block(&stmts, Some(sum));
+    let blk_e = b.async_block(inner_body, Capture::Move);
+    let blk = b.bind("blk");
+    let sb = b.let_(blk, None, blk_e);
+    let ke = b.local(k);
+    let pe1 = b.local(p);
+    let p1 = tuple_field(b, pe1, 1);
+    let p1x = named_field(b, p1, "x");
+    let set = b.int(None);
+    b.exprs[set.ix()] = Expr::Assign { lhs: ke, rhs: p1x };
+    let sset = b.semi(set);
+    let blk_out = b.local(blk);
+    let made = b.block(&[sp, sb, sset], Some(blk_out));
+    let inner = b.bind("inner");
+    let si = b.let_(inner, None, made);
+    let ie = b.local(inner);
+    let waited = b.await_(ie);
+    let (sv, v) = let_u64(b, "v", waited);
+    let (ve, kr) = (b.local(v), b.local(k));
+    let out = bin(b, BinOp::Add, ve, kr);
+    let body = b.block(&[s0, si, sv], Some(out));
+    b.async_block(body, Capture::Move)
+}
+
+/// A nested `async move` block that moves the field `p.0` out of its environment into `e`,
+/// which is live across its `.await`; the owner reads `p.1` after making the block.
+///
+/// The Reference, "Capture precision" and "Destructors": the block owns `p.0` alone; `p`'s
+/// scope end drops `p.1` alone ("If a variable has been partially initialized, only its
+/// initialized fields are dropped"). Completed: `(2 + 5) + 5` is 12 at poll 3, with TWO drops
+/// (`p.1` at its block's end, `e` at the inner body's end). Dropped while suspended after poll
+/// 1: the outer state's drop drops `inner` (live across the outer `.await`), whose state's drop
+/// drops `e` (live across the inner `.await`): again exactly TWO drops. NEGATIVE twin: a field
+/// moved into the block and dropped again with `p`, or `e` dropped by both the body and the
+/// state, counts 3 (and the host's check of a live `D` fails on the second drop).
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn a_nested_async_block_moves_one_field_and_the_owner_keeps_the_other() {
+    let mut w = open_world();
+    let owner = async_fn(&mut w, "owner", "owner_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    let root = place_moving_owner(&mut b, &mut lits, false);
+    let progs = [Prog { item: owner, b: &b, root, lits: &lits }];
+    let completed = run(&w, &progs, Script::Complete);
+    assert_eq!(completed, Ran { value: 12, polls: 3, drops: 2, made: 1 });
+    let cancelled = run(&w, &progs, Script::CancelAfter(1));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 2, made: 1 });
+    println!("coroutine emit 5: a moved field: ready({}) at poll {}, D dropped {} times; cancelled: D dropped {} times", completed.value, completed.polls, completed.drops, cancelled.drops);
+}
+
+/// As above, with the field moved AFTER the inner `.await`: at the suspension `p.0` is still
+/// the block's environment field, owned by its body (`Held::EnvPlace`). Dropped while
+/// suspended after poll 1, the inner state's drop drops that field once (the body's scopes
+/// left as a `return` there would, env_places.rs `drop_env_place`), and nothing else drops it:
+/// TWO drops in all, as on completion (12). NEGATIVE twin: the unresumed-or-suspended state's
+/// drop dropping the environment whole AND the body's held field would count 3.
+#[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
+fn a_future_dropped_at_a_suspension_drops_its_captured_field_once() {
+    let mut w = open_world();
+    let owner = async_fn(&mut w, "owner", "owner_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    let root = place_moving_owner(&mut b, &mut lits, true);
+    let progs = [Prog { item: owner, b: &b, root, lits: &lits }];
+    let cancelled = run(&w, &progs, Script::CancelAfter(1));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 2, made: 1 });
+    let completed = run(&w, &progs, Script::Complete);
+    assert_eq!(completed, Ran { value: 12, polls: 3, drops: 2, made: 1 });
+    println!("coroutine emit 6: a field held at a suspension: cancelled: D dropped {} times; ready({}) with {} drops", cancelled.drops, completed.value, completed.drops);
+}
+
+/// A nested `async move` block over `let a: u8 = 7; let c: u64 = 40; let z: u8 = 2;`: its
+/// ENVIRONMENT is `(u8, u64, u8)`, laid out `u64` first (decreasing alignment), read by
+/// declaration index (walk.rs `decl_field`, coroutine.rs's environment offsets).
+/// `async fn wide() -> u64 { ..; let blk = async move { (a as u64) * 10000 + c * 10 + (z as
+/// u64) }; blk.await }` is 70402 at poll 1, and the nested block is polled to completion by the
+/// outer `.await`. NEGATIVE twin: offsets taken by placement index read 40 where 7 is and give
+/// another number.
+#[test]
+fn a_nested_async_block_reads_its_reordered_environment_by_declaration_index() {
+    let mut w = open_world();
+    let wide = async_fn(&mut w, "wide", "wide_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    let (u8_, u64_) = (b.ty(PNode::Uint(UintTy::U8)), b.ty(PNode::Uint(UintTy::U64)));
+    let mut stmts = StdVec::new();
+    let mut put = |b: &mut Bb, lits: &mut StdVec<(ExprId, u128)>, name: &str, ty: PTy, v: u128| {
+        let p = b.bind(name);
+        let e = lit(b, lits, v);
+        stmts.push(b.let_(p, Some(ty), e));
+        p
+    };
+    let a = put(&mut b, &mut lits, "a", u8_, 7);
+    let c = put(&mut b, &mut lits, "c", u64_, 40);
+    let z = put(&mut b, &mut lits, "z", u8_, 2);
+    let cast = |b: &mut Bb, operand: ExprId| {
+        let at = b.int(None);
+        b.exprs[at.ix()] = Expr::Cast { operand, ty: u64_ };
+        at
+    };
+    let ae = b.local(a);
+    let aw = cast(&mut b, ae);
+    let big = lit(&mut b, &mut lits, 10000);
+    let xs = bin(&mut b, BinOp::Mul, aw, big);
+    let ce = b.local(c);
+    let ten = lit(&mut b, &mut lits, 10);
+    let ys = bin(&mut b, BinOp::Mul, ce, ten);
+    let ze = b.local(z);
+    let zw = cast(&mut b, ze);
+    let s = bin(&mut b, BinOp::Add, xs, ys);
+    let sum = bin(&mut b, BinOp::Add, s, zw);
+    let inner_body = b.block(&[], Some(sum));
+    let blk_e = b.async_block(inner_body, Capture::Move);
+    let blk = b.bind("blk");
+    stmts.push(b.let_(blk, None, blk_e));
+    let be = b.local(blk);
+    let waited = b.await_(be);
+    let body = b.block(&stmts, Some(waited));
+    let root = b.async_block(body, Capture::Move);
+    let ran = run(&w, &[Prog { item: wide, b: &b, root, lits: &lits }], Script::Complete);
+    assert_eq!(ran, Ran { value: 70402, polls: 1, drops: 0, made: 0 });
+    println!("coroutine emit 7: a nested block over (u8, u64, u8): ready({}) at poll {}", ran.value, ran.polls);
 }
 
 mod async_unwind;

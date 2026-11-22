@@ -30,8 +30,9 @@
 //!    and `blr x16`: in the record form the call site, untouched;
 //! 4. [`Pass::close_varargs`]: `add sp, sp, #area`, before the results are stored.
 //!
-//! Only `x9` (and `x12` for a far cell, `ld_sp`) is written between the named arguments and
-//! the site: `x16` and `x17`, the site's and the linker's scratch, are never used here. The
+//! Only `x9` (and, for a cell past the scaled reach, the far-address register `x16`, pass.rs
+//! `FAR`, which the site then loads afresh) is written between the named arguments and the
+//! site: no value is left in `x16` or `x17`, the site's and the linker's scratch. The
 //! frame's `fp` is unchanged, so the frame record and the compact unwind's frame form stay true
 //! across the call. A landing pad would be entered with `sp` still lowered, so an `invoke` with
 //! stacked variable arguments is refused by name: a "C" callee may not unwind (the Reference,
@@ -144,7 +145,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// outgoing area opened and each slot stored. Call it after the named arguments and BEFORE
     /// the callee's address is loaded (the call site follows, unbroken); every `sp`-relative
     /// access after it is the returned `area` off until [`Pass::close_varargs`], called right
-    /// after `blr`. Writes only `x9` (and `x12` for a far cell) besides the argument registers.
+    /// after `blr`. Writes only `x9` (and `FAR` for a far cell) besides the argument registers.
     ///
     /// `named` are the named arguments past the registers (pass/stack.rs), taking the area's
     /// first `named_end` bytes; the stacked variable arguments follow from there rounded up to

@@ -5,7 +5,7 @@
 //! "Key-value option set for each platform feature available for the current compilation
 //! target." The target's CPU is `apple-m1` (the pinned rustc's target spec for
 //! `aarch64-apple-darwin`, `"cpu": "apple-m1"`, recorded in
-//! crates/blaze-units/src/stdlib/rustc.json `target_spec_json`), so the features on are that
+//! pins/answers/rustc.json `target_spec_json`), so the features on are that
 //! CPU's: `target_features::cpus`, which tools/cpus.py writes from the pinned nightly's
 //! `rustc --print cfg -C target-cpu=<cpu>` (rustc 1.101.0-nightly 16d1ffac1 2026-10-26).
 //!

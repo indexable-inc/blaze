@@ -20,12 +20,377 @@ use std::format;
 use std::string::{String, ToString};
 
 use blaze_id::ItemKey as LibKey;
+use blaze_own::Alloc;
+use blaze_scope::items_record::{ItemsRecord, ItemsRecordError};
+use blaze_surface::{ItemKind, Range};
 use blaze_typeck::ItemKey;
 
 use super::check::Records;
 use super::heads::{HeadError, Want};
 use super::keys::{Keys, Origin};
 use super::source::NamesSource;
+
+/// A body fact's defining site, resolved from the crate's names and syntax. A missing
+/// semantic head (including the opaque's entire owner row) does not affect this lookup.
+#[derive(Debug)]
+pub struct FactDefinition {
+    pub krate: Option<usize>,
+    /// Supplied by the body's package scope when available.
+    pub version: Option<&'static str>,
+    /// A resolved item's path already names its crate.
+    unresolved_in: Option<String>,
+    site: Result<DefinitionSite, DefinitionLost>,
+}
+
+#[derive(Debug)]
+struct DefinitionSite {
+    words: String,
+    kind: &'static str,
+    opaque: Option<u32>,
+    unmapped: Option<super::expansion_origin::Unmapped>,
+}
+
+#[derive(Debug)]
+enum DefinitionLost {
+    NoCrate,
+    NoRecord,
+    Record(ItemsRecordError),
+    NoMatch,
+    Ambiguous,
+    Missing { item: LibKey, what: &'static str },
+}
+
+impl From<ItemsRecordError> for DefinitionLost {
+    fn from(error: ItemsRecordError) -> Self {
+        Self::Record(error)
+    }
+}
+
+impl fmt::Display for FactDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(name) = &self.unresolved_in {
+            write!(f, "in crate {name}: ")?;
+        }
+        match &self.site {
+            Ok(DefinitionSite { words, kind, opaque, unmapped }) => {
+                if let Some(index) = opaque {
+                    write!(f, "opaque type #{index} of ")?;
+                } else {
+                    write!(f, "{kind} ")?;
+                }
+                f.write_str(words)?;
+                if let Some(why) = unmapped {
+                    write!(f, " (source origin unavailable: {why:?})")?;
+                }
+            }
+            Err(DefinitionLost::Record(error)) => write!(f, "definition lookup refused by its items record: {error:?}")?,
+            Err(DefinitionLost::Missing { item, what }) => write!(f, "definition lookup lacks {what} of {item:x}")?,
+            Err(why) => write!(f, "definition lookup refused ({why:?}, crate row {:?})", self.krate)?,
+        }
+        if let Some(version) = self.version {
+            write!(f, " (crate version {version})")?;
+        }
+        Ok(())
+    }
+}
+
+impl FactDefinition {
+    pub fn of<'n>(names: &'n super::source::Records<'n>, key: ItemKey, owner: Option<(ItemKey, u32)>, alloc: Alloc<'_>) -> Self {
+        let mut prefix = [0; 32];
+        prefix[..16].copy_from_slice(&key.0.to_be_bytes());
+        let krate = names.crate_of(LibKey(blaze_id::ContentId(prefix)));
+        let mut unresolved_in = None;
+        let site = krate.ok_or(DefinitionLost::NoCrate).and_then(|krate| {
+            let record = names.items_record(krate).ok_or(DefinitionLost::NoRecord)?;
+            let mut search = DefinitionSearch { names, record, key, owner, alloc, found: None, incomplete: None };
+            let site = search.find();
+            if site.is_err() {
+                unresolved_in = Some(record.name()?.to_owned());
+            }
+            site
+        });
+        Self { krate, version: None, unresolved_in, site }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Declaration<'n> {
+    container: LibKey,
+    lib: LibKey,
+    checker: ItemKey,
+    kind: ItemKind,
+    member: Option<super::source::MemberOf<'n>>,
+}
+
+struct DefinitionSearch<'n, 'a> {
+    names: &'n super::source::Records<'n>,
+    record: &'n ItemsRecord<'n>,
+    key: ItemKey,
+    owner: Option<(ItemKey, u32)>,
+    alloc: Alloc<'a>,
+    found: Option<DefinitionSite>,
+    incomplete: Option<DefinitionLost>,
+}
+
+impl<'n> DefinitionSearch<'n, '_> {
+    fn find(&mut self) -> Result<DefinitionSite, DefinitionLost> {
+        use super::keys::{MemberKind, checker_of, member_key_of};
+        if let Some((owner, _)) = self.owner
+            && let Some(lib) = self.names.key_beginning(owner.0.to_be_bytes())
+            && let Some(row) = self.record.item(lib)?
+            && matches!(row.kind, ItemKind::Function | ItemKind::TypeAlias)
+        {
+            let decl = Declaration { container: lib, lib, checker: owner, kind: row.kind, member: None };
+            return self.opaque(decl)?.ok_or(DefinitionLost::NoMatch);
+        }
+        if self.owner.is_none()
+            && let Some(lib) = self.names.key_beginning(self.key.0.to_be_bytes())
+        {
+            if let Some(row) = self.record.item(lib)? {
+                let decl = Declaration { container: lib, lib, checker: self.key, kind: row.kind, member: None };
+                return self.show_item(decl, row.kind.name());
+            }
+            if let Some((adt, index)) = self.record.variant_home(lib)? {
+                let decl = Declaration { container: adt, lib, checker: self.key, kind: ItemKind::Variant, member: None };
+                let text = self.text(decl)?;
+                let lowered = self.lower(decl, text)?;
+                let view = lowered.view();
+                let missing = || DefinitionLost::Missing { item: lib, what: "the variant's name range" };
+                let rows = view.rows(view.list(blaze_lower::head::FIELDS)).map_err(|_| missing())?;
+                let variant = blaze_lower::form::Variant::decode(*rows.get(index as usize).ok_or_else(missing)?).map_err(|_| missing())?;
+                let name = view.name_range(variant.name).map_err(|_| missing())?;
+                return self.show(decl, "variant", None, view.site(name).map_err(|_| missing())?, view.text_at(name).map_err(|_| missing())?);
+            }
+            if let Some(module) = self.record.module(lib)? {
+                let path = module.path.ok_or(DefinitionLost::Missing { item: lib, what: "the module's path" })?;
+                let mut words = path.to_owned();
+                words.push_str(" (the module row has no declaration range)");
+                return Ok(DefinitionSite { words, kind: "module", opaque: None, unmapped: None });
+            }
+        }
+        // Library members have their own sorted key section. A checker member is keyed
+        // differently, by its container, kind and name.
+        let lookup = self.owner.map_or(self.key, |(owner, _)| owner);
+        if self.names.errors().iter().any(|error| {
+            matches!(error, super::source::SourceError::KeysBeginAlike { first, .. } if checker_of(*first) == lookup)
+        }) {
+            return Err(DefinitionLost::Ambiguous);
+        }
+        let mut lo = 0;
+        let mut hi = self.record.owned_members();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let lib = self.record.owned_key_at(mid)?.ok_or(DefinitionLost::NoRecord)?;
+            if checker_of(lib) < lookup { lo = mid + 1; } else { hi = mid; }
+        }
+        if let Some(lib) = self.record.owned_key_at(lo)?
+            && checker_of(lib) == lookup
+            && let Some((container, _)) = self.record.member_owner(lib)?
+        {
+            if self.record.owned_key_at(lo + 1)?.is_some_and(|next| checker_of(next) == lookup) {
+                return Err(DefinitionLost::Ambiguous);
+            }
+            self.members(container, Some(lib))?;
+            return self.take();
+        }
+        let record = self.record;
+        for i in 0..record.items() {
+            let row = record.item_at(i)?.ok_or(DefinitionLost::NoRecord)?;
+            let lib = row.key;
+            let checker = checker_of(lib);
+            let decl = Declaration { container: lib, lib, checker, kind: row.kind, member: None };
+            match row.kind {
+                ItemKind::Trait | ItemKind::Impl => self.members(lib, None)?,
+                ItemKind::Struct if row.ctor && member_key_of(checker, MemberKind::Ctor, "") == self.key => {
+                    let site = self.show_item(decl, "constructor")?;
+                    self.put(site)?;
+                }
+                ItemKind::Function | ItemKind::TypeAlias => self.candidate(decl)?,
+                _ => {}
+            }
+        }
+        self.take()
+    }
+
+    fn put(&mut self, site: DefinitionSite) -> Result<(), DefinitionLost> {
+        if self.found.replace(site).is_some() { Err(DefinitionLost::Ambiguous) } else { Ok(()) }
+    }
+
+    fn take(&mut self) -> Result<DefinitionSite, DefinitionLost> {
+        self.found.take().ok_or_else(|| self.incomplete.take().unwrap_or(DefinitionLost::NoMatch))
+    }
+
+    fn members(&mut self, container: LibKey, only: Option<LibKey>) -> Result<(), DefinitionLost> {
+        use super::keys::{MemberKind, checker_of, member_key_of};
+        let mut result = Ok(());
+        self.names.each_member(container, &mut |m| {
+            if result.is_err() || only.is_some_and(|lib| m.key != lib) { return; }
+            let Some(name) = m.name else { return };
+            let kind = match m.kind {
+                ItemKind::Function => MemberKind::Fn,
+                ItemKind::TypeAlias => MemberKind::Type,
+                ItemKind::Const => MemberKind::Const,
+                _ => return,
+            };
+            let checker = member_key_of(checker_of(container), kind, name);
+            let decl = Declaration { container, lib: m.key, checker, kind: m.kind, member: Some(m) };
+            result = if self.owner.is_none() && (checker == self.key || only == Some(m.key)) {
+                self.show_item(decl, m.kind.name()).and_then(|site| self.put(site))
+            } else if m.kind == ItemKind::Function {
+                self.candidate(decl)
+            } else { Ok(()) };
+        });
+        result
+    }
+
+    fn text(&self, decl: Declaration<'n>) -> Result<&'n str, DefinitionLost> {
+        decl.member.map(|m| m.text).or_else(|| self.names.text_of(decl.container).map(|it| it.text))
+            .ok_or(DefinitionLost::Missing { item: decl.lib, what: "the item text" })
+    }
+
+    fn lower<'t>(&self, decl: Declaration<'_>, text: &'t str) -> Result<blaze_lower::Lowered<'_, 't>, DefinitionLost> {
+        let missing = |what| DefinitionLost::Missing { item: decl.lib, what };
+        let krate = self.names.crate_of(decl.container).ok_or(DefinitionLost::NoCrate)?;
+        let atoms = self.names.cfg_atoms(krate).ok_or_else(|| missing("the crate's cfg"))?;
+        blaze_lower::lower_signature(text, self.record.edition(), &mut super::heads::CrateCfg(atoms), self.alloc)
+            .map_err(|_| missing("a readable signature"))
+    }
+
+    fn candidate(&mut self, decl: Declaration<'n>) -> Result<(), DefinitionLost> {
+        if self.owner.is_some_and(|(owner, _)| owner != decl.checker) { return Ok(()); }
+        match self.opaque(decl) {
+            Ok(Some(site)) => self.put(site),
+            Ok(None) => Ok(()),
+            Err(error) => {
+                // An unrelated unlowerable signature cannot identify this key. Retain the
+                // reason in case no signature with an exact identity can be found.
+                self.incomplete.get_or_insert(error);
+                Ok(())
+            }
+        }
+    }
+
+    fn opaque(&self, decl: Declaration<'n>) -> Result<Option<DefinitionSite>, DefinitionLost> {
+        use super::keys::opaque_key;
+        use blaze_lower::{form::TypeId, head, machine::sig};
+        let text = self.text(decl)?;
+        let alias = decl.kind == ItemKind::TypeAlias;
+        let has_key = |n| self.owner.is_none_or(|(_, tagged)| super::tait::of_alias(tagged) == alias && (tagged & !super::tait::ALIAS_OPAQUE) == n)
+            && opaque_key(decl.checker, n) == self.key;
+        // Without a macro, each numbered opaque needs one written 'impl', apart from
+        // the implicit future. This upper bound only skips impossible key matches.
+        if (alias || !text.contains('!')) && self.owner.is_none() {
+            let max = text.matches("impl").count() + usize::from(!alias && text.contains("async"));
+            if !(0..max).any(|n| u32::try_from(n).is_ok_and(has_key)) { return Ok(None); }
+        }
+        let lowered = self.lower(decl, text)?;
+        let view = lowered.view();
+        let first = u32::from(!alias && view.head[head::FLAGS] & sig::ASYNC != 0);
+        let missing = |what| DefinitionLost::Missing { item: decl.lib, what };
+        if first == 1 && has_key(0) {
+            let end = match view.head_opt(head::FN_TEXT_PREFIX) {
+                Some(n) => text.get(..n as usize).ok_or_else(|| missing("the async signature's prefix"))?,
+                None => text,
+            };
+            return self.show(decl, "async fn", Some(0), Range::new(0, end.len() as u32), end).map(Some);
+        }
+        let Some(root) = view.head_opt(head::TY).map(TypeId) else { return Ok(None) };
+        let mut ids = std::vec::Vec::new_in(self.alloc);
+        let macros = super::types::return_impls(&view, root, &mut ids).map_err(|_| missing("opaque syntax numbering"))?;
+        let expanded;
+        let mut offset = 0;
+        let opaque_view = if macros && !alias {
+            let at = view.type_range(root).map_err(|_| missing("the return type's range"))?;
+            let range = view.site(at).map_err(|_| missing("the return type's site"))?;
+            let written = view.text_at(at).map_err(|_| missing("the return type's text"))?;
+            let module = self.names.home_of(decl.container).ok_or_else(|| missing("the defining module"))?;
+            let marks = super::item_site::member_marks(self.names, decl.container, decl.member.and_then(|m| m.written_by), text)
+                .map_err(|_| missing("the defining signature's token marks"))?;
+            expanded = super::type_expand::expand_type_text(self.names, module, written, marks, range, self.alloc)
+                .map_err(|_| missing("the expanded return type"))?;
+            ids.clear();
+            if super::types::return_impls(&expanded.view(), expanded.root, &mut ids).map_err(|_| missing("the expanded opaque types"))? {
+                return Err(missing("the remaining type macro's expansion"));
+            }
+            offset = range.start;
+            expanded.view()
+        } else { view };
+        for (j, t) in ids.into_iter().enumerate() {
+            let n = u32::try_from(j).ok().and_then(|j| first.checked_add(j)).ok_or_else(|| missing("a representable opaque ordinal"))?;
+            if !has_key(n) { continue; }
+            let at = opaque_view.type_range(t).map_err(|_| missing("the opaque type's range"))?;
+            let site = opaque_view.site(at).map_err(|_| missing("the opaque type's source"))?;
+            let snippet = opaque_view.text_at(at).map_err(|_| missing("the opaque type's text"))?;
+            // For an expanded term, site() projects through the lowering's expansion_calls
+            // to its outermost call in the WRITTEN return text. Only then move into the item.
+            let start = offset.checked_add(site.start).ok_or_else(|| missing("the opaque type's item-relative start"))?;
+            let end = offset.checked_add(site.end).ok_or_else(|| missing("the opaque type's item-relative end"))?;
+            let mut shown = self.show(decl, decl.kind.name(), Some(n), Range::new(start, end), snippet)?;
+            if at.in_expansion() {
+                shown.words.push_str(" (range of the type macro call, text from its expansion)");
+            }
+            return Ok(Some(shown));
+        }
+        Ok(None)
+    }
+
+    fn show_item(&self, decl: Declaration<'n>, kind: &'static str) -> Result<DefinitionSite, DefinitionLost> {
+        let text = self.text(decl)?;
+        self.show(decl, kind, None, Range::new(0, text.len() as u32), text)
+    }
+
+    fn show(&self, decl: Declaration<'n>, kind: &'static str, opaque: Option<u32>, range: Range, snippet: &str) -> Result<DefinitionSite, DefinitionLost> {
+        use core::fmt::Write;
+        let missing = |what| DefinitionLost::Missing { item: decl.lib, what };
+        let mut words = lib_path(self.names, decl.lib).ok_or_else(|| missing("the definition's path"))?;
+        let crate_name = self.record.name()?;
+        if words.split("::").next() != Some(crate_name) {
+            words.insert_str(0, "::");
+            words.insert_str(0, crate_name);
+        }
+        let krate = self.names.crate_of(decl.container).ok_or(DefinitionLost::NoCrate)?;
+        let (at, start) = self.names.item_start(decl.container).ok_or_else(|| missing("the declaration's position"))?;
+        let (at, start) = if let Some(member) = decl.member {
+            if let Some(call) = member.written_by {
+                let at = blaze_scope::resolve::At::Expansion(call);
+                let text = self.names.whole_text(krate, at).ok_or_else(|| missing("the expansion's text"))?;
+                (at, blaze_scope::expansion_origins::offset_in(text, member.text).ok_or_else(|| missing("the member's expansion range"))?)
+            } else {
+                let whole = self.names.text_of(decl.container).ok_or_else(|| missing("the container text"))?;
+                let offset = blaze_scope::expansion_origins::offset_in(whole.text, member.text).ok_or_else(|| missing("the member's range"))?;
+                (at, start.checked_add(offset).ok_or_else(|| missing("the member's absolute start"))?)
+            }
+        } else { (at, start) };
+        let mut unmapped = None;
+        match at {
+            blaze_scope::resolve::At::File(file) => {
+                let file_name = self.names.file_shown(krate, file).ok_or_else(|| missing("the file path"))?;
+                let file_text = self.names.file_text(krate, file).ok_or_else(|| missing("the current file text"))?;
+                let position = start.checked_add(range.start).ok_or_else(|| missing("the absolute source position"))?;
+                let before = file_text.get(..position as usize).ok_or_else(|| missing("a UTF-8 source position"))?;
+                let line = 1 + before.bytes().filter(|&b| b == b'\n').count();
+                let col = 1 + before.rsplit('\n').next().map_or(0, |s| s.chars().count());
+                write!(words, " at {file_name}:{line}:{col}").expect("writing a string");
+            }
+            blaze_scope::resolve::At::Expansion(call) => {
+                let placed = match decl.member {
+                    Some(m) => super::expansion_origin::file_member_range(self.names, decl.container, m.text, blaze_typeck::Range { start: range.start, end: range.end }, self.alloc),
+                    None => super::expansion_origin::file_range(self.names, Some(decl.container), blaze_typeck::Range { start: range.start, end: range.end }, self.alloc),
+                };
+                match placed {
+                    super::expansion_origin::Filed::Unmapped(why) => {
+                        unmapped = Some(why);
+                        write!(words, " in expansion {call:x}").expect("writing a string");
+                    }
+                    _ => write!(words, " (expansion {call:x}, {placed})").expect("writing a string"),
+                }
+            }
+        }
+        let end = snippet.char_indices().nth(60).map_or(snippet.len(), |(at, _)| at);
+        write!(words, ", bytes {}..{} in the {kind}, `{}`", range.start, range.end, &snippet[..end]).expect("writing a string");
+        Ok(DefinitionSite { words, kind, opaque, unmapped })
+    }
+}
 
 /// The digits of a key shown after a path: bytes 8..14, the item's part (bytes 0..8 are the
 /// crate's prefix, which the path already names).
@@ -202,7 +567,7 @@ fn lib_path<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<String> {
     match names.name_of(owner) {
         Some(n) => out.push_str(n),
         // An impl has no name: its header as written, from its first token.
-        None => out.push_str(&impl_shown(names.text_of(owner)?.impl_header?)),
+        None => out.push_str(&impl_shown(names.signature_text_of(owner)?.impl_header?)),
     }
     if let Some(l) = last {
         out.push_str("::");
@@ -381,6 +746,7 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
     };
     match e {
         CheckFail::Gap { gaps, .. } => match gaps.first() {
+            Some(first @ (super::world_items::Gap::Hidden(_) | super::world_items::Gap::HiddenRow { .. } | super::world_items::Gap::CoroutineRow { .. })) => first.to_string(),
             Some(first) => format!("a question the world cannot answer yet ({})", debug_class(&format!("{first:?}"), 2)),
             None => String::from("a question the world cannot answer yet"),
         },
@@ -421,14 +787,82 @@ fn check_error_class(path: &dyn Fn(ItemKey) -> String, e: &blaze_typeck::CheckEr
     use blaze_typeck::CheckError as E;
     match e {
         E::Limit(l) => format!("a bound of the checker passed ({l:?})"),
+        E::Malformed(blaze_typeck::Malformed::CoroutineFactsMissing { reader, at, owner, ordinal }) => {
+            let mut text = path(*reader);
+            fmt::Write::write_fmt(&mut text, format_args!(
+                " at item bytes {}..{} needs the checked output and stored types of coroutine #{ordinal} of {}: the auto trait of another fn's future needs its witness record",
+                at.start, at.end, path(*owner)
+            )).expect("writing to a String is infallible");
+            text
+        }
+        E::Malformed(blaze_typeck::Malformed::BodyTypeInRecord(blaze_typeck::Question::Coroutine(owner, ordinal))) => {
+            let mut text = path(*owner);
+            fmt::Write::write_fmt(&mut text, format_args!(
+                ", coroutine #{ordinal}: the importer cannot reconstruct its output and stored types from the defining body's record"
+            )).expect("writing to a String is infallible");
+            text
+        }
+        E::Malformed(blaze_typeck::Malformed::FutureIdentity { owner, block, at }) => {
+            let mut text = path(*owner);
+            fmt::Write::write_fmt(&mut text, format_args!(
+                " at item bytes {}..{} has no coroutine ordinal for future expression {}", at.start, at.end, block.0
+            )).expect("writing to a String is infallible");
+            text
+        }
+        E::Malformed(blaze_typeck::Malformed::NestedFutureIdentity { owner, ordinal, block, reader }) => {
+            let mut text = path(*owner);
+            fmt::Write::write_fmt(&mut text, format_args!(
+                ", coroutine #{ordinal}: nested future expression {} needs its owner-qualified coroutine ordinal", block.0
+            )).expect("writing to a String is infallible");
+            if let Some((item, range)) = reader {
+                fmt::Write::write_fmt(&mut text, format_args!(
+                    " at item bytes {}..{} of {}", range.start, range.end, path(*item)
+                )).expect("writing to a String is infallible");
+            }
+            text
+        }
+        E::Malformed(blaze_typeck::Malformed::FutureOutsideOwner { .. } | blaze_typeck::Malformed::CoroutineSubstitution { .. } | blaze_typeck::Malformed::BodyRecordCycle { .. }) => e.to_string(),
         E::Malformed(m) => format!("malformed input ({})", debug_class(&format!("{m:?}"), 1)),
+        // Rule 19: the trait whose members the facts do not hold, by its path (the item is a
+        // solver key: `assoc_def(trait, name)`, no item of the names).
+        E::Solve(blaze_solve::SolveError::Unsupported(blaze_solve::error::Unsupported::MemberNotFiled { trait_, .. })) => format!(
+            "the trait solver needs the members of {} (an associated item of it is not filed: its bounds and default are not known)",
+            path(ItemKey(trait_.0))
+        ),
         E::Solve(s) => format!("the trait solver ({})", debug_class(&format!("{s:?}"), 2)),
         E::Unported(what) => format!("{what} is not checked yet"),
+        E::FutureWitness { .. } => e.to_string(),
+        // Rule 19: the fn whose future's record is missing, by its path.
+        E::ForeignWitness { gap, item, ordinal: Some(ordinal), at } => format!(
+            "{gap}: coroutine #{ordinal} of {} has only its check's superset interior (its defining body's flow was refused) at item bytes {}..{}",
+            path(*item), at.start, at.end
+        ),
+        E::ForeignWitness { gap, item, ordinal: None, at } => format!(
+            "{gap}: the hidden type of {} (another fn's future) has no record here at item bytes {}..{}",
+            path(*item), at.start, at.end
+        ),
+        E::FutureWitnessGoal { trait_, .. } => path(*trait_) + ": " + &e.to_string(),
         E::DynUndecided { trait_, .. } => format!("the dyn compatibility of {} is not decided", path(*trait_)),
         E::UnknownInCleanBody { .. } => String::from("a body with no diagnostic recorded an unknown type (the checker's own invariant)"),
         E::DiagWithoutPlace { code, .. } => format!("diagnostic {} has an empty range (the checker's own invariant)", code.code()),
         E::ImplTraitArity { trait_, .. } => format!("an impl header of {} has the wrong number of trait arguments", path(*trait_)),
-        E::OpaqueHiddenUnknown { trait_, .. } => format!("a goal of {} on an opaque type with no hidden type", path(*trait_)),
+        E::OpaqueHiddenUnknown { opaque, trait_ } => {
+            let mut text = path(*trait_);
+            fmt::Write::write_fmt(&mut text, format_args!(" requires the defining body's hidden type for opaque {:032x}", opaque.0))
+                .expect("writing to a String is infallible");
+            text
+        }
+        E::OpaqueAutoUndecided { opaque, trait_, at, constituent } => {
+            let mut text = path(*trait_);
+            fmt::Write::write_fmt(&mut text, format_args!(
+                " remains undecided for the supplied hidden type of opaque {:032x} at item bytes {}..{}", opaque.0, at.start, at.end
+            )).expect("writing to a String is infallible");
+            if let Some((part, needed)) = constituent {
+                fmt::Write::write_fmt(&mut text, format_args!("; the stored type from {} requires {}", path(*part), path(*needed)))
+                    .expect("writing to a String is infallible");
+            }
+            text
+        }
         E::TraitDefaultsNotKnown { trait_ } => format!("the defaults of {} were not read", path(*trait_)),
     }
 }
@@ -466,7 +900,7 @@ pub fn head_error_shown<'n, S: NamesSource<'n>>(names: S, e: &HeadError) -> Stri
     match e {
         HeadError::NoText(k) => format!("the names library holds no text for item {}", item(*k)),
         HeadError::Cfg(k) => format!("item {} asks for cfg atoms its crate's set does not answer", item(*k)),
-        HeadError::NotAHead(k, what) => format!("item {} is {what}, not a struct, enum, union, trait, impl or fn", item(*k)),
+        HeadError::NotAHead(k, what) => format!("item {} is {what}: no head is made for it under that want", item(*k)),
         HeadError::Cycle(ks) => {
             let mut out = String::from("these items need each other's heads in a cycle: [");
             for (i, k) in ks.iter().enumerate() {

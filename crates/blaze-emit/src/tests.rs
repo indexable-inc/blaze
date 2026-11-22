@@ -163,7 +163,7 @@ pub(crate) fn emitted(view: View<'_>, via: &[Via]) -> Result<Code<Global>, EmitE
 
 pub(crate) fn emitted_for(view: View<'_>, via: &[Via], isa: Isa) -> Result<Code<Global>, EmitError> {
     let mut code = Code::new_in(Global);
-    emit(view, via, isa, &mut code)?;
+    emit(blaze_lir::verify(view).expect("the test's function is LIR"), via, isa, &mut code)?;
     // Every function the tests emit is also built as a code record and checked: no literal
     // word left, a round trip, equal bytes twice (record_tests.rs).
     crate::record_tests::holds(view, isa);

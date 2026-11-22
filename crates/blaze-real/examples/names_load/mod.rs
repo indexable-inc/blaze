@@ -518,6 +518,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
         }
         match res.pass().map_err(|e| LoadError::Graph(e.to_string()))? {
             Pass::Done(graph) => break graph,
+            Pass::Partial(partial) => return Err(LoadError::Graph(format!("the manifests of {:?} are missing: no unit graph", partial.missing()))),
             Pass::Need(needs) => {
                 for id in needs.iter() {
                     let facts = sources.package(*id).map_err(|e| LoadError::Graph(e.to_string()))?;

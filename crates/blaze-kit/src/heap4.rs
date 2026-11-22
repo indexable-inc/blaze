@@ -1,6 +1,15 @@
 //! [`Heap4<T, A>`]: a 4-ary min-heap in one vector: the scheduler's ready queue, Dijkstra over a
 //! call graph, the k-way merge of sorted runs. In place of `BinaryHeap<Reverse<T>>`.
 //!
+//! MOVED (2026-11-20, rule 30): the one home is now `blaze_own::Heap4` (blaze-own/src/heap4.rs),
+//! the same API, its plant on the `Planted` seam (`pop_planted`, `blaze_own::Heap4Plant`) instead
+//! of this crate's thread-local switch. This copy stays until its users move, then becomes
+//! `pub use blaze_own::Heap4;` and the file goes. Its users: blaze-protocol src/events.rs (12,
+//! 159, 170), blaze-graph src/plane.rs (66, 849, 862), blaze-profile src/time/sim.rs (23, 408,
+//! 430), and this crate's examples/heaps.rs and src/tests/heaps.rs. Each changes its import
+//! from `blaze_kit::Heap4` to `blaze_own::Heap4`, and the three that write `Global` take the
+//! caller's allocator instead.
+//!
 //! The children of slot `i` are `4i + 1 ..= 4i + 4`, so the tree is half as deep as a binary
 //! heap's and the four children of a slot are adjacent: for an 8- or 16-byte `T` they share one
 //! line. A push sifts up `log4 n` levels with one compare each; a pop sifts the last element

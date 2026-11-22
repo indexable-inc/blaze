@@ -1,13 +1,18 @@
-//! Planted bugs for the oracles' controls (rule 53): a test sets one for the length of a closure
-//! on its own thread, and the code it names misbehaves on purpose. Outside tests [`on`] is
-//! `false` and folds away.
+//! The bugs a control can plant in the pack reader and the tree walk (D165, rule 78: a strategy
+//! is a type parameter at one seam). [`PlantedIndex`](crate::PlantedIndex) holds one as its
+//! type parameter `P: Planted<GitFetchPlant>` and the tree walk asks the index's; shipped code
+//! uses [`Index`](crate::Index), the index with `NoPlant`, whose every `has` is `false`, so each
+//! check compiles away. The controls (tests.rs) pass a value.
+
+#![blaze::sans_io]
+
+use blaze_own::planted::Plants;
 
 /// A bug a control plants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    /// Nothing planted: the code as it is.
-    #[cfg(test)]
-    Clean,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GitFetchPlant {
+    /// The code as it is.
+    None,
     /// A pack's trailer is not checked.
     TrailerUnchecked,
     /// A delta's copy from a nonzero offset starts one byte late.
@@ -19,27 +24,4 @@ pub(crate) enum Plant {
     NearestId,
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static PLANTED: core::cell::Cell<Plant> = const { core::cell::Cell::new(Plant::Clean) };
-}
-
-/// Whether `plant` is planted on this thread.
-#[cfg(test)]
-pub(crate) fn on(plant: Plant) -> bool {
-    PLANTED.with(core::cell::Cell::get) == plant
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-pub(crate) const fn on(_plant: Plant) -> bool {
-    false
-}
-
-/// Runs `body` with `plant` planted on this thread, and puts the clean code back after.
-#[cfg(test)]
-pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
-    let before = PLANTED.with(|p| p.replace(plant));
-    let _back = core::mem::DropGuard::new(before, |before| PLANTED.with(|p| p.set(before)));
-    body()
-}
+impl Plants for GitFetchPlant {}

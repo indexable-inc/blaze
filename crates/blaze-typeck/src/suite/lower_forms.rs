@@ -483,7 +483,10 @@ fn question_mark_with_no_from_impl_is_e0277() {
 /// u8>` holds only where `T`'s implementation of `Tr` defines `Out` as `u8`; `B`'s defines it
 /// as `u16`, so the call's where-clause `<B as Tr>::Out == u8` cannot hold. The finding names
 /// that projection entire (self type, trait, name, term) at the path whose where-clause it is
-/// (as `missing_impl_reported`), and no trait goal: `B: Tr` holds.
+/// (as `missing_impl_reported`), and no trait goal: `B: Tr` holds. The impl decides `Out`, so it
+/// is E0271 ("type mismatch resolving `<B as Tr>::Out == u8`", rustc's code), naming `u16` found
+/// and `u8` expected (machine.rs `projection_found`); E0277 is left for a projection whose trait
+/// goal fails.
 /// ```text
 /// trait Tr { type Out; }   struct B;   impl Tr for B { type Out = u16; }
 /// fn wants<T: Tr<Out = u8>>(t: T);
@@ -527,8 +530,10 @@ fn a_projection_that_cannot_hold_names_the_projection_and_its_term() {
         })
         .collect();
     // At `b` of `wants(b)`, the argument for the input that names the clause's `T`.
-    let want = format!("E0277 at {} <B as Tr>::{:?} == u8", e1.0, Name::of("Out"));
+    let want = format!("E0271 at {} <B as Tr>::{:?} == u8", e1.0, Name::of("Out"));
     assert_eq!(got, [want], "{:?}", c.diags);
+    let shown = |t: Option<crate::portable::PTy>| t.map(|t| super::show(&fx, types, t));
+    assert_eq!((shown(c.diags[0].expected), shown(c.diags[0].found)), (Some("u8".into()), Some("u16".into())), "{:?}", c.diags);
 }
 
 /// A lang item the world cannot answer is the one finding naming it (typeck.md, "`?` on the

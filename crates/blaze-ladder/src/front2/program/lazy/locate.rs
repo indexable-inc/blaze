@@ -208,6 +208,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     && let Some(name) = m.name
                 {
                     let mk = member_key_of(checker_of(container), MemberKind::Fn, name);
+                    names.read_member_body(m.key, m.written_by);
                     tops.push(Searched { lib: m.key, member: Some((container, mk)), text: m.text, name });
                 }
             });

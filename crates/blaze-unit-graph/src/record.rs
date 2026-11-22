@@ -29,8 +29,9 @@ use crate::resolve::unit_cfg;
 use crate::{Ask, CfgAtom, ExtraUnit, PackageMeta, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 
 /// The record's form. A change to it is a new magic; an older one is refused by it.
-/// `BUG2`: each package's `CARGO_PKG_*` metadata after the unavailable ids.
-pub const MAGIC: &[u8; 4] = b"BUG2";
+/// `BUG2`: each package's `CARGO_PKG_*` metadata after the unavailable ids. `BUG3`: no
+/// unavailable ids and no `incomplete` flag: a graph is whole or not made (states.md 35).
+pub const MAGIC: &[u8; 4] = b"BUG3";
 /// The domain of [`Source`]'s digest.
 pub const SOURCE_DOMAIN: &str = "blaze-unit-graph: what a request's unit graph read, v1";
 
@@ -103,7 +104,7 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
                 }
             }
         }
-        w.u8(u8::from(unit.for_host) | (u8::from(unit.incomplete) << 1));
+        w.u8(u8::from(unit.for_host));
         match unit.edition.blaze {
             Some(blaze) => {
                 w.u8(1);
@@ -134,10 +135,6 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
             }
         }
     }
-    w.u32(graph.unavailable.len() as u32);
-    for id in graph.unavailable.iter() {
-        w.u32(id.0);
-    }
     // Each package's metadata (`CARGO_PKG_*`), by id: what a crate's environment reads.
     w.u32(graph.meta.len() as u32);
     for (id, meta) in graph.meta.iter() {
@@ -155,7 +152,7 @@ fn is_test(kind: &UnitKind<'_>) -> bool {
 
 /// Whether `unit`'s cfg is the set [`crate::resolve::unit_cfg`] makes on `desc`.
 fn cfg_is<'a>(unit: &Unit<'a>, desc: &TargetDesc<'a>, alloc: Alloc<'a>) -> bool {
-    unit.cfg == unit_cfg(desc, &unit.features, is_test(&unit.kind), unit.kind == UnitKind::ProcMacro, alloc)
+    unit.cfg == unit_cfg(desc, &unit.features, is_test(&unit.kind), crate::resolve::ignores_profile_panic(&unit.kind), unit.kind == UnitKind::ProcMacro, alloc)
 }
 
 /// Bytes that are not a unit graph's record: where, and what is wrong there.
@@ -226,7 +223,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
             _ => return r.refuse("no such unit kind"),
         };
         let flags = r.u8()?;
-        if flags > 3 {
+        if flags > 1 {
             return r.refuse("unknown unit flags");
         }
         let edition = r.edition()?;
@@ -239,7 +236,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
         }
         let for_host = flags & 1 != 0;
         let desc = if for_host { &host } else { &target };
-        let cfg = unit_cfg(desc, &features, is_test(&kind), kind == UnitKind::ProcMacro, alloc);
+        let cfg = unit_cfg(desc, &features, is_test(&kind), crate::resolve::ignores_profile_panic(&kind), kind == UnitKind::ProcMacro, alloc);
         let nd = r.count()?;
         let mut deps = Vec::with_capacity_in(nd, alloc);
         for _ in 0..nd {
@@ -271,13 +268,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
             deps,
             build_script,
             links,
-            incomplete: flags & 2 != 0,
         });
-    }
-    let nu = r.count()?;
-    let mut unavailable = Vec::with_capacity_in(nu, alloc);
-    for _ in 0..nu {
-        unavailable.push(LockId(r.u32()?));
     }
     let nm = r.count()?;
     let mut meta: AVec<'a, (LockId, PackageMeta<'a>)> = Vec::with_capacity_in(nm, alloc);
@@ -295,7 +286,7 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
     if r.at != bytes.len() {
         return r.refuse("bytes after the record");
     }
-    Ok(Decoded { graph: UnitGraph { units, unavailable, resolver, meta }, target, host })
+    Ok(Decoded { graph: UnitGraph { units, resolver, meta }, target, host })
 }
 
 /// The digest of what a request's unit graph read: the record's source.

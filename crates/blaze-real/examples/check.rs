@@ -36,7 +36,7 @@ use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemDetail};
 use blaze_typeck::{
     AssocItem, AskLog, CheckError, Clock, Def, Fetch, FnSig, Hidden, ImplHeader, InferCtx, ItemKey, LangItem, Name,
-    Needs, Order, Outcome, PathIdx, PathRes, Predicates, Question, ScopeId, Seal, Shape, TraitDef, TypeAttrs, World,
+    Malformed, Needs, Order, Outcome, PathIdx, Predicates, Question, ScopeId, Seal, Shape, TraitDef, TypeAttrs, World,
     restarts,
 };
 
@@ -72,7 +72,7 @@ const EDITION: Edition = Edition::E2024;
 // The world, timed: every question the checker asks, counted and timed by kind, then answered
 // by the front end's world. Harness counters only; the checker is unchanged.
 
-const KINDS: usize = 24;
+const KINDS: usize = 25;
 
 fn kind_of(q: &Question) -> usize {
     match q {
@@ -99,13 +99,14 @@ fn kind_of(q: &Question) -> usize {
         Question::Coroutine(..) => 21,
         Question::TypeAlias(_) => 22,
         Question::FieldDefaults(_) => 23,
+        Question::MemberVisible(..) => 24,
     }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
     "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure", "AssocGenerics",
-    "Coroutine", "TypeAlias", "FieldDefaults",
+    "Coroutine", "TypeAlias", "FieldDefaults", "MemberVisible",
 ];
 
 struct Tally {
@@ -172,7 +173,11 @@ impl<W: World> World for Timed<'_, W> {
     }
     fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
         self.time(19, || self.inner.closure(seal, owner, ordinal))
-    }    fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
+    }
+    fn coroutine(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<blaze_typeck::CoroutineFacts<'_>>> {
+        self.time(21, || self.inner.coroutine(seal, owner, ordinal))
+    }
+    fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         self.time(13, || self.inner.attrs(seal, item))
     }
     fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
@@ -195,6 +200,15 @@ impl<W: World> World for Timed<'_, W> {
     }
     fn assoc_generics(&self, seal: Seal, trait_: ItemKey, name: blaze_typeck::Name) -> Fetch<Option<blaze_typeck::AssocGenerics>> {
         self.time(20, || self.inner.assoc_generics(seal, trait_, name))
+    }
+    fn type_alias(&self, seal: Seal, item: ItemKey) -> Fetch<Option<blaze_typeck::AliasDef<'_>>> {
+        self.time(22, || self.inner.type_alias(seal, item))
+    }
+    fn field_defaults(&self, seal: Seal, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
+        self.time(23, || self.inner.field_defaults(seal, adt))
+    }
+    fn member_visible(&self, seal: Seal, container: ItemKey, name: blaze_typeck::Name) -> Fetch<bool> {
+        self.time(24, || self.inner.member_visible(seal, container, name))
     }
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
         self.time(18,|| self.inner.prefetch(seal, questions))
@@ -558,13 +572,15 @@ fn run_crate(dir: &Path, census: &mut Census, costs: &mut Vec<Cost>, restart: &m
                 Err(e) => {
                     let label = match e {
                         CheckError::Unported(w) => format!("check: unported: {w}"),
+                        CheckError::FutureWitness { .. } | CheckError::ForeignWitness { .. } | CheckError::FutureWitnessGoal { .. } => e.to_string(),
                         CheckError::DynUndecided { why, .. } => format!("check: dyn undecided {}", variant(&format!("{why:?}"))),
                         CheckError::UnknownInCleanBody { at } => format!("check: unknown in a clean body {}", variant(&format!("{at:?}"))),
                         CheckError::DiagWithoutPlace { code, .. } => format!("check: diagnostic without a place {}", code.code()),
                         CheckError::ImplTraitArity { .. } => "check: an impl header's trait arguments miscounted (Self first?)".to_string(),
-                        CheckError::OpaqueHiddenUnknown { .. } => "check: an auto trait of an opaque whose hidden type was not given".to_string(),
+                        CheckError::OpaqueHiddenUnknown { .. } | CheckError::OpaqueAutoUndecided { .. } => e.to_string(),
                         CheckError::TraitDefaultsNotKnown { .. } => "check: a qualified path's trait defaults not read".to_string(),
                         CheckError::Limit(l) => format!("check: limit {l:?}"),
+                        CheckError::Malformed(m) if future_record_error(m) => e.to_string(),
                         CheckError::Malformed(m) => format!("check: malformed {}", variant(&format!("{m:?}"))),
                         CheckError::Solve(s) => format!("check: solver {}", variant(&format!("{s:?}"))),
                     };
@@ -640,6 +656,12 @@ fn run_crate(dir: &Path, census: &mut Census, costs: &mut Vec<Cost>, restart: &m
     );
     local.checked += checked_here;
     merge(census, local);
+}
+
+fn future_record_error(m: Malformed) -> bool {
+    matches!(m, Malformed::CoroutineFactsMissing { .. } | Malformed::FutureIdentity { .. } |
+        Malformed::FutureOutsideOwner { .. } | Malformed::NestedFutureIdentity { .. } |
+        Malformed::CoroutineSubstitution { .. } | Malformed::BodyRecordCycle { .. })
 }
 
 fn variant(debug: &str) -> String {
@@ -987,13 +1009,15 @@ fn forms_file(rel: &str, text: &str, rules: &'static [(&'static str, blaze_expan
                 Err(e) => {
                     let label = match e {
                         CheckError::Unported(w) => format!("check: unported: {w}"),
+                        CheckError::FutureWitness { .. } | CheckError::ForeignWitness { .. } | CheckError::FutureWitnessGoal { .. } => e.to_string(),
                         CheckError::DynUndecided { why, .. } => format!("check: dyn undecided {}", variant(&format!("{why:?}"))),
                         CheckError::UnknownInCleanBody { at } => format!("check: unknown in a clean body {}", variant(&format!("{at:?}"))),
                         CheckError::DiagWithoutPlace { code, .. } => format!("check: diagnostic without a place {}", code.code()),
                         CheckError::ImplTraitArity { .. } => "check: an impl header's trait arguments miscounted (Self first?)".to_string(),
-                        CheckError::OpaqueHiddenUnknown { .. } => "check: an auto trait of an opaque whose hidden type was not given".to_string(),
+                        CheckError::OpaqueHiddenUnknown { .. } | CheckError::OpaqueAutoUndecided { .. } => e.to_string(),
                         CheckError::TraitDefaultsNotKnown { .. } => "check: a qualified path's trait defaults not read".to_string(),
                         CheckError::Limit(l) => format!("check: limit {l:?}"),
+                        CheckError::Malformed(m) if future_record_error(m) => e.to_string(),
                         CheckError::Malformed(m) => format!("check: malformed {}", variant(&format!("{m:?}"))),
                         CheckError::Solve(s) => format!("check: solver {}", variant(&format!("{s:?}"))),
                     };

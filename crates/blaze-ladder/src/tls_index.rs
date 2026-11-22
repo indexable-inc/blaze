@@ -245,22 +245,34 @@ pub fn create_key(desc: u64, ender: u64) -> Result<(), PlaceError> {
     // SAFETY: `ender` is the entry thunk of the ender's slot, declared by `place` before this
     // call: the C function `fn(t: *mut Table)` blaze-build's `tls::index::ender` built. One
     // pointer argument, no result: the ABI of pthread's destructor type.
-    let destructor = unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut libc::c_void)>(ender) };
+    let destructor = unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut core::ffi::c_void)>(ender) };
+    #[cfg(target_os = "macos")]
+    let key_at = (desc + index::DESC_KEY as u64) as *mut blaze_sys::posix::thread::pthread_key_t;
+    #[cfg(not(target_os = "macos"))]
     let key_at = (desc + index::DESC_KEY as u64) as *mut libc::pthread_key_t;
     // SAFETY: `desc` is the descriptor static in the image `load_statics` wrote, 8-aligned
     // (checked above), its `key` word 8 bytes; `pthread_key_t` (4 bytes on Linux, 8 on macOS)
     // fits in it, the rest of the word left zero as the image wrote it.
-    let errno = unsafe { libc::pthread_key_create(key_at, Some(destructor)) };
-    if errno != 0 {
-        return Err(PlaceError::TlsKey { errno });
-    }
+    #[cfg(target_os = "macos")]
+    let key = match blaze_sys::posix::thread::key_create(Some(destructor)) {
+        Ok(key) => { unsafe { key_at.write(key) }; key }
+        Err(error) => return Err(PlaceError::TlsKey { errno: i32::from(error.raw()) }),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let key = {
+        let errno = unsafe { libc::pthread_key_create(key_at, Some(destructor)) };
+        if errno != 0 { return Err(PlaceError::TlsKey { errno }); }
+        unsafe { key_at.read() }
+    };
     // SAFETY: written just above by `pthread_key_create`.
-    let key = unsafe { key_at.read() };
     let root = match root_word(u64::from(key)) {
         Ok(root) => root,
         Err(error) => {
             // SAFETY: the key was created above and no thread has a value under it yet.
-            unsafe { libc::pthread_key_delete(key) };
+            #[cfg(target_os = "macos")]
+            { let _ = blaze_sys::posix::thread::key_delete(key); }
+            #[cfg(not(target_os = "macos"))]
+            { unsafe { libc::pthread_key_delete(key) }; }
             return Err(error);
         }
     };
@@ -296,7 +308,7 @@ pub fn make_ender_entry<'a>(isa: blaze_emit::Isa, alloc: Alloc<'a>) -> Result<AV
     let funcs = index::ENDER_IMPORTS.map(Callee::C);
     let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
-    make_entry(&func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
+    make_entry(func.verified(), &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }
 
 impl RecordRun<'_> {

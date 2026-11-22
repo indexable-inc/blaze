@@ -101,6 +101,8 @@ impl BodyBuf {
             asm_text: "",
             call_arg_ints: &[],
             unsafe_blocks: &[],
+            expr_editions: &[],
+            pat_editions: &[],
         }
     }
 }

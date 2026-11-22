@@ -28,7 +28,7 @@ use blaze_ladder::code_records::{Builder, CodeStore, MemoryStore, Settings, Tier
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::program::{StartOf, start_of};
-use blaze_ladder::front2::source::{Load, Log, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, Records};
 use blaze_ladder::front2::start::linked_lang_start;
 use blaze_ladder::run::special::{EntryForm, EntryLine, RootRow, Roots, Shim, Special, make_special, roots, shim_symbol, special_of};
 use blaze_ladder::symbols::{encode_instance, fn_symbol_of_name};
@@ -184,12 +184,10 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: blaze_id::ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: blaze_id::ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    /// The texts, with no origins kept.
+    fn expansion(&self, krate: usize, call: blaze_id::ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 

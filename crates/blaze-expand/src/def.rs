@@ -17,7 +17,7 @@ use blaze_surface::{BuildError, MacroDef, MacroDefHead, MacroDefView};
 use crate::{
     error::{StreamError, Table},
     record::{RecordBytes, RecordError, stream_record_id},
-    tokens::{DefSite, Edition, Mark, MarkOf, Sink, Text, TokenStream, Transparency, push_text},
+    tokens::{Buffered, DefSite, Edition, Mark, MarkOf, Sink, Text, TokenStream, Transparency, push_text},
 };
 
 /// The macro words, defined once in the schema: the builtin names, how a proc macro is called,
@@ -387,12 +387,13 @@ impl<'a> MacroDefinition<'a> {
                 hasher.part(name.as_bytes());
             }
         }
-        self.body.encode(&mut hasher);
+        // Streams through a buffer (tokens.rs `Buffered`), each fed at its statement's end.
+        self.body.encode(&mut Buffered::new(&mut hasher));
         match &self.params {
             None => hasher.put(&[0]),
             Some(params) => {
                 hasher.put(&[1]);
-                params.encode(&mut hasher);
+                params.encode(&mut Buffered::new(&mut hasher));
             }
         }
         hasher.put(&crate::tokens::index(self.helpers.len()).to_be_bytes());

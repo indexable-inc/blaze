@@ -10,8 +10,9 @@ use bstd::clock::{Clock, Instant};
 
 pub(crate) mod byte_rows;
 
-/// The most phases one command marks.
-const MOST: usize = 16;
+/// The most phases one command marks: tempo's edit marked 16 when the open checkout was one
+/// phase (2026-11-20, score-c1725wave42), and its parts are four more (engine_check.rs `edge`).
+const MOST: usize = 24;
 
 pub struct Phases {
     clock: Clock,
@@ -23,6 +24,13 @@ pub struct Phases {
     before_runtime: Option<u64>,
     /// From the driver's start to `main`'s first line.
     before_main: u64,
+    /// What the process used from its start to `main`'s first line (`proc_pid_rusage` and
+    /// `getrusage` of the whole process, read at [`Phases::new`]): the CPU, instructions and
+    /// page faults of the kernel's exec, dyld, Rust std's start and bstd's runtime start, all
+    /// threads. It says which of `before_runtime` and `before_main` was work (user or system
+    /// time), page-ins (major faults: read from disk; minor: mapped from the page cache, each
+    /// also validated against the code signature on its first map), or a wait (wall less CPU).
+    before_main_used: blaze_meter::System,
     rows: [(&'static str, u64); MOST],
     len: usize,
     /// Inside the request: the machine's steps and each kind of effect performed, summed.
@@ -53,7 +61,29 @@ pub struct Phases {
     pub(crate) published: Option<crate::store::take::Taken>,
     /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
     held: Held,
+    /// What each phase used on this thread (D169), beside `rows`: the meter's difference of
+    /// the snapshots at its two marks, or why the two are not a pair (the marks were on two
+    /// threads, or the tests' meter switch was thrown between them: blaze-meter `Unpaired`).
+    used: [Result<blaze_meter::Used, blaze_meter::Unpaired>; MOST],
+    /// The meter at the last mark (at `Phases::new` before the first).
+    meter: blaze_meter::Meter,
+    /// The command's own worker cell's waits at the last [`Phases::mark_cx`] (`ZERO` before
+    /// the first: the cell is the command's, so the first phase marked this way takes every
+    /// wait since the command began), and at the start of the last row once it began.
+    waits_at: blaze_meter::Waited,
+    last_row_waits_from: blaze_meter::Waited,
+    /// Stretches on other threads, by what ran them ([`Phases::worked_used`]): the tasks'
+    /// spread, counted beside the phases in the reconciliation.
+    beside: [(&'static str, blaze_meter::Spread); MOST_BESIDE],
+    beside_len: usize,
 }
+
+/// The most kinds of other threads' stretches [`Phases::worked_used`] names; past it a kind
+/// is added to the last row.
+const MOST_BESIDE: usize = 8;
+
+/// A share under this of the process's total is printed `UNACCOUNTED` (D169).
+const ACCOUNTED_PERCENT: u64 = 95;
 
 /// The most kinds [`Held`] names; past it a kind is added to the last row.
 const MOST_KINDS: usize = 40;
@@ -128,6 +158,7 @@ impl Phases {
             last: now,
             before_runtime: since_process.map(|it| nanos(it.saturating_sub(now.since_start()))),
             before_main: nanos(now.since_start()),
+            before_main_used: blaze_meter::Process::now().system,
             clock,
             rows: [("", 0); MOST],
             len: 0,
@@ -142,7 +173,29 @@ impl Phases {
             cleanup: None,
             published: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
+            used: [Ok(blaze_meter::Used::ZERO); MOST],
+            meter: blaze_meter::Meter::now(),
+            waits_at: blaze_meter::Waited::ZERO,
+            last_row_waits_from: blaze_meter::Waited::ZERO,
+            beside: [("", blaze_meter::Spread::NONE); MOST_BESIDE],
+            beside_len: 0,
         }
+    }
+
+    /// Stretches of `kind` that ran on threads other than this one (a pool's tasks on its
+    /// workers), their spread: counted beside the phases when the profile reconciles against
+    /// the process. A stretch on this thread is inside a phase already and is never given here.
+    pub fn worked_used(&mut self, kind: &'static str, spread: &blaze_meter::Spread) {
+        let at = match self.beside[..self.beside_len].iter().position(|row| row.0 == kind) {
+            Some(at) => at,
+            None if self.beside_len < MOST_BESIDE => {
+                self.beside[self.beside_len].0 = kind;
+                self.beside_len += 1;
+                self.beside_len - 1
+            }
+            None => MOST_BESIDE - 1,
+        };
+        self.beside[at].1.join(spread);
     }
 
     /// [`Phases::mark`], and the bytes of the command's `frame` taken since the last phase
@@ -154,6 +207,33 @@ impl Phases {
         self.held.phases[row] += used.saturating_sub(self.held.phase_at) as u64;
         self.held.phase_at = used;
         self.held.seen = (used, frame.reserved());
+    }
+
+    /// [`Phases::mark_in`], with the waits the command's own worker cell was charged since the
+    /// last such mark put in the phase's use. [`Phases::mark`] reads the meter of the thread
+    /// alone (`Meter::now`), whose `waited` is zero by construction (blaze-meter `Meter::read`),
+    /// and its "N waits" are the thread's lock waits and parks: a bstd wait (`Cx::wait`,
+    /// charged to the worker's tally on its way out, D171, bstd workers.rs `charge_wait_at`)
+    /// is in neither, so a 177 ms journal replay printed "0 waits" (tempo, score-c0230wave85).
+    /// Here the cell's waits are read through `cx`, the command's root, on the thread that
+    /// marks.
+    pub fn mark_cx(&mut self, cx: &bstd::Cx, name: &'static str, frame: &bstd::mem::Frame) {
+        let row = self.len.min(MOST - 1);
+        let merged = self.len >= MOST;
+        if self.len == MOST - 1 {
+            self.last_row_waits_from = self.waits_at;
+        }
+        self.mark_in(name, frame);
+        let now = cx.on_worker(|w| *w.meter().waits());
+        // Past MOST the last row is a sum ([`Phases::mark`]): its waits are those since it began.
+        let from = match merged {
+            true => self.last_row_waits_from,
+            false => self.waits_at,
+        };
+        self.waits_at = now;
+        if let Ok(used) = &mut self.used[row] {
+            used.waited = now.since(&from);
+        }
     }
 
     /// The bytes of the command's `frame` taken since the last call, and the main thread's time
@@ -224,13 +304,44 @@ impl Phases {
         let now = self.clock.now();
         let ns = now.since(self.last).map_or(0, nanos);
         self.last = now;
+        // The meter after the clock: the clock's read is the phase's, the meter's own read the
+        // next one's (its cost, stated in blaze-meter's docs, is in some phase either way).
+        let meter = blaze_meter::Meter::now();
+        let used = meter.since(&self.meter);
+        self.meter = meter;
         match self.len < MOST {
             true => {
                 self.rows[self.len] = (name, ns);
+                self.used[self.len] = used;
                 self.len += 1;
             }
-            false => self.rows[MOST - 1].1 += ns,
+            false => {
+                self.rows[MOST - 1].1 += ns;
+                self.used[MOST - 1] = match (self.used[MOST - 1], used) {
+                    (Ok(have), Ok(new)) => Ok(have.plus(&new)),
+                    (Err(why), _) | (_, Err(why)) => Err(why),
+                };
+            }
         }
+    }
+
+    /// Every phase's use summed, and every other thread's stretch given: what the meter
+    /// accounts of the process.
+    /// A phase whose pair was refused is not in it: the reconciliation then says what it misses.
+    fn accounted(&self) -> blaze_meter::Used {
+        let mut sum = match self.used[..self.len].iter().flatten().next() {
+            Some(first) => first.zero_like(),
+            None => blaze_meter::Used::ZERO,
+        };
+        for used in self.used[..self.len].iter().flatten() {
+            sum = sum.plus(used);
+        }
+        for (_, spread) in &self.beside[..self.beside_len] {
+            if spread.n > 0 {
+                sum = sum.plus(&spread.sum);
+            }
+        }
+        sum
     }
 
     /// Nanoseconds since `main` began.
@@ -260,6 +371,40 @@ impl fmt::Display for Phases {
             write!(f, " · {name} {ns}")?;
         }
         writeln!(f, " · in main {} (ns; the profile's own write and exit are after this line)", self.in_main())?;
+        // Where the time before `main` went, as the process's own counters say (all threads,
+        // from its start): CPU against the wall above is work; the rest a wait or a page-in.
+        let used = self.before_main_used;
+        write!(f, "before main  ")?;
+        for (name, reading) in [
+            ("user ns", used.user_ns),
+            ("system ns", used.system_ns),
+            ("instructions", used.instructions),
+            ("minor faults", used.minor_faults),
+            ("major faults", used.major_faults),
+        ] {
+            match reading {
+                blaze_meter::Reading::Got(n) => write!(f, "{name} {n} · ")?,
+                blaze_meter::Reading::Unavailable(why) => write!(f, "{name} unread ({why:?}) · ")?,
+            }
+        }
+        writeln!(f, "(the process's own counters from its start to main's first line)")?;
+        // D169: what each phase used, one line a phase, only its counters that are not zero.
+        for ((name, _), used) in self.rows[..self.len].iter().zip(self.used.iter()) {
+            match used {
+                Ok(used) => writeln!(f, "phase used   {name}: {used}")?,
+                Err(why) => writeln!(f, "phase used   {name}: not metered: {why}")?,
+            }
+        }
+        for (kind, spread) in &self.beside[..self.beside_len] {
+            writeln!(f, "beside       {kind}, {} stretches on other threads: {}", spread.n, spread.sum)?;
+            if let Some(why) = spread.first_unpaired {
+                writeln!(f, "             {} stretches not metered, the first: {why}", spread.unpaired)?;
+            }
+            writeln!(f, "             the mean one: {}", spread.mean())?;
+            writeln!(f, "             each counter's most: {}", spread.most)?;
+        }
+        reconciled(f, &self.accounted(), &blaze_meter::Process::now())?;
+        floors(f, &self.accounted(), &self.used[..self.len])?;
         writeln!(f, "names        worlds made {}", self.worlds)?;
         let r = self.request;
         writeln!(
@@ -283,6 +428,9 @@ impl fmt::Display for Phases {
             writeln!(f, "run          {}", tally.codes)?;
             writeln!(f, "run          {}", tally.start)?;
             writeln!(f, "run          {}", tally.lowerings)?;
+            if let Some(walk) = tally.walk {
+                writeln!(f, "run walk     {walk}")?;
+            }
         }
         if let Some(read) = self.run_names {
             writeln!(f, "run          {read}")?;
@@ -311,6 +459,82 @@ impl fmt::Display for Phases {
         memory_line(f, "by the profile", &blaze_mem::syscalls::snapshot())?;
         held_line(f, &blaze_mem::tag::snapshot())
     }
+}
+
+/// The reconciliation (D169): each counter the process keeps in all, against what the phases
+/// and the stretches beside them accounted; a share under [`ACCOUNTED_PERCENT`] is a line of
+/// its own, `UNACCOUNTED <counter>: <amount>`. The process's heap is blaze-mem's churn, folded
+/// a batch at a time per thread (counted.rs), so it may trail the meter's by a batch a thread.
+fn reconciled(f: &mut fmt::Formatter<'_>, accounted: &blaze_meter::Used, process: &blaze_meter::Process) -> fmt::Result {
+    use blaze_meter::{Bytes, Count, Large, Ns, Reading};
+    let s = blaze_mem::tag::snapshot();
+    let heap = blaze_mem::Tag::ALL.iter().fold(s.heap_outside_allocated, |sum, tag| sum.saturating_add(s.get(*tag).heap_allocated));
+    let a = accounted.system;
+    let p = process.system;
+    #[derive(Clone, Copy)]
+    enum Unit {
+        Count,
+        Bytes,
+        Ns,
+    }
+    let rows: [(&str, Reading, Reading, Unit); 6] = [
+        ("instr", a.instructions, p.instructions, Unit::Count),
+        ("cycles", a.cycles, p.cycles, Unit::Count),
+        ("user", a.user_ns, p.user_ns, Unit::Ns),
+        ("sys", a.system_ns, p.system_ns, Unit::Ns),
+        ("faults", a.faults(), p.faults(), Unit::Count),
+        ("heap bytes", Reading::Got(accounted.count(Count::HeapBytes)), Reading::Got(heap), Unit::Bytes),
+    ];
+    let amount = |f: &mut fmt::Formatter<'_>, unit: Unit, n: u64| match unit {
+        Unit::Count => write!(f, "{}", Large(n)),
+        Unit::Bytes => write!(f, "{}", Bytes(n)),
+        Unit::Ns => write!(f, "{}", Ns(n)),
+    };
+    write!(f, "meter        accounted of the process's totals:")?;
+    let mut short: [Option<(&str, u64, Unit)>; 6] = [None; 6];
+    for (at, (name, got, all, unit)) in rows.iter().enumerate() {
+        match (got, all) {
+            (Reading::Got(got), Reading::Got(all)) => {
+                write!(f, " · {name} ")?;
+                amount(f, *unit, *got)?;
+                write!(f, " of ")?;
+                amount(f, *unit, *all)?;
+                let percent = if *all == 0 { 100 } else { got.saturating_mul(100) / all };
+                write!(f, " ({percent}%)")?;
+                if percent < ACCOUNTED_PERCENT {
+                    short[at] = Some((name, all.saturating_sub(*got), *unit));
+                }
+            }
+            (Reading::Unavailable(why), _) | (_, Reading::Unavailable(why)) => write!(f, " · {name} unavailable ({})", why.says())?,
+        }
+    }
+    match process.most_resident {
+        Reading::Got(bytes) => writeln!(f, " · most resident {}", Bytes(bytes))?,
+        Reading::Unavailable(why) => writeln!(f, " · most resident unavailable ({})", why.says())?,
+    }
+    for (name, missing, unit) in short.iter().flatten() {
+        write!(f, "UNACCOUNTED {name}: ")?;
+        amount(f, *unit, *missing)?;
+        writeln!(f)?;
+    }
+    Ok(())
+}
+
+/// D168's floors, each with its floor: store asks answered again (asks less keys that reached
+/// the store, floor 0); heads listed (no counter yet: said so, never 0); heap bytes kept past
+/// the phases on this thread (allocated less freed over every metered phase, floor 0; signed,
+/// as the thread may free what other threads allocated: `-` then, never a saturated 0).
+fn floors(f: &mut fmt::Formatter<'_>, accounted: &blaze_meter::Used, phases: &[Result<blaze_meter::Used, blaze_meter::Unpaired>]) -> fmt::Result {
+    use blaze_meter::{Bytes, Count, Grouped};
+    let repeat = accounted.count(Count::StoreGets).saturating_sub(accounted.count(Count::StoreKeys));
+    let kept: i128 = phases.iter().flatten().map(blaze_meter::Used::heap_kept).sum();
+    let sign = if kept < 0 { "-" } else { "" };
+    writeln!(
+        f,
+        "floors       repeat store asks {} (floor 0) · heads listed: not metered · heap kept past the phases on the command's thread {sign}{} (floor 0)",
+        Grouped(repeat),
+        Bytes(u64::try_from(kept.unsigned_abs()).unwrap_or(u64::MAX))
+    )
 }
 
 /// The `memory held` line: where the command's peak footprint can sit, each number blaze-mem's
@@ -353,9 +577,9 @@ mod tests {
     fn run_stats_and_profile_print_lowering_counts() {
         let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
         let mut phases = Phases::new(io.need_clock().expect("the simulated clock"));
-        let start = StartTally { placed: 0, answered: 0, data: 0, resolved: 0, built: Built::Head, held: ListHeld::None };
+        let start = StartTally { placed: 0, answered: 0, data: 0, positioned: 0, resolved: 0, built: Built::Head, held: ListHeld::None };
         let lowerings = LoweringCounts { bodies_lowered: 7, lower_again: 2, forks: 1 };
-        phases.code_records = Some(RunTally { codes: Tally::default(), start, lowerings });
+        phases.code_records = Some(RunTally { codes: Tally::default(), start, lowerings, walk: None });
         let profile = std::format!("{phases}");
         assert!(profile.lines().any(|line| line == "run          bodies lowered 7, lower_again calls 2, forks 1"), "{profile}");
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("the simulated context");
@@ -363,5 +587,30 @@ mod tests {
         phases.write_lowering_stats(&cx, &err).unwrap();
         err.flush(&cx).unwrap();
         io.script(|host| assert_eq!(host.err.as_slice(), b"blaze: bodies lowered 7, lower_again calls 2, forks 1\n")).expect("the simulated host");
+    }
+
+    /// A bstd wait in a phase is in that phase's use when it is marked through the command's
+    /// `cx` ([`Phases::mark_cx`]); CONTROL (rule 23): marked as before ([`Phases::mark_in`]),
+    /// the same wait is in no phase ("0 waits" on tempo's 177 ms replay).
+    #[test]
+    fn a_wait_in_a_phase_is_in_its_use_when_marked_through_cx() {
+        let io = Io::simulated(SimWorld::new(5, Limits::USUAL));
+        let clock = io.need_clock().expect("the simulated clock");
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("the simulated context");
+        let frame = cx.frame();
+        let mut phases = Phases::new(io.need_clock().expect("the simulated clock"));
+        phases.mark_cx(&cx, "before", frame);
+        clock.sleep(&cx, core::time::Duration::from_millis(5)).expect("the sleep");
+        phases.mark_cx(&cx, "slept", frame);
+        phases.mark_cx(&cx, "nothing", frame);
+        let waited = |row: usize| phases.used[row].as_ref().map(|used| used.waited.total()).expect("one thread's marks pair");
+        let (count, ns) = waited(1);
+        assert!(count >= 1 && ns >= 5_000_000, "the sleep is in the phase it ran in: {count} waits {ns} ns");
+        assert_eq!(waited(2), (0, 0), "and in no later phase");
+        clock.sleep(&cx, core::time::Duration::from_millis(5)).expect("the sleep");
+        phases.mark_in("slept, marked without cx", frame);
+        // A fresh reader: the first one's borrow of `phases` ended at its last call, before the mark.
+        let waited = |row: usize| phases.used[row].as_ref().map(|used| used.waited.total()).expect("one thread's marks pair");
+        assert_eq!(waited(3), (0, 0), "the control: the thread's meter alone cannot see a worker's wait");
     }
 }

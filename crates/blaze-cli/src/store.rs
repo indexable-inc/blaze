@@ -1,5 +1,6 @@
 //! Records by key (drive.md, "The system side", "Store"; "D114 rulings", "The store under the
-//! command"): ONE store a user, blaze-cas's plain store at `<home>/.blaze/v2/store`, read and
+//! command"): ONE store a user, blaze-cas's plain store at `<home>/.blaze/`
+//! [`plain_place::STORE_DIR`] (`v2/store/f5s2`: its forms name its folder, D160), read and
 //! written by every checkout and worktree, records read IN PLACE ([`plain_place`]). A get is
 //! a probe of the segments the head names, each mapped at its first probe; the request's first
 //! pool task maps the rest ([`Store::map_all`]); a put is copied once into the command's arena;
@@ -24,10 +25,11 @@ use blaze_ids::ContentId;
 
 use core::fmt;
 use core::time::Duration;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use blaze_cas::plain::{Lent, Settings, Snapshot};
 use blaze_core::Driver;
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Arc};
 use blaze_remote::PublicKey;
 use blaze_remote::published::set::SetCheck;
 use blaze_remote::read::{Answer, BatchError, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
@@ -50,7 +52,7 @@ use crate::CliError;
 
 /// The command's store on blaze-cas's plain store: `Lent`, `PlainPlace`, the proof.
 pub(crate) mod plain_place;
-pub use plain_place::{AfterAnswer, Checked, Counts, Facts, Held, PlaceError, PlainPlace, StoreAlloc};
+pub use plain_place::{Facts, Held, PlaceError, PlainPlace, StoreAlloc};
 
 /// What keeps a record after its command: one typed root per lifetime class.
 pub(crate) mod roots;
@@ -74,6 +76,18 @@ pub(crate) const TRUSTED_BUILDER: bool = cfg!(feature = "publish");
 /// The seam the request reads and writes records through. `'m` is the borrow of the command's
 /// [`Lent`]: a [`Held<'m>`] outlives every later get and put (blaze-cas plain/lent.rs).
 pub trait Store<'m> {
+    /// The committed records visible to one request's read-only workers. `None` is a typed
+    /// refusal for a test or alternate store that cannot lend the immutable view.
+    fn snapshot(&self) -> Result<Option<SharedSnapshot>, CliError> {
+        Ok(None)
+    }
+
+    /// The drive can hand a body inputs still in its put arena. Seal those inputs before
+    /// lending the round's read-only view to the workers.
+    fn commit_for_body_reads(&mut self) -> Result<SharedSnapshot, CliError> {
+        Err(CliError::Text { what: "this store cannot commit the body round's expansion records" })
+    }
+
     /// The record at `key`, in place; `None` when there is none.
     fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError>;
     /// The record at `key` copied into `into`, for a reader whose bytes must live in its own
@@ -120,9 +134,44 @@ pub trait Store<'m> {
     /// by the names step with them: their records are kept under the toolchain's root, for
     /// every checkout on the toolchain (store/roots.rs `keep_toolchain`).
     fn toolchain_crates(&mut self, subjects: &[ContentId]);
+    /// A record made of the toolchain alone, read or put this command (a side's library-features
+    /// listing, scripts.rs `CommandFeatures`): kept under the toolchain's root with the
+    /// toolchain's crates' records, by the answer's save ([`CommandStore::keep_toolchain`]),
+    /// renewed with that root. A store with no roots keeps nothing.
+    fn keep_with_toolchain(&mut self, key: Key) -> Result<(), CliError>;
     /// What this store's puts cost the process so far (rules 50, 51): the copies of records it
     /// made into the heap and the bytes of them it holds now, counted where it copies.
     fn kept(&self) -> StoreKept;
+}
+
+/// A verified, immutable view of the store's committed generation. The mappings are owned by the
+/// snapshot and can be read concurrently by body workers without borrowing the mutable command
+/// store.
+pub(crate) struct StoreSnapshot {
+    inner: Snapshot<blaze_mem::Kept>,
+    expansion_demands: AtomicU64,
+}
+
+pub(crate) type SharedSnapshot = Arc<StoreSnapshot, blaze_mem::Kept>;
+
+impl StoreSnapshot {
+    /// A regular snapshot read. It is not an expansion-text demand and therefore does not enter
+    /// the Bodies expansion diagnostic.
+    pub(crate) fn get(&self, key: Key) -> Result<Option<&[u8]>, blaze_cas::plain::SnapshotError> {
+        self.inner.get(&blaze_cas::Key(key.0))
+    }
+
+    /// The lazy expansion loader's record source. Every demand is counted for the Bodies stage's
+    /// profile after every worker has joined. The phase owns its distinct-key set.
+    pub(crate) fn expansion_get(&self, key: Key) -> Result<Option<&[u8]>, blaze_cas::plain::SnapshotError> {
+        self.expansion_demands.fetch_add(1, Ordering::Relaxed);
+        self.inner.get(&blaze_cas::Key(key.0))
+    }
+
+    pub(crate) fn expansion_demands(&self) -> u64 {
+        self.expansion_demands.load(Ordering::Relaxed)
+    }
+
 }
 
 /// The bytes of records a [`Store`] copied into this process's heap, and holds now (a gauge):
@@ -143,13 +192,18 @@ const HOME_FOLDER: &str = ".blaze";
 pub(crate) const OLD_HOME: [&str; 2] = ["v2/shared", "v2/own"];
 /// The stand-in's forms under a checkout: its packs folder and its `last` pointer file (the
 /// last answer and leaf table are now a root of the one store, drive.md ruling 3).
-pub(crate) const OLD_CHECKOUT: [&str; 2] = [".blaze/v2/packs", ".blaze/v2/at"];
+/// Named from clean.rs's one list of a checkout's entries, so `blaze clean` removes them.
+pub(crate) const OLD_CHECKOUT: [&str; 2] = [crate::clean::CheckoutEntry::Packs.path(), crate::clean::CheckoutEntry::At.path()];
 /// The roots that say the old forms were looked for: the home's once, each checkout's once
 /// (its name ends in the digest of the checkout's path, drive.md ruling 3).
 const OLD_HOME_LOOKED: &str = "blaze.old-home-looked";
 const OLD_CHECKOUT_LOOKED: &str = "blaze.old-packs-looked.";
 
-/// Compaction slices run after the answer, each bounded by blaze-cas `SLICE_BYTES`.
+/// Whether compaction runs after the answer (past zero: it does): the first slice folded into
+/// the answer's commit, which restores blaze-cas's tier invariant for the namespace it merges
+/// however far behind it is (`plain::core::Tiers`, the tiered merge), then one more slice a
+/// namespace still behind while blaze-cas `Plain::cleanup_goes_on` holds (its work budget,
+/// [`plain_place::after_answer`]).
 pub(crate) const AFTER_ANSWER_SLICES: u32 = 1;
 
 /// Why the command's store stopped it, by name (rule 19).
@@ -165,6 +219,9 @@ pub enum StoreFailure {
     Copy(Stopped),
     /// Looking for an old form's folder failed.
     Look { folder: &'static str, error: FsError },
+    /// The store root holds more than `most` stores of other forms (D160, store/forms.rs
+    /// `OTHER_FORMS_MOST`): refused by the count, never cut.
+    OtherForms { most: usize },
     /// A put of other bytes under a key the store holds (rule 21): the store's refusal, and
     /// the two records opened, so the refusal names the record and where they differ.
     TwoValues { key: Key, lent: blaze_cas::plain::LentError, clash: Clash },
@@ -202,7 +259,7 @@ impl Form {
 /// first field they differ in, and the first names that differ when the field is a list of
 /// reads (a shape's read names, a whole record's reads or parts), or the first differing byte
 /// of the payload. `label` is the crate or file the name is of, filled by the command where it
-/// knows the crate list ([`Clash::label_with`]).
+/// knows the crate list.
 #[derive(Debug)]
 pub struct Clash {
     pub name: Option<Name>,
@@ -392,20 +449,6 @@ impl Clash {
         }
         clash
     }
-
-    /// The crate the record's name is of, from the command's crate list: a `CrateScope`, its
-    /// `Links`, or any task named by a crate's subject (work.rs `tally`'s labels).
-    pub(crate) fn label_with(&mut self, names: Option<&crate::names::Names<'_>>) {
-        let Some(name) = self.name else { return };
-        let Some((krate, macro_side)) = names.and_then(|names| names.crate_at(name.subject).map(|at| names.crate_label(at))) else { return };
-        let mut label = blaze_own::String::new_in(Global);
-        label.push_str("crate ");
-        label.push_str(krate);
-        if macro_side {
-            label.push_str(" (macro side)");
-        }
-        self.label = Some(label);
-    }
 }
 
 impl fmt::Display for Clash {
@@ -463,7 +506,12 @@ impl Clash {
 impl fmt::Display for StoreFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StoreFailure::NoHome => f.write_str("HOME is not set: blaze's one store is under the home's .blaze/v2/store (rule: store.rs)"),
+            StoreFailure::NoHome => write!(f, "HOME is not set: blaze's one store is under the home's .blaze/{} (rule: store.rs)", plain_place::STORE_DIR),
+            StoreFailure::OtherForms { most } => write!(
+                f,
+                "the home's .blaze/{} holds more than {most} stores of other forms; blaze lists at most {most} (rule 18): remove them with `blaze clean`",
+                plain_place::STORE_ROOT
+            ),
             StoreFailure::Home(error) => write!(f, "the home: {error}"),
             StoreFailure::Place(error) => write!(f, "{error}"),
             StoreFailure::Copy(stopped) => write!(f, "a record read from the store: {stopped}"),
@@ -472,7 +520,7 @@ impl fmt::Display for StoreFailure {
             StoreFailure::Published(error) => write!(f, "{error}"),
             StoreFailure::Take(error) => write!(f, "{error}"),
             StoreFailure::TwoValues { key, lent, clash } => {
-                write!(f, "the store under the home's .blaze/v2/store: two values under one key {key}: the record of ")?;
+                write!(f, "the store under the home's .blaze/{}: two values under one key {key}: the record of ", plain_place::STORE_DIR)?;
                 clash.write_subject(f)?;
                 // Whether `blaze clean --store` lets the user go on: only when the held value is
                 // a committed one (an earlier command's); two values made by this one command
@@ -657,6 +705,9 @@ pub struct CommandStore<'m, 'r, D: Driver, S: Sharing = ToolchainCrates> {
     /// The toolchain's crates by their `CrateScope` subjects, sorted ([`Store::toolchain_crates`]):
     /// their records go under the toolchain's root ([`CommandStore::keep_toolchain`]).
     toolchain: std::vec::Vec<ContentId, Global>,
+    /// The records of the toolchain alone this command read or put ([`Store::keep_with_toolchain`]),
+    /// in the store's allocator: named by the toolchain's root at the answer's save.
+    toolchain_records: std::vec::Vec<Key, StoreAlloc>,
     remote: Option<Remote<'r>>,
     mapped_all: bool,
     /// The open's time, for the profile and `--stats`.
@@ -665,7 +716,9 @@ pub struct CommandStore<'m, 'r, D: Driver, S: Sharing = ToolchainCrates> {
 
 impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
     /// The handle over `lent`, opened in `open_ns`, then `origin` when one is named. Past
-    /// [`plain_place::SEGMENTS_NAMED_MOST`] segments named, one line says compaction is behind.
+    /// the bound blaze-cas's tiered merge keeps after a cleanup (`Lent::named_most`: 49 a
+    /// namespace) segments named, one line says compaction is behind (a crashed command's
+    /// commits, or a trusted writer's namespaces waiting for their slices).
     #[expect(clippy::too_many_arguments, reason = "the store's edge: each argument one handle or fact of it")]
     pub fn new(cx: &Cx, lent: &'m Lent<D, StoreAlloc>, public_writer: bool, open_ns: u64, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<CommandStore<'m, 'r, D>, CliError> {
         let remote = origin.map(|named| Remote {
@@ -684,11 +737,12 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
             floored: false,
         });
         let (_, named) = lent.mapped_of_named();
-        if named > plain_place::SEGMENTS_NAMED_MOST {
-            err.line(cx, format_args!("blaze: the store under the home's .blaze/{} names {named} segments, past {}: its compaction is behind", plain_place::STORE_DIR, plain_place::SEGMENTS_NAMED_MOST))?;
+        let most = lent.named_most();
+        if named > most {
+            err.line(cx, format_args!("blaze: the store under the home's .blaze/{} names {named} segments, past {most}: its compaction is behind", plain_place::STORE_DIR))?;
         }
         // A trusted builder's blaze writes the public class `PUBLIC` whoever calls ([`TRUSTED_BUILDER`]).
-        Ok(CommandStore { place: PlainPlace::new(lent, public_writer || TRUSTED_BUILDER), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), remote, mapped_all: false, open_ns })
+        Ok(CommandStore { place: PlainPlace::new(lent, public_writer || TRUSTED_BUILDER), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), toolchain_records: std::vec::Vec::new_in(*lent.alloc()), remote, mapped_all: false, open_ns })
     }
 }
 
@@ -728,6 +782,8 @@ pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout
     let lent = home.open_store(&settings, Facts { boot, nonce }, heap.alloc())?;
     let open_ns = ns(clock).saturating_sub(began);
     old_home(cx, &home, checkout_root, checkout, &lent, err)?;
+    // Stores of other forms beside this blaze's (D160): said once, never read.
+    plain_place::forms::note_once(cx, &home.dir, &lent, err)?;
     Ok(Opened { home, lent, open_ns })
 }
 
@@ -747,13 +803,19 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
 /// effect (the process exits right after). Answers the cleanup line, whole (its slice and what
 /// the commit carried too): a caller that writes its profile after the commit (the engine's
 /// `check`, engine_check.rs) puts it there; one that wrote its profile before put
-/// [`roots::CleanupLine::before_commit`] there instead.
-pub fn after_answer_printed(cx: &Cx, lent: CommandLent, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
+/// [`roots::CleanupLine::before_commit`] there instead. After the commit, the sweep of stores of
+/// other forms under `home` (D160, clean.rs `sweep_other_forms`): one unused past forms.rs
+/// `EXPIRY_DAYS` is removed and said; this blaze's own folder never is.
+pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let answered = ns(clock);
-    let after = plain_place::after_answer(&lent, AFTER_ANSWER_SLICES)?;
+    let after = plain_place::after_answer(cx, &lent, AFTER_ANSWER_SLICES)?;
     let commit_ns = ns(clock).saturating_sub(answered);
     drop(lent);
+    {
+        let cx = cx.span("store after answer: sweep of other forms' stores (a listing of the store root)");
+        crate::clean::sweep_other_forms(&cx, &home.dir, clock.wall().as_ns(), err, crate::clean::SweepPlant::None)?;
+    }
     if stats {
         err.line(
             cx,
@@ -795,72 +857,7 @@ pub(crate) fn draw_nonce(rng: &mut bstd::rng::Rng, plant: NoncePlant) -> u64 {
     }
 }
 
-/// The root a checkout's last answer for one request shape hangs from (drive.md ruling 3):
-/// `last.<16 hex of H(checkout path)>.<the pointer's 16 hex of H(tool, shape)>`. The one place a
-/// digest of a machine's path stands: a root is `LOCAL`, never sealed or published.
-pub fn last_root(checkout: &str, pointer: &blaze_drive::pointers::PointerName) -> std::string::String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = std::string::String::with_capacity(5 + 16 + 1 + 16);
-    name.push_str("last.");
-    for byte in &ContentId::of("blaze-cli last root checkout", checkout.as_bytes()).0[..8] {
-        name.push(char::from(HEX[usize::from(byte >> 4)]));
-        name.push(char::from(HEX[usize::from(byte & 15)]));
-    }
-    name.push('.');
-    for &byte in pointer.bytes() {
-        name.push(char::from(byte));
-    }
-    name
-}
-
-/// The root naming the last answer written for one units' source and request shape, by any
-/// checkout on this machine: `seed.<16 hex of the units' source>.<the pointer's 16 hex>`. A
-/// checkout with no last answer of its own (a second worktree's first command) follows it
-/// (main.rs `request`): its reads re-hashed here key the certificate, so equal text is a hit,
-/// other text a miss that walks forward from that answer. No machine's path: a checkout's
-/// layout reads relative paths, so two worktrees of one tree name one seed. `LOCAL`, like
-/// [`last_root`].
-pub fn seed_root(units: &ContentId, pointer: &blaze_drive::pointers::PointerName) -> std::string::String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = std::string::String::with_capacity(5 + 16 + 1 + 16);
-    name.push_str("seed.");
-    for byte in &units.0[..8] {
-        name.push(char::from(HEX[usize::from(byte >> 4)]));
-        name.push(char::from(HEX[usize::from(byte & 15)]));
-    }
-    name.push('.');
-    for &byte in pointer.bytes() {
-        name.push(char::from(byte));
-    }
-    name
-}
-
-/// The checkout's last answer and leaf table for one request shape, in place: the one record the
-/// root `root` ([`last_root`]) names (main.rs seals it with `seal::seal`). Read before the
-/// request's handle is made and never asked of an origin: a root is `LOCAL`. `None`: no root
-/// yet, or a root naming no single record (the request answers in full).
-pub fn last<'m, D: Driver>(lent: &'m Lent<D, StoreAlloc>, root: &str) -> Result<Option<Held<'m>>, CliError> {
-    let place = PlainPlace::new(lent, false);
-    let Some(named) = place.root(root)? else { return Ok(None) };
-    let Ok(key) = <[u8; 32]>::try_from(named.bytes) else { return Ok(None) };
-    Ok(place.get(Key(ContentId(key)))?)
-}
-
 impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
-    /// `sealed` as the checkout's last answer for one request shape: put under its content key
-    /// and named by each root of `roots` (the checkout's [`last_root`], and the [`seed_root`]
-    /// of its units' source). All ride the ONE commit after the answer is printed
-    /// ([`plain_place::after_answer`]): no generation names a pointer whose record is absent
-    /// (blaze-cas plain/root_commit_tests.rs).
-    pub fn set_last(&mut self, cx: &Cx, roots: &[&str], sealed: &[u8]) -> Result<(), CliError> {
-        let key = Key(ContentId::of("blaze-cli last answer record", sealed));
-        self.put(cx, key, sealed)?;
-        for root in roots {
-            self.place.pin(root, &[key])?;
-        }
-        Ok(())
-    }
-
     /// The keys the root `name` names, in place (32 bytes each, in order): `None` when there
     /// is no root of that name (engine_answer.rs reads the engine's stored answer by it).
     pub fn named(&self, name: &str) -> Result<Option<&'m [u8]>, CliError> {
@@ -895,14 +892,6 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
-    /// [`CommandStore::pin`] through index records: `keys`, and the records filed beside each
-    /// of `owners` (a names record's expansion records), kept by the root `name`
-    /// (plain_place.rs `pin_through`).
-    pub fn pin_through(&mut self, name: &str, keys: &[Key], owners: &[Key]) -> Result<(), CliError> {
-        self.place.pin_through(name, keys, owners)?;
-        Ok(())
-    }
-
     /// The toolchain's records this command's answer names, `records` (std's names records and
     /// the like: their `CrateScope` subjects were told public by the names step,
     /// [`Store::public_crates`]) and those filed beside them, kept under the toolchain's root
@@ -910,8 +899,15 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
     /// command that answers with them.
     pub fn keep_toolchain(&mut self, toolchain: blaze_toolchain::ToolchainId, records: &[Key]) -> Result<(), CliError> {
         let alloc = *self.place.lent().alloc();
-        let mut made = std::vec::Vec::with_capacity_in(records.len(), alloc);
+        let mut made = std::vec::Vec::with_capacity_in(records.len() + self.toolchain_records.len(), alloc);
         made.extend(records.iter().map(|key| blaze_cas::Key(key.0)));
+        // The records of the toolchain alone this command read or put (`keep_with_toolchain`):
+        // sorted and once each, so an equal set is an equal index (rule 25).
+        let mut alone = std::vec::Vec::with_capacity_in(self.toolchain_records.len(), alloc);
+        alone.extend(self.toolchain_records.iter().map(|key| blaze_cas::Key(key.0)));
+        alone.sort_unstable();
+        alone.dedup();
+        made.extend(alone);
         let mut beside = std::vec::Vec::new_in(alloc);
         for record in records {
             if let Some(index) = self.place.beside(*record)? {
@@ -942,6 +938,17 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
 }
 
 impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
+    fn commit_for_body_reads(&mut self) -> Result<SharedSnapshot, CliError> {
+        self.commit_puts()?;
+        self.snapshot()?.ok_or(CliError::Text { what: "the committed body round has no store snapshot" })
+    }
+
+    fn snapshot(&self) -> Result<Option<SharedSnapshot>, CliError> {
+        let alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
+        let inner = self.place.snapshot_in(alloc)?;
+        Ok(Some(Arc::new_in(StoreSnapshot { inner, expansion_demands: AtomicU64::new(0) }, alloc)))
+    }
+
     fn public_crates(&mut self, subjects: &[ContentId]) {
         self.sharing.add_public(subjects);
     }
@@ -950,6 +957,16 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         self.toolchain.extend_from_slice(subjects);
         self.toolchain.sort_unstable();
         self.toolchain.dedup();
+    }
+
+    fn keep_with_toolchain(&mut self, key: Key) -> Result<(), CliError> {
+        if self.toolchain_records.contains(&key) {
+            return Ok(());
+        }
+        let had = self.toolchain_records.len();
+        self.toolchain_records.try_reserve(1).map_err(|_| CliError::EngineCheck(crate::engine_check::EngineCheckError::Grow { what: "the store's records of the toolchain alone", had }))?;
+        self.toolchain_records.push(key);
+        Ok(())
     }
 
     fn kept(&self) -> StoreKept {
@@ -1407,11 +1424,6 @@ impl Remote<'_> {
 #[cfg(test)]
 #[path = "store_http_tests.rs"]
 mod http_tests;
-
-/// Two worktrees on one home (remote-read.md, "Shared across worktrees (2026-11-16)").
-#[cfg(test)]
-#[path = "store_worktree_tests.rs"]
-mod worktree_tests;
 
 /// The old home's report and the no-home refusal, on bstd's simulated world.
 #[cfg(test)]

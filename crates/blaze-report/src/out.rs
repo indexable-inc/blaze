@@ -15,7 +15,7 @@
 
 use std::{
     fmt,
-    io::{self, Write as _},
+    io,
     sync::OnceLock,
 };
 

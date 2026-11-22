@@ -5,8 +5,8 @@ use std::{
 };
 
 use blaze_format::{
-    Aligned, FormatError, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, buffer_id,
-    open_as, schema_of, to_bytes,
+    Aligned, FormatError, Own, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, WriterIn,
+    buffer_id, open_as, schema_of, to_bytes,
 };
 use blaze_ids::{ContentId, Domain, Hasher, Idx, Interner, rng::SplitMix64 as Rng};
 
@@ -77,7 +77,7 @@ mod records {
     }
 }
 
-fn write_leaf(leaf: &Leaf, out: &mut Writer) -> u64 {
+fn write_leaf<P: WriterIn>(leaf: &Leaf, out: &mut Writer<P>) -> u64 {
     let name = out.push_str(&leaf.name);
     let at = out.next::<LeafRoot>();
     let name = match leaf.name.is_empty() {
@@ -101,7 +101,7 @@ impl Persist for Leaf {
     ]);
     type Ref<'a> = (u64, &'a str);
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         write_leaf(self, out)
     }
 
@@ -126,7 +126,7 @@ impl Persist for Pair {
     ]);
     type Ref<'a> = ((u64, &'a str), (u64, &'a str));
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         let left = write_leaf(self.left.get(), out);
         let right = write_leaf(self.right.get(), out);
         let at = out.next::<PairRoot>();
@@ -437,8 +437,9 @@ fn a_handle_hashes_as_its_fingerprint() {
 fn a_handle_persists_as_its_value() {
     let leaves = leaked::<Leaf>();
     let handle = leaves.intern(leaf(5, "five"));
-    let bytes = to_bytes(&handle);
-    assert_eq!(bytes, to_bytes(handle.get()));
+    let heap = Own(blaze_own::testing::heap().alloc());
+    let bytes = to_bytes(&handle, heap);
+    assert_eq!(bytes, to_bytes(handle.get(), heap));
     let buffer = Aligned::copy_from(&bytes);
     assert_eq!(<Interned<'static, Leaf> as Persist>::read(&buffer).unwrap(), (5, "five"));
     let fresh = HashCons::<Leaf>::new();

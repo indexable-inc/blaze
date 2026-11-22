@@ -5,12 +5,9 @@
 use std::vec::Vec;
 
 use blaze_id::ItemKey;
-use blaze_own::Alloc;
-
 use super::{N, Solved, V, World, solve};
 use crate::{
-    AmbiguityKind, BindingState, DefKind, Edition, CallShape, Namespace, Read, Reply,
-    Resolver, ScopeError, Step, Unresolved, Visibility,
+    AmbiguityKind, DefKind, Edition, CallShape, Namespace, ScopeError, Unresolved, Visibility,
 };
 
 fn solved(w: &World) -> Solved {
@@ -68,7 +65,7 @@ fn a_ring_of_globs_reaches_its_fixpoint() {
 fn derive_helpers_scope_the_attributes_after_them() {
     let mut w = World::new();
     let dep_root = w.root(2, Edition::E2021);
-    let ser = w.derive_macro(dep_root, "Ser", &["serde"]);
+    let _ser = w.derive_macro(dep_root, "Ser", &["serde"]);
     let root = w.root(1, Edition::E2021);
     w.dep(root, "dep", dep_root);
     w.use_(root, "dep::Ser", V::Priv);

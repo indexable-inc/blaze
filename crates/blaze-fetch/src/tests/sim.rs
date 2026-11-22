@@ -15,7 +15,8 @@
 //! The oracles: every record in the store is the truth for its key ("wrong bytes"); no hostile
 //! crate is ever stored ("outside its folder", "a bomb was stored"); no allocation goes past
 //! its bound ("allocated past its bound"); every run ends ("hang"); a calm run fetches every
-//! honest crate ("calm run left"); the run after it asks for nothing ("asked again"). Each
+//! honest crate ("calm run left"); the run after it asks for nothing ("asked again"); a run
+//! never asks a unit again after a failure ("tried again": one try, D172). Each
 //! planted bug of [`Plant`] is caught by the oracle that names it.
 
 use std::alloc::{AllocError, Allocator, Global, Layout};
@@ -109,8 +110,6 @@ fn limits(tape: &Tape) -> Limits {
     let mut limits = Limits::REAL;
     limits.in_flight_most = 1 + tape.below(4, "in flight") as u32;
     limits.ask_ns = 1_000_000_000;
-    limits.tries_most = 1 + tape.below(4, "tries") as u32;
-    limits.backoff_ns = 50_000_000;
     limits.crate_most = 256 << 10;
     // Small enough that some answers pass a first request's `most` and some requests wait.
     limits.first_most = 256 + tape.below(8192, "first most");
@@ -515,7 +514,7 @@ fn run(
         if machine.is_done() {
             // Late answers still arrive, and must change nothing.
             for (_, ask, _, _, _) in wire.drain(..) {
-                machine.answered(ask, now, Reply::Failed(NetFailure::Reset));
+                machine.answered(ask, Reply::Failed(NetFailure::Reset));
             }
             // The budget: requests' `most`s within it, and at most one record past it.
             let bound =
@@ -552,7 +551,7 @@ fn run(
             // length said.
             let fate = match fate {
                 Fate::Calm | Fate::Late if body.len() as u64 > most => {
-                    machine.answered(ask, now, Reply::Failed(NetFailure::TooBig { said: stated(body.len()) }));
+                    machine.answered(ask, Reply::Failed(NetFailure::TooBig { said: stated(body.len()) }));
                     continue;
                 }
                 fate => fate,
@@ -605,7 +604,7 @@ fn run(
             if let Reply::Body { bytes, .. } = reply {
                 kept.insert(ask.unit, bytes.to_vec());
             }
-            machine.answered(ask, now, reply);
+            machine.answered(ask, reply);
         }
     }
     Err(Broke::Oracle("a hang: the run took 20,000 steps".into()))
@@ -675,6 +674,14 @@ fn case_inner(tape: &Tape, crates: &[Crate], limits: Limits) -> Result<(), Broke
     let crash_at = tape.one_in(3, "crash").then(|| 1 + tape.below(12, "crash at") as u32);
     let first = run(tape, &units, crates, &mut store, limits, false, crash_at, alloc)?;
     judge_store(&units, crates, &store)?;
+    // One try (D172): whatever the origin's fates, no unit is asked more than its resized asks
+    // (a crate three times: the first, its stated length, the limit; a git commit four: its
+    // advertisement and its pack, each once more past a first `most`). A failure is never
+    // asked again in the run: a retry would pass this bound under a run of failing fates.
+    let tried_most: u32 = crates.iter().map(|krate| if krate.git.is_some() { 4 } else { 3 }).sum();
+    if first.asked > tried_most {
+        return Err(Broke::Oracle(format!("tried again: {} asks in a run, past one try's {tried_most}", first.asked)));
+    }
     if !first.crashed {
         for (outcome, krate) in first.outcomes.iter().zip(crates) {
             match (outcome, krate.hostile) {

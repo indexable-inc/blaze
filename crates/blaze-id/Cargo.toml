@@ -17,9 +17,9 @@ repository.workspace = true
 # By path, not `.workspace`: the workspace entries turn on the adapter features the crates above
 # need, which a member's entry cannot turn off, so this crate's own graph would hold them.
 # `ContentId` and `Fingerprint`: the hashes a key is made of.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 # `HashMap`: what a carried table is.
-blaze-hash = { path = "../blaze-hash" }
+blaze-hash.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

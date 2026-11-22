@@ -7,16 +7,21 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::Vec;
+use blaze_own::{Vec, planted::Planted};
 
 use crate::{
     error::{PathWhy, Why},
-    plant::{self, Plant},
+    plant::TarPlant,
 };
 
 /// `raw` in normal form, written to `out` (cleared first). An empty result is the top
-/// directory itself, which only a directory entry may name.
-pub(crate) fn normalize<A: Allocator>(raw: &[u8], most: u32, out: &mut Vec<u8, A>) -> Result<(), Why> {
+/// directory itself, which only a directory entry may name. `plant` is the seam.
+pub(crate) fn normalize<A: Allocator>(
+    raw: &[u8],
+    most: u32,
+    out: &mut Vec<u8, A>,
+    plant: impl Planted<TarPlant>,
+) -> Result<(), Why> {
     out.clear();
     if raw.len() > most as usize {
         return Err(Why::Path(PathWhy::TooLong { len: raw.len().min(u32::MAX as usize) as u32, most }));
@@ -26,7 +31,7 @@ pub(crate) fn normalize<A: Allocator>(raw: &[u8], most: u32, out: &mut Vec<u8, A
     for part in raw.split(|&b| b == b'/') {
         match part {
             b"" | b"." => {}
-            b".." if !plant::on(Plant::ParentUnchecked) => return Err(Why::Path(PathWhy::Parent)),
+            b".." if !plant.has(TarPlant::ParentUnchecked) => return Err(Why::Path(PathWhy::Parent)),
             _ => {
                 if !out.is_empty() {
                     out.push(b'/');

@@ -131,7 +131,7 @@ impl FetchIo for CargoIo<'_> {
         };
         let body = self.crates[ask.unit as usize].archive.clone();
         let (_, body) = self.last.insert((ask.unit, body));
-        Woke::Answer { ask, at: self.now, reply: Reply::Body { status: 200, bytes: body.as_slice() } }
+        Woke::Answer { ask, reply: Reply::Body { status: 200, bytes: body.as_slice() } }
     }
 
     fn keep(&mut self, unit: u32) {

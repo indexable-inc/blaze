@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Ended, Link, LinkPlant, LinkedChild, start_linked};
+use super::{Exit, Link, LinkPlant, LinkedChild, Waited, start_linked};
 use crate::{
     Command, Sandbox,
     wait::{Clock as _, Deadline, Monotonic},
@@ -102,12 +102,14 @@ fn group_gone(pgid: u32, within: Duration) -> bool {
 fn started_and_echoed() -> (LinkedChild, OwnedFd) {
     let (ours, theirs) = socket_pair();
     let inherit = [(theirs.as_fd(), 3u32)];
-    let child = start_linked(&command(), &Link { inherit: &inherit, own_group: true }).expect("a linked start");
+    let child = start_linked(&command(), &Link { inherit: &inherit, own_group: true }).expect("a linked start").child;
     drop(theirs);
     write_all(&ours, b"ping\n");
     assert_eq!(read_line(&ours), b"ping\n", "the child's echo on descriptor 3");
     let deadline = Deadline::after(child.clock().now(), Duration::from_millis(300));
-    assert_eq!(child.wait_until(deadline).expect("a wait by its deadline"), Ended::Deadline);
+    let Waited::Running(child) = child.wait_until(deadline).expect("a wait by its deadline") else {
+        panic!("the child ended before its 300 ms deadline; it waits for its sleep 60");
+    };
     (child, ours)
 }
 
@@ -117,18 +119,13 @@ fn linked_child_echoes_on_fd_3_and_its_group_is_killed() {
     // The real kill: the shell and its sleep both gone.
     let (child, _ours) = started_and_echoed();
     let pgid = child.pid();
-    child.kill_group().expect("the group killed");
-    assert_eq!(
-        child.wait_until(Deadline::PASSED).expect("its end, kept"),
-        Ended::Signaled(libc::SIGKILL),
-        "the leader ended by SIGKILL"
-    );
+    assert_eq!(child.kill_group().expect("the group killed"), Exit::Signaled(libc::SIGKILL), "the leader ended by SIGKILL");
     assert!(group_gone(pgid, Duration::from_secs(2)), "a member of group {pgid} is left after kill_group");
 
     // The plant: only the leader killed, so its sleep is left, and the oracle sees it.
     let (child, _ours) = started_and_echoed();
     let pgid = child.pid();
-    child.kill_with(LinkPlant::KillLeaderOnly).expect("the leader killed");
+    let _leader = child.kill_with(LinkPlant::KillLeaderOnly).expect("the leader killed");
     let caught = !group_gone(pgid, Duration::from_millis(500));
     // What the plant left: killed here, so no `sleep 60` outlives the test.
     // SAFETY: no pointers; the group still has its sleep as a member, so the id is its.

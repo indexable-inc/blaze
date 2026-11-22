@@ -46,7 +46,7 @@ use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
 use blaze_ladder::code_records::{Builder, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::{Maker, NamesRecords, walk_records};
 use blaze_mem::Frame;
@@ -266,11 +266,7 @@ impl Load<'static> for Kept {
         (krate == 0 && path.as_str() == self.path).then_some(self.text)
     }
 
-    fn expansion(&self, _krate: usize, _call: LibKey) -> Option<&'static str> {
-        None
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: LibKey) -> Option<(&'static [u8], &'static [u8])> {
+    fn expansion(&self, _krate: usize, _call: LibKey) -> Option<LoadedExpansion<'static>> {
         None
     }
 }

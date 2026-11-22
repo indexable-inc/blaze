@@ -24,23 +24,6 @@ crates/blaze-cargo/src/serve/unit/reads.rs	VERSION	none
 crates/blaze-cargo/src/serve/why.rs	MAGIC	none
 crates/blaze-cargo/src/toolchain/library/texts.rs	LAYOUT	none
 crates/blaze-cargo/src/toolchain/library/texts.rs	MAGIC	none
-crates/blaze-cas/src/collect.rs	PIN_MAGIC	none
-crates/blaze-cas/src/derived.rs	MAGIC	none
-crates/blaze-cas/src/disk.rs	HEAD_MAGIC	none
-crates/blaze-cas/src/disk.rs	PACK_MAGIC	none
-crates/blaze-cas/src/disk.rs	RECORD_MAGIC_HEADER	none
-crates/blaze-cas/src/disk.rs	RECORD_MAGIC_WHOLE	none
-crates/blaze-cas/src/disk.rs	SCHEMA_PREFIX	none
-crates/blaze-cas/src/index.rs	INDEX_MAGIC	none
-crates/blaze-cas/src/lib.rs	FORMAT	test a_store_of_an_older_format_is_read_and_goes_on
-crates/blaze-cas/src/lib.rs	FORMAT_READ	test a_store_of_an_older_format_is_read_and_goes_on
-crates/blaze-cas/src/remote.rs	ANSWER_MAGIC	none
-crates/blaze-cas/src/remote.rs	ASK_MAGIC	none
-crates/blaze-cas/src/remote.rs	VERSION	none
-crates/blaze-cas/src/sealed.rs	MAGIC	none
-crates/blaze-cas/src/sets.rs	MAGIC	none
-crates/blaze-cas/src/whole.rs	NAMES_MAGIC	none
-crates/blaze-cas/src/whole.rs	NAMES_MAGIC_1	none
 crates/blaze-certify/src/certificate.rs	LAYOUT	test a_list_of_the_previous_layout_is_refused_by_name
 crates/blaze-certify/src/certificate.rs	MAGIC	test a_list_of_the_previous_layout_is_refused_by_name
 crates/blaze-certify/src/kept.rs	MAGIC	none
@@ -62,8 +45,6 @@ crates/blaze-format/src/lib.rs	MAGIC	none
 crates/blaze-format/src/schema.rs	SCHEMA_DOMAIN	none
 crates/blaze-format/src/tiers.rs	COLD_VERSION	none
 crates/blaze-format/src/tiers/buffer.rs	FORM_VERSION	none
-crates/blaze-gc/src/ledger.rs	FORMAT	test a_file_of_the_previous_layout_is_refused_by_name
-crates/blaze-gc/src/record.rs	FORMAT	none
 crates/blaze-global/src/wire.rs	VERSION	not persisted: the remote protocol's version, said at hello
 crates/blaze-graph/src/admission.rs	ESTIMATES_MAGIC	none
 crates/blaze-graph/src/admission.rs	PEAKS_LAYOUT	test a_previous_layout_is_refused_naming_both
@@ -76,16 +57,8 @@ crates/blaze-hashcons/src/persist.rs	PACK_SCHEMA	none
 crates/blaze-history/src/codec.rs	MAGIC	none
 crates/blaze-history/src/section.rs	SCHEMA	none
 crates/blaze-hub/src/wire.rs	SCHEMA	not persisted: the hub's messages
-crates/blaze-image/src/spine.rs	LAYOUT	none
-crates/blaze-image/src/spine.rs	MAGIC	none
 crates/blaze-items/src/facts.rs	LAYOUT	none
 crates/blaze-items/src/hash.rs	LAYOUT_DOMAIN	none
-crates/blaze-kernel/src/entry.rs	ENTRY_MAGIC	none
-crates/blaze-kernel/src/entry.rs	ENTRY_MAGIC_FAMILY	none
-crates/blaze-kernel/src/session.rs	ROOT_MAGIC	none
-crates/blaze-kernel/src/table.rs	MAGIC	none
-crates/blaze-kernel/src/table.rs	MAGIC_FAMILY	none
-crates/blaze-kernel/src/trie.rs	MAGIC	none
 crates/blaze-launch-host/src/bind.rs	MAGIC	none
 crates/blaze-launch-host/src/record.rs	SPANS_MAGIC	none
 crates/blaze-launch-host/src/start.rs	MAGIC	none
@@ -148,9 +121,6 @@ crates/blaze-registry/src/auth/protocol.rs	VERSIONS	not persisted: the credentia
 crates/blaze-registry/src/index.rs	CACHE_VERSION	not persisted: cargo's index cache, not blaze's
 crates/blaze-script/src/engine.rs	STATUS_FORMAT	not persisted: a status line's form
 crates/blaze-shader/src/device.rs	MSL_VERSION	not persisted: the Metal language version asked for
-crates/blaze-solo/src/root.rs	SLOT_MAGIC	none
-crates/blaze-solo/src/table.rs	LAYOUT	none
-crates/blaze-solo/src/table.rs	MAGIC	none
 crates/blaze-std/src/task.rs	LAYOUT	not persisted: an enum value of this build
 crates/blaze-stencil/src/shape.rs	VERSION	none
 crates/blaze-stencil/src/table/format.rs	FORMAT	none
@@ -168,11 +138,6 @@ crates/blaze-usercode/src/test/wire.rs	MAGIC	none
 crates/blaze-usercode/src/test/wire.rs	VERSION	not persisted: the test protocol's version, said at hello
 crates/blaze-usercode/src/trace.rs	MAGIC	none
 crates/blaze-v2-proof/src/wire.rs	VERSION	none
-crates/blaze-vfs/src/disk.rs	MAGIC	none
-crates/blaze-vfs/src/image.rs	DISKS_SCHEMA	none
-crates/blaze-vfs/src/image.rs	TREE_SCHEMA	none
-crates/blaze-vfs/src/journal.rs	MAGIC	none
-crates/blaze-vfs/src/texts.rs	TEXT_SCHEMA	none
 crates/blaze-wasi/src/seed.rs	VERSION	not persisted: the ABI's version
 crates/const-ast/src/kinds.rs	FORMAT_ARGS_ARG	not persisted: a syntax kind's number
 crates/const-ast/src/kinds.rs	FORMAT_ARGS_EXPR	not persisted: a syntax kind's number

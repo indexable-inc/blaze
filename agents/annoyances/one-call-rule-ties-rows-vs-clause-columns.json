@@ -1,0 +1,15 @@
+{
+ "id": "one-call-rule-ties-rows-vs-clause-columns",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer lane D156 (flow-lower one call rule seam), round 3",
+ "where": "crates/blaze-flow-lower/src/one_call.rs (call_one, CallSel), trait_ties_tests.rs, impl_ties_tests.rs, open_projection_tests.rs, oracle.rs",
+ "what": "A callee's `T: Trait<'x>` is filed twice in production: as a `Facts::ties` row (borrows_ties.rs, the old model the old paths read) and as a subject-first clause column (heads_regions.rs, incl. `trait_inherited`'s clause 0, the model blaze-borrow reads). The fixtures laid only the rows, so the one rule saw no clause, took the trait's lifetimes as free fresh slots and accepted with nothing where the old paths refused (NoOwnBound, ImplAnswers) or emitted the tie. Separately, the old paths emit `'static: x` as an edge where blaze-borrow emits nothing (it is true of every x), which read as 'fewer constraints'.",
+ "cost": "three of the oracle's five round-2 failures were the fixture missing one model, one was a vacuous pair; each looked like a gap in the contract until the fixture and relate.rs `outlives` were read",
+ "cause": "two records of one fact (ties rows, clause columns) with nothing checking they agree, and a fixture helper written before the second existed",
+ "whys": "the one rule reads only clause columns; an absent clause column is indistinguishable from 'no bound'; the oracle compared raw reach without the meaning of 'static",
+ "class": "a fact present in one model and absent in the other read as 'nothing to do'",
+ "prevention": "done here: the adapter refuses `OneRuleWhy::TieUnlaid { param, trait_ }` when a tie row has no matching clause column (a typed refusal, never 'no clause'); the three fixture helpers lay both forms; the oracle's pairs are closed under 'static. Ends when the ties rows are deleted at the flip (D156)",
+ "annoyance": "fixtures have no single 'declare a bound' helper that writes both records",
+ "workaround": "each fixture's Heads::method/func now lays the clause column next to the row",
+ "state": "open"
+}

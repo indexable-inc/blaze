@@ -389,20 +389,20 @@ fn at(path: &Path, why: &io::Error) -> io::Error {
 pub(crate) mod linux {
     use std::{collections::BTreeSet, io, mem::size_of};
 
-    const BITS: usize = 8 * size_of::<libc::c_ulong>();
+    const BITS: usize = 8 * size_of::<core::ffi::c_ulong>();
 
     /// The CPUs the process may run on.
     pub(crate) fn affinity() -> io::Result<BTreeSet<u32>> {
         let mut words = 1024 / BITS;
         loop {
             // alloc: the affinity mask, once per pool
-            let mut mask: Vec<libc::c_ulong> = vec![0; words];
+        let mut mask: Vec<core::ffi::c_ulong> = vec![0; words];
             // SAFETY: the kernel writes at most `words * size_of::<c_ulong>()` bytes of the mask,
             // which is what `mask` holds; a `cpu_set_t` is such words.
             let got = unsafe {
                 libc::sched_getaffinity(
                     0,
-                    words * size_of::<libc::c_ulong>(),
+                    words * size_of::<core::ffi::c_ulong>(),
                     mask.as_mut_ptr().cast::<libc::cpu_set_t>(),
                 )
             };
@@ -420,7 +420,7 @@ pub(crate) mod linux {
             }
             let why = io::Error::last_os_error();
             // EINVAL: the mask is smaller than the kernel's.
-            if why.raw_os_error() == Some(libc::EINVAL) && words < 1 << 16 {
+            if why.raw_os_error() == Some(blaze_sys::Errno::Inval.raw() as i32) && words < 1 << 16 {
                 words *= 2;
                 continue;
             }
@@ -433,13 +433,13 @@ pub(crate) mod linux {
     pub(crate) fn bind(cpu: u32) -> io::Result<()> {
         let cpu = cpu as usize;
         // alloc: the affinity mask, once per worker start
-        let mut mask: Vec<libc::c_ulong> = vec![0; (cpu / BITS + 1).max(1024 / BITS)];
+        let mut mask: Vec<core::ffi::c_ulong> = vec![0; (cpu / BITS + 1).max(1024 / BITS)];
         mask[cpu / BITS] |= 1 << (cpu % BITS);
         // SAFETY: the kernel reads `mask.len() * size_of::<c_ulong>()` bytes, which `mask` holds.
         let set = unsafe {
             libc::sched_setaffinity(
                 0,
-                mask.len() * size_of::<libc::c_ulong>(),
+                mask.len() * size_of::<core::ffi::c_ulong>(),
                 mask.as_ptr().cast::<libc::cpu_set_t>(),
             )
         };
@@ -457,25 +457,16 @@ pub(crate) mod linux {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub(crate) mod macos {
-    use std::{ffi::CString, mem::size_of, ptr};
+    use std::{ffi::CString, mem::size_of};
+
+    use blaze_sys::posix::thread::sysctl_bytes;
 
     /// A 32-bit integer the kernel says by `name`, if it says it.
     pub(crate) fn sysctl(name: &str) -> Option<u32> {
         let name = CString::new(name).ok()?;
-        let mut value: i32 = 0;
-        let mut len = size_of::<i32>();
-        // SAFETY: `value` has room for the `len` bytes the kernel may write, and `name` is a C
-        // string that outlives the call.
-        let got = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&raw mut value).cast::<libc::c_void>(),
-                &mut len,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        (got == 0 && len == size_of::<i32>()).then(|| u32::try_from(value).ok()).flatten()
+        let mut bytes = [0u8; size_of::<i32>()];
+        let got = sysctl_bytes(&name, &mut bytes).ok().flatten()?;
+        (got == size_of::<i32>()).then(|| u32::try_from(i32::from_ne_bytes(bytes)).ok()).flatten()
     }
 }
 

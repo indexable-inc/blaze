@@ -16,7 +16,9 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::form as lf;
 use blaze_lower::{BodyRange, TextAt, View};
 use blaze_surface::Range;
+use blaze_own::Alloc;
 use blaze_typeck as tc;
+use blaze_typeck::regions::{Region, RegionError, each_slot_node};
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTys};
 
 use super::source::NamesSource;
@@ -67,6 +69,9 @@ pub enum Why {
     /// evaluated first ([`Heads::const_len`]); the driver that has the evaluator does so and
     /// tries the item again, as for [`Why::Need`].
     NeedConst(LibKey, Range),
+    /// The head's lifetimes were refused (D148): the language's error by its code, or a
+    /// construct by name, with its range inside the refusal (heads_regions.rs).
+    Regions(super::heads_regions::RegionsRefusal),
 }
 
 /// Why a type alias's head was refused ([`Heads::alias_gap`]): the refusal's text, the same
@@ -90,6 +95,28 @@ impl core::fmt::Debug for AliasGap {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.text)
     }
+}
+
+/// One region slot of a type alias's type, laid by the alias's head over its own lifetimes
+/// (D148), in `each_slot_node`'s order over the aliased type ([`Heads::alias_slots`]): a use
+/// `R<'q>` puts `'q` where the alias wrote `'x`, its expansion's slots substituted (the
+/// Reference, "Type aliases").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AliasSlot {
+    /// The alias's `i`-th declared lifetime parameter.
+    Lifetime(u32),
+    Static,
+    /// Bound inside the aliased type (`for<'a> fn(&'a S)`): `binder` the binding node's index
+    /// among the aliased type's binder nodes in pre-order.
+    Late { binder: u32, var: u32 },
+}
+
+/// A type alias's laid regions ([`Heads::alias_slots`]): its declared lifetime count and its
+/// type's slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AliasRegions {
+    pub lifetimes: u32,
+    pub slots: blaze_own::Vec<AliasSlot, Alloc<'static>>,
 }
 
 impl From<lf::BadRow> for Why {
@@ -208,6 +235,12 @@ pub trait Heads {
     fn ask_anon(&self, _ask: super::anon::Ask) -> bool {
         false
     }
+    /// The allocator an asked anonymous constant's token marks are copied into
+    /// ([`super::anon::Ask::carry_marks`]); `None` where these heads have no evaluator behind
+    /// them (the default: nothing is asked).
+    fn mark_alloc(&self) -> Option<Alloc<'static>> {
+        None
+    }
     /// Takes the qualified constant leaf `ask` (`<B4 as Spec>::BITS` in a head's expression:
     /// [`super::const_qpath`]) to be selected and evaluated; `false` where these heads have
     /// no evaluator behind them (the default), and the expression is evaluated as written.
@@ -264,6 +297,11 @@ pub trait Heads {
     /// A type alias's parameter defaults, made with its head (`None` where none is written;
     /// empty before its head is made).
     fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>];
+    /// A type alias's type laid over its own lifetimes ([`AliasRegions`]), made with its head;
+    /// `None` where its head laid none (its walk refused them, or its type holds an elided
+    /// lifetime, a trait object's default or an undeclared name): a use whose expansion holds a
+    /// lifetime is then refused by name.
+    fn alias_slots(&self, alias: LibKey) -> Option<&AliasRegions>;
     /// Why a type alias's head was refused (`Some(None)` from [`Heads::alias`]).
     fn alias_gap(&self, alias: LibKey) -> Option<&AliasGap>;
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): what a bound naming it stands
@@ -281,6 +319,85 @@ pub trait Heads {
     fn written_depth(&self) -> Option<&core::cell::Cell<u32>> {
         None
     }
+    /// How many lifetime parameters the BODY-LOCAL ADT `adt` (a checker key; an item declared
+    /// in a body, which the names world does not hold) declares, filed when its body made its
+    /// head. Every other item's count is the names' ([`declared_lifetimes`], D155): never read
+    /// here. `None`: not filed.
+    fn adt_lifetimes(&self, adt: ItemKey) -> Option<u32>;
+    /// How many lifetime parameters the body-local trait `trait_` declares, as `adt_lifetimes`.
+    fn trait_lifetimes(&self, trait_: ItemKey) -> Option<u32>;
+    /// How many lifetime parameters the body-local trait's associated type `name` declares on
+    /// itself, as `adt_lifetimes`.
+    fn assoc_lifetimes(&self, trait_: ItemKey, name: Name) -> Option<u32>;
+    /// How many lifetimes the opaque type `opaque` captures (filed by its fn's head).
+    fn opaque_lifetimes(&self, opaque: ItemKey) -> Option<u32>;
+}
+
+/// The one region counter's facts (`regions::Arity`, D148): each DECLARED lifetime count
+/// (an ADT's, a trait's, an associated type's) from the names (`names`, D155:
+/// [`declared_lifetimes`]), the same in every store whatever heads it made; an opaque's
+/// captures from the fn being made (`opaques`, not filed until its head is), then as the
+/// heads filed them. An unknown fact is `Count::NotKnown`, never a guessed count (rule 3).
+pub struct HeadsArity<'h, H: Heads + ?Sized, S> {
+    pub heads: &'h H,
+    pub opaques: &'h [(ItemKey, u32)],
+    pub names: S,
+}
+
+impl<'n, H: Heads + ?Sized, S: NamesSource<'n>> tc::regions::Arity for HeadsArity<'_, H, S> {
+    fn adt_lifetimes(&self, adt: ItemKey) -> tc::regions::Count {
+        known(declared_lifetimes(self.heads, self.names, adt, Declared::Adt))
+    }
+    fn opaque_captures(&self, opaque: ItemKey) -> tc::regions::Count {
+        match self.opaques.iter().find(|(k, _)| *k == opaque) {
+            Some(&(_, n)) => tc::regions::Count::Known(n),
+            None => known(self.heads.opaque_lifetimes(opaque)),
+        }
+    }
+    fn alias_lifetimes(&self, trait_: ItemKey, name: Name) -> tc::regions::Count {
+        let own = declared_lifetimes(self.heads, self.names, trait_, Declared::Trait);
+        match (own, declared_lifetimes(self.heads, self.names, trait_, Declared::Assoc(name))) {
+            (Some(t), Some(a)) => t.checked_add(a).map_or(tc::regions::Count::NotKnown, tc::regions::Count::Known),
+            _ => tc::regions::Count::NotKnown,
+        }
+    }
+    fn trait_lifetimes(&self, trait_: ItemKey) -> tc::regions::Count {
+        known(declared_lifetimes(self.heads, self.names, trait_, Declared::Trait))
+    }
+}
+
+/// Whose declared lifetimes [`declared_lifetimes`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Declared {
+    /// A struct's, enum's or union's.
+    Adt,
+    /// A trait's.
+    Trait,
+    /// The named associated type's own (a GAT's) of the trait asked.
+    Assoc(Name),
+}
+
+/// THE ONE READ of a declared lifetime count (D155; design/states.md item 30): a fact of the
+/// item's own text, whose one home is its crate's items record. `item` is a checker key: the
+/// names find its library key (`NamesSource::key_beginning`, the solved names' index or one
+/// search of its crate's records) and answer from that crate's record
+/// (`NamesSource::declared_lifetimes`, `assoc_lifetimes`), in any store, whatever heads were
+/// made. A key the names world holds no item for is a body-local item's (declared in a body,
+/// keyed by its body: front2 locals.rs): its count is the one its body filed with its head
+/// (`Heads::adt_lifetimes`), a body's locals being made before any type of the body names
+/// them. Which of the two answers is decided by whose key it is, never by a failed ask.
+pub fn declared_lifetimes<'n, H: Heads + ?Sized, S: NamesSource<'n>>(heads: &H, names: S, item: ItemKey, what: Declared) -> Option<u32> {
+    match (names.key_beginning(item.0.to_be_bytes()), what) {
+        (Some(lib), Declared::Adt | Declared::Trait) => names.declared_lifetimes(lib),
+        (Some(lib), Declared::Assoc(name)) => names.assoc_lifetimes(lib, name),
+        (None, Declared::Adt) => heads.adt_lifetimes(item),
+        (None, Declared::Trait) => heads.trait_lifetimes(item),
+        (None, Declared::Assoc(name)) => heads.assoc_lifetimes(item, name),
+    }
+}
+
+fn known(n: Option<u32>) -> tc::regions::Count {
+    n.map_or(tc::regions::Count::NotKnown, tc::regions::Count::Known)
 }
 
 /// A trait alias's head. The unstable book, `trait_alias`: "Trait aliases ... `trait Foo = Bar
@@ -355,9 +472,8 @@ pub struct Env<'e> {
     /// generics"): each one's index (among `params`, which names it) and its declared type.
     /// A name in `params` whose index is here is a constant, never a type.
     pub consts: &'e [(u32, PTy)],
-    /// The body whose blocks the type is written in: a path's first segment is asked of
-    /// their named imports before the module ([`super::block_type_uses`]). `None` for a type
-    /// no body's block holds (a signature, a head).
+    /// The body whose blocks may bind the first segment of a written path
+    /// ([`super::scope_table::written`]). `None` for a signature or other item head.
     pub body: Option<super::block_type_uses::BodyScope<'e>>,
 }
 
@@ -405,13 +521,16 @@ pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool,
         if (s.parenthesized && !read) || s.return_notation {
             return Err(Why::Unsupported("parenthesized generic arguments (`Fn(A) -> B`)", r));
         }
+        // A raw identifier's segment is its name without `r#` (`impl<T> Tr for r#return<T>`),
+        // as the names library files it (blaze-scope lower.rs `unraw`); the raw text stayed a
+        // segment no item is named, "a path did not resolve".
         let text = match (s.kind, s.name) {
-            (lf::SegKind::Ident, Some(n)) => v.name_text(n)?,
+            (lf::SegKind::Ident, Some(n)) => blaze_scope::task::unraw(v.name_text(n)?),
             (lf::SegKind::SelfMod, _) => "self",
             (lf::SegKind::Super, _) => "super",
             (lf::SegKind::Crate, _) => "crate",
             (lf::SegKind::SelfTy, _) => "Self",
-            (lf::SegKind::DollarCrate, _) => return Err(Why::Unsupported("`$crate`", r)),
+            (lf::SegKind::DollarCrate, _) => "$crate",
             (lf::SegKind::Anchor, _) | (lf::SegKind::Ident, None) => "<qualified>",
         };
         texts.push(text);
@@ -574,6 +693,19 @@ pub struct Builder<'b, H: Heads, S> {
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// The portable type of `t`, by a work list (no recursion).
     pub fn ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId) -> Result<PTy, Why> {
+        self.walk_ty(tys, env, v, t, None)
+    }
+
+    /// [`Builder::ty`], with the type's region slots pushed into `sink` in the same walk
+    /// (D148): one fragment more on its stack, the slots in `regions::each_slot_node`'s order
+    /// over the made type. A region position this producer does not lay is the sink's
+    /// refusal ([`RegionSink::refused`]), never the type's: the erased type is made as by
+    /// [`Builder::ty`]. A program error of the lifetimes themselves (E0106) is the type's.
+    pub fn ty_regions(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, sink: &mut RegionSink<'_>) -> Result<PTy, Why> {
+        self.walk_ty(tys, env, v, t, Some(sink))
+    }
+
+    fn walk_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, mut sink: Option<&mut RegionSink<'_>>) -> Result<PTy, Why> {
         enum S {
             Visit(lf::TypeId),
             Make(lf::TypeId),
@@ -593,7 +725,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 S::Make(t) => {
                     children(v, t, &mut kids)?;
                     let start = done.len() - kids.len();
-                    let made = self.make(tys, env, v, t, &done[start..])?;
+                    let mut args = None;
+                    let made = self.make(tys, env, v, t, &done[start..], &mut args)?;
+                    if let Some(s) = sink.as_deref_mut() {
+                        self.regions_made(tys, env, v, t, made, &done[start..], args.as_deref().unwrap_or(&[]), s)?;
+                    }
                     done.truncate(start);
                     done.push(made);
                 }
@@ -683,12 +819,23 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return Err(Why::ConstPath(format!("{leaf}: {why}").into_boxed_str(), r));
             }
         };
+        let source = text;
         let text = match &with_values {
             Some(done) => done.as_str(),
             None => text,
         };
         if plain {
-            let found = self.resolver.path(env.module, abs, &segs, Ns::Value).map_err(|e| Why::Resolve(e, r))?;
+            // A constant item's path resolves where its first token's mark says, as every
+            // written path of a macro-written head does (item_site.rs `written_site`): a
+            // `$crate::N` another crate's macro wrote is that crate's `N`.
+            let first = segs.first().copied().unwrap_or("");
+            let mark = match self.marks.map(|m| m.mark_of(first)) {
+                Some(Ok(mark)) => mark,
+                Some(Err(miss)) if first == "crate" => return Err(program(format!("the constant path `{source}`: {miss}"), r)),
+                Some(Err(_)) | None => None,
+            };
+            let site = super::item_site::marked_site(self.resolver.names, mark, first, abs, env.module, r)?;
+            let found = self.resolver.path_with(site.module, site.dollar_crate, abs, &segs, Ns::Value).map_err(|e| Why::Resolve(e, r))?;
             if found.kind == Kind::Const && found.consumed as usize == segs.len() {
                 // Tried and refused by the evaluator (front2/tables/head.rs `freeze_seeded`
                 // files it, as for an anonymous constant below): this head's refusal by name.
@@ -698,7 +845,23 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r));
             }
         }
-        let Some(ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
+        let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
+        // A macro-written head's expression is lowered with its tokens' marks (anon.rs
+        // `head_marks`), and keyed by them (`Ask::carry_marks`): zerocopy's
+        // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86.
+        // Heads with no evaluator (`mark_alloc` `None`) ask nothing, so carry nothing.
+        if let (Some(marks), Some(alloc)) = (self.marks, self.heads.mark_alloc()) {
+            match super::anon::head_marks(marks, source, with_values.as_deref(), alloc, r)? {
+                Some(rows) => ask = ask.carry_marks(rows),
+                // Not the item's text: its marks are not read here. Only a `crate` would be
+                // misread without them (a `macro_rules!` expansion's other paths resolve at the
+                // call site, which is the head's module): refused by name.
+                None if super::anon::names_crate(source) => {
+                    return Err(Why::Unsupported("a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: types.rs `const_value_bits`)", r));
+                }
+                None => {}
+            }
+        }
         if let Some(bits) = self.heads.const_bits(ask.need) {
             return Ok(bits);
         }
@@ -845,11 +1008,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         for (k, s) in segs.iter().enumerate() {
             if s.kind == lf::SegKind::Anchor {
                 out.push(next.next().ok_or(program(format!("a qualified path's self type is missing"), r))?);
-                let Some(tr) = s.trait_ else { return Err(Why::Unsupported("a qualified path with no trait (`<T>::X`)", r)) };
-                let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
-                let (tabs, ttexts, tsegs, _) = path_texts(v, tp)?;
-                for ts in tsegs {
-                    work.push((ts, tp, tabs, ttexts.clone()));
+                // `<T>::X` has no trait whose arguments are listed (`children`).
+                if let Some(tr) = s.trait_ {
+                    let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
+                    let (tabs, ttexts, tsegs, _) = path_texts(v, tp)?;
+                    for ts in tsegs {
+                        work.push((ts, tp, tabs, ttexts.clone()));
+                    }
                 }
             } else {
                 let mut upto = Vec::new_in(Global);
@@ -871,6 +1036,19 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
                                 let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
                                 let ar = place(v, v.type_range(t))?;
+                                // An item the body declares takes part as in a body path's own
+                                // argument (body.rs `name_arg`; the one rule is const_open.rs
+                                // `local_arg`): the Reference, "Generic parameters": a one-name
+                                // argument is a type if it resolves to one in the type
+                                // namespace, else a const; "Statements", "Item declarations":
+                                // a block's item is in scope in its block. tempo's
+                                // `Exec::for_config::<Config<SPEC_ID>>()` names the `const
+                                // SPEC_ID` of its block; read at the module alone, it was
+                                // "cannot find type `SPEC_ID`".
+                                let local = match env.body {
+                                    Some(body) => super::const_open::local_arg(body.locals, body.owner, self.heads, v, t, name, ar),
+                                    None => Ok(None),
+                                };
                                 // The name resolves where its token's mark says, as the
                                 // argument's own type would (`path_ty`): never at the module
                                 // alone when a macro wrote it.
@@ -882,9 +1060,26 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                     Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
                                     Err(_) => false,
                                 };
-                                let is_type = !is_const && (param.is_some() || names_a_type());
+                                let local_type = matches!(local, Ok(Some(super::const_open::LocalArg::Type)));
+                                let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
                                 if is_type {
                                     self.path_ty(tys, env, v, tp, &[])?
+                                } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
+                                    // The constant's bits in the parameter's type, as a module
+                                    // constant's are (`const_term`). A scalar parameter only: a
+                                    // fieldless enum's value is its variant under the enum's key
+                                    // (const_enum.rs), which a body's constant's bits are not.
+                                    let ty = self.const_want(env, v, spath, sabs, &stexts, index, ar)?;
+                                    if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
+                                        return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
+                                    }
+                                    intern(tys, PNode::ConstValue { ty, bits })?
+                                } else if let Err(why) = local {
+                                    // A body's constant not evaluated yet (`Why::NeedConst`: the
+                                    // driver evaluates it and lowers again), or a body's value
+                                    // item that is no constant: refused by name, never read at
+                                    // the module, where the name would mean another item.
+                                    return Err(why);
                                 } else {
                                     // A name that is no parameter, no type and no value here
                                     // names nothing: refused as unresolved, never guessed to be
@@ -919,9 +1114,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         Ok(out)
     }
 
-    fn make(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, kids: &[PTy]) -> Result<PTy, Why> {
+    /// The type `t` made of its children `kids`; a path's arguments (`path_args`' answer) are
+    /// left in `args` for its region slots ([`Builder::regions_made`]).
+    fn make(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, kids: &[PTy], args: &mut Option<Vec<PTy, Global>>) -> Result<PTy, Why> {
         let r = place(v, v.type_range(t))?;
         match v.ty(t)? {
+            // The written lifetime is the reference's region slot (`regions_made`), never
+            // part of the erased type.
             lf::TypeRef::Ref { mutbl, .. } => intern(tys, PNode::Ref(mutbl, kids[0])),
             lf::TypeRef::Ptr { mutbl, .. } => intern(tys, PNode::Ptr(mutbl, kids[0])),
             lf::TypeRef::Slice(_) => intern(tys, PNode::Slice(kids[0])),
@@ -932,8 +1131,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             lf::TypeRef::Never => intern(tys, PNode::Never),
             lf::TypeRef::Infer => intern(tys, PNode::Infer),
             lf::TypeRef::Path(p) => {
-                let args = self.path_args(tys, env, v, p, kids)?;
-                self.path_ty(tys, env, v, p, &args)
+                let made_args = self.path_args(tys, env, v, p, kids)?;
+                let made = self.path_ty(tys, env, v, p, &made_args)?;
+                *args = Some(made_args);
+                Ok(made)
             }
             lf::TypeRef::Dyn(bounds) => self.dyn_ty(tys, env, v, bounds, kids, r),
             // `[T; N]` (the Reference, "Array types": the length is a constant expression of
@@ -998,16 +1199,12 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
     }
 
-    /// A path type: `Self`, a generic parameter, an ADT, a primitive, or `<T as Tr>::X`.
-    /// What the written path `p` of `v` (segments `texts`, from `::` when `abs`) names in `ns`,
-    /// the one reading of a written type's path: in a body, through a block's named import of
-    /// its first segment ([`super::block_type_uses::through_use`]; the import's path read where
-    /// the `use` is written); else where its first token's mark says, from `env.module`
-    /// ([`super::item_site::resolve_written`]).
+    /// Resolves a written path in `ns` by the block and first-token rule in
+    /// [`super::scope_table::written`]. Item heads read the first token's site directly.
     #[expect(clippy::too_many_arguments, reason = "one resolve of one path: the path, its view and its env")]
     fn resolve_at(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], ns: Ns, r: Range) -> Result<crate::resolve::Target, Why> {
         if let Some(body) = env.body
-            && let Some(found) = super::block_type_uses::through_use(&self.resolver, self.marks, &body, v, p, abs, texts, ns, r)?
+            && let Some(found) = super::scope_table::written(&self.resolver, self.marks, &body, v, p, abs, texts, ns, r)?
         {
             return Ok(found);
         }
@@ -1021,7 +1218,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             let [_, last] = segs.as_slice() else {
                 return Err(Why::Unsupported("a qualified path of more than one item", r));
             };
-            let tr = segs[0].trait_.ok_or(Why::Unsupported("a qualified path with no trait (`<T>::X`)", r))?;
+            let Some(tr) = segs[0].trait_ else {
+                return self.qualified_no_trait(tys, env, v, &segs[0], last, kids, r, shown);
+            };
             let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
             // `kids` are the self type, then the arguments written on the trait's path, then
             // those written on the associated type's own segment (`path_args`' order). The
@@ -1041,49 +1240,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             return match (texts.len(), env.self_) {
                 (1, SelfTy::Trait(_)) => intern(tys, PNode::Param(0)),
                 (1, SelfTy::Ty(t, _)) => Ok(t),
-                (2, SelfTy::Trait(tr)) => {
-                    let (g, _) = self.heads.trait_head(tr).ok_or(Why::Need(tr))?;
-                    // The trait's supertraits are filed when its own bounds are lowered
-                    // (heads.rs `trait_members`); until then `v` IS its header, and a name the
-                    // trait does not declare is found through the bounds written there
-                    // ([`super::written`]): asking for the filed supertraits here is the trait's
-                    // members needing themselves (reth's `trait Call: LoadState<Error:
-                    // From<Self::Evm>> + ..`, the cycle that stopped tempo's contracts).
-                    if self.heads.trait_supers(tr).is_none() && !self.heads.trait_has_assoc(tr, Name::of(texts[1])).ok_or(Why::Need(tr))? {
-                        return self.written_self_assoc(tys, env, v, Name::of(texts[1]), r, shown);
-                    }
-                    let mut args = Vec::with_capacity_in(g as usize, Global);
-                    for i in 0..g {
-                        args.push(intern(tys, PNode::Param(i))?);
-                    }
-                    let args = intern_list(tys, &args)?;
-                    self.trait_self_assoc(tys, env, tr, args, Name::of(texts[1]), r, shown)
-                }
-                // In a trait impl, `Self::X` is the PROJECTION `<SelfTy as Tr>::X` of the trait
-                // (or the one supertrait) declaring `X`, never the impl's `type X = ..` text
-                // (the Reference, "Paths", "`Self`" and "Paths in types"; rustc lowers it so
-                // and normalizes it where it is used). Its value comes from normalization in
-                // the environment of the use: the impl's type where no where-bound shadows the
-                // impl, the rigid alias where one does (core's `rposition` in `impl Iterator
-                // for Iter<'a, T>`, `Self: ExactSizeIterator + DoubleEndedIterator`): the same
-                // answer on every side. Reading the impl's text here made the bound's
-                // `FnMut(Self::Item)` `&'a T` beside a rigid `x`: a false E0308. Arguments on
-                // the segment are the associated type's own (`Self::Out<A>`). Core's `impl
-                // DoubleEndedIterator for X { fn rfold(..) -> Self::Item }`, `Item`
-                // `Iterator`'s, is the supertrait's projection the same way. An inherent impl
-                // has no trait: its own associated type is its text (inherent associated
-                // types, unstable).
-                (2, SelfTy::Ty(_, tr)) => match (tr, env.self_assoc.iter().find(|(n, _)| *n == Name::of(texts[1]))) {
-                    (Some((tr, args)), _) => {
-                        let name = Name::of(texts[1]);
-                        match self.assoc_owner(tys, tr, args, name, r, shown)? {
-                            Some((t, a)) => self.assoc_with_args(tys, t, name, a, kids, r, shown),
-                            None => Err(program(format!("`{shown}` names no associated type of the trait or its supertraits"), r)),
-                        }
-                    }
-                    (None, Some(&(_, t))) => Ok(t),
-                    (None, None) => Err(program(format!("`{shown}` names no associated type of the impl"), r)),
-                },
+                (2, _) => self.self_assoc_path(tys, env, v, Name::of(texts[1]), kids, r, shown),
                 _ => Err(Why::Unsupported(SELF_HERE, r)),
             };
         }
@@ -1114,9 +1271,112 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return self.param_assoc(tys, env, v, i, Name::of(texts[1]), kids, r, shown);
             }
         }
+        self.resolved_path_ty(tys, env, v, p, abs, &texts, kids, r, shown)
+    }
+
+    /// `<T>::X<own..>`, a qualified path with no trait (the anchor `anchor`, the associated
+    /// type's segment `last`; `kids` the self type, then the arguments on `last`): the
+    /// type-relative path `T::X` written with its self type in angle brackets. The Reference,
+    /// "Paths", "Qualified paths": "Fully qualified paths allow for disambiguating the path for
+    /// trait implementations"; with no `as Trait` the type is only bracketed, so the
+    /// associated item is looked up on the type as for `T::X` ("Paths in types"; rustc lowers
+    /// both forms through one type-relative lookup). For a type parameter that is through its
+    /// bounds in scope, E0220 when none declares `X`, E0221 when two do ([`Self::param_assoc`]);
+    /// for `Self` it is `Self::X` ([`Self::self_assoc_path`]). chacha20's NEON backend writes it
+    /// through a `$variant:ty` fragment: `size_of::<<$variant>::Counter>()` in
+    /// `impl<R: Rounds, V: Variant> Backend<R, V>`. Another self type would be an inherent
+    /// associated type (unstable `inherent_associated_types`; without it rustc's E0223), refused
+    /// by name.
+    #[expect(clippy::too_many_arguments, reason = "the path's two segments, its lowered children and where it is written")]
+    fn qualified_no_trait(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'_>,
+        anchor: &lf::Segment,
+        last: &lf::Segment,
+        kids: &[PTy],
+        r: Range,
+        shown: &str,
+    ) -> Result<PTy, Why> {
+        let Some(n) = last.name else { return Err(Why::Unsupported("this qualified path", r)) };
+        let name = Name(v.name(n)?);
+        let Some((&self_ty, own)) = kids.split_first() else {
+            return Err(program(format!("a qualified path's self type is missing"), r));
+        };
+        let written = anchor.ty.ok_or(program(format!("a qualified path's self type is missing"), r))?;
+        if let lf::TypeRef::Path(sp) = v.ty(written)? {
+            let (sabs, stexts, _, _) = path_texts(v, sp)?;
+            if !sabs && stexts.as_slice() == ["Self"] {
+                return self.self_assoc_path(tys, env, v, name, own, r, shown);
+            }
+        }
+        // The self type as lowered: a parameter however it was written (`V`, a `$v:ty`
+        // fragment, an alias of a parameter).
+        let lowered = tys.view().get(self_ty).copied();
+        match lowered {
+            Some(PNode::Param(i)) => self.param_assoc(tys, env, v, i, name, own, r, shown),
+            _ => Err(Why::Unsupported("`<T>::X` with `T` neither a type parameter nor `Self` (an inherent associated type; rustc's E0223 without `inherent_associated_types`)", r)),
+        }
+    }
+
+    /// `Self::name<own..>`: in a trait (or its member), through the bounds on `Self` in scope;
+    /// in a trait impl, the projection of the impl's trait; in an inherent impl, the impl's own
+    /// associated type.
+    #[expect(clippy::too_many_arguments, reason = "the associated type's name and arguments and where it is written")]
+    fn self_assoc_path(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, name: Name, kids: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
+        match env.self_ {
+            SelfTy::Trait(tr) => {
+                let (g, _) = self.heads.trait_head(tr).ok_or(Why::Need(tr))?;
+                // The trait's supertraits are filed when its own bounds are lowered (heads.rs
+                // `trait_members`); until then `v` IS its header, and a name the trait does not
+                // declare is found through the bounds written there ([`super::written`]):
+                // asking for the filed supertraits here is the trait's members needing
+                // themselves (reth's `trait Call: LoadState<Error: From<Self::Evm>> + ..`, the
+                // cycle that stopped tempo's contracts).
+                if self.heads.trait_supers(tr).is_none() && !self.heads.trait_has_assoc(tr, name).ok_or(Why::Need(tr))? {
+                    return self.written_self_assoc(tys, env, v, name, kids, r, shown);
+                }
+                let mut args = Vec::with_capacity_in(g as usize, Global);
+                for i in 0..g {
+                    args.push(intern(tys, PNode::Param(i))?);
+                }
+                let args = intern_list(tys, &args)?;
+                self.trait_self_assoc(tys, env, tr, args, name, kids, r, shown)
+            }
+            // In a trait impl, `Self::X` is the PROJECTION `<SelfTy as Tr>::X` of the trait (or
+            // the one supertrait) declaring `X`, never the impl's `type X = ..` text (the
+            // Reference, "Paths", "`Self`" and "Paths in types"; rustc lowers it so and
+            // normalizes it where it is used). Its value comes from normalization in the
+            // environment of the use: the impl's type where no where-bound shadows the impl,
+            // the rigid alias where one does (core's `rposition` in `impl Iterator for Iter<'a,
+            // T>`, `Self: ExactSizeIterator + DoubleEndedIterator`): the same answer on every
+            // side. Reading the impl's text here made the bound's `FnMut(Self::Item)` `&'a T`
+            // beside a rigid `x`: a false E0308. Arguments on the segment are the associated
+            // type's own (`Self::Out<A>`). Core's `impl DoubleEndedIterator for X { fn rfold(..)
+            // -> Self::Item }`, `Item` `Iterator`'s, is the supertrait's projection the same
+            // way. An inherent impl has no trait: its own associated type is its text
+            // (inherent associated types, unstable).
+            SelfTy::Ty(_, tr) => match (tr, env.self_assoc.iter().find(|(n, _)| *n == name)) {
+                (Some((tr, args)), _) => match self.assoc_owner(tys, tr, args, name, r, shown)? {
+                    Some((t, a)) => self.assoc_with_args(tys, t, name, a, kids, r, shown),
+                    None => Err(program(format!("`{shown}` names no associated type of the trait or its supertraits"), r)),
+                },
+                (None, Some(&(_, t))) if kids.is_empty() => Ok(t),
+                (None, Some(_)) => Err(Why::Unsupported("type or const arguments on an inherent associated type", r)),
+                (None, None) => Err(program(format!("`{shown}` names no associated type of the impl"), r)),
+            },
+            SelfTy::None => Err(Why::Unsupported(SELF_HERE, r)),
+        }
+    }
+
+    /// A written path that is no parameter and no `Self` form: what the names library resolves
+    /// it to (a nominal type, an alias, a built-in type).
+    #[expect(clippy::too_many_arguments, reason = "one resolve of one path: the path, its view and its env")]
+    fn resolved_path_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], kids: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
         // A built-in type is the names library's answer (`Kind::Builtin`): front2 has no lookup
         // rule of its own for one. Where the path resolves is its first token's mark.
-        let found = self.resolve_at(env, v, p, abs, &texts, Ns::Type, r)?;
+        let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
         if found.consumed as usize != texts.len() {
             return Err(Why::Unsupported("an associated type of a type (`T::X`)", r));
         }
@@ -1162,7 +1422,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// `Self` in `env` (`Param(0)`'s: the trait's `where Self: ..` and the member's own, tap's
     /// `fn try_conv<T>(self) -> Result<T, Self::Error> where Self: TryInto<T>`, where `Error`
     /// is `TryInto<T>`'s). Two distinct traits declaring it are ambiguous (rustc's E0221).
-    fn trait_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, tr: LibKey, args: List, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
+    #[expect(clippy::too_many_arguments, reason = "the trait, the associated item's own arguments, and the path's site")]
+    fn trait_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, tr: LibKey, args: List, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
         let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
         if let Some(owner) = self.assoc_owner(tys, tr, args, name, r, shown)? {
             found.push(owner);
@@ -1176,7 +1437,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         match found.as_slice() {
-            &[(t, a)] => self.alias(tys, t, name, a, r, shown),
+            &[(t, a)] => self.assoc_with_args(tys, t, name, a, own, r, shown),
             [] => Err(program(format!("`{shown}` names no associated type of the trait, its supertraits or a bound on `Self` in scope"), r)),
             many => {
                 let mut traits = Vec::with_capacity_in(many.len(), Global);
@@ -1192,8 +1453,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// ([`Self::assoc_with_args`]; none is [`Self::alias`]). While the bounds are themselves
     /// being lowered (`Bounds::Building`) and none lowered so far declares it, the bounds of `T`
     /// as written in the header `v` are read ([`super::written`]: `T: Tr<T::X> + Declares`, a
-    /// bound naming `X` before the bound that declares it); with own arguments that case is
-    /// refused by name.
+    /// bound naming `X` before the bound that declares it).
     #[expect(clippy::too_many_arguments, reason = "the path, where it is written, and the parameter")]
     fn param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, param: u32, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
         let (bounds, done) = match env.bounds {
@@ -1210,8 +1470,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         match found.as_slice() {
             &[(t, a)] => self.assoc_with_args(tys, t, name, a, own, r, shown),
-            [] if !done && !own.is_empty() => Err(Why::Unsupported("`T::X<A>` in a bound written before the bound of `T` that declares `X`", r)),
-            [] if !done => match self.written_param_assoc(tys, env, v, param, name, r, shown)? {
+            [] if !done => match self.written_param_assoc(tys, env, v, param, name, own, r, shown)? {
                 Some(t) => Ok(t),
                 None => Err(Why::Unsupported("`T::X` in a bound written before the bound of `T` that declares `X`", r)),
             },
@@ -1282,7 +1541,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// for a generic associated type (blaze-solve alias.rs: the arguments from the trait's
     /// generic count on are the associated type's own).
     #[expect(clippy::too_many_arguments, reason = "the projection, its own arguments, and where it is written")]
-    fn assoc_with_args(&self, tys: &mut PortableTys<'_>, trait_: LibKey, name: Name, args: List, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
+    pub(super) fn assoc_with_args(&self, tys: &mut PortableTys<'_>, trait_: LibKey, name: Name, args: List, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
         if own.is_empty() {
             return self.alias(tys, trait_, name, args, r, shown);
         }
@@ -1296,7 +1555,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             return Err(program(format!("the associated type of `{shown}` is written with {} type arguments; it takes {declared}", own.len()), r));
         }
         let of_trait = tys.view().list(args).map_err(|_| program(format!("`{shown}`: the trait's arguments are past the type table"), r))?;
-        let mut all = Vec::with_capacity_in(of_trait.len() + own.len(), Global);
+        let mut all = Vec::with_capacity_in(of_trait.len() + own.len(), tys.alloc());
         all.extend_from_slice(of_trait);
         all.extend_from_slice(own);
         let all = intern_list(tys, &all)?;
@@ -1418,77 +1677,17 @@ pub fn subst_clause(tys: &mut PortableTys<'_>, c: PClause, args: &[PTy]) -> Resu
             PClause::Projection { trait_, args: l, name, term: subst(tys, term, args)? }
         }
         PClause::Const { cond, args: l } => PClause::Const { cond, args: list(tys, l)? },
+        PClause::TypeOutlives { ty, region } => PClause::TypeOutlives { ty: subst(tys, ty, args)?, region },
+        c @ PClause::RegionOutlives { .. } => c,
     })
 }
 
-/// `t` with each `Param(i)` replaced by `args[i]`, by a work list. Moved here from front.rs,
-/// whose copy goes at the switch (its one home after that; blaze-typeck's `PortableTys` is the
-/// better one, its lane's to take).
+/// Instantiate parameters throughout the portable type, including a trait object's predicates.
 pub fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why> {
-    enum S {
-        Visit(PTy),
-        Make(PTy),
-    }
-    let bad = || program(format!("a type refers past the type table"), Range::new(0, 0));
-    let mut todo = Vec::new_in(Global);
-    let mut done: Vec<PTy, Global> = Vec::new_in(Global);
-    let mut kids: Vec<PTy, Global> = Vec::new_in(Global);
-    todo.push(S::Visit(t));
-    while let Some(step) = todo.pop() {
-        kids.clear();
-        match step {
-            S::Visit(t) => {
-                todo.push(S::Make(t));
-                children_of(tys.view(), t, &mut kids).ok_or_else(bad)?;
-                todo.extend(kids.iter().rev().map(|&k| S::Visit(k)));
-            }
-            S::Make(t) => {
-                children_of(tys.view(), t, &mut kids).ok_or_else(bad)?;
-                let start = done.len() - kids.len();
-                let node = *tys.view().get(t).ok_or_else(bad)?;
-                let new: Vec<PTy, Global> = done.split_off(start);
-                let made = match node {
-                    PNode::Param(i) | PNode::ConstParam(i) => *args.get(i as usize).ok_or_else(|| program(format!("a generic parameter past the arguments"), Range::new(0, 0)))?,
-                    PNode::Ref(m, _) => intern(tys, PNode::Ref(m, new[0]))?,
-                    PNode::Ptr(m, _) => intern(tys, PNode::Ptr(m, new[0]))?,
-                    PNode::Slice(_) => intern(tys, PNode::Slice(new[0]))?,
-                    PNode::Array(..) => intern(tys, PNode::Array(new[0], new[1]))?,
-                    PNode::Closure { owner, ordinal, .. } => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Closure { owner, ordinal, args: l })?
-                    }
-                    PNode::Future(e, _, _) => intern(tys, PNode::Future(e, new[0], new[1]))?,
-                    PNode::Tuple(_) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Tuple(l))?
-                    }
-                    PNode::Adt(k, _) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Adt(k, l))?
-                    }
-                    PNode::FnDef(k, _) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::FnDef(k, l))?
-                    }
-                    PNode::FnPtr(_, h) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::FnPtr(l, h))?
-                    }
-                    PNode::Opaque(k, _) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Opaque(k, l))?
-                    }
-                    PNode::Alias { trait_, name, .. } => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Alias { trait_, name, args: l })?
-                    }
-                    _ => t,
-                };
-                done.push(made);
-            }
-        }
-    }
-    done.pop().ok_or_else(bad)
+    tys.subst(t, args).map_err(|e| {
+        let message = blaze_own::text::format(tys.alloc(), format_args!("substituting type {t:?}: {e}"));
+        Why::Program(message.as_str().into(), Range::new(0, 0))
+    })
 }
 
 /// A written ABI string (`"C"`, with its quotes): the one reading of it, for fn items
@@ -1560,22 +1759,7 @@ fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: 
 
 /// The types `t` is made of, in order; `None` past the table.
 pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
-    match *t.get(ty)? {
-        PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) => out.push(i),
-        PNode::Closure { args, .. } => out.extend_from_slice(t.list(args).ok()?),
-        PNode::Future(_, o, i) | PNode::Array(o, i) => {
-            out.push(o);
-            out.push(i);
-        }
-        PNode::Tuple(l)
-        | PNode::Adt(_, l)
-        | PNode::FnDef(_, l)
-        | PNode::FnPtr(l, _)
-        | PNode::Opaque(_, l)
-        | PNode::Alias { args: l, .. } => out.extend_from_slice(t.list(l).ok()?),
-        _ => {}
-    }
-    Some(())
+    t.children_of(*t.get(ty)?, out).ok()
 }
 
 /// Each `impl Trait` written in a fn's return type `ret` (the Reference, "Impl trait",
@@ -1651,10 +1835,10 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
             for &n in v.segments(path)? {
                 let s = lf::Segment::decode(n)?;
                 if s.kind == lf::SegKind::Anchor {
-                    let (Some(ty), Some(tr)) = (s.ty, s.trait_) else {
-                        return Err(Why::Unsupported("a qualified path with no trait (`<T>::X`)", r));
-                    };
+                    let Some(ty) = s.ty else { return Err(program(format!("a qualified path's self type is missing"), r)) };
                     out.push(ty);
+                    // `<T>::X`: the self type only (`Builder::qualified_no_trait`).
+                    let Some(tr) = s.trait_ else { continue };
                     let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                     for &tn in v.segments(v.path(tp)?)? {
                         arg_types(v, &lf::Segment::decode(tn)?, r, out)?;
@@ -1702,4 +1886,1821 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Error => return Err(Why::Unsupported("this type", r)),
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Region slots beside the made types (D148, piece L1a; docs/v2/plan/design/flow.md "Lifetimes
+// are produced once and carried beside the types"). The walk that interns a written type
+// pushes, for each type it makes, that type's slots in `regions::each_slot_node`'s order: a
+// node's own first, then its children's in order. Nothing reads a signature's text for its
+// lifetimes after this walk.
+
+/// What a written type's text says at one region position, before its item's lifetimes are
+/// numbered (heads.rs `Store::fn_head` numbers them with `regions::Numbering`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotKind {
+    /// `'static`.
+    Static,
+    /// A lifetime written by name and bound by no binder inside the type: the item's or its
+    /// container's, numbered by the head.
+    Named(Name, Range),
+    /// An elided lifetime (`&T`, `'_`, a path written without its ADT's lifetimes): its site's
+    /// index ([`RegionSink::elided_at`]).
+    Elided(u32),
+    /// Bound inside the made type: `binder` the binding node's index among its binder nodes
+    /// (fn pointers and trait objects, [`is_binder`]) in pre-order, as `Region::Late`.
+    Late { binder: u32, var: u32 },
+    /// Bound by the trait object being made (its bounds' `for<..>`, its `Fn` sugar's elided
+    /// inputs): `Late { binder: 0, var }` once its slots are placed.
+    Bound(u32),
+    /// Given whole by the head: `Self`'s regions, an opaque type's captured lifetimes.
+    Given(Region),
+    /// A trait object's lifetime bound not written: its context decides it (the Reference,
+    /// "Lifetime elision", "Default trait object lifetimes").
+    ObjectDefault(Range),
+}
+
+/// One region slot: what it is, and whether the elision rules count it as a lifetime its
+/// inputs use (a written or elided lifetime does; `Self`'s and a trait object's default do
+/// not: the Reference, "Lifetime elision in functions").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slot {
+    pub kind: SlotKind,
+    pub counts: bool,
+}
+
+impl Slot {
+    pub const fn written(kind: SlotKind) -> Slot {
+        Slot { kind, counts: true }
+    }
+
+    pub const fn quiet(kind: SlotKind) -> Slot {
+        Slot { kind, counts: false }
+    }
+
+    /// The slot inside a parent whose binder nodes before it are `by`.
+    fn shifted(self, by: u32) -> Slot {
+        match self.kind {
+            SlotKind::Late { binder, var } => Slot { kind: SlotKind::Late { binder: binder + by, var }, counts: self.counts },
+            _ => self,
+        }
+    }
+}
+
+/// Whether two slots name one region (a name is one lifetime wherever it is written).
+pub fn same_region(a: SlotKind, b: SlotKind) -> bool {
+    match (a, b) {
+        (SlotKind::Named(x, _), SlotKind::Named(y, _)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// How many lifetimes `slots` use, as the elision rules count them: the counted slots whose
+/// kind `local` takes (a binder's own variables) or that are written or `'static`.
+pub enum Used {
+    None,
+    One(SlotKind),
+    Many,
+}
+
+pub fn used_lifetimes(slots: &[Slot], local: fn(SlotKind) -> bool) -> Used {
+    let mut one: Option<SlotKind> = None;
+    for s in slots {
+        if !s.counts {
+            continue;
+        }
+        let usable = match s.kind {
+            SlotKind::Static | SlotKind::Named(..) | SlotKind::Elided(_) => true,
+            SlotKind::Late { .. } | SlotKind::Bound(_) | SlotKind::Given(_) => local(s.kind),
+            SlotKind::ObjectDefault(_) => false,
+        };
+        if !usable {
+            continue;
+        }
+        match one {
+            None => one = Some(s.kind),
+            Some(o) if same_region(o, s.kind) => {}
+            Some(_) => return Used::Many,
+        }
+    }
+    one.map_or(Used::None, Used::One)
+}
+
+/// A fn pointer's own variables: `Late { binder: 0, .. }`.
+fn fn_ptr_local(k: SlotKind) -> bool {
+    matches!(k, SlotKind::Late { binder: 0, .. })
+}
+
+/// A trait object's own variables, before its slots are placed: `Bound`.
+fn object_local(k: SlotKind) -> bool {
+    matches!(k, SlotKind::Bound(_))
+}
+
+/// The nodes that bind regions of their children: a fn pointer (its elided and `for<..>`
+/// lifetimes) and a trait object (its bounds' `for<..>` and `Fn` sugar).
+pub fn is_binder(n: PNode) -> bool {
+    matches!(n, PNode::FnPtr(..) | PNode::Dynamic(_))
+}
+
+/// The slots of one made type on a [`RegionSink`]'s stack, and how many binder nodes the type
+/// has (what a parent shifts its `Late` binders by).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frag {
+    pub start: u32,
+    pub len: u32,
+    pub binders: u32,
+}
+
+/// Why a made type's region slots are not laid: the erased type stands; the head's regions
+/// are refused by this name (rule 19), never guessed (rule 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionRefusal {
+    /// The one counter or the column refused (blaze-typeck regions.rs).
+    Regions(RegionError),
+    /// A lifetime written by name that no scope of the head declares (E0261).
+    Undeclared { at: Range },
+    /// A path to an ADT written with `got` lifetime arguments where it declares `want`
+    /// (E0107).
+    LifetimeArgs { at: Range, want: u32, got: u32 },
+    /// A trait object's default lifetime its context does not decide here (an argument of
+    /// a type that has lifetime parameters, or of a type alias).
+    ObjectDefault { at: Range },
+    /// A region position this producer does not lay yet, by its typed cause (a reader in
+    /// another store is told it: head_record.rs `Unlaid::NotLaid`).
+    NotLaid { why: NotLaidWhy, at: Range },
+    /// A written type that names nothing (E0412): no column is laid over the error type.
+    NoType { at: Range },
+    /// The container's lifetimes were not filed with its head (`Store::container_regions`).
+    NoContainer { container: ItemKey },
+}
+
+impl From<RegionError> for RegionRefusal {
+    fn from(e: RegionError) -> RegionRefusal {
+        RegionRefusal::Regions(e)
+    }
+}
+
+impl RegionRefusal {
+    /// A region position this producer does not lay, by its typed cause, at `at`.
+    pub const fn not_laid(why: NotLaidWhy, at: Range) -> RegionRefusal {
+        RegionRefusal::NotLaid { why, at }
+    }
+}
+
+/// What a person reads of a region refusal (rule 19): the cause in Rust's words and the
+/// item-relative range it is at (rule 71: a `file:line:col` only where printed with its file).
+impl core::fmt::Display for RegionRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            RegionRefusal::Regions(e) => write!(f, "{e}"),
+            RegionRefusal::Undeclared { at } => write!(f, "a lifetime written by name that no scope declares, at {}..{} (E0261)", at.start, at.end),
+            RegionRefusal::LifetimeArgs { at, want, got } => write!(f, "a path written with {got} lifetime argument(s) where it declares {want}, at {}..{} (E0107)", at.start, at.end),
+            RegionRefusal::ObjectDefault { at } => write!(f, "a trait object's default lifetime its context does not decide here, at {}..{}", at.start, at.end),
+            RegionRefusal::NotLaid { why, at } => write!(f, "[NotLaid/{}] {}, at {}..{}", why.name(), why.text(), at.start, at.end),
+            RegionRefusal::NoType { at } => write!(f, "a written type that names nothing, at {}..{} (E0412)", at.start, at.end),
+            RegionRefusal::NoContainer { .. } => f.write_str("its impl's or trait's own regions were not filed with the container's head"),
+        }
+    }
+}
+
+/// Why a region position is not laid ([`RegionRefusal::NotLaid`]): one variant per distinct
+/// cause the walks name, so a reader in any store (head_record.rs `Unlaid::NotLaid`) and the
+/// profile's "refused by cause" line count the refusals by cause, never by a producer's text.
+/// Its byte ([`NotLaidWhy::byte`]) is part of the frozen head's entry (front2 tables/head.rs
+/// form 12): a variant is never renumbered; a new one takes the next byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NotLaidWhy {
+    /// A made type's children's slots are not on the sink's stack where the walk left them (a
+    /// producer's bug: the walk's own bookkeeping).
+    Stack,
+    /// The made type and the region walk of it disagree (a path to an ADT made as no ADT, a
+    /// projection made as no alias, a path's, an alias's, `Self`'s, a trait object's or a
+    /// signature's slots out of step with the made type): a producer's bug.
+    OutOfStep,
+    /// A written type whose slots pass the table's `u32` count.
+    TooMany,
+    /// The region walk did not resolve a path (a type, a one-name argument, a bound) as the
+    /// erased walk did a step before, or its second walk of a written type was refused.
+    Resolve,
+    /// A declared lifetime count (an ADT's, a trait's, an associated type's) the names do not
+    /// hold.
+    DeclaredCount,
+    /// A fn pointer's, or a trait object's `Fn(..) -> ..` sugar's, return type elides a
+    /// lifetime its inputs do not give exactly one of (rustc: E0106 there).
+    FnPtrElision,
+    /// A `for<..>` binder over a type that is no fn pointer.
+    ForBinder,
+    /// A return `impl Trait` whose captured lifetimes its rule or `use<..>` did not decide
+    /// (heads_regions.rs `captures` refused them).
+    OpaqueCaptures,
+    /// `'_` in a return opaque's bound, and the inputs give no single lifetime for it (rustc:
+    /// E0106).
+    OpaqueElided,
+    /// `_` in a declared type.
+    Infer,
+    /// A type macro's expansion.
+    TypeMacro,
+    /// A type form the region walk has no step for.
+    OtherForm,
+    /// A qualified path `<T>::Name` with no trait, or whose trait is no path.
+    QualifiedNoTrait,
+    /// A qualified path `<T as Tr<'a>>::Name` whose trait declares a lifetime. No walk names
+    /// it now (the trait's lifetimes are laid: `Builder::qualified_slots`); kept for its byte,
+    /// which a frozen head's entry may hold.
+    QualifiedTraitLifetimes,
+    /// A one-name type argument (`R` for `R<'_>`) whose own arguments hold a lifetime.
+    OneNameArgs,
+    /// A lifetime argument on a path's segment before its last.
+    EarlySegmentLifetime,
+    /// A projection path read through no bound (`T::A::B`, `Self::A::B`, `T::Name` outside
+    /// the forms read through a bound) whose arguments or trait hold a lifetime.
+    ProjectionPath,
+    /// `Self`'s regions are not known where the type is written.
+    SelfUnknown,
+    /// A defaulted type argument (of an ADT or a type alias) that holds a lifetime.
+    DefaultArg,
+    /// A type alias whose head is not made.
+    AliasUnmade,
+    /// A type alias whose type holds a lifetime its head did not lay, or a bound lifetime
+    /// whose binder is not above it.
+    AliasRegions,
+    /// A path whose made type holds a region this producer does not place.
+    PathRegion,
+    /// `Self::Name` of a supertrait (in a trait, or in an impl of its subtrait) whose trait
+    /// holds a lifetime.
+    SelfSupertrait,
+    /// `Self::Name` in a trait impl whose trait holds a lifetime, laid where the header's
+    /// trait column is not known (an associated type's value, a member's where clause or
+    /// constant: those walks are given `Self`'s regions only; or the impl's regions refused).
+    ImplTraitLifetimes,
+    /// A projection read through a `for<..>` bound or where clause.
+    ProjectionHigherRanked,
+    /// A projection `T::Name` whose trait holds a lifetime and no bound on `T` in this item
+    /// names (a supertrait's, or the container's bound).
+    ProjectionBoundElsewhere,
+    /// A projection whose parameter has two bounds naming its trait.
+    ProjectionTwoBounds,
+    /// A projection whose bound's type arguments hold a lifetime.
+    ProjectionBoundArgs,
+    /// An elided lifetime in the bound a projection is read through.
+    ProjectionElidedBound,
+    /// A trait object with more than one lifetime bound.
+    DynLifetimes,
+    /// A region position in a trait object no written lifetime gives, or arguments of it the
+    /// walk could not place.
+    DynRegion,
+    /// A bound lifetime (a fn pointer's or a trait object's) where the walk does not place
+    /// it: an impl's self type, outside its object, a column a producer reads.
+    BoundVariable,
+    /// A member's container's lifetime group and its lifetimes' names disagree (D148).
+    ContainerDisagree,
+    /// An `async fn`'s future whose in-scope lifetimes were not counted.
+    AsyncCount,
+    /// An elided lifetime of the output that the inputs' group does not hold, or that the
+    /// sink gave no site.
+    ElidedOutput,
+    /// A written type the head's walk did not lay (it was not listed).
+    Unlisted,
+}
+
+impl NotLaidWhy {
+    /// Every cause, in byte order.
+    pub const ALL: [NotLaidWhy; 36] = [
+        NotLaidWhy::Stack,
+        NotLaidWhy::OutOfStep,
+        NotLaidWhy::TooMany,
+        NotLaidWhy::Resolve,
+        NotLaidWhy::DeclaredCount,
+        NotLaidWhy::FnPtrElision,
+        NotLaidWhy::ForBinder,
+        NotLaidWhy::OpaqueCaptures,
+        NotLaidWhy::OpaqueElided,
+        NotLaidWhy::Infer,
+        NotLaidWhy::TypeMacro,
+        NotLaidWhy::OtherForm,
+        NotLaidWhy::QualifiedNoTrait,
+        NotLaidWhy::QualifiedTraitLifetimes,
+        NotLaidWhy::OneNameArgs,
+        NotLaidWhy::EarlySegmentLifetime,
+        NotLaidWhy::ProjectionPath,
+        NotLaidWhy::SelfUnknown,
+        NotLaidWhy::DefaultArg,
+        NotLaidWhy::AliasUnmade,
+        NotLaidWhy::AliasRegions,
+        NotLaidWhy::PathRegion,
+        NotLaidWhy::SelfSupertrait,
+        NotLaidWhy::ImplTraitLifetimes,
+        NotLaidWhy::ProjectionHigherRanked,
+        NotLaidWhy::ProjectionBoundElsewhere,
+        NotLaidWhy::ProjectionTwoBounds,
+        NotLaidWhy::ProjectionBoundArgs,
+        NotLaidWhy::ProjectionElidedBound,
+        NotLaidWhy::DynLifetimes,
+        NotLaidWhy::DynRegion,
+        NotLaidWhy::BoundVariable,
+        NotLaidWhy::ContainerDisagree,
+        NotLaidWhy::AsyncCount,
+        NotLaidWhy::ElidedOutput,
+        NotLaidWhy::Unlisted,
+    ];
+
+    /// Its byte in a record: its index in [`NotLaidWhy::ALL`].
+    pub const fn byte(self) -> u8 {
+        match self {
+            NotLaidWhy::Stack => 0,
+            NotLaidWhy::OutOfStep => 1,
+            NotLaidWhy::TooMany => 2,
+            NotLaidWhy::Resolve => 3,
+            NotLaidWhy::DeclaredCount => 4,
+            NotLaidWhy::FnPtrElision => 5,
+            NotLaidWhy::ForBinder => 6,
+            NotLaidWhy::OpaqueCaptures => 7,
+            NotLaidWhy::OpaqueElided => 8,
+            NotLaidWhy::Infer => 9,
+            NotLaidWhy::TypeMacro => 10,
+            NotLaidWhy::OtherForm => 11,
+            NotLaidWhy::QualifiedNoTrait => 12,
+            NotLaidWhy::QualifiedTraitLifetimes => 13,
+            NotLaidWhy::OneNameArgs => 14,
+            NotLaidWhy::EarlySegmentLifetime => 15,
+            NotLaidWhy::ProjectionPath => 16,
+            NotLaidWhy::SelfUnknown => 17,
+            NotLaidWhy::DefaultArg => 18,
+            NotLaidWhy::AliasUnmade => 19,
+            NotLaidWhy::AliasRegions => 20,
+            NotLaidWhy::PathRegion => 21,
+            NotLaidWhy::SelfSupertrait => 22,
+            NotLaidWhy::ImplTraitLifetimes => 23,
+            NotLaidWhy::ProjectionHigherRanked => 24,
+            NotLaidWhy::ProjectionBoundElsewhere => 25,
+            NotLaidWhy::ProjectionTwoBounds => 26,
+            NotLaidWhy::ProjectionBoundArgs => 27,
+            NotLaidWhy::ProjectionElidedBound => 28,
+            NotLaidWhy::DynLifetimes => 29,
+            NotLaidWhy::DynRegion => 30,
+            NotLaidWhy::BoundVariable => 31,
+            NotLaidWhy::ContainerDisagree => 32,
+            NotLaidWhy::AsyncCount => 33,
+            NotLaidWhy::ElidedOutput => 34,
+            NotLaidWhy::Unlisted => 35,
+        }
+    }
+
+    /// The cause of byte `b`, or `None` for a byte no cause writes.
+    pub fn of_byte(b: u8) -> Option<NotLaidWhy> {
+        NotLaidWhy::ALL.get(usize::from(b)).copied()
+    }
+
+    /// Its variant's name: the short class a refusal is counted by (`[NotLaid/<name>/..]`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            NotLaidWhy::Stack => "Stack",
+            NotLaidWhy::OutOfStep => "OutOfStep",
+            NotLaidWhy::TooMany => "TooMany",
+            NotLaidWhy::Resolve => "Resolve",
+            NotLaidWhy::DeclaredCount => "DeclaredCount",
+            NotLaidWhy::FnPtrElision => "FnPtrElision",
+            NotLaidWhy::ForBinder => "ForBinder",
+            NotLaidWhy::OpaqueCaptures => "OpaqueCaptures",
+            NotLaidWhy::OpaqueElided => "OpaqueElided",
+            NotLaidWhy::Infer => "Infer",
+            NotLaidWhy::TypeMacro => "TypeMacro",
+            NotLaidWhy::OtherForm => "OtherForm",
+            NotLaidWhy::QualifiedNoTrait => "QualifiedNoTrait",
+            NotLaidWhy::QualifiedTraitLifetimes => "QualifiedTraitLifetimes",
+            NotLaidWhy::OneNameArgs => "OneNameArgs",
+            NotLaidWhy::EarlySegmentLifetime => "EarlySegmentLifetime",
+            NotLaidWhy::ProjectionPath => "ProjectionPath",
+            NotLaidWhy::SelfUnknown => "SelfUnknown",
+            NotLaidWhy::DefaultArg => "DefaultArg",
+            NotLaidWhy::AliasUnmade => "AliasUnmade",
+            NotLaidWhy::AliasRegions => "AliasRegions",
+            NotLaidWhy::PathRegion => "PathRegion",
+            NotLaidWhy::SelfSupertrait => "SelfSupertrait",
+            NotLaidWhy::ImplTraitLifetimes => "ImplTraitLifetimes",
+            NotLaidWhy::ProjectionHigherRanked => "ProjectionHigherRanked",
+            NotLaidWhy::ProjectionBoundElsewhere => "ProjectionBoundElsewhere",
+            NotLaidWhy::ProjectionTwoBounds => "ProjectionTwoBounds",
+            NotLaidWhy::ProjectionBoundArgs => "ProjectionBoundArgs",
+            NotLaidWhy::ProjectionElidedBound => "ProjectionElidedBound",
+            NotLaidWhy::DynLifetimes => "DynLifetimes",
+            NotLaidWhy::DynRegion => "DynRegion",
+            NotLaidWhy::BoundVariable => "BoundVariable",
+            NotLaidWhy::ContainerDisagree => "ContainerDisagree",
+            NotLaidWhy::AsyncCount => "AsyncCount",
+            NotLaidWhy::ElidedOutput => "ElidedOutput",
+            NotLaidWhy::Unlisted => "Unlisted",
+        }
+    }
+
+    /// What a person reads (rule 19): the region position, in Rust's words.
+    pub const fn text(self) -> &'static str {
+        match self {
+            NotLaidWhy::Stack => "a type whose children's region slots are not where the walk left them (a producer's bug)",
+            NotLaidWhy::OutOfStep => "a type whose region walk is out of step with its made type (a producer's bug)",
+            NotLaidWhy::TooMany => "a written type whose region slots pass a u32 count",
+            NotLaidWhy::Resolve => "a path the region walk did not resolve as the type walk did",
+            NotLaidWhy::DeclaredCount => "a declared lifetime count (an ADT's, a trait's or an associated type's) the names do not hold",
+            NotLaidWhy::FnPtrElision => "a fn pointer's or `Fn(..)` sugar's return type elides a lifetime its inputs do not give exactly one of (rustc: E0106)",
+            NotLaidWhy::ForBinder => "a `for<..>` binder over a type that is no fn pointer",
+            NotLaidWhy::OpaqueCaptures => "a return `impl Trait` whose captured lifetimes its rule or `use<..>` did not decide",
+            NotLaidWhy::OpaqueElided => "`'_` in a return `impl Trait`'s bound, and the inputs give no single lifetime for it (rustc: E0106)",
+            NotLaidWhy::Infer => "`_` in a declared type",
+            NotLaidWhy::TypeMacro => "a type macro's expansion",
+            NotLaidWhy::OtherForm => "a type form the region walk has no step for",
+            NotLaidWhy::QualifiedNoTrait => "a qualified path `<T>::Name` with no trait whose projection holds a lifetime, or whose trait is no path",
+            NotLaidWhy::QualifiedTraitLifetimes => "a qualified path `<T as Tr<'a>>::Name` whose trait declares a lifetime",
+            NotLaidWhy::OneNameArgs => "a one-name type argument whose own arguments hold a lifetime",
+            NotLaidWhy::EarlySegmentLifetime => "a lifetime argument on a path's segment before its last",
+            NotLaidWhy::ProjectionPath => "a projection path read through no bound whose arguments or trait hold a lifetime",
+            NotLaidWhy::SelfUnknown => "`Self`'s regions, not known where this type is written",
+            NotLaidWhy::DefaultArg => "a defaulted type argument that holds a lifetime",
+            NotLaidWhy::AliasUnmade => "a type alias whose head is not made",
+            NotLaidWhy::AliasRegions => "a type alias whose type holds a lifetime its head did not lay",
+            NotLaidWhy::PathRegion => "a path whose made type holds a region the walk does not place",
+            NotLaidWhy::SelfSupertrait => "`Self::Name` of a supertrait whose trait holds a lifetime",
+            NotLaidWhy::ImplTraitLifetimes => "`Self::Name` in an impl whose trait holds a lifetime, where the header's trait lifetimes are not known",
+            NotLaidWhy::ProjectionHigherRanked => "a projection read through a `for<..>` bound or where clause",
+            NotLaidWhy::ProjectionBoundElsewhere => "a projection `T::Name` whose trait holds a lifetime and no bound on `T` in this item names (a supertrait's or the container's)",
+            NotLaidWhy::ProjectionTwoBounds => "a projection whose parameter has two bounds naming its trait",
+            NotLaidWhy::ProjectionBoundArgs => "a projection whose bound's type arguments hold a lifetime",
+            NotLaidWhy::ProjectionElidedBound => "an elided lifetime in the bound a projection is read through",
+            NotLaidWhy::DynLifetimes => "a trait object with more than one lifetime bound",
+            NotLaidWhy::DynRegion => "a region position in a trait object no written lifetime gives",
+            NotLaidWhy::BoundVariable => "a bound lifetime of a fn pointer or trait object where the walk does not place it",
+            NotLaidWhy::ContainerDisagree => "a member whose container's lifetime group and its lifetimes' names disagree (D148)",
+            NotLaidWhy::AsyncCount => "an `async fn`'s future whose in-scope lifetimes were not counted",
+            NotLaidWhy::ElidedOutput => "an elided lifetime of the output the inputs' group does not hold",
+            NotLaidWhy::Unlisted => "a written type the head's walk did not lay",
+        }
+    }
+}
+
+/// Which part of an item's signature a region refusal was met in: what a refusal is placed by
+/// beside its cause ([`NotLaidWhy`]). A sink is told the part it walks
+/// ([`RegionSink::set_part`]); a check across the parts is the signature's `Whole`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SigPart {
+    /// The signature as a whole (a check across its parts), or a walk of no one part.
+    Whole,
+    /// Input `n` of a fn (its `self` the first).
+    Input(u32),
+    /// A fn's return type (an `async fn`'s future and its written type), a constant's or
+    /// static's type, a return opaque.
+    Output,
+    /// An impl's header: its self type.
+    Header,
+}
+
+impl SigPart {
+    /// Its tag and index in a record.
+    pub const fn bytes(self) -> (u8, u32) {
+        match self {
+            SigPart::Whole => (0, 0),
+            SigPart::Input(n) => (1, n),
+            SigPart::Output => (2, 0),
+            SigPart::Header => (3, 0),
+        }
+    }
+
+    /// The part of tag `tag` and index `n`; `None` for a tag no part writes, or an index on a
+    /// part that has none (one form per part: the bytes are canonical).
+    pub fn of_bytes(tag: u8, n: u32) -> Option<SigPart> {
+        match (tag, n) {
+            (0, 0) => Some(SigPart::Whole),
+            (1, n) => Some(SigPart::Input(n)),
+            (2, 0) => Some(SigPart::Output),
+            (3, 0) => Some(SigPart::Header),
+            _ => None,
+        }
+    }
+
+    /// Its kind's name: the class a refusal is counted by (its index is not in the class).
+    pub const fn name(self) -> &'static str {
+        match self {
+            SigPart::Whole => "Whole",
+            SigPart::Input(_) => "Input",
+            SigPart::Output => "Output",
+            SigPart::Header => "Header",
+        }
+    }
+}
+
+impl core::fmt::Display for SigPart {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SigPart::Whole => f.write_str("the signature"),
+            SigPart::Input(n) => write!(f, "input {n}"),
+            SigPart::Output => f.write_str("the output"),
+            SigPart::Header => f.write_str("the impl header"),
+        }
+    }
+}
+
+/// A region step's answer: the binder count of the slots it left in the sink's scratch, or
+/// why it laid none. A program error of the lifetimes (E0106) is the step's `Why`.
+type Laid = Result<u32, RegionRefusal>;
+
+/// What a projection written `X::Name` is read through ([`Builder::projection_slots`]): the
+/// bounds on the type parameter `X` in this item, or, in a trait, the trait itself (`Self`),
+/// or, in a trait impl, the impl's trait with `Self` the impl's self type (`SelfImpl`).
+#[derive(Clone, Copy)]
+enum Through<'t> {
+    Param(&'t str),
+    SelfTrait(LibKey),
+    SelfImpl(LibKey),
+}
+
+/// Takes the soft answer of a step, or returns it.
+macro_rules! soft {
+    ($e:expr) => {
+        match $e {
+            Ok(x) => x,
+            Err(why) => return Ok(Err(RegionRefusal::from(why))),
+        }
+    };
+}
+
+/// The shadow arguments a trait object is made again with, to see where each of its written
+/// arguments lands in it: `Param(SHADOW_BASE + i)` for argument `i`. Below `u32::MAX`, the
+/// erased `Self` of `dyn_ty`.
+const SHADOW_BASE: u32 = 0xffff_0000;
+
+/// One made type's region facts that its slots do not hold: its slot total, binder nodes and
+/// nodes (a subtree's, by the one walk).
+#[derive(Clone, Copy)]
+struct Sub {
+    slots: u32,
+    binders: u32,
+    nodes: u32,
+}
+
+fn subtree<F: tc::regions::Arity + ?Sized>(tys: tc::PTys<'_>, ty: PTy, facts: &F, alloc: Alloc<'_>) -> Result<Sub, RegionError> {
+    let mut sub = Sub { slots: 0, binders: 0, nodes: 0 };
+    let slots = each_slot_node(tys, ty, facts, alloc, &mut |_, node, _| {
+        sub.nodes += 1;
+        sub.binders += u32::from(is_binder(node));
+        Ok(())
+    })?;
+    sub.slots = slots;
+    Ok(sub)
+}
+
+/// The captured lifetimes of the opaque types of the item being made (D148): each opaque's
+/// count (`counts`, its `opaque_captures`), and the regions it captures in the fn's numbering
+/// (`regions`: one run per opaque, in `counts`' order, each in ascending `Param` order as
+/// heads_regions.rs `captures` gives it). The run is the `Opaque` node's own slots in the
+/// signature's column: `Param(0..n)` under the every-lifetime rule, and the listed ones under
+/// a `use<..>` bound or a pre-2024 RPIT's named-lifetimes rule (`fn sleep(&self, ..) -> impl
+/// Future + use<Self>` in a trait captures NO lifetime: commonware-runtime's `Clock::sleep`).
+#[derive(Clone, Copy, Debug)]
+pub struct Captures<'c> {
+    pub counts: &'c [(ItemKey, u32)],
+    pub regions: &'c [Region],
+}
+
+impl<'c> Captures<'c> {
+    /// No opaque type's captures: an item that has no return-position opaque.
+    pub const NONE: Captures<'static> = Captures { counts: &[], regions: &[] };
+
+    /// The regions `opaque` captures, `None` where it is not one of these opaques (or the runs
+    /// are out of step with the counts: never a guessed run).
+    pub fn of(&self, opaque: ItemKey) -> Option<&'c [Region]> {
+        let mut lo = 0usize;
+        for &(k, n) in self.counts {
+            let hi = lo.checked_add(n as usize)?;
+            if k == opaque {
+                return self.regions.get(lo..hi);
+            }
+            lo = hi;
+        }
+        None
+    }
+}
+
+/// What a walk in a container's member is given for `Self` (D148): `Self`'s regions (the impl's
+/// self type's column) and, in a trait impl's member, the impl's trait reference's column, for
+/// `Self::Name` (`projection_slots`, `Through::SelfImpl`). Either `None`: not known, and a use
+/// needing it is refused by name. Made from the container's filed regions by
+/// `SelfGiven::of` (heads.rs), so every member walk (a fn's signature, its clauses and opaque
+/// bounds, a constant's type) is given the same two.
+#[derive(Clone, Copy, Debug)]
+pub struct SelfGiven<'a> {
+    pub self_: Option<&'a [Region]>,
+    pub impl_trait: Option<&'a [Region]>,
+}
+
+impl SelfGiven<'_> {
+    /// Nothing given: outside an impl, or where the container's regions are not filed yet.
+    pub const NONE: SelfGiven<'static> = SelfGiven { self_: None, impl_trait: None };
+}
+
+/// `Self`'s regions alone (no trait column): a header's own walk, where the trait column is
+/// what is being laid.
+impl<'a> From<Option<&'a [Region]>> for SelfGiven<'a> {
+    fn from(self_: Option<&'a [Region]>) -> SelfGiven<'a> {
+        SelfGiven { self_, impl_trait: None }
+    }
+}
+
+/// The region slots of the types one walk makes, a fragment per made type on a stack beside
+/// the walk's own (D148): a type's slots are its children's fragments composed, with its own
+/// first. The head ([`Builder::ty_regions`]'s caller) numbers what is left.
+pub struct RegionSink<'s> {
+    alloc: Alloc<'s>,
+    slots: Vec<Slot, Alloc<'s>>,
+    frags: Vec<Frag, Alloc<'s>>,
+    /// Each elided lifetime's site, by its id.
+    elided: Vec<Range, Alloc<'s>>,
+    /// `Self`'s regions where `Self` is a type (an impl's self type, numbered as its members'
+    /// container group); `None` where they are not known.
+    self_slots: Option<Vec<Region, Alloc<'s>>>,
+    /// In a trait impl's member, the impl's trait reference's column (its trait's lifetimes as
+    /// the header writes them first, `heads_regions.rs` `header_trait`), numbered as `Self`'s;
+    /// `None` where there is none or it is not known.
+    impl_trait: Option<Vec<Region, Alloc<'s>>>,
+    /// The captured lifetime count of each opaque type of the item being made.
+    opaques: Vec<(ItemKey, u32), Alloc<'s>>,
+    /// The regions each of `opaques` captures, one run per opaque ([`Captures`]).
+    captured: Vec<Region, Alloc<'s>>,
+    scratch: Vec<Slot, Alloc<'s>>,
+    refused: Option<RegionRefusal>,
+    /// The part of the signature being laid ([`RegionSink::set_part`]).
+    part: SigPart,
+    /// The part `refused` was met in.
+    refused_part: SigPart,
+}
+
+impl<'s> RegionSink<'s> {
+    pub fn new_in(alloc: Alloc<'s>) -> RegionSink<'s> {
+        RegionSink {
+            alloc,
+            slots: Vec::new_in(alloc),
+            frags: Vec::new_in(alloc),
+            elided: Vec::new_in(alloc),
+            self_slots: None,
+            impl_trait: None,
+            opaques: Vec::new_in(alloc),
+            captured: Vec::new_in(alloc),
+            scratch: Vec::new_in(alloc),
+            refused: None,
+            part: SigPart::Whole,
+            refused_part: SigPart::Whole,
+        }
+    }
+
+    /// `Self`'s regions for the types made next (`None`: not known; a `Self` with regions is
+    /// then refused by name).
+    pub fn set_self(&mut self, regions: Option<&[Region]>) {
+        let alloc = self.alloc;
+        self.self_slots = regions.map(|r| {
+            let mut v = Vec::with_capacity_in(r.len(), alloc);
+            v.extend_from_slice(r);
+            v
+        });
+    }
+
+    pub fn self_regions(&self) -> Option<&[Region]> {
+        self.self_slots.as_deref()
+    }
+
+    /// The impl's trait reference's column for the types made next, in the numbering `Self`'s
+    /// regions are in (`None`: none or not known; a `Self::Name` of a trait with lifetimes is
+    /// then refused by name).
+    pub fn set_impl_trait(&mut self, regions: Option<&[Region]>) {
+        let alloc = self.alloc;
+        self.impl_trait = regions.map(|r| {
+            let mut v = Vec::with_capacity_in(r.len(), alloc);
+            v.extend_from_slice(r);
+            v
+        });
+    }
+
+    /// Both of what a container's member's walk is given for `Self` ([`SelfGiven`]): `Self`'s
+    /// regions ([`Self::set_self`]) and the impl's trait column ([`Self::set_impl_trait`]).
+    pub fn set_given(&mut self, given: SelfGiven<'_>) {
+        self.set_self(given.self_);
+        self.set_impl_trait(given.impl_trait);
+    }
+
+    /// The captured lifetimes of the opaques of the item being made.
+    pub fn set_opaques(&mut self, captures: Captures<'_>) {
+        self.opaques.clear();
+        self.opaques.extend_from_slice(captures.counts);
+        self.captured.clear();
+        self.captured.extend_from_slice(captures.regions);
+    }
+
+    /// The captured lifetime counts of the opaques of the item being made.
+    pub fn opaques(&self) -> &[(ItemKey, u32)] {
+        &self.opaques
+    }
+
+    /// The captured lifetimes of the opaques of the item being made.
+    pub fn captures(&self) -> Captures<'_> {
+        Captures { counts: &self.opaques, regions: &self.captured }
+    }
+
+    /// The first refusal of any type this sink laid, if one was refused.
+    pub fn refused(&self) -> Option<RegionRefusal> {
+        self.refused
+    }
+
+    /// The part of the signature the types laid next are (an input by index, the output, an
+    /// impl's header): what [`RegionSink::refused_part`] names of a refusal met while laying
+    /// them. [`SigPart::Whole`] until set.
+    pub fn set_part(&mut self, part: SigPart) {
+        self.part = part;
+    }
+
+    /// The part the first refusal ([`RegionSink::refused`]) was met in; [`SigPart::Whole`]
+    /// when nothing was refused or no part was set.
+    pub fn refused_part(&self) -> SigPart {
+        self.refused_part
+    }
+
+    /// Refuses the regions of what is being made (the first refusal is kept, with the part it
+    /// was met in).
+    pub fn refuse(&mut self, why: RegionRefusal) {
+        if self.refused.is_none() {
+            self.refused = Some(why);
+            self.refused_part = self.part;
+        }
+    }
+
+    /// The fragments on the stack, the oldest first.
+    pub fn frags(&self) -> &[Frag] {
+        &self.frags
+    }
+
+    pub fn slots_of(&self, f: Frag) -> &[Slot] {
+        self.slots.get(f.start as usize..(f.start + f.len) as usize).unwrap_or(&[])
+    }
+
+    /// The site of the elided lifetime `id`.
+    pub fn elided_at(&self, id: u32) -> Option<Range> {
+        self.elided.get(id as usize).copied()
+    }
+
+    /// A new elided lifetime at `at`.
+    pub fn new_elided(&mut self, at: Range) -> SlotKind {
+        let id = self.elided.len() as u32;
+        self.elided.push(at);
+        SlotKind::Elided(id)
+    }
+
+    /// Where the stack is: what [`RegionSink::reset`] goes back to (a walk that stopped half
+    /// way, as a type that names nothing does, leaves its children's fragments).
+    pub fn mark(&self) -> (usize, usize) {
+        (self.frags.len(), self.slots.len())
+    }
+
+    pub fn reset(&mut self, mark: (usize, usize)) {
+        self.frags.truncate(mark.0);
+        self.slots.truncate(mark.1);
+    }
+
+    /// Pushes a fragment of `slots` whose type has `binders` binder nodes (a type the head
+    /// makes itself: `&self`, `self`).
+    pub fn push(&mut self, slots: &[Slot], binders: u32) {
+        let start = self.slots.len() as u32;
+        self.slots.extend_from_slice(slots);
+        self.frags.push(Frag { start, len: slots.len() as u32, binders });
+    }
+
+    /// The `k`-th of the top `n` fragments.
+    fn kid(&self, n: usize, k: usize) -> Option<Frag> {
+        self.frags.len().checked_sub(n).and_then(|b| self.frags.get(b + k)).copied()
+    }
+
+    /// Replaces the top `n` fragments with the scratch's slots, of `binders` binder nodes.
+    fn replace(&mut self, n: usize, binders: u32) {
+        let keep = self.frags.len().saturating_sub(n);
+        let base = self.frags.get(keep).map_or(self.slots.len(), |f| f.start as usize);
+        self.frags.truncate(keep);
+        self.slots.truncate(base);
+        let start = self.slots.len() as u32;
+        self.slots.extend_from_slice(&self.scratch);
+        self.frags.push(Frag { start, len: self.scratch.len() as u32, binders });
+        self.scratch.clear();
+    }
+
+    /// `own` (a reference's slot) then the `n` children's slots in order: a child trait
+    /// object's default is `own` where the child is the reference's pointee, `'static`
+    /// anywhere else (a raw pointer, a slice, an array, a tuple: no lifetime of theirs).
+    fn wrap(&mut self, n: usize, own: Option<SlotKind>) -> Laid {
+        self.scratch.clear();
+        if let Some(o) = own {
+            self.scratch.push(Slot::written(o));
+        }
+        let mut binders = 0u32;
+        for k in 0..n {
+            let f = self.kid(n, k).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, Range::new(0, 0)))?;
+            for i in f.start..f.start + f.len {
+                let slot = self.slots[i as usize];
+                let slot = match (slot.kind, own) {
+                    (SlotKind::ObjectDefault(_), Some(o)) => Slot::quiet(o),
+                    (SlotKind::ObjectDefault(_), None) => Slot::quiet(SlotKind::Static),
+                    _ => slot.shifted(binders),
+                };
+                self.scratch.push(slot);
+            }
+            binders += f.binders;
+        }
+        Ok(binders)
+    }
+
+    /// A fn pointer: binder 0 of its own slots. Its inputs' elided lifetimes are its own
+    /// variables, one each in input slot order; its output's take the one lifetime its inputs
+    /// use, or are E0106 (the Reference, "Lifetime elision in functions", which "applies to
+    /// function pointer types" as to fns).
+    fn fn_ptr(&mut self, n: usize, ret_written: bool, r: Range) -> Result<Laid, Why> {
+        let inputs = if ret_written { n.saturating_sub(1) } else { n };
+        self.scratch.clear();
+        let mut vars: Vec<u32, Alloc<'s>> = Vec::new_in(self.alloc);
+        let mut binders = 1u32;
+        let mut input_end = 0usize;
+        for k in 0..n {
+            let f = soft!(self.kid(n, k).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, r)));
+            for i in f.start..f.start + f.len {
+                let slot = self.slots[i as usize];
+                let slot = match slot.kind {
+                    SlotKind::ObjectDefault(_) => Slot::quiet(SlotKind::Static),
+                    SlotKind::Elided(id) if k < inputs => {
+                        let var = match vars.iter().position(|&v| v == id) {
+                            Some(p) => p as u32,
+                            None => {
+                                vars.push(id);
+                                vars.len() as u32 - 1
+                            }
+                        };
+                        Slot::written(SlotKind::Late { binder: 0, var })
+                    }
+                    _ => slot.shifted(binders),
+                };
+                self.scratch.push(slot);
+            }
+            binders += f.binders;
+            if k < inputs {
+                input_end = self.scratch.len();
+            }
+        }
+        if ret_written {
+            let one = used_lifetimes(&self.scratch[..input_end], fn_ptr_local);
+            for i in input_end..self.scratch.len() {
+                if let SlotKind::Elided(_) = self.scratch[i].kind {
+                    match one {
+                        Used::One(k) => self.scratch[i].kind = k,
+                        // A regions refusal by name, the head made: E0106 is the program's
+                        // only for a fn's own return type (heads.rs `missing_lifetime`).
+                        Used::None | Used::Many => {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::FnPtrElision, r)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Ok(binders))
+    }
+
+    /// `for<'a, ..> fn(..)`: its names are the fn pointer's variables, before the elided ones.
+    fn for_binder(&mut self, tys: tc::PTys<'_>, v: &View<'_>, binder: lf::List, made: PTy, r: Range) -> Result<Laid, Why> {
+        if !matches!(tys.node(made), Ok(PNode::FnPtr(..))) {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ForBinder, r)));
+        }
+        let mut names: Vec<Name, Alloc<'s>> = Vec::new_in(self.alloc);
+        for &row in v.rows(binder)? {
+            if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(row)? {
+                names.push(Name(v.name(name)?));
+            }
+        }
+        let nb = names.len() as u32;
+        let f = soft!(self.kid(1, 0).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, r)));
+        self.scratch.clear();
+        for i in f.start..f.start + f.len {
+            let slot = self.slots[i as usize];
+            let kind = match slot.kind {
+                SlotKind::Late { binder: 0, var } => SlotKind::Late { binder: 0, var: var + nb },
+                SlotKind::Named(n, at) => match names.iter().position(|&x| x == n) {
+                    Some(p) => SlotKind::Late { binder: 0, var: p as u32 },
+                    None => SlotKind::Named(n, at),
+                },
+                k => k,
+            };
+            self.scratch.push(Slot { kind, counts: slot.counts });
+        }
+        Ok(Ok(f.binders))
+    }
+
+    /// An `impl Trait` type: a parameter's (`Param`) has no slot; a return type's opaque has
+    /// its captured lifetimes, in its fn's numbering ([`Captures`]): `Param(0..n)` under the
+    /// every-lifetime rule (edition 2024, an `async fn`'s future, a trait's or trait impl's
+    /// fn), the listed ones under `use<..>` or a pre-2024 RPIT's named-lifetimes rule.
+    fn opaque(&mut self, tys: tc::PTys<'_>, made: PTy, r: Range) -> Laid {
+        self.scratch.clear();
+        match tys.node(made) {
+            Ok(PNode::Opaque(k, _)) => {
+                let captures = Captures { counts: &self.opaques, regions: &self.captured };
+                let run = captures.of(k).ok_or(RegionRefusal::not_laid(NotLaidWhy::OpaqueCaptures, r))?;
+                for &c in run {
+                    self.scratch.push(Slot::quiet(SlotKind::Given(c)));
+                }
+                Ok(0)
+            }
+            Ok(_) => Ok(0),
+            Err(e) => Err(RegionRefusal::Regions(RegionError::Table(e))),
+        }
+    }
+}
+
+/// Where a path's segment stands, for the lifetimes written on it ([`Builder::path_regions`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegRole {
+    /// The path's last segment: its lifetimes are the named item's (an ADT's, an alias's, a
+    /// projection's own).
+    Last,
+    /// The last segment of a qualified path's trait (`Tr<'a>` in `<T as Tr<'a>>::Name`): its
+    /// lifetimes are the trait reference's, the alias's first slots.
+    QualifiedTrait,
+    /// Any other segment: a lifetime there is refused by name
+    /// ([`NotLaidWhy::EarlySegmentLifetime`]).
+    Early,
+}
+
+/// The slot a written lifetime gives (`'_` and none written are elided, a new one each).
+fn lifetime_kind(v: &View<'_>, n: Option<lf::NameIdx>, r: Range, s: &mut RegionSink<'_>) -> Result<SlotKind, Why> {
+    let Some(n) = n else { return Ok(s.new_elided(r)) };
+    let text = v.name_text(n)?;
+    let at = place(v, v.name_range(n))?;
+    Ok(match text.strip_prefix('\'').unwrap_or(text) {
+        "_" => s.new_elided(at),
+        "static" => SlotKind::Static,
+        _ => SlotKind::Named(Name(v.name(n)?), at),
+    })
+}
+
+impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
+    /// The region step of the type `t` the walk just made (`made`, of the children `kids`,
+    /// with `args` its path's arguments): its fragment replaces its children's on `s`.
+    #[expect(clippy::too_many_arguments, reason = "one made type: its written form, its children, its path's arguments and the sink")]
+    fn regions_made(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, made: PTy, kids: &[PTy], args: &[PTy], s: &mut RegionSink<'_>) -> Result<(), Why> {
+        let n = kids.len();
+        let r = place(v, v.type_range(t))?;
+        let laid = if s.refused.is_some() {
+            Ok(0)
+        } else {
+            match v.ty(t)? {
+                lf::TypeRef::Ref { lifetime, .. } => {
+                    let own = lifetime_kind(v, lifetime, r, s)?;
+                    s.wrap(n, Some(own))
+                }
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::FnPtr { ret, .. } => s.fn_ptr(n, ret.is_some(), r)?,
+                lf::TypeRef::For { binder, .. } => s.for_binder(tys.view(), v, binder, made, r)?,
+                lf::TypeRef::Path(p) => self.path_regions(tys, env, v, p, made, args, n, s, r)?,
+                lf::TypeRef::Dyn(bounds) => self.dyn_regions(tys, env, v, bounds, made, kids, s, r)?,
+                lf::TypeRef::Impl(_) => s.opaque(tys.view(), made, r),
+                lf::TypeRef::Infer => Err(RegionRefusal::not_laid(NotLaidWhy::Infer, r)),
+                lf::TypeRef::Macro(_) => Err(RegionRefusal::not_laid(NotLaidWhy::TypeMacro, r)),
+                _ => Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r)),
+            }
+        };
+        match laid {
+            Ok(binders) => s.replace(n, binders),
+            Err(why) => {
+                s.refuse(why);
+                s.scratch.clear();
+                s.replace(n, 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// A path's slots. A struct's, enum's or union's: its written lifetime arguments (or one
+    /// elided lifetime per declared one when none is written: the Reference, "Lifetime
+    /// elision", "elided in paths"), then its arguments' slots; a type alias's: its type's
+    /// with each parameter's argument's slots where the parameter is; `Self`'s: the head's;
+    /// a type parameter's and a primitive's: none. A projection's are laid only when it has
+    /// none (its own come from its trait's lifetime arguments: not laid yet).
+    #[expect(clippy::too_many_arguments, reason = "one made path: its written form, its arguments and the sink")]
+    fn path_regions(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, made: PTy, args: &[PTy], n: usize, s: &mut RegionSink<'_>, r: Range) -> Result<Laid, Why> {
+        // The segments as `path_args` reads them (the last one's `Fn(A) -> B` sugar too).
+        let (abs, texts, segs, _) = path_texts_of(v, p, true)?;
+        let alloc = s.alloc;
+        // Each argument's slots in `args`' order (`path_args`' walk): a written type
+        // argument's from its fragment, a one-name or const argument's made here.
+        let mut pool: Vec<Slot, Alloc<'_>> = Vec::new_in(alloc);
+        let mut index: Vec<(u32, u32, u32), Alloc<'_>> = Vec::new_in(alloc);
+        let mut lifetimes: Vec<SlotKind, Alloc<'_>> = Vec::new_in(alloc);
+        // The lifetimes written on a qualified path's trait (`<T as Tr<'a>>::Name`): the
+        // trait reference's own arguments, the alias's first slots ([`Builder::qualified_slots`]).
+        let mut trait_lifetimes: Vec<SlotKind, Alloc<'_>> = Vec::new_in(alloc);
+        let mut stray = false;
+        let mut todo: Vec<(lf::Segment, SegRole), Alloc<'_>> = Vec::new_in(alloc);
+        let anchored = segs.first().is_some_and(|s0| s0.kind == lf::SegKind::Anchor);
+        for (k, seg) in segs.iter().enumerate() {
+            if seg.kind == lf::SegKind::Anchor {
+                // `<T>::Name` writes no trait: no trait segment is walked; it is laid below only
+                // when its projection holds no slot.
+                let Some(tr) = seg.trait_ else { continue };
+                let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::QualifiedNoTrait, r))) };
+                let tsegs = path_texts(v, tp)?.2;
+                let nt = tsegs.len();
+                for (j, ts) in tsegs.into_iter().enumerate() {
+                    todo.push((ts, if j + 1 == nt { SegRole::QualifiedTrait } else { SegRole::Early }));
+                }
+            } else {
+                todo.push((*seg, if k + 1 == segs.len() { SegRole::Last } else { SegRole::Early }));
+            }
+        }
+        let mut next_kid = 0usize;
+        let mut at = 0usize;
+        // Made at each use, not held: a one-name alias argument hands the whole sink on.
+        // (Written out at its two uses: a closure cannot return a borrow of its argument's field
+        // under one inferred signature: "lifetime may not live long enough".)
+        let take_kid =|s_slots: &[Slot], f: Frag, pool: &mut Vec<Slot, Alloc<'_>>, index: &mut Vec<(u32, u32, u32), Alloc<'_>>| {
+            let start = pool.len() as u32;
+            pool.extend_from_slice(s_slots.get(f.start as usize..(f.start + f.len) as usize).unwrap_or(&[]));
+            index.push((start, f.len, f.binders));
+        };
+        if anchored {
+            let f = soft!(s.kid(n, next_kid).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, r)));
+            take_kid(&s.slots, f, &mut pool, &mut index);
+            next_kid += 1;
+            at += 1;
+        }
+        for &(seg, role) in &todo {
+            if !seg.has_args {
+                continue;
+            }
+            for &row in v.rows(seg.args)? {
+                match lf::GenericArg::decode(row)? {
+                    lf::GenericArg::Type(ta) if bare_name(v, ta)?.is_none() => {
+                        let f = soft!(s.kid(n, next_kid).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, r)));
+                        take_kid(&s.slots, f, &mut pool, &mut index);
+                        next_kid += 1;
+                        at += 1;
+                    }
+                    lf::GenericArg::Type(_) | lf::GenericArg::Const(_) => {
+                        // Made in `path_args`: a type parameter, a primitive, a constant (no
+                        // slot), or a path to an ADT with no arguments, whose lifetimes are
+                        // elided.
+                        let a = soft!(args.get(at).copied().ok_or(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                        let sub = soft!(subtree(tys.view(), a, &HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names }, alloc));
+                        // A one-name type alias (`Result<B256, ErrorObjectOwned>`, jsonrpsee's
+                        // `type ErrorObjectOwned = ErrorObject<'static>`): its made type is its
+                        // expansion's, so the ADT rule below would read `ErrorObject` written
+                        // bare and elide its lifetime, a false E0106 in a return type with two
+                        // input lifetimes (tempo `zone_node::rpc::operator_commitment`). Its
+                        // slots are the alias's, as the path arm lays a written `R<..>`.
+                        if sub.slots != 0
+                            && let lf::GenericArg::Type(ta) = lf::GenericArg::decode(row)?
+                            && let Some(name) = bare_name(v, ta)?
+                            && !env.params.iter().any(|(nm, _)| *nm == Name::of(name))
+                            && let lf::TypeRef::Path(tp) = v.ty(ta)?
+                        {
+                            let ar = place(v, v.type_range(ta))?;
+                            let found = match self.resolve_at(env, v, tp, false, &[name], Ns::Type, ar) {
+                                Ok(found) => found,
+                                Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                                Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::Resolve, ar))),
+                            };
+                            if matches!(found.kind, Kind::TypeAlias) {
+                                s.scratch.clear();
+                                let b = match self.path_regions_found(tys, v, tp, (a, &[]), s, ar, &found, (&[], &[], &[]), sub)? {
+                                    Ok(b) => b,
+                                    Err(why) => return Ok(Err(why)),
+                                };
+                                let start = pool.len() as u32;
+                                pool.extend_from_slice(&s.scratch);
+                                index.push((start, s.scratch.len() as u32, b));
+                                s.scratch.clear();
+                                at += 1;
+                                continue;
+                            }
+                        }
+                        let own = match tys.view().node(a) {
+                            Ok(PNode::Adt(k, _)) => soft!(declared_lifetimes(self.heads, self.resolver.names, k, Declared::Adt).ok_or(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, r))),
+                            _ => 0,
+                        };
+                        if sub.slots != own {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OneNameArgs, r)));
+                        }
+                        let start = pool.len() as u32;
+                        for _ in 0..own {
+                            let id = s.elided.len() as u32;
+                            s.elided.push(r);
+                            pool.push(Slot::written(SlotKind::Elided(id)));
+                        }
+                        index.push((start, own, sub.binders));
+                        at += 1;
+                    }
+                    lf::GenericArg::Lifetime(nm) if role != SegRole::Early => {
+                        let text = v.name_text(nm)?;
+                        let lat = place(v, v.name_range(nm))?;
+                        let kind = match text.strip_prefix('\'').unwrap_or(text) {
+                            "_" => {
+                                let id = s.elided.len() as u32;
+                                s.elided.push(lat);
+                                SlotKind::Elided(id)
+                            }
+                            "static" => SlotKind::Static,
+                            _ => SlotKind::Named(Name(v.name(nm)?), lat),
+                        };
+                        match role {
+                            SegRole::QualifiedTrait => trait_lifetimes.push(kind),
+                            SegRole::Last | SegRole::Early => lifetimes.push(kind),
+                        }
+                    }
+                    lf::GenericArg::Lifetime(_) => stray = true,
+                    _ => {}
+                }
+            }
+        }
+        if at != args.len() || next_kid != n {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+        }
+        if stray {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::EarlySegmentLifetime, r)));
+        }
+        let param = |name: &str| env.params.iter().any(|(nm, _)| *nm == Name::of(name));
+        let self_path = !abs && texts.first() == Some(&"Self");
+        let whole = soft!(subtree(tys.view(), made, &HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names }, alloc));
+        s.scratch.clear();
+        // `T::Name` and, in a trait, `Self::Name` whose trait holds a lifetime: read through
+        // the bound that names the trait ([`Builder::projection_slots`]).
+        if !anchored && !abs && texts.len() == 2 && whole.slots != 0 {
+            let through = match env.self_ {
+                _ if param(texts[0]) => Some(Through::Param(texts[0])),
+                SelfTy::Trait(tr) if self_path => Some(Through::SelfTrait(tr)),
+                // In a trait impl `Self::Name` is the projection `<SelfTy as Tr>::Name` (the
+                // erased walk's `path_ty`): laid as one, `Self`'s slots the impl's self type's.
+                SelfTy::Ty(_, Some((tr, _))) if self_path => Some(Through::SelfImpl(tr)),
+                _ => None,
+            };
+            if let Some(through) = through {
+                return self.projection_slots(tys, env, v, made, through, (&lifetimes, &pool, &index), s, r);
+            }
+        }
+        // A qualified path `<T as Tr<'a>>::Name`: laid as the projection it is, never
+        // normalized here (a head is a function of its own text, rules 65 and 21: no trait
+        // selection). Its slots are the alias node's, in `each_slot_node`'s order: its trait's
+        // lifetimes (those written on the trait's last segment, `trait_lifetimes`), its own (a
+        // GAT's, written on `Name`), then its arguments' (the self type's, the trait's type
+        // arguments', `Name`'s), each from the stack. A reader that knows the impl the
+        // projection selects maps the normalized type's regions through the impl's column
+        // (`RegionFacts::impl_assoc`, the impl's self column for its parameters); one that does
+        // not keeps the alias's positions. Lifetimes written on a trait that declares none are
+        // a count the walk refuses there (E0107), never dropped.
+        // `<T>::Name` with no trait whose projection holds a lifetime: its trait's lifetimes are
+        // the bound's (as `T::Name`'s, `projection_slots`), not read through this form yet.
+        if anchored && segs.first().is_some_and(|s0| s0.trait_.is_none()) && whole.slots != 0 {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::QualifiedNoTrait, r)));
+        }
+        if anchored && (whole.slots != 0 || !trait_lifetimes.is_empty()) {
+            return Ok(self.qualified_slots(tys, made, (&trait_lifetimes, &lifetimes, &pool, &index), whole, s, r));
+        }
+        if anchored || (self_path && texts.len() >= 2) || (!abs && texts.len() == 2 && param(texts[0])) {
+            if !lifetimes.is_empty() || !pool.is_empty() || whole.slots != 0 {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionPath, r)));
+            }
+            return Ok(Ok(whole.binders));
+        }
+        if self_path {
+            if let SelfTy::Ty(..) = env.self_ {
+                let Some(given) = s.self_slots.as_ref() else {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::SelfUnknown, r)));
+                };
+                if given.len() as u32 != whole.slots {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                }
+                for &g in given.iter() {
+                    s.scratch.push(Slot::quiet(SlotKind::Given(g)));
+                }
+            }
+            return Ok(Ok(whole.binders));
+        }
+        if !abs && texts.len() == 1 && param(texts[0]) {
+            return Ok(Ok(0));
+        }
+        // The erased walk resolved this path in this env a step before (`walk_ty`'s `make`), so
+        // a refusal here is the regions walk's own and never the head's: the regions are
+        // refused by name, the erased type stands (a need still goes up, to be met).
+        let found = match self.resolve_at(env, v, p, abs, &texts, Ns::Type, r) {
+            Ok(found) => found,
+            Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+            Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::Resolve, r))),
+        };
+        self.path_regions_found(tys, v, p, (made, args), s, r, &found, (&lifetimes, &pool, &index), whole)
+    }
+
+    /// [`Builder::path_regions`] once its path is resolved to `found`: the ADT's or the type
+    /// alias's slots from the arguments' (`pool`, by `index`) and the written lifetimes. In a
+    /// frame of its own: `path_regions`' frame stays on the stack under the resolution, which
+    /// can make another head (blaze-int notes t29 overflow-bt4.txt: 55,072 bytes), and a debug
+    /// frame gives each temporary of these walks a slot.
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments, reason = "one resolved path: its written form, its gathered arguments and the sink")]
+    fn path_regions_found(&self, tys: &mut PortableTys<'_>, v: &View<'_>, p: PathIdx, (made, args): (PTy, &[PTy]), s: &mut RegionSink<'_>, r: Range, found: &crate::resolve::Target, (lifetimes, pool, index): (&[SlotKind], &[Slot], &[(u32, u32, u32)]), whole: Sub) -> Result<Laid, Why> {
+        let alloc = s.alloc;
+        let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
+        match found.kind {
+            Kind::Struct | Kind::Enum | Kind::Union => {
+                let Ok(PNode::Adt(k, l)) = tys.view().node(made) else {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                };
+                let want = soft!(declared_lifetimes(self.heads, self.resolver.names, k, Declared::Adt).ok_or(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, r)));
+                if lifetimes.is_empty() {
+                    for _ in 0..want {
+                        let id = s.elided.len() as u32;
+                        s.elided.push(r);
+                        s.scratch.push(Slot::written(SlotKind::Elided(id)));
+                    }
+                } else if lifetimes.len() as u32 == want {
+                    s.scratch.extend(lifetimes.iter().map(|&k| Slot::written(k)));
+                } else {
+                    return Ok(Err(RegionRefusal::LifetimeArgs { at: r, want, got: lifetimes.len() as u32 }));
+                }
+                let list = soft!(tys.view().list(l).map_err(RegionError::Table));
+                let mut binders = 0u32;
+                for (i, &a) in list.iter().enumerate() {
+                    match index.get(i) {
+                        Some(&(start, len, b)) => {
+                            for &slot in &pool[start as usize..(start + len) as usize] {
+                                let slot = match slot.kind {
+                                    // A trait object argument of a type with no lifetime
+                                    // parameter: `'static` (`Box<dyn Tr>`).
+                                    SlotKind::ObjectDefault(_) if want == 0 => Slot::quiet(SlotKind::Static),
+                                    SlotKind::ObjectDefault(oat) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
+                                    _ => slot.shifted(binders),
+                                };
+                                s.scratch.push(slot);
+                            }
+                            binders += b;
+                        }
+                        None => {
+                            let sub = soft!(subtree(tys.view(), a, &arity, alloc));
+                            if sub.slots != 0 {
+                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                            }
+                            binders += sub.binders;
+                        }
+                    }
+                }
+                Ok(Ok(binders))
+            }
+            Kind::TypeAlias => {
+                let Some(Some((g, body))) = self.heads.alias(found.key) else {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::AliasUnmade, r)));
+                };
+                let shown = v.text_at(v.path_range(p)?)?;
+                let full = with_defaults(tys, args, g, self.heads.alias_defaults(found.key), shown, r)?;
+                let mut visits: Vec<(PTy, PNode, u32), Alloc<'_>> = Vec::new_in(alloc);
+                soft!(each_slot_node(tys.view(), body, &arity, alloc, &mut |t, node, own| {
+                    visits.push((t, node, own));
+                    Ok(())
+                }));
+                // The alias's own lifetimes as this use gives them: written (`R<'q>`), or, none
+                // written, each an elided lifetime of this position (`fn f(x: R)`, the
+                // position's elision rule decides it, as for an ADT's), made where first used.
+                let laid = self.heads.alias_slots(found.key);
+                let mut given: Vec<Option<SlotKind>, Alloc<'_>> = Vec::new_in(alloc);
+                match laid {
+                    Some(l) if lifetimes.is_empty() => given.resize(l.lifetimes as usize, None),
+                    Some(l) if lifetimes.len() as u32 == l.lifetimes => given.extend(lifetimes.iter().map(|&k| Some(k))),
+                    Some(l) => return Ok(Err(RegionRefusal::LifetimeArgs { at: r, want: l.lifetimes, got: lifetimes.len() as u32 })),
+                    None => {}
+                }
+                // Each binder node of the alias's type, its index among the made type's.
+                let mut binder_at: Vec<u32, Alloc<'_>> = Vec::new_in(alloc);
+                let mut next = 0usize;
+                // The alias's type in pre-order: a parameter (a leaf) takes its argument's slots,
+                // any other node its own from the alias's laid column.
+                let mut binders = 0u32;
+                for &(_, node, own) in &visits {
+                    if let PNode::Param(i) = node
+                        && let Some(&a) = full.get(i as usize)
+                    {
+                        match index.get(i as usize) {
+                            Some(&(start, len, b)) => {
+                                for &slot in &pool[start as usize..(start + len) as usize] {
+                                    if let SlotKind::ObjectDefault(oat) = slot.kind {
+                                        return Ok(Err(RegionRefusal::ObjectDefault { at: oat }));
+                                    }
+                                    s.scratch.push(slot.shifted(binders));
+                                }
+                                binders += b;
+                            }
+                            None => {
+                                let sub = soft!(subtree(tys.view(), a, &arity, alloc));
+                                if sub.slots != 0 {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                }
+                                binders += sub.binders;
+                            }
+                        }
+                        continue;
+                    }
+                    if own > 0 {
+                        let Some(l) = laid else {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::AliasRegions, r)));
+                        };
+                        let Some(col) = l.slots.get(next..next + own as usize) else {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                        };
+                        next += own as usize;
+                        for &a in col {
+                            let kind = match a {
+                                AliasSlot::Static => SlotKind::Static,
+                                AliasSlot::Late { binder, var } => match binder_at.get(binder as usize) {
+                                    Some(&b) => SlotKind::Late { binder: b, var },
+                                    None => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::AliasRegions, r))),
+                                },
+                                AliasSlot::Lifetime(i) => match given.get_mut(i as usize) {
+                                    Some(Some(k)) => *k,
+                                    Some(g @ None) => {
+                                        let id = s.elided.len() as u32;
+                                        s.elided.push(r);
+                                        *g = Some(SlotKind::Elided(id));
+                                        SlotKind::Elided(id)
+                                    }
+                                    None => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r))),
+                                },
+                            };
+                            s.scratch.push(Slot::written(kind));
+                        }
+                    }
+                    if is_binder(node) {
+                        binder_at.push(binders);
+                    }
+                    binders += u32::from(is_binder(node));
+                }
+                if laid.is_some_and(|l| l.slots.len() != next) {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                }
+                if s.scratch.len() as u32 != whole.slots || binders != whole.binders {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                }
+                Ok(Ok(binders))
+            }
+            _ => {
+                if whole.slots != 0 {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::PathRegion, r)));
+                }
+                Ok(Ok(whole.binders))
+            }
+        }
+    }
+
+    /// The slots of the projection `made` written `T::Name` (`T` a type parameter) or, in a
+    /// trait, `Self::Name` (D148), in `each_slot_node`'s order: the alias's own (its trait's
+    /// lifetimes, then its own, `regions::Arity::alias_lifetimes`), then its arguments'. Its
+    /// trait's lifetimes are those the one bound naming the trait writes on `T` in this item
+    /// (the Reference, "Paths", "Paths in types": `T::Name` is `<T as Trait>::Name` for the
+    /// bound `T: Trait`; serde's `V: Visitor<'de>` gives `V::Value` the slot `'de`), or the
+    /// trait's own for `Self::Name` (`Param(0..)`, the container group its members number
+    /// first). Its own lifetimes and arguments are those written on `Name`. A trait that
+    /// declares no lifetime needs no bound at all (none gives it a slot). A projection whose
+    /// trait has lifetimes, read through a supertrait, a container's bound, a `for<..>` bound
+    /// or two bounds, or whose other arguments hold a lifetime, is refused by name: not laid
+    /// yet, never guessed.
+    #[expect(clippy::too_many_arguments, reason = "one made projection: its written form, its arguments and the sink")]
+    fn projection_slots(
+        &self,
+        tys: &mut PortableTys<'_>,
+        env: &Env<'_>,
+        v: &View<'_>,
+        made: PTy,
+        through: Through<'_>,
+        (own_written, pool, index): (&[SlotKind], &[Slot], &[(u32, u32, u32)]),
+        s: &mut RegionSink<'_>,
+        r: Range,
+    ) -> Result<Laid, Why> {
+        let alloc = s.alloc;
+        let Ok(PNode::Alias { trait_, name, args }) = tys.view().node(made) else {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+        };
+        let Some(trait_count) = declared_lifetimes(self.heads, self.resolver.names, trait_, Declared::Trait) else {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, r)));
+        };
+        let Some(own_count) = declared_lifetimes(self.heads, self.resolver.names, trait_, Declared::Assoc(name)) else {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, r)));
+        };
+        if own_written.len() as u32 != own_count {
+            return Ok(Err(RegionRefusal::LifetimeArgs { at: r, want: own_count, got: own_written.len() as u32 }));
+        }
+        let mut slots: Vec<Slot, Alloc<'_>> = Vec::new_in(alloc);
+        // A trait that declares no lifetime gives the alias no slot of its own trait's: which
+        // bound, supertrait or container names it decides nothing of the regions (its type
+        // arguments are the alias's arguments, read from the made type below and refused if
+        // they hold a lifetime). So `T::Token<'_>` under the container's `T: SolType`
+        // (alloy-sol-types' `trait SolTypeValue<T: SolType> { fn stv_to_tokens(&self) ->
+        // T::Token<'_>; }`) and `Self::Name` of a supertrait without lifetimes are laid
+        // exactly; only a trait WITH lifetimes needs the one bound that writes them.
+        match through {
+            Through::SelfTrait(tr) => {
+                if self.heads.checker(tr) != trait_ && trait_count != 0 {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::SelfSupertrait, r)));
+                }
+                for i in 0..trait_count {
+                    slots.push(Slot::quiet(SlotKind::Given(Region::Param(i))));
+                }
+            }
+            // The impl's own trait: `Self::Name` is `<SelfTy as Tr<'x..>>::Name` with the
+            // trait's lifetimes as the impl's header writes them (the Reference, "Paths",
+            // "`Self`", and "Implementations": the impl implements `Tr<'x..>` for `SelfTy`;
+            // serde's derived `impl<'de> Visitor<'de> for __Visitor<'de> { fn visit_seq<A>(..)
+            // -> Result<Self::Value, A::Error> }` is `<__Visitor<'de> as Visitor<'de>>::Value`).
+            // They are the first `trait_count` regions of the header's trait column
+            // (heads_regions.rs `header_trait`: the trait's lifetimes, each elided one a fresh
+            // parameter of the impl, then `Self`'s, then the arguments'), numbered as `Self`'s
+            // (the members' container group); `Self`'s slots are put with the arguments below.
+            Through::SelfImpl(tr) => {
+                if self.heads.checker(tr) != trait_ && trait_count != 0 {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::SelfSupertrait, r)));
+                }
+                if trait_count != 0 {
+                    let Some(col) = s.impl_trait.as_ref() else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ImplTraitLifetimes, r)));
+                    };
+                    let Some(lead) = col.get(..trait_count as usize) else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                    };
+                    slots.extend(lead.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
+                }
+            }
+            Through::Param(_) if trait_count == 0 => {}
+            Through::Param(t) => {
+                let mut found = 0u32;
+                for &n in v.rows(v.list(blaze_lower::head::GENERICS))? {
+                    if let lf::GenericParam::Type { name: pn, bounds, .. } = lf::GenericParam::decode(n)?
+                        && v.name_text(pn)? == t
+                        && let Err(why) = self.bound_lifetimes(env, v, bounds, trait_, &mut found, &mut slots, r)?
+                    {
+                        return Ok(Err(why));
+                    }
+                }
+                for &n in v.rows(v.list(blaze_lower::head::WHERE))? {
+                    let lf::WherePred::Type { binder, ty, bounds } = lf::WherePred::decode(n)? else { continue };
+                    let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
+                    let (pabs, ptexts, _, _) = path_texts(v, p)?;
+                    if pabs || !matches!(ptexts.as_slice(), [only] if *only == t) {
+                        continue;
+                    }
+                    if !v.rows(binder)?.is_empty() {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionHigherRanked, r)));
+                    }
+                    if let Err(why) = self.bound_lifetimes(env, v, bounds, trait_, &mut found, &mut slots, r)? {
+                        return Ok(Err(why));
+                    }
+                }
+                if found == 0 {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundElsewhere, r)));
+                }
+                if slots.len() as u32 != trait_count {
+                    return Ok(Err(RegionRefusal::LifetimeArgs { at: r, want: trait_count, got: slots.len() as u32 }));
+                }
+            }
+        }
+        slots.extend(own_written.iter().map(|&k| Slot::written(k)));
+        // The alias's arguments: `Self` and the trait's (from the bound, not written here: they
+        // must hold no lifetime), then those written on `Name` (`index`, from the stack).
+        let list = soft!(tys.view().list(args).map_err(RegionError::Table));
+        let Some(lead) = list.len().checked_sub(index.len()) else {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+        };
+        let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
+        let mut binders = 0u32;
+        for (i, &a) in list[..lead].iter().enumerate() {
+            let sub = soft!(subtree(tys.view(), a, &arity, alloc));
+            // In an impl the first is `Self`, the impl's self type: its slots are the regions
+            // the container hands its members (as a bare `Self` is laid in `path_regions`).
+            if i == 0 && matches!(through, Through::SelfImpl(_)) {
+                let Some(given) = s.self_slots.as_ref() else {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::SelfUnknown, r)));
+                };
+                if given.len() as u32 != sub.slots {
+                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                }
+                slots.extend(given.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
+                binders += sub.binders;
+                continue;
+            }
+            if sub.slots != 0 {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundArgs, r)));
+            }
+            binders += sub.binders;
+        }
+        for &(start, len, b) in index {
+            for &slot in &pool[start as usize..(start + len) as usize] {
+                if let SlotKind::ObjectDefault(oat) = slot.kind {
+                    return Ok(Err(RegionRefusal::ObjectDefault { at: oat }));
+                }
+                slots.push(slot.shifted(binders));
+            }
+            binders += b;
+        }
+        let whole = soft!(subtree(tys.view(), made, &arity, alloc));
+        if slots.len() as u32 != whole.slots || binders != whole.binders {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+        }
+        s.scratch.clear();
+        s.scratch.extend_from_slice(&slots);
+        Ok(Ok(binders))
+    }
+
+    /// The slots of the qualified projection `made` (`<T as Tr<'a>>::Name`, the alias node),
+    /// in `each_slot_node`'s order: its trait's lifetimes (`trait_written`, those written on
+    /// the trait's last segment: the trait reference `Tr<'a>` the Reference's "Qualified
+    /// paths" names; none written, one elided lifetime per declared one, as for an ADT's path:
+    /// "Lifetime elision", "elided in paths"), its own written on `Name` (`own_written`), then
+    /// each argument's from the stack (`pool`, `index`: the self type first, as the path's walk
+    /// pushed them). Checked against the made type's count (`whole`), never assumed.
+    fn qualified_slots(
+        &self,
+        tys: &PortableTys<'_>,
+        made: PTy,
+        (trait_written, own_written, pool, index): (&[SlotKind], &[SlotKind], &[Slot], &[(u32, u32, u32)]),
+        whole: Sub,
+        s: &mut RegionSink<'_>,
+        r: Range,
+    ) -> Laid {
+        let Ok(PNode::Alias { trait_, name, .. }) = tys.view().node(made) else {
+            return Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r));
+        };
+        let Some(trait_count) = declared_lifetimes(self.heads, self.resolver.names, trait_, Declared::Trait) else {
+            return Err(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, r));
+        };
+        let Some(own_count) = declared_lifetimes(self.heads, self.resolver.names, trait_, Declared::Assoc(name)) else {
+            return Err(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, r));
+        };
+        if own_written.len() as u32 != own_count {
+            return Err(RegionRefusal::LifetimeArgs { at: r, want: own_count, got: own_written.len() as u32 });
+        }
+        let mut slots: Vec<Slot, Alloc<'_>> = Vec::new_in(s.alloc);
+        if trait_written.is_empty() {
+            for _ in 0..trait_count {
+                slots.push(Slot::written(s.new_elided(r)));
+            }
+        } else if trait_written.len() as u32 == trait_count {
+            slots.extend(trait_written.iter().map(|&k| Slot::written(k)));
+        } else {
+            return Err(RegionRefusal::LifetimeArgs { at: r, want: trait_count, got: trait_written.len() as u32 });
+        }
+        slots.extend(own_written.iter().map(|&k| Slot::written(k)));
+        let mut binders = 0u32;
+        for &(start, len, b) in index {
+            for &slot in &pool[start as usize..(start + len) as usize] {
+                if let SlotKind::ObjectDefault(oat) = slot.kind {
+                    return Err(RegionRefusal::ObjectDefault { at: oat });
+                }
+                slots.push(slot.shifted(binders));
+            }
+            binders += b;
+        }
+        if slots.len() as u32 != whole.slots || binders != whole.binders {
+            return Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r));
+        }
+        s.scratch.clear();
+        s.scratch.extend_from_slice(&slots);
+        Ok(binders)
+    }
+
+    /// The lifetimes written on each bound of `bounds` (a type parameter's) that names the
+    /// trait `trait_`, pushed on `out` in order; `found` counts those bounds, a second one
+    /// refused (which of two bounds a projection reads is not decided here). For
+    /// [`Builder::projection_slots`].
+    #[expect(clippy::too_many_arguments, reason = "one parameter's bounds, the trait sought and what is found")]
+    fn bound_lifetimes(&self, env: &Env<'_>, v: &View<'_>, bounds: lf::List, trait_: ItemKey, found: &mut u32, out: &mut Vec<Slot, Alloc<'_>>, r: Range) -> Result<Result<(), RegionRefusal>, Why> {
+        for &row in v.rows(bounds)? {
+            let lf::Bound::Trait { ty, binder, mods } = lf::Bound::decode(row)? else { continue };
+            if mods.maybe || mods.negative {
+                continue;
+            }
+            let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
+            let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
+            // The erased walk resolved this bound (preds.rs `param_bound`): a refusal here is
+            // the regions walk's own.
+            let target = match self.bound_target(env, v, p, abs, &texts, pr) {
+                Ok(target) => target,
+                Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::Resolve, r))),
+            };
+            let Bounded::Trait(key) = target else { continue };
+            if self.heads.checker(key) != trait_ {
+                continue;
+            }
+            *found += 1;
+            if *found > 1 {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionTwoBounds, r)));
+            }
+            if !v.rows(binder)?.is_empty() {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionHigherRanked, r)));
+            }
+            let Some(last) = segs.last() else { continue };
+            if !last.has_args {
+                continue;
+            }
+            for &a in v.rows(last.args)? {
+                let lf::GenericArg::Lifetime(nm) = lf::GenericArg::decode(a)? else { continue };
+                let text = v.name_text(nm)?;
+                let lat = place(v, v.name_range(nm))?;
+                let kind = match text.strip_prefix('\'').unwrap_or(text) {
+                    "_" => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionElidedBound, lat))),
+                    "static" => SlotKind::Static,
+                    _ => SlotKind::Named(Name(v.name(nm)?), lat),
+                };
+                // Not written in the projection's type: no input lifetime for elision.
+                out.push(Slot::quiet(kind));
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// A trait object's slots: its own (its written lifetime bound, else its default, decided
+    /// by its context), then its arguments' where each lands in its made type (found by making
+    /// it again with shadow arguments, `SHADOW_BASE`). Its bounds' `for<..>` names and its `Fn`
+    /// sugar's elided inputs are its own variables (binder 0); an elided lifetime of the sugar's
+    /// output takes the one its inputs use, or is E0106.
+    #[expect(clippy::too_many_arguments, reason = "one made trait object: its bounds, its children and the sink")]
+    fn dyn_regions(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, bounds: lf::List, made: PTy, kids: &[PTy], s: &mut RegionSink<'_>, r: Range) -> Result<Laid, Why> {
+        let n = kids.len();
+        let alloc = s.alloc;
+        let mut at = 0usize;
+        let mut vars = 0u32;
+        let mut object: Option<SlotKind> = None;
+        let mut written = 0u32;
+        for &b in v.rows(bounds)? {
+            let bd = lf::Bound::decode(b)?;
+            if let lf::Bound::Lifetime(nm) = bd {
+                written += 1;
+                object = Some(lifetime_kind(v, Some(nm), r, s)?);
+                continue;
+            }
+            let lf::Bound::Trait { binder, .. } = bd else { continue };
+            let Some((_, seg)) = super::dyn_ty::dyn_bound(v, bd, r)? else { continue };
+            let mut names: Vec<Name, Alloc<'_>> = Vec::new_in(alloc);
+            for &row in v.rows(binder)? {
+                if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(row)? {
+                    names.push(Name(v.name(name)?));
+                }
+            }
+            // How many children this bound gave the walk (`dyn_arg_types`' count).
+            let mut inputs = 0usize;
+            for &row in v.rows(seg.args)? {
+                match lf::GenericArg::decode(row)? {
+                    lf::GenericArg::Type(_) => inputs += 1,
+                    lf::GenericArg::AssocType { args, .. } if !seg.parenthesized && args.len == 0 => inputs += 1,
+                    _ => {}
+                }
+            }
+            let output = seg.parenthesized && seg.ty.is_some();
+            let count = inputs + usize::from(output);
+            let first = vars;
+            let mut next = vars + names.len() as u32;
+            let mut ids: Vec<u32, Alloc<'_>> = Vec::new_in(alloc);
+            let mut input_slots: Vec<Slot, Alloc<'_>> = Vec::new_in(alloc);
+            for k in at..at + count {
+                let f = soft!(s.kid(n, k).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, r)));
+                let is_input = k < at + inputs;
+                for i in f.start..f.start + f.len {
+                    let slot = &mut s.slots[i as usize];
+                    if let SlotKind::Named(nm, _) = slot.kind
+                        && let Some(p) = names.iter().position(|&x| x == nm)
+                    {
+                        slot.kind = SlotKind::Bound(first + p as u32);
+                    }
+                    if seg.parenthesized
+                        && is_input
+                        && let SlotKind::Elided(id) = slot.kind
+                    {
+                        let var = match ids.iter().position(|&x| x == id) {
+                            Some(p) => first + names.len() as u32 + p as u32,
+                            None => {
+                                ids.push(id);
+                                next += 1;
+                                next - 1
+                            }
+                        };
+                        slot.kind = SlotKind::Bound(var);
+                    }
+                    if is_input {
+                        input_slots.push(*slot);
+                    }
+                }
+                if output && !is_input {
+                    let one = used_lifetimes(&input_slots, object_local);
+                    for i in f.start..f.start + f.len {
+                        if let SlotKind::Elided(_) = s.slots[i as usize].kind {
+                            match one {
+                                Used::One(kind) => s.slots[i as usize].kind = kind,
+                                // A regions refusal by name, the head made (heads.rs
+                                // `missing_lifetime`: E0106 is hard for a fn's return type only).
+                                Used::None | Used::Many => {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::FnPtrElision, r)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            vars = next;
+            at += count;
+        }
+        if at != n {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+        }
+        if written > 1 {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynLifetimes, r)));
+        }
+        let own = match object {
+            Some(k) => Slot::written(k),
+            None => Slot::quiet(SlotKind::ObjectDefault(r)),
+        };
+        let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
+        let whole = soft!(subtree(tys.view(), made, &arity, alloc));
+        s.scratch.clear();
+        let mut kid_slots = 0u32;
+        for k in 0..n {
+            kid_slots += s.kid(n, k).map_or(0, |f| f.len);
+        }
+        let binders = if kid_slots == 0 {
+            if whole.slots != 1 {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+            }
+            s.scratch.push(own);
+            whole.binders
+        } else {
+            // Made again with shadow arguments: where each `Param(SHADOW_BASE + k)` is, child
+            // `k`'s slots go; every other node must agree with the made type's and have no
+            // slot of its own but the root's.
+            let mut shadow_kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
+            for k in 0..n {
+                shadow_kids.push(intern(tys, PNode::Param(SHADOW_BASE + k as u32))?);
+            }
+            let Ok(shadow) = self.dyn_ty(tys, env, v, bounds, &shadow_kids, r) else {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+            };
+            let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
+            let mut real: Vec<(PTy, PNode, u32), Alloc<'_>> = Vec::new_in(alloc);
+            soft!(each_slot_node(tys.view(), made, &arity, alloc, &mut |t, node, own| {
+                real.push((t, node, own));
+                Ok(())
+            }));
+            let mut seen: Vec<(PTy, PNode, u32), Alloc<'_>> = Vec::new_in(alloc);
+            soft!(each_slot_node(tys.view(), shadow, &arity, alloc, &mut |t, node, own| {
+                seen.push((t, node, own));
+                Ok(())
+            }));
+            let out_of_step = RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r);
+            let mut ri = 0usize;
+            let mut binders = 0u32;
+            for (si, &(_, sn, sown)) in seen.iter().enumerate() {
+                if let PNode::Param(p) = sn
+                    && p >= SHADOW_BASE
+                    && ((p - SHADOW_BASE) as usize) < n
+                {
+                    let k = (p - SHADOW_BASE) as usize;
+                    let Some(&(rt, _, _)) = real.get(ri) else { return Ok(Err(out_of_step)) };
+                    if rt != kids[k] {
+                        return Ok(Err(out_of_step));
+                    }
+                    let f = soft!(s.kid(n, k).ok_or(out_of_step));
+                    for i in f.start..f.start + f.len {
+                        let slot = s.slots[i as usize];
+                        s.scratch.push(match slot.kind {
+                            SlotKind::ObjectDefault(_) => Slot::quiet(SlotKind::Static),
+                            _ => slot.shifted(binders),
+                        });
+                    }
+                    binders += f.binders;
+                    ri += soft!(subtree(tys.view(), kids[k], &arity, alloc)).nodes as usize;
+                    continue;
+                }
+                let Some(&(_, rn, rown)) = real.get(ri) else { return Ok(Err(out_of_step)) };
+                if core::mem::discriminant(&rn) != core::mem::discriminant(&sn) || rown != sown {
+                    return Ok(Err(out_of_step));
+                }
+                if rown > 0 {
+                    if si == 0 && rown == 1 {
+                        s.scratch.push(own);
+                    } else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+                    }
+                }
+                binders += u32::from(is_binder(rn));
+                ri += 1;
+            }
+            if ri != real.len() {
+                return Ok(Err(out_of_step));
+            }
+            binders
+        };
+        for slot in s.scratch.iter_mut() {
+            if let SlotKind::Bound(var) = slot.kind {
+                slot.kind = SlotKind::Late { binder: 0, var };
+            }
+        }
+        Ok(Ok(binders))
+    }
 }

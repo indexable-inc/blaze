@@ -58,7 +58,7 @@
 //!   module-level call's entry holds its own ([`entry_out`]; the call's text is the impl's
 //!   source, never its out);
 //! - a foreign fn or static: its `extern` block's, which is an entry of its own whose whole text
-//!   is its heads and whose out holds each foreign item's want digest ([`wants_digest`]);
+//!   is its heads and whose out holds each foreign item's want digest;
 //! - a head an expansion wrote: the entry its (outermost) call is at, as above, so a call in an
 //!   impl block is covered by its impl;
 //! - a head inside a body: none. A body's items are named only inside it and checked in its
@@ -80,9 +80,6 @@ const SOURCE_DOMAIN: &str = "blaze-cli signature source 2";
 const TOKENS_DOMAIN: &str = "blaze-cli signature tokens 2";
 /// The domain of a `Signature`'s out ([`signature_out`]).
 const OUT_DOMAIN: &str = "blaze-cli signature out 1";
-/// The want digest of an entry front2 makes no head for (a `const _`, an item a macro rewrote):
-/// its out is then its tokens alone, and no body reads it (body_types.rs reads by want).
-pub(crate) const NO_WANT: ContentId = ContentId([0; 32]);
 
 /// Whether `kind` is a head of its own when written outside any body and any trait or impl.
 const fn own_head(kind: ItemKind) -> bool {
@@ -172,30 +169,34 @@ pub(crate) fn uncovered_why(outline: &Outline<'_>, at: ItemIndex) -> &'static st
     "the entry at a head's place is no head of its own, and no trait, impl or `extern` block in modules holds it (signature.rs `covering_entry`)"
 }
 
-/// The domain of an entry's own wants' digest ([`wants_digest`]).
-const WANTS_DOMAIN: &str = "blaze-cli signature entry wants 1";
+/// The physical checkout file whose outline supplies an entry's signature. A module slot
+/// cannot be passed to the head planner or listing as a signature file.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SignatureFile(ContentId);
 
-/// The digest of an entry's own wants' digests, in its entries' order: [`NO_WANT`] for none,
-/// the one digest for one (every entry with one head keeps its out), else each after the count
-/// (an `extern` block: one want a foreign item).
-pub(crate) fn wants_digest(digests: &[ContentId]) -> ContentId {
-    match digests {
-        [] => NO_WANT,
-        [one] => *one,
-        _ => {
-            let mut h = Hasher::new(WANTS_DOMAIN);
-            h.update(&(digests.len() as u32).to_le_bytes());
-            for digest in digests {
-                h.update(&digest.0);
-            }
-            h.finish()
-        }
+impl SignatureFile {
+    pub(crate) fn new(real_path: &[u8]) -> Self {
+        Self(Name::file(real_path).subject)
+    }
+
+    pub(crate) fn subject(self) -> ContentId {
+        self.0
+    }
+
+    pub(crate) fn entry(self, outline: &Outline<'_>, item: &Item, text: &str) -> Name {
+        signature_name(self.0, outline, item, text)
+    }
+
+    pub(crate) fn entry_from_chain(self, chain: ContentId) -> Name {
+        let mut h = Hasher::new(NAME_DOMAIN);
+        h.id(&self.0).id(&chain);
+        Name::new(Kind::Signature, h.finish())
     }
 }
 
 /// The subject of a file's `Signature`s: its real path in the checkout.
 pub(crate) fn file_subject(real: &str) -> ContentId {
-    Name::file(real.as_bytes()).subject
+    SignatureFile::new(real.as_bytes()).subject()
 }
 
 /// The `Signature` of `item` (an entry passing [`is_signature_entry`]) in the file of subject
@@ -213,9 +214,23 @@ pub(crate) fn file_subject(real: &str) -> ContentId {
 /// `impl Measure for ..`) shared one name too. 2: the chain's form, so no task or record named
 /// by the old form is read by its key.
 pub(crate) fn signature_name(file: ContentId, outline: &Outline<'_>, item: &Item, text: &str) -> Name {
-    let mut h = Hasher::new(NAME_DOMAIN);
-    h.update(&file.0).update(&blaze_file_items::item_chain(outline, item, text).0);
-    Name::new(Kind::Signature, h.finish())
+    SignatureFile(file).entry_from_chain(blaze_file_items::item_chain(outline, item, text))
+}
+
+/// The same grain chain as `blaze_file_items::item_chain`, over the serialized outline. Its
+/// name column already contains the original spelling, including the raw-identifier prefix.
+pub(crate) fn stored_chain(file: blaze_surface::FileItemsView<'_>, at: ItemIndex) -> ContentId {
+    let mut h = Hasher::new(blaze_file_items::CHAIN_DOMAIN);
+    let mut next = Some(at);
+    while let Some(index) = next {
+        let entry = file.item(index).expect("verified outline parent");
+        h.update(&[entry.kind().byte()]).update(&(entry.name.len() as u32).to_le_bytes()).update(entry.name.as_bytes()).update(&entry.disambiguator.to_le_bytes());
+        if entry.item.name.is_none() {
+            h.id(&blaze_file_items::head_of(&entry.item));
+        }
+        next = entry.parent;
+    }
+    h.finish()
 }
 
 /// THE PLANT (rule 23): [`signature_name`]'s form before lane RU3 (kind, name and disambiguator
@@ -256,14 +271,38 @@ fn head_bytes(item: &Item) -> ContentId {
 /// owners' `CrateScope` records whole, which every surface of the crate moves.
 pub(crate) fn signature_source(outline: &Outline<'_>, at: ItemIndex, text: &str) -> ContentId {
     let item = outline.item(at);
+    let children = outline.children(Some(at)).map(|(_, member)| (member.name.map_or("", |range| member.text(text, range)), *member));
+    let parents = core::iter::successors(item.parent, |at| outline.item(*at).parent).map(|at| *outline.item(at));
+    head_source_parts(item, children, parents)
+}
+
+/// The tokens a signature lookup can observe, including whether a function is defined.
+/// A member's inherited impl header and an ADT's fields are part of its signature.
+pub(crate) fn stored_signature(file: blaze_surface::FileItemsView<'_>, at: ItemIndex, item: &Item) -> ContentId {
+    let children = file.children(Some(at)).map(|(_, member)| (member.name, member.item));
+    let parents = core::iter::successors(item.parent, |at| file.item(*at).and_then(|entry| entry.parent))
+        .map(|at| file.item(at).expect("verified outline parent").item);
+    let mut h = Hasher::new("blaze-cli outline item signature tokens 1");
+    h.id(&head_source_parts(item, children, parents));
+    if matches!(item.kind(), ItemKind::Function | ItemKind::Const | ItemKind::Static) {
+        h.update(&[u8::from(item.body.is_some())]);
+    }
+    if item.kind() == ItemKind::Trait {
+        for (_, member) in file.children(Some(at)).filter(|(_, member)| member.kind() == ItemKind::Function) {
+            h.update(&[u8::from(member.body.is_some())]);
+        }
+    }
+    h.finish()
+}
+
+fn head_source_parts<'a>(item: &Item, children: impl Iterator<Item = (&'a str, Item)>, parents: impl Iterator<Item = Item>) -> ContentId {
     let mut h = Hasher::new(SOURCE_DOMAIN);
     h.update(&[item.kind() as u8]).update(&head_bytes(item).0);
     if matches!(item.kind(), ItemKind::Trait | ItemKind::Impl) {
         let trait_ = item.kind() == ItemKind::Trait;
         let mut count = 0u32;
-        for (_, member) in outline.children(Some(at)) {
+        for (name, member) in children {
             count += 1;
-            let name = member.name.map_or("", |range| member.text(text, range));
             h.update(&[member.kind() as u8]).update(&(name.len() as u32).to_le_bytes()).update(name.as_bytes()).update(&member.disambiguator.to_le_bytes());
             // An impl's fn is its own `Signature`; a trait's fn and every other member are part
             // of this one. A trait's fn's default body is not a head: its signature is.
@@ -278,13 +317,10 @@ pub(crate) fn signature_source(outline: &Outline<'_>, at: ItemIndex, text: &str)
         h.update(&count.to_le_bytes());
     }
     // Each enclosing impl's or trait's signature: an impl's generics and self type are its fn's.
-    let mut parent = item.parent;
-    while let Some(at) = parent {
-        let up = outline.item(at);
+    for up in parents {
         if matches!(up.kind(), ItemKind::Impl | ItemKind::Trait) {
             h.update(&[up.kind() as u8]).update(&up.signature_hash.0);
         }
-        parent = up.parent;
     }
     h.finish()
 }
@@ -349,7 +385,7 @@ pub(crate) fn unencoded(outline: &Outline<'_>, at: ItemIndex, text: &str, editio
     h.finish()
 }
 
-/// A `Signature`'s out: the want's head records' digest (`want_digest`, or [`NO_WANT`]) and
+/// A `Signature`'s out: the want's head records' digest (`want_digest`) and
 /// [`unencoded`].
 pub(crate) fn signature_out(want_digest: ContentId, unencoded: ContentId) -> ContentId {
     let mut h = Hasher::new(OUT_DOMAIN);

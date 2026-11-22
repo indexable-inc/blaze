@@ -47,7 +47,6 @@
 //! is a typed refusal ([`StoreError::TwoValues`], rule 21), never a second write.
 
 use core::fmt;
-use core::hash::Hasher as _;
 use std::alloc::Global;
 use std::boxed::Box;
 
@@ -56,7 +55,7 @@ use blaze_code::record::{CodeView, DecodeError, MAGIC, RecordError, Symbol, Trap
 use blaze_emit::{AddressWord, Isa, Named, Names, Os, Outside, RecordEmitError, emit_record_measured, no_address_word};
 use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ids::{ContentId, Hasher};
-use blaze_lir::Func;
+use blaze_lir::Verified;
 use blaze_own::{AVec, Alloc, Vec};
 pub use blaze_tier::TierName;
 use blaze_toolchain::ToolchainId;
@@ -83,7 +82,11 @@ pub mod statics;
 /// ([`statics`]). 5: an entry also declares the thread-locals its record names (by item key),
 /// and a thread-local's template has an entry of its own (`statics::make_template_entry`).
 /// 6: a code entry carries the datum of each vtable its record names ([`VtableDatum`]).
-pub const ENTRY_FORM: u32 = 6;
+/// 7: wide pointers cross calls in two registers and transparent values use their field's ABI.
+/// 8: the instance names an entry declares are symbols.rs' form 2 (a shared forest, each
+/// distinct type once), never form 1's trees: an entry of 7 is refused by its form, never
+/// listed by `body_ids::each_item` as a forest.
+pub const ENTRY_FORM: u32 = 8;
 
 /// One vtable a code record names, as the entry carries it (run.md, "Statics in the run": a
 /// vtable is data the child places before the record, as a static's datum is): its symbol
@@ -465,7 +468,7 @@ impl core::error::Error for CodeRecordError {}
 /// each: its question's length (4) and bytes, and its answer's digest (32), sorted by question
 /// and each once ([`reads`]). An entry made here reads nothing beyond its key: no row.
 pub fn make_entry<'a, 'd>(
-    func: &Func<Global>,
+    func: Verified<'_>,
     names: &InstanceNames<'_>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
@@ -477,7 +480,7 @@ pub fn make_entry<'a, 'd>(
 
 /// [`make_entry`] with the build's read list `reads` ([`reads::ReadLog::seal`]).
 pub fn make_entry_reading<'a, 'd>(
-    func: &Func<Global>,
+    func: Verified<'_>,
     names: &InstanceNames<'_>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
@@ -496,7 +499,7 @@ pub fn make_entry_reading<'a, 'd>(
 /// construct an `unreachable` ends by.
 #[expect(clippy::too_many_arguments, reason = "the entry's parts, each its own input")]
 pub fn make_entry_with_vtables<'a, 'd>(
-    func: &Func<Global>,
+    func: Verified<'_>,
     names: &InstanceNames<'_>,
     vtables: &mut AVec<'_, VtableDatum<'_>>,
     routines: crate::front2::builtins_shim::Routines<'d>,
@@ -507,7 +510,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
     let (record, insts, called) =
-        emit_record_measured(func.view(), names, routines.places(), isa, traps, alloc).map_err(|why| routines.refusal(why))?;
+        emit_record_measured(func, names, routines.places(), isa, traps, alloc).map_err(|why| routines.refusal(why))?;
     // Which soft-float routines the record calls is the emitter's answer (only legalize maps an
     // `f128` operation to its routine): exactly those are declared, as any instance it reaches.
     for r in called.iter() {
@@ -599,7 +602,7 @@ pub fn make_getter_entry<'a>(isa: Isa, alloc: Alloc<'a>) -> Result<AVec<'a, u8>,
     let funcs = tls::index::GETTER_IMPORTS.map(Callee::C);
     let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
-    make_entry(&func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
+    make_entry(func.verified(), &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }
 
 /// Why an entry's bytes do not read.
@@ -1001,7 +1004,7 @@ pub struct Met {
 pub trait LirSeen {
     /// Instance `function` (as the program names it; its symbol `symbol`), built as `func`, its
     /// references named by `names`.
-    fn seen(&mut self, function: &str, symbol: Symbol, func: &Func<Global>, names: &InstanceNames<'_>);
+    fn seen(&mut self, function: &str, symbol: Symbol, func: Verified<'_>, names: &InstanceNames<'_>);
 }
 
 /// A record walk's state (run.rs `build_records`): the store, what the records are built for,

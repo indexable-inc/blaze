@@ -17,7 +17,7 @@ use crate::{
         SpanRow, SwitchRow, ThreadNow, WaitedOn,
     },
     sampler::Sample,
-    schema::{self, Table},
+    schema,
     span,
 };
 
@@ -685,6 +685,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::schema::Table;
 
     /// Row `row` of column `name` of `batch`, a batch of `table`.
     fn column<'b>(batch: &'b Batch, table: &Table, name: &str) -> &'b Column {

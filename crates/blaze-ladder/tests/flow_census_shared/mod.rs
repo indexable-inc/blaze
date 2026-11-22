@@ -218,8 +218,9 @@ fn form_name(r: &BorrowRefused, a: Alloc<'static>) -> AString<'static> {
     let word = |debug: AString<'static>| format_in!(a, "{}", first_word(debug.as_str()));
     match r {
         BorrowRefused::Lower(x) => word(format_in!(a, "{:?}", x.form)),
+        BorrowRefused::Stricter(x) => format_in!(a, "Stricter {}", word(format_in!(a, "{:?}", x.form))),
         BorrowRefused::CallUnrelated { lacks, .. } => format_in!(a, "CallUnrelated {}", word(format_in!(a, "{lacks:?}"))),
-        BorrowRefused::CallSigUnread { why, .. } => format_in!(a, "CallSigUnread {}", word(format_in!(a, "{why:?}"))),
+        BorrowRefused::RegionsUnread { why, .. } => format_in!(a, "RegionsUnread {}", word(format_in!(a, "{why:?}"))),
         BorrowRefused::FactUnknown { fact, .. } => format_in!(a, "FactUnknown {fact}"),
         BorrowRefused::AdtNotMade { why, .. } => format_in!(a, "AdtNotMade {}", word(format_in!(a, "{why:?}"))),
         other => word(format_in!(a, "{other:?}")),

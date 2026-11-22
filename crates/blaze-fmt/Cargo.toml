@@ -23,7 +23,6 @@ blaze-semver.workspace = true
 annotate-snippets.workspace = true
 # The user's home directory (`blaze_core::home`), the one answer to it.
 blaze-core.workspace = true
-blaze-serde.workspace = true
 diff.workspace = true
 # Widths, legacy grapheme clusters and General_Category=Po, where rustfmt reads unicode-width
 # 0.1.14, unicode-segmentation and unicode-properties.
@@ -43,7 +42,7 @@ syntax.workspace = true
 
 # `cargo fmt -q` sends rustfmt's standard output to /dev/null, as cargo-fmt does its child's.
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+blaze-sys.workspace = true
 
 [dev-dependencies]
 test-utils.workspace = true

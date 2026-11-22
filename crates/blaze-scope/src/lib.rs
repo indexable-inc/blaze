@@ -49,6 +49,8 @@ extern crate std;
 mod again;
 pub mod apart;
 pub mod asked;
+// `#[link_name = concat!(..)]`: an attribute value written as a macro call, expanded at its item.
+pub mod attr_values;
 pub mod blocks;
 pub mod call_refusal;
 pub mod expanded_blocks;
@@ -67,6 +69,10 @@ pub mod expansions;
 mod facts;
 pub mod failed_call;
 pub mod main_call;
+pub mod macro_effect;
+pub mod surface;
+// D189 step 4: a body's block scopes solved as the body's own.
+pub mod body_scope;
 mod finish;
 pub mod graph;
 mod group;
@@ -104,7 +110,7 @@ pub use error::{GlobBug, ResolveError};
 pub use facts::{Name, RecordFacts, ScopeFacts};
 
 pub use cells::{
-    DecideCheck, DecideError, GroupRecords, GroupRef, MemberRefusal as GroupMemberRefusal, Members as GroupMembers, OneGroup as OneGroupSolver, OneGroupRefusal, Solved as GroupsSolved, Edit as GroupsEdit, EditError as GroupsEditError, Edited as GroupsEdited, GROUP_ABSENT, GroupOwnError, GroupRead, GroupRecordError, GroupSeen, GroupShape, GroupSolver,
+    DecideCheck, DecideError, Difference as DecideDifference, Layer as CellLayer, Value as CellValue, GroupRecords, GroupRef, MemberRefusal as GroupMemberRefusal, Members as GroupMembers, OneGroup as OneGroupSolver, OneGroupRefusal, Solved as GroupsSolved, Edit as GroupsEdit, EditError as GroupsEditError, Edited as GroupsEdited, GROUP_ABSENT, GroupOwnError, GroupRead, GroupRecordError, GroupSeen, GroupShape, GroupSolver,
     GroupsError, ItemResult as CellResult, NameGroup, NodeAt as GroupNodeAt, Outcome as CellOutcome, globs_cell as group_globs_cell, most_entries as group_most_entries,
     own_digest as group_own_digest, re_solve as re_solve_groups, DemandError as GroupDemandError, Demanded as GroupsDemanded, DemandedOpts as GroupsDemandedOpts, MOST_DEMAND_DEPTH, MOST_DEMAND_SOLVES, NoRecordOf as GroupNoRecordOf, demand as demand_groups, names_on_demand, OnDemand as NamesOnDemand, OnDemandError as NamesOnDemandError, OnDemandRefused as NamesOnDemandRefused, LazyDep, Want as NamesWant, MOST_WANT_ROUNDS, textual_cell as group_textual_cell, write_groups,
 };

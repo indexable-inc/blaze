@@ -2,18 +2,18 @@
 //! the bounds, the field reader, the event stream, and the round trip against `Value` with its
 //! planted-bug control.
 
-use std::{format, string::ToString};
+use core::fmt;
+use std::{format, string::String as StdString, string::ToString, vec::Vec as StdVec};
 
 use blaze_mem::{Frame, Tag};
 
 use blaze_data::{Int, Map, Value, value};
 use blaze_own::{Alloc, AVec, Erased, String, Vec};
-use blaze_sim::{Broke, Config, Tape};
+use blaze_sim::{Broken, Config, NoPlant, Planted, Point, Tape, check, controls};
 
 use crate::{
-    Decoder, Encoder, Error, Event, Head, Limits, Reader, StreamWhat, major,
-    plant::{self, Plant},
-    read_in, to_vec_in, why,
+    CborPlant, Decoder, Encoder, Error, Event, Head, Limits, Reader, StreamError, StreamWhat, major,
+    read_in, to_vec_in, why, write_into_planted,
 };
 
 fn hex<'a>(text: &str, alloc: Alloc<'a>) -> AVec<'a, u8> {
@@ -385,29 +385,78 @@ fn draw_value<'a>(tape: &Tape, depth: u32, alloc: Alloc<'a>) -> Value<Alloc<'a>>
 
 /// read(write(v)) == v (a NaN read back as the one NaN), the bytes written twice equal, and
 /// the decoder's events through the encoder give the same bytes.
-fn round_trip(tape: &Tape, alloc: Alloc<'_>) -> Result<(), Broke> {
+fn round_trip(tape: &Tape, alloc: Alloc<'_>, plant: impl Planted<CborPlant>) -> Result<(), Broken<TripBroken>> {
     let v = draw_value(tape, 3, alloc);
-    let bytes = to_vec_in(&v, alloc);
-    let back = read_in(bytes.as_slice(), Limits::DEFAULT, alloc)
-        .map_err(|error| Broke::Oracle(format!("the round trip of {v:?} wrote {:02x?}: {error}", bytes.as_slice())))?;
+    let mut bytes = Vec::new_in(alloc);
+    write_into_planted(&v, &mut bytes, alloc, plant);
+    let back = read_in(bytes.as_slice(), Limits::SHIPPED, alloc).map_err(|error| {
+        Broken::Oracle(TripBroken::Unread { value: format!("{v:?}"), bytes: bytes.as_slice().to_vec(), error })
+    })?;
     let canonical = |x: &Value<Alloc<'_>>| to_vec_in(x, alloc);
-    if canonical(&back) != bytes.as_slice() {
-        return Err(Broke::Oracle(format!("the round trip of {v:?} gave {back:?}")));
-    }
-    if !has_nan(&v) && back != v {
-        return Err(Broke::Oracle(format!("the round trip of {v:?} gave {back:?}")));
+    if canonical(&back) != bytes.as_slice() || (!has_nan(&v) && back != v) {
+        return Err(Broken::Oracle(TripBroken::Differs { value: format!("{v:?}"), back: format!("{back:?}") }));
     }
     let mut out = Vec::new_in(alloc);
     let mut encoder = Encoder::new_in(&mut out, alloc);
-    let mut decoder = Decoder::new_in(bytes.as_slice(), Limits::DEFAULT, alloc).map_err(|e| Broke::Harness(e.to_string()))?;
-    while let Some(item) = decoder.next().map_err(|e| Broke::Oracle(format!("the decoder: {e}")))? {
-        encoder.event(&item.event).map_err(|e| Broke::Oracle(format!("the encoder: {e}")))?;
+    let mut decoder =
+        Decoder::new_in(bytes.as_slice(), Limits::SHIPPED, alloc).map_err(|e| Broken::Harness(e.to_string()))?;
+    while let Some(item) = decoder.next().map_err(|error| Broken::Oracle(TripBroken::Decoder { error }))? {
+        encoder.event(&item.event).map_err(|error| Broken::Oracle(TripBroken::Encoder { error }))?;
     }
-    encoder.finish().map_err(|e| Broke::Oracle(format!("the encoder: {e}")))?;
+    encoder.finish().map_err(|error| Broken::Oracle(TripBroken::Encoder { error }))?;
     if out.as_slice() != bytes.as_slice() {
-        return Err(Broke::Oracle(format!("events gave {:02x?}, not {:02x?}", out.as_slice(), bytes.as_slice())));
+        return Err(Broken::Oracle(TripBroken::Events { events: out.as_slice().to_vec(), bytes: bytes.as_slice().to_vec() }));
     }
     Ok(())
+}
+
+/// The round trip's invariants, each its own value (D165: a control names one by pattern).
+#[derive(Clone, PartialEq, Debug)]
+enum TripBroken {
+    /// The bytes written for a value were refused by the reader.
+    Unread { value: StdString, bytes: StdVec<u8>, error: Error },
+    /// The value read back is not the one written, or writes other bytes.
+    Differs { value: StdString, back: StdString },
+    /// The decoder refused bytes the reader took.
+    Decoder { error: Error },
+    /// The encoder refused the decoder's events.
+    Encoder { error: StreamError },
+    /// The decoder's events through the encoder gave other bytes.
+    Events { events: StdVec<u8>, bytes: StdVec<u8> },
+}
+
+impl fmt::Display for TripBroken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TripBroken::Unread { value, bytes, error } => {
+                write!(f, "the round trip of {value} wrote {bytes:02x?}: {error}")
+            }
+            TripBroken::Differs { value, back } => write!(f, "the round trip of {value} gave {back}"),
+            TripBroken::Decoder { error } => write!(f, "the decoder: {error}"),
+            TripBroken::Encoder { error } => write!(f, "the encoder: {error}"),
+            TripBroken::Events { events, bytes } => write!(f, "events gave {events:02x?}, not {bytes:02x?}"),
+        }
+    }
+}
+
+blaze_sim::plants! {
+    /// The bugs planted in the writer, each with the invariant that must catch it.
+    enum TripPlant breaks TripBroken {
+        /// The writer as it is.
+        None,
+        /// Keys written in their bytes' order: the reader refuses the order of their encodings.
+        KeysBytewise => TripBroken::Unread { error: Error { why: why::KEY_ORDER, .. }, .. },
+    }
+}
+
+impl TripPlant {
+    /// The writer's plant this control plants.
+    fn planted(self) -> CborPlant {
+        match self {
+            TripPlant::None => CborPlant::None,
+            TripPlant::KeysBytewise => CborPlant::KeysBytewise,
+        }
+    }
 }
 
 fn has_nan(v: &Value<Alloc<'_>>) -> bool {
@@ -424,14 +473,103 @@ fn the_round_trip_holds() {
     let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
     let erased = Erased::new(&frame);
     let alloc = erased.handle();
-    blaze_sim::check(Config::cases(400), |tape| round_trip(tape, alloc));
+    check(Config::cases(400), |tape| round_trip(tape, alloc, NoPlant));
 }
 
 #[test]
-fn the_oracle_catches_keys_sorted_by_bytes_alone() {
+fn every_writer_plant_is_caught_by_its_invariant() {
     let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
     let erased = Erased::new(&frame);
     let alloc = erased.handle();
-    let run = |tape: &Tape, p: Plant| plant::with(p, || round_trip(tape, alloc));
-    blaze_sim::control(Config::cases(400), Plant::Clean, Plant::KeysBytewise, "the round trip", run);
+    controls(Config::cases(400), |tape, plant: TripPlant| round_trip(tape, alloc, plant.planted()));
+}
+
+// The decoder's caps (D165): drawn down to their least legal values, each reached.
+
+impl blaze_sim::Limits for Limits {
+    const SHIPPED: Limits = Limits::SHIPPED;
+
+    fn draw(tape: &Tape) -> Limits {
+        Limits {
+            most_bytes: tape.limit(Limits::SHIPPED.most_bytes, Limits::SMALLEST.most_bytes, "most bytes"),
+            most_depth: tape.limit(Limits::SHIPPED.most_depth, Limits::SMALLEST.most_depth, "most depth"),
+        }
+    }
+}
+
+blaze_sim::points! {
+    /// Where the decoder's limits simulation has to get.
+    enum CapPoint {
+        /// An input was refused for passing `most_bytes`.
+        TooLarge,
+        /// A container was refused for passing `most_depth`.
+        TooDeep,
+    }
+}
+
+/// A read held to its drawn limits: refused for a cap only past that cap, and otherwise read.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum CapBroken {
+    /// Refused as too large at or under `most_bytes`.
+    LargeUnder { len: usize, most: usize },
+    /// Refused as too deep at or under `most_depth`.
+    DeepUnder { depth: usize, most: usize },
+    /// Read although past a cap, or refused for another reason within both.
+    Wrong { len: usize, depth: usize, limits: Limits, got: StdString },
+}
+
+impl fmt::Display for CapBroken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CapBroken::LargeUnder { len, most } => write!(f, "{len} bytes refused as past a cap of {most}"),
+            CapBroken::DeepUnder { depth, most } => write!(f, "{depth} deep refused as past a cap of {most}"),
+            CapBroken::Wrong { len, depth, limits, got } => {
+                write!(f, "{len} bytes {depth} deep under {limits:?}: {got}")
+            }
+        }
+    }
+}
+
+/// How deeply `v`'s lists and maps nest: 0 for a scalar.
+fn depth_of(v: &Value<Alloc<'_>>) -> usize {
+    match v {
+        Value::List(list) => 1 + list.iter().map(depth_of).max().unwrap_or(0),
+        Value::Map(map) => 1 + map.iter().map(|(_, v)| depth_of(v)).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn caps(tape: &Tape, alloc: Alloc<'_>) -> Result<(), Broken<CapBroken>> {
+    let limits: Limits = tape.limits();
+    let v = draw_value(tape, 3, alloc);
+    let bytes = to_vec_in(&v, alloc);
+    let (len, depth) = (bytes.len(), depth_of(&v));
+    let wrong = |got: StdString| Broken::Oracle(CapBroken::Wrong { len, depth, limits, got });
+    match read_in(bytes.as_slice(), limits, alloc) {
+        Err(Error { why: why::TOO_LARGE, .. }) => {
+            tape.reach(CapPoint::TooLarge);
+            match len > limits.most_bytes {
+                true => Ok(()),
+                false => Err(Broken::Oracle(CapBroken::LargeUnder { len, most: limits.most_bytes })),
+            }
+        }
+        Err(Error { why: why::TOO_DEEP, .. }) => {
+            tape.reach(CapPoint::TooDeep);
+            match depth > limits.most_depth {
+                true => Ok(()),
+                false => Err(Broken::Oracle(CapBroken::DeepUnder { depth, most: limits.most_depth })),
+            }
+        }
+        Err(error) => Err(wrong(error.to_string())),
+        Ok(_) if len > limits.most_bytes || depth > limits.most_depth => Err(wrong(StdString::from("read"))),
+        Ok(_) => Ok(()),
+    }
+}
+
+#[test]
+fn the_decoder_holds_each_drawn_cap_and_reaches_it() {
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    check(Config::cases(400).must_reach_points(<CapPoint as Point>::IDS), |tape| caps(tape, alloc));
 }

@@ -254,6 +254,12 @@ fn live_step<A: Allocator>(flow: &Flow<A>, init: &Inits<A>, s: Stmt, row: &mut [
         }
         StmtKind::Activate(l) => bits::put(row, local(flow.loan(l).place), true),
         StmtKind::Switch { on, .. } => bits::put(row, local(on), true),
+        // Live across a suspension where the mention dereferences it (loans.rs `uses_and_def`).
+        StmtKind::Mention(p) => {
+            if let Some(l) = flow.mention_use(p) {
+                bits::put(row, l.index(), true);
+            }
+        }
         StmtKind::Return => bits::put(row, 0, true),
         StmtKind::Goto(_) | StmtKind::Suspend { .. } | StmtKind::Unreachable => {}
     }

@@ -16,7 +16,7 @@
 //! rustc's `convert_place_derefs_to_mutable`; `Checked::index_mut`). Omitted: privacy.
 
 use crate::diag::{About, At, DiagCode};
-use crate::error::Stop;
+use crate::error::{CheckError, Malformed, ParamSite, Stop};
 use crate::ids::{ExprId, ItemKey, LangItem, Name};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Cause, Goal, Ty, TyView, TypeCtx, Var, VarKind};
@@ -71,7 +71,14 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         let fields = adt.fields.get(v.fields.range()).unwrap_or(&[]);
                         match fields.iter().position(|fl| fl.name == want) {
                             Some(at) => {
-                                let ty = self.lower(adt.types, fields[at].ty, Lower::Args(args), Cause::Expr(e))?;
+                                let field = fields[at];
+                                let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
+                                    Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
+                                        let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
+                                        Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                                    }
+                                    other => other,
+                                })?;
                                 Some((ty, 0, at as u32, adt.kind == AdtKind::Union))
                             }
                             None => None,

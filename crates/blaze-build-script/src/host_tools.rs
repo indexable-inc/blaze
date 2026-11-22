@@ -1,6 +1,6 @@
 //! D71: the host tools a native build script may start besides the pinned C toolchain (today:
 //! `perl`, which sha3-asm starts to turn cryptogams' perlasm into assembly). The list's one home
-//! is the pin table's `host_tools` (`crates/blaze-toolchain/pins/clang.json`, [`crate::toolchain::PIN`]).
+//! is the pin table's `host_tools` (`pins/clang.json`, [`blaze_pins::CLANG_JSON`]).
 //!
 //! A script whose package is in a tool's `needed_by` is granted read and execute of the tool's
 //! resolved real path and read-only of the folders its runtime needs; the tool's binary digest
@@ -30,10 +30,26 @@
 
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
-use crate::toolchain::{PIN_PATH, object, scalar};
+use blaze_pins::CLANG_PATH;
+
+use crate::toolchain::{object, scalar};
 
 /// The mark's name, as reports and the origin's refusal print it.
 pub const MARK: &str = "host-tool";
+
+/// The answer and its command-side grant are paired by the canonical spawn request key.
+/// Only a complete, lowercase digest is an identity in this namespace.
+pub const SPAWN_ANSWER: &str = "spawn:";
+pub const SPAWN_GRANT: &str = "spawn-grant:";
+
+pub fn spawn_receipt(subject: &str) -> Option<(bool, &str)> {
+    let (grant, key) = if let Some(key) = subject.strip_prefix(SPAWN_GRANT) {
+        (true, key)
+    } else {
+        (false, subject.strip_prefix(SPAWN_ANSWER)?)
+    };
+    (key.len() == 64 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))).then_some((grant, key))
+}
 
 /// The kind word a build-script run's read list is filed under (`blaze_record::write_list`).
 pub const RUN_KIND: &[u8] = b"build-script run";
@@ -141,9 +157,9 @@ pub enum HostToolError<'t> {
 impl core::fmt::Display for HostToolError<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            HostToolError::NoRow { target } => write!(f, "{PIN_PATH}: no `host_tools` row for {target} (D71)"),
-            HostToolError::Malformed { target, tool, field } => write!(f, "{PIN_PATH}: {target}'s host tool `{tool}` has no `{field}` of its form (D71)"),
-            HostToolError::Unsorted { target } => write!(f, "{PIN_PATH}: {target}'s host tool `names` are not sorted and unique (D71)"),
+            HostToolError::NoRow { target } => write!(f, "{CLANG_PATH}: no `host_tools` row for {target} (D71)"),
+            HostToolError::Malformed { target, tool, field } => write!(f, "{CLANG_PATH}: {target}'s host tool `{tool}` has no `{field}` of its form (D71)"),
+            HostToolError::Unsorted { target } => write!(f, "{CLANG_PATH}: {target}'s host tool `names` are not sorted and unique (D71)"),
         }
     }
 }
@@ -262,7 +278,7 @@ mod tests {
 
     use super::{HostToolError, MARK, RUN_KIND, RUN_KIND_HOST_TOOL, granted, host_tools, marked, run_kind, runs_out_dir};
     use crate::native::{Grant, seatbelt_with};
-    use crate::toolchain::PIN;
+    use blaze_pins::CLANG_JSON as PIN;
 
     /// The checked-in table grants perl, at its real path with the system's Perl folders, to
     /// sha3-asm alone (D71); Linux lists none; a target with no row is refused by name.

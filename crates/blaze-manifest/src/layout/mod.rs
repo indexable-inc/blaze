@@ -62,7 +62,7 @@ use core::fmt;
 use blaze_own::{Alloc, SortedMap, String, Vec};
 use edition::{NoEdition, PackageEdition};
 
-use raw::{GitRef as RawGitRef, Raw, RawBuild, RawDep, RawEdition, RawMeta, RawPackage, RawTarget, RawVersion, RawWorkspace};
+use raw::{Raw, RawBuild, RawDep, RawEdition, RawMeta, RawPackage, RawTarget, RawVersion, RawWorkspace};
 
 pub use extra::{ExtraKind, ExtraTarget, RefusedTarget, TargetRefused};
 pub use meta::{META_KEYS, PackageMeta, PackageMetaVars};
@@ -140,6 +140,12 @@ pub struct Target<'a> {
     /// Found by its file (`src/lib.rs`, `src/main.rs`, `src/bin/..`), not written.
     pub found: bool,
     pub proc_macro: bool,
+    /// A `[[bin]]`'s `required-features`, as written; empty for every other target (a library
+    /// or build script has none). The Cargo Book, "Cargo Targets", "The `required-features`
+    /// field": "The `required-features` field specifies which features the target needs in
+    /// order to be built. If any of the required features are not enabled, the target will be
+    /// skipped." Judged where features are known (blaze-unit-graph).
+    pub required_features: Vec<Text<'a>, Alloc<'a>>,
 }
 
 /// Where a dependency comes from.
@@ -822,6 +828,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                 span: *span,
                 found: false,
                 proc_macro: false,
+                required_features: Vec::new_in(alloc),
             }),
             RawBuild::Auto => match self.list(&found.dir) {
                 None => return Ok(None),
@@ -832,6 +839,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                         span: package.span,
                         found: true,
                         proc_macro: false,
+                        required_features: Vec::new_in(alloc),
                     }),
                     false => None,
                 },
@@ -980,7 +988,14 @@ impl<'l, 'a> Passing<'l, 'a> {
                     None if has(src_entries, "lib.rs", false) => file(&src, "lib.rs", alloc),
                     None => return Err(LayoutError::NoTargetFile { at: lib.span }),
                 };
-                Some(Target { name: lib_name(lib.name.as_ref(), &package.name, alloc), root, span: lib.span, found: false, proc_macro: lib.proc_macro })
+                Some(Target {
+                    name: lib_name(lib.name.as_ref(), &package.name, alloc),
+                    root,
+                    span: lib.span,
+                    found: false,
+                    proc_macro: lib.proc_macro,
+                    required_features: Vec::new_in(alloc),
+                })
             }
             None if package.autolib && has(src_entries, "lib.rs", false) => Some(Target {
                 name: lib_name(None, &package.name, alloc),
@@ -988,6 +1003,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                 span: package.span,
                 found: true,
                 proc_macro: false,
+                required_features: Vec::new_in(alloc),
             }),
             None => None,
         };
@@ -999,7 +1015,15 @@ impl<'l, 'a> Passing<'l, 'a> {
             for (name, root) in inferred.iter() {
                 let taken = bins.iter().any(|bin| bin.name == *name || bin.root == *root);
                 if !taken {
-                    bins.push(Target { name: name.clone(), root: root.clone(), span: package.span, found: true, proc_macro: false });
+                    // A binary found by its file has no table, so no `required-features`.
+                    bins.push(Target {
+                        name: name.clone(),
+                        root: root.clone(),
+                        span: package.span,
+                        found: true,
+                        proc_macro: false,
+                        required_features: Vec::new_in(alloc),
+                    });
                 }
             }
         }
@@ -1020,7 +1044,14 @@ impl<'l, 'a> Passing<'l, 'a> {
                 None => return Err(LayoutError::NoTargetFile { at: bin.span }),
             },
         };
-        Ok(Target { name: name.clone(), root, span: bin.span, found: false, proc_macro: false })
+        Ok(Target {
+            name: name.clone(),
+            root,
+            span: bin.span,
+            found: false,
+            proc_macro: false,
+            required_features: bin.required_features.clone(),
+        })
     }
 
     fn rooted(&self, dir: &str, path: &str, span: Span) -> Result<Text<'a>, LayoutError<'a>> {

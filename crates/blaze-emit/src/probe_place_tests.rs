@@ -154,7 +154,7 @@ fn the_probe_tail_is_inside_the_record_instructions() {
             let at = b.data_addr(row);
             b.load(Ty::I8, Flags::NONE, at, 1, MemAttrs::default())
         });
-        let (record, insts, _) = emit_record_up_to(func.view(), &Nameless, &crate::RoutinePlaces::NONE, ISA, BULK_INLINE_MOST, Alloc::global())
+        let (record, insts, _) = emit_record_up_to(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &Nameless, &crate::RoutinePlaces::NONE, ISA, BULK_INLINE_MOST, Alloc::global())
             .unwrap_or_else(|why| panic!("a {slot}-byte slot's function emits as a record: {why}"));
         let code = &record.code[..];
         let insts = u64::from(insts);
@@ -211,13 +211,15 @@ fn the_fast_tier_refuses_a_frame_past_a_page() {
     };
     let fast = Fast { table: &table, regs: &ARM64 };
     let machine = table.head().machine;
-    let large = fast.emit(framed(4096, 4).view(), &Nameless, machine, Alloc::global());
+    let large_func = framed(4096, 4);
+    let large = fast.emit(blaze_lir::verify(large_func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global());
     match large {
         Err(TierError::Refused { tier: TierName::Fast, inst: None, what }) => assert_eq!(what, FAST_FRAME_PAST_A_PAGE),
         Err(other) => panic!("a 4096-byte frame is refused for another reason: {other:?}"),
         Ok(_) => panic!("the Fast tier composed a 4096-byte frame with no probe"),
     }
-    let at_bound = fast.emit(framed(4064, 4).view(), &Nameless, machine, Alloc::global());
+    let bound_func = framed(4064, 4);
+    let at_bound = fast.emit(blaze_lir::verify(bound_func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global());
     if let Err(TierError::Refused { what, .. }) = at_bound {
         assert_ne!(what, FAST_FRAME_PAST_A_PAGE, "a 4064-byte frame is within the bound");
     }

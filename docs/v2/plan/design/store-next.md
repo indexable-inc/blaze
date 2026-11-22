@@ -345,3 +345,115 @@ coordinator: `blaze-ids`' `many.rs` duplicates `hash_many`, with its own groupin
 and its own `padded_words`, and could call `derive_key_many` instead (rule 30). Revisit if a
 measurement on x86-64 with SHA-NI and AVX-512, or of SHA-256 run four at a time over unequal
 lengths, moves the mixed-length row by more than 1.5x.
+
+## D182: the store's bottom, a seam (built, not the default)
+
+Evidence (a one-function edit on tempo, the command's on-CPU time): `__open` and
+`__open_nocancel` 9.5%, `read` 3.65%, stat calls 3.2%, the `read_all` copy 3.35%; the stored
+answer is 29,972 pages (2.83 GB).
+
+The store's driver is a `Bottom` (`crates/blaze-cas/src/plain/bottom.rs`, rule 78):
+`OverDir<D>` hands every effect on as it is (today's behaviour, a pure refactor), and
+`OverBlock<D>` makes every file of the store an extent of one device file, its table in one of
+two alternating superblocks (generation, live extents, folders, digest). The free map is derived
+at open, never stored. An extent a name drops is free only once the flip of the first generation
+not naming it is durable, and never in the process that mapped it. A flip is the table taken,
+the device synced, the slot written, the device synced. Flips run in order, and a queued flip
+takes every later sync. A write grows within its extent, or moves the file whole to an extent
+of twice the size. One process holds a device: its exclusive lock, refused by name if held, so
+the two-writer mode stays on `OverDir`.
+
+The names' calls are saved by the table alone: listing, rename, unlink, a folder's sync, the
+temporary file of a durable write. The opens are saved only once the native driver keeps the
+device's descriptor for every effect on its name; today it keeps descriptors for `ReadInto`
+and `ReadMany` alone.
+
+**Two writers on one device: a step, not a wall.** Accepted for now (coordinator,
+2026-11-20): one process holds a device, and the two-writer mode stays on `OverDir`. Over a
+block range it would need three things:
+
+- extents claimed per writer in the head: each writer's run of the device named in the
+  table, allocations only inside its own claim, a new claim taken by a flip;
+- one owner of the flip at a time: the flip lock the store already takes (`Effect::Lock` on
+  its flip file) taken on the device, the head read again under it, the writer's table merged
+  into it, then written;
+- what D159 makes of the store's one answer form: the merge is of disjoint claims, so it
+  never rewrites another writer's extent. A writer that died leaves its claim, freed by the
+  next open that finds no live holder.
+
+**The descriptors kept for a held name: what removes the opens.** Tonight's profile puts
+`__open` and `__open_nocancel` at 9.5% of an edit's CPU.
+
+Where descriptors are kept today: `blaze-core/src/descriptors.rs` (`Descriptors::file`,
+keyed by name and `Cache`, LRU-bounded at 1024 and a quarter of `RLIMIT_NOFILE`). Only
+`Effect::ReadInto` and `Effect::ReadMany` read through it (`threads.rs` `run_kept`).
+`threads::run` closes a name's descriptor after any effect that changes what is under the
+name (`changes`: Remove, Rename, Write, Truncate, Clone, Link and the rest). Every other file
+effect in `run_kept` opens its path and closes it: `ReadAll` (`std::fs::read`: open, fstat,
+read, close), `Read`, `Append`, `Sync`, `Barrier`, `WriteAt`, `Map`, `Stat`. io_uring keeps its
+own registered-file table for positional reads.
+
+The rule a kept descriptor needs: its name changes only through this driver. That holds for the
+store's content-named files, which is why reads may keep them. It does not hold for a source
+file an editor replaces by rename. So holding is asked, never assumed:
+
+- `Effect::Hold { file, access: Read | ReadWrite, tag }` opens once and keeps the descriptor
+  outside the LRU, under its own cap (`HELD_MOST`, 256: the store's head, log, flip file and
+  live segments; refused by name past it, never evicted). `Effect::Release { file, tag }`
+  closes it.
+- Every file effect on a held name runs on the kept descriptor:
+  - `ReadAll` as `fstat` + `pread`, which saves the open and the close;
+  - `Read`, `WriteAt` and `Append` as `pread` or `pwrite`, at the length the driver keeps for
+    an append;
+  - `Sync` as `fdatasync` and `Barrier` as `F_BARRIERFSYNC`;
+  - `Map` as `mmap` of the kept descriptor;
+  - `Stat` as `fstat`.
+- An effect that changes what is under a held name (`Remove`, `Rename` onto it, `Write`,
+  `Truncate` to zero, `Clone` or `Link` onto it) fails naming the hold (rule 3, no
+  fallback); the asker releases the name first. `Truncate` to a length keeps the inode, so it
+  runs on the descriptor.
+- The simulation answers `Hold` and `Release` with a table of held names. It checks the same
+  refusals, so a DST catches an asker that changes a held name. A crash releases every hold.
+
+That fix needs no change of the store's format and helps `OverDir` today. The store holds its
+segments as it maps them, its head and its log while open, and releases a segment before its
+removal: `cleanup` already orders the removal after the flip. `OverBlock` holds its one
+device. What it does not save: the opens of source files, which cannot be held. Their cost is
+the stat-then-open of the incremental check, a separate piece.
+
+The exact edits are in blaze-core, not this lane's files:
+
+- `lib.rs` `Effect`: `Hold`, `Release` and `HoldAccess`; `Done::Held` and `Done::Released`.
+- `descriptors.rs`: a `held` map beside `kept`, with `hold`, `release` and `held(name) ->
+  Option<Arc<File>>`.
+- `threads.rs`:
+  - `run_kept`: each arm listed above looks up `held(name)` first;
+  - `changes`: on a held name, refuse instead of forget.
+- `fs.rs`: descriptor forms of `read_all`, `sync`, `barrier`, `append`, `write_at` and `map`
+  beside the path forms.
+- `uring.rs`: `Hold` as a registered file (`IORING_REGISTER_FILES_UPDATE`).
+- `sim.rs`: the held table and its refusals.
+
+The store's core then holds and releases these names: `core.rs`, after its map of a segment,
+at open, and before a removal.
+
+Proof: `bottom_tests.rs`. One crash simulation runs over both bottoms with one oracle:
+
+- an acknowledged record reads back with equal bytes;
+- a cut record reads back whole or not at all;
+- a key never put is never found;
+- the head after a cut is one of the last two generations.
+
+A differential check compares the two bottoms without cuts. Three plants are each caught:
+
+- both slots written in one step;
+- an extent freed before the flip is durable;
+- a stored free map trusted at open.
+
+`Limits::SIMULATED` is checked against the drawn cases' high-water marks (D165), which the
+test prints. `Limits::store` is not yet sized from a real store's marks.
+
+The device under it is bstd's block grant (`crates/blaze-std/src/block.rs`): `Block`, `Lba`,
+`Blocks`, aligned buffers and `DeviceFacts`, over `OverFile`, the simulated device
+(`blaze-core/src/sim/block.rs`) and `RawDevice`. Making `Driven::open` use `OverBlock` is the
+coordinator's call, after the tempo edit is measured on both.

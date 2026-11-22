@@ -353,20 +353,20 @@ fn unadvised_memory_follows_the_process_opt_out_on_linux() {
     let bytes = 64 << 20;
     // SAFETY: a fresh anonymous mapping, unmapped below.
     let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        blaze_sys::posix::io::mmap(
+            None,
             bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
+            blaze_sys::posix::io::Prot::READ | blaze_sys::posix::io::Prot::WRITE,
+            blaze_sys::posix::io::MapFlags::PRIVATE | blaze_sys::posix::io::MapFlags::ANONYMOUS,
+            None,
             0,
         )
-    };
-    assert_ne!(base, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-    touch_sparsely(base.cast(), bytes);
-    let kib = anon_huge_kib(base.addr());
+    }
+    .expect("mmap");
+    touch_sparsely(base.as_ptr(), bytes);
+    let kib = anon_huge_kib(base.as_ptr().addr());
     // SAFETY: the mapping made above, no longer used.
-    unsafe { libc::munmap(base, bytes) };
+    unsafe { blaze_sys::posix::io::munmap(base, bytes) }.expect("munmap");
     assert_eq!(
         kib, 0,
         "an unadvised mapping has {kib} KiB on huge pages under the process policy {thp}"
@@ -472,15 +472,17 @@ fn apple_silicon_has_no_superpages_for_anonymous_memory() {
         libc::mmap(
             std::ptr::null_mut(),
             HUGE_PAGE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            libc::VM_FLAGS_SUPERPAGE_SIZE_2MB,
+            (blaze_sys::posix::io::Prot::READ | blaze_sys::posix::io::Prot::WRITE).bits() as _,
+            (blaze_sys::posix::io::MapFlags::ANONYMOUS | blaze_sys::posix::io::MapFlags::PRIVATE).bits() as _,
+            blaze_sys::posix::proc::VM_FLAGS_SUPERPAGE_SIZE_2MB,
             0,
         )
     };
     if at != libc::MAP_FAILED {
         // SAFETY: the mapping just made, which nothing else knows of.
-        unsafe { libc::munmap(at, HUGE_PAGE) };
+        if let Some(at) = std::ptr::NonNull::new(at.cast()) {
+            let _ = unsafe { blaze_sys::posix::io::munmap(at, HUGE_PAGE) };
+        }
     }
     assert_eq!(
         at,

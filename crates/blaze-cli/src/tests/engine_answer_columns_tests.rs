@@ -19,7 +19,7 @@ use blaze_ids::ContentId;
 use blaze_own::{AVec, SharedAlloc, Vec};
 
 use crate::engine_answer::{Facts, Printed};
-use crate::engine_answer_rows::{Close, Counts, RowsAnswer, RowsNext, RowsWritten, StoreSink, load_root, load_rows, root_names, summary, write_effects};
+use crate::engine_answer_rows::{Close, Counts, RowPayload, RowsAnswer, RowsNext, RowsWritten, StoreSink, load_root, load_rows, root_names, summary, write_effects};
 
 use super::engine_answer_rows_tests::{Asked, CELL, Memory, Recording, ask, cell_of, digest, file_name, task_name, tools, universe, with_store};
 
@@ -79,7 +79,7 @@ fn each_column_costs_its_answer() {
     let facts = Facts { files: counts.files, printed: Printed { names: true, bodies_whole: true, replayable: true }, findings: counts.findings, owed: 8 };
     let effects = NextAnswer::finish(next, &tree, &summary(&facts), &LinesKey([0; 32])).expect("the commit");
     let mut sink = Recording::default();
-    match write_effects(&mut sink, &names, &[], &effects, Key(ContentId([0; 32])), alloc) {
+    match write_effects(&mut sink, &names, &effects, alloc) {
         Ok(_) => {}
         Err(never) => match never {},
     }
@@ -159,7 +159,7 @@ fn an_owed_row_keeps_its_serial() {
         let facts = Facts { files: counts.files, printed: Printed { names: true, bodies_whole: true, replayable: true }, findings: counts.findings, owed: u32::from(moved) };
         let effects = NextAnswer::finish(next, &tree, &summary(&facts), &LinesKey([0; 32])).expect("the commit");
         let mut sink = Recording::default();
-        match write_effects(&mut sink, &names, last.segments(), &effects, Key(ContentId([0; 32])), alloc) {
+        match write_effects(&mut sink, &names, &effects, alloc) {
             Ok(_) => {}
             Err(never) => match never {},
         }
@@ -317,33 +317,11 @@ impl<'a> Pool<'a> for One {
     }
 }
 
-/// What a task makes of a cell the view hands it. The seam promises a cell's digest in its kept
-/// form alone (last.rs `content`: the rows form keeps the first `DIGEST_BYTES` and pads the rest
-/// with zeros, the memory form hands the whole digest), so a task whose result is a function of
-/// the bytes handed must take them in that form: the command's tasks do (blaze-ladder
-/// front2/tables/task.rs: a body's `out` is its verdict's bytes; what `Make` hands is the seen
-/// digest the engine compares, never an input of `out`).
+/// The control reproduces the previous rows reader's loss of the suffix of a carried value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Handed {
-    /// The kept form: what both forms hand alike.
-    Kept,
-    /// The whole bytes: the history's fixture before lane RD10, whose bodies' `out` differed
-    /// between the forms the first time a body read a cell carried from the last answer (request
-    /// 3: body 5 reads head 6's cell). The control: the comparison catches it.
     Whole,
-}
-
-/// `seen` as a task of `how` takes it into its result.
-fn handed(how: Handed, seen: &ContentId) -> ContentId {
-    match how {
-        Handed::Whole => *seen,
-        Handed::Kept => {
-            let kept = CellDigest::of(seen);
-            let mut whole = [0u8; 32];
-            whole[..kept.0.len()].copy_from_slice(&kept.0);
-            ContentId(whole)
-        }
-    }
+    PrefixPadded,
 }
 
 /// The world's tasks over the view's cells. A body whose text's version is a multiple of three
@@ -364,23 +342,25 @@ fn work<'a, L: LastAnswer>(world: &World, how: Handed, shared: SharedAlloc<'a>, 
         let id = CellId { of: file_name(), cell: item_cell(SIG, i) };
         let seen = view.cell(&id);
         reads.push((id, seen));
-        let made = pair("engine_answer_columns_tests head", &handed(how, &seen), &handed(how, &seen));
+        let made = pair("engine_answer_columns_tests head", &seen, &seen);
         defines.push((CELL, made));
         made
     } else {
         let i = (0..world.items).find(|i| body(*i) == name).expect("a body of today's plan");
         let text = CellId { of: file_name(), cell: item_cell(BODY, i) };
         let callee = CellId { of: head((i + 1) % world.items), cell: CELL };
-        let (a, b) = (view.cell(&text), view.cell(&callee));
+        let (a, mut b) = (view.cell(&text), view.cell(&callee));
+        if how == Handed::PrefixPadded {
+            b.0[20..].fill(0);
+        }
         reads.push((text, a));
         reads.push((callee, b));
         if world.body[i] % 3 == 0 {
             findings = 1;
         }
-        pair("engine_answer_columns_tests body", &handed(how, &a), &handed(how, &b))
+        pair("engine_answer_columns_tests body", &a, &b)
     };
     defines.sort_unstable_by_key(|(cell, _)| *cell);
-    reads.sort_unstable_by_key(|(id, _)| *id);
     buffer.done.push(Done { name, key: task.key, out, defines, reads, findings, failed: false });
 }
 
@@ -396,7 +376,28 @@ fn request<'a, L: Fold<'a> + Sync>(world: &World, how: Handed, last: L, shared: 
 
 /// What the command hands the rows form's commit at a request's end, for `world`.
 fn close(world: &World) -> Close<'static> {
-    Close { tree: world.tree(), printed: Printed { names: true, bodies_whole: true, replayable: true }, lines: LinesKey([0; 32]), records: &record_of }
+    Close { tree: world.tree(), printed: Printed { names: true, bodies_whole: true, replayable: true }, lines: LinesKey([0; 32]), records: &|name| record_of(name).map(RowPayload::Stored) }
+}
+
+#[test]
+fn a_changed_row_requires_a_payload_decision() {
+    let world = World::first();
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    let heap = heap_of(&io);
+    let finished = request(&world, Handed::Whole, RowsAnswer::empty(heap.shared()), heap.shared(), blaze_engine::Plant::None);
+    let task = body(5);
+    let missing = |name: &Name| if *name == task { None } else { record_of(name).map(RowPayload::Stored) };
+    let close = Close { records: &missing, ..close(&world) };
+    assert!(matches!(finished.answer.commit(&close, Plant::None, heap.alloc()), Err(blaze_engine::last::LastError::RowPayload { task: refused }) if refused == task));
+    let recordless = |name: &Name| if *name == task { Some(RowPayload::NoPayload) } else { record_of(name).map(RowPayload::Stored) };
+    let close = Close { records: &recordless, ..close };
+    let (effects, _) = finished.answer.commit(&close, Plant::None, heap.alloc()).expect("a body with an explicit recordless result can be published");
+    let opened = AnswerView::open(effects.root(), |child| effects.writes().iter().find_map(|write| match write {
+        blaze_answer::Write::Segment { at, bytes } if at == child => Some(bytes.as_slice()),
+        _ => None,
+    }), Plant::None, heap.shared()).expect("the recordless row reopens");
+    let row = opened.task(&task).and_then(|id| opened.row(id)).expect("the body still has a row");
+    assert_eq!(row.record(), Key::default(), "a recordless row names no payload");
 }
 
 /// Two answers' lists equal, or a panic naming the FIRST entry that differs, both sides of it
@@ -519,7 +520,7 @@ fn rows_engine_keeps_the_memory_engines_answer() {
     for r in 1..30 {
         worlds[r] = worlds[r - 1].step(n32(r));
     }
-    let (totals, _) = twin(&io, &worlds, Handed::Kept, true, blaze_engine::Plant::None);
+    let (totals, _) = twin(&io, &worlds, Handed::Whole, true, blaze_engine::Plant::None);
     println!(
         "thirty requests: entered {} by digest, {} by generation ({} extra, {} standing extras); owed only by generation {} (at most {} at once); rows touched {}",
         totals.entered_mem, totals.entered_rows, totals.extra_entries, totals.extra_rows, totals.gen_owed, totals.gen_owed_most, totals.touched_rows
@@ -541,7 +542,7 @@ fn control_a_cell_that_never_settles_is_caught() {
     for r in 1..30 {
         worlds[r] = worlds[r - 1].step(n32(r));
     }
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| twin(&io, &worlds, Handed::Kept, false, blaze_engine::Plant::StaleKeptOnTake)));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| twin(&io, &worlds, Handed::Whole, false, blaze_engine::Plant::StaleKeptOnTake)));
     let why = match caught {
         Ok(_) => panic!("control: a cell kept owed after its readers ran again went unseen: the owed-cells bound is blind"),
         Err(why) => why,
@@ -551,13 +552,8 @@ fn control_a_cell_that_never_settles_is_caught() {
     assert!(said.contains("owed cells") && said.contains("never settle"), "control: the comparison names a cell that never settles: {said}");
 }
 
-/// A CARRIED CELL IS HANDED IN ITS KEPT FORM (lane RD10, the history's request 3 in two
-/// requests): the second request edits body 5's text alone, so body 5 is entered and reads head
-/// 6's cell, which no task of the request made: the rows form hands it from the last answer,
-/// its first `DIGEST_BYTES` padded with zeros (last.rs `content`), the memory form whole. The
-/// two agree in the kept form and not in the whole bytes; a task that makes its result of the
-/// kept form leaves both answers alike; one that makes it of the whole bytes (the control,
-/// `Handed::Whole`) gives body 5 another `out` in each form, and the comparison names that row.
+/// Editing body 5 while head 6 stands must hand the body all 32 bytes of its callee's
+/// value. Its output depends on all 32. Padding the carried value must change that output.
 #[test]
 fn a_carried_cell_is_handed_in_its_kept_form() {
     let first = World::first();
@@ -565,24 +561,30 @@ fn a_carried_cell_is_handed_in_its_kept_form() {
     edited.body[5] = 100;
     let worlds = [first, edited];
     let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
-    let (_, memory) = twin(&io, &worlds, Handed::Kept, false, blaze_engine::Plant::None);
+    let (_, memory) = twin(&io, &worlds, Handed::Whole, false, blaze_engine::Plant::None);
     let id = CellId { of: head(6), cell: CELL };
-    let whole = memory.cell(&id);
-    with_store(&io, |cx, store, opts| {
+    let alloc = heap_of(&io).shared();
+    let fresh = request(&edited, Handed::Whole, Answer::new_in(alloc), alloc, blaze_engine::Plant::None).answer;
+    let whole = fresh.cell(&id);
+    assert_eq!(whole, memory.cell(&id), "the standing head equals a cold head");
+    let fresh_out = fresh.rows.get(&body(5)).expect("a cold run checks the edited body").out;
+    with_store(&io, |cx, store, opts, _| {
         let names = root_names(opts.place.checkout, &tools(), &edited.tree(), cx.frame());
         let root = load_root(cx, store, names.checkout.as_str()).expect("the store reads").expect("a rows root").expect("the rows root reads");
         let rows = load_rows(cx, store, &root, opts.heap.shared()).expect("the store reads").expect("the rows read");
         let cell = LastAnswer::cell(&rows, &id).expect("head 6's cell is named");
         let carried = LastAnswer::content(&rows, cell);
-        assert_eq!(CellDigest::of(&carried), CellDigest::of(&whole), "the forms agree on a carried cell's kept form");
-        assert_ne!(carried, whole, "the rows form hands the kept form padded, the memory form the whole digest");
-        assert_eq!(handed(Handed::Kept, &carried), handed(Handed::Kept, &whole), "the kept form of either is one value");
+        assert!(whole.0[20..].iter().any(|&byte| byte != 0), "the fixture exercises the carried suffix");
+        assert_eq!(carried, whole, "fresh content id == reopened content id");
+        let body_row = rows.task(&body(5)).and_then(|task| rows.view().row(task)).expect("the edited body has a stored row");
+        assert_eq!(body_row.out(), fresh_out, "using a carried callee gives the cold body's output");
+        println!("fresh content id == reopened content id (32 bytes)");
     });
 
     let control = Io::simulated(SimWorld::new(11, Limits::USUAL));
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| twin(&control, &worlds, Handed::Whole, false, blaze_engine::Plant::None)));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| twin(&control, &worlds, Handed::PrefixPadded, false, blaze_engine::Plant::None)));
     let why = match caught {
-        Ok(_) => panic!("control: a body made of the whole bytes handed gives both forms one answer: the comparison is blind"),
+        Ok(_) => panic!("control: the comparison missed a padded callee value"),
         Err(why) => why,
     };
     let said = why.downcast_ref::<std::string::String>().map(|s| s.as_str()).or_else(|| why.downcast_ref::<&str>().copied()).unwrap_or("");
@@ -620,7 +622,7 @@ fn twin(io: &Io, worlds: &[World], how: Handed, print: bool, plant: blaze_engine
         // Whether the request that wrote the answers compared now ran every task.
         let ran_all = r > 0 && !worlds[r as usize - 1].partial;
         let last_memory = &memory;
-        let ran = with_store(io, |cx, store, opts| {
+        let ran = with_store(io, |cx, store, opts, lent| {
             let names = root_names(opts.place.checkout, &tools(), &world.tree(), cx.frame());
             let (compared, last) = match first {
                 true => (Compared::default(), RowsAnswer::empty(opts.heap.shared())),
@@ -633,15 +635,14 @@ fn twin(io: &Io, worlds: &[World], how: Handed, print: bool, plant: blaze_engine
                     (compared, load_rows(cx, store, &root, opts.heap.shared()).expect("the store reads").expect("the rows read"))
                 }
             };
-            let finished = request(&world, how, last, opts.heap.shared(), plant);
+            let finished = request(&world, if first { Handed::Whole } else { how }, last, opts.heap.shared(), plant);
             let (effects, written) = finished.answer.commit(&close(&world), Plant::None, alloc).expect("the rows commit");
-            let segments = finished.answer.last().view().segments();
-            write_effects(&mut StoreSink { cx, store: &mut *store }, &names, segments, &effects, Key(ContentId([0; 32])), alloc).expect("the store takes the writes");
+            write_effects(&mut StoreSink { cx, store: &mut *store, lent, toolchain: opts.toolchain }, &names, &effects, alloc).expect("the store takes the writes");
             let mut entered: AVec<'static, Name> = Vec::new_in(alloc);
             entered.extend(finished.entered.iter().copied());
             Ran { extras: compared.extras, gen_owed: compared.gen_owed, touched: finished.touched, written, entered }
         });
-        let ours = request(&world, how, core::mem::replace(&mut memory, Answer::new_in(shared)), shared, blaze_engine::Plant::None);
+        let ours = request(&world, Handed::Whole, core::mem::replace(&mut memory, Answer::new_in(shared)), shared, blaze_engine::Plant::None);
         memory = ours.answer;
         let mut mem_entered: AVec<'_, Name> = Vec::new_in(alloc);
         mem_entered.extend(ours.entered.iter().copied());
@@ -676,7 +677,7 @@ fn twin(io: &Io, worlds: &[World], how: Handed, print: bool, plant: blaze_engine
     }
     let last_world = worlds.last().copied().unwrap_or_else(World::first);
     let last_memory = &memory;
-    let compared = with_store(io, |cx, store, opts| {
+    let compared = with_store(io, |cx, store, opts, _| {
         let names = root_names(opts.place.checkout, &tools(), &last_world.tree(), cx.frame());
         let root = load_root(cx, store, names.checkout.as_str()).expect("the store reads").expect("a rows root").expect("the rows root reads");
         let rows = load_rows(cx, store, &root, opts.heap.shared()).expect("the store reads").expect("the rows read");
@@ -705,10 +706,10 @@ fn a_cut_commit_leaves_the_last_answer_whole() {
     let first_world = World::first();
     let names = root_names("ws", &tools(), &first_world.tree(), cx.frame());
     let ops_of = |world: &World, last: RowsAnswer<'_>| -> Recording {
-        let finished = request(world, Handed::Kept, last, shared, blaze_engine::Plant::None);
+        let finished = request(world, Handed::Whole, last, shared, blaze_engine::Plant::None);
         let (effects, _) = finished.answer.commit(&close(world), Plant::None, alloc).expect("the rows commit");
         let mut sink = Recording::default();
-        match write_effects(&mut sink, &names, finished.answer.last().view().segments(), &effects, Key(ContentId([0; 32])), alloc) {
+        match write_effects(&mut sink, &names, &effects, alloc) {
             Ok(_) => {}
             Err(never) => match never {},
         }

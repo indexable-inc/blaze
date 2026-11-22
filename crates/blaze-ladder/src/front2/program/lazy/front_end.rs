@@ -87,8 +87,11 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             reveal: crate::front2::opaque_auto::Reveal::All,
         };
         let out = f(&world);
-        // What the question found unmade, for the build's `make_asked`.
+        // What the question found unmade, for the build's `make_asked`; what it found refused
+        // (a candidate impl's header, by name), for `make_asked`'s refusal when nothing is
+        // left to make: never the bare `Missing` (rule 19).
         self.asked.borrow_mut().extend(world.fills.into_inner());
+        self.asked_gaps.borrow_mut().extend(world.gaps.into_inner());
         Ok(out)
     }
 
@@ -114,6 +117,32 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     pub fn internal_binding_reads(&mut self, owner: ItemKey) -> &[TableRead] {
         let bindings = self.internal_bindings.get_mut();
         if bindings.callers.contains_key(&owner) { bindings.reads.as_slice() } else { &[] }
+    }
+
+    /// The seam's `check_one` with the body's checked columns read from the check's record
+    /// (typed.rs), never checked here: the typing seam's `FromRecord` (run/make_one.rs). A
+    /// gap is [`LazyRefusal::Typed`] naming the body.
+    pub fn check_one_typed(&mut self, key: ItemKey, records: &mut dyn super::typed::TypedRecords) -> Result<Option<(usize, Checked<'static>)>, crate::run::RunError> {
+        self.check_one_by(key, super::fill::Typer::Record(records))
+    }
+
+    /// `check_one` over either typer: the body made by `check_one_key_by`, then each fn it
+    /// names bound (the reach walk also visits fns used as values, fn pointers included).
+    fn check_one_by(&mut self, key: ItemKey, typer: super::fill::Typer<'_>) -> Result<Option<(usize, Checked<'static>)>, crate::run::RunError> {
+        use crate::run::RunError;
+        let body = self.check_one_key_by(key, typer).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        if let Some((_, checked)) = &body {
+            let values = checked.expr_defs.column::<1>().iter().filter_map(|d| match *d {
+                tc::Def::Fn(k) => Some(k),
+                _ => None,
+            });
+            for callee in checked.callees.column::<1>().iter().copied().chain(values) {
+                self.bind_internal(key, callee).map_err(RunError::Front2)?;
+            }
+        } else {
+            self.bind_internal(key, key).map_err(RunError::Front2)?;
+        }
+        Ok(body)
     }
 }
 
@@ -201,11 +230,31 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             return Err(crate::run::RunError::Front2(why));
         }
         let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));
-        if fills.is_empty() {
-            return Ok(false);
-        }
+        let mut gaps = core::mem::replace(self.asked_gaps.get_mut(), Vec::new_in(Global));
         let owner = self.rows.key[i];
         let function: Box<str> = Box::from(self.rows.str(self.rows.path[i]));
+        if fills.is_empty() {
+            // Nothing to make: a question the world refused (a refused candidate impl) is the
+            // instance's refusal by name, never the bare "no answer" (rule 19); none at all is
+            // `Ok(false)`, the caller's refusal as before.
+            if gaps.is_empty() {
+                return Ok(false);
+            }
+            gaps.sort_unstable_by_key(|g| std::format!("{g:?}"));
+            gaps.dedup_by_key(|g| std::format!("{g:?}"));
+            let error = crate::front2::check::CheckFail::Gap { owner, gaps };
+            return Err(crate::run::RunError::Front2(crate::front2::program::Front2Refusal::Asked { function, error }));
+        }
+        // With the program's evaluator, as a body check makes its world's fills (fill.rs
+        // `records(true)`): a head these fills make may name a constant (an impl's `type Output
+        // = [u32; BUFFER_SIZE]`, chacha20 rng.rs; a parameter `[u8; size_of::<Self>()]` of an
+        // integer's method; ruint's `Uint<256, { nlimbs!(256) }>`), and the Reference,
+        // "Constant evaluation", "Const context": "Array type length expressions" and "Const
+        // generic arguments" are evaluated as a constant item is, reading other constants to
+        // any depth. Without it check.rs `eval_len` found no evaluator and every such fill was
+        // `ConstFail::Nested` (or an anonymous constant filed as "this caller has no constant
+        // evaluator"): the instance refused. Never called inside an evaluation (`const_at` is
+        // one seam call with the evaluator taken there), so this is no nested evaluation.
         let mut records = Records {
             names: self.front.names,
             keys: &mut self.front.keys,
@@ -213,7 +262,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             store: &mut self.store,
             buckets: &mut self.buckets,
             order: BuildOrder::AsAsked,
-            consts: None,
+            consts: Some((&mut self.consts, self.prepared)),
         };
         crate::front2::check::make_all(&mut records, fills, owner)
             .map_err(|error| crate::run::RunError::Front2(crate::front2::program::Front2Refusal::Asked { function, error }))?;
@@ -325,21 +374,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn check_one(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, crate::run::RunError> {
-        use crate::run::RunError;
-        let body = self.check_one_key(key).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        if let Some((_, checked)) = &body {
-            // The reach walk also visits fns used as values (including fn pointers).
-            let values = checked.expr_defs.column::<1>().iter().filter_map(|d| match *d {
-                tc::Def::Fn(k) => Some(k),
-                _ => None,
-            });
-            for callee in checked.callees.column::<1>().iter().copied().chain(values) {
-                self.bind_internal(key, callee).map_err(RunError::Front2)?;
-            }
-        } else {
-            self.bind_internal(key, key).map_err(RunError::Front2)?;
-        }
-        Ok(body)
+        self.check_one_by(key, super::fill::Typer::Check)
     }
 
     fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, crate::run::RunError> {

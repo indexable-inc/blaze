@@ -7,7 +7,9 @@ use core::{
     hash::{Hash, Hasher},
 };
 
-use crate::{BuildMetadata, Cursor, Error, Ident, Limits, Part, Prerelease};
+use blaze_own::planted::{NoPlant, Planted};
+
+use crate::{BuildMetadata, Cursor, Error, Ident, Limits, Part, Prerelease, SemverPlant};
 
 /// A semantic version.
 pub struct Version<A: Allocator> {
@@ -72,9 +74,16 @@ impl<A: Allocator> Version<A> {
     /// The order of SemVer 2.0.0's section 11: by the numbers, then a pre-release before the
     /// release; build metadata does not count.
     pub fn cmp_precedence(&self, other: &Version<A>) -> Ordering {
+        self.cmp_precedence_planted(other, NoPlant)
+    }
+
+    /// [`Version::cmp_precedence`] with a planted bug from `plant`: the seam the precedence
+    /// oracle's control drives. Shipped callers pass `NoPlant` (through `cmp_precedence` and
+    /// `Ord`), and the order is the code as it is.
+    pub fn cmp_precedence_planted(&self, other: &Version<A>, plant: impl Planted<SemverPlant>) -> Ordering {
         (self.major, self.minor, self.patch)
             .cmp(&(other.major, other.minor, other.patch))
-            .then_with(|| self.pre.cmp(&other.pre))
+            .then_with(|| self.pre.cmp_planted(&other.pre, plant))
     }
 }
 

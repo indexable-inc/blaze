@@ -163,7 +163,7 @@ fn variadic_stores_precede_the_record_call_site() {
     let func = caller();
     let heap = blaze_own::testing::heap();
     for isa in [APPLE, LINUX] {
-        let (record, _) = emit_record(func.view(), &ByC, &crate::RoutinePlaces::NONE, isa, heap.alloc()).unwrap_or_else(|why| panic!("{isa:?}: {why}"));
+        let (record, _) = emit_record(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &ByC, &crate::RoutinePlaces::NONE, isa, heap.alloc()).unwrap_or_else(|why| panic!("{isa:?}: {why}"));
         let code: Vec<u32, Global> =
             record.code.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
         let calls: Vec<u32, Global> = record.sites.iter().filter(|s| s.kind == SiteKind::Call).map(|s| s.at / 4).collect();
@@ -180,9 +180,10 @@ fn variadic_stores_precede_the_record_call_site() {
         let slot0 = code[..at].iter().rposition(|&w| w == enc::str(Size::X, X9, SP, 0)).expect("Apple: slot 0 stored before the site");
         let slot8 = code[..at].iter().rposition(|&w| w == enc::str(Size::X, X9, SP, 1)).expect("Apple: slot 8 stored before the site");
         assert!(open < slot0 && slot0 < slot8, "Apple: open, int, double, then the site");
-        // Between the area's opening and the site only x9 (or x12) is written: x16 and x17,
-        // the site's and the linker's scratch, are left alone (bits 0..4 of a load, a store or
-        // an `add` name its register).
+        // Between the area's opening and the site only x9 is written (this caller has no cell
+        // past the scaled reach, so not pass.rs `FAR` either): x16 and x17, the site's and the
+        // linker's scratch, are left alone (bits 0..4 of a load, a store or an `add` name its
+        // register).
         for (k, &w) in code[open..at].iter().enumerate() {
             assert!(!matches!(w & 31, 16 | 17), "Apple: word {} before the site names x16 or x17: {w:#010x}", open + k);
         }

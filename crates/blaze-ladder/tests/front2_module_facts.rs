@@ -27,7 +27,7 @@ use blaze_drive::key::{ABSENT, Key, Kind, Name};
 use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::keys::checker_of;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::head::signature_name;
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::task::{BodyFrame, BodyOut, Make, MakeRefused, SaidWhat, check_body};
@@ -290,12 +290,10 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
-        self.expansions.get(krate)?.get(&call).copied()
-    }
-
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
-        None
+    /// The texts, with no origins kept.
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
+        let text = self.expansions.get(krate)?.get(&call).copied()?;
+        Some(LoadedExpansion { text, origins: None })
     }
 }
 
@@ -366,7 +364,7 @@ impl<'a> Make<'a> for MapMake {
 
 fn body_frame() -> BodyFrame<'static> {
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the body's frame")));
-    BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None }
+    BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All, heads: None, sources: None, goals: None, census: None }
 }
 
 /// One body task: a task error (the find's refusal) fails the test by the body's path.

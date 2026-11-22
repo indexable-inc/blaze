@@ -14,7 +14,9 @@
 
 use std::{alloc::Global, mem::offset_of};
 
-use blaze_format::{FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of};
+use blaze_format::{
+    FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, WriterIn, open_as, schema_of,
+};
 
 use blaze_format::SpanRef;
 
@@ -40,7 +42,7 @@ macro_rules! root {
         }
 
         /// Writes `view`'s columns, then the root naming them; returns where the root is.
-        fn write_columns(view: &View<'_>, out: &mut Writer) -> u64 {
+        fn write_columns<P: WriterIn>(view: &View<'_>, out: &mut Writer<P>) -> u64 {
             $( let $name = Placed::push(out, view.$name); )*
             let at = out.next::<LirRoot>();
             let root = LirRoot {
@@ -99,13 +101,14 @@ impl std::fmt::Display for ReadError {
 impl std::error::Error for ReadError {}
 
 /// `view` written into `out`, a writer of [`SCHEMA`]: where its root is.
-pub fn write(view: &View<'_>, out: &mut Writer) -> u64 {
+pub fn write<P: WriterIn>(view: &View<'_>, out: &mut Writer<P>) -> u64 {
     write_columns(view, out)
 }
 
 /// `view` as a buffer of its own.
 pub fn to_bytes(view: &View<'_>) -> Vec<u8> {
-    let mut out = Writer::new(SCHEMA);
+    // Compatibility (D170): the global heap until blaze-lir's conversion passes an allocator.
+    let mut out = Writer::on_the_global_heap_until_ported(SCHEMA);
     let root = write(view, &mut out);
     out.finish(root)
 }
@@ -124,7 +127,7 @@ impl Persist for Func<Global> {
     const SCHEMA: SchemaHash = SCHEMA;
     type Ref<'a> = View<'a>;
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         write(&self.view(), out)
     }
 

@@ -1,0 +1,14 @@
+# The first rung of D175 (comptime-native.md, "The first rung"): a derive macro using only
+# `proc_macro`, expanded both ways (wasm in Wasmtime, native from code records) and compared by
+# `blaze_comptime::first_difference`. Its own workspace: never a member of blaze's.
+[package]
+name = "derive-hello"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[workspace]

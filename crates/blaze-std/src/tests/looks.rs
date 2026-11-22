@@ -134,6 +134,16 @@ fn build(plan: &Plan) -> Result<(Io, crate::cx::Cx, Dir<ReadWrite>, std::vec::Ve
         for &(folder, leaf) in files.iter().filter(|(folder, _)| *folder == gone) {
             dir.remove_synced(&cx, &path(&joined(FOLDERS[folder], LEAVES[leaf]))).map_err(|e| format!("harness: {e}"))?;
         }
+        // A folder stays when its last file goes, as on a real disk (blaze-core's conformance
+        // suite, `a_folder_outlives_its_last_file`): removed too, so the vanished folder is not
+        // there, where its files made it and no folder under it holds one.
+        let made = files.iter().any(|(folder, _)| *folder == gone);
+        let holds_more = files.iter().any(|(folder, _)| {
+            FOLDERS[*folder].strip_prefix(FOLDERS[gone]).is_some_and(|rest| rest.starts_with('/'))
+        });
+        if made && !holds_more {
+            dir.remove_dir_synced(&cx, &path(FOLDERS[gone])).map_err(|e| format!("harness: {e}"))?;
+        }
     }
     let mut texts: std::vec::Vec<std::string::String> =
         plan.asked.iter().map(|&(folder, leaf)| joined(FOLDERS[folder], LEAVES[leaf])).collect();

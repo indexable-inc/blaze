@@ -1,51 +1,40 @@
-//! One `CrateScope` task, in three steps, so a crate's names are resolved on a pool worker
-//! (drive.md, RUNNER 17): [`prepare`] on the main thread, [`resolve`] on any worker, [`settle`]
-//! and [`answer`] on the main thread again.
+//! One crate's names resolved on a pool worker ([`resolve`]) from a [`ScopeJob`] the engine's
+//! names stage makes (engine_names.rs). A job shares RECORD BYTES and read-only views only: its
+//! dependencies' exports records ([`DepExports`], read in place), the packs' views and the
+//! corrections, the crate's environment lent to be copied ([`EnvLent`]). The worker reads the
+//! checkout files the crate names itself ([`JobTexts`]), compiles the macros it calls and holds
+//! everything it makes in its own task frame, freed when the task ends; what it returns is the
+//! crate's record, owned.
 //!
-//! Why it ran on the main thread before: the task borrowed the command's live names state.
-//! [`Names`]' world reads the checkout through a reader that allocates into one frame through
-//! the main thread's context (`&dyn Tree`, not `Sync`); the store is `&mut dyn Store`; the
-//! command's one `Prepares` (compiled macro definitions) holds an `Alloc` handle (not `Sync`);
-//! the crate's `CrateEnv` likewise; and every resolution allocated in the global heap, never
-//! freed. Now a job shares RECORD BYTES and read-only views only: its dependencies' exports
-//! records (read from the store on the main thread, once a round each), the packs' views and
-//! the corrections (copied once a round), the crate's environment lent to be copied
-//! ([`EnvLent`]). The worker reads the checkout files the crate names itself
-//! ([`JobTexts`]), compiles the macros it calls and holds everything it makes in its own task
-//! frame, freed when the task ends; what it returns is the crate's record, owned.
-//!
-//! A crate's record is a function of its job: the same bytes whichever worker, order or batch
-//! made it (rule 25; the test `a_pooled_check_writes_the_records_a_serial_one_does`, main.rs).
+//! A crate's record is a function of its job: the same bytes whichever worker or order made it
+//! (rule 25).
 
 use core::cell::RefCell;
 use std::alloc::Global;
 use std::string::String;
 
-use blaze_build_script::outputs::OutputsRef;
-use blaze_drive::{Input, Key, Kind, Locate, Name, Part, Task, TaskFailure, Want, Why};
+use blaze_drive::Input;
 use blaze_fetch::pack::PackView;
 use blaze_id::CrateItemKey;
-use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{Alloc, Erased};
 use blaze_scope::crate_env::EnvLent;
+use blaze_scope::body_scope::BlocksTally;
 use blaze_scope::crate_scope::{CrateScopeError, resolve_crate};
-use blaze_scope::graph::{CrateId, Sysroot};
+use blaze_scope::graph::Sysroot;
 use blaze_scope::prepares::Prepares;
-use blaze_scope::resolve::{CrateInput, SourceTexts};
+use blaze_scope::resolve::CrateInput;
+use blaze_scope::task::Par;
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Frame, Tag};
 
-use blaze_drive::key::crate_scope_name;
-
-use super::{Names, OUT_DOMAIN, RULE, Resolved, scope_record, sections, slot_of, surface, tell_public, world};
+use super::{OUT_DOMAIN, Resolved, scope_record, sections, slot_of};
 use crate::CliError;
+use crate::engine_names::{NamesOracle, OracleCrate, OracleLinks};
 use crate::engine_records::ReadError;
-use crate::fetch::FetchEnv;
-use crate::front_load::LoadError;
 use crate::job_texts::JobTexts;
 use crate::store::Store;
-use crate::work::{Did, Made, held_str};
+use crate::work::Made;
 
 /// The most one crate's resolution holds in its task frame: address space reserved, committed
 /// as used (the largest crate of blaze's clone resolves in far less). Past it the task fails
@@ -56,103 +45,48 @@ pub(crate) const SCOPE_FRAME: usize = 4 << 30;
 /// each once a round): reserved, committed as used, reset when the round's scope has joined.
 pub(crate) const SCOPE_JOBS: usize = 4 << 30;
 
-/// One crate to resolve, as a pool worker is handed it: all of it read-only and `Sync`.
+/// Read-only inputs assembled by the engine Names worker or by the legacy check coordinator.
 pub(crate) struct ScopeJob<'j> {
+    /// The requested width of this job's file outline scope.
+    pub(crate) workers: core::num::NonZeroU32,
     /// Where the crate's findings are kept: they leave the worker with its result, so the
     /// request's shared heap, named (never a conjured one).
-    kept: blaze_own::SharedAlloc<'static>,
+    pub(crate) kept: blaze_own::SharedAlloc<'static>,
     /// The crate's index in the world (its texts' `krate`).
-    at: usize,
+    pub(crate) at: usize,
     /// Its input, its dependencies renumbered to `deps`' order.
-    input: CrateInput<'j>,
+    pub(crate) input: CrateInput<'j>,
     /// The exports record of each crate it reads, 16-byte aligned, in its local order.
-    deps: &'j [&'j [u8]],
-    sysroot: Sysroot,
-    packs: &'j [PackView<'j>],
-    corrected: &'j [(u32, &'j str, &'j str)],
-    env: Option<EnvLent<'j, 'j>>,
+    pub(crate) deps: &'j [&'j [u8]],
+    pub(crate) sysroot: Sysroot,
+    pub(crate) packs: &'j [PackView<'j>],
+    pub(crate) corrected: &'j [(u32, &'j str, &'j str)],
+    pub(crate) env: Option<EnvLent<'j, 'j>>,
     /// The command's proc-macro runner (`Names::procs`).
-    procs: Option<&'j crate::proc_runner::ProcRunner<'static>>,
-}
-
-/// What a round's jobs share, made once a round in its frame: the packs' views and the
-/// corrections, and each exports record read (by its key), so ten crates that read `core` read
-/// its record once (rule 77).
-pub(crate) struct ScopeRound<'j> {
-    frame: &'j Frame,
-    alloc: Alloc<'j>,
-    texts: Option<(&'j [PackView<'j>], &'j [(u32, &'j str, &'j str)])>,
-    /// Each exports record read this round: its key, the place it had in the list of the crate
-    /// that read it first, its aligned bytes.
-    exports: blaze_own::Vec<(Key, usize, &'j [u8]), &'j Frame>,
-    /// The tests' planted bug (`work::Plant::ScopeShareByPlace`): look records up by place.
-    by_place: bool,
-}
-
-impl<'j> ScopeRound<'j> {
-    pub(crate) fn new(frame: &'j Frame, by_place: bool) -> ScopeRound<'j> {
-        let erased: &'j Erased<&'j Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(Erased::new(frame), frame));
-        ScopeRound { frame, alloc: erased.handle(), texts: None, exports: blaze_own::Vec::new_in(frame), by_place }
-    }
-
-    /// The round's frame, held until the round's scope has joined.
-    pub(crate) fn frame(&self) -> &'j Frame {
-        self.frame
-    }
+    pub(crate) procs: Option<&'j crate::proc_runner::ProcRunner<'static>>,
+    /// `--names-oracle` (engine_names.rs [`NamesOracle`]): the crate's cells decided twice and
+    /// compared; the clock the check is timed by.
+    pub(crate) oracle: NamesOracle,
+    pub(crate) clock: &'j bstd::clock::Clock,
 }
 
 /// How a `CrateScope` job reads each dependency's exports section (rule 78: one seam). The
 /// engine's names stage reads them in place through the request's one reader
 /// (engine_records.rs `EngineRecords::exports`, engine_names.rs), so a wave's frame holds no
-/// dependency's bytes; the old machine ([`CopiedExports`]: work.rs, [`run`]), whose puts are
-/// read back from the store's arena before its commit, copies each into the round's frame.
-/// `krate` names the dependency for the names tests' watch (sections.rs `watch`).
+/// dependency's bytes. `krate` names the dependency for the names tests' watch (sections.rs
+/// `watch`).
 pub(crate) trait DepExports<'j, 's> {
     fn exports(&mut self, cx: &Cx, store: &mut dyn Store<'s>, input: &Input, krate: &str, frame: &'j Frame, alloc: Alloc<'j>) -> Result<&'j [u8], ReadError>;
 }
 
-/// The old machine's route: the dependency's record read out of the store into `frame`, its
-/// exports section copied 16-aligned into `alloc` (two copies, held to the round's end).
-pub(crate) struct CopiedExports;
-
-impl<'j, 's> DepExports<'j, 's> for CopiedExports {
-    fn exports(&mut self, cx: &Cx, store: &mut dyn Store<'s>, input: &Input, krate: &str, frame: &'j Frame, alloc: Alloc<'j>) -> Result<&'j [u8], ReadError> {
-        let read = crate::work::payload(cx, store, input, frame).map_err(|error| ReadError::Load(LoadError::Store(error)))?;
-        let parts = sections::sections(read.payload()).map_err(|error| ReadError::Load(LoadError::Sections { name: input.name, error }))?;
-        #[cfg(test)]
-        sections::watch(krate, read.payload());
-        #[cfg(not(test))]
-        let _ = krate;
-        Ok(blaze_scope::resolve::aligned(parts.exports, alloc))
-    }
-}
-
-/// A `CrateScope` task's first step.
-pub(crate) enum Prepared<'b, 'j> {
-    /// Its answer without a resolution (a need, a failure).
-    Answer(Did<'b>),
-    /// Its crate was resolved this command: [`answer`] files it.
-    Made,
-    /// Its crate is to be resolved now.
-    Resolve(&'j ScopeJob<'j>),
-}
-
-/// A crate's resolution as its job made it, owned: what [`settle`] files on the main thread.
+/// A crate's resolution as its job made it, owned: what the engine's names stage files.
 pub(crate) enum Resolution {
     /// Resolved (or failed, its failure filed in `resolved`); `ok`: the resolution itself
-    /// succeeded; `unresolved`: its unresolved paths.
-    Made { resolved: Resolved, ok: bool, unresolved: u32 },
+    /// succeeded; `unresolved`: its unresolved paths; `oracle`: under `--names-oracle`, the
+    /// comparison its check reported (`None` when none did).
+    Made { resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate> },
     /// It needs these crates' records first.
     Need(std::vec::Vec<CrateItemKey, Global>),
-}
-
-/// The crates a crate reads, by world index, in its local order: direct dependencies, the
-/// sysroot crates, then each a `Need` named (any `CrateScope` input beyond those).
-struct Locals<'f> {
-    local: std::vec::Vec<usize, Global>,
-    own_deps: std::vec::Vec<(&'f str, usize), Global>,
-    mapped: [Option<usize>; 4],
-    all: [Option<CrateId>; 4],
 }
 
 /// Which of the sysroot crates `all` (core, alloc, std, bstd, by world index) the crate at
@@ -161,259 +95,13 @@ struct Locals<'f> {
 /// real dependencies: blaze_toolchain::implied), read here and nowhere else. A crate of the
 /// program: every one the world holds (which `std` it names is its `Implicit`'s; what its
 /// root's `#![no_std]` drops is blaze-scope graph.rs `externs`'). Never the crate itself.
-fn sysroot_given(toolchain: bool, at: usize, all: [Option<usize>; 4], own: &[(&str, usize)]) -> [bool; 4] {
+pub(crate) fn sysroot_given(toolchain: bool, at: usize, all: [Option<usize>; 4], own: &[(&str, usize)]) -> [bool; 4] {
     let mut given = [false; 4];
     for (slot, s) in given.iter_mut().zip(all) {
         let Some(s) = s else { continue };
         *slot = s != at && (!toolchain || own.iter().any(|(_, d)| *d == s));
     }
     given
-}
-
-fn locals<'f>(names: &Names<'f>, at: usize, task: &Task<'_>) -> Locals<'f> {
-    let crates = &names.world.crates;
-    let input = crates[at].input;
-    let mut local: std::vec::Vec<usize, Global> = std::vec::Vec::new();
-    let place = |global: usize, local: &mut std::vec::Vec<usize, Global>| match local.iter().position(|g| *g == global) {
-        Some(p) => p,
-        None => {
-            local.push(global);
-            local.len() - 1
-        }
-    };
-    let mut own_deps: std::vec::Vec<(&'f str, usize), Global> = std::vec::Vec::with_capacity(input.deps.len());
-    for &(dep, index) in input.deps {
-        own_deps.push((dep, place(index, &mut local)));
-    }
-    let sysroot = names.world.sysroot;
-    let all = [sysroot.core, sysroot.alloc, sysroot.std, sysroot.bstd];
-    // A toolchain crate is given the sysroot crates its shelf row names (its edges: the
-    // cutter's implied `core`, `alloc`, `std`), so bstd and the blaze crates under it, none of
-    // which lists `core` in a manifest, are given it, and std's own closure is never given
-    // std; a program crate every one the world holds (test
-    // `a_toolchain_crate_is_given_what_its_row_names`).
-    let toolchain = matches!(crates[at].origin, blaze_world::Origin::Toolchain(_));
-    let given = sysroot_given(toolchain, at, all.map(|s| s.map(|s| s.index())), input.deps);
-    let mut mapped = [None; 4];
-    for ((slot, s), given) in mapped.iter_mut().zip(all).zip(given) {
-        *slot = s.filter(|_| given).map(|s| place(s.index(), &mut local));
-    }
-    for input in task.inputs.iter().filter(|input| input.name.kind == Kind::CrateScope) {
-        if let Ok(i) = names.by_subject.binary_search_by_key(&input.name.subject, |(subject, _)| *subject) {
-            place(names.by_subject[i].1, &mut local);
-        }
-    }
-    Locals { local, own_deps, mapped, all }
-}
-
-/// The input of the crate at world index `g`, if the task was handed it. The name is hashed
-/// once per lookup, never per input compared (as body_types.rs `input_at`).
-fn have<'t>(names: &Names<'_>, task: &'t Task<'_>, g: usize) -> Option<&'t Input> {
-    let name = crate_scope_name(&names.world.crates[g].input.key);
-    task.inputs.iter().find(|input| input.name == name)
-}
-
-/// The task's first step, on the main thread: the world made if this command has none yet, the
-/// crate found, its needs checked; a crate not resolved this command gets its job, made in
-/// `round` (its dependencies' exports sections read from `store` by `exports`: in place on the
-/// engine's path, [`DepExports`]).
-#[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
-pub(crate) fn prepare<'f: 'j, 'j, 'b, 's>(
-    cx: &Cx,
-    root: &Dir<ReadWrite>,
-    store: &mut dyn Store<'s>,
-    exports: &mut dyn DepExports<'j, 's>,
-    names: &mut Option<Names<'f>>,
-    lock: Option<&'f Lock<'static>>,
-    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
-    env: &FetchEnv<'_>,
-    macros: Option<&crate::proc_runner::MacroSide<'_, '_, '_>>,
-    task: &Task<'_>,
-    round: &mut ScopeRound<'j>,
-    held: &'b Frame,
-) -> Result<Prepared<'b, 'j>, CliError> {
-    let cx = cx.span("crate scope: what one crate reads");
-    let name = task.name;
-    let refused = |what: &'static str| TaskFailure { name, why: Why::Refused { what, rule: RULE } };
-    if names.is_none() {
-        let Some(graph) = task.inputs.iter().find(|input: &&Input| input.name == Name::unit_graph()) else {
-            let mut wants = blaze_own::Vec::with_capacity_in(1, held);
-            wants.push(Want { name: Name::unit_graph(), home: Name::unit_graph() });
-            return Ok(Prepared::Answer(Did::Need(wants)));
-        };
-        let read = crate::work::payload(&cx, store, graph, round.frame)?;
-        match world(&cx, root, read.unit_graph(graph.name)?.graph, lock, members, env) {
-            Ok(made) => {
-                tell_public(store, &made);
-                *names = Some(made);
-            }
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "names not resolved: {error}");
-                return Ok(Prepared::Answer(Did::FailedSaying(refused("the crates' inputs could not be made"), held_str(words.as_str(), held))));
-            }
-        }
-    }
-    // The proc-macro runner, once a command, right after the world: every crate's job carries
-    // it, so a proc-macro crate's record holds its key and every call reaches the one path.
-    if let (Some(made), Some(side)) = (names.as_mut(), macros)
-        && made.procs().is_none()
-    {
-        match crate::proc_runner::make(made, side) {
-            Ok(runner) => made.set_procs(runner),
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "names not resolved: the proc-macro runner: {error}");
-                return Ok(Prepared::Answer(Did::FailedSaying(refused("the proc-macro runner could not be made"), held_str(words.as_str(), held))));
-            }
-        }
-    }
-    let Some(names) = names.as_ref() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
-    let Ok(at) = names.by_subject.binary_search_by_key(&name.subject, |(subject, _)| *subject).map(|i| names.by_subject[i].1) else {
-        return Ok(Prepared::Answer(Did::FailedSaying(refused("a crate the world does not hold"), "a `CrateScope` part names a crate this command's world does not hold")));
-    };
-    // A crate the list refused (a member proc macro the toolchain shelf has no wasm32-wasip1
-    // side for) is never resolved with no dependencies (rule 3: its every path into `syn` or
-    // `quote` would be NotFound at segment 0): it fails alone, naming itself and the fix.
-    // `World::refused` is sorted by `krate`, each once.
-    if let Ok(i) = names.world.refused.binary_search_by_key(&at, |r| r.krate) {
-        let why = &names.world.refused[i].why;
-        let words = bstd::mem::format_in!(held, "crate `{}`: {why}", names.world.crates[at].input.name);
-        return Ok(Prepared::Answer(Did::FailedSaying(refused("a crate the toolchain shelf cannot build"), held_str(words.as_str(), held))));
-    }
-    // A need that failed this command and that no answer can stand for: the crate's own build
-    // script (its cfgs and environment unknown, so a resolution without them would be a
-    // fallback, rule 3). This crate fails `Waited` on it, alone (rule 20); asking again would
-    // loop. A dependency whose names failed is no such need: it is handed by its failed out and
-    // read as an error crate below (plan row A8, engine_names.rs `run_phase`).
-    if let Some(failed) = task.failed.first() {
-        return Ok(Prepared::Answer(Did::Failed(TaskFailure { name, why: Why::Waited { on: *failed } })));
-    }
-    let crates = &names.world.crates;
-    let Locals { local, own_deps, mapped, all } = locals(names, at, task);
-    let missing: std::vec::Vec<usize, Global> = local.iter().copied().filter(|g| have(names, task, *g).is_none()).collect();
-    // Its unit's build script's run (decision D115 (B)): read now, never in the crate's key.
-    let script = names.script_of(at);
-    let script_handed = script.and_then(|script| task.inputs.iter().find(|input| input.name == script));
-    if !missing.is_empty() || (script.is_some() && script_handed.is_none()) {
-        let mut wants = blaze_own::Vec::with_capacity_in(missing.len() + 1, held);
-        wants.extend(missing.iter().map(|g| Want { name: crate_scope_name(&crates[*g].input.key), home: Name::unit_graph() }));
-        wants.extend(script.filter(|_| script_handed.is_none()).map(|script| Want { name: script, home: Name::unit_graph() }));
-        return Ok(Prepared::Answer(Did::Need(wants)));
-    }
-    if names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).is_ok() {
-        return Ok(Prepared::Made);
-    }
-    // The crate's input with its script's outputs joined (`rustc-cfg` atoms, the record for
-    // `env!`/`include!`), in the round's frame.
-    let (input, outputs): (CrateInput<'j>, Option<OutputsRef<'j>>) = match script_handed {
-        None => (crates[at].input, None),
-        Some(handed) => {
-            let read = crate::work::payload(&cx, store, handed, round.frame)?;
-            let bytes: &'j [u8] = blaze_own::Vec::from_slice_in(read.payload(), round.frame).leak();
-            // A `Script` payload: how it ran, then the outputs record (scripts.rs `payload_parts`).
-            // Its stored files (a native script's `OUT_DIR` files, in the home's file area) are
-            // read from there by an `include!` that names one, each mapped on its first ask:
-            // nothing of them is read here.
-            let opened = match crate::scripts::payload_parts(bytes) {
-                Some((_, record)) => OutputsRef::open(record).map(|outputs| {
-                    let area: &'j blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::file_area(env.home, &outputs), round.frame));
-                    outputs.with_area(area)
-                }),
-                None => Err(blaze_build_script::outputs::RecordError::Layout),
-            };
-            match opened {
-                Ok(outputs) => (blaze_world::joined(&crates[at].input, outputs, round.alloc), Some(outputs)),
-                Err(error) => {
-                    let words = bstd::mem::format_in!(held, "crate `{}`: its build script's record ({:?}) is not an outputs record: {error:?}", crates[at].input.name, handed.name);
-                    return Ok(Prepared::Answer(Did::FailedSaying(refused("a build script's record"), held_str(words.as_str(), held))));
-                }
-            }
-        }
-    };
-    let mut deps: blaze_own::Vec<&'j [u8], &'j Frame> = blaze_own::Vec::with_capacity_in(local.len(), round.frame);
-    for (place, g) in local.iter().enumerate() {
-        let handed = have(names, task, *g).ok_or(CliError::Text { what: "a crate's input, checked above, is gone" })?;
-        // A dependency that failed this command (no record of its names): its error record,
-        // a function of its key, name and edition, so every path into it is unknown and quiet
-        // and only its own failure is reported (plan row A8). Its read stays the failed out
-        // (`answer`), so its fix moves it and this crate is solved again (rule 21). Never put in
-        // `round.exports`: a failed dependency is handed under no key of its own.
-        if handed.out == crate::work::failed_out() {
-            let dep = &crates[*g].input;
-            match blaze_scope::crate_scope::error_record(dep.key, dep.name, dep.edition, round.alloc) {
-                Ok(record) => {
-                    deps.push(blaze_scope::resolve::aligned(&record, round.alloc));
-                    continue;
-                }
-                Err(error) => {
-                    let words = bstd::mem::format_in!(held, "crate `{}`: the error record of its failed dependency `{}`: {error:?}", input.name, dep.name);
-                    return Ok(Prepared::Answer(Did::FailedSaying(refused("a failed dependency's error record"), held_str(words.as_str(), held))));
-                }
-            }
-        }
-        let by_place = round.by_place;
-        if let Some((_, _, bytes)) = round.exports.iter().find(|(key, at, _)| if by_place { *at == place } else { *key == handed.at }) {
-            deps.push(bytes);
-            continue;
-        }
-        // In place on the engine's path: a borrow of the store's mapping, nothing of it in the
-        // round's frame (engine_records.rs `EngineRecords::exports`); a store that cannot be
-        // read stops the request, as before; a record that does not open fails this crate,
-        // naming the dependency (rule 19).
-        let krate = crates[*g].input.name;
-        let bytes = match exports.exports(&cx, store, handed, krate, round.frame, round.alloc) {
-            Ok(bytes) => bytes,
-            Err(ReadError::Load(LoadError::Store(error))) => return Err(error),
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: the record of its dependency `{krate}`: {error}", input.name);
-                return Ok(Prepared::Answer(Did::FailedSaying(refused("a dependency's record"), held_str(words.as_str(), held))));
-            }
-        };
-        round.exports.push((handed.at, place, bytes));
-        deps.push(bytes);
-    }
-    // Every crate the dependencies' records reach and none of them is, read from the records'
-    // heads in place: asked for here, all at once, so the pooled resolve never decodes every
-    // dependency only to answer `Need` (rule 77; tempo's cold check made 2,668 pooled
-    // resolutions for 1,550 records, the rest such answers).
-    match blaze_scope::crate_scope::unmet_reaches(&deps, round.alloc) {
-        Ok(unmet) if unmet.is_empty() => {}
-        Ok(unmet) => return Ok(Prepared::Answer(need_crates(names, name, &unmet, held))),
-        Err(error) => {
-            let words = bstd::mem::format_in!(held, "crate `{}`: a dependency's record: {error:?}", input.name);
-            return Ok(Prepared::Answer(Did::FailedSaying(refused("a dependency's record"), held_str(words.as_str(), held))));
-        }
-    }
-    let me = local.len();
-    let own = |s: Option<CrateId>| s.filter(|s| s.index() == at).map(|_| CrateId(me as u32));
-    let ids = mapped.map(|p| p.map(|p| CrateId(p as u32)));
-    let sysroot = Sysroot { core: ids[0].or(own(all[0])), alloc: ids[1].or(own(all[1])), std: ids[2].or(own(all[2])), bstd: ids[3].or(own(all[3])) };
-    let own_deps: &'j [(&'f str, usize)] = blaze_own::Vec::from_slice_in(&own_deps, round.frame).leak();
-    let (packs, corrected) = match round.texts {
-        Some(texts) => texts,
-        None => {
-            let packs: &'j [PackView<'j>] = blaze_own::Vec::from_slice_in(names.world.texts.packs(), round.frame).leak();
-            let corrected: &'j [(u32, &'j str, &'j str)] = blaze_own::Vec::from_slice_in(names.world.texts.corrected(), round.frame).leak();
-            round.texts = Some((packs, corrected));
-            (packs, corrected)
-        }
-    };
-    // The environment is copied here into the round's frame, so the job outlives this borrow
-    // of the world; the worker copies it again into its own frame ([`EnvLent`]). With a script,
-    // its `OUT_DIR` and `rustc-env` pairs joined (`CrateEnv::joined`, a copy too).
-    let kept = env.heap.shared();
-    let env = match (names.world.texts.crate_env(at), outputs) {
-        (None, _) => None,
-        (Some(env), Some(outputs)) => Some(EnvLent::new(&*blaze_own::Box::leak(blaze_own::Box::new_in(env.joined(outputs, round.alloc), round.alloc)))),
-        (Some(env), None) => match env.clone_in(round.alloc) {
-            Ok(copy) => Some(EnvLent::new(&*blaze_own::Box::leak(blaze_own::Box::new_in(copy, round.alloc)))),
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: its environment's build-script record did not open again: {error:?}", input.name);
-                return Ok(Prepared::Answer(Did::FailedSaying(refused("a crate's environment"), held_str(words.as_str(), held))));
-            }
-        },
-    };
-    let job = ScopeJob { at, input: CrateInput { deps: own_deps, ..input }, deps: deps.leak(), sysroot, packs, corrected, env, procs: names.procs(), kept };
-    Ok(Prepared::Resolve(blaze_own::Box::leak(blaze_own::Box::new_in(job, round.frame))))
 }
 
 /// The crate resolved, on whichever thread runs it, in `frame` (a pool task's own): its record
@@ -435,6 +123,122 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
     (resolution, metered.finish(of))
 }
 
+/// Only a file outline's input text and edition cross this seam. The generic module lowerer
+/// and the expansion fixpoint borrow the crate frame and its metering state on this worker.
+struct FilePar<'p> {
+    cx: &'p Cx,
+    meter: &'p super::metered::Metered<'p>,
+    heap: blaze_own::SharedAlloc<'static>,
+    workers: core::num::NonZeroU32,
+    /// `--names-oracle`: whether D116's check runs (blaze-scope task/fill.rs
+    /// `Par::decide_check`), the clock it is timed by, and what it reported, copied out of the
+    /// solve's frame onto `heap`.
+    oracle: NamesOracle,
+    now: &'p dyn Fn() -> u64,
+    seen: RefCell<Option<Seen>>,
+}
+
+/// One crate's check as D116's `DecideCheck` reported it, before its items are named by path.
+struct Seen {
+    cells: u64,
+    differences: u64,
+    waits: u64,
+    hops: u64,
+    examples: blaze_own::Vec<SeenDifference, blaze_own::SharedAlloc<'static>>,
+    links: SeenLinks,
+}
+
+struct SeenDifference {
+    module: blaze_id::ItemKey,
+    ns: blaze_surface::Namespace,
+    name: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+    layer: blaze_scope::CellLayer,
+    whole: blaze_scope::CellValue,
+    decided: Option<blaze_scope::CellValue>,
+}
+
+enum SeenLinks {
+    NotRun,
+    Agreed { modules: u64, names: u64, capped: u64 },
+    /// agree.rs's first disagreement, as its `Display` says it.
+    Differ(blaze_own::String<blaze_own::SharedAlloc<'static>>),
+}
+
+impl Par for FilePar<'_> {
+    fn decide_check(&self) -> Option<&dyn Fn() -> u64> {
+        self.oracle.on().then_some(self.now)
+    }
+
+    fn decided(&self, _krate: &str, check: &blaze_scope::DecideCheck<'_, &str>) {
+        let kept = self.heap;
+        let mut examples = blaze_own::Vec::with_capacity_in(check.examples.len(), kept);
+        for d in check.examples.iter() {
+            examples.push(SeenDifference { module: d.module, ns: d.ns, name: blaze_own::String::from_str_in(d.name, kept), layer: d.layer, whole: d.whole, decided: d.decided });
+        }
+        let links = match check.links() {
+            None => SeenLinks::NotRun,
+            Some(Ok(agreed)) => SeenLinks::Agreed { modules: agreed.modules, names: agreed.names, capped: agreed.capped },
+            Some(Err(differ)) => SeenLinks::Differ(blaze_own::format_in!(kept, "{differ}")),
+        };
+        *self.seen.borrow_mut() = Some(Seen { cells: check.cells, differences: check.differences, waits: check.waits, hops: check.hops, examples, links });
+    }
+
+    fn decide_plant(&self) -> blaze_scope::task::DecidePlant {
+        self.oracle.plant()
+    }
+
+    fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut blaze_own::AVec<'_, T>) {
+        self.meter.map(n, f, out);
+    }
+
+    fn stage(&self, stage: blaze_scope::task::Stage) {
+        self.meter.stage(stage);
+    }
+
+    fn expand_part(&self, part: blaze_scope::task::ExpandPart, name: &str, size: usize) {
+        self.meter.expand_part(part, name, size);
+    }
+
+    fn call_scratch(&self, work: &mut dyn FnMut(blaze_own::Alloc<'_>)) -> blaze_scope::task::Scratch {
+        self.meter.call_scratch(work)
+    }
+
+    fn outline_files<'a>(
+        &self,
+        krate: &'a str,
+        files: &[(&'a str, &'a str)],
+        edition: blaze_surface::Edition,
+        alloc: blaze_own::Alloc<'a>,
+        out: &mut blaze_own::AVec<'a, blaze_file_items::Outline<'a>>,
+    ) -> Result<(), blaze_scope::resolve::NamesError<'a>> {
+        if files.len() < 2 || self.workers.get().min(self.cx.workers()) == 1 {
+            return self.meter.outline_files(krate, files, edition, alloc, out);
+        }
+        let scope = self.cx.scope();
+        scope.narrow_workers(self.workers, bstd::task::Class::Foreground);
+        let heap = self.heap;
+        let mut jobs = blaze_own::Vec::with_capacity_in(files.len(), alloc);
+        for &(path, text) in files {
+            jobs.push((path, scope.may_overlap("names: outline module file", 64 << 10, move |_| {
+                Ok::<_, core::convert::Infallible>(blaze_scope::resolve::SharedOutline::parse(text, edition, heap))
+            })));
+        }
+        let mut failed = None;
+        for (path, job) in jobs {
+            match job.join(self.cx) {
+                Ok(file) => out.push(file.into_frame(alloc)),
+                Err(why) => { failed.get_or_insert((path, why)); }
+            }
+        }
+        let joined = scope.join(self.cx);
+        if let Some((path, why)) = failed.or_else(|| joined.err().map(|why| (krate, why))) {
+            let words = blaze_own::format_in!(alloc, "{why}");
+            return Err(blaze_scope::resolve::NamesError::OutlineWorker { krate, path, why: blaze_own::Box::leak(words.into_boxed_str()) });
+        }
+        Ok(())
+    }
+}
+
 /// The most one macro call's working memory holds ([`resolve`]'s call scratch): address space
 /// reserved, committed as used. Past it the call's allocation fails as a crate frame's does.
 pub(crate) const CALL_SCRATCH: usize = 4 << 30;
@@ -452,11 +256,133 @@ fn failed_scope(words: String, kept: blaze_own::SharedAlloc<'static>) -> Resolut
             left_package: blaze_own::Vec::new_in(Global),
             failed: Some(words),
             failed_calls: blaze_own::Vec::new_in(Global),
+            module_missing: blaze_own::Vec::new_in(kept),
             test_marks: blaze_own::Vec::new_in(Global),
             expansions: crate::work::Extras::none(),
         },
         ok: false,
         unresolved: 0,
+        oracle: None,
+    }
+}
+
+/// The frame the differential's `Modules` side is kept in between its two solves
+/// (blaze-scope `ModulesSide`: each impl's row and header, the chains of the modules impls are
+/// written in). Its size is the crate's impl count, never a solve's; outgrowing it is the
+/// crate's verdict line (rule 18), never raised to fit.
+const SIDE_FRAME: usize = 256 << 20;
+
+/// D189 step 4's `--block-scopes=bodies` differential of one crate (blaze-scope crate_scope.rs
+/// `block_scopes_modules_side` then `block_scopes_bodies_side`): its verdict line when it
+/// differs or did not run, `None` when it agrees. Never in the crate's frame, and its two whole
+/// solves never in one frame: the `Modules` solve runs in a frame of its own, what the
+/// comparison reads of it is copied into [`SIDE_FRAME`], its frame is dropped, and only then
+/// does the `Bodies` solve (with every held body's) run in a frame of its own. With both in one
+/// [`SCOPE_FRAME`], tempo's `core` panicked at 4,411,162,624 bytes committed of 4,294,967,296;
+/// the peak is now the larger of the two solves. Each half under its own `unwinding`, so a
+/// panic or a frame it outgrows is this crate's verdict line, never the crate's job (rule 20).
+/// The span is the proof it ran (rule 61).
+#[allow(clippy::too_many_arguments, reason = "the crate job's parts the differential reads, each named")]
+fn blocks_differential(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    job: &ScopeJob<'_>,
+    env: Option<&blaze_scope::crate_env::CrateEnv<'_>>,
+    callers: &[(usize, usize, blaze_expand::Edition)],
+    metered: &super::metered::Metered<'_>,
+    now: &dyn Fn() -> u64,
+) -> (BlocksTally, Option<blaze_own::String<blaze_own::SharedAlloc<'static>>>) {
+    let crate_name = job.input.name;
+    let span = cx.span("crate scope: block scopes differential");
+    let side_frame = match Frame::with_reserve(SIDE_FRAME, Tag::Nameres) {
+        Ok(f) => f,
+        Err(error) => return (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: the `Modules` side's frame ({SIDE_FRAME} bytes) could not be reserved: {error:?}"))),
+    };
+    let side_erased = Erased::new(&side_frame);
+    let out = side_erased.handle();
+
+    // The `Modules` solve, in its own frame, dropped at the end of this block.
+    let modules = {
+        let span = span.span("block scopes differential: the `Modules` solve");
+        let own = match Frame::with_reserve(SCOPE_FRAME, Tag::Nameres) {
+            Ok(own) => own,
+            Err(error) => return (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: the `Modules` solve's frame ({SCOPE_FRAME} bytes) could not be reserved: {error:?}"))),
+        };
+        let ran = crate::work::unwinding(|| {
+            let erased = Erased::new(&own);
+            let alloc = erased.handle();
+            let texts = JobTexts {
+                cx: &span,
+                root,
+                frame: &own,
+                packs: crate::job_texts::Packs::Open(job.packs),
+                corrected: job.corrected,
+                env: env.map(|env| (job.at, env)),
+                envs: None,
+                read: RefCell::new(std::vec::Vec::new()),
+                data: RefCell::new(std::vec::Vec::new()),
+                left: RefCell::new(std::vec::Vec::new()),
+                procs: crate::job_texts::Procs::of(job.procs),
+                own: Some(job.at),
+                callers,
+                by_need: None,
+                run_stopped: core::cell::Cell::new(None),
+            };
+            let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
+            blaze_scope::crate_scope::block_scopes_modules_side(&job.input, job.deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc, out)
+                .map_err(|error| blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: {error}"))
+        });
+        match ran {
+            Ok(Ok(side)) => side,
+            Ok(Err(words)) => return (BlocksTally::failed(), Some(words)),
+            Err(crate::work::Panicked) => {
+                return (
+                    BlocksTally::failed(),
+                    Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: the `Modules` solve panicked in its own frame ({} bytes committed of {SCOPE_FRAME}; the side's frame {} of {SIDE_FRAME})", own.committed(), side_frame.committed())),
+                );
+            }
+        }
+    };
+
+    // The `Bodies` solve and every held body's, in a frame of their own.
+    let span = span.span("block scopes differential: the `Bodies` solve");
+    let own = match Frame::with_reserve(SCOPE_FRAME, Tag::Nameres) {
+        Ok(own) => own,
+        Err(error) => return (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: the `Bodies` solve's frame ({SCOPE_FRAME} bytes) could not be reserved: {error:?}"))),
+    };
+    let ran = crate::work::unwinding(|| {
+        let erased = Erased::new(&own);
+        let alloc = erased.handle();
+        let texts = JobTexts {
+            cx: &span,
+            root,
+            frame: &own,
+            packs: crate::job_texts::Packs::Open(job.packs),
+            corrected: job.corrected,
+            env: env.map(|env| (job.at, env)),
+            envs: None,
+            read: RefCell::new(std::vec::Vec::new()),
+            data: RefCell::new(std::vec::Vec::new()),
+            left: RefCell::new(std::vec::Vec::new()),
+            procs: crate::job_texts::Procs::of(job.procs),
+            own: Some(job.at),
+            callers,
+            by_need: None,
+            run_stopped: core::cell::Cell::new(None),
+        };
+        let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
+        match blaze_scope::crate_scope::block_scopes_bodies_side(&modules, &job.input, job.deps, job.sysroot, &texts, job.at, &par, Prepares::new_in(alloc), alloc) {
+            Ok(verdict) if verdict.agrees() => (BlocksTally::of(&verdict), None),
+            Ok(verdict) => (BlocksTally::of(&verdict), Some(blaze_own::format_in!(job.kept, "{verdict}"))),
+            Err(error) => (BlocksTally::failed(), Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: {error}"))),
+        }
+    });
+    match ran {
+        Ok(out) => out,
+        Err(crate::work::Panicked) => (
+            BlocksTally::failed(),
+            Some(blaze_own::format_in!(job.kept, "block scopes differential: crate `{crate_name}`: DID NOT RUN: the `Bodies` solve panicked in its own frame ({} bytes committed of {SCOPE_FRAME})", own.committed())),
+        ),
     }
 }
 
@@ -481,18 +407,43 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         packs: crate::job_texts::Packs::Open(job.packs),
         corrected: job.corrected,
         env: env.map(|env| (job.at, env)),
+        envs: None,
         read: RefCell::new(std::vec::Vec::new()),
         data: RefCell::new(std::vec::Vec::new()),
         left: RefCell::new(std::vec::Vec::new()),
-        procs: job.procs,
+        procs: crate::job_texts::Procs::of(job.procs),
         own: Some(job.at),
         callers,
+        by_need: None,
         run_stopped: core::cell::Cell::new(None),
     };
     let prepares = Prepares::new_in(alloc);
-    let done = {
-        let _cx = cx.span("crate scope: resolve_crate");
-        resolve_crate(&job.input, job.deps, job.sysroot, &texts, job.at, metered, prepares, alloc)
+    let now = || crate::engine_times::ns(job.clock.now().since_start());
+    let (done, seen) = {
+        let solve = cx.span("crate scope: resolve_crate");
+        let par = FilePar { cx: &solve, meter: metered, heap: job.kept, workers: job.workers, oracle: job.oracle, now: &now, seen: RefCell::new(None) };
+        let done = resolve_crate(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, alloc);
+        (done, par.seen.into_inner())
+    };
+    // The crate's comparison, its items named by path while its names are at hand.
+    let oracle = match (job.oracle.on(), seen) {
+        (true, Some(seen)) => Some(oracle_crate(crate_name, seen, done.as_ref().ok().map(|done| done.names), job.kept)),
+        _ => None,
+    };
+    // `--block-scopes=bodies` (D189 step 4, proof 3): the crate solved again under each
+    // block-scope strategy, its own texts read afresh (the crate's read list above is not
+    // touched), and its impl tables compared. Every crate adds its tally to the oracle's
+    // block-scopes count line (`o.blocks`); one that differs or did not run also gives its
+    // verdict line (`o.blocks_line`), listed under its own cap (engine_check.rs). The span is the
+    // proof it ran (rule 61).
+    let oracle = match (job.oracle.blocks(), oracle) {
+        (true, Some(mut o)) => {
+            let (tally, line) = blocks_differential(&cx, root, job, env, callers, metered, &now);
+            o.blocks = Some(tally);
+            o.blocks_line = line;
+            Some(o)
+        }
+        (_, o) => o,
     };
     metered.outside(super::metered::Outside::Record);
     // Each include that left its package inside the workspace (D111): a warning finding at
@@ -509,8 +460,15 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Ok(done) => crate::names::failed_call::findings(done.names, alloc),
         Err(_) => blaze_own::Vec::new_in(Global),
     };
+    // Each `mod` of the crate's own code whose file is at neither place (or whose `#[path]`
+    // names none): an error finding at the `mod` item (E0583; cfg decided by the walk). The
+    // module is empty for the rest of the crate, which is still solved.
+    let module_missing = match &done {
+        Ok(done) => crate::names::module_missing::findings(done.names, job.kept),
+        Err(_) => blaze_own::Vec::new_in(job.kept),
+    };
     // The names this crate calls its failed dependencies by (each handed as an error record,
-    // `prepare`): a path into one is counted, never a finding (plan row A8, rule 19).
+    // engine_names.rs): a path into one is counted, never a finding (plan row A8, rule 19).
     let mut quiet: blaze_own::Vec<&str, Global> = blaze_own::Vec::new_in(Global);
     quiet.extend(job.input.deps.iter().filter(|(_, at)| job.deps.get(*at).is_some_and(|bytes| blaze_scope::crate_scope::is_error_record(bytes))).map(|(name, _)| *name));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
@@ -538,7 +496,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
             ),
         },
         Err(CrateScopeError::Need(keys)) => return Resolution::Need(keys.iter().copied().collect()),
-        // The crate's typed failure is its answer (work.rs, `filed`): a record whose out
+        // The crate's typed failure is its answer: a record whose out
         // says failed, with the files it read so far as its read list, so it stands until
         // one of them moves and a reader of it fails `Waited` on it.
         Err(error) => (
@@ -592,129 +550,154 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         }
         None => crate::work::failed_out(),
     };
-    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, test_marks, expansions }, ok, unresolved }
+    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, module_missing, test_marks, expansions }, ok, unresolved, oracle }
 }
 
-/// A resolution filed on the main thread: a need is the task's answer; a made crate is kept
-/// for [`answer`] (the first kept stands: two equal jobs make equal bytes).
-/// The records of the crates `keys` asked for, each by its `CrateScope` name.
-fn need_crates<'b>(names: &Names<'_>, name: Name, keys: &[CrateItemKey], held: &'b Frame) -> Did<'b> {
-    let mut wants = blaze_own::Vec::with_capacity_in(keys.len(), held);
-    for key in keys.iter() {
-        let Ok(i) = names.by_key.binary_search_by_key(key, |(k, _)| *k) else {
-            let failure = TaskFailure { name, why: Why::Refused { what: "a needed crate the world does not hold", rule: RULE } };
-            return Did::FailedSaying(failure, "the resolution needs a crate's record this command's world does not hold");
-        };
-        wants.push(Want { name: crate_scope_name(&names.world.crates[names.by_key[i].1].input.key), home: Name::unit_graph() });
+/// The crate's comparison, owned on `kept`: its counts, and a line for each disagreement its
+/// check kept naming the crate, the module by path, the namespace, the name and both answers,
+/// each found item by its path where `names` declares it (else its key).
+fn oracle_crate(krate: &str, seen: Seen, names: Option<&blaze_scope::resolve::CrateNames<'_>>, kept: blaze_own::SharedAlloc<'static>) -> OracleCrate {
+    let mut lines = blaze_own::Vec::with_capacity_in(seen.examples.len() + 1, kept);
+    for d in seen.examples.iter() {
+        let module = Module { key: d.module, names };
+        let whole = Answer { value: Some(d.whole), names };
+        let decided = Answer { value: d.decided, names };
+        lines.push(blaze_own::format_in!(kept, "crate `{krate}` module {module} {} `{}` ({:?}): whole solve {whole}, on demand {decided}", d.ns.name(), d.name, d.layer));
     }
-    Did::Need(wants)
+    let links = match seen.links {
+        SeenLinks::NotRun => OracleLinks::NotRun,
+        SeenLinks::Agreed { modules, names, capped } => OracleLinks::Agreed { modules, names, capped },
+        SeenLinks::Differ(words) => {
+            lines.push(blaze_own::format_in!(kept, "crate `{krate}` names records: {words}"));
+            OracleLinks::Differ
+        }
+    };
+    let modules = names.map_or(0, |names| (names.tree.modules.len() + names.made.len()) as u64);
+    OracleCrate { krate: blaze_own::String::from_str_in(krate, kept), cells: seen.cells, differences: seen.differences, waits: seen.waits, hops: seen.hops, modules, links, lines, blocks: None, blocks_line: None }
 }
 
-pub(crate) fn settle<'b>(names: &mut Names<'_>, task: &Task<'_>, resolution: Resolution, held: &'b Frame) -> Option<Did<'b>> {
-    let name = task.name;
-    match resolution {
-        Resolution::Need(keys) => Some(need_crates(names, name, &keys, held)),
-        Resolution::Made { resolved, ok, unresolved } => {
-            if ok {
-                names.resolved += 1;
-            }
-            names.unresolved += u64::from(unresolved);
-            if let Err(i) = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject) {
-                names.made.insert(i, (name.subject, resolved));
-            }
-            None
+/// A module, printed by its path (`krate::a::b`) where the crate's names hold it, else its key.
+struct Module<'n, 'a> {
+    key: blaze_id::ItemKey,
+    names: Option<&'n blaze_scope::resolve::CrateNames<'a>>,
+}
+
+impl core::fmt::Display for Module<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.names.and_then(|names| names.path_of(self.key)) {
+            Some(path) => write!(f, "`{path}`"),
+            None => write!(f, "{:x}", self.key),
         }
     }
 }
 
-/// The last step, for a crate made this command: each checkout file it read is asked for as
-/// its `Surface` (with the dependencies' records again, so the entry after holds them all);
-/// with all of them handed in, its record, its payload moved out of `names` ([`hand_payload`]).
-pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame) -> Result<Did<'b>, CliError> {
-    let name = task.name;
-    let Ok(at) = names.by_subject.binary_search_by_key(&name.subject, |(subject, _)| *subject).map(|i| names.by_subject[i].1) else {
-        return Err(CliError::Text { what: "a made crate the world does not hold" });
+/// A decided cell's value, a found item by its path.
+struct Answer<'n, 'a> {
+    value: Option<blaze_scope::CellValue>,
+    names: Option<&'n blaze_scope::resolve::CrateNames<'a>>,
+}
+
+impl core::fmt::Display for Answer<'_, '_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use blaze_scope::CellValue;
+        let item = |f: &mut core::fmt::Formatter<'_>, def: blaze_surface::Def| -> core::fmt::Result {
+            match self.names.and_then(|names| item_path(names, def)) {
+                Some((path, "")) => write!(f, "`{path}` ({:?})", def.kind),
+                Some((module, name)) => write!(f, "`{module}::{name}` ({:?})", def.kind),
+                None => write!(f, "{:?} {:x}", def.kind, def.key),
+            }
+        };
+        match self.value {
+            None => write!(f, "undecided"),
+            Some(CellValue::NotFound) => write!(f, "not found"),
+            Some(CellValue::Outside) => write!(f, "outside (an import stage 1 does not follow)"),
+            Some(CellValue::Found(def, vis)) => {
+                item(f, def)?;
+                write!(f, " {vis:?}")
+            }
+            Some(CellValue::Ambiguous(def, vis)) => {
+                write!(f, "ambiguous, the first ")?;
+                item(f, def)?;
+                write!(f, " {vis:?}")
+            }
+        }
+    }
+}
+
+/// Where `def` is declared among the crate's modules and calls: its module's path and its name
+/// (a module: its own path and no name); an item a macro call wrote, by the call's module.
+fn item_path<'n, 'a: 'n>(names: &'n blaze_scope::resolve::CrateNames<'a>, def: blaze_surface::Def) -> Option<(&'n str, &'n str)> {
+    if def.kind == blaze_surface::DefKind::Module {
+        return Some((names.path_of(def.key)?, ""));
+    }
+    let declares = |decls: &blaze_surface::DeclsBuilder<'a, &'a str>| -> Option<&'a str> {
+        decls.items.iter().find(|item| item.def.key == def.key).map(|item| item.name)
+            .or_else(|| decls.macro_rules.iter().find(|m| m.def == def.key).map(|m| m.name))
     };
-    let Ok(i) = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject) else {
-        return Err(CliError::Text { what: "a crate scope answered before its crate was made" });
-    };
-    let resolved = &names.made[i].1;
-    let local = locals(names, at, task).local;
-    let crates = &names.world.crates;
-    let unread: std::vec::Vec<&String, Global> = resolved.files.iter().filter(|path| !task.inputs.iter().any(|input| input.name == surface(path))).collect();
-    // Each file read as data is read as its own `FileItems` record (its bytes' id), listed by
-    // the outline of the file whose call read it (data_include.rs): never a `Surface`.
-    let unread_data: std::vec::Vec<&(String, String), Global> =
-        resolved.data.iter().filter(|(path, _)| !task.inputs.iter().any(|input| input.name == blaze_drive::Name::file(path.as_bytes()))).collect();
-    let script = names.script_of(at);
-    if !unread.is_empty() || !unread_data.is_empty() {
-        let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + unread_data.len() + local.len() + 1, held);
-        wants.extend(unread.iter().map(|path| Want { name: surface(path), home: blaze_drive::Name::file(path.as_bytes()) }));
-        wants.extend(unread_data.iter().map(|(path, home)| Want { name: blaze_drive::Name::file(path.as_bytes()), home: blaze_drive::Name::file(home.as_bytes()) }));
-        wants.extend(local.iter().map(|g| Want { name: crate_scope_name(&crates[*g].input.key), home: Name::unit_graph() }));
-        wants.extend(script.map(|script| Want { name: script, home: Name::unit_graph() }));
-        return Ok(Did::Need(wants));
+    for (module, (_, decls)) in names.decls.iter() {
+        if let Some(name) = declares(decls) {
+            return Some((names.path_of(*module)?, name));
+        }
     }
-    let mut made = Made::new_in(name, held);
-    made.out = resolved.out;
-    for (rule, finding) in resolved.findings.iter() {
-        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a path's segment is not UTF-8" })?;
-        made.find(*rule, finding.at, &[words]);
+    for (module, made) in names.made.iter() {
+        if let Some(name) = declares(&made.decls) {
+            return Some((names.path_of(*module)?, name));
+        }
     }
-    for finding in resolved.failed_calls.iter() {
-        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a failed call's words are not UTF-8" })?;
-        made.find(crate::names::failed_call::FAILED_CALL, finding.at, &[words]);
+    for (call, expansion) in names.expansions.iter() {
+        if let Some(name) = declares(&expansion.decls) {
+            return Some((names.path_of(call_module(names, *call)?)?, name));
+        }
     }
-    for (rule, finding) in resolved.test_marks.iter() {
-        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a test finding's words are not UTF-8" })?;
-        made.find(*rule, finding.at, &[words]);
+    None
+}
+
+/// The module whose text, or whose call's expansion, holds macro call `call` (expansions
+/// nest at most [`blaze_scope::MAX_EXPANSIONS`] deep: the walk is bounded by it, rule 18).
+fn call_module<'a>(names: &blaze_scope::resolve::CrateNames<'a>, mut call: blaze_id::ItemKey) -> Option<blaze_id::ItemKey> {
+    let holds = |decls: &blaze_surface::DeclsBuilder<'a, &'a str>, call: blaze_id::ItemKey| decls.calls.iter().any(|c| c.call == call);
+    for _ in 0..blaze_scope::MAX_EXPANSIONS {
+        if let Some((module, _)) = names.decls.iter().find(|(_, (_, decls))| holds(decls, call)) {
+            return Some(*module);
+        }
+        if let Some((module, _)) = names.made.iter().find(|(_, made)| holds(&made.decls, call)) {
+            return Some(*module);
+        }
+        call = *names.expansions.iter().find(|(_, expansion)| holds(&expansion.decls, call))?.0;
     }
-    if let Some(words) = &resolved.failed {
-        made.find(crate::work::TASK_FAILED, (0, 0), &[words.as_str()]);
+    None
+}
+
+pub(crate) struct FindingText(pub(crate) &'static str);
+
+impl Resolved {
+    /// File the resolver's ordered diagnostics in either check driver's record.
+    pub(crate) fn file_findings<A: core::alloc::Allocator + Copy>(&self, made: &mut crate::work::Record<A>) -> Result<(), FindingText> {
+        let mut finding = |rule, at, bytes: &[u8], what| -> Result<(), FindingText> {
+            let words = core::str::from_utf8(bytes).map_err(|_| FindingText(what))?;
+            made.find(rule, at, &[words]);
+            Ok(())
+        };
+        for (rule, f) in &self.findings {
+            finding(*rule, f.at, &f.message, "a path's segment is not UTF-8")?;
+        }
+        for f in &self.failed_calls {
+            finding(super::failed_call::FAILED_CALL, f.at, &f.message, "a failed call's words are not UTF-8")?;
+        }
+        for f in self.module_missing.iter() {
+            finding(f.rule, f.at, &f.message, "a module file's path is not UTF-8")?;
+        }
+        for (rule, f) in &self.test_marks {
+            finding(*rule, f.at, &f.message, "a test finding's words are not UTF-8")?;
+        }
+        if let Some(words) = &self.failed {
+            finding(crate::work::TASK_FAILED, (0, 0), words.as_bytes(), "a crate's failure is not UTF-8")?;
+        }
+        for f in &self.left_package {
+            finding(super::include_outside::INCLUDE_OUTSIDE_PACKAGE, f.at, &f.message, "an included file's path is not UTF-8")?;
+        }
+        Ok(())
     }
-    // D111: an include read outside its package inside the workspace, a warning at its call.
-    for finding in resolved.left_package.iter() {
-        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "an included file's path is not UTF-8" })?;
-        made.find(crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE, finding.at, &[words]);
-    }
-    for path in resolved.files.iter() {
-        let input = task.inputs.iter().find(|input| input.name == surface(path)).ok_or(CliError::Text { what: "a surface, checked above, is gone" })?;
-        made.reads.push((input.name, input.out));
-    }
-    for path in resolved.absent.iter() {
-        made.reads.push((surface(path), blaze_drive::key::ABSENT));
-    }
-    // The bytes' digest of each data file in the read list (rule 21): an edit of the file moves
-    // its record's out and asks this crate again; nothing else does.
-    for (path, _) in resolved.data.iter() {
-        let file = blaze_drive::Name::file(path.as_bytes());
-        let input = task.inputs.iter().find(|input| input.name == file).ok_or(CliError::Text { what: "a data file's record, checked above, is gone" })?;
-        made.reads.push((input.name, input.out));
-    }
-    for g in local.iter() {
-        let input = have(names, task, *g).ok_or(CliError::Text { what: "a crate's input, checked above, is gone" })?;
-        made.reads.push((input.name, input.out));
-    }
-    // Its script's run, by its out: an equal record moves nothing; another runs this crate.
-    if let Some(script) = script {
-        let input = task.inputs.iter().find(|input| input.name == script).ok_or(CliError::Text { what: "a crate's build script's record, checked above, is gone" })?;
-        made.reads.push((input.name, input.out));
-    }
-    // The crate's link table as a part of its own, located by the table's digest
-    // (native_links.rs `table_digest`): its reader, the program's native image, is moved only
-    // when the table's bytes move, never by a re-solve that leaves them equal. An empty payload
-    // is a second answer, which `hand_payload` refuses below.
-    if !resolved.payload.is_empty() {
-        let links = sections::sections(&resolved.payload)
-            .map_err(|_| CliError::Text { what: "a crate's `CrateScope` payload, written by its resolution, does not open (names/scope.rs `answer`)" })?
-            .links;
-        made.parts.push(Part { name: Name::links_of(name), locate: Locate::Source(blaze_ladder::native_links::table_digest(links)), place: 0 });
-    }
-    // Last, after every step that can fail: a payload handed is gone from `names`.
-    hand_payload(&mut names.made[i].1, &mut made)?;
-    #[cfg(test)]
-    MADE.with(|kept| kept.borrow_mut().push((name.subject, made.out, blaze_ids::ContentId::of("names scope test", made.payload_bytes().expect("a record just made holds its payload")))));
-    Ok(Did::Done(made))
 }
 
 /// Hands `resolved`'s payload to its record `made`, moved, never copied (rules 11 and 51): the
@@ -724,64 +707,15 @@ pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame
 /// unchecked (2026-11-16 23:11). A crate's record is answered once a command; a second answer
 /// finds the payload gone (a written one is never empty: [`sections::write`] puts its head
 /// first) and is refused (rule 3), never answered with an empty record.
-fn hand_payload(resolved: &mut Resolved, made: &mut Made<'_>) -> Result<(), CliError> {
+pub(crate) fn hand_payload(resolved: &mut Resolved, made: &mut Made<'_>) -> Result<(), CliError> {
     if resolved.payload.is_empty() {
         return Err(CliError::Text { what: "a crate's `CrateScope` record answered twice this command: its payload went to the first answer (names/scope.rs `hand_payload`)" });
     }
     let payload = core::mem::replace(&mut resolved.payload, blaze_own::Vec::new_in(Global));
     made.hand(payload)?;
     // Its expansion records with it, moved: the directory in the payload names them, so they
-    // go to the store after it (engine_store.rs `put_all`, work.rs `PendingExtras`).
+    // go to the store after it (engine_store.rs `put_all`).
     made.hand_extras(core::mem::replace(&mut resolved.expansions, crate::work::Extras::none()))
-}
-
-/// [`MADE`], for a test.
-#[cfg(test)]
-pub(crate) fn scope_made() -> &'static std::thread::LocalKey<RefCell<std::vec::Vec<(blaze_ids::ContentId, blaze_ids::ContentId, blaze_ids::ContentId), Global>>> {
-    &MADE
-}
-
-#[cfg(test)]
-std::thread_local! {
-    /// Each `CrateScope` record this thread answered: (subject, out, payload digest). The
-    /// simulation runs a command's tasks on its test's thread, so a test reads its own.
-    pub(crate) static MADE: RefCell<std::vec::Vec<(blaze_ids::ContentId, blaze_ids::ContentId, blaze_ids::ContentId), Global>> = const { RefCell::new(std::vec::Vec::new()) };
-}
-
-/// One `CrateScope` task on the main thread: the three steps back to back, the resolution in
-/// a frame of its own. The pool runs the same steps (work.rs `run_batches`).
-#[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
-pub(crate) fn run<'f, 'b>(
-    cx: &Cx,
-    root: &Dir<ReadWrite>,
-    store: &mut dyn Store<'_>,
-    names: &mut Option<Names<'f>>,
-    lock: Option<&'f Lock<'static>>,
-    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
-    env: &FetchEnv<'_>,
-    macros: Option<&crate::proc_runner::MacroSide<'_, '_, '_>>,
-    task: &Task<'_>,
-    held: &'b Frame,
-) -> Result<Did<'b>, CliError> {
-    let own = Frame::with_reserve(SCOPE_JOBS, Tag::Other).map_err(|_| CliError::Text { what: "a crate scope's frame could not be reserved" })?;
-    let resolution = {
-        let mut round = ScopeRound::new(&own, false);
-        match prepare(cx, root, store, &mut CopiedExports, names, lock, members, env, macros, task, &mut round, held)? {
-            Prepared::Answer(did) => return Ok(did),
-            Prepared::Made => None,
-            Prepared::Resolve(job) => {
-                let scratch = Frame::with_reserve(SCOPE_FRAME, Tag::Other).map_err(|_| CliError::Text { what: "a crate scope's frame could not be reserved" })?;
-                Some(resolve(cx, root, job, &scratch).0)
-            }
-        }
-    };
-    let Some(names) = names.as_mut() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
-    if let Some(resolution) = resolution
-        && let Some(did) = settle(names, task, resolution, held)
-    {
-        return Ok(did);
-    }
-    answer(names, task, held)
 }
 
 #[cfg(test)]
@@ -850,6 +784,7 @@ mod tests {
             left_package: blaze_own::Vec::new_in(Global),
             failed: None,
             failed_calls: blaze_own::Vec::new_in(Global),
+            module_missing: blaze_own::Vec::new_in(blaze_own::testing::heap().shared()),
             test_marks: blaze_own::Vec::new_in(Global),
             expansions: crate::work::Extras::none(),
         };

@@ -31,7 +31,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
+use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, WriterOpts, schema_of};
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -494,7 +494,7 @@ pub fn build_crate_graph<'a>(
         index: index[p as usize],
     }));
 
-    let mut out = Writer::new_in(GRAPH_SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: GRAPH_SCHEMA, alloc: alloc, capacity: None });
     let names_at = out.push_slice(&names);
     let edges_at = out.push_slice(&edge_rows);
     let crates_at = out.push_slice(&crate_rows);

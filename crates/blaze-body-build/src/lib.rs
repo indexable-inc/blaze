@@ -208,7 +208,7 @@ pub fn build<A: Allocator + Clone>(
     };
     cx.frame()?;
     cx.blocks()?;
-    let func = cx.b.finish_checked().map_err(BuildError::Lir)?;
+    let func = cx.b.finish_verified().map_err(BuildError::Lir)?;
     Ok(Built {
         func,
         refs: cx.refs,

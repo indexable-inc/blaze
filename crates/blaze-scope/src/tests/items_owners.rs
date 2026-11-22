@@ -93,7 +93,7 @@ fn a_member_finds_its_owner_in_one_search() {
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
     let bytes: &'static [u8] = aligned(&a, g);
-    let record = ItemsRecord::open(bytes, g).unwrap_or_else(|e| panic!("open: {e:?}"));
+    let record = super::items_record::one_file(bytes, names.files[0].text, g);
 
     // Every named member, by its key alone, answers the owner and the name its list holds.
     let members = listed(&record);

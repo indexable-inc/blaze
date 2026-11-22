@@ -25,7 +25,7 @@ pub(crate) use std::{
     path::Path as RootPath,
 };
 
-use alloc::{string::{String, ToString as _}, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString as _}, sync::Arc};
 use core::{fmt::Write as _, time::Duration};
 
 use crate::{
@@ -109,9 +109,160 @@ pub fn run_with_heap<R: Outcome>(os: &'static blaze_core::Os, main: impl FnOnce(
     run_io(native(os), move |cx, io| main(cx, io, heap))
 }
 
+/// [`run_with_heap`] with the run's telemetry level chosen by the program from its arguments
+/// (D178; [`crate::telemetry`], "Wiring", decision 3): `level` is called once, after the
+/// command line is read and before the world's workers or the pool exist, so every worker's
+/// cell is made at that level and nothing is raised after the start. It is a plain `fn`: it
+/// sees the arguments and nothing else (no environment, no clock; nothing ambient). From
+/// [`Level::Spans`](crate::telemetry::Level::Spans) the report is written to standard error as
+/// text when the run ends: `main` returned, failed, or panicked; at `Totals` it is kept and
+/// written nowhere.
+pub fn run_with_heap_at<R: Outcome>(
+    os: &'static blaze_core::Os,
+    level: fn(&crate::args::Args) -> crate::telemetry::Level,
+    main: impl FnOnce(&Cx, Io, Heap) -> R,
+) -> Exit {
+    let heap = crate::entry::process_heap();
+    let world = process_start().and_then(|block| {
+        let args = ArgList::process(block);
+        // clone: the arguments' list (a borrow of the start block), read once by `level`.
+        let chosen = level(&crate::args::Args::new(args.clone()));
+        let io = open_native(os, args, Vars::process(block), start_dir(), u8::MAX)?;
+        let alloc = heap.shared();
+        Ok((with_telemetry(io, chosen, alloc)?, AtExit { level: chosen, alloc }))
+    });
+    let (world, at_exit) = match world {
+        Ok((io, at_exit)) => (Ok(io), Some(at_exit)),
+        Err(why) => (Err(why), None),
+    };
+    run_io_with(world, at_exit, move |cx, io| main(cx, io, heap))
+}
+
+/// `io` over a `Workers` of the same setup whose cells keep telemetry at `level` in `alloc`
+/// (the bare one `open_native` made is dropped: one sparse reservation, nothing backed).
+fn with_telemetry(io: Io, level: crate::telemetry::Level, alloc: blaze_own::SharedAlloc<'static>) -> Result<Io, String> {
+    let setup = io.workers().setup();
+    // alloc: an error's message.
+    let mut opts = crate::workers::WorkersOpts::new(setup).map_err(|error| error.to_string())?;
+    opts.telemetry(level, alloc);
+    // alloc: an error's message.
+    let workers = crate::workers::Workers::new(opts).map_err(|error| error.to_string())?;
+    Ok(io.on_workers(workers))
+}
+
+/// What the runtime does with the run's telemetry when it ends: the level the cells keep and
+/// the allocator the report is made in (the process heap's shared handle).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AtExit {
+    level: crate::telemetry::Level,
+    alloc: blaze_own::SharedAlloc<'static>,
+}
+
+/// The run's report, armed from the pool's start to the exit: [`Reporting::end`] writes it
+/// on the ways out that return; its drop writes it, as `Panicked`, on the unwind of a `main`
+/// that panicked. Below `Spans` nothing is gathered or written.
+struct Reporting {
+    at: AtExit,
+    world: Io,
+    began_ns: u64,
+    begun: blaze_meter::Process,
+    armed: bool,
+}
+
+impl Reporting {
+    fn new(at: AtExit, world: &Io) -> Reporting {
+        // clone: the world kept to gather its workers' cells at the end.
+        Reporting { at, world: world.clone(), began_ns: ns_of(world.now()), begun: blaze_meter::Process::now(), armed: true }
+    }
+
+    /// Gathers every worker's cell (each stopped at now) into one report, finishes it as
+    /// `exit`, reconciles it against the process's totals, and writes its text to standard
+    /// error. Once: a second call does nothing.
+    fn end(&mut self, exit: crate::telemetry::Exit) -> Result<(), String> {
+        use crate::telemetry::{Level, Report, ReportOpts};
+        if !core::mem::replace(&mut self.armed, false) || !self.at.level.keeps(Level::Spans) {
+            return Ok(());
+        }
+        let workers = self.world.workers();
+        let now = ns_of(self.world.now());
+        let opts = ReportOpts { level: self.at.level, most_workers: workers.cells() };
+        // alloc: an error's message (each `to_string` below).
+        let mut report = Report::new(opts, self.at.alloc).map_err(|error| error.to_string())?;
+        let mut merged = Ok(());
+        workers
+            .each_made_held(|w| {
+                if let Some((tally, cell)) = w.telemetry() {
+                    cell.stop(now);
+                    if merged.is_ok() {
+                        merged = report.merge(tally, cell);
+                    }
+                }
+            })
+            // alloc: an error's message.
+            .map_err(|busy| alloc::format!("bstd::rt: a worker's cell was held at the run's end: {busy:?}"))?;
+        merged.map_err(|error| error.to_string())?;
+        report.finish(exit).map_err(|error| error.to_string())?;
+        report.reconcile(now.saturating_sub(self.began_ns), &self.begun, &blaze_meter::Process::now()).map_err(|error| error.to_string())?;
+        let mut text = blaze_own::Vec::new_in(self.at.alloc);
+        crate::telemetry::text_into(&report, &mut text).map_err(|error| error.to_string())?;
+        write_out(crate::out::Stream::Err, &[&text[..]])
+    }
+}
+
+impl Drop for Reporting {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(why) = self.end(crate::telemetry::Exit::Panicked)
+        {
+            error_line(&why);
+        }
+    }
+}
+
+/// A reading of the world's clock as nanoseconds.
+fn ns_of(at: Duration) -> u64 {
+    u64::try_from(at.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// [`run_with_heap`] for a program that keeps state per worker (D171, [`crate::workers`]):
+/// `register` adds every slot, with the process's heap to name their allocators, before the
+/// world or the pool exists, and what it returns (the keys) is handed to `main` beside it.
+/// `main`'s context and every task under it hold cells of these `Workers`. A registration
+/// refused (too many slots, a cell too large) or a reservation the system refuses fails the
+/// process before `main`, naming it.
+pub fn run_with_workers<S, R: Outcome>(
+    os: &'static blaze_core::Os,
+    setup: crate::workers::WorkersSetup,
+    register: impl FnOnce(&mut crate::workers::WorkersOpts, Heap) -> S,
+    main: impl FnOnce(&Cx, Io, Heap, S) -> R,
+) -> Exit {
+    let heap = crate::entry::process_heap();
+    let made = crate::workers::WorkersOpts::new(setup).and_then(|mut opts| {
+        let keys = register(&mut opts, heap);
+        crate::workers::Workers::new(opts).map(|workers| (workers, keys))
+    });
+    let (world, keys) = match made {
+        Ok((workers, keys)) => (native(os).map(|io| io.on_workers(workers)), Some(keys)),
+        // alloc: an error's message, once.
+        Err(error) => (Err(error.to_string()), None),
+    };
+    // `keys` is `None` only with the world refused, so `main` never runs without them.
+    run_io(world, move |cx, io| match keys {
+        Some(keys) => main(cx, io, heap, keys),
+        None => unreachable!("bstd::rt::run_with_workers: main ran over a refused world"),
+    })
+}
+
 /// [`run`] in the world `world` made, or saying why it could not be: the one home of the
 /// pool's start and stop for a program's `main` ([`run`], and `launch`'s spec-made world).
 pub(crate) fn run_io<R: Outcome>(world: Result<Io, String>, main: impl FnOnce(&Cx, Io) -> R) -> Exit {
+    run_io_with(world, None, main)
+}
+
+/// [`run_io`] with the run's telemetry written at its end ([`run_with_heap_at`]): after the
+/// drain, on every way out of `main` (returned, failed, panicked: the last by the guard's drop).
+/// A report that cannot be gathered or written fails the run, naming why.
+pub(crate) fn run_io_with<R: Outcome>(world: Result<Io, String>, at_exit: Option<AtExit>, main: impl FnOnce(&Cx, Io) -> R) -> Exit {
     // alloc: once per process, what a failure says.
     let mut said = String::new();
     let status = match world {
@@ -119,6 +270,7 @@ pub(crate) fn run_io<R: Outcome>(world: Result<Io, String>, main: impl FnOnce(&C
             let running = pool::lazy(Plants::NONE);
             // clone: the world kept past `main`, to drain what it left in flight.
             let kept = io.clone();
+            let mut reporting = at_exit.map(|at| Reporting::new(at, &kept));
             let status = run_on(io, running.pool().clone(), &mut said, main);
             // A command answers and exits (rule 70): every scope of `main` has ended, so no
             // task runs; what the driver still holds is drained, and then the process exits
@@ -134,6 +286,17 @@ pub(crate) fn run_io<R: Outcome>(world: Result<Io, String>, main: impl FnOnce(&C
                     let _ = write!(said, "{stopped}");
                     Status::FAILED
                 }
+            };
+            let exit = if status.0 == Status::OK.0 { crate::telemetry::Exit::Returned } else { crate::telemetry::Exit::Failed };
+            let status = match reporting.as_mut().map(|reporting| reporting.end(exit)) {
+                Some(Err(why)) => {
+                    if !said.is_empty() {
+                        said.push_str("; ");
+                    }
+                    let _ = write!(said, "bstd::telemetry: the run's report: {why}");
+                    Status::FAILED
+                }
+                Some(Ok(())) | None => status,
             };
             if !said.is_empty() {
                 error_line(&said);
@@ -346,7 +509,7 @@ mod machine {
     //! The machine's cores, and placing a worker on one (rule 45 for macOS's).
 
     // `std` is this module's (bstd is `no_std`: rt.rs is where Rust std is named).
-    use super::std::{self, format, fs, string::String, vec::Vec as StdVec};
+    use super::std::{self, format, string::String, vec::Vec as StdVec};
 
     use alloc::{alloc::Global, string::ToString as _};
 

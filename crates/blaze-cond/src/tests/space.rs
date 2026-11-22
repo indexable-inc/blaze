@@ -3,7 +3,7 @@
 
 use std::{format, string::String};
 
-use blaze_own::{AVec};
+use blaze_own::AVec;
 
 use crate::cfg;
 use crate::isop::Cover;
@@ -58,7 +58,7 @@ fn lower(text: &str, space: &Space<'_>, bdd: &mut Bdd<'_>) -> Cond {
 #[test]
 fn valid_is_one_target_and_closed_features() {
     let space = space(false);
-    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, blaze_own::testing::heap().alloc()).unwrap();
+    let mut bdd = Bdd::new_in(space.len(), Limits::SHIPPED, blaze_own::testing::heap().alloc()).unwrap();
     let valid = space.valid_in(&mut bdd).unwrap();
     // Three targets, {}, {rt}, {rt, full}, test on or off.
     assert_eq!(bdd.sat_count(Cond::TRUE, valid).unwrap(), 18);
@@ -74,7 +74,7 @@ fn valid_is_one_target_and_closed_features() {
 #[test]
 fn a_witness_reads_as_a_configuration() {
     let space = space(false);
-    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, blaze_own::testing::heap().alloc()).unwrap();
+    let mut bdd = Bdd::new_in(space.len(), Limits::SHIPPED, blaze_own::testing::heap().alloc()).unwrap();
     let valid = space.valid_in(&mut bdd).unwrap();
     let f = lower(r#"all(windows, feature = "full", not(test))"#, &space, &mut bdd);
     let mut witness = AVec::new_in(blaze_own::testing::heap().alloc());
@@ -88,7 +88,7 @@ fn a_witness_reads_as_a_configuration() {
 fn the_printed_form_says_the_same_within_valid() {
     let space = space(false);
     let alloc = blaze_own::testing::heap().alloc();
-    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, alloc).unwrap();
+    let mut bdd = Bdd::new_in(space.len(), Limits::SHIPPED, alloc).unwrap();
     let valid = space.valid_in(&mut bdd).unwrap();
     let mut cover = Cover::new_in(alloc);
     for text in [
@@ -126,8 +126,8 @@ fn two_builders_in_two_orders_write_equal_bytes() {
     let (a, b) = (space(false), space(true));
     assert_eq!(a.len(), b.len());
     let alloc = blaze_own::testing::heap().alloc();
-    let mut bdd_a = Bdd::new_in(a.len(), Limits::TASK, alloc).unwrap();
-    let mut bdd_b = Bdd::new_in(b.len(), Limits::TASK, alloc).unwrap();
+    let mut bdd_a = Bdd::new_in(a.len(), Limits::SHIPPED, alloc).unwrap();
+    let mut bdd_b = Bdd::new_in(b.len(), Limits::SHIPPED, alloc).unwrap();
     let text = r#"any(all(unix, feature = "rt"), all(windows, not(test)))"#;
     let fa = lower(text, &a, &mut bdd_a);
     let fb = lower(text, &b, &mut bdd_b);

@@ -1,0 +1,7 @@
+# The packages under vendor/ that are no longer counted as third-party, each with why it is still
+# there (docs/v2/plan/design/end-state.md, D180: what is left when the count has fallen is placed
+# in vendor/ pinned by digest; the TLS and QUIC closure is the one long-lived entry expected).
+# `<package name><TAB><why>`. A vendored package not named here is third-party: a pair in
+# tools/ratchets/thirdparty.txt and, in the end state, a refusal. A line naming no package under
+# vendor/ in the graph is refused. Only a person adds a line. Read by scripts/src/bin/thirdparty.rs
+# (`reach-check`). Empty on 2026-11-20: every vendored package still counts.

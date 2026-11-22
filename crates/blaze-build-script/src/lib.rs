@@ -21,6 +21,9 @@
 #![forbid(unsafe_code)]
 
 pub mod c_request;
+pub mod c_tasks;
+pub mod c_tasks_built;
+pub mod c_tasks_probe;
 pub mod cx;
 pub mod dep_paths;
 pub mod env;
@@ -29,13 +32,13 @@ pub mod fact_shim;
 pub mod facts;
 pub mod git;
 mod git_attributes;
+mod git_ignore;
 mod git_objects;
 pub mod host_tools;
 pub mod instr;
 pub mod key;
 pub mod native;
 pub mod outputs;
-pub mod outputs4;
 pub mod pinned;
 pub mod probe;
 pub mod probe_ask;
@@ -44,6 +47,10 @@ pub mod toolchain;
 
 #[cfg(test)]
 mod c_request_tests;
+#[cfg(test)]
+mod c_tasks_probe_tests;
+#[cfg(test)]
+mod c_tasks_tests;
 #[cfg(test)]
 mod nm_row_tests;
 #[cfg(test)]

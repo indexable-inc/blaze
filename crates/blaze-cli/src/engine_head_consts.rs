@@ -12,15 +12,9 @@
 //! use a definition the first read, and its read list would miss that text (rule 21). The step
 //! cap stays the front end's (`MOST_FREEZE_CONSTS` constants a freeze, check.rs `MOST_STEPS`).
 //!
-//! THE READ LIST OF AN EVALUATED CONSTANT: every names cell the evaluation read, as the
-//! freeze's own (engine_heads.rs `names_read`); and for each item whose TEXT it read (a
-//! `NameCell::Item` read: the constant's initializer, a const fn's body, an ADT a layout
-//! needs), the cell that moves when that text does ([`text_cell`]): the `WHOLE` cell of the
-//! outline of the item's file when a member's file holds it (an Outlines cell: no head task
-//! reads a cell of its own phase, engine.rs invariant 2), else its crate's names record whole.
-//! The same for each constant whose value a frozen cell holds (`CellReads::consts`). The
-//! value's own cell (head.rs `const_value_cell`, the constant's head task's) is the floor; it
-//! is a Heads cell, so reading it needs the wave rule for heads that read heads (A2), owed.
+//! A names lookup records its metadata. A text operation additionally records which tokens
+//! it consumed. A member file publishes those tokens under the item's stable chain. A macro
+//! or block module publishes its generated text under the expansion that contains the item.
 
 use blaze_drive::key::crate_scope_name;
 use blaze_engine::CellId;
@@ -148,6 +142,8 @@ pub(crate) enum UnplacedWhy {
     NoCrate,
     /// Its crate is the records' crate `at`, which has no crate key.
     NoCrateKey { at: usize },
+    Record { what: &'static str },
+    NoOutline { file: u32 },
 }
 
 /// [`Unplaced`] with the names of the scope's crates it was looked for in: what a refusal
@@ -167,6 +163,8 @@ impl core::fmt::Display for UnplacedIn<'_, '_> {
         match self.unplaced.why {
             UnplacedWhy::NoCrate => write!(f, "the item of key {key:x} (crate prefix {prefix:016x}) is of no crate of its scope's {} crate(s)", self.crates.len())?,
             UnplacedWhy::NoCrateKey { at } => write!(f, "the item of key {key:x} is of its scope's crate {at}, which has no crate key")?,
+            UnplacedWhy::Record { what } => write!(f, "cannot place the text of item {key:x}: {what}")?,
+            UnplacedWhy::NoOutline { file } => write!(f, "item {key:x} is in member file {file}, which has no matched checkout outline")?,
         }
         for (i, one) in self.crates.iter().take(MOST_NAMED_CRATES).enumerate() {
             let sep = if i == 0 { ": " } else { ", " };
@@ -182,36 +180,30 @@ impl core::fmt::Display for UnplacedIn<'_, '_> {
 /// Each cell that moves when a text the evaluation read moves (module docs), given to `each`.
 pub(crate) fn eval_reads<'n>(records: &'n Records<'n>, subjects: &Subjects, reads: &[TableRead], each: &mut dyn FnMut(CellId)) -> Result<(), Unplaced> {
     for one in reads.iter() {
-        if let TableRead::Names(NameCell::Item { key }) = one {
-            if let Some(cell) = text_cell(records, subjects, *key)? {
-                each(cell);
-            }
+        if let Some(cell) = source_read(records, subjects, *one)? {
+            each(cell);
         }
     }
     Ok(())
 }
 
-/// The cell that moves when item `key`'s text does, by where the text is:
-/// - an item of a member's file (`At::File` of a file the members' outlines hold): that file's
-///   outline `WHOLE`;
-/// - a dependency crate's item (its constant, a const fn it calls): its crate's names record
-///   `WHOLE`, which holds every text of that crate;
-/// - an item a macro expansion wrote (`At::Expansion`), and an anonymous constant (front2
-///   anon.rs `need_key`, of its module's crate prefix, with no place): its crate's names record
-///   `WHOLE`, which holds the expansion's text (coarse: any edit of that crate moves it).
-///
-/// `None`: a builtin type (`u8`, `usize`, `str`: blaze-scope builtin.rs, a key of the prefix
-/// `builtin\0`): it has no text and no crate, and is the same in every crate and on every
-/// machine, so reading it is a function of the tool alone, which every task's key holds: no
-/// cell. (On real projects every head whose constants' evaluation named a primitive was refused
-/// here as "of no crate of its scope": clap, serde, thiserror and a plain crate, 2026-11-17.)
-///
-/// Refused, naming the item, only when no crate of `records` holds it ([`Unplaced`]).
-pub(crate) fn text_cell<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Result<Option<CellId>, Unplaced> {
-    if has_no_text(key) {
-        return Ok(None);
+/// The source facet accompanying a table observation. Its metadata cell is placed by
+/// `tables::task::cell_id`, including when the lookup found no definition.
+pub(crate) fn source_read<'n>(records: &'n Records<'n>, subjects: &Subjects, read: TableRead) -> Result<Option<CellId>, Unplaced> {
+    match read {
+        TableRead::Text { key } => text_cell(records, subjects, key),
+        TableRead::Signature { key } => signature_text_cell(records, subjects, key),
+        _ => Ok(None),
     }
-    text_cell_of(records, subjects, key).map(Some)
+}
+
+/// The item's full definition, including an initializer or const fn body.
+pub(crate) fn text_cell<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Result<Option<CellId>, Unplaced> {
+    text_cell_of(records, subjects, key, crate::engine_tasks::definition_cell)
+}
+
+pub(crate) fn signature_text_cell<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Result<Option<CellId>, Unplaced> {
+    text_cell_of(records, subjects, key, crate::engine_tasks::signature_cell)
 }
 
 /// Whether `key` is a builtin type's (its first eight bytes are blaze-scope's `BUILTIN_PREFIX`,
@@ -220,18 +212,64 @@ pub(crate) fn has_no_text(key: LibKey) -> bool {
     key.0.0[..8] == blaze_scope::BUILTIN_PREFIX
 }
 
-/// [`text_cell`] of an item that is some crate's.
-fn text_cell_of<'n>(records: &'n Records<'n>, subjects: &Subjects, key: LibKey) -> Result<CellId, Unplaced> {
+fn text_cell_of<'n>(
+    records: &'n Records<'n>, subjects: &Subjects, key: LibKey, facet: fn(blaze_drive::Name) -> blaze_drive::cells::Cell,
+) -> Result<Option<CellId>, Unplaced> {
+    if has_no_text(key) {
+        return Ok(None);
+    }
     let k = NamesSource::crate_of(records, key).ok_or(Unplaced { key, why: UnplacedWhy::NoCrate })?;
     let krate = NamesSource::crate_key(records, k).ok_or(Unplaced { key, why: UnplacedWhy::NoCrateKey { at: k } })?;
-    let whole = CellId { of: crate_scope_name(&krate), cell: WHOLE };
-    let Some(place) = NamesSource::place_of(records, key) else { return Ok(whole) };
-    let At::File(file) = place.at else { return Ok(whole) };
+    let scope = crate_scope_name(&krate);
     let prefix = krate.prefix();
-    Ok(match subjects.binary_search_by(|(p, f, _)| (*p, *f).cmp(&(prefix, file))) {
-        Ok(at) => CellId { of: subjects[at].2, cell: WHOLE },
-        Err(_) => whole,
-    })
+    let first = subjects.partition_point(|row| row.prefix < prefix);
+    if subjects.get(first).is_none_or(|row| row.prefix != prefix) {
+        return Ok(Some(CellId { of: scope, cell: WHOLE }));
+    }
+    let bad = |what| Unplaced { key, why: UnplacedWhy::Record { what } };
+    let items = records.items_record(k).ok_or_else(|| bad("no items record"))?;
+    let (at, owner, member) = if let Some(row) = items.item(key).map_err(|_| bad("unreadable item row"))? {
+        (row.text.ok_or_else(|| bad("item row has no text span"))?.at, key, None)
+    } else if let Some((owner, _)) = items.member_owner(key).map_err(|_| bad("unreadable member owner"))? {
+        let rows = items.members(owner).map_err(|_| bad("unreadable member rows"))?.ok_or_else(|| bad("owner has no member rows"))?;
+        let mut found = None;
+        for row in rows.iter() {
+            let row = row.map_err(|_| bad("unreadable member row"))?;
+            if row.key == key {
+                let name = row.name.ok_or_else(|| bad("member owner names an unnamed member"))?;
+                let at = row.text.ok_or_else(|| bad("member has no text span"))?.at;
+                let placement = (at, owner, Some((row.kind, name)));
+                if found.replace(placement).is_some_and(|previous| previous != placement) {
+                    return Err(bad("the same member key has definitions at different sources"));
+                }
+            }
+        }
+        found.ok_or_else(|| bad("the owner does not list the member"))?
+    } else {
+        // The operation records Item as well. For an absent item this second negative
+        // records the other place its text could appear, the associated-member table.
+        let absent = NameCell::MemberOf { member: key };
+        return Ok(Some(CellId { of: scope, cell: blaze_drive::cells::Cell(absent.key()) }));
+    };
+    let file = match at {
+        At::Expansion(call) => {
+            if items.expansion(call).is_none() {
+                return Err(bad("the item's generating expansion has no text row"));
+            }
+            return Ok(Some(CellId { of: scope, cell: blaze_drive::cells::Cell(NameCell::Expansion { call }.key()) }));
+        }
+        At::File(file) => file,
+    };
+    let row = subjects.binary_search_by(|row| (row.prefix, row.file).cmp(&(prefix, file)))
+        .map_err(|_| Unplaced { key, why: UnplacedWhy::NoOutline { file } })?;
+    let subject = &subjects[row];
+    let pieces = items.pieces(owner).map_err(|_| bad("unreadable item chain"))?.ok_or_else(|| bad("missing item chain"))?;
+    let entry = subject.signature_file.entry_from_chain(pieces.chain);
+    let name = match member {
+        Some((kind, name)) => crate::engine_tasks::member_entry(entry, kind, name),
+        None => entry,
+    };
+    Ok(Some(CellId { of: subject.slot, cell: facet(name) }))
 }
 
 /// The head `want` makes, as a finding shows its path (`krate::m::S`; an impl's fn

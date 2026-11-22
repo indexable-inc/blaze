@@ -15,6 +15,10 @@
 //! - [`Act::Hang`] never sends and never exits: only the parent's deadline and its kill end it.
 //!
 //! Nothing allocates: the acts and their messages are the test's, borrowed.
+//!
+//! The loop is handed `&mut SimChild` (the [`RunChild`]): a wait or a kill takes that borrow, so
+//! the loop cannot step the child after its end, and the test reads the child's record
+//! ([`SimChild::killed`], [`SimChild::answers`]) once the loop has returned.
 
 use alloc::vec::Vec;
 use core::{alloc::Allocator, time::Duration};
@@ -22,8 +26,8 @@ use core::{alloc::Allocator, time::Duration};
 use blaze_core::wait::Deadline;
 
 use super::{
-    Ended,
-    run::{ChannelError, Message, PREFIX, RunChild, RunError, RunFault, RunStep, whole_messages},
+    Exit, Waited,
+    run::{ChannelError, Message, PREFIX, Reaped, RunChild, RunError, RunFault, RunStep, RunWaited, whole_messages},
 };
 use crate::{Stopped, procs::ProcId};
 
@@ -63,7 +67,7 @@ pub struct SimChild<'s> {
     read_off: usize,
     /// Whole messages the parent has sent.
     answers: u32,
-    ended: Option<Ended>,
+    ended: Option<Exit>,
     killed: bool,
     rng: u64,
     trace: u64,
@@ -141,9 +145,9 @@ impl<'s> SimChild<'s> {
     fn act(&mut self, at: Duration) {
         self.now = self.now.max(at);
         match self.acts[self.next] {
-            Act::Exit { status, .. } => self.ended = Some(Ended::Exited(status)),
-            Act::Signal { signal, .. } => self.ended = Some(Ended::Signaled(signal)),
-            Act::DieMidMessage { .. } => self.ended = Some(Ended::Signaled(SIGKILL)),
+            Act::Exit { status, .. } => self.ended = Some(Exit::Exited(status)),
+            Act::Signal { signal, .. } => self.ended = Some(Exit::Signaled(signal)),
+            Act::DieMidMessage { .. } => self.ended = Some(Exit::Signaled(SIGKILL)),
             Act::Send { .. } | Act::Await { .. } | Act::Hang => {}
         }
         self.next += 1;
@@ -204,12 +208,16 @@ impl<'s> SimChild<'s> {
     }
 }
 
-impl RunChild for SimChild<'_> {
-    fn now(&self) -> Duration {
+/// The steps the [`RunChild`] of a `&mut SimChild` is made of, on the child itself, so
+/// [`super::sim_term::TermChild`] wraps them.
+impl SimChild<'_> {
+    /// The virtual clock.
+    pub fn now(&self) -> Duration {
         self.now
     }
 
-    fn recv_message<A: Allocator>(
+    /// [`RunChild::recv_message`].
+    pub(super) fn recv_in<A: Allocator>(
         &mut self,
         into: &mut Vec<u8, A>,
         most: u32,
@@ -270,7 +278,8 @@ impl RunChild for SimChild<'_> {
         }
     }
 
-    fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError> {
+    /// [`RunChild::send`].
+    pub(super) fn send_in(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError> {
         self.until(RunStep::Send, deadline)?;
         if self.ended.is_some() {
             return Err(self.error(RunStep::Send, RunFault::Channel(ChannelError::Hangup)));
@@ -287,32 +296,65 @@ impl RunChild for SimChild<'_> {
         Ok(())
     }
 
-    fn wait(&mut self, deadline: Deadline) -> Result<Ended, RunError> {
+    /// [`RunChild::wait`]: its end by `deadline`, or `None` with it still running.
+    pub(super) fn wait_in(&mut self, deadline: Deadline) -> Result<Option<Exit>, RunError> {
         let until = self.until(RunStep::Wait, deadline)?;
         loop {
             if let Some(ended) = self.ended {
-                return Ok(ended);
+                return Ok(Some(ended));
             }
             match self.due() {
                 Some(at) if at <= until => self.act(at),
                 _ => {
                     self.now = self.now.max(until);
-                    return Ok(Ended::Deadline);
+                    return Ok(None);
                 }
             }
         }
     }
 
-    fn kill(&mut self) -> Result<Ended, RunError> {
-        // An end that came first is kept, as a reaped child's is.
+    /// [`RunChild::kill`]: an end that came first is kept, as a reaped child's is.
+    pub(super) fn kill_in(&mut self) -> Exit {
         match self.ended {
-            Some(ended) => Ok(ended),
+            Some(ended) => ended,
             None => {
                 self.killed = true;
-                self.ended = Some(Ended::Signaled(SIGKILL));
-                Ok(Ended::Signaled(SIGKILL))
+                self.ended = Some(Exit::Signaled(SIGKILL));
+                Exit::Signaled(SIGKILL)
             }
         }
+    }
+}
+
+impl RunChild for &mut SimChild<'_> {
+    type Left = ();
+
+    fn now(&self) -> Duration {
+        self.now
+    }
+
+    fn recv_message<A: Allocator>(
+        &mut self,
+        into: &mut Vec<u8, A>,
+        most: u32,
+        deadline: Deadline,
+    ) -> Result<Message, RunError> {
+        self.recv_in(into, most, deadline)
+    }
+
+    fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError> {
+        self.send_in(bytes, deadline)
+    }
+
+    fn wait(self, deadline: Deadline) -> Result<RunWaited<Self>, RunError> {
+        Ok(match self.wait_in(deadline)? {
+            Some(exit) => Waited::Ended(Reaped { exit, left: () }),
+            None => Waited::Running(self),
+        })
+    }
+
+    fn kill(self) -> Result<Reaped<()>, RunError> {
+        Ok(Reaped { exit: self.kill_in(), left: () })
     }
 
     /// A scripted child goes on as its acts say: it models a program whose SIGTERM handler does

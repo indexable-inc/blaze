@@ -40,18 +40,31 @@ pub(crate) fn impl_var_kinds<'a>(h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result
     let mut work: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
     work.push(h.self_ty);
     work.extend_from_slice(h.types.list(h.trait_args.list())?);
-    for &(_, t) in h.assoc_types {
-        work.push(t);
-    }
+    // The self type and trait arguments first, then the associated types' values: a value is
+    // over the impl's generics THEN the associated type's own (a generic associated type, or
+    // a trait fn's `impl Trait` whose fn has its own const parameter), so there a
+    // `ConstParam(i)` past the impl's generics is that own parameter, no impl variable.
+    let mut from_assoc = false;
     let mut steps: u32 = 0;
-    while let Some(t) = work.pop() {
+    loop {
+        let Some(t) = work.pop() else {
+            if from_assoc {
+                break;
+            }
+            from_assoc = true;
+            for &(_, t) in h.assoc_types {
+                work.push(t);
+            }
+            continue;
+        };
         steps += 1;
         if steps > MAX_STEPS {
-            return Err(CheckError::Limit(Limit::Export));
+            return Err(CheckError::Limit(Limit::ImplVarKindSteps { node: t, steps, limit: MAX_STEPS }));
         }
         match h.types.node(t)? {
             PNode::ConstParam(i) => match kinds.get_mut(i as usize) {
                 Some(k) => *k = VarKind::Const,
+                None if from_assoc => {}
                 None => return Err(CheckError::Malformed(Malformed::Sort { node: t.0 })),
             },
             PNode::Tuple(l)

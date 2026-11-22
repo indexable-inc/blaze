@@ -1,6 +1,6 @@
-//! The key an adaptive table switches to, from a key its caller drew: the capability form of
-//! [`super::switch_key`], which draws from the operating system inside the table operation
-//! that saw the flood. A table that adapts holds a standby key, drawn where it was made from
+//! The key an adaptive table switches to, from a key its caller drew (the ambient
+//! `switch_key`, which drew from the operating system inside the table operation that saw the
+//! flood, was deleted on 2026-11-20). A table that adapts holds a standby key, drawn where it was made from
 //! the capability its maker was handed (bstd's `Io::sip_key`), and passes it here at the flood,
 //! so the switch reads nothing ambient and a simulation repeats it by its seed.
 

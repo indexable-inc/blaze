@@ -678,49 +678,7 @@ set_operator!(
     Sub sub difference
 );
 
-// serde's forms, a sequence of the elements: behind the `serde` feature.
-#[cfg(feature = "serde")]
-impl<T: serde::Serialize, S, A: Allocator> serde::Serialize for Set<T, S, A> {
-    fn serialize<Z: serde::Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
-        serializer.collect_seq(self.iter())
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de, T, S, A> serde::Deserialize<'de> for Set<T, S, A>
-where
-    T: serde::Deserialize<'de> + Eq,
-    S: KeyHash<T> + Default,
-    A: Allocator + Default,
-{
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use core::marker::PhantomData;
-
-        struct Elements<T, S, A>(PhantomData<fn() -> (T, S, A)>);
-
-        impl<'de, T, S, A> serde::de::Visitor<'de> for Elements<T, S, A>
-        where
-            T: serde::Deserialize<'de> + Eq,
-            S: KeyHash<T> + Default,
-            A: Allocator + Default,
-        {
-            type Value = Set<T, S, A>;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a sequence")
-            }
-
-            fn visit_seq<Q: serde::de::SeqAccess<'de>>(self, mut elements: Q) -> Result<Self::Value, Q::Error> {
-                // At most a page's worth up front: the hint is the input's, not to be trusted.
-                let hint = elements.size_hint().unwrap_or(0).min(4096);
-                let mut set = Set::with_capacity_in(hint, A::default());
-                while let Some(value) = elements.next_element()? {
-                    set.insert(value);
-                }
-                Ok(set)
-            }
-        }
-
-        deserializer.deserialize_seq(Elements(PhantomData))
-    }
-}
+// No serde forms: the `serde` feature (hand-written `Serialize`/`Deserialize`, the second on
+// an allocator that is `Default`, so `Global`) was removed on 2026-11-20 (D170 C7). blaze's own
+// records do not go through serde; its last users were blaze-manifest's `EnvConfig` (the
+// cargo layer, a `BTreeMap` now) and one blaze-protocol test.

@@ -12,7 +12,7 @@ use blaze_ids::producer::{Producers, Whole};
 use blaze_native::Platform;
 use blaze_own::{AVec, Alloc};
 
-use super::{ProgramCrate, Table, open_table, program_image, program_key, table_digest, write_table};
+use super::{ProgramCrate, Source, Table, open_table, program_image, program_key, program_libraries, table_digest, write_table};
 use crate::front2::links::{CrateLinks, LinkKind, text_links};
 
 fn table_of<'a>(text: &'a str, alloc: Alloc<'a>) -> AVec<'a, u8> {
@@ -107,9 +107,15 @@ fn a_program_with_no_c_input_gets_a_system_only_image() {
     assert!(links.decls.is_empty() && links.foreign.is_empty() && links.exports.is_empty());
     let links: &CrateLinks<'_> = blaze_own::Box::leak(blaze_own::Box::new_in(links, alloc));
     let crates = [ProgramCrate { package: "app", outputs: None, links }];
-    let key = program_key(&crates, Platform::MacosArm64, &producer, alloc).unwrap_or_else(|e| panic!("the key: {e:?}"));
+    // The one library asked, `c`, resolved as the SDK's `usr/lib/libc.tbd` (libSystem's) states it.
+    let asked = program_libraries(&crates, Platform::MacosArm64, &producer, alloc).unwrap_or_else(|e| panic!("the libraries: {e:?}"));
+    let [one] = asked.as_slice() else { panic!("a program with no C input asks for `c` alone: {asked:?}") };
+    let Source::Stub(at) = one.source else { panic!("macOS names `c` by its stub") };
+    let stub: &[u8] = b"--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\ninstall-name: '/usr/lib/libSystem.B.dylib'\n...\n";
+    let installs = [at.linked(stub).unwrap_or_else(|e| panic!("the stub: {e}"))];
+    let key = program_key(&crates, &installs, Platform::MacosArm64, &producer, alloc).unwrap_or_else(|e| panic!("the key: {e:?}"));
     let mut bytes = AVec::new_in(alloc);
-    let summary = program_image(&crates, Platform::MacosArm64, &producer, FixedState, &mut bytes, alloc)
+    let summary = program_image(&crates, &installs, Platform::MacosArm64, &producer, FixedState, &mut bytes, alloc)
         .unwrap_or_else(|e| panic!("a program with no C input is refused: {e:?}"));
     assert_eq!(summary.inputs, 0, "no archive or object on the link line");
     assert!(!bytes.is_empty(), "no empty case: the image is written");

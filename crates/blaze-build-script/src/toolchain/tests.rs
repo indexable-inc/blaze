@@ -1,8 +1,9 @@
 use blaze_own::{AString, AVec, Alloc, Vec};
+use blaze_pins::CLANG_JSON as PIN;
 use blaze_unit_graph::UnitId;
 
 use super::{
-    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PIN, PinError, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest, placement,
+    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest, placement,
     sysroot,
 };
 use crate::native::Runner;

@@ -22,7 +22,7 @@ fn the_keys_of_mixed_order() {
         let torsion = Point::decode(&TORSION[i + 1]).expect("a small-order point");
         assert_eq!(prime.add(&torsion).encode(), *key, "MIXED_KEYS[{i}] is PRIME_KEY + TORSION[{}]", i + 1);
     }
-    if let Err(broke) = super::mixed_keys_refused() {
+    if let Err(broke) = super::mixed_keys_refused(crate::Plant::None) {
         panic!("{broke}");
     }
 }
@@ -30,7 +30,7 @@ fn the_keys_of_mixed_order() {
 /// T2.
 #[test]
 fn the_range_of_s_at_its_boundaries() {
-    if let Err(broke) = super::s_bounds_hold() {
+    if let Err(broke) = super::s_bounds_hold(crate::Plant::None) {
         panic!("{broke}");
     }
 }
@@ -38,7 +38,7 @@ fn the_range_of_s_at_its_boundaries() {
 /// T6.
 #[test]
 fn points_sharing_a_coordinate_differ() {
-    if let Err(broke) = super::distinct_points_differ() {
+    if let Err(broke) = super::distinct_points_differ(crate::Plant::None) {
         panic!("{broke}");
     }
 }

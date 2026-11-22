@@ -33,7 +33,6 @@ use std::alloc::Global;
 use crate::{
     Cancelled, Key,
     admission::{self, Predict, TaskKind},
-    arena,
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
     pool::{self, Header, Pool as Workers},

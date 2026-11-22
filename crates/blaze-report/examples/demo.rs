@@ -1,9 +1,7 @@
-//! The frame before and after its redesign, in your terminal:
+//! The frame, in your terminal:
 //! `demo [--caps truecolor|256|16|plain|lines] [--width N] [--bg dark|light|unknown]`.
 //!
-//! Each fixture finding is drawn twice, the old renderer's form first (`── before ──`, the
-//! code kept whole in examples/old_frame) and the new one's under it (`── after ──`). The first
-//! two are the owner's own: /Volumes/Projects/tmp/hello-world/src/main.rs, read as it is and
+//! Each fixture finding is drawn as `blaze` draws it. The first two are the owner's own: /Volumes/Projects/tmp/hello-world/src/main.rs, read as it is and
 //! never written (the two `?` `blaze run` refuses), and its Cargo.toml as it stood when he met
 //! the finding (the dependency this build of blaze cannot read yet). Then a name deep in a
 //! function, a span over lines, a label hung to the left, a lint with a fix, a borrow with
@@ -12,11 +10,7 @@
 
 #![feature(allocator_api)]
 
-#[path = "old_frame/mod.rs"]
-#[expect(dead_code, reason = "the old renderer, kept whole for the comparison; the demo calls only its render")]
-mod old_frame;
-
-use blaze_own::{AString};
+use blaze_own::AString;
 use blaze_report::Severity;
 use blaze_report::frame::words::{Area, say, wording};
 use blaze_report::frame::{
@@ -37,48 +31,6 @@ fn at(text: &str, needle: &str, nth: usize) -> u32 {
 fn span<'l>(text: &str, needle: &str, nth: usize, label: &'l str) -> Mark<'l> {
     let start = at(text, needle, nth);
     Mark { start, end: start + needle.len() as u32, label }
-}
-
-/// The old renderer's caps for a level.
-fn old_caps(level: &str, width: u16) -> old_frame::Caps {
-    let caps = match level {
-        "truecolor" => old_frame::Caps::RICH,
-        "256" => old_frame::Caps { colour: old_frame::Colour::Ansi256, ..old_frame::Caps::ANSI },
-        "16" => old_frame::Caps::ANSI,
-        "plain" => old_frame::Caps::FRAMES,
-        _ => old_frame::Caps::LINES,
-    };
-    old_frame::Caps { width, ..caps }
-}
-
-/// The same findings drawn by the old renderer.
-fn old_render(out: &mut AString<'_>, findings: &[Finding<'_>], sources: &[Source<'_>], caps: old_frame::Caps, heap: &'static blaze_own::Heap) {
-    let marks: Vec<Vec<old_frame::Mark<'_>>> = findings
-        .iter()
-        .map(|f| f.secondary.iter().map(|m| old_frame::Mark { start: m.start, end: m.end, label: m.label }).collect())
-        .collect();
-    let edits: Vec<Vec<old_frame::Edit<'_>>> = findings
-        .iter()
-        .map(|f| f.fix.iter().map(|e| old_frame::Edit { start: e.start, end: e.end, insert: e.insert }).collect())
-        .collect();
-    let old: Vec<old_frame::Finding<'_>> = findings
-        .iter()
-        .enumerate()
-        .map(|(at, f)| old_frame::Finding {
-            severity: f.severity,
-            rule: f.rule,
-            message: f.message,
-            file: f.file,
-            item: f.item,
-            primary: old_frame::Mark { start: f.primary.start, end: f.primary.end, label: f.primary.label },
-            secondary: &marks[at],
-            fix: &edits[at],
-        })
-        .collect();
-    let old_sources: Vec<old_frame::Source<'_>> =
-        sources.iter().map(|s| old_frame::Source { shown: s.shown, absolute: s.absolute, text: s.text }).collect();
-    let input = old_frame::Input { findings: &old, sources: &old_sources, link: old_frame::LINK_FILE };
-    old_frame::render(out, &input, caps, heap.alloc()).expect("every range is in its file");
 }
 
 fn main() {
@@ -121,7 +73,6 @@ fn main() {
         _ => Caps::LINES,
     };
     let caps = Caps { width, background: bg, ..caps };
-    let old = old_caps(&level, width);
 
     let main_path = format!("{PROJECT}/src/main.rs");
     let manifest_path = format!("{PROJECT}/Cargo.toml");
@@ -267,9 +218,6 @@ fn main() {
     let mut out = AString::new_in(heap.alloc());
     let mut counts = Counts { files: 8, ..Counts::default() };
     for findings in fixtures {
-        out.push_str("── before ──\n");
-        old_render(&mut out, findings, &sources, old, heap);
-        out.push_str("── after ──\n");
         render(&mut out, &Input { findings, sources: &sources, link: LINK_FILE, fixes: Fixes::ByHand, ids: &[] }, caps, heap.alloc())
             .expect("every range is in its file");
         out.push_str("\n");
@@ -278,7 +226,7 @@ fn main() {
         }
     }
     if caps.form == Form::Frames {
-        out.push_str("── after: the closing line ──\n");
+        out.push_str("── the closing line ──\n");
     }
     closing(&mut out, &Closing { counts, checked: 8, nanos: 2_400_000, changed: Some(0), fixes: Fixes::ByHand, coverage: None, fix_with: "" }, caps);
     print!("{}", out.as_str());

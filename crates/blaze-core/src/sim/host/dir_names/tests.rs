@@ -114,13 +114,12 @@ fn synced_file_in_made_dir(seed: u64, plant: Option<Plant>, sync_parent: bool) -
         sync_root(&mut sim, 5);
     }
     sim.crash();
-    match (sim.was_made(&d), sim.exists(&f)) {
+    match (sim.is_dir(&d), sim.exists(&f)) {
         (true, true) if sim.contents(&f) == KEPT => Ok(Left::Both),
         (true, true) => Err(format!("seed {seed}: d/f holds {:?}, not its synced bytes", sim.contents(&f))),
-        (false, false) if !sim.is_dir(&d) => Ok(Left::Neither),
+        (false, false) => Ok(Left::Neither),
         (made, there) => Err(format!(
-            "seed {seed}: d made {made}, d a directory {}, d/f there {there}: a name outlived its directory or a synced name went alone",
-            sim.is_dir(&d)
+            "seed {seed}: d a directory {made}, d/f there {there}: a name outlived its directory or a synced name went alone"
         )),
     }
 }
@@ -218,8 +217,8 @@ fn removed_with_a_name(seed: u64) -> Result<Back, String> {
     ok(&mut sim, Effect::Remove { file: f.clone(), tag: Tag(6) });
     ok(&mut sim, Effect::RemoveDir { dir: d.clone(), tag: Tag(7) });
     sim.crash();
-    match (sim.was_made(&d), sim.exists(&f)) {
-        (false, false) if !sim.is_dir(&d) => Ok(Back::Gone),
+    match (sim.is_dir(&d), sim.exists(&f)) {
+        (false, false) => Ok(Back::Gone),
         (true, false) => Ok(Back::Empty),
         (true, true) if sim.contents(&f) == KEPT => Ok(Back::WithItsName),
         (made, there) => Err(format!(
@@ -246,4 +245,49 @@ fn a_removed_dir_comes_back_empty_or_with_its_synced_names() {
     for (at, outcome) in [Back::Gone, Back::Empty, Back::WithItsName].into_iter().enumerate() {
         assert!(first[at].is_some(), "no seed of {SEEDS} reached {outcome:?}: {first:?}");
     }
+}
+
+/// (5) `a/b/f` written durably ([`Effect::Write`]) where neither `a` nor `a/b` is there, the
+/// write making both; then `u/w/v` made by an unsynced append (making `u` and `u/w`), its
+/// bytes synced and its name synced into `u/w`, the steps of bstd's `close_synced`; a crash.
+/// Whether each file is gone. Both promise the file under its name after any crash, which
+/// needs each folder made on the way synced into its parent by the effect that made it (the
+/// folders rule, on [`Effect`]; `fs.rs`'s `make_parent`): the append's own sync and the sync
+/// of `u/w` cover the bytes and the name in `u/w`, never `u/w`'s name in `u` or `u`'s in the
+/// root.
+fn written_into_new_folders(seed: u64, plant: Option<Plant>) -> (bool, bool) {
+    let mut sim = world(seed, plant);
+    let (f, v) = (name("a/b/f"), name("u/w/v"));
+    ok(&mut sim, Effect::Write { file: f.clone(), bytes: KEPT.to_vec(), tag: Tag(1) });
+    ok(&mut sim, Effect::Append { file: v.clone(), bytes: KEPT.to_vec(), tag: Tag(2) });
+    ok(&mut sim, Effect::Sync { file: v.clone(), tag: Tag(3) });
+    ok(&mut sim, Effect::SyncDir { dir: name("u/w").into(), tag: Tag(4) });
+    sim.crash();
+    let kept = |sim: &Sim, file: &FileName| sim.exists(file) && sim.contents(file) == KEPT;
+    (!kept(&sim, &f), !kept(&sim, &v))
+}
+
+/// (5): a durable write into folders it made survives every crash, and so does a file synced
+/// with its name into folders an unsynced append made.
+///
+/// Prints `test sim::host::dir_names::tests::a_durable_write_into_new_folders_survives_every_crash ... ok`.
+#[test]
+fn a_durable_write_into_new_folders_survives_every_crash() {
+    let lost = seeds_where("a/b/f, written durably, lost", |seed| written_into_new_folders(seed, None).0);
+    assert!(lost.is_empty(), "seeds {lost:?} lost a file `Effect::Write` called durable, with the folders it made");
+    let lost = seeds_where("u/w/v, appended and synced, lost", |seed| written_into_new_folders(seed, None).1);
+    assert!(lost.is_empty(), "seeds {lost:?} lost a file synced with its name into folders its append made");
+}
+
+/// Control of (5): with the made folders' parents not synced (the drivers before 2026-11-20),
+/// some seed loses each file: the survival is the makings' syncs.
+///
+/// Prints `test sim::host::dir_names::tests::control_a_durable_write_is_lost_with_its_folders_left_unsynced ... ok`.
+#[test]
+fn control_a_durable_write_is_lost_with_its_folders_left_unsynced() {
+    let planted = |seed| written_into_new_folders(seed, Some(Plant::MadeParentsNotSynced));
+    let lost = seeds_where("parents not synced: a/b/f lost", |seed| planted(seed).0);
+    assert!(!lost.is_empty(), "no seed of {SEEDS} lost the write with its folders' parents unsynced: the survival is not the syncs'");
+    let lost = seeds_where("parents not synced: u/w/v lost", |seed| planted(seed).1);
+    assert!(!lost.is_empty(), "no seed of {SEEDS} lost the appended file with its folders' parents unsynced: the survival is not the syncs'");
 }

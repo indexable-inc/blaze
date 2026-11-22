@@ -13,10 +13,13 @@
 #![blaze::sans_io]
 
 use blaze_int::{Int, idx};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{
+    AVec, Alloc,
+    planted::{NoPlant, Planted},
+};
 
 use crate::error::CondError;
-use crate::plant::{self, Plant};
+use crate::plant::CondPlant;
 
 /// The most nodes one arena may hold: a [`Cond`]'s 31 bits of node, less room for the cache's
 /// operation tags above them.
@@ -99,10 +102,6 @@ impl Cond {
     const fn regular(self) -> Cond {
         Cond(self.0 & !1)
     }
-
-    pub(crate) const fn from_raw(raw: u32) -> Cond {
-        Cond(raw)
-    }
 }
 
 impl core::ops::Not for Cond {
@@ -113,18 +112,25 @@ impl core::ops::Not for Cond {
     }
 }
 
-/// An arena's bounds (rule 18).
+/// An arena's bounds (rule 18; D165: a cap is a field here, drawn by the simulation down to its
+/// smallest legal value, tests/mod.rs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The most nodes, the constant included; past it an operation refuses.
+    /// The most nodes, the constant included; past it an operation refuses
+    /// ([`CondError::NodeCap`]). At least 1 and at most [`MOST_NODES`].
     pub nodes: u32,
-    /// The `ite` cache has 2^`cache_bits` entries of 16 bytes, fixed for the arena's life.
+    /// The `ite` cache has 2^`cache_bits` entries of 16 bytes, fixed for the arena's life; at
+    /// most 26.
     pub cache_bits: u8,
 }
 
 impl Limits {
-    /// A task's arena: a million nodes (18 MB at most), a 256 KB cache.
-    pub const TASK: Limits = Limits { nodes: 1 << 20, cache_bits: 14 };
+    /// What a task's arena ships with: a million nodes (18 MB at most), a 256 KB cache.
+    pub const SHIPPED: Limits = Limits { nodes: 1 << 20, cache_bits: 14 };
+    /// The least legal value of each bound: an arena of the constant alone, a one-entry cache.
+    pub const SMALLEST: Limits = Limits { nodes: 1, cache_bits: 0 };
+    /// The most `cache_bits` an arena takes.
+    pub const MOST_CACHE_BITS: u8 = 26;
 }
 
 /// What an arena has done, for the cost example and the profile.
@@ -259,8 +265,13 @@ fn spush<T>(v: &mut AVec<'_, T>, x: T) -> Result<(), CondError> {
     v.try_push(x).map_err(|refused| CondError::Alloc(refused.why))
 }
 
-/// The arena of one task's conditions over one space's variables.
-pub struct Bdd<'a> {
+/// The arena of one task's conditions over one space's variables, as it ships: no plant.
+pub type Bdd<'a> = PlantedBdd<'a, NoPlant>;
+
+/// The arena of one task's conditions over one space's variables, with its plant seam `P`
+/// (D165, rule 78): [`NoPlant`] where it ships ([`Bdd`]), a [`CondPlant`] under a control.
+pub struct PlantedBdd<'a, P> {
+    plant: P,
     vars: u16,
     cap: u32,
     node: AVec<'a, Node>,
@@ -286,17 +297,26 @@ pub struct Bdd<'a> {
     alloc: Alloc<'a>,
 }
 
-impl<'a> Bdd<'a> {
+impl<'a> PlantedBdd<'a, NoPlant> {
     /// An empty arena over `vars` variables, in `alloc`.
     pub fn new_in(vars: usize, limits: Limits, alloc: Alloc<'a>) -> Result<Bdd<'a>, CondError> {
+        PlantedBdd::new_planted(vars, limits, alloc, NoPlant)
+    }
+}
+
+impl<'a, P: Planted<CondPlant>> PlantedBdd<'a, P> {
+    /// An empty arena over `vars` variables, in `alloc`, with the plant `plant` ([`NoPlant`]
+    /// where it ships: [`Bdd::new_in`]).
+    pub fn new_planted(vars: usize, limits: Limits, alloc: Alloc<'a>, plant: P) -> Result<PlantedBdd<'a, P>, CondError> {
         let Ok(vars) = u16::try_from(vars) else { return Err(CondError::TooManyVars { vars }) };
         if vars > MOST_VARS {
             return Err(CondError::TooManyVars { vars: vars.widen_to::<usize>() });
         }
-        if limits.nodes > MOST_NODES || limits.nodes == 0 || limits.cache_bits > 26 {
+        if limits.nodes > MOST_NODES || limits.nodes < Limits::SMALLEST.nodes || limits.cache_bits > Limits::MOST_CACHE_BITS {
             return Err(CondError::BadLimits { nodes: limits.nodes, cache_bits: limits.cache_bits });
         }
-        let mut bdd = Bdd {
+        let mut bdd = PlantedBdd {
+            plant,
             vars,
             cap: limits.nodes,
             node: AVec::new_in(alloc),
@@ -388,7 +408,7 @@ impl<'a> Bdd<'a> {
         if low == high {
             return Ok(low);
         }
-        let (low, high, neg) = if high.is_neg() && !plant::on(Plant::UniqueSkipsComplement) {
+        let (low, high, neg) = if high.is_neg() && !self.plant.has(CondPlant::UniqueSkipsComplement) {
             (low.not(), high.not(), true)
         } else {
             (low, high, false)
@@ -458,8 +478,8 @@ impl<'a> Bdd<'a> {
 
     /// `ite`'s cache key for `h`: the whole of it, or nothing under the planted bug.
     #[inline]
-    fn ite_key(h: Cond) -> u32 {
-        if plant::on(Plant::IteCacheSkipsElse) { 0 } else { h.0 }
+    fn ite_key(&self, h: Cond) -> u32 {
+        if self.plant.has(CondPlant::IteCacheSkipsElse) { 0 } else { h.0 }
     }
 
     fn result(&mut self) -> Cond {
@@ -477,7 +497,7 @@ impl<'a> Bdd<'a> {
                 Frame::Ite(f, g, h) => match normalize(f, g, h) {
                     Norm::Done(r) => spush(&mut self.results, r)?,
                     Norm::Go { f, g, h, neg } => {
-                        if let Some(r) = self.cache_get(f.0, g.0, Self::ite_key(h)) {
+                        if let Some(r) = self.cache_get(f.0, g.0, self.ite_key(h)) {
                             self.stats.hits += 1;
                             spush(&mut self.results, r.neg_if(neg))?;
                             continue;
@@ -496,7 +516,8 @@ impl<'a> Bdd<'a> {
                     let high = self.result();
                     let low = self.result();
                     let r = self.mk(var, low, high)?;
-                    self.cache_put(f.0, g.0, Self::ite_key(h), r);
+                    let key = self.ite_key(h);
+                    self.cache_put(f.0, g.0, key, r);
                     spush(&mut self.results, r.neg_if(neg))?;
                 }
                 Frame::Restrict { f, var, value } => {
@@ -505,7 +526,7 @@ impl<'a> Bdd<'a> {
                         spush(&mut self.results, f)?;
                     } else if top == var {
                         let (low, high) = self.cof(f, var);
-                        let take = value != plant::on(Plant::RestrictWrongBranch);
+                        let take = value != self.plant.has(CondPlant::RestrictWrongBranch);
                         spush(&mut self.results, if take { high } else { low })?;
                     } else {
                         let neg = f.is_neg();
@@ -778,7 +799,7 @@ impl<'a> Bdd<'a> {
         self.counts.clear();
         self.counts.try_reserve(self.order.len())?;
         // Models of edge `e` over the variables from its node's on.
-        let from = |bdd: &Bdd<'_>, e: Cond| -> (u128, u32) {
+        let from = |bdd: &Self, e: Cond| -> (u128, u32) {
             let lvl = u32::from(bdd.level(e)).min(n);
             let m = if e.node() == 0 { 1 } else { bdd.counts[idx(bdd.slot[idx(e.node())] - 1)] };
             let m = if e.is_neg() { (1u128 << (n - lvl)) - m } else { m };

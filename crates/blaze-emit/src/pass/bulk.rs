@@ -134,7 +134,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.ld(X10, b);
                 let mut to_end: Vec<u32, Global> = Vec::new_in(Global);
                 for (off, size) in pieces(n) {
-                    // (`mem` takes `x11` for an offset past its immediates, never `x0`, `x1`.)
+                    // (`mem` takes `FAR`, `x16`, for an offset past its immediates, never `x0`, `x1`.)
                     self.mem(true, size, X0, X9, off as i32);
                     self.mem(true, size, X1, X10, off as i32);
                     self.put(enc::cmp(X0, X1));

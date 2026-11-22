@@ -15,7 +15,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Record, Slice, Writer, open, record};
+use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts, open, record};
 use blaze_own::{AVec, Alloc};
 
 use crate::registry::RunEvent;
@@ -106,7 +106,7 @@ fn column<T: Record>(
 /// buffer is `std`'s vector because blaze-format's `Writer` still hands one back: blaze-own lacks
 /// nothing here, blaze-format has yet to move onto it.
 pub fn write<'a>(events: &[RunEvent], alloc: Alloc<'a>) -> std::vec::Vec<u8, Alloc<'a>> {
-    let mut writer = Writer::new_in(Batch::SCHEMA, alloc);
+    let mut writer = Writer::new(WriterOpts { schema: Batch::SCHEMA, alloc: alloc, capacity: None });
     let kinds = column(&mut writer, events, |event| Some(row(event).0));
     let at = column(&mut writer, events, |event| Some(row(event).1));
     let values = column(&mut writer, events, |event| Some(row(event).2));

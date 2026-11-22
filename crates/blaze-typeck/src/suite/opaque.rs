@@ -403,7 +403,11 @@ fn an_async_fn_returning_the_wrong_type_is_one_mismatch_at_the_value() {
     let inner = b.block(&[], Some(a));
     let root = b.async_block(inner, crate::body::Capture::Move);
     let c = check_body(&fx, &b, h, root, Plant::None, InferPlant::None);
-    let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::Mismatch, a)] };
-    let d = written(differences(&fx, &b, &c, &want));
-    assert!(d.is_empty(), "\n{}", d.join("\n"));
+    let [diag] = c.diags.as_slice() else { panic!("one error at the returned string: {:?}", c.diags) };
+    assert_eq!(diag.code, DiagCode::Mismatch);
+    assert_eq!(diag.node, Some(crate::diag::Node::Expr(a)));
+    assert_eq!(diag.at, b.view(h, root).expr_range(a));
+    let types = c.types.view();
+    assert_eq!(crate::fixture::show(&fx, types, diag.expected.expect("written return type")), "u8");
+    assert_eq!(crate::fixture::show(&fx, types, diag.found.expect("returned value")), "&str");
 }

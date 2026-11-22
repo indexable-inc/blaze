@@ -547,6 +547,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         // What the code read, once per evaluation: its body, and the records its compile read.
         if !self.entered.contains(&ci) {
             self.entered.push(ci);
+            self.world.entered_body(c.item);
             self.read_add(c.hash);
             for &r in c.reads.iter() {
                 self.read_add(r);

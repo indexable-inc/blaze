@@ -63,7 +63,7 @@ mod engine {
 
     use blaze_ids::ContentId;
     use blaze_mem::Tag;
-    use blaze_memo::{Alone, Builder, Config, Database, Fact, Id, Memo, Reads};
+    use blaze_memo::{Alone, Builder, Config, Database, Fact, Memo, Reads};
 
     use super::{
         CYCLE, EDGES, FAN, KEYS, LAYERS, LEAVES, POOL, READERS, WIDTH, pick, spread, walk,

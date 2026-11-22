@@ -27,7 +27,15 @@ impl Io {
         let driver = blaze_core::native_in(os, world.root, world.threads).map_err(|error| refused(error.to_string()))?;
         // alloc: an error's message.
         let host = crate::native::host_facts(world.host_name, driver.now()).map_err(|error| refused(error.to_string()))?;
-        Ok(Io::over(Start {
+        // The world's workers (D171): bstd's own cells, no slots; a program that registers
+        // slots hands its own `Workers` (`Io::on_workers`, `rt::run_with_workers`). One sparse
+        // reservation, nothing backed until a task uses its cell; no seed, as the start draws
+        // no randomness.
+        let setup = crate::workers::WorkersSetup { limits: crate::workers::Limits::BARE, seed: world.seed, models: 0 };
+        // alloc: an error's message.
+        let workers = crate::workers::Workers::bare(setup).map_err(|error| refused(error.to_string()))?;
+        Ok(Io::over(
+            Start {
             // alloc: once per process, the driver.
             driver: Backend::Native(Box::new(driver)),
             seed: world.seed,
@@ -40,6 +48,8 @@ impl Io {
             hosted: None,
             disk: None,
             plant: Plant::None,
-        }))
+            },
+            workers,
+        ))
     }
 }

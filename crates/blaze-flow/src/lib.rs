@@ -40,7 +40,7 @@ pub use flow::{
     Block, BorrowKind, Bound, Flow, FlowBuilder, FlowError, Loan, Local, Operand, Origin, Place,
     PlaceMark, Point, Proj, Span, Stmt, StmtKind, Value,
 };
-pub use loans::{BorrowFinding, TierOne};
+pub use loans::{BorrowFinding, Kept, LoanParts, TierOne};
 pub use moves::{DropKind, MoveFinding, MoveFindingKind, MoveOut};
 pub use record::{Checked, Record, check, check_named};
 pub use suspend::{Saved, saved};

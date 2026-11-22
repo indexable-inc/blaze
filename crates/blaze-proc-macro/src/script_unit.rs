@@ -69,6 +69,8 @@ pub enum UnitScriptError {
     ServesNothing { package: String },
     /// No module record of the package with exactly these features.
     NoModule { package: String, features: Vec<String>, store: PathBuf },
+    /// The module store could not answer the lookup.
+    Lookup(ModuleLookupError),
     /// The module record's bytes could not be read.
     ReadModule { path: PathBuf, error: std::io::Error },
     /// The caller has no files for the package.
@@ -100,6 +102,7 @@ impl std::fmt::Display for UnitScriptError {
                 features.join(","),
                 store.display()
             ),
+            UnitScriptError::Lookup(error) => write!(f, "{error}"),
             UnitScriptError::ReadModule { path, error } => write!(f, "{}: {error}", path.display()),
             UnitScriptError::NoFiles { package } => write!(f, "no files of {package} to run its build script over"),
             UnitScriptError::Script(error) => write!(f, "{error}"),
@@ -123,52 +126,103 @@ impl std::error::Error for UnitScriptError {}
 /// The module record (`<store>/build-script/modules/<key>`) of `name version` compiled with
 /// exactly `features`: the one whose identity names all three. A native script's record (its
 /// identity has a `target` line, D69) is never it: that one holds `script.bin`, not a module.
-pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Option<PathBuf> {
+/// `Ok(None)`: the store holds no such record (no `modules` folder at all included).
+pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Result<Option<PathBuf>, ModuleLookupError> {
     module_where(store, name, version, features, None)
 }
 
 /// The native binary record (`<store>/build-script/modules/<key>`, holding `script.bin`) of
 /// `name version` built for `host` with exactly `features` (D69: the interim builder's
 /// `native` mode, whose identity adds `target <host>`).
-pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Option<PathBuf> {
+pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Result<Option<PathBuf>, ModuleLookupError> {
     module_where(store, name, version, features, Some(host))
+}
+
+/// Why the module store could not answer a lookup: each names the path (rule 19), and none is
+/// taken as "no record" (rule 3).
+#[derive(Debug)]
+pub enum ModuleLookupError {
+    /// The store's `build-script/modules` folder could not be listed (other than absent).
+    List { folder: PathBuf, error: std::io::Error },
+    /// A record's `identity` could not be read: a record without one is not a record.
+    Identity { path: PathBuf, error: std::io::Error },
+    /// Two records answer one ask (a toolchain or closure each, same name, version, features
+    /// and runner): which is meant is not decided by the store's listing order (rules 21, 25).
+    Ambiguous { first: PathBuf, second: PathBuf },
+}
+
+impl std::fmt::Display for ModuleLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleLookupError::List { folder, error } => write!(f, "{}: the module store could not be listed: {error}", folder.display()),
+            ModuleLookupError::Identity { path, error } => write!(f, "{}: a module record's identity could not be read: {error}", path.display()),
+            ModuleLookupError::Ambiguous { first, second } => write!(
+                f,
+                "{} and {}: two module records answer one ask (name, version, features, runner); remove the stale one",
+                first.display(),
+                second.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModuleLookupError {}
+
+/// Each record of the store as (its folder, its identity's text), sorted by folder; none when
+/// the store has no `modules` folder.
+///
+/// A listing and one read a record: the interim builder names a record by the SHA-256 of its
+/// whole identity (scripts proc_macro_modules build_scripts.rs: origin, the lock's closure,
+/// toolchain, shim), which an ask (name, version, features, runner) cannot compute, so the
+/// folder cannot be joined from the ask until the builder also writes an ask-named pointer.
+fn records(store: &Path) -> Result<Vec<(PathBuf, String)>, ModuleLookupError> {
+    let folder = store.join("build-script/modules");
+    let entries = match std::fs::read_dir(&folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(ModuleLookupError::List { folder, error }),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| ModuleLookupError::List { folder: folder.clone(), error })?;
+        let path = entry.path().join("identity");
+        let identity = std::fs::read_to_string(&path).map_err(|error| ModuleLookupError::Identity { path, error })?;
+        found.push((entry.path(), identity));
+    }
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
 }
 
 /// Every record of the store whose identity names `name` and `version`, whatever its features
 /// and runner: (its folder, its identity's text), sorted by folder. What a refusal of a lookup
 /// shows beside the asked identity (rule 19): which line of the nearest record differs.
-pub fn records_named(store: &Path, name: &str, version: &str) -> Vec<(PathBuf, String)> {
+pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(PathBuf, String)>, ModuleLookupError> {
     let (name, version) = (format!("name {name}"), format!("version {version}"));
-    let Ok(entries) = std::fs::read_dir(store.join("build-script/modules")) else { return Vec::new() };
-    let mut found: Vec<(PathBuf, String)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let identity = std::fs::read_to_string(entry.path().join("identity")).ok()?;
-            (identity.lines().any(|l| l == name) && identity.lines().any(|l| l == version)).then(|| (entry.path(), identity))
-        })
-        .collect();
-    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    found
+    let mut found = records(store)?;
+    found.retain(|(_, identity)| identity.lines().any(|l| l == name) && identity.lines().any(|l| l == version));
+    Ok(found)
 }
 
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
-/// <host>`; for `None`, one with no `target` line (a wasm module).
-fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Option<PathBuf> {
+/// <host>`; for `None`, one with no `target` line (a wasm module). Two such records are a
+/// typed refusal, never the first in the listing's order.
+fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
-    for entry in std::fs::read_dir(store.join("build-script/modules")).ok()?.flatten() {
-        let identity = std::fs::read_to_string(entry.path().join("identity")).unwrap_or_default();
+    let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
         let runner_fits = match &target {
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("target ")),
         };
-        if runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want)) {
-            return Some(entry.path());
-        }
+        runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
+    });
+    let Some((first, _)) = fits.next() else { return Ok(None) };
+    match fits.next() {
+        Some((second, _)) => Err(ModuleLookupError::Ambiguous { first, second }),
+        None => Ok(Some(first)),
     }
-    None
 }
 
 /// The unit build-script unit `script` serves: the library (or proc macro) whose
@@ -255,7 +309,7 @@ pub fn prepare_viewing_on<'a>(
     let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
     let serves = &graph.units[serves.index()];
     let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).ok_or_else(|| UnitScriptError::NoModule {
+    let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
         package: package.clone(),
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.to_owned(),

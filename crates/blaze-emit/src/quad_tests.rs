@@ -90,7 +90,8 @@ fn quad_and_half_encodings() {
 #[test]
 fn unlegalized_f128_arithmetic_is_refused_by_name() {
     let mut code = Code::new_in(Global);
-    let refused = emit(add_f128().view(), &[], ISA, &mut code);
+    let func = add_f128();
+    let refused = emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &[], ISA, &mut code);
     assert!(
         matches!(refused, Err(EmitError::Legalize(blaze_lir::legalize::LegalizeError::NoRoutine(r))) if r.symbol() == "__addtf3"),
         "an unlegalized f128 add: {refused:?}"
@@ -125,7 +126,7 @@ fn an_f128_add_calls_addtf3_in_q_registers() {
     assert!(called.contains(SoftFloat::AddTf3), "{called:?}");
     let legal = legal.expect("an f128 add is rewritten");
     let mut code = Code::new_in(Global);
-    emit(legal.view(), &[Via::Address], ISA, &mut code)
+    emit(blaze_lir::verify(legal.view()).expect("the legalized function is LIR"), &[Via::Address], ISA, &mut code)
         .unwrap_or_else(|why| panic!("the legalized f128 add emits on the Reference tier: {why:?}"));
     assert_eq!(code.fixups.len(), 1, "one literal word: __addtf3's");
     assert_eq!(code.fixups[0].place, 0);

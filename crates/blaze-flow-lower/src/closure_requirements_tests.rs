@@ -19,9 +19,11 @@
 //! both ways (an invariant one, `&mut &'a S`).
 
 use blaze_typeck::fixture::Bb;
+use blaze_typeck::regions::Region;
 
 use crate::callee_value_tests::{Lane, no_clauses, world_with};
-use crate::tests::findings_with;
+use crate::region_fixture::{FnHead, P0, P1};
+use crate::tests::findings_laid;
 use crate::{Need, Plant, Requirement};
 
 /// The captured `a`'s referent outlives `'static` (the module doc).
@@ -36,15 +38,22 @@ const A_STATIC: [Requirement; 1] = [Requirement { from: Need::Capture(1), into: 
 /// NoRequirements: []`.
 #[test]
 fn a_closure_requirement_is_the_owners_finding_at_the_closure() {
-    let mut owner = None;
+    let mut owners = None;
     let w = world_with(|fx, _st, rs, unit| {
-        let _ = fx.func("two", 0, &[rs, rs], unit, no_clauses());
-        owner = Some(fx.func("f", 0, &[rs, rs], unit, no_clauses()));
+        let two = fx.func("two", 0, &[rs, rs], unit, no_clauses());
+        owners = Some((two, fx.func("f", 0, &[rs, rs], unit, no_clauses())));
     });
-    let f = owner.expect("declared");
-    for (text, stated) in [
-        ("fn f<'a, 'b>(a: &'a S, b: &'b S) { let c = || two(a, b); c(); }", false),
-        ("fn f<'b>(a: &'static S, b: &'b S) { let c = || two(a, b); c(); }", true),
+    let (two, f) = owners.expect("declared");
+    // `fn two(_: &S, _: &S)`: two elided input lifetimes `P0`, `P1`, both late-bound.
+    let two_head = FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[w.rs, w.rs], output: w.unit, slots: &[P0, P1] };
+    // `fn f<'a, 'b>(a: &'a S, b: &'b S)`: `'a` is `P0`, `'b` `P1`, both late-bound (in the
+    // inputs, named by no bound): `[P0, P1]`.
+    let unstated = FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[w.rs, w.rs], output: w.unit, slots: &[P0, P1] };
+    // `fn f<'b>(a: &'static S, b: &'b S)`: `'b` is `P0`, late-bound: `[Static, P0]`.
+    let stated_head = FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rs, w.rs], output: w.unit, slots: &[Region::Static, P0] };
+    for (_text, head, stated) in [
+        ("fn f<'a, 'b>(a: &'a S, b: &'b S) { let c = || two(a, b); c(); }", unstated, false),
+        ("fn f<'b>(a: &'static S, b: &'b S) { let c = || two(a, b); c(); }", stated_head, true),
     ] {
         let mut b = Bb::new();
         let (pa, pb) = (b.param("a"), b.param("b"));
@@ -58,11 +67,12 @@ fn a_closure_requirement_is_the_owners_finding_at_the_closure() {
         let call = b.call(lc, &[]);
         let st2 = b.semi(call);
         let root = b.block(&[st1, st2], None);
-        let mut facts = Lane::new();
-        facts.wide.add(&w.fx, f, text, &[w.rs, w.rs], w.unit);
+        let mut facts = Lane::of(&w);
+        facts.wide.add(two, two_head);
+        facts.wide.add(f, head);
         facts.closure = Some(cl);
         facts.reqs = &A_STATIC;
-        let got = findings_with(&w.fx, &b, f, root, &facts, Plant::None);
+        let got = findings_laid(&w.fx, &b, f, root, &facts, Plant::None);
         std::println!("requirement {}: {got:?}", if stated { "stated" } else { "unstated" });
         let got = got.expect("lowered");
         if stated {
@@ -74,7 +84,7 @@ fn a_closure_requirement_is_the_owners_finding_at_the_closure() {
         core::fmt::Write::write_fmt(&mut at, format_args!("span: Span {{ lo: {}, hi: {} }}", range.start, range.end)).expect("fits");
         let at = at.text().expect("fits");
         assert!(got.iter().any(|l| l.starts_with("borrow UnprovenOutlives") && l.contains(at)), "{got:?}; the closure at {at}");
-        let planted = findings_with(&w.fx, &b, f, root, &facts, Plant::NoRequirements);
+        let planted = findings_laid(&w.fx, &b, f, root, &facts, Plant::NoRequirements);
         std::println!("requirement unstated, planted NoRequirements: {planted:?}");
         assert!(planted.as_ref().is_ok_and(|p| p.is_empty()), "{planted:?}");
     }

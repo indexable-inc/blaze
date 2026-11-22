@@ -191,9 +191,11 @@ fn a_private_fn_added_enters_its_body_and_head_alone() {
     checks_clean(&first, "the first request");
     let added = format!("{C}\nfn extra() -> u32 {{\n    7\n}}\n");
     let answers = request(&sides, "a private fn added", &[("src/c.rs", &added)]);
-    cells_entered(&answers, "a private fn added", 1, 1);
-    assert_eq!(bodies_for(&answers[0].checked, "new"), 1, "a private fn added: its body, new: {}", entries(&answers[0].checked));
-    assert!(bodies(&answers[1].checked) > 1, "CONTROL: under Whole the probes of a primitive's methods are entered: {}", entries(&answers[1].checked));
+    // D191: every unit that holds a body checks it, a row each; the library and its test build
+    // hold `extra`, so its body is 2 rows entered.
+    cells_entered(&answers, "a private fn added", 2, 1);
+    assert_eq!(bodies_for(&answers[0].checked, "new"), 2, "a private fn added: its body, new, in its 2 units' rows (D191): {}", entries(&answers[0].checked));
+    assert!(bodies(&answers[1].checked) > 2, "CONTROL: under Whole the probes of a primitive's methods are entered, past the new body's 2 rows (D191): {}", entries(&answers[1].checked));
     assert!(!whole_record_lines(&answers[1].profile).is_empty(), "CONTROL: under Whole the cause is a record read whole:\n{}", answers[1].profile);
     let removed = request(&sides, "the private fn removed", &[("src/c.rs", C)]);
     cells_entered(&removed, "the private fn removed", 0, 0);
@@ -214,8 +216,8 @@ fn an_unused_pub_fn_added_enters_its_body_and_head_alone() {
     checks_clean(&first, "the first request");
     let added = format!("{C}\npub fn unused() -> u32 {{\n    9\n}}\n");
     let answers = request(&sides, "an unused pub fn added", &[("src/c.rs", &added)]);
-    cells_entered(&answers, "an unused pub fn added", 1, 1);
-    assert_eq!(bodies_for(&answers[0].checked, "new"), 1, "an unused pub fn added: its body, new: {}", entries(&answers[0].checked));
+    cells_entered(&answers, "an unused pub fn added", 2, 1);
+    assert_eq!(bodies_for(&answers[0].checked, "new"), 2, "an unused pub fn added: its body, new, in its 2 units' rows (D191: the library's and its test build's): {}", entries(&answers[0].checked));
 }
 
 /// A FN `a` CALLS RENAMED (`b::grow` to `b::grown`): the renamed body, new, and its one caller
@@ -233,8 +235,9 @@ fn a_renamed_callee_enters_its_caller_alone() {
     let answers = request(&sides, "a callee renamed", &[("src/b.rs", &renamed)]);
     println!("a callee renamed: cells {}; findings {:?}", entries(&answers[0].checked), answers[0].placed);
     assert!(answers[2].failed && !answers[2].placed.is_empty(), "a callee renamed: the caller reports it: {:?}", answers[2].placed);
-    assert_eq!(bodies_for(&answers[0].checked, "new"), 1, "a callee renamed: the renamed body, new: {}", entries(&answers[0].checked));
-    assert_eq!(bodies(&answers[0].checked), 2, "a callee renamed: the renamed body and its one caller: {}", entries(&answers[0].checked));
+    // D191: each body is checked in its 2 units' rows (the library's and its test build's).
+    assert_eq!(bodies_for(&answers[0].checked, "new"), 2, "a callee renamed: the renamed body, new, in its 2 units' rows (D191): {}", entries(&answers[0].checked));
+    assert_eq!(bodies(&answers[0].checked), 4, "a callee renamed: the renamed body and its one caller, 2 rows each (D191): {}", entries(&answers[0].checked));
     assert!(whole_record_lines(&answers[0].profile).is_empty(), "a callee renamed: a body entered for a record read whole:\n{}", answers[0].profile);
 }
 
@@ -272,8 +275,9 @@ fn an_impl_added_enters_only_the_bodies_its_answers_move() {
     let added = format!("{C}\nimpl crate::Measure for Meter {{\n    fn measure(&self) -> u32 {{\n        self.n\n    }}\n}}\n");
     let answers = request(&sides, "an impl added", &[("src/c.rs", &added)]);
     println!("an impl added: cells {}", entries(&answers[0].checked));
-    assert_eq!(bodies_for(&answers[0].checked, "new"), 1, "an impl added: its fn's body, new: {}", entries(&answers[0].checked));
-    assert!(bodies(&answers[0].checked) <= 2, "an impl added: its fn's body and at most `d::m`: {}", entries(&answers[0].checked));
+    // D191: each body is checked in its 2 units' rows (the library's and its test build's).
+    assert_eq!(bodies_for(&answers[0].checked, "new"), 2, "an impl added: its fn's body, new, in its 2 units' rows (D191): {}", entries(&answers[0].checked));
+    assert!(bodies(&answers[0].checked) <= 4, "an impl added: its fn's body and at most `d::m`, 2 rows each (D191): {}", entries(&answers[0].checked));
     assert!(whole_record_lines(&answers[0].profile).is_empty(), "an impl added: a body entered for a record read whole:\n{}", answers[0].profile);
 }
 
@@ -339,4 +343,61 @@ fn a_planted_reader_without_the_glob_member_set_is_caught() {
     assert!(!answers[2].1 && answers[2].0.is_empty(), "the fresh run: `grow2` found through the glob: {:?}", answers[2]);
     assert_eq!((&answers[0].0, answers[0].1), (&answers[2].0, answers[2].1), "Cells answers as fresh: {}", answers[0].2);
     assert_ne!((&answers[3].0, answers[3].1), (&answers[2].0, answers[2].1), "CONTROL: the planted reader's answer is stale, and the oracle sees it: {}", answers[3].2);
+}
+
+/// The package of [`including`]: one `#![no_core]` library, with `include_str!` its own builtin
+/// (as engine_body_memory_tests.rs `FACT_LIB`), so the shelf's prelude is not in the measure.
+const INCLUDING_MANIFEST: &str = "[package]\nname = \"inc\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+/// Two bodies that read no file.
+const INCLUDING_LIB: &str = "#![no_core]\n#[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\npub fn plain() {}\npub fn calls() { plain() }\n";
+/// A body that includes a file of its own package.
+const INCLUDING_BODY: &str = "pub fn reads() { let _value = include_str!(\"../assets/g.json\"); }\n";
+
+/// The fixture: [`INCLUDING_LIB`], with [`INCLUDING_BODY`] when `with_include`.
+fn including(io: &Io, with_include: bool) -> std::string::String {
+    let lib = if with_include { format!("{INCLUDING_LIB}{INCLUDING_BODY}") } else { INCLUDING_LIB.to_owned() };
+    write(io, "Cargo.toml", INCLUDING_MANIFEST);
+    write(io, "src/lib.rs", &lib);
+    write(io, "assets/g.json", "{\"n\":1}\n");
+    lib
+}
+
+/// AN ITEM ADDED ENTERS NO BODY THAT READS NO FILE. D111's include filing asks a body's file
+/// (over records: the items section WHOLE, tables view.rs `file_paths`) only at the body's first
+/// include read (blaze-ladder front2/body_left.rs `file_body_left_includes`, 2026-11-21). Asked of
+/// every body (body.rs before: `body_file` for each), a struct added entered every body of the
+/// crate in every unit's row, "read moved CrateScope (names cell)" (run t82: R6 14 where 2).
+///
+/// THE CAUSE'S READ, KEPT (rule 23): a body that DOES include a file reads its file row, through
+/// its host and the filing alike, so the same struct added enters it, its rows alone (D191: "Every
+/// unit that holds a body checks it"; the rows per body are the first request's new rows over its
+/// bodies). That is the eager read's effect, on the one body that makes it. OPEN (said, not
+/// hidden): the file row has no cell of its own (names_cells.rs: `Whole { Items }`), so an
+/// including body re-enters on ANY item of its crate added, not only when its file's place moves.
+///
+/// Prints `an item added: 0 bodies entered; an including body: its 2 rows` (2 with D191's lib
+/// and lib-test units).
+#[test]
+fn an_item_added_enters_no_body_that_reads_no_file() {
+    let mut rows_seen = 0;
+    for (with_include, seed) in [(false, 41u64), (true, 43u64)] {
+        let what = if with_include { "with an including body" } else { "no body includes" };
+        let sides = sides(seed);
+        let lib = sides.iter().map(|side| including(&side.io, with_include)).last().expect("three sides");
+        let first = request(&sides, what, &[]);
+        assert!(first.iter().all(|answer| !answer.failed), "{what}: the first request fails no body: {}", entries(&first[0].checked));
+        let n_bodies = if with_include { 3 } else { 2 };
+        let new = bodies_for(&first[0].checked, "new");
+        assert_eq!(new % n_bodies, 0, "{what}: each of the {n_bodies} bodies is new in as many units' rows (D191): {}", entries(&first[0].checked));
+        let rows = new / n_bodies;
+        assert!(rows > 0, "{what}: the first request checks the bodies: {}", entries(&first[0].checked));
+        rows_seen = rows;
+        let added = format!("{lib}pub struct Extra;\n");
+        let answers = request(&sides, &format!("{what}: an unrelated struct added"), &[("src/lib.rs", &added)]);
+        let cells = &answers[0].checked;
+        let want = if with_include { rows } else { 0 };
+        assert_eq!(bodies(cells), want, "{what}: an unrelated struct added enters {} under Cells (body_left.rs `file_body_left_includes` asks the file at an include alone): {}\n{}", if with_include { "the including body's rows alone" } else { "no body" }, entries(cells), because_lines(&answers[0].profile).join("\n"));
+        println!("{what}: an unrelated struct added: cells {}; whole {}", entries(cells), entries(&answers[1].checked));
+    }
+    println!("an item added: 0 bodies entered; an including body: its {rows_seen} rows");
 }

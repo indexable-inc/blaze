@@ -385,3 +385,140 @@ fn links_agree_on_drawn_crates() {
         }
     });
 }
+
+/// Every name of the crate rooted at `root` agrees, solved after its dependencies; the
+/// disagreement is the panic's text.
+fn agrees_world(w: &World, root: ItemKey) -> crate::links::Agreed {
+    match crate::cells::links_agree_world(w, root) {
+        Ok(a) => {
+            assert_eq!(a.agreed + a.unfollowed_total(), a.names, "{a}");
+            a
+        }
+        Err(d) => panic!("{d}"),
+    }
+}
+
+/// The 23 of tempo (21 Nov 05:33, oracle.out), kind 1 of 4: a `#[macro_export]` in the own text
+/// of a module whose `mod` item an expansion wrote (commonware-utils `stability_scope!(ALPHA, ..
+/// { pub mod hostname; })` with `#[macro_export] macro_rules! hostname` in `hostname.rs`; the
+/// same in commonware-codec `mode`, -formatting `hex`, -runtime `spawn_cell`, nix
+/// `getsockopt_impl` under `feature! { pub mod socket; }`). The Reference, "Macros By Example",
+/// "Path-based scope": "macros labeled with `#[macro_export]` are always `pub` and can be
+/// referred to by other crates, either by path or by `#[macro_use]`"; the crate places them in
+/// its root. The records' `Exported` table held it; the old answer, rebuilt by the harness from
+/// the written scopes' expansion-written exports alone, missed what resolve.rs publishes as
+/// `in_made` (cells/agree.rs). The twin: the same export in a module of the crate's own text,
+/// in the root's own scope on both sides.
+///
+/// Should print: `test tests::module_links::an_export_in_a_module_an_expansion_declared_agrees ... ok`
+#[test]
+fn an_export_in_a_module_an_expansion_declared_agrees() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "mk");
+    let call = w.call(root, "mk", crate::CallShape::FnLike);
+    let p = w.module(call, "p", V::Pub);
+    w.rules_with(p, "made_export", true);
+    let a = agrees_world(&w, root);
+    assert!(a.names > 0, "{a}");
+    // The twin: a module of the crate's own text.
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let q = w.module(root, "q", V::Pub);
+    w.rules_with(q, "own_export", true);
+    agrees_world(&w, root);
+}
+
+/// Kind 2 of 4: a written `super` or `self` in a block's module (h2 0.4.20 streams.rs `use
+/// super::stream::ContentLength;` in `fn send_request`; tokio chan.rs `use super::block::Read;`;
+/// serde_core ser/impls.rs `use super::SerializeStruct`; alloy's `TransactionEnvelope` derive
+/// writing `const _: () = { use super::*; .. }`, in alloy-consensus and tempo-primitives). The
+/// Reference, `paths.qualifiers.super`: "`super` in a path resolves to the parent module"; a
+/// block is an anonymous scope, no module, so `super` from a block is the parent of the module
+/// around the body. The rows held the path as written and the lookup counted the blocks
+/// (cells/made.rs `table_kind`). The block's own lexical `use super::*;` (its first import)
+/// still reaches its parent: `OnlyInStreams` is asked through it. The twin: a named module in
+/// the block's place, where `super` is that module's parent and one more `super` is needed.
+///
+/// Should print: `test tests::module_links::super_in_a_block_passes_over_the_blocks ... ok`
+#[test]
+fn super_in_a_block_passes_over_the_blocks() {
+    let build = |inner: N, content_length: &'static str| {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let stream = w.module(root, "stream", V::Priv);
+        w.item(stream, "ContentLength", Namespace::Types, crate::DefKind::Enum, V::Pub);
+        let streams = w.module(root, "streams", V::Priv);
+        w.item(streams, "OnlyInStreams", Namespace::Types, crate::DefKind::Other, V::Pub);
+        let block = w.module(streams, inner, V::Priv);
+        w.glob(block, "super", V::Priv);
+        w.use_(block, content_length, V::Priv);
+        let nested = w.module(block, "__blaze_block_1", V::Priv);
+        w.glob(nested, "super", V::Priv);
+        w.use_as(nested, "self::OnlyInStreams", "SelfFromNested", V::Priv);
+        (w, root)
+    };
+    let (w, root) = build("__blaze_block_0", "super::stream::ContentLength");
+    agrees_world(&w, root);
+    let (w, root) = build("named", "super::super::stream::ContentLength");
+    agrees_world(&w, root);
+}
+
+/// Kind 3 of 4: two imports of one name, each binding another namespace (core slice `use
+/// crate::{.., range, ..};` then `pub use index::{range, ..};`; der `pub use
+/// crate::{ord::ValueOrd}` then `pub use der_derive::ValueOrd;`; fixed-map `Key`; tempo
+/// precompiles `Storable`, a trait and its derive). The Reference, "Use declarations" and
+/// "Names", "Namespaces": a `use` binds its name in each namespace its target has, and names
+/// in different namespaces may overlap. The first import's path was every namespace's row, so
+/// the derive answered absent (cells/made.rs `row_import`). Both orders; the twin: one import,
+/// the derive absent on both sides.
+///
+/// Should print: `test tests::module_links::two_imports_of_one_name_each_keep_their_namespace ... ok`
+#[test]
+fn two_imports_of_one_name_each_keep_their_namespace() {
+    let derive = crate::DefKind::Macro(crate::MacroShapes::DERIVE);
+    for trait_first in [true, false] {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let ord = w.module(root, "ord", V::Pub);
+        w.item(ord, "ValueOrd", Namespace::Types, crate::DefKind::Trait, V::Pub);
+        let derives = w.module(root, "derives", V::Pub);
+        w.item(derives, "ValueOrd", Namespace::Macros, derive, V::Pub);
+        if trait_first {
+            w.use_(root, "crate::ord::ValueOrd", V::Pub);
+            w.use_(root, "crate::derives::ValueOrd", V::Pub);
+        } else {
+            w.use_(root, "crate::derives::ValueOrd", V::Pub);
+            w.use_(root, "crate::ord::ValueOrd", V::Pub);
+        }
+        let uint = w.module(root, "uint", V::Pub);
+        w.use_(uint, "crate::ValueOrd", V::Priv);
+        agrees_world(&w, root);
+    }
+    // The twin: the trait's import alone.
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let ord = w.module(root, "ord", V::Pub);
+    w.item(ord, "ValueOrd", Namespace::Types, crate::DefKind::Trait, V::Pub);
+    w.use_(root, "crate::ord::ValueOrd", V::Pub);
+    agrees_world(&w, root);
+}
+
+/// Kind 4 of 4: `use crate as name;` (icu_normalizer and icu_properties baked data: `pub mod
+/// icu { pub use crate as normalizer; }` in a `const _: () = { .. }` block). rustc refuses the
+/// unnamed `use crate;` ("crate root imports need to be explicitly named: `use crate as
+/// name;`"): renamed, it binds the crate root, a module, in the type namespace. The lookup left
+/// a path of no segment to the core (`Unfollowed::EmptyPath`, links.rs `follow`). The values
+/// and macro namespaces of the same import are asked too and are absent on both sides.
+///
+/// Should print: `test tests::module_links::use_crate_as_a_name_binds_the_root ... ok`
+#[test]
+fn use_crate_as_a_name_binds_the_root() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let icu = w.module(root, "icu", V::Pub);
+    w.use_as(icu, "crate", "normalizer", V::Pub);
+    let user = w.module(root, "user", V::Pub);
+    w.use_(user, "crate::icu::normalizer::user", V::Priv);
+    agrees_world(&w, root);
+}

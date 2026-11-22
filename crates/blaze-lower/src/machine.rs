@@ -333,7 +333,8 @@ pub struct Machine<'t, 'c, 'a> {
 /// One word of an expansion lowered in place.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExpWord {
-    pub(crate) start: u32,
+    /// The word's byte range in the machine's text, excluding inter-word spacing.
+    pub(crate) text: Range,
     pub(crate) hygiene: u64,
     pub(crate) expansion: u32,
     pub(crate) token: u32,
@@ -541,21 +542,20 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         if open < item {
             return ScopeOrigin::Item { open };
         }
-        let at = self.words.binary_search_by_key(&open, |w| w.start).expect("a block's `{` past the item's text is a word of an expansion");
+        let at = self.words.binary_search_by_key(&open, |w| w.text.start).expect("a block's `{` past the item's text is a word of an expansion");
         let expansion = self.words[at].expansion;
         let start = self.out.expansion_starts[expansion as usize];
         ScopeOrigin::Expansion { expansion, open: open - item - start }
     }
 
-    /// The local hygiene of the token at `start`: 0 in the item's own text.
-    fn hygiene_at(&self, start: u32) -> u64 {
-        if (start as usize) < self.text.len() || self.words.is_empty() {
+    /// The local hygiene of the word containing this byte. An implicit format capture
+    /// names a substring of a string token and inherits the hygiene of that literal.
+    fn hygiene_at(&self, byte: u32) -> u64 {
+        if (byte as usize) < self.text.len() {
             return 0;
         }
-        match self.words.binary_search_by_key(&start, |w| w.start) {
-            Ok(at) => self.words[at].hygiene,
-            Err(_) => 0,
-        }
+        let i = self.words.partition_point(|w| w.text.end <= byte);
+        self.words.get(i).filter(|w| w.text.start <= byte).map_or(0, |w| w.hygiene)
     }
 
     /// The key a local or a label of name `name` is bound and looked up by: its name's hash,
@@ -598,8 +598,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         if (r.end as usize) <= self.text.len() {
             return crate::driver::CallInput::Text(r.of(self.text));
         }
-        let first = self.words.partition_point(|w| w.start < r.start);
-        let last = self.words.partition_point(|w| w.start < r.end).saturating_sub(1);
+        let first = self.words.partition_point(|w| w.text.start < r.start);
+        let last = self.words.partition_point(|w| w.text.start < r.end).saturating_sub(1);
         match (self.words.get(first), self.words.get(last)) {
             (Some(a), Some(b)) if a.expansion == b.expansion => crate::driver::CallInput::Expanded {
                 expansion: a.expansion,
@@ -624,6 +624,34 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             self.out.mark_starts.push(start);
             self.out.mark_bytes.extend_from_slice(&mark.to_bytes());
         }
+    }
+
+    /// The call written in the item's own text that `range` is in: `range` itself when it is
+    /// there, else the call whose expansion holds it, followed out to the text (an expansion is
+    /// appended after every one before it, so each step lands on an earlier call, and the walk
+    /// ends). A path the call's expansion reads at the call site (no `$crate`, no opaque mark:
+    /// the Reference, "Macros By Example", Hygiene) is read where that written call is: in the
+    /// innermost block of the item's text around it.
+    pub(crate) fn written_call(&self, range: Range) -> Range {
+        let base = idx(self.text.len());
+        let mut at = range;
+        while at.start >= base {
+            let offset = at.start - base;
+            let after = self.out.expansion_starts.partition_point(|s| *s <= offset);
+            let Some(e) = after.checked_sub(1) else { break };
+            let call = self.out.expansion_calls[e];
+            // An expansion's call is written before its expansion is appended: each step goes
+            // to an earlier start.
+            assert!(call.start < at.start, "a call comes before its expansion");
+            at = call;
+        }
+        at
+    }
+
+    /// The expansions appended so far, each one's text and call (the driver's
+    /// [`crate::driver::Expansions`]): a resolver reads a call's block in them.
+    pub(crate) fn expansions(&self) -> crate::driver::Expansions<'_> {
+        crate::driver::Expansions { text: self.text(), item_len: idx(self.text.len()), starts: &self.out.expansion_starts, calls: &self.out.expansion_calls }
     }
 
     /// The mark of the word that starts at `start` (the item's own text or an expansion lowered
@@ -659,14 +687,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             let start = idx(grown.len());
             grown.push_str(&out.words.text[w.text.0 as usize..w.text.1 as usize]);
             let end = idx(grown.len());
-            ranges.push(Range::new(start, end));
+            let text = Range::new(start, end);
+            ranges.push(text);
             // The word's mark beside the text (drive.md, "A token keeps its mark"): starts
             // ascend, as the words are appended in order.
             if let Some(mark) = w.mark {
                 self.out.mark_starts.push(start);
                 self.out.mark_bytes.extend_from_slice(&mark.to_bytes());
             }
-            self.words.push(ExpWord { start, hygiene: w.hygiene, expansion, token: w.token, end: w.end });
+            self.words.push(ExpWord { text, hygiene: w.hygiene, expansion, token: w.token, end: w.end });
         }
         self.note_templates(request, &out.words.words);
         ranges
@@ -1326,6 +1355,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     pub(crate) fn put_path(&mut self, p: PathRef, r: Range) -> PathIdx {
         let id = idx(self.out.paths.len());
+        self.out.paths.reserve(1);
+        self.out.path_ranges.reserve(1);
         self.out.paths.push(p.encode());
         self.out.path_ranges.push(r);
         PathIdx(id)
@@ -1370,6 +1401,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     /// The unplaced rows of `tag` among the children of `f`, placed.
     fn put_rows(&mut self, f: &Frame, tag: u16) -> List {
         let start = idx(self.out.rows.len());
+        let count = self.vals[f.base as usize..].iter().filter(|v| v.v == V::Row(tag)).count();
+        self.out.rows.reserve(count);
+        self.out.row_ranges.reserve(count);
         for i in f.base as usize..self.vals.len() {
             let v = self.vals[i];
             if v.v == V::Row(tag) {
@@ -2767,6 +2801,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             return;
         }
         let absolute = self.first(f, V::Seg).is_some_and(|s| s.node.f == 1);
+        let segments = self.vals[f.base as usize..].iter().filter(|v| v.v == V::Seg).count();
+        self.out.rows.reserve(segments);
+        self.out.row_ranges.reserve(segments);
         let start = idx(self.out.rows.len());
         for i in f.base as usize..self.vals.len() {
             let v = self.vals[i];
@@ -3357,13 +3394,6 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
         let name = text(self.segment_name(p, usize::MAX)?);
         names.iter().copied().find(|it| *it == name)
-    }
-
-    /// The text of a path of one plain segment.
-    pub(crate) fn single_name(&self, p: PathIdx) -> Option<&str> {
-        let seg = self.single_segment(p)?;
-        let name = seg.name?;
-        Some(self.out.name_ranges[name.0 as usize].of(self.text()))
     }
 
     fn signature_root(&mut self, f: &Frame) {

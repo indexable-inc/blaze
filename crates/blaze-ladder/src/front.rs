@@ -42,7 +42,7 @@ use blaze_lower::typeck::{Refused, TypeckBody, Types, to_typeck};
 use blaze_lower::{BodyRange, Cfg, CfgAnswer, Lowered, TextAt, View, head};
 use blaze_own::Alloc;
 use blaze_surface::tool_attrs::{self, BlazeAttr, State};
-use blaze_surface::{Edition, Item, ItemDetail, ItemIndex, Range};
+use blaze_surface::{Edition, ItemDetail, ItemIndex, Range};
 use blaze_typeck as tc;
 use blaze_typeck::{
     AdtKind, AssocItem, AssocKind, AssocParent, AssocTyDef, CtorKind, Def, Fetch, FnSig, Hidden, ImplHeader, ItemKey,
@@ -282,89 +282,12 @@ fn params_of(tys: &mut PortableTys<'_>, from: u32, to: u32) -> Result<Vec<PTy, G
     Ok(out)
 }
 
-/// `t` with each `Param(i)` replaced by `args[i]`.
+/// Instantiate parameters in the same portable type table used by the checker.
 fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why> {
-    enum S {
-        Visit(PTy),
-        Make(PTy),
-    }
-    let bad = || program(format!("a type refers past the type table"), Range::new(0, 0));
-    let mut todo = Vec::new_in(Global);
-    let mut done: Vec<PTy, Global> = Vec::new_in(Global);
-    let mut kids: Vec<PTy, Global> = Vec::new_in(Global);
-    todo.push(S::Visit(t));
-    while let Some(step) = todo.pop() {
-        match step {
-            S::Visit(t) => {
-                todo.push(S::Make(t));
-                kids.clear();
-                children_of(tys.view(), t, &mut kids).ok_or_else(bad)?;
-                for &k in kids.iter().rev() {
-                    todo.push(S::Visit(k));
-                }
-            }
-            S::Make(t) => {
-                kids.clear();
-                children_of(tys.view(), t, &mut kids).ok_or_else(bad)?;
-                let start = done.len() - kids.len();
-                let node = *tys.view().get(t).ok_or_else(bad)?;
-                let new: Vec<PTy, Global> = done.split_off(start);
-                let made = match node {
-                    PNode::Param(i) | PNode::ConstParam(i) => *args.get(i as usize).ok_or_else(|| program(format!("a generic parameter past the arguments"), Range::new(0, 0)))?,
-                    PNode::Ref(m, _) => intern(tys, PNode::Ref(m, new[0]))?,
-                    PNode::Ptr(m, _) => intern(tys, PNode::Ptr(m, new[0]))?,
-                    PNode::Slice(_) => intern(tys, PNode::Slice(new[0]))?,
-                    PNode::Array(..) => intern(tys, PNode::Array(new[0], new[1]))?,
-                    PNode::Tuple(_) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Tuple(l))?
-                    }
-                    PNode::Adt(k, _) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Adt(k, l))?
-                    }
-                    PNode::FnDef(k, _) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::FnDef(k, l))?
-                    }
-                    PNode::FnPtr(_, h) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::FnPtr(l, h))?
-                    }
-                    PNode::Opaque(k, _) => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Opaque(k, l))?
-                    }
-                    PNode::Alias { trait_, name, .. } => {
-                        let l = intern_list(tys, &new)?;
-                        intern(tys, PNode::Alias { trait_, name, args: l })?
-                    }
-                    _ => t,
-                };
-                done.push(made);
-            }
-        }
-    }
-    done.pop().ok_or_else(bad)
-}
-
-/// The types `t` is made of, in order; `None` past the table.
-fn children_of(t: PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
-    match *t.get(ty)? {
-        PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) => out.push(i),
-        PNode::Array(i, n) => {
-            out.push(i);
-            out.push(n);
-        }
-        PNode::Tuple(l)
-        | PNode::Adt(_, l)
-        | PNode::FnDef(_, l)
-        | PNode::FnPtr(l, _)
-        | PNode::Opaque(_, l)
-        | PNode::Alias { args: l, .. } => out.extend_from_slice(t.list(l).ok()?),
-        _ => {}
-    }
-    Some(())
+    tys.subst(t, args).map_err(|e| {
+        let message = blaze_own::text::format(tys.alloc(), format_args!("substituting type {t:?}: {e}"));
+        Why::Program(message.as_str().into(), Range::new(0, 0))
+    })
 }
 
 /// A segment's name, the keywords by their own.
@@ -715,6 +638,9 @@ impl Names {
             let [_, last] = segs.as_slice() else {
                 return Err(Why::Unsupported("a qualified path of more than one item", r));
             };
+            if last.args.len != 0 {
+                return Err(Why::Unsupported("arguments on a generic associated type", r));
+            }
             let tr = segs[0].trait_.ok_or(Why::Unsupported("a qualified path with no trait (`<T>::X`)", r))?;
             let (ti, args) = self.trait_path(tys, env, v, path_of(v, tr)?, kids[0], &kids[1..])?;
             let name = seg_name(v, last, r)?;
@@ -722,6 +648,9 @@ impl Names {
         }
         let first = seg_name(v, &segs[0], r)?;
         if first == SELF_TY {
+            if let [_, member] = segs.as_slice() && member.args.len != 0 {
+                return Err(Why::Unsupported("arguments on a generic associated type", r));
+            }
             return match (segs.len(), env.self_) {
                 (1, SelfTy::Trait(_)) => intern(tys, PNode::Param(0)),
                 (1, SelfTy::Ty(t)) => Ok(t),
@@ -837,6 +766,9 @@ impl Names {
                     match lf::GenericArg::decode(n)? {
                         lf::GenericArg::Type(t) => given.push(self.ty(tys, env, v, t)?),
                         lf::GenericArg::Lifetime(_) => {}
+                        lf::GenericArg::AssocType { args, .. } if args.len != 0 => {
+                            return Err(Why::Unsupported("arguments on a generic associated type binding", pr));
+                        }
                         lf::GenericArg::AssocType { name, ty, .. } => {
                             let term = self.ty(tys, env, v, ty)?;
                             projections.push((Name(v.name(name)?), term));

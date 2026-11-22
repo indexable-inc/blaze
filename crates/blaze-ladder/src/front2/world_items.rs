@@ -88,6 +88,10 @@ pub enum Gap {
     /// An auto trait of an opaque whose hidden type could not be given
     /// ([`super::opaque_auto::HiddenFail`]: its defining body's refusal, or the E0391 cycle).
     Hidden(super::opaque_auto::HiddenFail),
+    /// A reveal requested the opaque's row, but the producer has supplied no hidden type.
+    HiddenRow { opaque: ItemKey, owner: ItemKey, ordinal: u32, path: Box<str> },
+    /// The producer's filed row gives no facts of this coroutine to this reader: `why`.
+    CoroutineRow { reader: ItemKey, owner: ItemKey, ordinal: u32, path: Box<str>, why: &'static str },
     /// An impl whose trait path the names do not resolve as written (so it was a candidate of
     /// every question) and whose header could not be made: the header's error.
     UnreadImpl(LibKey, Box<str>),
@@ -117,6 +121,13 @@ pub enum Gap {
     FieldDefaults(ItemKey),
     /// The crates whose impls a checked body sees were not told (buckets.rs [`Unseen`]).
     Sight(Unseen),
+    /// Whether the body may name member `name` of inherent impl `impl_` could not be told
+    /// (`World::member_visible`): why (a `pub(in path)` in the impl's crate, a module chain
+    /// the names do not hold, no frame for the impl).
+    MemberVisibility { impl_: ItemKey, name: Name, why: &'static str },
+    /// An import through the one ask (`AsksMet::Once`, front2 asks.rs) was refused: the need
+    /// and why.
+    Ask(super::asks::AskRefused),
 }
 
 impl core::fmt::Display for Gap {
@@ -139,7 +150,7 @@ impl core::fmt::Display for Gap {
                 let why = match gap.why {
                     ConstGapWhy::NoEvaluator => "its converter evaluates no constant",
                     ConstGapWhy::OverGeneric => "a constant expression over a generic parameter (the checker's type form has no node for an unevaluated expression)",
-                    ConstGapWhy::AnonInBody(_) => "an anonymous constant in a body (its type is the checker's to find, or the evaluator refused it)",
+                    ConstGapWhy::AnonInBody(_) => "an anonymous constant whose type is unknown in this body",
                     ConstGapWhy::NegativeNoSuffix => "a negated literal with no suffix (its bits wait for the parameter's type)",
                 };
                 write!(f, "the {site} at {}..{} of the body {owner:?} has no value yet: {why}", gap.range.start, gap.range.end)?;
@@ -152,7 +163,12 @@ impl core::fmt::Display for Gap {
             Gap::Resolve(e) => write!(f, "{e}"),
             Gap::Fill(e) => write!(f, "{e}"),
             Gap::VariantOfNoEnum(k) => write!(f, "the lang variant {k:x} is in no enum of its crate"),
+            Gap::Hidden(super::opaque_auto::HiddenFail::NoHead { opaque }) => write!(f, "the opaque type {opaque:?} has no defining-owner row in the loaded heads"),
             Gap::Hidden(h) => write!(f, "{h}"),
+            Gap::HiddenRow { opaque, owner, ordinal, path } => write!(f, "the hidden-type row for return opaque #{ordinal} ({opaque:?}) of {path} ({owner:?}) is unavailable"),
+            Gap::CoroutineRow { reader, owner, ordinal, path, why } => write!(
+                f, "item {reader:?} needs the checked output and stored types of coroutine #{ordinal} of {path} ({owner:?}): {why}: {}", tc::EXTERNAL_WITNESS_GAP
+            ),
             Gap::FnHead(k, why) => write!(f, "the member fn {k:?} has no signature: {why}"),
             Gap::Local(g) => write!(f, "{g}"),
             Gap::UnreadImpl(k, why) => write!(f, "the impl {k:x}, a candidate filed without its trait or self type (unread as written), has no header: {why}"),
@@ -163,6 +179,10 @@ impl core::fmt::Display for Gap {
             Gap::Site { path, why: None } => write!(f, "the body path {path} has no mark row in the world (made without the body's `path_marks`)"),
             Gap::FieldDefaults(k) => write!(f, "the field defaults of ADT {k:?}, read by a base-less `S {{ a: 1, .. }}`: its head row was filed without them"),
             Gap::Sight(why) => write!(f, "{why}"),
+            Gap::MemberVisibility { impl_, name, why } => {
+                write!(f, "whether the body may name the member {name:?} of inherent impl {impl_:?} (the Reference, \"Visibility and privacy\"): {why}")
+            }
+            Gap::Ask(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -306,7 +326,23 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
     ///   between rounds (`check.rs` `make_round`). A seed that files nothing, or refuses, is
     ///   left to that same fill: `Store::ensure` asks the seed again and stops the body with
     ///   its typed refusal naming the head (`HeadError::Seed`), as before (rule 3).
+    /// - ONE ASK (`AsksMet::Once`, front2 asks.rs, D161 step 3): over a seeded store the import
+    ///   is `w`'s need asked once on the store's board ([`super::asks::ask_seed`]); made, the
+    ///   question is asked again at once; failed, the round's fill; refused, a gap naming it.
     pub(super) fn store_want<T>(&self, w: Want) -> Fetch<T> {
+        if let Some(seeds) = self.store.seeds
+            && self.store.asks.once()
+        {
+            use super::asks::Imported;
+            return match super::asks::ask_seed(self.store, self.keys, seeds, w) {
+                Ok(Imported::Made) => Err(Missing),
+                Ok(Imported::Read | Imported::Failed) => self.fill(Fill::Store(w)),
+                Err(refused) => {
+                    self.store.asks.take_refused();
+                    self.gap(Gap::Ask(refused))
+                }
+            };
+        }
         if let Some(seeds) = self.store.seeds {
             let _cost = super::tables::cost::Cost::enter_want(self.store.cost, w);
             let filed = seeds.seed(self.store, self.keys, w, self.store.tys.alloc());
@@ -347,7 +383,16 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
             Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
             Fill::Store(_) => return self.fill(fill),
         };
+        // Under the one ask, an import its question met refused is the question's gap.
+        if let Some(refused) = self.store.asks.take_refused() {
+            return self.gap(Gap::Ask(refused));
+        }
         match made {
+            Ok(Made::Made) if self.store.asks.once() => {
+                let fact = if matches!(fill, Fill::Inherent(..)) { blaze_ask::Fact::Inherent } else { blaze_ask::Fact::ImplsOf };
+                self.store.answered(fact);
+                Err(Missing)
+            }
             Ok(Made::Made) => {
                 self.store.imported.set(self.store.imported.get() + 1);
                 Err(Missing)
@@ -360,11 +405,16 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
     /// import files a cell not filed before (`want_unmade` asks only an unmade want), so the
     /// asks are bounded by the cells the question reads; past [`MOST_IMPORTS_A_QUESTION`] the
     /// last `Missing` stands and the round ends (check.rs `check_rounds_as` goes on).
+    ///
+    /// Under the one ask (`AsksMet::Once`) the count watched is what the store's asks made
+    /// (`Store::imports`), and the bound the board's slots: each pass past the first made a
+    /// fact never made before in the store. (The question itself is read again: a read of
+    /// published rows, no work made again.)
     fn again<T>(&self, ask: impl Fn() -> Fetch<T>) -> Fetch<T> {
-        for _ in 0..MOST_IMPORTS_A_QUESTION {
-            let before = self.store.imported.get();
+        for _ in 0..self.store.asks.most_asks_again() {
+            let before = self.store.imports();
             let got = ask();
-            if got.is_ok() || self.store.imported.get() == before {
+            if got.is_ok() || self.store.imports() == before {
                 return got;
             }
         }
@@ -443,6 +493,17 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     fn goal_share(&self) -> Option<&dyn blaze_solve::share::GoalShare> {
         self.store.goals
     }
+    /// The syntactic prefetch of a body with no record: the questions its text names, before
+    /// the walk enters it. Not answered here (no read enters the list); collected as the
+    /// body's gate set while round 0 collects (front2 asks.rs `Gate`).
+    fn prefetch(&self, _: Seal, questions: &[tc::Question]) {
+        self.store.gate.borrow_mut().note(questions);
+    }
+    /// The checker's run memo, handed to the recorder the names are read through (tables/
+    /// recorder.rs `Repeats`): a question this run answered already offers none of its reads.
+    fn asking(&self, _: Seal, ask: Option<tc::Asking>) {
+        self.names.asking(ask);
+    }
     fn fn_sig(&self, _: Seal, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         self.again(|| self.fn_sig_once(item))
     }
@@ -451,6 +512,9 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     }
     fn field_defaults(&self, _: Seal, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
         self.again(|| self.field_defaults_once(adt))
+    }
+    fn member_visible(&self, _: Seal, container: ItemKey, name: Name) -> Fetch<bool> {
+        self.again(|| self.member_visible_once(container, name))
     }
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
         self.again(|| self.adt_once(item))
@@ -489,6 +553,9 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         self.coroutine_once(owner, ordinal)
     }
     fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
+        self.closure_once(owner, ordinal).map(|row| row.map(|(call, _)| call))
+    }
+    fn closure_with_captures(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<(tc::ClosureFacts<'_>, Option<tc::PTy>)>> {
         self.closure_once(owner, ordinal)
     }
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
@@ -583,6 +650,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     fn predicates_once(&self, item: ItemKey) -> Fetch<Predicates<'_>> {
         // A ctor fn's where-clauses are its type's.
         let item = self.store.ctors.get(&item).map_or(item, |c| c.adt);
+        // The default of a provided trait fn's `impl Trait` (super::rpitit `Twin`): its
+        // source's bounds with itself as `Self`, filed with its trait's rows.
+        if let Some(twin) = self.store.rpitit_defaults.get(&item) {
+            return Ok(Predicates { clauses: &twin.clauses, types: self.types() });
+        }
         match self.store.preds.get(&item) {
             Some(p) if !p.conds.is_empty() => self.gap(Gap::WhereConst(item)),
             Some(p) => Ok(Predicates { clauses: &p.clauses, types: self.types() }),
@@ -610,6 +682,77 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             Some(ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => self.want(adt),
             _ => Ok(&[]),
         }
+    }
+
+    /// The Reference, "Visibility and privacy", for member fn `name` of inherent impl
+    /// `container` against the body's module ([`World::member_visible`]). The member's
+    /// visibility is its impl head's (`ImplHead::fn_vis`, as written); the module it is
+    /// relative to is the impl's (its members' frame). As rustc's `Visibility::Restricted`, a
+    /// restriction names the nearest NORMAL module (a block's module is passed over:
+    /// `written_module(m, 0)`), and a module sees it when that module is on its chain
+    /// (`written_module(body, n)` for n = 0, 1, ..). What cannot be told is a named gap.
+    fn member_visible_once(&self, container: ItemKey, name: Name) -> Fetch<bool> {
+        let Some(i) = self.store.impls.get(&container) else {
+            return match self.detail(container) {
+                Some(ItemDetail::Impl) => self.want(container),
+                // No inherent impl: the question was asked of no member, nothing hides it.
+                _ => Ok(true),
+            };
+        };
+        let Some(at) = i.fns.iter().position(|(n, _)| *n == name) else { return Ok(true) };
+        let Some(&vis) = i.fn_vis.get(at) else {
+            return self.gap(Gap::MemberVisibility { impl_: container, name, why: "its impl's head holds no visibility for it" });
+        };
+        use super::heads::MemberVis;
+        let gap = |why: &'static str| self.gap(Gap::MemberVisibility { impl_: container, name, why });
+        if vis == MemberVis::Public {
+            return Ok(true);
+        }
+        let Some(frame) = self.store.member_frame(container) else { return gap("its impl's head holds no members' frame (the impl's module)") };
+        let home = frame.module;
+        let (Some(home_crate), Some(body_crate)) = (self.names.crate_of(home), self.names.crate_of(self.module)) else {
+            return gap("the names hold no crate for the impl's module or the body's");
+        };
+        // `pub(crate)`, `pub(super)`, `pub(in ..)` and private never reach past the crate.
+        if home_crate != body_crate {
+            return Ok(false);
+        }
+        let up = match vis {
+            MemberVis::Public | MemberVis::Crate => return Ok(true),
+            MemberVis::SelfMod => 0,
+            MemberVis::Super => 1,
+            MemberVis::Up { up } => up,
+            // The ancestor `depth` modules below the root: the impl's module's own depth, less
+            // `depth`, steps up (the path names an ancestor: heads.rs `MemberVis::InCrate`).
+            MemberVis::InCrate { depth } => {
+                let mut deepest = None;
+                for n in 0..=u8::MAX {
+                    match self.names.written_module(home, n) {
+                        Ok(_) => deepest = Some(n),
+                        Err(e) if matches!(e.why, blaze_scope::names::Why::SuperPastRoot) => break,
+                        Err(_) => return gap("the impl's module chain is not held"),
+                    }
+                }
+                let Some(at_root) = deepest else { return gap("the impl's module chain is not held") };
+                match at_root.checked_sub(depth) {
+                    Some(up) => up,
+                    None => return gap("its `pub(in crate::..)` path is deeper than the impl's module: no ancestor (rustc E0742)"),
+                }
+            }
+            MemberVis::InPath => return gap("it is `pub(in path)` in a form other than `crate::..` or `super::..`, and the body is in the impl's crate"),
+        };
+        let Ok(scope) = self.names.written_module(home, up) else {
+            return gap("the impl's module chain is not held (or `pub(super)` at the crate's root)");
+        };
+        for n in 0..=u8::MAX {
+            match self.names.written_module(self.module, n) {
+                Ok(m) if m == scope => return Ok(true),
+                Ok(_) => {}
+                Err(e) if matches!(e.why, blaze_scope::names::Why::SuperPastRoot) => return Ok(false),
+                Err(_) => return gap("the body's module chain is not held"),
+            }
+        }
+        gap("the body's module is deeper than 256 modules (rule 18)")
     }
 
     fn adt_once(&self, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
@@ -652,12 +795,21 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
 
     fn impl_header_once(&self, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
         if let Some(i) = self.store.impls.get(&item) {
+            // An impl of a trait with a fn returning `impl Trait`: that type's value
+            // here is a synthetic associated type's row (super::rpitit).
+            let assoc_types = match i.trait_ {
+                Some(trait_) => match self.rpitit_rows(trait_)? {
+                    Some(rows) => self.rpitit_retry(item, || super::rpitit::impl_assoc(self.store, item, i, rows))?,
+                    None => &i.assoc[..],
+                },
+                None => &i.assoc[..],
+            };
             return Ok(Some(ImplHeader {
                 generics: i.generics,
                 self_ty: i.self_ty,
                 trait_: i.trait_,
                 trait_args: i.trait_args,
-                assoc_types: &i.assoc,
+                assoc_types,
                 types: self.types(),
                 polarity: i.polarity,
             }));
@@ -788,32 +940,65 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// defining body's filed check ([`super::opaque_auto`]). A filed record with no hidden type
     /// for it, and any key no head made, is a gap.
     fn opaque_hidden_once(&self, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
-        let Some(&(owner, _)) = self.store.opaques.get(&item) else {
-            return self.gap(Gap::BodyRecord(tc::Question::Opaque(item)));
+        // The default of a provided trait fn's `impl Trait` (super::rpitit `Twin`) is answered
+        // by that fn's body's row for its source opaque.
+        let filed = super::rpitit::filed_as(self.store, item);
+        let Some(&(owner, ordinal)) = self.store.opaques.get(&filed) else {
+            return self.gap(Gap::Hidden(super::opaque_auto::HiddenFail::NoHead { opaque: item }));
         };
-        match self.store.hidden.answer(item, owner, self.reveal) {
+        // A trait fn's `impl Trait` at a place of its return type reveals its synthetic
+        // projection, per impl (super::rpitit), required or provided: the answer is the same in
+        // every body. An impl's fn's container has no rows (`rpitit_rows` of an impl is `None`).
+        let rows = match self.store.fns.get(&owner).and_then(|f| f.container) {
+            Some(container) if filed == item => self.rpitit_rows(container)?,
+            _ => None,
+        };
+        if let Some(alias) = super::rpitit::hidden_of(rows, item) {
+            return Ok(Some(Hidden { ty: alias, types: self.types() }));
+        }
+        match self.store.hidden.answer(item, filed, owner, self.reveal) {
+            // A trait fn's `impl Trait` with no row stands in another's bounds: its body's type
+            // (a provided fn's) is not the type through an impl that writes the fn.
+            super::opaque_auto::HiddenAnswer::Known(_) if rows.is_some() => {
+                let shown = super::check::key_shown_in(self.names, self.keys, self.store, owner);
+                self.gap(Gap::Hidden(super::opaque_auto::HiddenFail::TraitFnInBounds { opaque: item, owner, shown }))
+            }
             super::opaque_auto::HiddenAnswer::Known(h) => Ok(Some(h)),
             super::opaque_auto::HiddenAnswer::Opaque => Ok(None),
-            super::opaque_auto::HiddenAnswer::NoneGiven => self.gap(Gap::BodyRecord(tc::Question::Opaque(item))),
+            super::opaque_auto::HiddenAnswer::NoneGiven => {
+                if super::tait::of_alias(ordinal) {
+                    return self.gap(Gap::Hidden(super::opaque_auto::HiddenFail::AliasOpaque { opaque: item, alias: owner }));
+                }
+                let path = super::check::key_shown_in(self.names, self.keys, self.store, owner);
+                self.gap(Gap::HiddenRow { opaque: item, owner, ordinal, path })
+            }
         }
     }
     /// Async block `ordinal` of `owner` (an `async fn`'s hidden type is its root block by
     /// identity, `PNode::Coroutine`): its output and interior from the owner's filed check
-    /// (`Store::hidden`); a gap while that body is not filed.
+    /// (`Store::hidden`); a gap, saying why, while that body is not filed or its row cannot
+    /// answer. A row whose flow was refused answers with the check's superset interior
+    /// ([`tc::InteriorIs::Superset`]) to a body check only ([`super::opaque_auto::Reveal::InBody`]),
+    /// where a failure over it is the checker's typed gap (blaze-typeck rules/async_fn.rs
+    /// `Witness::ForeignSuperset`); a resolution after checking decides on exact facts only.
     fn coroutine_once(&self, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::CoroutineFacts<'_>>> {
-        match self.store.hidden.coroutine(owner, ordinal) {
-            Some(f) => Ok(Some(f)),
-            None => self.gap(Gap::BodyRecord(tc::Question::Coroutine(owner, ordinal))),
-        }
+        use super::opaque_auto::{CoroutineAnswer, Reveal};
+        let why = match self.store.hidden.coroutine(owner, ordinal) {
+            CoroutineAnswer::Facts(f) if f.is == tc::InteriorIs::Exact || matches!(self.reveal, Reveal::InBody) => return Ok(Some(f)),
+            CoroutineAnswer::Facts(_) => "its flow was refused, so only its check's superset interior is filed, which decides no auto trait outside a body check",
+            other => other.why().unwrap_or("no facts were given"),
+        };
+        let path = super::check::key_shown_in(self.names, self.keys, self.store, owner);
+        self.gap(Gap::CoroutineRow { reader: self.owner, owner, ordinal, path, why })
     }
     /// A closure of another body: its kind and signature from its owner's checked record, filed
     /// in the store where that check finished clean ([`super::foreign_closures`]; typeck.md "A
     /// closure's identity"). The checker records the question with its answer's digest, so it
     /// is in this body's read list (rule 21). An owner with no clean record, or an ordinal it
     /// does not hold, is a gap naming the owner by its path and the ordinal (rule 19).
-    fn closure_once(&self, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
-        match self.store.closures.get(owner, ordinal) {
-            Ok((kind, sig)) => Ok(Some(tc::ClosureFacts { kind, sig, types: self.store.tys.view() })),
+    fn closure_once(&self, owner: ItemKey, ordinal: u32) -> Fetch<Option<(tc::ClosureFacts<'_>, Option<tc::PTy>)>> {
+        match self.store.closures.with_captures(owner, ordinal) {
+            Ok((kind, sig, env)) => Ok(Some((tc::ClosureFacts { kind, sig, types: self.store.tys.view() }, env))),
             Err(why) => {
                 let path = super::check::key_shown_in(self.names, self.keys, self.store, owner);
                 let text = format!("{}", super::foreign_closures::gap_text(owner, &path, ordinal, why)).into_boxed_str();
@@ -835,17 +1020,17 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         if let Some(a) = self.store.adts.get(&item) {
             // `#[blaze::args]` (rule 83): the options-struct mark, from the made head or its record.
             let args = if a.args { TypeAttrs::ARGS } else { 0 };
+            // `repr(packed)` in any form (`packed(N)`, `C, packed`): the layout's own fact
+            // (`ReprAttrs::packed`), answered for the capture analysis (TypeAttrs::PACKED).
+            let packed = if a.repr.packed.is_some() { TypeAttrs::PACKED } else { 0 };
             return Ok(match a.kind {
                 tc::AdtKind::Enum => TypeAttrs(args).with_discr(super::heads::discr_ty(a.repr)),
-                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args),
-                _ => TypeAttrs(args),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed),
+                _ => TypeAttrs(args | packed),
             });
         }
         if let Some(f) = self.store.fns.get(&item) {
-            return match super::fn_attrs::fn_type_attrs(self.names, f) {
-                Ok(attrs) => Ok(attrs),
-                Err(e) => self.gap(Gap::FnHead(item, format!("{e}").into_boxed_str())),
-            };
+            return Ok(super::fn_attrs::fn_type_attrs(f));
         }
         if self.store.ctors.contains_key(&item) {
             return Ok(TypeAttrs(0));
@@ -887,7 +1072,12 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             flags: t.flags,
             lang: self.index.lang_name_of(lib).and_then(trait_lang),
             supertraits: &extra.supertraits,
-            assoc_types: &extra.assoc,
+            // With a synthetic associated type per `impl Trait` at a place of a fn's return type
+            // (super::rpitit), after the written ones.
+            assoc_types: match self.rpitit_rows(trait_)? {
+                Some(rows) => &rows.assoc[..],
+                None => &extra.assoc[..],
+            },
             types: self.types(),
             members: blaze_typeck::TraitMembers::Known(&t.members),
             // heads.rs `TraitHead::defaults`: lowered into `store.tys` (as buckets.rs
@@ -936,7 +1126,49 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 _ => Ok(None),
             };
         };
-        Ok(self.store.maps.assoc_generics.get(&(lib, name)).map(|&own| tc::AssocGenerics { parent: t.generics, own }))
+        if let Some(&own) = self.store.maps.assoc_generics.get(&(lib, name)) {
+            return Ok(Some(tc::AssocGenerics { parent: t.generics, own }));
+        }
+        // A synthetic associated type (super::rpitit): its trait fn's own parameters.
+        let rows = self.rpitit_rows(trait_)?;
+        Ok(rows.and_then(|r| r.rows.iter().find(|s| s.name == name)).map(|s| tc::AssocGenerics { parent: t.generics, own: s.own }))
+    }
+
+    /// Trait `trait_`'s synthetic associated types ([`super::rpitit::trait_rows`]): `None` for
+    /// a key that is no trait, or a trait with no fn returning `impl Trait` (read from
+    /// its head's member facts, so such a trait's members are never asked for here). A trait
+    /// whose head or members are not made is asked for.
+    fn rpitit_rows(&self, trait_: ItemKey) -> Fetch<Option<&super::rpitit::TraitRows>> {
+        let Some(lib) = self.keys.library_in(self.names, trait_) else { return Ok(None) };
+        let Some(t) = self.store.maps.traits.get(&lib) else {
+            return match self.resolver().detail(lib) {
+                Some(ItemDetail::Trait) => self.want(trait_),
+                _ => Ok(None),
+            };
+        };
+        if !super::rpitit::may_have_rows(t) {
+            return Ok(None);
+        }
+        let Some(extra) = self.store.trait_defs.get(&trait_) else { return self.want(trait_) };
+        self.rpitit_retry(trait_, || super::rpitit::trait_rows(self.store, trait_, t, &extra.assoc))
+    }
+
+    /// `make` again after each fn signature it needs ([`super::rpitit::Need::Fn`], made or
+    /// asked for through [`Self::fn_row`]); a refusal is its gap naming the item (rule 19). A
+    /// round makes one more signature, so the cap is never met by a whole program: met, it is
+    /// the gap naming `about`.
+    fn rpitit_retry<T>(&self, about: ItemKey, make: impl Fn() -> Result<T, super::rpitit::Need>) -> Fetch<T> {
+        const ROUNDS: u32 = 4096;
+        for _ in 0..ROUNDS {
+            match make() {
+                Ok(v) => return Ok(v),
+                Err(super::rpitit::Need::Fn(f)) => {
+                    self.fn_row(f)?;
+                }
+                Err(super::rpitit::Need::Refused(k, why)) => return self.gap(Gap::FnHead(k, why.into())),
+            }
+        }
+        self.gap(Gap::FnHead(about, "its synthetic associated types (an `impl Trait` of a trait fn) needed more signatures than any trait or impl has".into()))
     }
 
     /// A type alias's definition from its head (`Maps::aliases`, `Maps::alias_defaults`, made

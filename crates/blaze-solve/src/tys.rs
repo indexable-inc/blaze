@@ -46,6 +46,29 @@ pub trait Tys {
 
     fn kind(&self, t: Ty) -> TyKind;
     fn flags(&self, t: Ty) -> Flags;
+    /// Rebuilds a bound variable at a new De Bruijn index, keeping its original term sort.
+    fn reindex_bound(&mut self, _original: Ty, depth: u32, var: u32) -> Result<Ty, SolveError> {
+        self.mk(TyKind::Bound(depth, var))
+    }
+    /// Moves the free bound variables of an argument under `by` new binders.
+    /// An arena with separate term sorts can preserve the sort using its own shifter.
+    fn shift_in(&mut self, scratch: &mut crate::fold::Scratch<'_>, t: Ty, by: u32) -> Result<Ty, SolveError>
+    where
+        Self: Sized,
+    {
+        crate::fold::fold_at_depth(self, scratch, t, |tys, _, x, depth| {
+            if !tys.flags(x).has(Flags::HAS_BOUND) {
+                return Ok(Some(x));
+            }
+            match tys.kind(x) {
+                TyKind::Bound(d, i) if d >= depth => {
+                    let d = d.checked_add(by).ok_or(SolveError::Limit(crate::error::Limit::Walk))?;
+                    Ok(Some(tys.reindex_bound(x, d, i)?))
+                }
+                _ => Ok(None),
+            }
+        })
+    }
     /// The marker answers kept on `t` (solve.md (c)).
     fn markers(&self, t: Ty) -> Markers;
     fn set_markers(&mut self, t: Ty, m: Markers);

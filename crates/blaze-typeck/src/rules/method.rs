@@ -20,9 +20,13 @@
 //! unsize), the callee, the method's where-clauses and the trait obligation, then checks the
 //! arguments as a call does.
 //!
+//! An inherent candidate the body may not name ([`World::member_visible`]) is set aside before
+//! any is tried (probe.rs `push_candidate`'s `private_candidates`); only when nothing visible
+//! applies does one that applies make the error E0624.
+//!
 //! Omitted for now: raw-pointer autoref (`pick_const_ptr_method`), the 2021 `into_iter` array
-//! shadowing, unstable-candidate and private-candidate reporting, and `self: Box<Self>`-style
-//! receivers beyond what autoderef reaches.
+//! shadowing, unstable-candidate reporting, and `self: Box<Self>`-style receivers beyond what
+//! autoderef reaches.
 
 use blaze_own::{Alloc, Vec};
 
@@ -42,6 +46,16 @@ struct Cand {
     item: ItemKey,
     trait_: Option<ItemKey>,
     is_method: bool,
+    /// For a candidate of a parameter's bound or an object's principal (and their
+    /// supertraits): the step type it was found at, which is the trait's `Self` (probe.rs
+    /// `WhereClauseCandidate` and `ObjectCandidate`: their `xform_self_ty` is the method's
+    /// `self` with `Self` the parameter or the object). `None`: an impl's item, or a trait in
+    /// scope, whose `Self` is a fresh variable the receiver decides. Without it a bound
+    /// candidate applied at every step as if in scope, AND in the inherent group: tempo's
+    /// zone_sequencer settlement.rs:96 `error.fmt(f)` on a `&eyre::Report` (whose deref step
+    /// `dyn Error + Send + Sync` brings `Debug::fmt` and `Display::fmt`) matched both at the
+    /// `&Report` step, a false E0034 ("found `&Report`, about `fmt`").
+    on: Option<Ty>,
 }
 
 /// The probe's answer.
@@ -111,6 +125,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
+    /// The trait of the impl whose item this body is (`impl Tr for T { fn f() { .. } }` gives
+    /// `Tr`), or `None` outside a trait impl. rustc_resolve counts it among the traits in scope
+    /// of every body in the impl (`traits_in_scope` adds `current_trait_ref`), so a method or
+    /// path of that trait needs no `use`; both the method probe and a type-relative path
+    /// (rules/lit_path.rs) take it from here.
+    pub(super) fn current_impl_trait(&mut self) -> Result<Option<ItemKey>, Stop> {
+        let Some(parent) = self.reads.assoc_parent(self.body.owner)? else { return Ok(None) };
+        Ok(self.reads.impl_header(parent.container)?.and_then(|h| h.trait_))
+    }
+
     /// `probe_op` in `Mode::MethodCall`: the pick, or the code of the error.
     fn probe_method(&mut self, recv: Ty, name: Name, scope: ScopeId) -> Result<Result<Pick<'a>, DiagCode>, Stop> {
         let (mut steps, limit) = self.autoderef(recv, false)?;
@@ -127,9 +151,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &tr in self.reads.traits_in_scope(scope)? {
             if let Some(it) = self.reads.assoc_item(tr, name)? {
                 if let AssocKind::Fn { self_param } = it.kind {
-                    ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param });
+                    ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: None });
                 }
             }
+        }
+        // The trait of the impl this body is an item of is in scope too, imported or not
+        // (`Self::current_impl_trait`): inside `impl fmt::Display for E` with only `fmt`
+        // imported, `inner.fmt(f)` on a `&eyre::Report` is `Display::fmt` (tempo's
+        // zone_sequencer settlement.rs:96, a false "found `&Report`, about `fmt`").
+        if let Some(tr) = self.current_impl_trait()?
+            && !ext.iter().any(|c| c.trait_ == Some(tr))
+            && let Some(it) = self.reads.assoc_item(tr, name)?
+            && let AssocKind::Fn { self_param } = it.kind
+        {
+            ext.push(Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: None });
         }
         // The inherent candidates of every step, assembled once before any is tried
         // (`assemble_inherent_candidates` over all steps, as Relax's `assemble_probe_candidates`):
@@ -137,21 +172,37 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // extension candidate of `&Foo`.
         let mut not_method = false;
         let mut inh: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
+        // The inherent candidates the body may not name (the Reference, "Visibility and
+        // privacy"): set aside, never tried, as rustc's probe.rs `push_candidate` puts an
+        // inaccessible candidate in `private_candidates`. So a visible method of the name
+        // further on (an extension candidate, a later step) is the pick: reth's private
+        // `impl Tx<RW> { fn put<T>(&self, kind: PutKind, key, value) }` beside the trait
+        // method `DbTxMut::put<T>(&self, key, value)` that `tx.put::<T>(k, v)` calls from
+        // another crate. Only when nothing visible applies is it E0624.
+        let mut private: Vec<Cand, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut bounds: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
         for i in 0..steps.len() {
             let step = steps[i];
             if let Some(shape) = self.shape(step.ty) {
                 for it in self.reads.inherent(shape, name)? {
                     if let AssocKind::Fn { self_param } = it.kind {
-                        let c = Cand { container: it.container, item: it.item, trait_: None, is_method: self_param };
-                        if !inh.iter().any(|x| x.item == c.item) {
+                        let c = Cand { container: it.container, item: it.item, trait_: None, is_method: self_param, on: None };
+                        if inh.iter().chain(private.iter()).any(|x| x.item == c.item) {
+                            continue;
+                        }
+                        if self.reads.member_visible(it.container, name)? {
                             inh.push(c);
+                        } else {
+                            private.push(c);
                         }
                     }
                 }
             }
             // A parameter's bound traits, and an object's principal with its supertraits, are
-            // found at their step whether or not in scope (typeck.md "Trait objects" (c)).
+            // found at their step whether or not in scope (typeck.md "Trait objects" (c)), with
+            // `Self` that step's type (`Cand::on`): they apply where the receiver's adjusted
+            // type is the method's `self` of THAT type (`x: &T` still picks `T`'s bound method
+            // at the `&T` step, by value), never with another `Self`.
             let view = self.view(step.ty);
             if let TyView::Param(_) | TyView::Dynamic(_) = view {
                 bounds.clear();
@@ -168,8 +219,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 for &tr in bounds.iter() {
                     if let Some(it) = self.reads.assoc_item(tr, name)? {
                         if let AssocKind::Fn { self_param } = it.kind {
-                            let c = Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param };
-                            if !inh.iter().any(|x| x.item == c.item) {
+                            let c = Cand { container: tr, item: it.item, trait_: Some(tr), is_method: self_param, on: Some(step.ty) };
+                            if !inh.iter().any(|x| x.item == c.item && x.on == c.on) {
                                 inh.push(c);
                             }
                         }
@@ -192,10 +243,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     let mut found = None;
                     let mut count = 0u32;
                     let cands = if group == 0 { &inh } else { &ext };
+                    // A trait in scope is tried here even when a bound candidate names the same
+                    // item: that one's `Self` is its own step's type, this one's the receiver's.
                     for &c in cands.iter() {
-                        if group == 1 && inh.iter().any(|x| x.item == c.item) {
-                            continue;
-                        }
                         if !c.is_method {
                             not_method = true;
                             continue;
@@ -212,6 +262,26 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     if let Some(cand) = found {
                         return Ok(Ok(Pick { cand, steps, step: i, autoref, unsize }));
+                    }
+                }
+            }
+        }
+        // Nothing visible applies: a set-aside candidate that applies at some step makes it
+        // E0624 (rustc's `MethodError::PrivateMatch`), not "no method".
+        for i in 0..steps.len() {
+            let step = steps[i];
+            let unsize = unsize_at == Some(i);
+            for autoref in [None, Some(Mutbl::Not), Some(Mutbl::Mut)] {
+                if unsize && autoref.is_none() {
+                    continue;
+                }
+                let adjusted = match autoref {
+                    None => step.ty,
+                    Some(m) => self.mk(TyView::Ref(m, step.ty))?,
+                };
+                for &c in private.iter() {
+                    if c.is_method && self.probe(|m| m.instantiate_method(c, adjusted, None))?.is_some() {
+                        return Ok(Err(DiagCode::PrivateMethod));
                     }
                 }
             }
@@ -237,7 +307,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// and its `self` parameter unified with `adjusted` (probe.rs `xform_self_ty` against the
     /// receiver, `consider_probe`): the parent's arguments and all of them, or `None` when it
     /// does not apply. A candidate is so matched at every step, whichever step it was assembled
-    /// from. With `seg`, the method's own arguments are the written ones (confirmation);
+    /// from; a bound candidate's `Self` is fixed to its own step's type (`Cand::on`), so it
+    /// applies only where the adjusted receiver is its `self` of that type. With `seg`, the method's own arguments are the written ones (confirmation);
     /// without, fresh (the probe, where no diagnostic may be made).
     fn instantiate_method(
         &mut self,
@@ -245,7 +316,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         adjusted: Ty,
         seg: Option<(At, Segment)>,
     ) -> Result<Option<(TyList, TyList)>, Stop> {
-        let self_ty = self.fresh()?;
+        // A bound candidate's `Self` is the step it was found at (`Cand::on`).
+        let self_ty = match c.on {
+            Some(t) => t,
+            None => self.fresh()?,
+        };
         // Confirmation reports at the call; the probe makes no diagnostic and is rolled back.
         let cause = seg.map_or(Cause::Body, |(at, _)| at.cause());
         let parent = match c.trait_ {

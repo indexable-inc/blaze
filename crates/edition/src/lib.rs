@@ -1,6 +1,26 @@
 //! The edition of the Rust language used in a crate.
+//!
+//! A sans-IO core: `core` only, and nothing allocates but the one deprecated error that still
+//! copies the caller's text ([`UnknownBlazeEdition`], kept while blaze-manifest holds it; the
+//! form that holds none is [`BlazeEdition::of_manifest`] with [`NoEdition`]).
 // This should live in a separate crate because we use it in both actual code and codegen.
-use std::fmt;
+
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
+#![forbid(unsafe_code)]
+
+// Only [`UnknownBlazeEdition`]'s `String`, deprecated: it goes with its last caller
+// (blaze-manifest's `FeatureError::UnknownBlazeEdition`), and this line with it.
+extern crate alloc;
+
+// The tests' `format!` and `to_string`.
+#[cfg(test)]
+extern crate std;
+
+use core::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -55,19 +75,19 @@ impl Edition {
     }
 }
 
-#[derive(Debug)]
-pub struct ParseEditionError {
-    invalid_input: String,
-}
+/// A text that is no Rust edition. The text is the caller's, so the error holds none of it
+/// (the caller names it beside this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseEditionError(());
 
-impl std::error::Error for ParseEditionError {}
+impl core::error::Error for ParseEditionError {}
 impl fmt::Display for ParseEditionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid edition: {:?}", self.invalid_input)
+        f.write_str("invalid edition: none of `2015`, `2018`, `2021` or `2024`")
     }
 }
 
-impl std::str::FromStr for Edition {
+impl core::str::FromStr for Edition {
     type Err = ParseEditionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -76,7 +96,7 @@ impl std::str::FromStr for Edition {
             "2018" => Edition::Edition2018,
             "2021" => Edition::Edition2021,
             "2024" => Edition::Edition2024,
-            _ => return Err(ParseEditionError { invalid_input: s.to_owned() }),
+            _ => return Err(ParseEditionError(())),
         };
         Ok(res)
     }
@@ -111,15 +131,30 @@ pub enum BlazeEdition {
 
 /// A manifest's `edition` that starts [`BlazeEdition::MANIFEST_PREFIX`] and is no blaze
 /// edition's: the value as written.
+///
+/// Deprecated: it copies the caller's text onto the global heap. Use
+/// [`BlazeEdition::of_manifest`], whose [`NoEdition::UnknownBlaze`] holds none of it (the
+/// caller has the text and names it; [`KnownBlazeEditions`] prints what is known).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(blaze::implicit_allocator, reason = "deprecated; goes with its last caller, blaze-manifest's FeatureError")]
 pub struct UnknownBlazeEdition {
-    pub written: String,
+    pub written: alloc::string::String,
 }
 
-impl std::error::Error for UnknownBlazeEdition {}
+impl core::error::Error for UnknownBlazeEdition {}
 impl fmt::Display for UnknownBlazeEdition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "`{}` is no blaze edition: this blaze knows ", self.written)?;
+        write!(f, "`{}` is no blaze edition: this blaze knows {KnownBlazeEditions}", self.written)
+    }
+}
+
+/// Every blaze edition this blaze knows, as a manifest spells them, comma separated and each in
+/// backticks: what a refusal of an unknown `blaze-` value prints after it names the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownBlazeEditions;
+
+impl fmt::Display for KnownBlazeEditions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (at, it) in BlazeEdition::ALL.iter().enumerate() {
             write!(f, "{}`{}`", if at == 0 { "" } else { ", " }, it.manifest())?;
         }
@@ -186,15 +221,27 @@ impl BlazeEdition {
 
     /// The blaze edition a manifest's `edition` names: `Ok(None)` for one that does not
     /// start [`BlazeEdition::MANIFEST_PREFIX`] (a Rust edition, or nothing blaze reads here),
-    /// an error for one that does and is no blaze edition's.
-    pub fn from_manifest(written: &str) -> Result<Option<BlazeEdition>, UnknownBlazeEdition> {
+    /// [`NoEdition::UnknownBlaze`] for one that does and is no blaze edition's. The error holds
+    /// none of `written`: the caller names it, and [`KnownBlazeEditions`] what is known.
+    pub fn of_manifest(written: &str) -> Result<Option<BlazeEdition>, NoEdition> {
         if !written.starts_with(BlazeEdition::MANIFEST_PREFIX) {
             return Ok(None);
         }
         match BlazeEdition::ALL.into_iter().find(|it| it.manifest() == written) {
             Some(it) => Ok(Some(it)),
-            None => Err(UnknownBlazeEdition { written: written.to_owned() }),
+            None => Err(NoEdition::UnknownBlaze),
         }
+    }
+
+    /// [`BlazeEdition::of_manifest`] with the refusal holding a copy of `written`.
+    ///
+    /// Deprecated: it allocates on the global heap. Use [`BlazeEdition::of_manifest`]. Its
+    /// callers today: blaze-manifest (features.rs, `FromStr for Edition`) and blaze-new
+    /// (lib.rs, which drops the error).
+    #[expect(blaze::implicit_allocator, reason = "deprecated; goes with its last caller")]
+    pub fn from_manifest(written: &str) -> Result<Option<BlazeEdition>, UnknownBlazeEdition> {
+        BlazeEdition::of_manifest(written)
+            .map_err(|_| UnknownBlazeEdition { written: alloc::borrow::ToOwned::to_owned(written) })
     }
 }
 
@@ -229,7 +276,7 @@ impl fmt::Display for NoEdition {
     }
 }
 
-impl std::error::Error for NoEdition {}
+impl core::error::Error for NoEdition {}
 
 impl PackageEdition {
     /// A package with no `edition`: 2015, as cargo reads it.
@@ -245,10 +292,9 @@ impl PackageEdition {
             "2021" => Edition::Edition2021,
             "2024" => Edition::Edition2024,
             _ => {
-                return match BlazeEdition::from_manifest(written) {
-                    Ok(Some(blaze)) => Ok(PackageEdition { syntax: blaze.rust(), blaze: Some(blaze) }),
-                    Ok(None) => Err(NoEdition::Unknown),
-                    Err(_) => Err(NoEdition::UnknownBlaze),
+                return match BlazeEdition::of_manifest(written)? {
+                    Some(blaze) => Ok(PackageEdition { syntax: blaze.rust(), blaze: Some(blaze) }),
+                    None => Err(NoEdition::Unknown),
                 };
             }
         };
@@ -347,7 +393,9 @@ impl Extensions {
 
 #[cfg(test)]
 mod blaze_edition_tests {
-    use super::{BlazeEdition, Edition};
+    use std::{format, string::ToString};
+
+    use super::{BlazeEdition, Edition, KnownBlazeEditions, NoEdition, PackageEdition, ParseEditionError};
 
     /// Each blaze edition is read back from each of its spellings, and every spelling is
     /// derived from the version: the manifest's value, the crate attribute, the prelude.
@@ -370,14 +418,22 @@ mod blaze_edition_tests {
     #[test]
     fn a_manifest_value_is_a_blaze_edition_a_rust_one_or_an_error() {
         for rust in ["2015", "2018", "2021", "2024", "future", ""] {
+            assert_eq!(BlazeEdition::of_manifest(rust), Ok(None), "{rust}");
             assert_eq!(BlazeEdition::from_manifest(rust), Ok(None), "{rust}");
         }
+        assert_eq!(KnownBlazeEditions.to_string(), "`blaze-2026.11`");
         for unknown in ["blaze-", "blaze-2024", "blaze-2026.12", "blaze-2026.11 "] {
+            assert_eq!(BlazeEdition::of_manifest(unknown), Err(NoEdition::UnknownBlaze), "{unknown}");
+            assert_eq!(PackageEdition::of_manifest(unknown), Err(NoEdition::UnknownBlaze), "{unknown}");
+            // The deprecated form, while blaze-manifest holds its error.
             let refused = BlazeEdition::from_manifest(unknown).unwrap_err();
             assert_eq!(refused.written, unknown);
             let said = refused.to_string();
             assert!(said.contains(unknown) && said.contains("`blaze-2026.11`"), "{said}");
         }
+        assert_eq!(PackageEdition::of_manifest("2019"), Err(NoEdition::Unknown));
+        assert_eq!("2019".parse::<Edition>(), Err(ParseEditionError(())));
+        assert_eq!("2021".parse::<Edition>(), Ok(Edition::Edition2021));
         assert_eq!(BlazeEdition::from_version("blaze-2026.11"), None, "the attribute says the version alone");
     }
 }

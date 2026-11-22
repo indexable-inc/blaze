@@ -7,7 +7,7 @@
 //! exists under that cfg; `app`'s `g` calls it, so `app`'s call resolves only when `pkg`'s names
 //! record is made with the script's outputs.
 //!
-//! - `status --porcelain` has no cell: the record is used this command and not kept
+//! - A git observation without an argument vector has no cell: the record is used this command and not kept
 //!   (scripts.rs `PooledScript::unkept`), and the script runs again next command (owed).
 //! - `rev-parse HEAD` has a cell (engine_script_reads.rs `git_now`): the record is kept and
 //!   stands until the answer moves.
@@ -18,7 +18,7 @@ use super::*;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::engine_script_reads::{self as reads, CheckoutRead, ReadKind, ReadsPlant};
+use crate::engine_script_reads::{self as reads, ReadKind, ReadsPlant};
 use crate::sweep::{Plant, Stamp, Stamps};
 
 use super::engine_check_tests::engine_from;
@@ -42,18 +42,19 @@ impl Stamps for NoStamps {
 
 /// The questions, as a `git:` subject's rest (script_sandbox.rs `git_subject`).
 const HEAD_ASKED: &str = "pkg\nrev-parse HEAD";
-const STATUS_ASKED: &str = "pkg\nstatus --porcelain";
 const HEAD_SUBJECT: &str = "git:pkg\nrev-parse HEAD";
-const STATUS_SUBJECT: &str = "git:pkg\nstatus --porcelain";
+const UNNAMED_SUBJECT: &str = "git:pkg";
 
 const COMMIT_ONE: &str = "1111111111111111111111111111111111111111\n";
 const COMMIT_TWO: &str = "2222222222222222222222222222222222222222\n";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Route {
     /// `rev-parse HEAD`: a cell; the record is kept.
     Cell,
-    /// `status --porcelain`: no cell; the record is used this command and not kept.
+    /// A tracked-only porcelain query in a checkout whose contents the test changes.
+    Status(&'static AtomicU32),
+    /// A git read with no command to replay.
     Unkept,
     /// THE CONTROL: the old route, the run a hole and its record dropped.
     OldHole,
@@ -65,32 +66,43 @@ struct Double {
 }
 
 /// The cells of no read: what a run that hands none back carries.
-fn no_reads(plant: ReadsPlant) -> std::vec::Vec<CheckoutRead> {
+fn no_reads(plant: ReadsPlant) -> reads::ReadList {
     reads::cells_of(core::iter::empty(), plant).expect("no read has a cell")
 }
 
 impl crate::engine_scripts::ScriptRunner for Double {
-    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<ReadsPlant>, _: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
+    fn checkout_tree(&self) -> Option<blaze_proc_macro::script_sandbox::Tree> {
+        let Route::Status(state) = self.route else { return None };
+        let mut files = super::engine_script_reads_tests::status_files(false);
+        let bytes: &[u8] = match state.load(Ordering::SeqCst) { 0 => b"a\n", 1 => b"b\n", _ => b"c\n" };
+        files.iter_mut().find(|(name, _)| name == "f").unwrap().1 = bytes.to_vec();
+        Some(blaze_proc_macro::script_sandbox::mem_tree(files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())), "", None))
+    }
+
+    fn run(&self, cx: &Cx, root: &bstd::fs::Dir<bstd::fs::ReadWrite>, name: blaze_drive::Name, kept: Option<crate::engine_scripts::KeptReads>, _: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
         self.runs.fetch_add(1, Ordering::SeqCst);
         let frame = cx.frame();
-        let plant = kept.expect("the request plans the reads' cells, so a member's reads are kept");
+        let (plant, view) = kept.expect("the request plans the reads' cells, so a member's reads are kept");
         let done = |did: crate::scripts::Ran, checkout, unkept| crate::scripts::PooledScript { did: Ok(did), used: 0, ns: 0, checkout, unkept };
-        if self.route == Route::OldHole {
+        if matches!(self.route, Route::OldHole) {
             let failed = crate::scripts::failed("a member's build script made a read no cell names", format_args!("the build script of pkg 0.1.0 is run again next command, its outputs not kept (the old route, planted)"), true);
             return done(failed, no_reads(plant), None);
         }
-        // As the sandbox records the question: its subject and today's answer (for `status` the
-        // HEAD answer stands in: no cell keeps it, so no later command compares it).
-        let (_, _, answer) = reads::now(cx, root, &NoStamps, Plant::None, ReadKind::Git, HEAD_ASKED, None, frame).expect("the git question is answered");
-        let subject = match self.route {
-            Route::Cell => HEAD_SUBJECT,
-            Route::Unkept | Route::OldHole => STATUS_SUBJECT,
+        let recorded = match self.checkout_tree() {
+            Some(tree) => ["git-scope:pkg", "git:\nstatus --porcelain --untracked-files=no"].into_iter()
+                .map(|subject| (subject, blaze_proc_macro::script_sandbox::answer_now(&tree, subject).unwrap())).collect(),
+            None => {
+                // The broken recorder omits the argument vector from a real HEAD read.
+                let (_, _, answer) = reads::now(cx, root, &NoStamps, Plant::None, ReadKind::Git, HEAD_ASKED, None, frame).unwrap();
+                let subject = if matches!(self.route, Route::Cell) { HEAD_SUBJECT } else { UNNAMED_SUBJECT };
+                vec![(subject, Some(answer))]
+            }
         };
-        let recorded = [(subject, Some(answer))];
-        let (checkout, unkept) = match reads::cells_of(recorded.iter().copied(), plant) {
-            Ok(cells) => (cells, None),
-            Err(why) => (no_reads(plant), Some(why)),
-        };
+        let mut checkout = no_reads(plant);
+        let unkept = reads::collect_reads(recorded.into_iter(), plant, view, &mut checkout).err();
+        if unkept.is_some() {
+            checkout.clear();
+        }
         let mut cells: blaze_own::Vec<(blaze_drive::Name, blaze_ids::ContentId), &bstd::mem::Frame> = blaze_own::Vec::with_capacity_in(checkout.len(), frame);
         for read in checkout.iter() {
             cells.push((read.name(), read.answer));
@@ -130,6 +142,22 @@ fn runs(runner: &Double) -> u32 {
     runner.runs.load(Ordering::SeqCst)
 }
 
+#[test]
+fn a_status_script_certifies_until_its_porcelain_bytes_change() {
+    static STATE: AtomicU32 = AtomicU32::new(0);
+    static RUNNER: Double = Double { runs: AtomicU32::new(0), route: Route::Status(&STATE) };
+    let io = world(45);
+    for (state, certified, expected_runs) in [(0, false, 1), (0, true, 1), (1, false, 2), (2, true, 2), (0, false, 3)] {
+        STATE.store(state, Ordering::SeqCst);
+        let (ids, checked, said) = request(&io, &RUNNER);
+        assert!(ids.is_empty(), "{said}");
+        assert_eq!((checked.certified, runs(&RUNNER)), (certified, expected_runs), "{said}");
+        if certified {
+            assert_eq!(checked.entered, 0);
+        }
+    }
+}
+
 /// Whether a group of the scripts stage was entered for `cause` (engine.rs `Cause::text`), and
 /// for a read moved, because the cell `of` moved.
 fn entered_for(checked: &engine_check::Checked, cause: &str, of: Option<blaze_drive::Name>) -> bool {
@@ -139,7 +167,7 @@ fn entered_for(checked: &engine_check::Checked, cause: &str, of: Option<blaze_dr
 /// What the note of an unkept run says (engine_scripts.rs `UnkeptWords`).
 const UNKEPT: &str = "used by this command and not kept";
 
-/// (a) a script that asks `status`: its record is used this command, so `pkg`'s names record is
+/// (a) a script whose recorded git subject lost its command: its record is used this command, so `pkg`'s names record is
 /// made with its cfg and `app`'s body is checked, nothing waits on it and nothing is refused for
 /// a missing names record; the note is said once. (b) the next command runs it again (owed),
 /// with nothing changed, and is not certified.
@@ -152,6 +180,9 @@ fn a_script_with_a_read_no_cell_names_is_used_this_command_and_runs_again_next()
     assert!(!said.contains("has no names record"), "no crate lacks its names record: {said}");
     assert!(!said.contains("task(s) not run"), "no task waits on the script: {said}");
     assert_eq!(said.matches(UNKEPT).count(), 1, "the note is said once: {said}");
+    let profile = super::engine_check_tests::profile(&io);
+    let rejected = profile.lines().find(|line| line.contains("Scripts: unkept package=pkg 0.1.0 unit=")).expect("the rejected package and unit have a profile row");
+    assert!(rejected.contains("subject=\"git:pkg\" NoCell=Git"), "{rejected}");
     assert!(ids.is_empty(), "`app`'s call resolves under the script's cfg: {ids:?}\n{said}");
     assert!(checked.bodies.1 >= 1, "`app`'s body is checked: {:?}", checked.bodies.0);
     let (ids, again, said) = request(&io, &RUNNER);

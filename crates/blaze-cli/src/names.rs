@@ -26,23 +26,17 @@
 //! member (each is read under its own directory; one outside the workspace root is refused);
 //! the world and the records are held in the global allocator for the command.
 
-use core::cell::RefCell;
 use std::alloc::Global;
 use std::string::String;
 
-use blaze_drive::{Input, Kind, Name, Task, TaskFailure, Want, Why};
+use blaze_drive::{Kind, Name, TaskFailure, Why};
 use blaze_fetch::SourceId;
 use blaze_fetch::pack::PackView;
-use blaze_id::CrateItemKey;
 use blaze_ids::ContentId;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::Alloc;
-use blaze_scope::crate_scope::{CrateScopeError, resolve_crate};
-use blaze_scope::graph::{CrateId, Sysroot};
-use blaze_scope::resolve::{CrateInput, SourceTexts};
-use blaze_scope::prepares::Prepares;
-use blaze_scope::task::Serial;
 use blaze_unit_graph::{Records, StoreSources};
+use blaze_world::crate_list::{CrateGraph, CrateList};
 use blaze_world::{Fetched, Listed, Tree, World, WorldError};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadOnly, ReadWrite};
@@ -52,10 +46,10 @@ use bstd::mem::{Bytes, Frame};
 use crate::CliError;
 use crate::fetch::FetchEnv;
 use crate::store::Store;
-use crate::work::{Did, Made, held_str};
 
 pub(crate) mod expansion_texts;
 pub(crate) mod failed_call;
+pub(crate) mod module_missing;
 pub(crate) mod include_outside;
 pub(crate) mod test_marks;
 pub(crate) mod metered;
@@ -80,7 +74,7 @@ pub(crate) mod sections;
 // `crate_scope_name`): it names the crate's task, not its record's form, so a form change
 // moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
 // there only when what a name stands for changes.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 15";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 16";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -88,8 +82,8 @@ const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 15";
 /// drive does not re-enter readers of an equal out) kept "no crate's names record lists this
 /// file" while a fresh home did not (rule 21; main.rs `edits_of_module_files_answer_as_a_fresh_home`).
 const OUT_DOMAIN: &str = "blaze-cli crate scope out 2";
-/// The rule a refusal of this task names.
-const RULE: &str = "names.rs";
+/// The rule named by resolver refusals from both check drivers.
+pub(crate) const RULE: &str = "names.rs";
 
 
 /// Why the names world of a command could not be made.
@@ -120,6 +114,15 @@ pub enum NamesError {
     /// outside the workspace root): the names step reads members' directories only. `dependent`
     /// is the first unit that depends on it, `None` when none does.
     PathNotMember { package: String, dependent: Option<String> },
+    /// The crate list (blaze-world crate_list.rs) was not written from the world, or does not
+    /// open: a version 5 list of an old home is refused here, and the graph is made again (D160).
+    List(blaze_world::crate_list::ListError),
+    /// A row of the crate list whose planners' fact this crate cannot read (`what`): a script
+    /// part of another kind than `Script`, a placement byte no `RanAs` has.
+    ListFact { row: usize, what: &'static str },
+    /// Under test only: the list just written answers otherwise than the world it was written
+    /// from ([`Names::list_differences`], the oracle every test world's discovery runs).
+    ListDiffers { differences: usize },
 }
 
 impl core::fmt::Display for NamesError {
@@ -143,6 +146,74 @@ impl core::fmt::Display for NamesError {
             ),
             NamesError::PathNotMember { package, dependent: None } => {
                 write!(f, "the path package `{package}` is no member of the workspace (a path outside the workspace root): its directory is not known to the names step")
+            }
+            NamesError::List(error) => write!(f, "the crate list: {error}"),
+            NamesError::ListFact { row, what } => write!(f, "the crate list's row {row}: {what} (names.rs `of_list`)"),
+            NamesError::ListDiffers { differences } => {
+                write!(f, "the crate list written answers {differences} fact(s) otherwise than its own world (names.rs `differences_from`, the tests' oracle)")
+            }
+        }
+    }
+}
+
+/// What a request's names world was made by need for ([`Names::made_or_make`]): each its own
+/// span, so the profile says when the world was made and why (rule 15; engine.md item 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NeededBy {
+    /// A `CrateScope` task entered (engine_names.rs).
+    NamesTask,
+    /// A `Script` job made (scripts.rs `job`).
+    ScriptJob,
+    /// A build script's module lookup made (engine_scripts.rs `prepare_lookup`).
+    ModuleLookup,
+}
+
+impl NeededBy {
+    fn span(self) -> &'static str {
+        match self {
+            NeededBy::NamesTask => "names: make the world (needed by a names task)",
+            NeededBy::ScriptJob => "names: make the world (needed by a script job)",
+            NeededBy::ModuleLookup => "names: make the world (needed by a build script's module lookup)",
+        }
+    }
+}
+
+/// Why the world a request's crate list stands for was not made by need (rule 19): what needed
+/// it, and why not.
+#[derive(Debug)]
+pub(crate) struct WorldRefused {
+    pub(crate) needed_by: NeededBy,
+    pub(crate) why: WorldWhy,
+}
+
+#[derive(Debug)]
+pub(crate) enum WorldWhy {
+    /// These names were made from a world, not read from a list: nothing to make from.
+    NoMaker,
+    /// The graph's record named by the list's maker was not read back again.
+    Back(crate::engine_units::BackRefused),
+    /// The world was not made from it.
+    Make(NamesError),
+    /// The world made holds another crate at `row` than the list (or another count): the list
+    /// and the world under one graph key disagree (rule 21), refused, never mixed.
+    ListMoved { row: usize, crates: usize, rows: usize },
+    /// The world made answers `differences` facts otherwise than the list the request planned
+    /// from ([`Names::list_differences`]): under one graph key (rule 21), refused, never mixed.
+    ListDiffers { differences: usize },
+}
+
+impl core::fmt::Display for WorldRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the names world, needed by {:?}, was not made (names.rs `made_or_make`): ", self.needed_by)?;
+        match &self.why {
+            WorldWhy::NoMaker => f.write_str("these names hold no graph record to make it from"),
+            WorldWhy::Back(why) => write!(f, "{why}"),
+            WorldWhy::Make(why) => write!(f, "{why}"),
+            WorldWhy::ListMoved { row, crates, rows } => {
+                write!(f, "the world made holds another crate at row {row} than the crate list ({crates} crates, {rows} rows): the list and the world under one graph key disagree (rule 21)")
+            }
+            WorldWhy::ListDiffers { differences } => {
+                write!(f, "the world made answers {differences} fact(s) otherwise than the crate list the request planned from: the list and the world under one graph key disagree (rule 21)")
             }
         }
     }
@@ -189,21 +260,59 @@ impl Tree for ReadTree {
 
 /// The fetched sources' records: `<hex of the key>` in the machine's sources store
 /// (`<home>/.blaze/v2/sources`, fetch.rs `SOURCES`), never the checkout, for any key the graph
-/// pins: a reader over that store, with the names step's context and frame.
-struct Folder(Reader);
+/// pins: each MAPPED read-only in place, never read whole into a frame (it was until
+/// 2026-11-20: every command copied every fetched package's record, about 920 on tempo, into
+/// the names frame). A record there is written once and only ever renamed into place
+/// (fetch.rs `write_record`), so `Dir::map_read`'s contract holds, as for the unit graph's
+/// mapping of the same records (fetch.rs `Lockfile::map_source`).
+///
+/// THE ONE PROOF A FETCHED SOURCE IS STILL THERE (rule 74): this map. Every package the world
+/// places is mapped here once a command; one that is gone (removed by hand, or by a cleanup
+/// that ignored the answer's roots) is no mapping, so its package is not placed, the world is
+/// not made, and the units stage discovers in full (engine_units.rs `UnitsCause::World`), where
+/// the fetch's own stat (`fetch_stands`) finds it gone and fetches it again. No other stat of
+/// the sources store is made on a read back.
+struct Folder {
+    cx: &'static Cx,
+    store: Dir<ReadOnly>,
+    /// Where each mapping is held to the end of the command.
+    heap: Alloc<'static>,
+    opened: &'static Opened,
+}
+
+/// What making this world did, for the profile's `plan:` line (engine_units.rs `PlanRows`): each
+/// counted where it is done ([`world`]). One `Opened` a world; a world is made at most once a
+/// command on the units path, so these are the command's counts there.
+#[derive(Default)]
+pub(crate) struct Opened {
+    /// The graph record decoded ([`world`]: one; floor 0 once the world is read in place).
+    pub(crate) graph_decodes: core::cell::Cell<u32>,
+    /// The fetched records mapped in place ([`Folder`]), and their bytes.
+    pub(crate) records_mapped: core::cell::Cell<u32>,
+    pub(crate) mapped_bytes: core::cell::Cell<u64>,
+}
 
 impl Folder {
-    /// The sources store opened read only beside `checkout`'s reader (its context and frame).
-    fn of(checkout: &'static Reader, env: &FetchEnv<'_>) -> Result<Folder, NamesError> {
+    /// The sources store opened read only, with `checkout`'s context.
+    fn of(checkout: &'static Reader, env: &FetchEnv<'_>, opened: &'static Opened) -> Result<Folder, NamesError> {
         let sources = crate::fetch::sources_dir(checkout.cx, env).map_err(|error| NamesError::Sources(error.to_string()))?;
-        Ok(Folder(Reader { cx: checkout.cx, root: sources.read_only(), frame: checkout.frame }))
+        Ok(Folder { cx: checkout.cx, store: sources.read_only(), heap: env.heap.alloc(), opened })
     }
 }
 
 impl<'b> Records<'b> for Folder {
     fn record(&mut self, source: &SourceId<'_>) -> Option<&'b [u8]> {
         let hex = crate::fetch::key_hex(&source.key());
-        self.0.read(core::str::from_utf8(&hex).ok()?)
+        let path = Path::new(core::str::from_utf8(&hex).ok()?).ok()?;
+        // None is the package's `NotFetched` (blaze-unit-graph `SourceError`), named by its
+        // package and key: no world is made, and the units stage says why (engine_units.rs).
+        let mapping = self.store.map_read(self.cx, &path).ok()?;
+        // Held to the end of the command: the world and every reader of its packs borrow it.
+        let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak(blaze_own::Box::new_in(mapping, self.heap));
+        let bytes: &'static [u8] = mapping.bytes();
+        self.opened.records_mapped.set(self.opened.records_mapped.get().saturating_add(1));
+        self.opened.mapped_bytes.set(self.opened.mapped_bytes.get().saturating_add(bytes.len() as u64));
+        Some(bytes)
     }
 }
 
@@ -211,7 +320,8 @@ impl<'b> Records<'b> for Folder {
 pub(crate) struct Resolved {
     /// The record's payload ([`sections::write`]).
     payload: blaze_own::Vec<u8, Global>,
-    out: ContentId,
+    /// The digest both check drivers publish for this resolution.
+    pub(crate) out: ContentId,
     /// Each checkout file read, checkout-relative, sorted and without repeats.
     files: std::vec::Vec<String, Global>,
     /// Each checkout file looked for and not found (a `mod x;` whose file is missing, a
@@ -234,12 +344,27 @@ pub(crate) struct Resolved {
     /// Each failed macro call of the crate's own code, as its record's error finding
     /// ([`failed_call::findings`]).
     failed_calls: blaze_own::Vec<Unresolved, Global>,
+    /// Each `mod` of the crate's own code whose file the walk did not find, as its record's
+    /// error finding at the `mod` item ([`module_missing::findings`], E0583).
+    module_missing: blaze_own::Vec<module_missing::ModuleMissing, blaze_own::SharedAlloc<'static>>,
     /// What the tests record says about single functions of the crate's own code, each with
     /// its rule ([`test_marks::findings`]).
     test_marks: blaze_own::Vec<(u16, Unresolved), Global>,
     /// The crate's expansion records, which its payload's directory names: put after its
     /// record ([`crate::work::Record::extras`]).
     expansions: crate::work::Extras,
+}
+
+impl Resolved {
+    /// The engine worker takes its store key and wire length from these exact bytes.
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Checkout inputs for the engine worker's surface, absent-surface and data reads.
+    pub(crate) fn checkout_reads(&self) -> (&[String], &[String], &[(String, String)]) {
+        (&self.files, &self.absent, &self.data)
+    }
 }
 
 /// A resolved crate's payload ([`sections::write`]) with its unresolved paths as findings.
@@ -375,7 +500,8 @@ pub(crate) fn placed(rule: u16) -> bool {
         UNRESOLVED | UNRESOLVED_PRIVATE | UNRESOLVED_AMBIGUOUS | UNRESOLVED_NOT_A_MODULE |
         UNRESOLVED_SUPER_ABOVE_ROOT | UNRESOLVED_DOLLAR_CRATE | UNRESOLVED_WRONG_MACRO_KIND |
         UNRESOLVED_DERIVE_AFTER_ATTRIBUTE | include_outside::INCLUDE_OUTSIDE_PACKAGE |
-        failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED
+        failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED |
+        blaze_drive::task::MODULE_FILE_MISSING_RULE | blaze_drive::task::PATH_FILE_MISSING_RULE
     )
 }
 
@@ -557,70 +683,110 @@ pub(crate) fn place_pieces(message: &[u8]) -> Result<(Option<(&str, u64, blaze_s
     Ok((Some((path, chain, edition)), words))
 }
 
-/// The names step's state for a command: the world, each crate by subject, and what the
-/// tasks made (a task that asks for its files' `Surface`s answers from here when entered again).
+/// The names step's state for a command (engine.md item 2): the crate list it plans from, read
+/// in place (blaze-world crate_list.rs version 6), each crate by subject, what the tasks made (a
+/// task that asks for its files' `Surface`s answers from here when entered again), and the world
+/// the list stands for, made only when a task needs it ([`Names::made_or_make`]). Every planner
+/// answers from the list, so a request whose names, scripts and proc macros all stand makes no
+/// world and decodes no graph; the list's rows are in the world's order, so a row is the made
+/// world's crate index.
 pub struct Names<'f> {
-    world: World<'f>,
+    /// The list, its bytes held to the command's end (the command's heap).
+    list: CrateList<'static>,
+    /// Its bytes: what the graph's record is sealed with (engine_units.rs `discover`).
+    list_bytes: &'static [u8],
     /// (subject, crate index), sorted.
-    by_subject: std::vec::Vec<(ContentId, usize), Global>,
-    /// (key, crate index), sorted.
-    by_key: std::vec::Vec<(CrateItemKey, usize), Global>,
+    by_subject: blaze_own::Vec<(ContentId, usize), Alloc<'static>>,
     made: std::vec::Vec<(ContentId, Resolved), Global>,
     /// The subjects of the crates whose records may hold nothing of a project (target.md,
-    /// "Namespaces"): the toolchain's, and a registry archive's known by its lock checksum.
+    /// "Namespaces"): the toolchain's, and a registry archive's known by its lock checksum
+    /// (the list's `PUBLIC` flag); then each run of such a crate placed on the wasm path.
     /// Whether a record is public also needs every name it reads public: the store's check.
-    public: std::vec::Vec<ContentId, Global>,
+    public: blaze_own::Vec<ContentId, Alloc<'static>>,
     /// (crate index, the `Script` name of its side's run), sorted, for each crate that reads
     /// one ([`blaze_world::Script::Read`]): its task Needs it (decision D115 (B), ruling (2)).
-    scripts: std::vec::Vec<(usize, Name), Global>,
+    scripts: blaze_own::Vec<(usize, Name), Alloc<'static>>,
     /// How each run of `scripts` is placed, in its order (D112's choice point): in the run's key.
-    script_placed: std::vec::Vec<crate::scripts::RanAs, Global>,
+    script_placed: blaze_own::Vec<crate::scripts::RanAs, Alloc<'static>>,
+    /// Each crate's build-script module lookup, sorted by subject, then crate: one entry a crate
+    /// with a build script, so two crates of one module are two entries.
+    modules: blaze_own::Vec<ModuleAt, Alloc<'static>>,
+    /// The world, once a task needed it ([`Names::made_or_make`]); made with the list when the
+    /// graph was made this request ([`world`]).
+    world: core::cell::OnceCell<NamesWorld<'f>>,
+    /// What the world is made from by need: `None` for names made from a world.
+    maker: Option<Maker<'f>>,
+    /// The command's proc-macro runner, made by the first `CrateScope` task after the world
+    /// (names/scope.rs `prepare`) and lent to every names and body job.
+    procs: core::cell::Cell<Option<&'static crate::proc_runner::ProcRunner<'static>>>,
+    /// Crates whose names were resolved this command, and the unresolved paths among them.
+    pub resolved: u32,
+    pub unresolved: u64,
+}
+
+/// A crate's build-script module lookup as the list holds it: its subject (script_modules.rs
+/// `subject`), the crate whose package's script it is, and the run's placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModuleAt {
+    pub(crate) subject: ContentId,
+    pub(crate) crate_at: usize,
+    pub(crate) ran_as: crate::scripts::RanAs,
+}
+
+/// What a list-read [`Names`] makes its world from when a task needs it: the graph's record by
+/// its key and out (the one the list was read from), the lock and the members' directories.
+pub(crate) struct Maker<'f> {
+    record: blaze_drive::Key,
+    out: ContentId,
+    lock: &'f Lock<'static>,
+    members: &'f [(LockId, &'f str)],
+}
+
+impl<'f> Maker<'f> {
+    /// The maker of the graph record at `record` (out `out`), `members` copied into `frame`.
+    pub(crate) fn new(record: blaze_drive::Key, out: ContentId, lock: &'f Lock<'static>, members: &[(LockId, blaze_unit_graph::Text<'_>)], frame: &'f Frame) -> Maker<'f> {
+        let mut held = blaze_own::Vec::with_capacity_in(members.len(), frame);
+        for (id, dir) in members.iter() {
+            held.push((*id, crate::work::held_str(dir.as_str(), frame)));
+        }
+        Maker { record, out, lock, members: held.leak() }
+    }
+}
+
+/// The names world (blaze-world): every crate's input, made from the graph's record, the lock,
+/// the toolchain's shelf and the fetched sources ([`world`], [`Names::made_or_make`]), with what
+/// a task reads of it beyond the list: the decoded graph, where each package was placed, each
+/// module lookup's package, version and features.
+pub(crate) struct NamesWorld<'f> {
+    world: World<'f>,
+    /// Each crate's word for `public`, in world order (the crate list's `PUBLIC` flag).
+    crate_public: blaze_own::Vec<bool, Alloc<'static>>,
+    /// The command's heap (`FetchEnv::heap`): what the crate list's facts are worked out in
+    /// ([`blaze_world::crate_list::ListFacts`]).
+    heap: Alloc<'static>,
+    /// As [`Names`]'s, from the world.
+    scripts: std::vec::Vec<(usize, Name), Global>,
     /// (crate index, its build script's root file, package-relative), sorted: the file a
     /// failed script is named by (not_checked.rs).
     script_roots: std::vec::Vec<(usize, &'static str), Global>,
     /// Each crate's build-script module lookup (script_modules.rs), sorted by subject, then
     /// crate: one entry a crate reading a script, so two crates of one module are two entries.
     script_modules: std::vec::Vec<crate::script_modules::ScriptModule, Global>,
-    /// The command's one set of prepared macro definitions, shared by every crate it resolves.
-    prepares: &'f Prepares<'f>,
     /// The unit graph the world was made from (leaked with it): a proc-macro crate's unit, whose
     /// module identity the runner keys it by (proc_runner.rs).
     graph: &'static blaze_unit_graph::UnitGraph<'static>,
-    /// The command's proc-macro runner, made by the first `CrateScope` task after the world
-    /// (names/scope.rs `prepare`) and lent to every names and body job.
-    procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     /// Where the world placed each locked package (proc_callers.rs): what a proc macro called
     /// in a crate of that package is shown.
     placed: crate::proc_callers::Placed<'f>,
     /// The names step's own frame ([`NAMES_FRAME`], held to the command's end): what the world
     /// read into it, for the profile's memory line ([`Names::held`]).
     frame: &'static Frame,
-    /// Crates whose names were resolved this command, and the unresolved paths among them.
-    pub resolved: u32,
-    pub unresolved: u64,
+    /// What making the world did ([`Opened`]): the profile's `plan:` line.
+    opened: &'static Opened,
 }
 
-/// A checkout file a package's names read that no units record and no file's outline lists
-/// (the machine's `DriveError::NoPart`, which names the file by its digest alone).
-#[derive(Debug)]
-pub struct Unlisted {
-    pub package: String,
-    /// The file's path (its slot's: `x.rs` for `x/mod.rs` too), checkout-relative.
-    pub path: String,
-}
-
-impl core::fmt::Display for Unlisted {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "the names of package `{}` read `{}`, which no manifest's targets and no file's `mod` lines list (a module under a macro, an attribute or a `#[path]` the outline does not follow): its items cannot be checked",
-            self.package, self.path
-        )
-    }
-}
-
-impl<'f> Names<'f> {
-    /// The world the names are of: its crates in index order, their texts (body_types.rs).
+impl<'f> NamesWorld<'f> {
+    /// The world: its crates in index order (the list's rows), their texts (body_types.rs).
     pub(crate) fn world(&self) -> &World<'f> {
         &self.world
     }
@@ -630,45 +796,212 @@ impl<'f> Names<'f> {
         self.graph
     }
 
-    /// The command's proc-macro runner, once made.
-    pub(crate) fn procs(&self) -> Option<&'static crate::proc_runner::ProcRunner<'static>> {
-        self.procs
-    }
-
-    /// Sets the runner, once a command.
-    pub(crate) fn set_procs(&mut self, procs: &'static crate::proc_runner::ProcRunner<'static>) {
-        self.procs = Some(procs);
+    /// What making the world did: its graph decodes, fetched records mapped and packages placed.
+    pub(crate) fn opened(&self) -> &Opened {
+        self.opened
     }
 
     /// Where the world placed each locked package (proc_callers.rs).
     pub(crate) fn placed(&self) -> &crate::proc_callers::Placed<'f> {
         &self.placed
     }
+
+    /// Each build-script run the world's crates read: (its `Script` subject, as the world named
+    /// it, its build-script unit, the side of the crates that read it), sorted by subject, each
+    /// once. The runs a `Script` part can name (scripts.rs `Scripts::open`), no unit of the graph
+    /// walked beyond them; the list's runs table is written from it.
+    pub(crate) fn script_runs<A: core::alloc::Allocator>(&self, alloc: A) -> blaze_own::Vec<(ContentId, blaze_unit_graph::UnitId, blaze_world::Side), A> {
+        let mut runs = blaze_own::Vec::with_capacity_in(self.scripts.len(), alloc);
+        for (at, name) in self.scripts.iter() {
+            let krate = &self.world.crates[*at];
+            let blaze_world::Origin::Unit(unit) = krate.origin else { continue };
+            if let Some(script) = self.graph.units.get(unit.index()).and_then(|unit| unit.build_script) {
+                runs.push((name.subject, script, krate.side));
+            }
+        }
+        runs.sort_unstable_by_key(|(subject, script, _)| (*subject, *script));
+        runs.dedup_by_key(|(subject, _, _)| *subject);
+        runs
+    }
+
+    /// The build-script module lookup of `subject` whole (its package, version and features:
+    /// what the lookup's job asks), if it is one.
+    pub(crate) fn script_module(&self, subject: ContentId) -> Option<&crate::script_modules::ScriptModule> {
+        let at = self.script_modules.partition_point(|module| module.subject < subject);
+        self.script_modules.get(at).filter(|module| module.subject == subject)
+    }
+
+    fn script_module_of(&self, at: usize) -> Option<&crate::script_modules::ScriptModule> {
+        self.script_modules.iter().find(|module| module.crate_at == at)
+    }
+
+    fn script_root(&self, at: usize) -> Option<&str> {
+        self.script_roots.binary_search_by_key(&at, |(krate, _)| *krate).ok().map(|i| self.script_roots[i].1)
+    }
+
+    fn script_name_of(&self, at: usize) -> Option<[u8; 33]> {
+        let (_, name) = self.scripts.iter().find(|(of, _)| *of == at)?;
+        let mut bytes = [0; 33];
+        bytes[0] = name.kind as u8;
+        bytes[1..].copy_from_slice(&name.subject.0);
+        Some(bytes)
+    }
+}
+
+impl<'f> Names<'f> {
+    /// The names read from the crate list `list` (its bytes held to the command's end), the
+    /// world made by need from `maker`'s record ([`Names::made_or_make`]). No world is made and
+    /// no graph decoded here: O(crates), the list's rows read in place (engine.md item 2).
+    pub(crate) fn of_list(list_bytes: &'static [u8], maker: Option<Maker<'f>>, heap: Alloc<'static>) -> Result<Names<'f>, NamesError> {
+        let list = CrateList::open(list_bytes).map_err(NamesError::List)?;
+        let n = list.len();
+        let mut by_subject = blaze_own::Vec::with_capacity_in(n, heap);
+        by_subject.extend((0..n).map(|r| (blaze_drive::key::crate_scope_name(&list.key(r)).subject, r)));
+        by_subject.sort_unstable();
+        let mut scripts = blaze_own::Vec::new_in(heap);
+        for r in 0..n {
+            if let Some(name) = list.script(r) {
+                if name[0] != Kind::Script as u8 {
+                    return Err(NamesError::ListFact { row: r, what: "a script part of another kind than `Script`" });
+                }
+                let mut subject = [0u8; 32];
+                subject.copy_from_slice(&name[1..]);
+                scripts.push((r, Name::new(Kind::Script, ContentId(subject))));
+            }
+        }
+        let mut modules = blaze_own::Vec::with_capacity_in(list.modules().count(), heap);
+        for module in list.modules() {
+            let ran_as = match module.ran_as {
+                1 => crate::scripts::RanAs::Wasm,
+                2 => crate::scripts::RanAs::Native,
+                _ => return Err(NamesError::ListFact { row: module.row, what: "a module's placement byte that no `RanAs` has" }),
+            };
+            modules.push(ModuleAt { subject: ContentId(module.subject), crate_at: module.row, ran_as });
+        }
+        // The list holds them sorted by (subject, row) (crate_list.rs `open` checks it).
+        let mut script_placed = blaze_own::Vec::with_capacity_in(scripts.len(), heap);
+        for (at, _) in scripts.iter() {
+            let module = modules.iter().find(|module| module.crate_at == *at).ok_or(NamesError::ListFact { row: *at, what: "a crate that reads a build script's run with no module lookup (ruling D115 (3))" })?;
+            script_placed.push(module.ran_as);
+        }
+        // The public crates, in the list's order, then their runs placed on the wasm path (as
+        // [`world`] tells them: ruling D115 sharing (i)).
+        let mut public = blaze_own::Vec::new_in(heap);
+        public.extend((0..n).filter(|r| list.public(*r)).map(|r| blaze_drive::key::crate_scope_name(&list.key(r)).subject));
+        for ((at, name), ran_as) in scripts.iter().zip(script_placed.iter()) {
+            if crate::scripts::run_is_public(list.public(*at), *ran_as) {
+                public.push(name.subject);
+            }
+        }
+        Ok(Names {
+            list,
+            list_bytes,
+            by_subject,
+            made: std::vec::Vec::new(),
+            public,
+            scripts,
+            script_placed,
+            modules,
+            world: core::cell::OnceCell::new(),
+            maker,
+            procs: core::cell::Cell::new(None),
+            resolved: 0,
+            unresolved: 0,
+        })
+    }
+
+    /// The crate list these names plan from.
+    pub(crate) fn list(&self) -> &CrateList<'static> {
+        &self.list
+    }
+
+    /// The list's bytes, as written or read back.
+    pub(crate) fn list_bytes(&self) -> &'static [u8] {
+        self.list_bytes
+    }
+
+    /// The world, when it was made (with the list, or by need).
+    pub(crate) fn made(&self) -> Option<&NamesWorld<'f>> {
+        self.world.get()
+    }
+
+    /// The world, made now if no task made it yet: the graph's record read again by the key the
+    /// list was read from, the world made from it under the span naming `needed_by`, and every
+    /// row of the list checked to be the made world's crate at that index (a world that differs
+    /// is refused, never mixed with the list's answers). Made once a request: the cell is the
+    /// request's, dropped with it; nothing is kept between requests (rule 70). `Err` for the
+    /// store's own failure; `Ok(Err)` names why the world was not made.
+    pub(crate) fn made_or_make(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        store: &mut dyn Store<'_>,
+        env: &FetchEnv<'_>,
+        needed_by: NeededBy,
+    ) -> Result<Result<&NamesWorld<'f>, WorldRefused>, CliError> {
+        if let Some(made) = self.world.get() {
+            return Ok(Ok(made));
+        }
+        let refused = |why| Ok(Err(WorldRefused { needed_by, why }));
+        let Some(maker) = self.maker.as_ref() else { return refused(WorldWhy::NoMaker) };
+        let cx = cx.span(needed_by.span());
+        let (view, sections) = match crate::engine_units::stored_graph_at(&cx, store, maker.record)? {
+            Ok(found) => found,
+            Err(why) => return refused(WorldWhy::Back(why)),
+        };
+        if view.out != maker.out {
+            return refused(WorldWhy::Back(crate::engine_units::BackRefused::Out { key: maker.record }));
+        }
+        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, env) {
+            Ok(made) => made,
+            Err(why) => return refused(WorldWhy::Make(why)),
+        };
+        let (crates, rows) = (made.world.crates.len(), self.list.len());
+        if let Some(row) = (0..crates.max(rows)).find(|r| *r >= crates || *r >= rows || self.list.key(*r) != made.world.crates[*r].input.key) {
+            return refused(WorldWhy::ListMoved { row, crates, rows });
+        }
+        // Every answer the planners took from the list, against the world's (rule 21: two values
+        // under one key are refused, never mixed): a fact of the list whose input the graph's key
+        // missed (a lock entry moved under one key, say) stops the request here, by name.
+        let differences = {
+            let _cx = cx.span("names: the crate list checked against the world made");
+            self.differences_from(&made)
+        };
+        if differences != 0 {
+            return refused(WorldWhy::ListDiffers { differences });
+        }
+        // The cell was empty above, and nothing between filled it (one request, one thread).
+        Ok(Ok(self.world.get_or_init(|| made)))
+    }
+
+    /// The command's proc-macro runner, once made.
+    pub(crate) fn procs(&self) -> Option<&'static crate::proc_runner::ProcRunner<'static>> {
+        self.procs.get()
+    }
+
+    /// Sets the runner, once a command.
+    pub(crate) fn set_procs(&self, procs: &'static crate::proc_runner::ProcRunner<'static>) {
+        self.procs.set(Some(procs));
+    }
 }
 
 impl Names<'_> {
-    /// The package whose names read the checkout file `file` names, and the file's path: the
-    /// first in subject order. For an error that would name the file by its digest.
-    pub(crate) fn reader_of(&self, file: Name) -> Option<Unlisted> {
-        for (subject, resolved) in self.made.iter() {
-            let Some(path) = resolved.files.iter().find(|path| Name::file(path.as_bytes()) == file) else { continue };
-            let at = self.by_subject.binary_search_by_key(subject, |(subject, _)| *subject).ok()?;
-            return Some(Unlisted { package: String::from(self.world.crates[self.by_subject[at].1].package), path: path.clone() });
+    /// File one worker's result in subject order for both check drivers.
+    pub(crate) fn keep_resolution(&mut self, name: Name, resolved: Resolved, ok: bool, unresolved: u32) -> Result<(), TaskFailure> {
+        match self.made.binary_search_by_key(&name.subject, |row| row.0) {
+            Ok(_) => Err(TaskFailure { name, why: Why::Refused { what: "a second resolution of the same crate", rule: RULE } }),
+            Err(at) => {
+                self.made.insert(at, (name.subject, resolved));
+                self.resolved += u32::from(ok);
+                self.unresolved += u64::from(unresolved);
+                Ok(())
+            }
         }
-        None
-    }
-
-    /// The checkout files the crate `subject`'s resolution read this command (checkout-relative),
-    /// and each file it read as data with its home's slot: what its answer asks for as its
-    /// surfaces and data records (scope.rs `answer`). `None` before it was resolved.
-    pub(crate) fn read_files(&self, subject: ContentId) -> Option<(&[String], &[(String, String)])> {
-        let at = self.made.binary_search_by_key(&subject, |(subject, _)| *subject).ok()?;
-        Some((&self.made[at].1.files, &self.made[at].1.data))
     }
 
     /// What this world keeps of the crates resolved this command, to the command's end, for the
     /// profile's memory lines (engine_memory.rs): how many crates, the bytes of their read lists
-    /// and findings (a later step reads the lists, [`Names::read_files`]), and the payload bytes
+    /// and findings (a later step reads the lists), and the payload bytes
     /// not yet handed to a record (an answered crate hands its payload over, names/scope.rs
     /// `hand_payload`, so this is 0 once every crate resolved was answered). A walk made once,
     /// when the profile is written: profile-only, never in a record (rule 25).
@@ -677,10 +1010,11 @@ impl Names<'_> {
     }
 
     /// The names step's own frame ([`NAMES_FRAME`]): its bytes in use and committed now. It
-    /// takes the world's reads (the sources store, the shelf, the members' places, whatever is
-    /// read through the world's checkout reader), held to the command's end.
+    /// takes the world's reads (the shelf, the members' places, whatever is read through the
+    /// world's checkout reader; the fetched records are mapped, [`Folder`], not read into it),
+    /// held to the command's end. `(0, 0)` while no world was made (none was reserved).
     pub(crate) fn frame_held(&self) -> (u64, u64) {
-        (self.frame.used() as u64, self.frame.committed() as u64)
+        self.world.get().map_or((0, 0), |made| (made.frame.used() as u64, made.frame.committed() as u64))
     }
 
     fn held_by_crates(&self) -> (u64, u64, u64) {
@@ -716,8 +1050,23 @@ impl Names<'_> {
     /// The crate at world index `at` as it is printed: its crate name, and whether it is the
     /// macro side's copy.
     pub(crate) fn crate_label(&self, at: usize) -> (&str, bool) {
-        let krate = &self.world.crates[at];
-        (krate.input.name, krate.side == blaze_world::Side::Macro)
+        (CrateGraph::name(&self.list, at), CrateGraph::side(&self.list, at) == blaze_world::Side::Macro)
+    }
+
+    /// Each build-script run the world's crates read: (its `Script` subject, as the world named
+    /// it, its build-script unit, the side of the crates that read it), sorted by subject, each
+    /// once: the list's runs table ([`NamesWorld::script_runs`] wrote it). The runs a `Script`
+    /// part can name (scripts.rs `Scripts::open`), no unit of the graph walked beyond them.
+    pub(crate) fn script_runs<A: core::alloc::Allocator>(&self, alloc: A) -> blaze_own::Vec<(ContentId, blaze_unit_graph::UnitId, blaze_world::Side), A> {
+        let mut runs = blaze_own::Vec::with_capacity_in(self.list.runs().count(), alloc);
+        runs.extend(self.list.runs().map(|run| (ContentId(run.subject), blaze_unit_graph::UnitId(run.unit), run.side)));
+        runs
+    }
+
+    /// The run of `subject` as the list holds it: its unit, side, package name and version, and
+    /// the `Script` runs its `links` closure reads (engine_scripts.rs `plan`).
+    pub(crate) fn script_run(&self, subject: ContentId) -> Option<blaze_world::crate_list::RunRow<'static>> {
+        self.list.run(subject.0)
     }
 
     /// The world indices of the crates that read the `Script` run `script`, in index order.
@@ -727,39 +1076,128 @@ impl Names<'_> {
 
     /// The build-script file (package-relative) of the crate at world index `at`.
     pub(crate) fn script_root(&self, at: usize) -> Option<&str> {
-        self.script_roots.binary_search_by_key(&at, |(krate, _)| *krate).ok().map(|i| self.script_roots[i].1)
+        self.list.module_of(at).map(|module| module.root)
     }
 
     /// Each `Script` run's (subject, the reading crate's world key, its placement): its part
     /// source's inputs (scripts.rs `parts`).
     pub(crate) fn script_keys(&self) -> impl Iterator<Item = (ContentId, ContentId, crate::scripts::RanAs)> + '_ {
-        self.scripts.iter().zip(self.script_placed.iter()).map(|((at, name), ran_as)| (name.subject, self.world.crates[*at].input.key.0, *ran_as))
+        self.scripts.iter().zip(self.script_placed.iter()).map(|((at, name), ran_as)| (name.subject, self.list.key(*at).0, *ran_as))
     }
 
     /// The `Script` part's name (kind byte, subject) of the crate at world index `at`, when its
     /// build script's run is a task: the crate list's script column (graph_payload.rs).
     pub(crate) fn script_name_of(&self, at: usize) -> Option<[u8; 33]> {
-        let (_, name) = self.scripts.iter().find(|(of, _)| *of == at)?;
-        let mut bytes = [0; 33];
-        bytes[0] = name.kind as u8;
-        bytes[1..].copy_from_slice(&name.subject.0);
-        Some(bytes)
+        self.list.script(at)
     }
 
-    /// Every build-script module lookup of the world, sorted by subject (repeats adjacent).
-    pub(crate) fn script_modules(&self) -> &[crate::script_modules::ScriptModule] {
-        &self.script_modules
+    /// Every build-script module lookup's subject, sorted (repeats adjacent: one a crate).
+    pub(crate) fn script_module_subjects(&self) -> impl Iterator<Item = ContentId> + '_ {
+        self.modules.iter().map(|module| module.subject)
     }
 
     /// The module lookup the script read by the crate at world index `at` Needs.
-    pub(crate) fn script_module_of(&self, at: usize) -> Option<&crate::script_modules::ScriptModule> {
-        self.script_modules.iter().find(|module| module.crate_at == at)
+    pub(crate) fn script_module_of(&self, at: usize) -> Option<ModuleAt> {
+        self.modules.iter().find(|module| module.crate_at == at).copied()
     }
 
-    /// The build-script module lookup of `subject`, if it is one (else a proc-macro crate's).
-    pub(crate) fn script_module(&self, subject: ContentId) -> Option<&crate::script_modules::ScriptModule> {
-        let at = self.script_modules.partition_point(|module| module.subject < subject);
-        self.script_modules.get(at).filter(|module| module.subject == subject)
+    /// The build-script module lookup of `subject`, if it is one (else a proc-macro crate's):
+    /// its first crate. Its package, version and features are the world's
+    /// ([`NamesWorld::script_module`]).
+    pub(crate) fn script_module(&self, subject: ContentId) -> Option<ModuleAt> {
+        let at = self.modules.partition_point(|module| module.subject < subject);
+        self.modules.get(at).filter(|module| module.subject == subject).copied()
+    }
+
+    /// How many of the answers these names give from the list differ from the made world's,
+    /// crate by crate (0 when they agree; `None` while no world was made): each crate's key,
+    /// subject, label, script part, module (subject, placement, root) and public word; the runs
+    /// (subject, unit, side, name, version and the `links` producers the graph's closure names);
+    /// the proc-macro subjects. The planners' seam's oracle: run on every world made by need
+    /// ([`Names::made_or_make`]) and, under test, on every world discovered ([`world`]); its
+    /// controls in tests/engine_ready_edit_tests.rs.
+    pub(crate) fn list_differences(&self) -> Option<usize> {
+        self.world.get().map(|made| self.differences_from(made))
+    }
+
+    /// [`Names::list_differences`] against `made`, before it is kept.
+    fn differences_from(&self, made: &NamesWorld<'_>) -> usize {
+        let world = &made.world;
+        let mut differ = blaze_world::crate_list::differences(world, &self.list);
+        for (at, krate) in world.crates.iter().enumerate() {
+            if at >= self.list.len() {
+                break;
+            }
+            let subject = blaze_drive::key::crate_scope_name(&krate.input.key).subject;
+            differ += usize::from(self.crate_at(subject) != Some(at));
+            differ += usize::from(self.crate_label(at) != (krate.input.name, krate.side == blaze_world::Side::Macro));
+            differ += usize::from(self.script_name_of(at) != made.script_name_of(at));
+            differ += usize::from(self.script_root(at) != made.script_root(at));
+            let module = made.script_module_of(at).map(|module| (module.subject, module.ran_as));
+            differ += usize::from(self.script_module_of(at).map(|module| (module.subject, module.ran_as)) != module);
+            differ += usize::from(self.list.public(at) != made.crate_public[at]);
+        }
+        let runs = made.script_runs(made.heap);
+        differ += usize::from(self.script_runs(made.heap).as_slice() != runs.as_slice());
+        let mut each = |run: blaze_world::crate_list::Run<'_>| {
+            let listed = self.script_run(ContentId(run.subject));
+            let same = listed.is_some_and(|listed| {
+                listed.unit == run.unit && listed.side == run.side && listed.name == run.name && listed.version == run.version && listed.producers().eq(run.producers.iter().copied())
+            });
+            differ += usize::from(!same);
+        };
+        blaze_world::crate_list::ListFacts::runs(made, &mut each);
+        let mut macros: blaze_own::Vec<[u8; 32], Alloc<'static>> = blaze_own::Vec::new_in(made.heap);
+        blaze_world::crate_list::ListFacts::macros(made, &mut |subject| macros.push(subject));
+        differ += usize::from(!self.list.macros().eq(macros.iter().copied()));
+        differ
+    }
+}
+
+/// The crate list's planners' facts (blaze-world crate_list.rs version 6), answered from the
+/// world and the graph it was made from, by the one maker of the list ([`world`]): what the
+/// names, scripts and units stages then plan from with no world made and no graph decoded
+/// (engine.md item 2). [`Names::list_differences`] holds the list's answers equal to these.
+impl blaze_world::crate_list::ListFacts for NamesWorld<'_> {
+    fn script(&self, at: usize) -> Option<[u8; 33]> {
+        self.script_name_of(at)
+    }
+
+    fn public(&self, at: usize) -> bool {
+        self.crate_public[at]
+    }
+
+    fn module(&self, at: usize) -> Option<blaze_world::crate_list::Module<'_>> {
+        let module = self.script_module_of(at)?;
+        let root = self.script_root(at)?;
+        Some(blaze_world::crate_list::Module { ran_as: module.ran_as as u8, subject: module.subject.0, root })
+    }
+
+    fn runs(&self, each: &mut dyn FnMut(blaze_world::crate_list::Run<'_>)) {
+        let runs = self.script_runs(self.heap);
+        let mut producers: blaze_own::Vec<[u8; 32], Alloc<'static>> = blaze_own::Vec::new_in(self.heap);
+        for (subject, script, side) in runs.iter() {
+            producers.clear();
+            // The plan's reads of the run (engine_scripts.rs `plan`): each `Script` run its
+            // `links` closure reads, by the subject its side names.
+            for (input, _, _) in blaze_proc_macro::script_unit::links_closure(self.graph, *script).iter() {
+                if let Some(producer) = crate::scripts::name_of(self.graph, *input, *side, self.heap) {
+                    producers.push(producer.subject.0);
+                }
+            }
+            let unit = &self.graph.units[script.index()];
+            each(blaze_world::crate_list::Run { subject: subject.0, unit: script.0, side: *side, name: unit.name.as_str(), version: unit.version.as_str(), producers: &producers });
+        }
+    }
+
+    fn macros(&self, each: &mut dyn FnMut([u8; 32])) {
+        let mut subjects: blaze_own::Vec<[u8; 32], Alloc<'static>> = blaze_own::Vec::new_in(self.heap);
+        subjects.extend(crate::macros::macro_subjects(self.graph).map(|subject| subject.0));
+        subjects.sort_unstable();
+        subjects.dedup();
+        for subject in subjects.iter() {
+            each(*subject);
+        }
     }
 }
 
@@ -777,6 +1215,8 @@ pub(crate) fn member_dirs<'l>(laid: Option<&'l crate::units::Laid<'_>>) -> Optio
 
 /// The names world of a command, made from the graph record `graph_record`; `members` is each
 /// workspace member's lock entry and directory, anchor-relative ([`member_dirs`]).
+/// The world is made with its crate list (blaze-world crate_list.rs version 6, written from it:
+/// [`Names::list`]), which the graph's record is sealed with (engine_units.rs `discover`).
 pub(crate) fn world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
@@ -785,27 +1225,73 @@ pub(crate) fn world<'f>(
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
     env: &FetchEnv<'_>,
 ) -> Result<Names<'f>, NamesError> {
+    let lock = lock.ok_or(NamesError::NoLock)?;
+    let members = members.ok_or(NamesError::NoMembers)?;
+    let heap: Alloc<'static> = env.heap.alloc();
+    let mut dirs: blaze_own::Vec<(LockId, &str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(members.len(), heap);
+    dirs.extend(members.iter().map(|(id, dir)| (*id, dir.as_str())));
+    let made = make_world(cx, root, graph_record, lock, &dirs, env)?;
+    let list: &'static [u8] = {
+        let _cx = cx.span("names: the crate list written");
+        blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak()
+    };
+    let names = Names::of_list(list, None, heap)?;
+    // THE ORACLE, under test (names.rs `differences_from`): every answer the planners take from
+    // the list equals the world's, crate by crate, on every test world discovered. In a build it
+    // is the by-need make that checks it ([`Names::made_or_make`]): the list just written from
+    // this world is not checked against it again (rule 77).
+    #[cfg(test)]
+    {
+        let differences = names.differences_from(&made);
+        if differences != 0 {
+            return Err(NamesError::ListDiffers { differences });
+        }
+    }
+    names.world.get_or_init(|| made);
+    Ok(names)
+}
+
+/// The names world made from the graph record `graph_record`, the lock and the members'
+/// directories, anchor-relative ([`world`], [`Names::made_or_make`]).
+fn make_world<'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    graph_record: &[u8],
+    lock_whole: &'f Lock<'static>,
+    members: &[(LockId, &str)],
+    env: &FetchEnv<'_>,
+) -> Result<NamesWorld<'f>, NamesError> {
     // The lock as given, `'static` inside: the fetch path below is typed at `'static` so the
     // places it answers can be shown to the proc-macro sandbox (proc_callers.rs).
-    let lock_whole: &'f Lock<'static> = lock.ok_or(NamesError::NoLock)?;
     let lock: &'f Lock<'f> = lock_whole;
-    let members = members.ok_or(NamesError::NoMembers)?;
     // The command's allocator for the world and the records: the process's heap, handed from
     // `main` in `env`, held to the end.
     let heap: Alloc<'static> = env.heap.alloc();
     let alloc: Alloc<'f> = heap;
     let Some(home) = env.home else { return Err(NamesError::NoHome) };
-    let decoded = blaze_unit_graph::record::decode(graph_record, heap).map_err(NamesError::Graph)?;
+    // Each step of the making under its own span (engine.md item 2: the read back's 180 ms on
+    // tempo had no span below "names: make the world"), its counts in `opened`.
+    let opened: &'static Opened = blaze_own::Box::leak(blaze_own::Box::new_in(Opened::default(), heap));
+    let decoded = {
+        let _cx = cx.span("names: the unit graph decoded");
+        opened.graph_decodes.set(opened.graph_decodes.get().saturating_add(1));
+        blaze_unit_graph::record::decode(graph_record, heap).map_err(NamesError::Graph)?
+    };
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = std::boxed::Box::leak(std::boxed::Box::new(decoded));
     let graph = &decoded.graph;
     // The files read for the names step live to the end of the command: a context of the
     // command's (its deadline) and a frame of their own, both held to the end.
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
     let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
-    let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?;
+    let mut shelf = {
+        let _cx = cx.span("names: the toolchain's shelf opened");
+        crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?
+    };
     let reader: &'static Reader = std::boxed::Box::leak(std::boxed::Box::new(Reader { cx, root: root.read_only(), frame }));
-    let sources = StoreSources::new(lock_whole, Folder::of(reader, env)?, PackView::open_source_put, heap)
-        .map_err(|e| NamesError::Sources(std::format!("{e}")))?;
+    let sources = {
+        let _cx = cx.span("names: the lock's fetch plan and the sources store opened");
+        StoreSources::new(lock_whole, Folder::of(reader, env, opened)?, PackView::open_source_put, heap).map_err(|e| NamesError::Sources(std::format!("{e}")))?
+    };
     let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
     // Every path package the graph reaches is a member, placed at its own directory (the
     // layout's, anchor-relative: `""` for the root's own package), so its root file and its
@@ -814,7 +1300,7 @@ pub(crate) fn world<'f>(
     // (a path dependency outside the workspace root), is refused by name: nothing is guessed.
     let mut by_dir: blaze_own::Vec<(&str, &str), &Frame> = blaze_own::Vec::with_capacity_in(members.len(), frame);
     for (id, dir) in members.iter() {
-        by_dir.push((dir.as_str(), lock.package(*id).name.as_str()));
+        by_dir.push((*dir, lock.package(*id).name.as_str()));
     }
     by_dir.sort_unstable();
     if let Some(pair) = by_dir.windows(2).find(|pair| pair[0].0 == pair[1].0) {
@@ -838,7 +1324,7 @@ pub(crate) fn world<'f>(
             return Err(NamesError::PathNotMember { package: String::from(package.name.as_str()), dependent });
         };
         // Held to the end of the command, in the names frame, as the files read under it are.
-        let held: &'static blaze_own::String<&'static Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::String::from_str_in(dir.as_str(), frame), frame));
+        let held: &'static blaze_own::String<&'static Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::String::from_str_in(dir, frame), frame));
         paths.push((id, held.as_str()));
     }
     let paths: &'f [(LockId, &'static str)] = std::vec::Vec::leak(paths);
@@ -847,22 +1333,23 @@ pub(crate) fn world<'f>(
     // Every place the world is told, kept for the proc-macro runner (proc_callers.rs).
     let mut packages = crate::proc_callers::Placing::new(&mut fetched, alloc);
     // The crate list (blaze-scope's units list, the one home) and the toolchain crates it needs.
-    let listed = blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, heap).map_err(|e| match e {
-        WorldError::Toolchain(_) => NamesError::Toolchain(std::format!("{e}")),
-        other => NamesError::World(std::format!("{other}")),
-    })?;
-    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::leak(blaze_own::Box::new_in(listed, Global));
-    let world = blaze_world::world(graph, lock, listed, &mut packages, checkout, heap)
-        .map_err(|e| NamesError::World(std::format!("{e}")))?;
+    // Placing a member asks only its directory; the fetched packages are placed by the world.
+    let listed = {
+        let _cx = cx.span("names: the crate list and the toolchain's packs opened");
+        blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, heap).map_err(|e| match e {
+            WorldError::Toolchain(_) => NamesError::Toolchain(std::format!("{e}")),
+            other => NamesError::World(std::format!("{other}")),
+        })?
+    };
+    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::leak(blaze_own::Box::new_in(listed, heap));
+    // Every fetched package placed: its record mapped ([`Folder`]), its rows checked, its manifest
+    // laid out (blaze-unit-graph sources.rs `locate`), its crates keyed in order.
+    let world = {
+        let _cx = cx.span("names: the packages placed and the world made");
+        blaze_world::world(graph, lock, listed, &mut packages, checkout, heap).map_err(|e| NamesError::World(std::format!("{e}")))?
+    };
     let placed = packages.finish();
-    let mut by_subject = std::vec::Vec::new();
-    let mut by_key = std::vec::Vec::new();
-    for (at, krate) in world.crates.iter().enumerate() {
-        by_subject.push((blaze_drive::key::crate_scope_name(&krate.input.key).subject, at));
-        by_key.push((krate.input.key, at));
-    }
-    by_subject.sort_unstable();
-    by_key.sort_unstable();
+    let _cx = cx.span("names: the world's public crates and scripts");
     // A registry package with a checksum in the lock: its archive is known by content, so its
     // crate's records are keyed by nothing of this project. A path or git package, a member,
     // or a registry package with no checksum stays the project's.
@@ -870,17 +1357,12 @@ pub(crate) fn world<'f>(
         let package = lock.package(graph.units[unit.0 as usize].package);
         matches!(package.source, LockSource::Registry { .. }) && matches!(package.checksum, blaze_manifest::lock::Checksum::Sha256(_))
     };
-    let mut public = std::vec::Vec::new_in(Global);
-    public.extend(
-        world
-            .crates
-            .iter()
-            .filter(|krate| match krate.origin {
-                blaze_world::Origin::Toolchain(_) => true,
-                blaze_world::Origin::Unit(unit) => from_archive(unit),
-            })
-            .map(|krate| blaze_drive::key::crate_scope_name(&krate.input.key).subject),
-    );
+    // Each crate's word, in world order: the crate list's `PUBLIC` flag (crate_list.rs v6).
+    let mut crate_public: blaze_own::Vec<bool, Alloc<'static>> = blaze_own::Vec::with_capacity_in(world.crates.len(), heap);
+    crate_public.extend(world.crates.iter().map(|krate| match krate.origin {
+        blaze_world::Origin::Toolchain(_) => true,
+        blaze_world::Origin::Unit(unit) => from_archive(unit),
+    }));
     // Each crate that reads a build script's run, of ITS side (ruling D115 (2)): the subject
     // is the world's (`blaze_world::script_subject`). Crate order, so sorted by index.
     let mut scripts = std::vec::Vec::new_in(Global);
@@ -911,26 +1393,18 @@ pub(crate) fn world<'f>(
         script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at, ran_as, package: script.name.as_str(), version: script.version.as_str(), features });
     }
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));
-    // Each run's placement, and the public list's script subjects (ruling D115 sharing (i)):
-    // a public crate's run is added only when placed on the wasm path; one not added stays
-    // this machine's, and so does every record reading it (the safe direction).
-    let crates_public = public.len();
-    let mut script_placed = std::vec::Vec::with_capacity_in(scripts.len(), Global);
-    for (at, name) in scripts.iter() {
-        let Ok(i) = placements.binary_search_by_key(at, |(krate, _)| *krate) else {
+    // Each run's placement is its crate's module's (the list's module rows hold it; the public
+    // list's script subjects, ruling D115 sharing (i), are told from them: `Names::of_list`).
+    // A crate reading a run with no build-script unit is refused here, by name.
+    for (at, _) in scripts.iter() {
+        if placements.binary_search_by_key(at, |(krate, _)| *krate).is_err() {
             return Err(NamesError::World(std::format!(
                 "the crate `{}` reads a build script's run, and no unit of it has a build script (ruling D115 (3))",
                 world.crates[*at].input.name
             )));
-        };
-        let ran_as = placements[i].1;
-        script_placed.push(ran_as);
-        let crate_public = public[..crates_public].contains(&blaze_drive::key::crate_scope_name(&world.crates[*at].input.key).subject);
-        if crate::scripts::run_is_public(crate_public, ran_as) {
-            public.push(name.subject);
         }
     }
-    Ok(Names { world, by_subject, by_key, made: std::vec::Vec::new(), public, scripts, script_placed, script_roots, script_modules, prepares: Prepares::new_in(alloc), graph, procs: None, placed, frame, resolved: 0, unresolved: 0 })
+    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, placed, frame, opened })
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that
@@ -957,11 +1431,11 @@ pub(crate) fn script_units<'a>(
 /// a world is made.
 pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
     store.public_crates(&names.public);
-    // The toolchain's of them: their records are kept under the toolchain's root.
-    let mut toolchain = std::vec::Vec::with_capacity_in(names.world.crates.len(), Global);
-    toolchain.extend(
-        names.world.crates.iter().filter(|krate| matches!(krate.origin, blaze_world::Origin::Toolchain(_))).map(|krate| blaze_drive::key::crate_scope_name(&krate.input.key).subject),
-    );
+    // The toolchain's of them: their records are kept under the toolchain's root (the list's
+    // `TOOLCHAIN` flag).
+    let list = &names.list;
+    let mut toolchain = std::vec::Vec::with_capacity_in(list.len(), Global);
+    toolchain.extend((0..list.len()).filter(|r| CrateGraph::toolchain(list, *r)).map(|r| blaze_drive::key::crate_scope_name(&list.key(r)).subject));
     store.toolchain_crates(&toolchain);
 }
 
@@ -971,9 +1445,11 @@ pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
 /// name among its home's parts, so a toolchain crate cannot simply be left out here: the
 /// drive needs a part that is located but run only when wanted.
 pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Global> {
-    let mut parts = std::vec::Vec::with_capacity(names.world.crates.len());
-    for krate in names.world.crates.iter() {
-        parts.push((blaze_drive::key::crate_scope_name(&krate.input.key), ContentId::of(SOURCE_DOMAIN, &krate.input.key.0.0)));
+    let list = &names.list;
+    let mut parts = std::vec::Vec::with_capacity(list.len());
+    for r in 0..list.len() {
+        let key = list.key(r);
+        parts.push((blaze_drive::key::crate_scope_name(&key), ContentId::of(SOURCE_DOMAIN, &key.0.0)));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);
@@ -1000,10 +1476,6 @@ fn slot_of(path: String, probed: impl Fn(&str) -> bool) -> String {
         }
         None => path,
     }
-}
-
-fn surface(path: &str) -> Name {
-    Name::new(Kind::Surface, Name::file(path.as_bytes()).subject)
 }
 
 #[cfg(test)]
@@ -1049,7 +1521,7 @@ mod unresolved_tests {
 
     #[test]
     fn dollar_crate_without_dependency() {
-        let kind = PathKind::DollarCrate(super::CrateItemKey(super::ContentId([1; 32])));
+        let kind = PathKind::DollarCrate(blaze_id::CrateItemKey(super::ContentId([1; 32])));
         expect(Unresolved::NoCrate, kind, &["f"], 0, "unresolved-dollar-crate", "the crate named by `$crate` in `$crate::f` is not a dependency");
     }
 
@@ -1102,6 +1574,4 @@ mod unresolved_tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) use scope::scope_made;
-pub(crate) use scope::{CopiedExports, DepExports, Prepared, Resolution, SCOPE_FRAME, SCOPE_JOBS, ScopeJob, ScopeRound, answer, prepare, resolve, run, settle};
+pub(crate) use scope::{DepExports, FindingText, Resolution, SCOPE_FRAME, SCOPE_JOBS, ScopeJob, hand_payload, resolve, sysroot_given};

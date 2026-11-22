@@ -12,7 +12,7 @@ use blaze_lir::{
 
 use crate::{
     EmitError, Fixup, Isa, PositionFix, Reloc, RelocTo, Via,
-    enc::{self, Cond, FP, Field, LR, Reg, SP, Size, X0, X1, X8, X9, X10, X11, X12, X16, ZR},
+    enc::{self, Cond, FP, Field, LR, Reg, SP, Size, X8, X9, X10, X11, X16, ZR},
 };
 
 /// `asm!` blocks: operands placed in registers around the template's words (asm.rs).
@@ -48,6 +48,20 @@ pub(crate) const BRK_UNREACHABLE: u32 = blaze_code::trap::UNREACHABLE;
 
 /// The frame's bound: every `sp` offset is reached by at most two `add`s of 12 bits.
 const FRAME_LIMIT: u64 = 1 << 24;
+
+/// The register a memory access past its immediate's reach is addressed through: a frame
+/// cell or slot past `sp + 32 KiB` (the 2048th value's cell on), and `mem`'s far offsets.
+/// `x16` (IP0), because no value an instruction computes is ever held in it: it is written
+/// only by such an address, a callee's address loaded right before its `blr`, and a landing
+/// block's `sp` restore, each consumed at once. So a far access clobbers no operand, result
+/// or flag the instruction is still holding.
+///
+/// Before 2026-11-21 it was `x12`, which instructions also hold values in: an overflow
+/// operation keeps its flag in `x12` across its result's store (pass/int.rs `overflow`), so
+/// past the 2048th value every checked `+`, `-` and `*` stored an address as its flag and
+/// panicked with "attempt to add with overflow" (61 of tempo's tests); a `cmpxchg` stored
+/// the address over its old value (pass/atomic.rs). Pinned by `int_tests::far_cells_*`.
+pub(crate) const FAR: Reg = X16;
 /// The most alignment a stack slot may ask: a page.
 const MOST_SLOT_ALIGN: u8 = 12;
 /// The most alignment a data row may ask, as log2: a 4 KiB page, the most a code record's part
@@ -567,24 +581,27 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
     }
 
-    /// Loads the 8 bytes at `sp + off` (a multiple of 8).
+    /// Loads the 8 bytes at `sp + off` (a multiple of 8); past the scaled immediate's reach
+    /// through [`FAR`], so no register an instruction holds a value in is written.
     fn ld_sp(&mut self, rt: Reg, off: u32) {
         match off / 8 < 4096 {
             true => self.put(enc::ldr(Size::X, rt, SP, off / 8)),
             false => {
-                self.sp_addr(X12, off);
-                self.put(enc::ldr(Size::X, rt, X12, 0));
+                self.sp_addr(FAR, off);
+                self.put(enc::ldr(Size::X, rt, FAR, 0));
             }
         }
     }
 
-    /// Stores `rt` (`xzr` for 31) to the 8 bytes at `sp + off` (a multiple of 8).
+    /// Stores `rt` (`xzr` for 31) to the 8 bytes at `sp + off` (a multiple of 8); past the
+    /// scaled immediate's reach through [`FAR`], which never holds the value stored.
     fn st_sp(&mut self, rt: Reg, off: u32) {
+        debug_assert_ne!(rt, FAR, "a value stored from the far-address register (pass.rs `FAR`)");
         match off / 8 < 4096 {
             true => self.put(enc::str(Size::X, rt, SP, off / 8)),
             false => {
-                self.sp_addr(X12, off);
-                self.put(enc::str(Size::X, rt, X12, 0));
+                self.sp_addr(FAR, off);
+                self.put(enc::str(Size::X, rt, FAR, 0));
             }
         }
     }
@@ -650,11 +667,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 false => enc::str(size, rt, rn, imm),
             });
         } else {
-            self.mov_imm(X11, i64::from(off) as u64);
-            self.put(enc::add(X11, rn, X11));
+            self.mov_imm(FAR, i64::from(off) as u64);
+            self.put(enc::add(FAR, rn, FAR));
             self.put(match load {
-                true => enc::ldr(size, rt, X11, 0),
-                false => enc::str(size, rt, X11, 0),
+                true => enc::ldr(size, rt, FAR, 0),
+                false => enc::str(size, rt, FAR, 0),
             });
         }
     }

@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, PoisonError};
 
+use blaze_sys::posix::{io, net, signal, types};
+use blaze_sys::{Errno, Fd, Timespec};
+
 use super::{
     KERN_SUCCESS, Kern, MACH_PORT_NULL, Object, Port, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
     kern, mach_port_deallocate, mach_port_mod_refs, task,
@@ -283,13 +286,13 @@ pub(super) fn decode_reply(
 pub(super) fn peer_token(fd: i64) -> Result<Token, Error> {
     let fd = c_int::try_from(fd).map_err(|_| Error::new(format!("a channel fd of {fd}")))?;
     let mut token: Token = [0; 8];
-    let mut len = size_of::<Token>() as libc::socklen_t;
+    let mut len = size_of::<Token>() as types::socklen_t;
     // SAFETY: `token` is 32 writable bytes and `len` says so; a bad `fd` fails with an error.
     let got = unsafe {
-        libc::getsockopt(
+        net::c::getsockopt(
             fd,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERTOKEN,
+            net::SOL_LOCAL,
+            net::LOCAL_PEERTOKEN,
             (&raw mut token).cast(),
             &raw mut len,
         )
@@ -437,10 +440,8 @@ fn serve(port: Port) {
 /// Whether the process at the other end of `fd` wrote or hung up.
 fn spoke(fd: i64) -> bool {
     let Ok(fd) = c_int::try_from(fd) else { return true };
-    let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    // SAFETY: one live `pollfd`; a zero timeout returns at once.
-    let got = unsafe { libc::poll(&raw mut poll, 1, 0) };
-    got != 0
+    let mut poll = [io::PollFd::new(Fd::new(fd), io::PollEvents::IN)];
+    io::poll(&mut poll, Some(Timespec::ZERO)) != Ok(0)
 }
 
 /// The daemon's side of a run process: its process ID, since the start hook maps what it is
@@ -454,19 +455,16 @@ pub struct Remote {
 
 impl Remote {
     pub fn kill(&self) -> Result<(), Error> {
-        let Ok(pid) = libc::pid_t::try_from(self.pid) else {
+        let Ok(pid) = types::pid_t::try_from(self.pid) else {
             return Err(Error::new(format!("process ID {} past pid_t", self.pid)));
         };
-        // SAFETY: kill takes a process ID and a signal and touches no memory of ours.
-        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0
-            && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-        {
-            return Err(Error::new(format!(
-                "kill of process {pid}: {}",
-                std::io::Error::last_os_error()
-            )));
+        match signal::kill(pid, signal::SIGKILL) {
+            Ok(()) | Err(Errno::Srch) => Ok(()),
+            Err(errno) => {
+                let error = std::io::Error::from_raw_os_error(errno.raw().into());
+                Err(Error::new(format!("kill of process {pid}: {error}")))
+            }
         }
-        Ok(())
     }
 
     pub fn map(&self, object: u32, _: Access) -> Result<u64, Error> {

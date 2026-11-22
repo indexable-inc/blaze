@@ -683,9 +683,11 @@ fn a_walk_of_a_threads_own_stack_reaches_its_end_and_finds_no_frame_in_an_area_i
 #[cfg(target_os = "macos")]
 #[test]
 fn every_macos_symbol_resolves() {
+    use blaze_sys::posix::thread::{RTLD_DEFAULT, symbol};
+
     for (name, why) in sys::SYMBOLS {
         // SAFETY: a lookup, by a C string's name, among the images this process has loaded.
-        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-        assert!(!found.is_null(), "{name:?} is gone from this macOS; the launcher uses it for: {why}");
+        let found = unsafe { symbol(RTLD_DEFAULT, name) };
+        assert!(found.is_some(), "{name:?} is gone from this macOS; the launcher uses it for: {why}");
     }
 }

@@ -29,10 +29,18 @@
 //! move into mapped files of their own per process, and the record is then a region of that
 //! file, with the same layout and the same recovery.
 
+#[cfg(unix)]
+use core::ffi::{c_int, c_void};
 use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+};
+
+#[cfg(unix)]
+use blaze_sys::{
+    Fd,
+    posix::{io::{MapFlags, Prot, mmap, munmap}, signal, types::sighandler_t},
 };
 
 use crate::panics::{Kind, PanicRow};
@@ -216,11 +224,11 @@ pub fn signal_name(signal: i32) -> Option<&'static str> {
     #[cfg(unix)]
     {
         Some(match signal {
-            libc::SIGSEGV => "SIGSEGV",
-            libc::SIGBUS => "SIGBUS",
-            libc::SIGILL => "SIGILL",
-            libc::SIGFPE => "SIGFPE",
-            libc::SIGABRT => "SIGABRT",
+            signal::SIGSEGV => "SIGSEGV",
+            signal::SIGBUS => "SIGBUS",
+            signal::SIGILL => "SIGILL",
+            signal::SIGFPE => "SIGFPE",
+            signal::SIGABRT => "SIGABRT",
             _ => return None,
         })
     }
@@ -618,19 +626,17 @@ pub fn arm(dir: &Path) -> Result<PathBuf, CrashError> {
     // SAFETY: a new shared mapping of the `SIZE` bytes the file was just given, readable and
     // writable; it outlives the descriptor, which closes as `file` drops.
     let at = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        mmap(
+            None,
             SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            file.as_raw_fd(),
+            Prot::READ | Prot::WRITE,
+            MapFlags::SHARED,
+            Some(Fd::new(file.as_raw_fd())),
             0,
         )
-    };
-    if at == libc::MAP_FAILED {
-        return Err(error("mapping")(io::Error::last_os_error()));
     }
-    let page = Page(at.cast());
+    .map_err(|errno| error("mapping")(io::Error::from_raw_os_error(i32::from(errno.raw()))))?;
+    let page = Page(at.as_ptr());
     // SAFETY: the mapping is `SIZE` writable bytes, never unmapped, and no handler has it yet
     // (it is published below).
     unsafe {
@@ -647,7 +653,7 @@ pub fn arm(dir: &Path) -> Result<PathBuf, CrashError> {
     {
         // Another thread armed first: this mapping is let go, its file is the same path.
         // SAFETY: the mapping made above, never published, unmapped once.
-        unsafe { libc::munmap(at, SIZE) };
+        let _ = unsafe { munmap(at, SIZE) };
     }
     Ok(path)
 }
@@ -659,13 +665,13 @@ pub fn arm(_dir: &Path) -> Result<PathBuf, CrashError> {
 
 /// The signals the handler records.
 #[cfg(unix)]
-const FATAL: [libc::c_int; 5] =
-    [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT];
+const FATAL: [c_int; 5] =
+    [signal::SIGSEGV, signal::SIGBUS, signal::SIGILL, signal::SIGFPE, signal::SIGABRT];
 
 /// Each of [`FATAL`]'s handler and flags before [`install`]: atomics, as the handler reads them.
 #[cfg(unix)]
 static BEFORE: [(std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicI32); 5] = [const {
-    (std::sync::atomic::AtomicUsize::new(libc::SIG_DFL), std::sync::atomic::AtomicI32::new(0))
+    (std::sync::atomic::AtomicUsize::new(signal::SIG_DFL), std::sync::atomic::AtomicI32::new(0))
 }; 5];
 
 /// Puts the recording handler on each of [`FATAL`], before whatever was there (which it hands
@@ -680,33 +686,24 @@ pub fn install() {
         crate::stack::ready();
         altstack();
         for (at, signal) in FATAL.into_iter().enumerate() {
-            // SAFETY: `sigaction` is integers, a mask of integers and a handler address, for
-            // which all-zero bytes are a valid value (no handler, no flags, an empty mask).
-            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-            // SAFETY: `old` is live for the call to fill; a null new action changes nothing.
-            if unsafe { libc::sigaction(signal, std::ptr::null(), &mut old) } != 0 {
-                continue;
-            }
+            let Ok(old) = signal::get_action(signal) else { continue };
             BEFORE[at].0.store(old.sa_sigaction, Ordering::Release);
             BEFORE[at].1.store(old.sa_flags, Ordering::Release);
-            // SAFETY: as for `old`.
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let mut action = signal::sigaction::DEFAULT;
             action.sa_sigaction = on_fatal
-                as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
-                as libc::sighandler_t;
+                as extern "C" fn(c_int, *mut signal::siginfo_t, *mut c_void)
+                as sighandler_t;
             // On the alternate stack: a stack overflow leaves no room on the thread's own. Reset
             // as it is entered and not blocked in it, so the handler before (or the default)
             // ends the process with the same signal when it raises it again.
             action.sa_flags =
-                libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESETHAND | libc::SA_NODEFER;
-            // SAFETY: `action.sa_mask` is a live `sigset_t` of this frame for the call to fill.
-            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+                signal::SA_SIGINFO | signal::SA_ONSTACK | signal::SA_RESETHAND | signal::SA_NODEFER;
             // SAFETY: `action` is live and whole. `on_fatal` only writes the mapped page through
             // atomics and plain stores, calls async-signal-safe functions (`write`, `read`,
             // `clock_gettime`, the thread's id and name, `sigaction`, `raise`), and then the
             // handler that was there, as it would have been called: it neither allocates nor
             // locks, which could deadlock a process interrupted inside malloc.
-            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+            let _ = unsafe { signal::set_action(signal, &action) };
         }
     });
 }
@@ -719,70 +716,64 @@ pub fn install() {}
 /// handler std did not install (one something else handled first) has none on its main thread.
 #[cfg(unix)]
 fn altstack() {
-    // SAFETY: `stack_t` is a pointer, a size and flags; zeroed is a valid value to fill.
-    let mut old: libc::stack_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `old` is live for the call to fill; a null new stack changes nothing.
-    if unsafe { libc::sigaltstack(std::ptr::null(), &mut old) } != 0
-        || old.ss_flags & libc::SS_DISABLE == 0
-    {
+    let Ok(old) = signal::alt_stack() else { return };
+    if old.ss_flags & signal::SS_DISABLE == 0 {
         return;
     }
     const BYTES: usize = 64 << 10;
     // SAFETY: a new private anonymous mapping, never unmapped: the thread's signal stack for the
     // process's life.
-    let at = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+    let Ok(at) = (unsafe {
+        mmap(
+            None,
             BYTES,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
+            Prot::READ | Prot::WRITE,
+            MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+            None,
             0,
         )
-    };
-    if at == libc::MAP_FAILED {
+    }) else {
         return;
-    }
-    let stack = libc::stack_t { ss_sp: at, ss_flags: 0, ss_size: BYTES };
-    // SAFETY: `stack` names the mapping above, `BYTES` long and never unmapped.
-    unsafe { libc::sigaltstack(&stack, std::ptr::null_mut()) };
+    };
+    let stack = signal::stack_t { ss_sp: at.as_ptr().cast(), ss_flags: 0, ss_size: BYTES };
+    // SAFETY: the fresh mapping is writable, dedicated to this thread and never unmapped.
+    let _ = unsafe { signal::set_alt_stack(&stack) };
 }
 
 /// The handler: records the fault when armed, then hands it on.
 #[cfg(unix)]
 extern "C" fn on_fatal(
-    signal: libc::c_int,
-    info: *mut libc::siginfo_t,
-    context: *mut libc::c_void,
+    signal: c_int,
+    info: *mut signal::siginfo_t,
+    context: *mut c_void,
 ) {
     let page = PAGE.load(Ordering::Acquire);
     // SAFETY: the kernel passes an `SA_SIGINFO` handler a live `siginfo_t` and `ucontext_t`.
-    let fault = unsafe { fault_of(signal, info, context) };
+    let fault = unsafe { fault_of(signal, info.cast(), context) };
     if !page.is_null() {
         Page(page).record(&fault);
     }
     let Some(at) = FATAL.iter().position(|it| *it == signal) else { return };
     let (handler, flags) =
         (BEFORE[at].0.load(Ordering::Acquire), BEFORE[at].1.load(Ordering::Acquire));
-    if handler == libc::SIG_DFL || handler == libc::SIG_IGN {
+    if handler == signal::SIG_DFL || handler == signal::SIG_IGN {
         // `SA_RESETHAND` made the action the default as this handler was entered, and
         // `SA_NODEFER` left the signal unblocked, so raising it again ends the process with it
         // now: a sent one (`abort`, `kill`) comes no second time by itself, and which codes
         // mean "sent" differs by system (macOS's `SI_USER` is positive), so a fault is raised
         // again too rather than left to come again as the instruction reruns.
-        // SAFETY: `raise` is async-signal-safe.
-        unsafe { libc::raise(signal) };
+        let _ = signal::raise_signal(signal);
         return;
     }
-    if flags & libc::SA_SIGINFO != 0 {
+    if flags & signal::SA_SIGINFO != 0 {
         // SAFETY: `handler` was the `sa_sigaction` of an `SA_SIGINFO` action, so it is an
         // `extern "C" fn(c_int, *mut siginfo_t, *mut c_void)`, given what this one was.
-        let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+        let handler: extern "C" fn(c_int, *mut signal::siginfo_t, *mut c_void) =
             unsafe { std::mem::transmute(handler) };
         handler(signal, info, context);
     } else {
         // SAFETY: an action without `SA_SIGINFO` has an `extern "C" fn(c_int)` handler.
-        let handler: extern "C" fn(libc::c_int) = unsafe { std::mem::transmute(handler) };
+        let handler: extern "C" fn(c_int) = unsafe { std::mem::transmute(handler) };
         handler(signal);
     }
 }
@@ -794,9 +785,9 @@ extern "C" fn on_fatal(
 /// `info` and `context` are the live arguments of an `SA_SIGINFO` handler (either may be null).
 #[cfg(unix)]
 unsafe fn fault_of(
-    signal: libc::c_int,
-    info: *const libc::siginfo_t,
-    context: *const libc::c_void,
+    signal: c_int,
+    info: *const signal::siginfo_t,
+    context: *const c_void,
 ) -> Fault {
     let (code, addr) = match info.is_null() {
         true => (0, 0),
@@ -823,7 +814,7 @@ unsafe fn fault_of(
 ///
 /// `context` is the live, non-null `ucontext_t` of an `SA_SIGINFO` handler.
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
+unsafe fn registers(context: *const c_void) -> (u64, u64) {
     /// `struct __darwin_ucontext`, up to its machine context.
     #[repr(C)]
     struct Context {
@@ -831,7 +822,7 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
         sigmask: u32,
         /// `stack_t`: a pointer, a size and flags (padded).
         stack: [u64; 3],
-        link: *const libc::c_void,
+        link: *const c_void,
         mcsize: usize,
         mcontext: *const Machine,
     }
@@ -863,9 +854,9 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
 ///
 /// As above.
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
+unsafe fn registers(context: *const c_void) -> (u64, u64) {
     // SAFETY: as this function's own `# Safety` says.
-    let machine = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext };
+    let machine = unsafe { &(*context.cast::<signal::ucontext_t>()).uc_mcontext };
     (machine.pc, machine.regs[29])
 }
 
@@ -875,10 +866,10 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
 ///
 /// As above.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
+unsafe fn registers(context: *const c_void) -> (u64, u64) {
     // SAFETY: as this function's own `# Safety` says.
-    let machine = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext };
-    (machine.gregs[libc::REG_RIP as usize] as u64, machine.gregs[libc::REG_RBP as usize] as u64)
+    let machine = unsafe { &(*context.cast::<signal::ucontext_t>()).uc_mcontext };
+    (machine.gregs[signal::REG_RIP as usize] as u64, machine.gregs[signal::REG_RBP as usize] as u64)
 }
 
 /// Elsewhere the context is not read: a record holds the signal and its address, no stack.
@@ -893,7 +884,7 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
         all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64"))
     ))
 ))]
-unsafe fn registers(_context: *const libc::c_void) -> (u64, u64) {
+unsafe fn registers(_context: *const c_void) -> (u64, u64) {
     (0, 0)
 }
 
@@ -923,17 +914,16 @@ mod tests {
         // SAFETY: as in `arm`: a shared mapping of the file's `SIZE` bytes, kept for the test
         // process's life.
         let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
+            mmap(
+                None,
                 SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
+                Prot::READ | Prot::WRITE,
+                MapFlags::SHARED,
+                Some(Fd::new(file.as_raw_fd())),
                 0,
             )
-        };
-        assert_ne!(at, libc::MAP_FAILED);
-        let page = Page(at.cast());
+        }.unwrap();
+        let page = Page(at.as_ptr());
         let hash = crate::identity::binary_hash().unwrap();
         // SAFETY: the mapping above, no handler has it.
         unsafe {
@@ -950,7 +940,7 @@ mod tests {
     #[inline(never)]
     fn faults_here(page: Page) {
         let fault = Fault {
-            signal: libc::SIGSEGV,
+            signal: signal::SIGSEGV,
             code: 1,
             addr: 0x10,
             pc: faults_here as fn(Page) as usize as u64 + 4,
@@ -1028,8 +1018,8 @@ mod tests {
         assert!(read_back(&path).unwrap().is_none(), "an armed record holds no crash");
         fs::remove_file(&path).unwrap();
         let page2 = page_in(&path, GONE);
-        page2.record(&Fault { signal: libc::SIGBUS, code: 1, addr: 1, pc: 0, fp: 0 });
-        page2.record(&Fault { signal: libc::SIGSEGV, code: 1, addr: 2, pc: 0, fp: 0 });
+        page2.record(&Fault { signal: signal::SIGBUS, code: 1, addr: 1, pc: 0, fp: 0 });
+        page2.record(&Fault { signal: signal::SIGSEGV, code: 1, addr: 2, pc: 0, fp: 0 });
         let crash = read_back(&path).unwrap().expect("the first fault recorded");
         assert_eq!(crash.row().signal, Some("SIGBUS"));
         _ = page;
@@ -1043,7 +1033,7 @@ mod tests {
         let dir = scratch("refused");
         let path = dir.join(file_name(GONE));
         let page = page_in(&path, GONE);
-        page.record(&Fault { signal: libc::SIGSEGV, code: 1, addr: 1, pc: 0, fp: 0 });
+        page.record(&Fault { signal: signal::SIGSEGV, code: 1, addr: 1, pc: 0, fp: 0 });
         let mut bytes = fs::read(&path).unwrap();
         let ours = crate::identity::binary_hash().unwrap();
         assert!(read(&path, &bytes, &ours).unwrap().is_some());

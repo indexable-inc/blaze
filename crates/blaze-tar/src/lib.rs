@@ -9,9 +9,15 @@
 
 #![no_std]
 #![cfg_attr(test, feature(allocator_api))]
-// `#![blaze::sans_io]` in the modules names blaze's tool; inert under rustc.
+// `#![blaze::sans_io]` names blaze's tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
 #[cfg(test)]
 extern crate std;
@@ -26,5 +32,6 @@ mod write;
 mod tests;
 
 pub use error::{Error, Field, Name, PathWhy, Why};
-pub use read::{Entry, Event, Kind, Limits, Links, Reader, Step};
-pub use write::{Make, WriteError, WriteWhy, Writer};
+pub use plant::TarPlant;
+pub use read::{Entry, Event, Kind, Limits, Links, PlantedReader, Reader, Step};
+pub use write::{Make, PlantedWriter, WriteError, WriteWhy, Writer};

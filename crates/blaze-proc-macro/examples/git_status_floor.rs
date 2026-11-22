@@ -65,7 +65,10 @@ fn main() {
     }
     println!("floor: one index read + {entries} lstat: median {:?} of {ROUNDS}", median(floor));
     println!("floor with git's leading-folder check: + {folders} folder lstat: median {:?} of {ROUNDS}", median(with_folders));
-    let tree = Tree::Dir(root);
+    // The served root, resolved once as the command resolves it (an example's argument may be
+    // relative: made absolute here, the one place the process's folder is asked).
+    let absolute = std::path::absolute(&root).expect("the checkout's absolute path");
+    let tree = Tree::Dir(blaze_proc_macro::script_sandbox::RealRoot::resolve(&absolute).expect("the checkout resolves"));
     // tempo-node's questions, in the order its record lists them.
     let questions = ["--version", "rev-parse --is-inside-work-tree", "log -1 --pretty=format:%cI", "status --porcelain", "describe --always --tags --match tempo/v[0-9]*", "status --porcelain --untracked-files=no", "rev-parse HEAD"];
     for words in questions {

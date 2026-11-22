@@ -14,7 +14,7 @@
 use core::fmt;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -409,7 +409,7 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
             calls.push(CallRow { path, pos: c.pos, item, call: c.call.0, kind: c.kind, role: c.role, pad2: 0 });
         }
 
-        let mut out = Writer::new_in(<ModuleDeclsRoot as Record>::SCHEMA, alloc);
+        let mut out = Writer::new(WriterOpts { schema: <ModuleDeclsRoot as Record>::SCHEMA, alloc: alloc, capacity: None });
         let text = Column::push(&mut out, strings.bytes());
         let items = Column::push(&mut out, &items);
         let mods = Column::push(&mut out, &mods);

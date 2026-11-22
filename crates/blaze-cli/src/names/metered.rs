@@ -156,9 +156,12 @@ impl Par for Metered<'_> {
             CallScratch::Kept => return Scratch::Kept,
         }
         // blaze-scope resolve.rs `expand_decls` never opens a call inside a call (a call's work
-        // expands nothing): a second borrow is that promise broken, a bug that fails this
-        // crate's job alone (rule 20: the solve runs under the pool's `unwinding`).
-        let mut scratch = self.scratch.try_borrow_mut().unwrap_or_else(|_| panic!("a macro call's scratch was asked inside another call (blaze-scope resolve.rs `expand_decls` is not re-entered)"));
+        // expands nothing), and the block-scopes differential's held-body work (body_scope.rs
+        // `body_scope_scratch`, after the crate is solved) expands its calls in the crate's
+        // frame, never here: a second borrow is that promise broken, a bug that fails this
+        // crate's job alone (rule 20: the solve runs under the pool's `unwinding`). The
+        // count below is of both uses.
+        let mut scratch = self.scratch.try_borrow_mut().unwrap_or_else(|_| panic!("the scratch was asked inside another use (blaze-scope resolve.rs `expand_decls` and `solve_held_body_scratch` are not re-entered)"));
         scratch.scope(|frame| {
             let erased = Erased::new(frame);
             work(erased.handle());
@@ -183,13 +186,6 @@ pub(crate) struct ScopeBytes {
 impl Default for ScopeBytes {
     fn default() -> ScopeBytes {
         ScopeBytes { slots: [Slot::default(); SLOTS], peak: 0, abandoned: 0, scratch_peak: 0, scratch_calls: 0, of: Label::of(format_args!("")) }
-    }
-}
-
-impl ScopeBytes {
-    /// The frame's peak.
-    pub(crate) fn peak(&self) -> u64 {
-        self.peak
     }
 }
 

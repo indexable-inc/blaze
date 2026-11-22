@@ -5,6 +5,9 @@
 //! A scalar is four 64-bit limbs, little-endian.
 
 use blaze_int::Cast;
+use blaze_own::planted::Planted;
+
+use crate::Plant;
 
 /// L, little-endian limbs.
 pub(crate) const L: [u64; 4] = [0x5812_631a_5cf5_d3ed, 0x14de_f9de_a2f7_9cd6, 0, 0x1000_0000_0000_0000];
@@ -73,14 +76,20 @@ const fn sub(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
 
 /// Whether the 32 bytes `s` encode an integer below L: RFC 8032 section 5.1.7 step 1's range
 /// check of S, which keeps a signature from having a second form `S + L` (malleability).
-pub(crate) fn is_canonical(s: &[u8; 32]) -> bool {
-    if crate::planted(crate::Plant::SAtOrderTaken) {
+pub(crate) fn is_canonical_planted(s: &[u8; 32], plant: impl Planted<Plant>) -> bool {
+    if plant.has(Plant::SAtOrderTaken) {
         return !less(&L, &from_bytes(s));
     }
-    if crate::planted(crate::Plant::STopLimbOnly) {
+    if plant.has(Plant::STopLimbOnly) {
         return from_bytes(s)[3] <= L[3];
     }
     less(&from_bytes(s), &L)
+}
+
+/// [`is_canonical_planted`] with no plant: the tests'.
+#[cfg(test)]
+pub(crate) fn is_canonical(s: &[u8; 32]) -> bool {
+    is_canonical_planted(s, blaze_own::planted::NoPlant)
 }
 
 const fn mu() -> [u64; 5] {

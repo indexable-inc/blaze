@@ -1,0 +1,27 @@
+[package]
+name = "blaze-borrow"
+description = "The borrow check's one call rule (decision D156, docs/v2/plan/design/end-state.md): the region slots of a type, a callee's signature instantiated at a call, related by variance and its clauses turned into outlives constraints, written against a RegionTypes trait so it runs over D148's columns now and over regions inside the types later"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core and alloc only beside the two crates it joins; the allocator is a value the caller passes.
+[dependencies]
+blaze-flow.workspace = true
+blaze-typeck.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `testing::heap()`: the tests' root allocator (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

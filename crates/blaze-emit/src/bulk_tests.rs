@@ -33,7 +33,7 @@ fn routine(to: RelocTo) -> u64 {
 
 fn emitted_up_to(func: &Func<Global>, most: u64) -> Code<Global> {
     let mut code = Code::new_in(Global);
-    emit_inline_up_to(func.view(), &[], &crate::RoutinePlaces::NONE, ISA, most, &mut code).expect("emits");
+    emit_inline_up_to(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &[], &crate::RoutinePlaces::NONE, ISA, most, &mut code).expect("emits");
     code
 }
 
@@ -127,7 +127,7 @@ fn volatile_bulk_is_refused() {
     b.ret(&[zero]);
     let func = b.finish_checked().expect("builds");
     let mut code = Code::new_in(Global);
-    let refused = crate::emit(func.view(), &[], ISA, &mut code).err();
+    let refused = crate::emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &[], ISA, &mut code).err();
     assert!(matches!(refused, Some(crate::EmitError::Unsupported { op: Op::Memcpy, .. })), "{refused:?}");
 }
 

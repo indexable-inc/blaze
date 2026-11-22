@@ -663,13 +663,22 @@ impl Certainty {
     }
 }
 
-/// The typing mode (`rustc_type_ir::TypingMode`, the two the driver uses now).
+/// The typing mode (`rustc_type_ir::TypingMode`). Which one decides what an opaque type is to
+/// normalization (alias.rs `normalize_opaque_type`): in [`TypingMode::Analysis`] itself (rigid,
+/// only its item bounds known), in [`TypingMode::PostAnalysis`] its hidden type. In every mode
+/// an auto trait still sees through it (structural.rs, auto-trait leakage).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TypingMode {
-    /// Type checking and analysis of a body.
+    /// Type checking and analysis of a body. An opaque type outside its defining scope is
+    /// rigid (the Reference, "Abstract return types": "a caller of the function is not
+    /// permitted to know the concrete type"); the defining body has a variable for its own
+    /// (blaze-typeck rules/opaque_def.rs), so the solver never defines one.
     Analysis,
     /// Coherence: the overlap check between impls, with unknowable candidates.
     Coherence,
+    /// After analysis (layout, the borrow check's facts, codegen): every opaque type with a
+    /// hidden type normalizes to it (`TypingMode::PostAnalysis`, opaque_types.rs).
+    PostAnalysis,
 }
 
 /// The lang items the solver recognizes (`SolverTraitLangItem`, and the items next to them).

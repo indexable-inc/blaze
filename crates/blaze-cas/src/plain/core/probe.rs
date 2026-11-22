@@ -262,7 +262,8 @@ impl<A: Allocator + Clone> Plain<A> {
     /// rows of `space` newest first ([`Plain::newest_rows`]), the first that holds it answering;
     /// a row is mapped at its first probe, as [`Plain::find`] maps. What a pointer is read by
     /// ([`super::POINTER_TAG`]): its newer value lies in a later row. At most one probe a row,
-    /// so at most [`super::SEGMENTS_MOST`] (and the rows since the last merge) a read.
+    /// so at most [`super::SEGMENTS_MOST`] (the tiered merge's bound: `Tiers`; and the
+    /// rows committed since the last cleanup) a read.
     pub fn find_newest(&mut self, space: Namespace, key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Probe, StoreError> {
         if let Some(why) = &self.broken {
             return Err(why.clone());

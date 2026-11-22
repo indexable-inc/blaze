@@ -25,6 +25,9 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use blaze_own::Vec;
+use blaze_sys::Timespec;
+use blaze_sys::linux::sample::{TimerId, timer_create_thread_cpu, timer_delete, timer_settime};
+use blaze_sys::posix::signal;
 
 use super::ring::Ring;
 use super::{Bounds, CodeRange, Direct, Plan, Regs, SampleError, capture};
@@ -119,26 +122,24 @@ impl<A: Allocator + Clone + Sync + 'static> Table<A> {
         if unsafe { libc::sigaction(self.signal, ptr::null(), &mut old) } != 0 {
             return Err(SampleError::Kernel { call: "sigaction", code: errno(), thread: u32::MAX });
         }
-        if old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN {
+        if old.sa_sigaction != signal::SIG_DFL && old.sa_sigaction != signal::SIG_IGN {
             return Err(SampleError::SignalTaken { signal: self.signal });
         }
         let me = ptr::from_ref(self).cast_mut().cast::<()>();
         if STARTED.compare_exchange(ptr::null_mut(), me, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(SampleError::AlreadyStarted);
         }
-        // SAFETY: as above, an all-zero `sigaction` is valid; every field used is set below.
-        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
-        let handler: extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) = on_tick::<A>;
-        action.sa_sigaction = handler as usize;
-        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART | libc::SA_ONSTACK;
-        // SAFETY: empties the mask of one live local.
-        unsafe { libc::sigemptyset(&mut action.sa_mask) };
-        // SAFETY: installs `on_tick::<A>`, which is async-signal-safe (see the module), for the
-        // table's signal; `STARTED` names a `&'static Table<A>` of the same `A`.
-        if unsafe { libc::sigaction(self.signal, &action, ptr::null_mut()) } != 0 {
-            return Err(SampleError::Kernel { call: "sigaction", code: errno(), thread: u32::MAX });
-        }
-        Ok(())
+        let handler: extern "C" fn(c_int, *mut signal::siginfo_t, *mut c_void) = on_tick::<A>;
+        let action = signal::sigaction {
+            sa_sigaction: handler as usize,
+            sa_flags: signal::SA_SIGINFO | signal::SA_RESTART | signal::SA_ONSTACK,
+            ..signal::sigaction::DEFAULT
+        };
+        // SAFETY: the process-lifetime three-argument handler is async-signal-safe on the
+        // interrupted thread's alternate stack. STARTED names a static table of the same A.
+        unsafe { signal::set_action(self.signal, &action) }
+            .map(|_| ())
+            .map_err(|error| SampleError::Kernel { call: "sigaction", code: i32::from(error.raw()), thread: u32::MAX })
     }
 
     /// Registers the calling thread, the runtime's thread `index`, and starts its CPU timer.
@@ -179,31 +180,16 @@ impl<A: Allocator + Clone + Sync + 'static> Table<A> {
     /// Makes and arms the calling thread's timer for slot `at`.
     fn arm(&self, at: usize, slot: &Slot<A>, tid: u32) -> Result<(), SampleError> {
         let index = slot.index.load(Ordering::Relaxed);
-        // SAFETY: an all-zero `sigevent` is a valid value of the C struct, filled below.
-        let mut event: libc::sigevent = unsafe { core::mem::zeroed() };
-        event.sigev_notify = libc::SIGEV_THREAD_ID;
-        event.sigev_signo = self.signal;
         // The slot's number rides in the signal's value (`si_value`), so the handler finds its slot
         // without a thread-local.
-        event.sigev_value = libc::sigval { sival_ptr: ptr::without_provenance_mut(at) };
-        event.sigev_notify_thread_id = tid as c_int;
-        let mut timer: libc::timer_t = ptr::null_mut();
-        // SAFETY: `event` and `timer` are live locals; the clock is the calling thread's CPU clock
-        // and the signal goes to this thread (`tid` is its own `gettid`).
-        if unsafe { libc::timer_create(libc::CLOCK_THREAD_CPUTIME_ID, &mut event, &mut timer) } != 0 {
-            return Err(SampleError::Kernel { call: "timer_create", code: errno(), thread: index });
-        }
-        slot.timer.store(timer as usize, Ordering::Relaxed);
+        let timer = timer_create_thread_cpu(self.signal as u32, tid as i32, at)
+            .map_err(|error| SampleError::Kernel { call: "timer_create", code: i32::from(error.raw()), thread: index })?;
+        slot.timer.store(timer.0 as usize, Ordering::Relaxed);
         slot.has_timer.store(true, Ordering::Release);
-        let period = timespec(self.plan.period_ns);
-        let spec = libc::itimerspec { it_interval: period, it_value: period };
-        // SAFETY: `timer` was made just above and is not deleted while this call runs (only this
-        // thread's `end` and `stop` delete it, and `stop` racing here deletes a timer this call
-        // then fails on with EINVAL, reported); `spec` is a live local.
-        if unsafe { libc::timer_settime(timer, 0, &spec, ptr::null_mut()) } != 0 {
-            return Err(SampleError::Kernel { call: "timer_settime", code: errno(), thread: index });
-        }
-        Ok(())
+        let period = Timespec::from_duration(core::time::Duration::from_nanos(self.plan.period_ns));
+        // If stop has already deleted this timer, report timer_settime's EINVAL.
+        timer_settime(timer, period)
+            .map_err(|error| SampleError::Kernel { call: "timer_settime", code: i32::from(error.raw()), thread: index })
     }
 
     /// Ends the calling thread's registration: deletes its timer (unless `stop` did) and frees its
@@ -242,24 +228,14 @@ fn take_and_delete<A: Allocator>(slot: &Slot<A>, index: u32) -> Result<(), Sampl
     if !slot.has_timer.swap(false, Ordering::AcqRel) {
         return Ok(());
     }
-    let timer = slot.timer.load(Ordering::Relaxed) as libc::timer_t;
-    // SAFETY: the swap above made this call the timer's only deleter; it was made by
-    // `timer_create` and stored before `has_timer` was set.
-    if unsafe { libc::timer_delete(timer) } != 0 {
-        return Err(SampleError::Kernel { call: "timer_delete", code: errno(), thread: index });
-    }
-    Ok(())
-}
-
-fn timespec(ns: u64) -> libc::timespec {
-    libc::timespec { tv_sec: (ns / 1_000_000_000) as libc::time_t, tv_nsec: (ns % 1_000_000_000) as libc::c_long }
+    let timer = TimerId(slot.timer.load(Ordering::Relaxed) as i32);
+    timer_delete(timer)
+        .map_err(|error| SampleError::Kernel { call: "timer_delete", code: i32::from(error.raw()), thread: index })
 }
 
 /// The calling thread's kernel id. A system call: async-signal-safe.
 fn gettid() -> u32 {
-    // SAFETY: `gettid` takes no argument and cannot fail.
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-    tid as u32
+    blaze_sys::linux::sample::gettid() as u32
 }
 
 fn errno() -> i32 {
@@ -270,7 +246,7 @@ fn errno() -> i32 {
 /// The signal handler: saves `errno`, takes one sample, restores `errno`.
 extern "C" fn on_tick<A: Allocator + Clone + Sync + 'static>(
     _signal: c_int,
-    info: *mut libc::siginfo_t,
+    info: *mut signal::siginfo_t,
     context: *mut c_void,
 ) {
     let saved = errno();
@@ -279,7 +255,7 @@ extern "C" fn on_tick<A: Allocator + Clone + Sync + 'static>(
     unsafe { *libc::__errno_location() = saved };
 }
 
-fn tick<A: Allocator + Clone + Sync + 'static>(info: *mut libc::siginfo_t, context: *mut c_void) {
+fn tick<A: Allocator + Clone + Sync + 'static>(info: *mut signal::siginfo_t, context: *mut c_void) {
     let started = STARTED.load(Ordering::Acquire);
     if started.is_null() || info.is_null() || context.is_null() {
         return;
@@ -305,7 +281,7 @@ fn tick<A: Allocator + Clone + Sync + 'static>(info: *mut libc::siginfo_t, conte
     if slot.budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
         return;
     }
-    let regs = regs_of(context.cast_const().cast::<libc::ucontext_t>());
+    let regs = regs_of(context.cast_const().cast::<signal::ucontext_t>());
     let bounds = Bounds { low: slot.low.load(Ordering::Relaxed), high: slot.high.load(Ordering::Relaxed) };
     let thread = slot.index.load(Ordering::Relaxed);
     // `capture` reads only checked addresses of this thread's own stack and placed code; `push`
@@ -315,7 +291,7 @@ fn tick<A: Allocator + Clone + Sync + 'static>(info: *mut libc::siginfo_t, conte
 
 /// The interrupted registers.
 #[cfg(target_arch = "aarch64")]
-fn regs_of(context: *const libc::ucontext_t) -> Regs {
+fn regs_of(context: *const signal::ucontext_t) -> Regs {
     // SAFETY: `context` is the kernel's `ucontext_t` for this delivery (`SA_SIGINFO`; checked
     // non-null by the caller).
     let machine = unsafe { &(*context).uc_mcontext };
@@ -324,13 +300,13 @@ fn regs_of(context: *const libc::ucontext_t) -> Regs {
 
 /// The interrupted registers; x86-64 has no link register.
 #[cfg(target_arch = "x86_64")]
-fn regs_of(context: *const libc::ucontext_t) -> Regs {
+fn regs_of(context: *const signal::ucontext_t) -> Regs {
     // SAFETY: `context` is the kernel's `ucontext_t` for this delivery (`SA_SIGINFO`; checked
     // non-null by the caller).
     let machine = unsafe { &(*context).uc_mcontext };
     Regs {
-        pc: machine.gregs[libc::REG_RIP as usize] as u64,
+        pc: machine.gregs[signal::REG_RIP as usize] as u64,
         lr: 0,
-        fp: machine.gregs[libc::REG_RBP as usize] as u64,
+        fp: machine.gregs[signal::REG_RBP as usize] as u64,
     }
 }

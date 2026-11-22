@@ -728,7 +728,7 @@ fn main() {
         std::process::exit(2);
     };
     let cargo_home = args.get(2).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
-    // The pinned toolchain's library sources (harness/toolchain), whose macros stage h's
+    // The pinned toolchain's library sources (pins/toolchain), whose macros stage h's
     // body calls are expanded with.
     let library = args.get(3).map(PathBuf::from);
     // A folder without `core/src/lib.rs` is a wrong argument, never "no library": read

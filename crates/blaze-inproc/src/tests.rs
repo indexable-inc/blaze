@@ -889,8 +889,11 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    use blaze_sys::linux::{self, MapFlags, Prot};
 
     use super::*;
     use crate::channel::Channel;
@@ -978,17 +981,16 @@ mod linux {
         fn new(len: usize) -> FileLike {
             // SAFETY: a new private anonymous mapping the kernel places; nothing else uses it.
             let at = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
+                linux::mmap(
+                    None,
                     len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
+                    Prot::READ | Prot::WRITE,
+                    MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+                    None,
                     0,
                 )
-            };
-            assert_ne!(at, libc::MAP_FAILED);
-            FileLike { at: at as u64, len }
+            }.unwrap();
+            FileLike { at: at.as_ptr() as u64, len }
         }
 
         /// Puts `bytes` here and makes the pages read and execute, as the file maps.
@@ -999,13 +1001,13 @@ mod linux {
             // SAFETY: the same mapping, made read and execute before any thread runs it.
             assert_eq!(
                 unsafe {
-                    libc::mprotect(
-                        self.at as *mut libc::c_void,
+                    linux::mprotect(
+                        NonNull::new_unchecked(self.at as *mut u8),
                         self.len,
-                        libc::PROT_READ | libc::PROT_EXEC,
+                        Prot::READ | Prot::EXEC,
                     )
                 },
-                0
+                Ok(())
             );
         }
 
@@ -1020,7 +1022,7 @@ mod linux {
         fn drop(&mut self) {
             // SAFETY: the pages this made (or the overlay that replaced them), which no thread
             // runs any more: the test joined its thread.
-            unsafe { libc::munmap(self.at as *mut libc::c_void, self.len) };
+            let _ = unsafe { linux::munmap(NonNull::new_unchecked(self.at as *mut u8), self.len) };
         }
     }
 

@@ -121,6 +121,9 @@ pub enum Construct {
     Underscore,
     /// A path the record resolves to no value (a trait, a type).
     PathValue,
+    /// A closure environment field holding a captured place below its binding (`x.a`,
+    /// `(*r).b`: RFC 2229, blaze-typeck env_fields.rs): not lowered here yet.
+    CapturedPlace,
     /// The builder refused a row (blaze-body's [`BuildError`]).
     Build(BuildError),
 }
@@ -205,6 +208,32 @@ pub fn lower<A: Allocator + Clone, F: BodyFacts>(
     l.fn_frame()?;
     let root = body.root;
     l.finish(root)
+}
+
+/// Why a checked body was not kept (run.md R4): its lowering refused a construct, or the kept
+/// record refused the body (blaze-body kept.rs). The caller names the body's item (rule 19).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum KeepError {
+    Lower(LowerError),
+    Kept(blaze_body::KeptError),
+}
+
+/// The kept record of a fn body checked clean as `ck` (run.md R4, D119): [`lower`]'s generic
+/// body written with the table its handles index, `ck`'s own (`ck.types.view()`, the table the
+/// lowering built against), as one blaze-body kept record in `alloc`. What the Bodies stage
+/// leaves beside the facts record; a run builds instances from it (`blaze_body_build::build`
+/// over `blaze_body::kept::open`'s `verified()` and `tys()`) and lowers nothing again.
+///
+/// Two bodies whose verdicts agree but whose code differs (`return 1`, `return 2`) keep two
+/// records: the record is the code, not the verdict.
+pub fn keep<A: Allocator + Clone, F: BodyFacts>(
+    body: &BodyView<'_>,
+    ck: &Checked<'_>,
+    facts: &F,
+    alloc: A,
+) -> Result<Vec<u8, A>, KeepError> {
+    let lowered = lower(body, ck, facts, alloc.clone()).map_err(KeepError::Lower)?;
+    blaze_body::kept::encode(&lowered, ck.types.view(), alloc).map_err(KeepError::Kept)
 }
 
 fn range_of(body: &BodyView<'_>, e: ExprId) -> Range {
@@ -570,10 +599,15 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
                     let Some(&c) = self.ck.closures.column::<0>().get(ordinal as usize) else {
                         return self.refuse_at(Construct::Malformed, at);
                     };
-                    let cols = self.ck.captures.column::<0>();
-                    for (i, x) in cols.iter().enumerate() {
-                        if *x == c && self.ck.captures.column::<2>()[i] == blaze_typeck::CaptureKind::ByValue {
-                            stack.push(self.local_ty(self.ck.captures.column::<1>()[i])?);
+                    // Its by-value environment fields (blaze-typeck env_fields.rs): a whole
+                    // binding's type, or a captured place's (`x.a` by value holds `x.a` only).
+                    let ck = self.ck;
+                    for f in ck.env_fields(c) {
+                        if f.how == blaze_typeck::CaptureKind::ByValue {
+                            match f.place_ty(ck) {
+                                Some(t) => stack.push(t),
+                                None => return self.refuse_at(Construct::Malformed, at),
+                            }
                         }
                     }
                 }

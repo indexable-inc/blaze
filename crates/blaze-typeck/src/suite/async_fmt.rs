@@ -7,9 +7,9 @@
 //! trait Debug {}              // FmtDebug
 //! struct Arguments;           // format_arguments
 //! impl Display for u8 {}
-//! trait IntoFuture { type Output; fn into_future(self) -> Self; }
+//! trait IntoFuture { type Output; type IntoFuture; fn into_future(self) -> Self::IntoFuture; }
 //! struct Ready;
-//! impl IntoFuture for Ready { type Output = u8; .. }
+//! impl IntoFuture for Ready { type Output = u8; type IntoFuture = Ready; .. }
 //! ```
 
 use std::vec::Vec;
@@ -46,14 +46,17 @@ fn world() -> (Fx, Items) {
     let (u8_, usize_) = (fx.u8(), fx.usize());
     fx.imp("impl Display for u8", 0, u8_, Some((display, &[])), &[], Vec::new());
 
-    let into_future = fx.tr("IntoFuture", 1, Vec::new(), &["Output"]);
+    // core's `IntoFuture` (core/src/future/into_future.rs) declares both members, and `.await`
+    // projects both (rules/async_fmt.rs `expr_await`: the held future, then the output).
+    let into_future = fx.tr("IntoFuture", 1, Vec::new(), &["Output", "IntoFuture"]);
     fx.lang(LangItem::IntoFuture, into_future);
     let p0 = fx.param(0);
-    let f = fx.trait_fn(into_future, "into_future", true, &[p0], p0);
+    let held_p0 = fx.alias(into_future, "IntoFuture", &[p0]);
+    let f = fx.trait_fn(into_future, "into_future", true, &[p0], held_p0);
     fx.lang_def(LangItem::IntoFutureIntoFuture, Def::Fn(f));
     let ready = fx.strukt("Ready", 0, &[]);
     let ready_t = fx.adt(ready, &[]);
-    fx.imp("impl IntoFuture for Ready", 0, ready_t, Some((into_future, &[])), &[("Output", u8_)], Vec::new());
+    fx.imp("impl IntoFuture for Ready", 0, ready_t, Some((into_future, &[])), &[("Output", u8_), ("IntoFuture", ready_t)], Vec::new());
 
     let arguments_t = fx.adt(arguments, &[]);
     let wait = fx.func("wait", 0, &[ready_t], u8_, Vec::new());

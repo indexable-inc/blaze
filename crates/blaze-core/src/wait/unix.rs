@@ -1,6 +1,7 @@
 //! `poll`, the wait on descriptors of every Unix.
 
-use std::io;
+use blaze_sys::{Errno, Timespec, posix::{io::{PollFd, poll}, types::nfds_t}};
+use std::{io, time::Duration};
 
 use super::{Clock, Deadline, Once, WaitError, Waited, until};
 
@@ -13,49 +14,26 @@ pub fn readable(
     deadline: Option<Deadline>,
     clock: &impl Clock,
 ) -> Result<Waited<usize>, WaitError> {
-    let n = libc::nfds_t::try_from(fds.len()).map_err(|_| {
+    nfds_t::try_from(fds.len()).map_err(|_| {
         WaitError::io(what, io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))
     })?;
+    // SAFETY: both pollfd types are repr(C) with the same int fd and short events and
+    // revents, in order. Every bit pattern is valid. The slice stays exclusively borrowed.
+    let fds = unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr().cast::<PollFd>(), fds.len()) };
     until(what, clock, deadline, |left| {
-        let ms = match left {
-            None => -1,
+        let timeout = left.map(|left| {
             // Rounded up, so a wait shorter than a millisecond is not a spin.
-            Some(left) => libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000))
-                .unwrap_or(libc::c_int::MAX),
-        };
-        let ready = poll(fds, n, ms);
-        if ready > 0 {
-            return Ok(Once::Ready(ready as usize));
-        }
-        if ready == 0 {
-            return Ok(Once::TimedOut);
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::EINTR) => Ok(Once::Interrupted),
+            let ms = core::ffi::c_int::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(core::ffi::c_int::MAX);
+            Timespec::from_duration(Duration::from_millis(ms as u64))
+        });
+        match poll(fds, timeout) {
+            Ok(0) => Ok(Once::TimedOut),
+            Ok(ready) => Ok(Once::Ready(ready)),
+            Err(Errno::Intr) => Ok(Once::Interrupted),
             // The kernel could not allocate for the call this time.
-            Some(libc::EAGAIN) => Ok(Once::Spurious),
-            _ => Err(error),
+            Err(Errno::Again) => Ok(Once::Spurious),
+            Err(error) => Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
         }
     })
 }
 
-/// One `poll` of `fds` (`n` of them) for up to `ms` milliseconds (-1: no limit).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one `poll` of `wait::readable`, its timeout recomputed from the deadline"
-)]
-fn poll(fds: &mut [libc::pollfd], n: libc::nfds_t, ms: libc::c_int) -> libc::c_int {
-    // SAFETY: `fds` is a live, exclusive slice of `n` pollfds; the kernel writes only their
-    // `revents` and keeps no pointer after the call returns.
-    unsafe { libc::poll(fds.as_mut_ptr(), n, ms) }
-}
-
-/// A relative wait in the shape a `timespec` takes, saturating at its end.
-#[cfg(target_os = "macos")]
-pub(super) fn timespec(left: std::time::Duration) -> libc::timespec {
-    libc::timespec {
-        tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),
-        tv_nsec: left.subsec_nanos().into(),
-    }
-}

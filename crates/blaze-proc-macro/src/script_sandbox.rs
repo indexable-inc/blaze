@@ -36,6 +36,9 @@ use blaze_wasi::{Answer, Dirent, Errno, Filestat, Filetype, Open, ROOT_FD, Stop,
 
 pub use crate::sandbox::Read;
 
+/// The overflow observation names the first subject past this bound.
+pub const READS_CAP: usize = 1 << 16;
+
 /// A script's read-only view of its `links` dependencies' files (brief S1).
 pub mod dep_mount;
 use dep_mount::DepViews;
@@ -75,11 +78,101 @@ impl ScriptRoot {
 /// How much of standard error is kept.
 pub(crate) const STDERR_TAIL: usize = 64 << 10;
 
+/// A served checkout's root, resolved once where the tree is made (rule 74: the proof every
+/// read of the tree takes): absolute, with no link left in it. A read of the tree resolves the
+/// node alone, an absolute path (one `realpath`, never a `getcwd`, rule 75), and holds it inside
+/// by a prefix check against this; the root is never resolved again. Before 2026-11-20 each node
+/// resolved the root too, a relative `.`, and so asked the process for its folder twice per read
+/// (tempo's edit: `getcwd` 3.25% of the command's CPU, the reads a third of its opens).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealRoot(PathBuf);
+
+/// Why a served checkout's root has no [`RealRoot`].
+#[derive(Debug)]
+pub enum RootUnresolved {
+    /// [`RealRoot::resolve`] was given a relative path: a root is made absolute at the
+    /// command's edge ([`RealRoot::of_start`]), never deeper.
+    Relative(PathBuf),
+    /// The path could not be resolved.
+    Io { path: PathBuf, error: std::io::Error },
+}
+
+impl std::fmt::Display for RootUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Relative(path) => write!(f, "the served tree's root `{}` is relative: a root is resolved from an absolute path only (script_sandbox.rs `RealRoot::resolve`)", path.display()),
+            Self::Io { path, error } => write!(f, "cannot resolve the served tree's root `{}`: {error}", path.display()),
+        }
+    }
+}
+
+impl RealRoot {
+    /// `absolute` with every link resolved: the one `realpath` of a served tree's root.
+    pub fn resolve(absolute: &Path) -> Result<RealRoot, RootUnresolved> {
+        if !absolute.is_absolute() {
+            return Err(RootUnresolved::Relative(absolute.to_owned()));
+        }
+        std::fs::canonicalize(absolute).map(RealRoot).map_err(|error| RootUnresolved::Io { path: absolute.to_owned(), error })
+    }
+
+    /// `rel`, relative to the folder the process was started in (`.` for it), with every link
+    /// resolved: the ONE resolution of the working directory a command makes, at its edge (one
+    /// `realpath`, which asks the kernel for the folder once). Never `PWD`: an environment
+    /// variable is ambient, can be stale or unset (`env -i`), and is never read for this (rule
+    /// 75). `Err` names the path and the OS's error.
+    pub fn of_start(rel: &Path, plant: impl blaze_own::planted::Planted<StartPlant>) -> Result<RealRoot, RootUnresolved> {
+        if plant.has(StartPlant::LeftRelative) {
+            return Ok(RealRoot(rel.to_owned()));
+        }
+        std::fs::canonicalize(rel).map(RealRoot).map_err(|error| RootUnresolved::Io { path: rel.to_owned(), error })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// The bug a control plants in [`RealRoot::of_start`] (blaze_own::planted, D165).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartPlant {
+    /// As it is.
+    None,
+    /// The root is left as given, relative: every read of the tree then asks the process for
+    /// its folder, and a prefix check against it refuses every node.
+    LeftRelative,
+}
+
+impl blaze_own::planted::Plants for StartPlant {}
+
+impl core::ops::Deref for RealRoot {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for RealRoot {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// The bugs a control plants in the served tree's reads (blaze_own::planted, D165).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TreePlant {
+    /// The reads as they are.
+    None,
+    /// A resolved node is served without the prefix check against the root.
+    PrefixUnchecked,
+}
+
+impl blaze_own::planted::Plants for TreePlant {}
+
 /// The workspace's files.
 #[derive(Clone, Debug)]
 pub enum Tree {
-    /// A folder on disk, read-only (a workspace member's checkout).
-    Dir(PathBuf),
+    /// A folder on disk, read-only (a workspace member's checkout), at its resolved root.
+    Dir(RealRoot),
     /// Files read out of a package's record: (path from the root, bytes), sorted by path.
     /// `git`: the commit when the record is a fetched git source's, whose `git` answers it
     /// gives (D54); `None` for a crate.
@@ -90,6 +183,100 @@ pub enum Tree {
 enum Node<'t> {
     File(Cow<'t, [u8]>),
     Folder(Vec<(Vec<u8>, Filetype)>),
+}
+
+#[derive(Debug)]
+enum TreeFault {
+    Outside(PathBuf),
+    Special(PathBuf),
+    Io { path: PathBuf, op: &'static str, error: std::io::Error },
+}
+
+impl std::fmt::Display for TreeFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outside(path) => write!(f, "`{}` is a link out of the served tree", path.display()),
+            Self::Special(path) => write!(f, "`{}` in the served tree is neither a regular file nor a directory", path.display()),
+            Self::Io { path, op, error } => write!(f, "cannot {op} `{}` in the served tree: {error}", path.display()),
+        }
+    }
+}
+
+fn missing(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
+/// `rel` of the tree at `root`, every link resolved: one `realpath` of an absolute path, held
+/// inside the root by a prefix check against the root resolved once ([`RealRoot`]). A link out
+/// of the tree, or one whose target leaves it, is [`TreeFault::Outside`].
+fn disk_node(root: &RealRoot, rel: &str, plant: impl blaze_own::planted::Planted<TreePlant>) -> Result<Option<(PathBuf, std::fs::Metadata)>, TreeFault> {
+    let fault = |op, error| TreeFault::Io { path: PathBuf::from(rel), op, error };
+    let real = match std::fs::canonicalize(root.path().join(rel)) {
+        Ok(path) => path,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(error) => return Err(fault("resolve", error)),
+    };
+    if !plant.has(TreePlant::PrefixUnchecked) && !real.starts_with(root.path()) {
+        return Err(TreeFault::Outside(PathBuf::from(rel)));
+    }
+    let meta = std::fs::metadata(&real).map_err(|error| fault("stat", error))?;
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(TreeFault::Special(PathBuf::from(rel)));
+    }
+    Ok(Some((real, meta)))
+}
+
+pub const NOT_A_FILE: ContentId = ContentId([0xA1; 32]);
+pub const NOT_A_FOLDER: ContentId = ContentId([0xA2; 32]);
+
+/// The operation of a saved checkout row. Read failures that stop the sandbox
+/// cannot equal any answer it successfully served before.
+#[derive(Clone, Copy)]
+pub enum TreeRead {
+    File,
+    Listing,
+    Stat,
+}
+
+impl TreeRead {
+    fn observed(self, node: Option<&Node<'_>>) -> Option<ContentId> {
+        match (self, node?) {
+            (Self::File, Node::File(bytes)) => Some(file_answer(bytes)),
+            (Self::File, Node::Folder(_)) => Some(NOT_A_FILE),
+            (Self::Listing, Node::Folder(entries)) => Some(listing_digest(entries)),
+            (Self::Listing, Node::File(_)) => Some(NOT_A_FOLDER),
+            (Self::Stat, Node::File(bytes)) => Some(stat_answer(false, bytes.len() as u64)),
+            (Self::Stat, Node::Folder(_)) => Some(stat_answer(true, 0)),
+        }
+    }
+
+    pub fn answer(self, tree: &Tree, path: &str) -> Result<Option<ContentId>, UnknownSubject> {
+        let node = tree.node(path).map_err(|why| UnknownSubject(why.to_string()))?;
+        Ok(self.observed(node.as_ref()))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NodeRead {
+    Bytes,
+    Stat,
+    Open,
+    OpenDirectory,
+}
+
+impl NodeRead {
+    fn open(how: &Open) -> Self {
+        if how.directory() { Self::OpenDirectory } else { Self::Open }
+    }
+
+    fn observation(self, found: Option<&Node<'_>>) -> (&'static str, Option<ContentId>) {
+        let (prefix, read) = match (self, found) {
+            (Self::Stat, _) => ("stat:", TreeRead::Stat),
+            (Self::OpenDirectory, _) | (Self::Open, Some(Node::Folder(_))) => ("dir:", TreeRead::Listing),
+            (Self::Open | Self::Bytes, _) => ("file:", TreeRead::File),
+        };
+        (prefix, read.observed(found))
+    }
 }
 
 impl Tree {
@@ -104,35 +291,46 @@ impl Tree {
     /// The bytes of the file `rel` of the tree; `None` when it is absent, a folder or a link
     /// out of the tree.
     pub fn file(&self, rel: &str) -> Option<Vec<u8>> {
-        match self.node(rel) {
-            Ok(Some(Node::File(bytes))) => Some(bytes.into_owned()),
-            _ => None,
+        self.file_bytes(rel).ok().flatten().map(Cow::into_owned)
+    }
+
+    fn file_bytes(&self, rel: &str) -> Result<Option<Cow<'_, [u8]>>, TreeFault> {
+        match self {
+            Tree::Dir(root) => {
+                let Some((path, meta)) = disk_node(root, rel, blaze_own::planted::NoPlant)? else { return Ok(None) };
+                if meta.is_dir() {
+                    return Ok(None);
+                }
+                std::fs::read(path).map(|bytes| Some(Cow::Owned(bytes))).map_err(|error| TreeFault::Io { path: PathBuf::from(rel), op: "read", error })
+            }
+            Tree::Mem { files, .. } => Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| Cow::Borrowed(files[at].1.as_slice()))),
         }
     }
 
     /// What `rel` is: its bytes or its entries; `None` when absent. `Err`: a link out of the
     /// tree.
-    fn node(&self, rel: &str) -> Result<Option<Node<'_>>, String> {
+    fn node(&self, rel: &str) -> Result<Option<Node<'_>>, TreeFault> {
         match self {
             Tree::Dir(root) => {
-                let path = root.join(rel);
-                let Ok(real) = std::fs::canonicalize(&path) else { return Ok(None) };
-                let root = std::fs::canonicalize(root).map_err(|e| format!("the workspace folder {} cannot be resolved: {e}", root.display()))?;
-                if !real.starts_with(&root) {
-                    return Err(format!("`{rel}` (from the served tree's root) is a link out of the tree"));
-                }
-                if real.is_dir() {
-                    let mut entries = Vec::new();
-                    if let Ok(dir) = std::fs::read_dir(&real) {
-                        for entry in dir.flatten() {
-                            let filetype = if entry.path().is_dir() { Filetype::Directory } else { Filetype::RegularFile };
-                            entries.push((entry.file_name().into_encoded_bytes(), filetype));
-                        }
-                    }
+                let fault = |op, error| TreeFault::Io { path: PathBuf::from(rel), op, error };
+                let Some((real, meta)) = disk_node(root, rel, blaze_own::planted::NoPlant)? else { return Ok(None) };
+                if meta.is_dir() {
+                    let dir = std::fs::read_dir(&real).map_err(|error| fault("list", error))?;
+                    let mut entries = dir.map(|entry| {
+                        let entry = entry.map_err(|error| fault("list", error))?;
+                        let kind = match std::fs::metadata(entry.path()) {
+                            Ok(meta) if meta.is_dir() => Filetype::Directory,
+                            Ok(_) => Filetype::RegularFile,
+                            Err(error) if missing(&error) => Filetype::RegularFile,
+                            Err(error) => return Err(fault("stat a directory entry of", error)),
+                        };
+                        Ok((entry.file_name().into_encoded_bytes(), kind))
+                    }).collect::<Result<Vec<_>, TreeFault>>()?;
                     entries.sort_by(|a, b| a.0.cmp(&b.0));
                     return Ok(Some(Node::Folder(entries)));
                 }
-                Ok(std::fs::read(&real).ok().map(|bytes| Node::File(Cow::Owned(bytes))))
+                let bytes = std::fs::read(&real).map_err(|error| fault("read", error))?;
+                Ok(Some(Node::File(Cow::Owned(bytes))))
             }
             Tree::Mem { files, .. } => {
                 if let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) {
@@ -151,6 +349,8 @@ impl Tree {
                         entries.push((name.as_bytes().to_vec(), filetype));
                     }
                 }
+                // Full paths sort "a.txt" before "a/f"; the served names sort "a" first.
+                entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                 Ok((!entries.is_empty() || rel.is_empty()).then_some(Node::Folder(entries)))
             }
         }
@@ -328,12 +528,50 @@ enum Opened {
     Out { path: String, pos: u64, append: bool, write: bool },
 }
 
+/// `OUT_DIR`'s contents by path from it (`None` a folder, else a file's bytes, the root at the
+/// empty path), with a count of its edits. Read through `Deref`; changed only through
+/// [`OutDir::edit`], so a deferred request's state ([`ScriptSandbox::snap_out`]) is taken again
+/// exactly when `OUT_DIR` may differ from the last one taken.
+pub(crate) struct OutDir {
+    map: BTreeMap<String, Option<Vec<u8>>>,
+    edits: u64,
+}
+
+impl OutDir {
+    fn new() -> OutDir {
+        let mut map = BTreeMap::new();
+        map.insert(String::new(), None);
+        OutDir { map, edits: 0 }
+    }
+
+    /// The contents to change: counted as an edit.
+    pub(crate) fn edit(&mut self) -> &mut BTreeMap<String, Option<Vec<u8>>> {
+        self.edits += 1;
+        &mut self.map
+    }
+
+    pub(crate) fn edits(&self) -> u64 {
+        self.edits
+    }
+}
+
+impl core::ops::Deref for OutDir {
+    type Target = BTreeMap<String, Option<Vec<u8>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+/// One `OUT_DIR` state a deferred request saw: each entry's name and, for a file, its digest
+/// (blaze-build-script outputs.rs `snap_digest`).
+pub(crate) type OutState = Vec<(String, Option<[u8; 32]>)>;
+
 /// One run's sandbox.
 pub struct ScriptSandbox {
     pub(crate) script: Arc<Script>,
     opened: Vec<Option<Opened>>,
-    /// `OUT_DIR`'s contents by path from it: `None` a folder, else a file's bytes.
-    pub(crate) out: BTreeMap<String, Option<Vec<u8>>>,
+    pub(crate) out: OutDir,
     pub(crate) out_bytes: u64,
     pub(crate) stdout: Vec<u8>,
     line: u64,
@@ -343,8 +581,16 @@ pub struct ScriptSandbox {
     pub(crate) refused: Option<Refusal>,
     /// `proc_exit`'s code, when it exited.
     pub(crate) exit: Option<u32>,
-    /// The C requests deferred, each argv joined by NUL.
-    pub(crate) c_requests: Vec<String>,
+    /// The C requests deferred, each argv joined by NUL, with the `OUT_DIR` state it saw (an
+    /// index of `c_states`).
+    pub(crate) c_requests: Vec<(String, u32)>,
+    /// The `OUT_DIR` states the deferred requests saw, and the bytes of their files by digest
+    /// (blaze-build-script outputs.rs, THE C INPUTS).
+    pub(crate) c_states: Vec<OutState>,
+    pub(crate) c_held: BTreeMap<[u8; 32], Vec<u8>>,
+    c_held_bytes: u64,
+    /// `OUT_DIR`'s edit count when the last state was taken, and that state.
+    c_snapped: Option<(u64, u32)>,
     /// The last spawn's reply, read by the shim's `reply`.
     pub(crate) reply: Vec<u8>,
     pub(crate) spawns: u32,
@@ -355,13 +601,7 @@ fn digest(bytes: &[u8]) -> ContentId {
 }
 
 fn listing_digest(entries: &[(Vec<u8>, Filetype)]) -> ContentId {
-    let mut names = Vec::new();
-    for (name, filetype) in entries {
-        names.extend_from_slice(name);
-        names.push(0);
-        names.push(*filetype as u8);
-    }
-    digest(&names)
+    listing_answer(entries.iter().map(|(name, kind)| (name.as_slice(), *kind == Filetype::Directory)))
 }
 
 fn stat_digest(filetype: Filetype, size: u64) -> ContentId {
@@ -391,13 +631,12 @@ pub fn stat_answer(is_dir: bool, size: u64) -> ContentId {
 /// whether it is a folder through any link), in name order: [`listing_digest`]'s bytes, one
 /// level, each entry not a folder counted a regular file as [`Tree::node`] lists it.
 pub fn listing_answer<'e>(entries: impl IntoIterator<Item = (&'e [u8], bool)>) -> ContentId {
-    let mut names = Vec::new();
+    let mut names = blaze_ids::Hasher::new("blaze build-script read");
     for (name, is_dir) in entries {
-        names.extend_from_slice(name);
-        names.push(0);
-        names.push(if is_dir { Filetype::Directory } else { Filetype::RegularFile } as u8);
+        let kind = if is_dir { Filetype::Directory } else { Filetype::RegularFile };
+        names.update(name).update(&[0, kind as u8]);
     }
-    digest(&names)
+    names.finish()
 }
 
 fn filestat(filetype: Filetype, size: u64) -> Filestat {
@@ -412,23 +651,28 @@ pub struct UnknownSubject(pub String);
 pub fn answer_now(tree: &Tree, subject: &str) -> Result<Option<ContentId>, UnknownSubject> {
     let unknown = || UnknownSubject(subject.to_owned());
     let (kind, rel) = subject.split_once(':').ok_or_else(unknown)?;
-    if kind == "git" {
-        // Recomputed, not reread: a refusal now is an answer that differs (D54).
-        let (folder, command) = rel.split_once('\n').ok_or_else(unknown)?;
-        let words: Vec<&str> = command.split(' ').collect();
-        return Ok(git_fact(tree, folder, &words, Alloc::global()).ok().map(|answer| answer_digest(&answer)));
+    if matches!(kind, "git" | "git-scope") {
+        let (folder, command) = match kind {
+            "git" => {
+                let (folder, command) = rel.split_once('\n').ok_or_else(unknown)?;
+                (folder, Some(command))
+            }
+            _ => (rel, None),
+        };
+        let words: Vec<&str> = command.into_iter().flat_map(|words| words.split(' ')).collect();
+        let scratch = blaze_own::Erased::new(words.allocator());
+        return Ok(match command {
+            Some(_) => git_answer(tree, folder, &words, scratch.handle()).ok(),
+            None => Some(scope_answer(status_scope(tree, folder, scratch.handle()))),
+        });
     }
-    let node = tree.node(rel).map_err(|_| unknown())?;
-    Ok(match (kind, node) {
-        ("file", Some(Node::File(bytes))) => Some(digest(&bytes)),
-        ("file", _) => None,
-        ("dir", Some(Node::Folder(entries))) => Some(listing_digest(&entries)),
-        ("dir", _) => None,
-        ("stat", Some(Node::File(bytes))) => Some(stat_digest(Filetype::RegularFile, bytes.len() as u64)),
-        ("stat", Some(Node::Folder(_))) => Some(stat_digest(Filetype::Directory, 0)),
-        ("stat", None) => None,
+    let op = match kind {
+        "file" => TreeRead::File,
+        "dir" => TreeRead::Listing,
+        "stat" => TreeRead::Stat,
         _ => return Err(unknown()),
-    })
+    };
+    op.answer(tree, rel)
 }
 
 /// Where a path the script named is.
@@ -470,12 +714,10 @@ impl ScriptSandbox {
             environ.extend_from_slice(value.as_bytes());
             environ.push(0);
         }
-        let mut out = BTreeMap::new();
-        out.insert(String::new(), None);
         ScriptSandbox {
             script,
             opened: Vec::new(),
-            out,
+            out: OutDir::new(),
             out_bytes: 0,
             stdout: Vec::new(),
             line: 0,
@@ -485,6 +727,10 @@ impl ScriptSandbox {
             refused: None,
             exit: None,
             c_requests: Vec::new(),
+            c_states: Vec::new(),
+            c_held: BTreeMap::new(),
+            c_held_bytes: 0,
+            c_snapped: None,
             reply: Vec::new(),
             spawns: 0,
         }
@@ -499,10 +745,83 @@ impl ScriptSandbox {
         self.out.iter().filter_map(|(path, bytes)| bytes.as_deref().map(|b| (path.as_str(), b)))
     }
 
-    pub(crate) fn record(&mut self, subject: String, digest: Option<ContentId>) {
-        if !self.reads.iter().any(|it| it.subject == subject) {
-            self.reads.push(Read { subject, digest });
+    /// `OUT_DIR` as it is now, as a deferred request's state: the last state again while
+    /// `OUT_DIR` was not edited since it was taken, or when it holds the same; else a new one,
+    /// each file's bytes kept once by digest. A request runs LATER what the script asked NOW,
+    /// and the script may remove or rewrite what it read (outputs.rs, THE C INPUTS).
+    /// The bytes held are capped at `OUT_DIR`'s own byte limit (rule 18): past it the script
+    /// is refused by name.
+    pub(crate) fn snap_out(&mut self) -> Result<u32, Stop> {
+        if let Some((edits, state)) = self.c_snapped
+            && edits == self.out.edits()
+        {
+            return Ok(state);
         }
+        let limit = self.script.limits.out_dir_bytes;
+        let mut entries: OutState = Vec::with_capacity(self.out.len());
+        let mut over = None;
+        for (name, bytes) in self.out.iter() {
+            if name.is_empty() {
+                continue;
+            }
+            match bytes {
+                None => entries.push((name.clone(), None)),
+                Some(bytes) => {
+                    let digest = blaze_build_script::outputs::snap_digest(bytes);
+                    if !self.c_held.contains_key(&digest) {
+                        self.c_held_bytes += bytes.len() as u64;
+                        if self.c_held_bytes > limit {
+                            over = Some(name.clone());
+                            break;
+                        }
+                        self.c_held.insert(digest, bytes.clone());
+                    }
+                    entries.push((name.clone(), Some(digest)));
+                }
+            }
+        }
+        if let Some(name) = over {
+            return Err(self.refuse(Refusal::OutDir(format!(
+                "deferred C requests whose OUT_DIR inputs, kept as each request saw them, pass {limit} bytes (at {name})"
+            ))));
+        }
+        let state = match self.c_states.last() {
+            Some(last) if *last == entries => self.c_states.len() - 1,
+            _ => {
+                self.c_states.push(entries);
+                self.c_states.len() - 1
+            }
+        };
+        let state = u32::try_from(state).expect("snap_out: fewer states than spawns, and spawns are counted in u32");
+        self.c_snapped = Some((self.out.edits(), state));
+        Ok(state)
+    }
+
+    pub(crate) fn record(&mut self, mut subject: String, digest: Option<ContentId>) {
+        if self.reads.len() > READS_CAP {
+            return; // the overflow witness already refuses this whole run
+        }
+        if let Some(previous) = self.reads.iter().find(|it| it.subject == subject) {
+            if previous.digest == digest {
+                return;
+            }
+            // Both answers contributed to one run. A single cell can never
+            // prove both. Keep the conflicting subject for the engine's note.
+            subject.insert_str(0, "changed-during-run:");
+            if self.reads.iter().any(|it| it.subject == subject) {
+                return;
+            }
+        }
+        if self.reads.len() == READS_CAP {
+            subject.insert_str(0, "read-limit:");
+        }
+        self.reads.push(Read { subject, digest });
+    }
+
+    fn record_node(&mut self, mut rel: String, op: NodeRead, found: Option<&Node<'_>>) {
+        let (prefix, answer) = op.observation(found);
+        rel.insert_str(0, prefix);
+        self.record(rel, answer);
     }
 
     pub(crate) fn refuse(&mut self, refusal: Refusal) -> Stop {
@@ -613,7 +932,7 @@ impl ScriptSandbox {
                     return Ok(Err(Errno::NOENT));
                 }
                 self.count_file(&rel)?;
-                self.out.insert(rel, None);
+                self.out.edit().insert(rel, None);
                 Ok(Ok(()))
             }
             Place::Above(_) | Place::Ancestor(_) => Ok(Err(Errno::EXIST)),
@@ -635,7 +954,7 @@ impl ScriptSandbox {
                 Some(None) if !dir => Ok(Err(Errno::ISDIR)),
                 Some(None) if !self.out_listing(&rel).is_empty() => Ok(Err(Errno::NOTEMPTY)),
                 Some(_) => {
-                    if let Some(Some(bytes)) = self.out.remove(&rel) {
+                    if let Some(Some(bytes)) = self.out.edit().remove(&rel) {
                         self.out_bytes -= bytes.len() as u64;
                     }
                     Ok(Ok(()))
@@ -666,8 +985,8 @@ impl ScriptSandbox {
         if !self.out_parent_exists(&to) || matches!(self.out.get(&to), Some(None)) {
             return Ok(Err(Errno::NOENT));
         }
-        let bytes = self.out.remove(&from).flatten().unwrap_or_default();
-        if let Some(Some(old)) = self.out.insert(to, Some(bytes)) {
+        let bytes = self.out.edit().remove(&from).flatten().unwrap_or_default();
+        if let Some(Some(old)) = self.out.edit().insert(to, Some(bytes)) {
             self.out_bytes -= old.len() as u64;
         }
         Ok(Ok(()))
@@ -682,7 +1001,7 @@ impl ScriptSandbox {
         };
         let now = self.out.get(&path).and_then(|it| it.as_ref()).map_or(0, |b| b.len() as u64);
         self.grow(size.saturating_sub(now))?;
-        if let Some(Some(bytes)) = self.out.get_mut(&path) {
+        if let Some(Some(bytes)) = self.out.edit().get_mut(&path) {
             bytes.resize(size as usize, 0);
         }
         self.out_bytes = self.out_bytes - now.min(self.out_bytes) + size.min(now) + size.saturating_sub(now);
@@ -734,16 +1053,15 @@ impl ScriptSandbox {
                 let script = Arc::clone(&self.script);
                 let found = match script.tree.node(&rel) {
                     Ok(found) => found,
-                    Err(why) => return Err(self.refuse(Refusal::Path(why))),
+                    Err(why) => return Err(self.refuse(Refusal::Path(why.to_string()))),
                 };
-                let bytes = match found {
-                    Some(Node::File(bytes)) => Some(bytes.to_vec()),
+                self.record_node(rel, NodeRead::Bytes, found.as_ref());
+                match found {
+                    Some(Node::File(bytes)) => Some(bytes.into_owned()),
                     _ => None,
-                };
-                self.record(format!("file:{rel}"), bytes.as_deref().map(digest));
-                bytes
+                }
             }
-            Place::Dep { mount, rel } => self.dep_file(mount, &rel)?,
+            Place::Dep { mount, rel } => self.dep_file(mount, rel)?,
             Place::Above(_) | Place::Ancestor(_) => None,
         })
     }
@@ -808,14 +1126,25 @@ impl ScriptSandbox {
                     Some(cwd) => self.script.root.seen().in_tree(cwd).map(str::to_owned),
                 };
                 let script = Arc::clone(&self.script);
-                let answered = match folder.as_deref().map(|folder| (folder, git_subject(folder, &words))) {
-                    Some((folder, Some(subject))) => git_fact(&script.tree, folder, &words, Alloc::global()).map(|answer| (subject, answer)),
-                    Some((_, None)) => Err(git::Refused::CannotAnswerYet),
-                    None => Err(git::Refused::NoRepository),
-                };
+                let scratch = blaze_own::Erased::new(words.allocator());
+                let alloc = scratch.handle();
+                let answered = folder.as_deref().ok_or(git::Refused::NoRepository).and_then(|folder| {
+                    if folder.contains('\n') || words.iter().any(|word| word.is_empty() || word.contains(char::is_whitespace)) {
+                        return Err(git::Refused::CannotAnswerYet);
+                    }
+                    let status = matches!(git::question(&words), git::Question::Status { .. });
+                    let work = if status { status_scope(&script.tree, folder, alloc) } else { folder };
+                    let answer = git_fact(&script.tree, work, &words, alloc)?;
+                    if status && !folder.is_empty() && matches!(script.tree, Tree::Dir(_)) {
+                        let mut binding = folder.to_owned();
+                        binding.insert_str(0, "git-scope:");
+                        self.record(binding, Some(scope_answer(work)));
+                    }
+                    Ok((work, answer))
+                });
                 match answered {
-                    Ok((subject, answer)) => {
-                        self.record(subject, Some(answer_digest(&answer)));
+                    Ok((work, answer)) => {
+                        self.record(git_subject(work, command), Some(answer_digest(&answer)));
                         (answer.code, answer.stdout.as_bytes().to_vec(), answer.stderr.as_bytes().to_vec())
                     }
                     Err(why) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Git { command, why }))),
@@ -823,7 +1152,21 @@ impl ScriptSandbox {
             }
             crate::spawn_route::Route::Fact(fact) => return self.spawn_fact(&fact, program, args, &spawned),
             crate::spawn_route::Route::Deferred => {
-                self.c_requests.push(spawned.argv.join("\0"));
+                // Its inputs the script made are captured now, by content: the script may
+                // remove or rewrite them before the request runs (outputs.rs, THE C INPUTS).
+                let state = self.snap_out()?;
+                // Its relative paths made the guest paths they meant in the spawn's folder
+                // (c_tasks.rs `rooted`): the request runs later, elsewhere.
+                let script_cwd = self.script.cwd();
+                let cwd = match spawned.cwd.as_deref() {
+                    None => script_cwd,
+                    Some(cwd) if cwd.starts_with('/') => cwd.to_owned(),
+                    Some(cwd) => format!("{script_cwd}/{cwd}"),
+                };
+                let argv: Vec<&str> = spawned.argv.iter().map(String::as_str).collect();
+                let mut text = String::new();
+                blaze_build_script::c_tasks::rooted(&argv, &cwd, &mut text).expect("script_sandbox: writing to a String does not fail");
+                self.c_requests.push((text, state));
                 (0, Vec::new(), Vec::new())
             }
             crate::spawn_route::Route::Executor => return self.spawn_executor(program, args, &spawned),
@@ -856,22 +1199,92 @@ pub(crate) fn git_words(name: &str, args: &[&str]) -> Option<Vec<String>> {
 /// to make it; a later command recomputes the answer ([`answer_now`]) and reruns the script
 /// only when it changed, so an edit that leaves the answer alone reruns nothing (early cutoff).
 fn git_fact<'a>(tree: &Tree, folder: &str, words: &[&str], alloc: Alloc<'a>) -> Result<git::Answer<'a>, git::Refused> {
-    // The files behind the fact are not the record's reads: the question is.
-    let mut behind = Vec::new();
-    git::answer(git::question(words), folder, tree.vcs(), &mut GitView::new(tree, &mut behind, alloc), alloc)
+    git_question(tree, folder, git::question(words), alloc).map(|(answer, _)| answer)
 }
 
-/// A `git` question as a read's subject: `git:<folder>\n<words>`; `None` when a word is empty
-/// or holds whitespace (or the folder a newline), which would not read back the same.
-fn git_subject(folder: &str, words: &[&str]) -> Option<String> {
-    if folder.contains('\n') || words.iter().any(|word| word.is_empty() || word.contains(char::is_whitespace)) {
-        return None;
+/// `question` asked in `folder` on the tree granted to the script, through the one reader a
+/// run's spawn reads it by ([`GitView`]), with what it listed and read of the ignore files.
+pub fn git_question<'a>(tree: &Tree, folder: &str, question: git::Question, alloc: Alloc<'a>) -> Result<(git::Answer<'a>, GitCounts), git::Refused> {
+    let mut view = GitView::for_fact(tree, alloc);
+    let answer = git::answer(question, folder, tree.vcs(), &mut view, alloc);
+    match view.fault {
+        Some(why) => Err(why),
+        None => answer.map(|answer| (answer, view.counts)),
     }
-    Some(format!("git:{folder}\n{}", words.join(" ")))
 }
 
-fn answer_digest(answer: &git::Answer<'_>) -> ContentId {
-    let mut bytes = blaze_own::Vec::new_in(Alloc::global());
+/// `status --porcelain` in `work` (a worktree, [`status_scope`]) after a change, on the tree
+/// granted to the script, through the same reader as [`git_question`] (E3, blaze-build-script
+/// git.rs `status_after`): byte-equal to its answer; the answer, how it was made, and what it
+/// listed and read of the ignore files.
+#[allow(clippy::too_many_arguments, reason = "the tree, the question, the previous answer and its proof, the place now, the allocator and the plant")]
+pub fn status_after<'a>(
+    tree: &Tree,
+    work: &str,
+    untracked: bool,
+    all: bool,
+    previous: Option<&git::StatusAnswer<'_>>,
+    covered: Option<&git::CoveredSince<'_>>,
+    now: git::Gen,
+    alloc: Alloc<'a>,
+    plant: impl blaze_own::planted::Planted<git::StatusPlant>,
+) -> Result<(git::After<'a>, GitCounts), git::Refused> {
+    // A fetched source has no `.git` and no journal: its status is its commit's, answered by
+    // [`git_question`] alone. The checkout sweep serves only a checkout.
+    if let git::Vcs::Fetched(_) = tree.vcs() {
+        return Err(git::Refused::CannotAnswerYet);
+    }
+    let mut view = GitView::for_fact(tree, alloc);
+    let after = git::status_after(work, untracked, all, previous, covered, now, &mut view, alloc, plant);
+    match view.fault {
+        Some(why) => Err(why),
+        None => after.map(|after| (after, view.counts)),
+    }
+}
+
+/// Replay on the very tree granted to the script. In particular status sees the
+/// same lstat fields, link targets, config, index and listing as the spawn.
+pub fn git_answer(tree: &Tree, folder: &str, words: &[&str], alloc: Alloc<'_>) -> Result<ContentId, git::Refused> {
+    git_fact(tree, folder, words, alloc).map(|answer| answer_digest(&answer))
+}
+
+/// The nearest marker consumed by git.rs `find`, relative to the granted tree.
+/// A .git directory without a readable HEAD does not bind the question.
+pub fn status_scope<'f>(tree: &Tree, mut folder: &'f str, alloc: Alloc<'_>) -> &'f str {
+    let mut marker = blaze_own::String::new_in(alloc);
+    while !folder.is_empty() {
+        marker.clear();
+        marker.push_str(folder);
+        marker.push_str("/.git");
+        if !matches!(tree.file_bytes(&marker), Ok(None)) {
+            break;
+        }
+        marker.push_str("/HEAD");
+        if !matches!(tree.file_bytes(&marker), Ok(None)) {
+            break;
+        }
+        folder = folder.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
+    folder
+}
+
+pub fn scope_answer(work: &str) -> ContentId {
+    ContentId::of("blaze build-script git worktree 1", work.as_bytes())
+}
+
+/// The validated words as a read's subject, using the command's existing buffer.
+fn git_subject(folder: &str, mut command: String) -> String {
+    command.reserve("git:\n".len() + folder.len());
+    command.insert(0, '\n');
+    command.insert_str(0, folder);
+    command.insert_str(0, "git:");
+    command
+}
+
+/// A git answer's digest as a run's read records it: the digest of
+/// [`git::Answer::digest_bytes`], whatever made the answer.
+pub fn answer_digest(answer: &git::Answer<'_>) -> ContentId {
+    let mut bytes = blaze_own::Vec::new_in(*answer.stdout.allocator());
     answer.digest_bytes(&mut bytes);
     digest(&bytes)
 }
@@ -887,43 +1300,164 @@ fn answer_digest(answer: &git::Answer<'_>) -> ContentId {
 /// pass through a link, so none can reach outside the tree. The last part is never followed.
 pub(crate) struct GitView<'s> {
     tree: &'s Tree,
-    reads: &'s mut Vec<Read>,
+    reads: Option<&'s mut Vec<Read>>,
     /// Folders (relative to the root) proven real by `lstat`; sorted by bytes.
     real_folders: blaze_own::AVec<'s, blaze_own::AString<'s>>,
+    fault: Option<git::Refused>,
+    counts: GitCounts,
+}
+
+/// What one git answer asked of the tree that grows with the checkout rather than with the
+/// change: the folders listed and the ignore files read (`.gitignore`, `info/exclude`). A
+/// status after a change to tracked files asks neither (git_objects.rs `status_after`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct GitCounts {
+    pub lists: u32,
+    pub ignore_reads: u32,
+}
+
+impl GitCounts {
+    pub fn add(&mut self, other: GitCounts) {
+        self.lists = self.lists.saturating_add(other.lists);
+        self.ignore_reads = self.ignore_reads.saturating_add(other.ignore_reads);
+    }
 }
 
 impl<'s> GitView<'s> {
+    #[cfg(test)]
     pub(crate) fn new(tree: &'s Tree, reads: &'s mut Vec<Read>, alloc: Alloc<'s>) -> Self {
-        GitView { tree, reads, real_folders: blaze_own::Vec::new_in(alloc) }
+        GitView { reads: Some(reads), ..Self::for_fact(tree, alloc) }
+    }
+
+    fn for_fact(tree: &'s Tree, alloc: Alloc<'s>) -> Self {
+        GitView { tree, reads: None, real_folders: blaze_own::Vec::new_in(alloc), fault: None, counts: GitCounts::default() }
+    }
+
+    /// A read of `rel` counted when it is an ignore file.
+    fn count_read(&mut self, rel: &str) {
+        if rel.rsplit('/').next() == Some(".gitignore") || rel.ends_with("info/exclude") {
+            self.counts.ignore_reads = self.counts.ignore_reads.saturating_add(1);
+        }
     }
 
     /// `root/rel` when `rel` is plain (no empty, `.` or `..` part) and each folder before its
     /// last part is a real folder, not a link (one `lstat` per folder, once per view); `None`
     /// otherwise, which callers read as absent.
     fn inside(&mut self, root: &Path, rel: &str) -> Option<PathBuf> {
+        match self.reach(root, rel) {
+            Reach::At(path) => Some(path),
+            Reach::Absent | Reach::ThroughLink => None,
+        }
+    }
+
+    /// [`Self::inside`], telling a path absent from one behind a link or a non-folder.
+    fn reach(&mut self, root: &Path, rel: &str) -> Reach {
         if rel.split('/').any(|part| matches!(part, "" | "." | "..")) {
-            return None;
+            return Reach::Absent;
         }
         for (end, _) in rel.match_indices('/') {
             let folder = &rel[..end];
             let Err(at) = self.real_folders.binary_search_by(|known| known.as_bytes().cmp(folder.as_bytes())) else { continue };
-            if !std::fs::symlink_metadata(root.join(folder)).ok()?.file_type().is_dir() {
-                return None;
+            match std::fs::symlink_metadata(root.join(folder)) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(meta) if meta.file_type().is_symlink() => return Reach::ThroughLink,
+                Ok(_) => return Reach::Absent,
+                Err(error) if missing(&error) => return Reach::Absent,
+                Err(_) => {
+                    self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                    return Reach::Absent;
+                }
             }
             let alloc = *self.real_folders.allocator();
             self.real_folders.insert(at, blaze_own::String::from_str_in(folder, alloc));
         }
-        Some(root.join(rel))
+        Reach::At(root.join(rel))
     }
 }
 
-impl GitFiles for GitView<'_> {
-    fn read(&mut self, rel: &str, into: &mut blaze_own::AVec<'_, u8>) -> bool {
-        let bytes = self.tree.file(rel);
-        let subject = format!("file:{rel}");
-        if !self.reads.iter().any(|it| it.subject == subject) {
-            self.reads.push(Read { subject, digest: bytes.as_deref().map(digest) });
+impl GitView<'_> {
+    /// Notes the read of `rel` (`None`: absent) when the view keeps reads; whether it was found.
+    fn noted(&mut self, rel: &str, bytes: Option<&[u8]>) -> bool {
+        if let Some(reads) = &mut self.reads {
+            let subject = ["file:", rel].concat();
+            if !reads.iter().any(|it| it.subject == subject) {
+                reads.push(Read { subject, digest: bytes.map(digest) });
+            }
         }
+        bytes.is_some()
+    }
+}
+
+/// Where a plain path of a served tree is, as [`GitView`] reaches it without following links.
+enum Reach {
+    At(PathBuf),
+    Absent,
+    /// A folder on the way is a link.
+    ThroughLink,
+}
+
+impl GitFiles for GitView<'_> {
+    /// A served tree's file is reached as [`Self::stat`] reaches it: each folder on the way
+    /// proven real by one `lstat` per view, the file itself one `lstat` and one read; no
+    /// `realpath`, no `getcwd` (tempo's edit: this read through [`disk_node`] was a third of the
+    /// command's opens). A link on the way, or as the file, is refused, never followed: git
+    /// reads its own files and an ignore or attributes file through no link either, and a link
+    /// out of the tree was refused before as well.
+    fn read(&mut self, rel: &str, into: &mut blaze_own::AVec<'_, u8>) -> bool {
+        self.count_read(rel);
+        let tree: &Tree = self.tree;
+        if let Tree::Dir(root) = tree {
+            let path = match self.reach(root, rel) {
+                Reach::At(path) => path,
+                Reach::Absent => return self.noted(rel, None),
+                Reach::ThroughLink => {
+                    self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                    return false;
+                }
+            };
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_file() => {}
+                Ok(meta) if meta.is_dir() => return self.noted(rel, None),
+                Ok(_) => {
+                    self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                    return false;
+                }
+                Err(error) if missing(&error) => return self.noted(rel, None),
+                Err(_) => {
+                    self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                    return false;
+                }
+            }
+            let start = into.len();
+            use std::io::Read as _;
+            let read = std::fs::File::open(&path).and_then(|mut file| {
+                let mut chunk = [0u8; 16 << 10];
+                loop {
+                    let n = file.read(&mut chunk)?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    if into.try_reserve(n).is_err() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory));
+                    }
+                    into.extend_from_slice(&chunk[..n]);
+                }
+            });
+            if read.is_err() {
+                into.truncate(start);
+                self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                return false;
+            }
+            return self.noted(rel, Some(&into[start..]));
+        }
+        let bytes = match tree.file_bytes(rel) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                return false;
+            }
+        };
+        self.noted(rel, bytes.as_deref());
         let Some(bytes) = bytes else { return false };
         into.extend_from_slice(&bytes);
         true
@@ -966,7 +1500,14 @@ impl GitFiles for GitView<'_> {
         match tree {
             Tree::Dir(root) => {
                 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                let meta = std::fs::symlink_metadata(self.inside(root, rel)?).ok()?;
+                let meta = match std::fs::symlink_metadata(self.inside(root, rel)?) {
+                    Ok(meta) => meta,
+                    Err(error) if missing(&error) => return None,
+                    Err(_) => {
+                        self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                        return None;
+                    }
+                };
                 let kind = match meta.file_type() {
                     t if t.is_symlink() => git::FileKind::Symlink,
                     t if t.is_dir() => git::FileKind::Dir,
@@ -993,19 +1534,44 @@ impl GitFiles for GitView<'_> {
     }
 
     fn list<'a>(&mut self, rel: &str, alloc: Alloc<'a>, into: &mut blaze_own::AVec<'a, blaze_own::AString<'a>>) {
+        self.counts.lists = self.counts.lists.saturating_add(1);
         let tree: &Tree = self.tree;
         if let Tree::Dir(root) = tree {
             // Names only: no stat per entry. The folder itself must be real, not a link.
-            let Some(path) = self.inside(root, rel) else { return };
-            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_dir()) {
-                return;
-            }
-            let Ok(dir) = std::fs::read_dir(&path) else { return };
-            let start = into.len();
-            for entry in dir.flatten() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    into.push(blaze_own::String::from_str_in(&name, alloc));
+            let child;
+            let path = if rel.is_empty() {
+                root.path()
+            } else {
+                let Some(path) = self.inside(root, rel) else { return };
+                child = path;
+                &child
+            };
+            if !rel.is_empty() {
+                match std::fs::symlink_metadata(path) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(_) => {
+                        self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                        return;
+                    }
                 }
+            }
+            let Ok(dir) = std::fs::read_dir(path) else {
+                self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                return;
+            };
+            let start = into.len();
+            for entry in dir {
+                let Ok(entry) = entry else {
+                    self.fault.get_or_insert(git::Refused::CannotAnswerYet);
+                    return;
+                };
+                let Ok(name) = entry.file_name().into_string() else {
+                    self.fault.get_or_insert(git::Refused::QuotedPath);
+                    return;
+                };
+                into.push(blaze_own::String::from_str_in(&name, alloc));
             }
             into[start..].sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             return;
@@ -1027,16 +1593,12 @@ impl GitFiles for GitView<'_> {
         rest.strip_prefix('/')
     }
 
-    /// `readlink` of `rel`'s last part, reached like every path here (each folder on the way a
-    /// real folder, no link passed through): the link's own text, never followed, so nothing
-    /// outside the tree is read. Like `stat`, not a read of the record: the git answer is (D54).
-    /// A record's tree (`Tree::Mem`) holds no links.
+    /// A link contributes its own bytes even when its target is outside the tree.
     fn read_link(&mut self, rel: &str, into: &mut blaze_own::AVec<'_, u8>) -> Result<(), git::LinkUnread> {
         let tree: &Tree = self.tree;
         let Tree::Dir(root) = tree else { return Err(git::LinkUnread::NotALink) };
         let path = self.inside(root, rel).ok_or(git::LinkUnread::NotALink)?;
         let target = std::fs::read_link(&path).map_err(|e| match e.kind() {
-            // EINVAL (not a link) and ENOENT: what git sees as a type change.
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound => git::LinkUnread::NotALink,
             _ => git::LinkUnread::Unreadable,
         })?;
@@ -1090,7 +1652,7 @@ impl System for ScriptSandbox {
         let start = if append { len } else { pos };
         let end = start + bytes.len() as u64;
         self.grow(end.saturating_sub(len))?;
-        if let Some(Some(file)) = self.out.get_mut(&path) {
+        if let Some(Some(file)) = self.out.edit().get_mut(&path) {
             if (file.len() as u64) < end {
                 file.resize(end as usize, 0);
             }
@@ -1198,22 +1760,18 @@ impl System for ScriptSandbox {
                 let script = Arc::clone(&self.script);
                 let found = match script.tree.node(&rel) {
                     Ok(found) => found,
-                    Err(why) => return Err(self.refuse(Refusal::Path(why))),
+                    Err(why) => return Err(self.refuse(Refusal::Path(why.to_string()))),
                 };
+                self.record_node(rel, NodeRead::open(&how), found.as_ref());
                 let opened = match found {
-                    None => {
-                        self.record(format!("file:{rel}"), None);
-                        return Ok(Err(Errno::NOENT));
-                    }
+                    None => return Ok(Err(Errno::NOENT)),
                     Some(Node::Folder(entries)) => {
-                        self.record(format!("dir:{rel}"), Some(listing_digest(&entries)));
                         Opened::Ro { bytes: Vec::new(), pos: 0, entries: Some(entries), folder: path.to_vec() }
                     }
                     Some(Node::File(bytes)) => {
                         if how.directory() {
                             return Ok(Err(Errno::NOTDIR));
                         }
-                        self.record(format!("file:{rel}"), Some(digest(&bytes)));
                         Opened::Ro { bytes: bytes.into_owned(), pos: 0, entries: None, folder: Vec::new() }
                     }
                 };
@@ -1225,7 +1783,7 @@ impl System for ScriptSandbox {
                 }
                 Ok(Ok(self.slot(Opened::Ro { bytes: Vec::new(), pos: 0, entries: Some(vec![(entry, Filetype::Directory)]), folder: path.to_vec() })))
             }
-            Place::Dep { mount, rel } => self.dep_open(mount, &rel, path, how),
+            Place::Dep { mount, rel } => self.dep_open(mount, rel, path, how),
             Place::Ancestor(entries) => self.ancestor_open(entries, path, writes),
             Place::Out(rel) => {
                 match self.out.get(&rel) {
@@ -1245,11 +1803,11 @@ impl System for ScriptSandbox {
                             return Ok(Err(Errno::NOENT));
                         }
                         self.count_file(&rel)?;
-                        self.out.insert(rel.clone(), Some(Vec::new()));
+                        self.out.edit().insert(rel.clone(), Some(Vec::new()));
                     }
                 }
                 if how.truncate()
-                    && let Some(Some(bytes)) = self.out.get_mut(&rel)
+                    && let Some(Some(bytes)) = self.out.edit().get_mut(&rel)
                 {
                     self.out_bytes -= bytes.len() as u64;
                     bytes.clear();
@@ -1270,18 +1828,18 @@ impl System for ScriptSandbox {
                 let script = Arc::clone(&self.script);
                 let found = match script.tree.node(&rel) {
                     Ok(found) => found,
-                    Err(why) => return Err(self.refuse(Refusal::Path(why))),
+                    Err(why) => return Err(self.refuse(Refusal::Path(why.to_string()))),
                 };
+                self.record_node(rel, NodeRead::Stat, found.as_ref());
                 let found = match found {
                     Some(Node::File(bytes)) => Some((Filetype::RegularFile, bytes.len() as u64)),
                     Some(Node::Folder(_)) => Some((Filetype::Directory, 0)),
                     None => None,
                 };
-                self.record(format!("stat:{rel}"), found.map(|(filetype, size)| stat_digest(filetype, size)));
                 Ok(found.map(|(filetype, size)| filestat(filetype, size)).ok_or(Errno::NOENT))
             }
             Place::Above(_) | Place::Ancestor(_) => Ok(Ok(filestat(Filetype::Directory, 0))),
-            Place::Dep { mount, rel } => self.dep_stat(mount, &rel),
+            Place::Dep { mount, rel } => self.dep_stat(mount, rel),
             Place::Out(rel) => Ok(match self.out.get(&rel) {
                 Some(Some(bytes)) => Ok(filestat(Filetype::RegularFile, bytes.len() as u64)),
                 Some(None) => Ok(filestat(Filetype::Directory, 0)),
@@ -1319,10 +1877,12 @@ pub fn mem_tree<'f>(files: impl IntoIterator<Item = (&'f str, &'f [u8])>, dir: &
     Tree::Mem { files: Arc::new(out), git }
 }
 
-/// A folder of the checkout as a [`Tree::Dir`].
-pub fn dir_tree(root: &Path) -> Tree {
-    Tree::Dir(root.to_owned())
+/// A folder of the checkout as a [`Tree::Dir`], at the root the command resolved once.
+pub fn dir_tree(root: &RealRoot) -> Tree {
+    Tree::Dir(root.clone())
 }
 
 #[cfg(test)]
 mod side_refusal_tests;
+#[cfg(all(test, unix))]
+mod escape_tests;

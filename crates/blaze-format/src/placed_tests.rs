@@ -2,7 +2,12 @@
 
 use blaze_sim::Config;
 
-use crate::{Placed, Record, SchemaHash, Slice, Writer};
+use blaze_own::Alloc;
+
+use crate::{Own, Placed, Record, SchemaHash, Slice, Writer, WriterOpts};
+
+/// A writer on the test's heap (D170 C1: a test names its allocator too).
+type Out = Writer<Own<Alloc<'static>>>;
 
 /// The copy `hir-ty`'s `consteval.rs`, `infer/persist.rs`, `lower/persist.rs`,
 /// `body_store/infer.rs`, `body_store/mir.rs` and `check_cache/part.rs` each had.
@@ -13,7 +18,7 @@ struct Reference {
 }
 
 impl Reference {
-    fn push<T: Record>(out: &mut Writer, values: &[T]) -> Reference {
+    fn push<T: Record>(out: &mut Out, values: &[T]) -> Reference {
         match values.is_empty() {
             true => Reference { at: 0, len: 0 },
             false => Reference { at: out.push_slice(values), len: values.len() },
@@ -28,8 +33,12 @@ impl Reference {
     }
 }
 
-fn writer() -> Writer {
-    Writer::new(SchemaHash(blaze_ids::ContentId([0; 32])))
+fn writer() -> Out {
+    Writer::new(WriterOpts {
+        schema: SchemaHash(blaze_ids::ContentId([0; 32])),
+        alloc: Own(blaze_own::testing::heap().alloc()),
+        capacity: None,
+    })
 }
 
 #[test]

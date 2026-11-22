@@ -48,9 +48,8 @@ pub enum Kind {
     /// body. Its source is that digest and its out is its source, so a body edit leaves it, and
     /// every `CrateScope` reading it, standing.
     Surface = 15,
-    /// One file's owners (owners.rs): the crate roots whose module tree reaches it. Computed by
-    /// the request machine from its parents' rows, never a task; a body reads it to know which
-    /// crates' scopes it needs.
+    /// One file's owners: the crate roots whose module tree reaches it, from its parents' rows,
+    /// never a task; a body reads it to know which crates' scopes it needs.
     Owners = 16,
     /// One build script's run, one per crate of the world that reads it (decision D115): named
     /// with the `CrateScope` parts, keyed by its crate's subject, never the machine. Its read
@@ -262,6 +261,17 @@ impl core::fmt::Display for Name {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub struct Key(pub ContentId);
 
+/// A store key's table hash: its digest's first word, as is (blaze-hash `DigestKey`). Its one
+/// field is the digest, so equal keys have equal words; a table of keys on
+/// `blaze_hash::DigestState` hashes nothing. The safe form of `PlainKey { UNIFORM }`, which is
+/// an `unsafe impl` and this crate forbids unsafe code.
+impl blaze_hash::DigestKey for Key {
+    #[inline(always)]
+    fn digest_word(&self) -> u64 {
+        blaze_hash::digest_word(&self.0.0)
+    }
+}
+
 impl core::fmt::Display for Key {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for byte in &self.0.0[..8] {
@@ -282,7 +292,6 @@ const FILE_NAME_DOMAIN: &str = "blaze-drive file name 1";
 const FILE_SOURCE_DOMAIN: &str = "blaze-drive file source 1";
 const TASK_DOMAIN: &str = "blaze-drive task key 1";
 const VALUE_DOMAIN: &str = "blaze-drive value key 1";
-const CERT_DOMAIN: &str = "blaze-drive certificate 1";
 const CONTENT_DOMAIN: &str = "blaze-drive content 1";
 
 const FACT_DOMAIN: &str = "blaze-drive fact name 1";
@@ -308,8 +317,8 @@ pub fn crate_scope_name(key: &blaze_id::CrateItemKey) -> Name {
 }
 
 /// The name of a fact the command gives (an environment variable a task reads, the target, the
-/// profile): a [`Kind::Given`] whose subject is `what`'s digest. Its value is in
-/// [`crate::request::Ask::facts`]; never read from the machine by a task.
+/// profile): a [`Kind::Given`] whose subject is `what`'s digest. Its value is the command's
+/// (each with its digest, sorted by name); never an ambient input a task reads itself.
 pub fn fact_of(what: &[u8]) -> Name {
     Name { kind: Kind::Given, subject: ContentId::of(FACT_DOMAIN, what) }
 }
@@ -329,9 +338,9 @@ const CONDITION_DOMAIN: &str = "blaze-drive condition name 1";
 const SPACE_DOMAIN: &str = "blaze-drive space 1";
 
 /// The `Owners` name of the file `file` (a `FileItems` name): what a body asks, with its file as
-/// the want's home, to learn which crates own it (owners.rs).
+/// the want's home, to learn which crates own it. Its subject is the file's.
 pub fn owners_of(file: Name) -> Name {
-    crate::owners::of(file)
+    Name::new(Kind::Owners, file.subject)
 }
 
 /// The job of `base` under `condition` (drive.md, "One check covers every configuration"): a
@@ -404,18 +413,11 @@ pub fn value_key(key: Key, reads: &[(Name, ContentId)]) -> Key {
 /// `Owners` out) put two shapes of one `Signature` under one key ("held CrateScope(1e39..), put
 /// CrateScope(1e08..)", 2026-11-17). Every such task reads the `UnitGraph` already, so folding
 /// it moves no key a moved read would not have missed. `graph` is [`ABSENT`] in a command with
-/// no unit graph. The one derivation: the drive's (request.rs `locate`) and blaze-cli's
-/// (`body_types::body_check_key`, which hands `blaze run` a body's key) both call it.
+/// no unit graph. The one derivation: every caller that keys such a task calls it.
 pub fn owned_key(task: Key, graph: ContentId, owners: Name, owners_out: ContentId) -> Key {
     // Sorted by name, as a read list is: `UnitGraph` (2) before `Owners` (16).
     value_key(task, &[(Name::unit_graph(), graph), (owners, owners_out)])
 }
-
-/// The most shapes one lookup follows from a task key (request.rs `Walk`): the task key's, then
-/// each held at a value key its predecessor's names made. A chain grows by one only when a
-/// command's answers to every earlier shape's names are ones a record of other names was made
-/// under, so real chains are short; past this the lookup stops with a typed error (rule 18).
-pub const MOST_SHAPE_STEPS: u32 = 64;
 
 /// [`value_key`] of a record that also read cells (cells.rs): the whole reads, then each cell
 /// read in (name, cell) order with what it saw. With no cell read it is [`value_key`] itself.
@@ -438,17 +440,6 @@ pub fn value_key_with_cells(key: Key, reads: &[(Name, ContentId)], cells: &[crat
 
 /// The digest a read of a name with no record saw: an absence is a read too.
 pub const ABSENT: ContentId = ContentId([0; 32]);
-
-/// The certificate key of a request: the tool, the command and its arguments, and every file of
-/// the checkout by path and content (sorted by path).
-pub fn cert_key<'a>(tool: Tool, command: &[u8], files: impl Iterator<Item = (&'a [u8], &'a ContentId)>) -> Key {
-    let mut h = Hasher::new(CERT_DOMAIN);
-    h.id(&tool.0).part(command);
-    for (path, id) in files {
-        h.part(path).id(id);
-    }
-    Key(h.finish())
-}
 
 /// The key of bytes stored by their content (answer pages, roots).
 pub fn content_key(bytes: &[u8]) -> Key {

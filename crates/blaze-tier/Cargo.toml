@@ -18,7 +18,7 @@ doctest = false
 blaze-lir.workspace = true
 # `CodeRecord`, `Symbol`, `SiteKind`: the code record is blaze-code's; piece 0 adds only the
 # sections it lacks (the loop map, the polls, the read list).
-blaze-code = { path = "../blaze-code" }
+blaze-code.workspace = true
 # `InstanceKey`, `CodeId`, `SlotId`, `tier::Callee`, `parent::Read`: the run's keys and the read
 # list's row are blaze-run's; reused, not copied.
 blaze-run.workspace = true
@@ -26,7 +26,7 @@ blaze-run.workspace = true
 blaze-own.workspace = true
 # The domain-separated BLAKE3 `Hasher`: the digest that ends every `bzcode03` record. By path,
 # as blaze-code takes it: the workspace entry turns on its `serde` adapter.
-blaze-ids = { path = "../blaze-ids" }
+blaze-ids.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std", "testing"] }

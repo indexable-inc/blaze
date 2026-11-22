@@ -1431,6 +1431,13 @@ impl<A: Allocator + Clone> Builder<A, Full> {
         self.finish_as(Check::Always)
     }
 
+    /// [`Builder::finish`] with its proof (D163): verified once, in every build, and handed out
+    /// as a [`crate::VerifiedFunc`] an emitter takes without checking again.
+    pub fn finish_verified(self) -> Result<crate::VerifiedFunc<A>, BuildError> {
+        let func = self.finish_as(Check::ByProof)?;
+        crate::VerifiedFunc::new(func).map_err(BuildError::Verify)
+    }
+
     fn finish_as(mut self, check: Check) -> Result<Func<A>, BuildError> {
         self.check_finish()?;
         if let Some(block) = (0..self.named.len())
@@ -1446,6 +1453,8 @@ impl<A: Allocator + Clone> Builder<A, Full> {
         let verify_now = match check {
             Check::Always => true,
             Check::Debug => cfg!(debug_assertions),
+            // The caller makes the proof (`VerifiedFunc::new`): verified there, once.
+            Check::ByProof => false,
         };
         if verify_now {
             verify::verify(self.func.view()).map_err(BuildError::Verify)?;
@@ -1467,6 +1476,8 @@ impl<A: Allocator + Clone> Builder<A, RequestsOnly> {
 enum Check {
     Debug,
     Always,
+    /// Not here: [`Builder::finish_verified`] verifies once, making the proof.
+    ByProof,
 }
 
 /// Where an instruction's operands are written.

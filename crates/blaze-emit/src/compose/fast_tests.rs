@@ -39,7 +39,7 @@ fn composed(table: &dyn Table) -> Emitted<'static> {
     let machine = table.head().machine;
     assert_eq!(machine.arch, Arch::Arm64, "the committed table is arm64's");
     let func = sum_func();
-    match fast.emit(func.view(), &Nameless, machine, Alloc::global()) {
+    match fast.emit(blaze_lir::verify(func.view()).expect("the test's function is LIR"), &Nameless, machine, Alloc::global()) {
         Ok(emitted) => emitted,
         Err(error) => panic!("the Fast tier refused sum: {error:?}"),
     }

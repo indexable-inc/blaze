@@ -160,8 +160,8 @@ struct Hand<T> {
 // --- The channel --------------------------------------------------------------------------------
 
 enum Flavor<T> {
-    Array(ArrayQueue<T>),
-    List(SegQueue<T>),
+    Array(ArrayQueue<T, std::alloc::Global>),
+    List(SegQueue<T, std::alloc::Global>),
     Zero(Rendezvous<T>),
 }
 

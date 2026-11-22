@@ -1,4 +1,5 @@
 //! Where a column of records was written, for the [`Slice`] of a record written after it.
+#![blaze::sans_io]
 
 use core::mem::{align_of, size_of};
 

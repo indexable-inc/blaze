@@ -25,7 +25,8 @@
 //!
 //! FN POINTERS (lane B15): a fn pointer's positions are its inputs' then its output's (lib.rs
 //! `npos`), the inputs at `Contra`, the output at `Co`. Which of them its binder binds is a
-//! region of the lifetime part (sig.rs `Region::Bound`): a bound one is an existential origin,
+//! slot of the head record's column (blaze-typeck regions.rs `Region::Late`, D148): a bound
+//! one is an existential origin,
 //! so relating it by the table asks nothing of the fn's regions, while a free one (`fn(&'a u8)`
 //! with the fn's `'a`) relates by the table exactly. NOT HERE: a higher-ranked pointer type
 //! as the EXPECTED type (`fn(&'a u8)` given where `for<'r> fn(&'r u8)` is wanted, which rustc
@@ -40,31 +41,15 @@ use blaze_own::Vec;
 use blaze_typeck::{ExprId, Mutbl, PNode, PTy};
 use core::alloc::Allocator;
 
+use blaze_borrow::SlotCount;
+
+use crate::grain::BodyTypes;
+use crate::one_call::{CallRule, FactsArity};
 use crate::{Facts, Form, Lower, MOST_POSITIONS, Plant, Refusal, TyD};
 
-/// A variance (the Reference, "Subtyping and Variance").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Variance {
-    /// Covariant: `F<Sub>` is a subtype of `F<Super>`.
-    Co,
-    /// Contravariant: `F<Super>` is a subtype of `F<Sub>`.
-    Contra,
-    /// Invariant: no subtyping.
-    In,
-}
-
-impl Variance {
-    /// The variance of a position whose parent is at `self` and which is at `inner` within its
-    /// parent: the product (the module's COMPOSITION).
-    pub const fn then(self, inner: Variance) -> Variance {
-        match (self, inner) {
-            (Variance::In, _) | (_, Variance::In) => Variance::In,
-            (Variance::Co, v) => v,
-            (Variance::Contra, Variance::Co) => Variance::Contra,
-            (Variance::Contra, Variance::Contra) => Variance::Co,
-        }
-    }
-}
+/// A variance (the Reference, "Subtyping and Variance"): its one home is blaze-borrow (rule 30),
+/// the call rule's; the module's COMPOSITION is its `then`.
+pub use blaze_borrow::Variance;
 
 /// One step of the walk: a type at a variance, or a position of its own.
 #[derive(Clone, Copy)]
@@ -73,12 +58,20 @@ enum Step {
     Pos(Variance),
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
+impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R> {
     /// The variance of each origin position of `t` ([`Lower::npos_d`]'s count, in its layout
     /// order: a reference's own position before its referent's, an ADT's lifetimes before each
     /// argument's positions, a tuple's elements in order), relative to the whole value at
     /// covariant. Under `Plant::NoVariance`: the top reference `Co`, every other `In`.
+    ///
+    /// In the rule's grain (grain.rs): [`Lower::variances_by_positions`] under the positions,
+    /// [`Lower::variances_by_slots`] under the one rule.
     pub(crate) fn position_variances(&self, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
+        <R::Grain as crate::grain::Grain>::variances(self, t, out, e)
+    }
+
+    /// [`Lower::position_variances`] in the positions' grain (the old paths', unchanged).
+    pub(crate) fn variances_by_positions(&self, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
         out.clear();
         if self.plant == Plant::NoVariance {
             let n = self.npos_d(t, e)?;
@@ -149,6 +142,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         }
                         given.get(j).copied().unwrap_or(Variance::In)
                     };
+                    // An unknown variance taken `In` where the path to it is not already
+                    // invariant, over a parameter that holds a position: stricter than Rust's
+                    // whenever the true variance is not `In`, so noted (the coarse rule). The
+                    // ladder files lifetimes only today (D190 item 2).
+                    let unknown = |j: usize| !(af.is_box && j >= lifetimes) && given.get(j).is_none();
+                    if v != Variance::In {
+                        let mut noted = lifetimes > 0 && (0..lifetimes).any(unknown);
+                        for (j, &x) in args.iter().enumerate() {
+                            if noted {
+                                break;
+                            }
+                            noted = unknown(lifetimes + j) && self.npos(x, e)? > 0;
+                        }
+                        if noted {
+                            self.coarse_step(Form::Unified { why: crate::Unified::VarianceUnknown { adt: k } }, e);
+                        }
+                    }
                     for (j, &x) in args.iter().enumerate().rev() {
                         todo.push(Step::Ty(x, v.then(of(lifetimes + j))));
                     }
@@ -207,6 +217,100 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         Ok(true)
     }
 
+    /// [`Lower::position_variances`] in the slot grain (grain.rs): each region slot of `t` in
+    /// pre-order (a node's own, then each child's), its variance the product along its path
+    /// ([`Variance::then`]) of blaze-borrow's ONE rule (`rule_variance`, read through
+    /// [`BodyTypes`]): a reference's own slot covariant, its referent as its mutability says; a
+    /// trait object's own slot (its object lifetime) covariant and its predicates' invariant;
+    /// an ADT by its declared variances (`Box` covariant, one_call.rs `FactsArity`; not filed:
+    /// invariant, noted `Unified::VarianceUnknown` where the path is not invariant already and
+    /// the parameter holds a slot, as the positions note it); a fn pointer's inputs
+    /// contravariant, its output covariant; an opaque type's, an alias's, a fn item's and a
+    /// body type's slots invariant. Under `Plant::NoVariance`: the top reference `Co`, every
+    /// other `In`, as the positions'.
+    pub(crate) fn variances_by_slots(&self, t: TyD, out: &mut Vec<Variance, A>, e: ExprId) -> Result<(), Refusal> {
+        use blaze_borrow::{Columns, Pos, RegionTypes, Variances};
+        out.clear();
+        let n = self.npos_d(t, e)?;
+        if self.plant == Plant::NoVariance {
+            let top_ref = t.wrap.is_some() || matches!(self.node(t.ty, e)?, PNode::Ref(..));
+            for k in 0..n {
+                out.push(if k == 0 && top_ref { Variance::Co } else { Variance::In });
+            }
+            return Ok(());
+        }
+        let mut bodies: Vec<(PTy, SlotCount), A> = Vec::new_in(self.alloc.clone());
+        self.body_slots(t.ty, &mut bodies, e)?;
+        let facts: &'b F = self.facts;
+        let arity = FactsArity { facts };
+        let types = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
+        let mut todo: Vec<Step, A> = Vec::new_in(self.alloc.clone());
+        match t.wrap {
+            Some(m) => {
+                todo.push(Step::Ty(t.ty, under_ref(m)));
+                todo.push(Step::Pos(Variance::Co));
+            }
+            None => todo.push(Step::Ty(t.ty, Variance::Co)),
+        }
+        let mut steps = 0u32;
+        // Children are pushed last first, so they pop in pre-order.
+        while let Some(step) = todo.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            let (t, v) = match step {
+                Step::Pos(v) => {
+                    out.push(v);
+                    continue;
+                }
+                Step::Ty(t, v) => (t, v),
+            };
+            let own = match types.own(t) {
+                Ok(own) => own,
+                Err(u) => return self.uncounted(u, e),
+            };
+            let kids = match types.kids(t) {
+                Ok(kids) => kids,
+                Err(u) => return self.uncounted(u, e),
+            };
+            let var = |at: Pos| -> Result<Variance, Refusal> {
+                match types.variance(t, at) {
+                    Ok(x) => Ok(v.then(x)),
+                    Err(u) => self.uncounted(u, e),
+                }
+            };
+            if let PNode::Adt(k, _) = self.node(t, e)?
+                && v != Variance::In
+            {
+                let given = arity.of(k);
+                let unknown = |j: usize| given.and_then(|g| g.get(j)).is_none();
+                let mut noted = (0..own.len()).any(unknown);
+                for j in 0..kids.len() {
+                    if noted {
+                        break;
+                    }
+                    let Some(c) = kids.get(j) else { return self.refuse(Form::Malformed, e) };
+                    noted = unknown(own.len() + j as usize) && types.count(c).is_ok_and(|c| c.get() > 0);
+                }
+                if noted {
+                    self.coarse_step(Form::Unified { why: crate::Unified::VarianceUnknown { adt: k } }, e);
+                }
+            }
+            for j in (0..kids.len()).rev() {
+                let Some(c) = kids.get(j) else { return self.refuse(Form::Malformed, e) };
+                todo.push(Step::Ty(c, var(Pos::Kid(j))?));
+            }
+            for j in (0..own.get()).rev() {
+                todo.push(Step::Pos(var(Pos::Own(j))?));
+            }
+        }
+        if out.len() as u32 != n {
+            return self.refuse(Form::Malformed, e);
+        }
+        Ok(())
+    }
+
     /// [`Lower::position_variances`] of `t` for a place of `n` positions; when `n` is not
     /// `t`'s count (an inexact place, whose positions are its base's), every one `In`: the
     /// sound answer for positions whose meaning is not known.
@@ -217,6 +321,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         out.clear();
         for _ in 0..n {
             out.push(Variance::In);
+        }
+        // Every position both ways where the type's own may be one way: noted (the coarse rule).
+        if n > 0 {
+            self.coarse_step(Form::Unified { why: crate::Unified::VarianceInexact }, e);
         }
         Ok(())
     }

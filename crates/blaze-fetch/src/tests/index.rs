@@ -3,10 +3,12 @@
 //!
 //! The simulation draws a few crates (some the registry has not, one asked twice in another
 //! case, one asked by every `-`/`_` spelling) and a fate for each request (a reset or a 503 on
-//! the first tries, below the retry bound), runs the machine cold over an empty cache, then warm
-//! over the cache the cold run wrote. Its oracles: every read goes out before the first request
-//! ("a read after a request"); a cold run asks once per file, plus one per failure it was
-//! dealt ("asked again"); a fetched file's record opens, is its file's, keeps the answer's
+//! some files' one try), runs the machine cold over an empty cache, then as the next command
+//! over the cache the cold run wrote, then warm over the cache both wrote. Its oracles: every
+//! read goes out before the first request ("a read after a request"); a cold run asks once per
+//! file, its failure or not ("asked again": one try, D172), and a file dealt a failure ends
+//! failed ("a failure stood"); the next run fetches every file the cold run failed ("owed");
+//! a fetched file's record opens, is its file's, keeps the answer's
 //! `ETag` and holds every line in version order ("wrong record"); a crate the registry has not
 //! ends absent ("absent"); a warm run downloads nothing ("bytes fetched on a warm run"), parses
 //! nothing and writes nothing ("rewritten on a warm run"); every run ends ("hang"). The planted
@@ -24,7 +26,7 @@ use crate::index::request::{
 };
 use crate::index::{
     AnswerKind, Bad, ConfigRefused, DepKind, Field, FileEnd, Index, IndexAsk, IndexEffect, IndexLimits, IndexPlant,
-    IndexReply, IndexView, NameRefused, QueryKind, RegistryKey, Status, Update, Validator, parse_in,
+    IndexReply, IndexView, IndexWhy, NameRefused, QueryKind, RegistryKey, Status, Update, Validator, parse_in,
 };
 use crate::{Limits, NetFailure};
 
@@ -237,7 +239,7 @@ struct Run {
 }
 
 /// Drives `index` against `origin` and `cache` (records by index path) to its end, dealing
-/// `faults` (failures per path still to come) to the first tries.
+/// `faults` (failures per path still to come) to the first asks.
 fn drive(
     tape: &Tape,
     index: &mut Index<'_>,
@@ -295,7 +297,7 @@ fn drive(
                         IndexReply::Body { status: 200, etag: Some(etag.as_str()), last_modified: None, bytes: body.as_bytes() }
                     }
                 };
-                index.answered(ask, now, reply);
+                index.answered(ask, reply);
             }
             None if index.is_done() => return Ok(run),
             None => match index.next_deadline() {
@@ -351,7 +353,7 @@ fn case_inner(tape: &Tape) -> Result<(), Broke> {
     let mut cache = BTreeMap::new();
     let mut faults = BTreeMap::new();
     for path in origin.keys() {
-        faults.insert(path.clone(), tape.below(3, "faults") as u32);
+        faults.insert(path.clone(), u32::from(tape.one_in(3, "fault")));
     }
     let dealt = faults.clone();
     let mut cold = Index::new(CRATES_IO_INDEX, &asks, Update::Check, Limits::REAL, IndexLimits::REAL, alloc())
@@ -359,12 +361,15 @@ fn case_inner(tape: &Tape) -> Result<(), Broke> {
     let run = drive(tape, &mut cold, &origin, &mut cache, &mut faults)?;
     for file in 0..cold.files() {
         let path = cold.path(file);
-        let wanted = 1 + dealt.get(path).copied().unwrap_or(0);
+        // One try (D172): a file is asked once, its fault or not.
         let (asked, _) = run.asked.get(path).copied().unwrap_or((0, 0));
-        if asked != wanted {
-            return Err(Broke::Oracle(format!("asked again: {path} asked {asked} times, not {wanted}")));
+        if asked != 1 {
+            return Err(Broke::Oracle(format!("asked again: {path} asked {asked} times, not 1")));
         }
+        let faulted = dealt.get(path).copied().unwrap_or(0) > 0;
         match (cold.end(file), origin.get(path)) {
+            (FileEnd::Failed(IndexWhy::Net { .. } | IndexWhy::Status { .. }), Some(_)) if faulted => {}
+            (end, _) if faulted => return Err(Broke::Oracle(format!("a failure stood: {path} dealt one ended {end:?}"))),
             (FileEnd::Absent, None) => {}
             (end, None) => return Err(Broke::Oracle(format!("absent: {path} ended {end:?}"))),
             (FileEnd::Fetched, Some((body, etag))) => {
@@ -394,8 +399,21 @@ fn case_inner(tape: &Tape) -> Result<(), Broke> {
         }
     }
 
-    // Warm: the same asks over the cache the cold run wrote.
+    // The next command: the same asks over the cache the cold run wrote, the network well. A
+    // file the cold run failed has no record, so it is asked for again and fetched (owed, not
+    // stood). The files that stood are the warm run's to judge, below.
     let mut none = BTreeMap::new();
+    let mut next = Index::new(CRATES_IO_INDEX, &asks, Update::Check, Limits::REAL, IndexLimits::REAL, alloc())
+        .map_err(|e| Broke::Oracle(shown(&e)))?;
+    drive(tape, &mut next, &origin, &mut cache, &mut none)?;
+    for file in 0..next.files() {
+        let path = next.path(file);
+        if dealt.get(path).copied().unwrap_or(0) > 0 && *next.end(file) != FileEnd::Fetched {
+            return Err(Broke::Oracle(format!("owed: {path} failed cold and ended {:?} on the next run", next.end(file))));
+        }
+    }
+
+    // Warm: the same asks over the cache the two runs wrote.
     let mut warm = Index::new(CRATES_IO_INDEX, &asks, Update::Check, Limits::REAL, IndexLimits::REAL, alloc())
         .map_err(|e| Broke::Oracle(shown(&e)))?;
     let run = drive(tape, &mut warm, &origin, &mut cache, &mut none)?;

@@ -331,7 +331,8 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                             roots.extend_from_slice(tys.list(args).unwrap_or(&[]));
                             roots.push(term);
                         }
-                        blaze_typeck::PClause::Const { .. } => {}
+                        blaze_typeck::PClause::Const { .. } | blaze_typeck::PClause::RegionOutlives { .. } => {}
+                        blaze_typeck::PClause::TypeOutlives { ty, .. } => roots.push(ty),
                     }
                 }
                 s
@@ -520,7 +521,7 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
                     | Why::PatternType(_, r)
                     | Why::ConstPath(_, r)
                     | Why::NeedConst(_, r) => text.get(r.start as usize..r.end as usize),
-                    Why::Need(_) => None,
+                    Why::Need(_) | Why::Regions(_) => None,
                 };
                 out.push_str(&format!("WORK LIST (one failure): the head of {}: {why:?}, at `{}`\n", shown(names, crate_names, k), at.unwrap_or("?")));
                 // The probe for a name that names nothing: the same text from the item's module,

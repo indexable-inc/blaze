@@ -48,6 +48,9 @@ use core::{num::NonZeroU32, ptr, time::Duration};
 use blaze_core::wait::{Clock, Deadline};
 #[cfg(not(blaze_check))]
 use blaze_core::wait::{Waited, wait_shared, wake_shared};
+use blaze_sys::Fd;
+use blaze_sys::posix::io::{MapFlags, Prot, mmap, munmap, write};
+use blaze_sys::posix::signal::exit_now;
 
 use crate::sys::SysError;
 
@@ -306,20 +309,9 @@ impl Waiters {
         let len = Waiters::bytes(count);
         // SAFETY: an anonymous private mapping of `len` bytes, at an address the kernel picks;
         // nothing else is named or changed.
-        let at = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if at == libc::MAP_FAILED {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Err(SysError { call: "mmap (the stub waiters' rows)", errno, at: 0, len });
-        }
+        let at = unsafe { mmap(None, len, Prot::READ | Prot::WRITE, MapFlags::PRIVATE | MapFlags::ANONYMOUS, None, 0) }
+            .map_err(|error| SysError { call: "mmap (the stub waiters' rows)", errno: i32::from(error.raw()), at: 0, len })?
+            .as_ptr();
         let rows = at.cast::<Row>();
         // The cells follow the rows: `count * size_of::<Row>()` is a multiple of 64 (a row's
         // alignment), so the cells' start is aligned for a `Cell` (at most 8).
@@ -486,19 +478,19 @@ impl Waiters {
 impl Drop for Waiters {
     fn drop(&mut self) {
         let count = self.rows.len();
-        let at = self.rows.as_ptr().cast_mut();
+        let at = ptr::NonNull::from(self.rows).cast::<Row>();
         for index in 0..count {
             // SAFETY: the rows and cells `reserve` wrote, each dropped once, here, with no
             // reference to them left (they are lent only through `&self`, and this is `&mut`).
             unsafe {
-                ptr::drop_in_place(at.add(index));
+                ptr::drop_in_place(at.as_ptr().add(index));
                 ptr::drop_in_place(self.ring.cells.as_ptr().cast_mut().add(index));
             }
         }
         // SAFETY: the one mapping `reserve` made, of `bytes(count)` bytes at the rows' start;
         // nothing refers into it any more. Its failure leaves the pages mapped, which only
         // holds memory: there is nothing else to undo.
-        unsafe { libc::munmap(at.cast(), Waiters::bytes(count)) };
+        let _ = unsafe { munmap(at.cast(), Waiters::bytes(count)) };
     }
 }
 
@@ -538,8 +530,7 @@ pub fn say_no_code(slot: u32, why: &str) {
 /// Ends the process after the control thread said why a slot has no code ([`say_no_code`]):
 /// the waiter's end on [`Answer::Refused`] or [`Answer::Lost`]. `_exit`, as a handler may.
 pub fn stop_said() -> ! {
-    // SAFETY: the process's end; `_exit` is async-signal-safe and runs nothing of the program.
-    unsafe { libc::_exit(STOPPED) }
+    exit_now(STOPPED)
 }
 
 /// A line of text built on the stack, for a stop from a stub: no allocation, no lock, no
@@ -588,16 +579,13 @@ impl Line {
     pub(crate) fn stop(&self) -> ! {
         let mut done = 0;
         while done < self.len {
-            // SAFETY: a write of this line's own live bytes to descriptor 2.
-            let wrote = unsafe { libc::write(2, self.bytes[done..self.len].as_ptr().cast(), self.len - done) };
             // A failed write is not tried again: the process ends either way.
-            if wrote <= 0 {
-                break;
+            match write(Fd::STDERR, &self.bytes[done..self.len]) {
+                Ok(0) | Err(_) => break,
+                Ok(wrote) => done += wrote,
             }
-            done += wrote as usize;
         }
-        // SAFETY: the process's end; `_exit` is async-signal-safe.
-        unsafe { libc::_exit(STOPPED) }
+        exit_now(STOPPED)
     }
 }
 

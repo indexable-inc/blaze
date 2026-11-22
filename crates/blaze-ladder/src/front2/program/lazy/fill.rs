@@ -22,10 +22,28 @@ pub(super) struct Lowerings {
     refork: Option<PortableTys<'static>>,
 }
 
+/// Where a body's checked columns come from in [`LazyProgram::check_one_key_by`]: chosen by the
+/// typing seam's type (run/make_one.rs `Typing`: `SecondCheck` checks here, `FromRecord` reads
+/// the check's record), each instantiation one arm.
+pub(super) enum Typer<'r> {
+    /// The body checked here (`check_body`): today's second check.
+    Check,
+    /// The body's columns read from the check's record, never checked here; a gap is a typed
+    /// refusal naming the body ([`LazyRefusal::Typed`]).
+    Record(&'r mut dyn super::typed::TypedRecords),
+}
+
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// The seam's `check_one` (module docs, step 1). A declaration with no body answers
     /// `Ok(None)`. A key the records search cannot find gives [`LazyRefusal::NotFound`].
     pub(super) fn check_one_key(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, LazyRefusal> {
+        self.check_one_key_by(key, Typer::Check)
+    }
+
+    /// [`Self::check_one_key`] with the body's checked columns from `typer`: lowered here as
+    /// always (the build reads the run's lowering), then checked here or read from the check's
+    /// record, then tabled the same way. The record arm never calls `check_body`.
+    pub(super) fn check_one_key_by(&mut self, key: ItemKey, typer: Typer<'_>) -> Result<Option<(usize, Checked<'static>)>, LazyRefusal> {
         if let Some(&i) = self.rows.by_key.get(&key)
             && self.rows.checked[i as usize]
         {
@@ -47,7 +65,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 // A free fn can reach lowering before its head has been made. Its declaration
                 // decides whether the missing body is expected.
                 if !self.store.fns.contains_key(&key) {
-                    self.make_want(want, key)?;
+                    self.make_want(want, key, "check_one_key_by (a body-less fn's head)")?;
                 }
                 if self.store.fns.get(&key).is_some_and(|head| !head.has_body) {
                     return Ok(None);
@@ -56,26 +74,55 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             }
             Err(error) => return Err(LazyRefusal::Lower { function, error }),
         };
-        let checked = {
-            let view = made.lowered.view();
-            let spell = Spelling::of(&view).map_err(|_| LazyRefusal::Spell { function: function.clone() })?;
-            let scope = made.scope(&spell);
-            let mut r = self.records(true);
-            check_body(&mut r, &made, &scope)
-        }
-        .map_err(|error| self.check_refusal(&function, error))?;
-        self.counts.checked += 1;
+        let checked = match typer {
+            Typer::Check => {
+                let view = made.lowered.view();
+                let spell = Spelling::of(&view).map_err(|_| LazyRefusal::Spell { function: function.clone() })?;
+                let scope = made.scope(&spell);
+                let checked = {
+                    let mut r = self.records(true);
+                    check_body(&mut r, &made, &scope)
+                };
+                let checked = checked.map_err(|error| self.check_refusal(&function, error))?;
+                self.counts.checked += 1;
+                checked
+            }
+            // Read, not checked: `counts.checked` stays as it is (a run from records checks no
+            // body, and the count says so).
+            Typer::Record(records) => {
+                let checked = records.typed(key).map_err(|gap| LazyRefusal::Typed { function: function.clone(), gap })?;
+                self.file_read_check(key, want, &made, &checked, &function)?;
+                checked
+            }
+        };
         let i = self.row(key, false)?;
         self.rows.checked[i] = true;
+        // THE ONE RULE for what a body's columns name (both arms): every item they name is
+        // filed and its head made HERE, from the columns, never left to the check's side
+        // effects. A check files what it asks as it goes (an impl's head files its members,
+        // keys.rs `Keys::member`; an ADT's head its ctors); a body read from its record was
+        // not checked here, so nothing did (d106 `a_run_from_typed_records_..`, "async
+        // rung": `main`'s callee, a member of an impl no other body here had asked, had no row
+        // path). Over a checked body each step finds its item already filed and does nothing.
+        // The ADT heads first: a callee that is a ctor is filed by its ADT's head.
+        self.adt_rows(&checked)?;
+        // Each fn the body names as a value: filed (lazy/locate.rs), so `bind_internal` and
+        // the walk's `check_one` of it read a key the map knows.
+        for &def in checked.expr_defs.column::<1>() {
+            if let tc::Def::Fn(k) = def {
+                self.locate(k)?;
+            }
+        }
         // Each fn the body calls: its head row (the build reads a call's ABI and signature
         // from the item the call names). A trait's fn called by its trait's path is tabled as
         // declared, as make_from tables it.
         for &callee in checked.callees.column::<1>() {
-            let of_trait = matches!(self.front.keys.origin(callee), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !self.store.impls.contains_key(container));
-            self.row(callee, of_trait)?;
+            self.callee_row(callee)?;
         }
         self.async_rows(&made)?;
         self.fmt_rows(&made, key, &function)?;
+        // Again after the callees' and async items' heads: their types name ADTs too (the
+        // rounds over the store's table pick them up; nothing missing is nothing made).
         self.adt_rows(&checked)?;
         self.body_consts(&checked)?;
         self.body_statics(&checked, &function)?;
@@ -155,33 +202,63 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             return Ok((LowerTarget::Free(lib), want));
         }
         match self.front.keys.origin(key) {
-            Some(Origin::Member { container, kind: MemberKind::Fn, .. }) => {
-                let container = *container;
-                let Some(c) = self.front.keys.library_in(self.front.names, container) else {
-                    return Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("its container {:032x} is filed with no library key", container.0).into_boxed_str() });
+            // A fn or an associated constant with a body (a body owner, reach/initializers.rs:
+            // its closures are built at its row): its head by THE CHECK'S OWN RULE, heads/
+            // member_fn.rs `member_head_want` (what body.rs asks for a member it names): an
+            // impl's fn its own `MemberFn` (the impl's head first), an impl's constant the
+            // impl's head, a trait's fn or constant its trait's members. Never `Store::need`
+            // of the container, which asks an impl for a type's or trait's head (`Want::Head`)
+            // and is refused "is an impl" (heads.rs `step`'s last arm).
+            Some(Origin::Member { container, kind: kind @ (MemberKind::Fn | MemberKind::Const), .. }) => {
+                let (container, kind) = (*container, *kind);
+                let Some(want) = crate::front2::heads::member_head_want(self.front.names, &self.front.keys, key) else {
+                    return Err(LazyRefusal::NotFound {
+                        key,
+                        krate: self.refused_shown(key),
+                        searched: format!("a {kind:?} member of {:032x}, which is filed with no library key or is no trait or impl (heads/member_fn.rs `member_head_want`)", container.0).into_boxed_str(),
+                    });
                 };
-                let want = if self.store.impls.contains_key(&container) { Want::MemberFn(c, key) } else { Want::Members(c) };
                 Ok((LowerTarget::Member(key), want))
-            }
-            // An associated constant with a body is a body owner (reach/initializers.rs, the
-            // body-owner rule): its closures are built at its row. Its head is filed with its
-            // container's (heads.rs: an impl's constants with the impl's head, a trait's with
-            // its members), as a fn head with no inputs; consts.rs `check_as` lowers it so too.
-            Some(Origin::Member { container, kind: MemberKind::Const, .. }) => {
-                let container = *container;
-                let Some(c) = self.front.keys.library_in(self.front.names, container) else {
-                    return Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("its container {:032x} is filed with no library key", container.0).into_boxed_str() });
-                };
-                Ok((LowerTarget::Member(key), self.store.need(c)))
             }
             Some(Origin::Member { kind, .. }) => Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("it is a member of kind {kind:?}, not a fn with a body").into_boxed_str() }),
             Some(Origin::Item(_)) | None => Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: Box::from("the key map filed it with no library key") }),
         }
     }
 
+    /// A body's checked columns READ from its record, filed in the store as a clean check of
+    /// it files them (front2 body_reads.rs `check_body_keyed` and `check_body_filed_as`, after
+    /// `check_rounds`), so a later question about the body's coroutines or closures has the
+    /// same answer whichever arm made the columns (the module doc of lazy/typed.rs, "Body-local
+    /// items"):
+    ///
+    /// - its async blocks' and coroutines' rows and its opaques' hidden types: front2
+    ///   opaque_auto.rs `file` into `Store::hidden`, the world's answer to
+    ///   `Question::Coroutine(owner, n)` (world_items.rs `coroutine_once`) and to an opaque's
+    ///   auto traits. It makes the exact interiors from the body and its witnesses
+    ///   (exact_interior.rs), as on the check side, and reads the owner's head, made first.
+    /// - its closures' kinds, signatures and captures: foreign_closures.rs `ClosureRows::file`
+    ///   into `Store::closures`, the answer to `Question::Closure(owner, n)`.
+    ///
+    /// Not filed: the read list (`Store::reads`): a record's body is not checked here, it
+    /// has no read list of this run, and nothing a run makes reads one.
+    fn file_read_check(&mut self, key: ItemKey, want: Want, made: &crate::front2::body::Body<'_>, checked: &Checked<'_>, function: &str) -> Result<(), LazyRefusal> {
+        if !self.store.fns.contains_key(&key) {
+            self.make_want(want, key, "file_read_check (the coroutine owner's head)")?;
+        }
+        let filed = {
+            let mut r = self.records(true);
+            crate::front2::opaque_auto::file(&mut r, made, checked)
+        };
+        filed.map_err(|error| self.check_refusal(function, error))?;
+        let store = &mut self.store;
+        store.closures.file(&made.typeck.view(tc::PTys::EMPTY), checked, &mut store.tys);
+        Ok(())
+    }
+
     /// `want` made, each constant its head names evaluated as met (at most `MOST_ADT_LENS`),
-    /// as make_from's ADT rounds do.
-    fn make_want(&mut self, want: Want, item: ItemKey) -> Result<(), LazyRefusal> {
+    /// as make_from's ADT rounds do. `asker` names the step of this file that asked (rule
+    /// 19): a refusal says who asked which want for which item.
+    fn make_want(&mut self, want: Want, item: ItemKey, asker: &'static str) -> Result<(), LazyRefusal> {
         let mut lens = 0;
         loop {
             let names = self.front.names;
@@ -190,21 +267,44 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     lens += 1;
                     let mut r = self.records(true);
                     if let Err(e) = eval_len(&mut r, c) {
-                        return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("the constant {c:x} its head names: {e:?}").into_boxed_str() });
+                        return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("{asker} asked {want:?}: the constant {c:x} its head names: {e:?}").into_boxed_str() });
                     }
                 }
-                Err(e) => return Err(LazyRefusal::Head { item: self.refused_shown(item), why: crate::front2::item_shown::head_error_shown(names, &e).into_boxed_str() }),
+                Err(e) => {
+                    let shown = crate::front2::item_shown::head_error_shown(names, &e);
+                    return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("{asker} (lazy/fill.rs) asked {want:?}: {shown}").into_boxed_str() });
+                }
                 Ok(()) => return Ok(()),
             }
         }
     }
 
+    /// The row of `callee`, a fn a checked body calls: filed and its head made first (the
+    /// container's head for a member: an impl's lands in `store.impls`), so whether it is a
+    /// trait's fn called as declared is read from what is made, not from what a check of the
+    /// caller happened to make before. A ctor's head is its ADT's (`adt_rows`, run before).
+    fn callee_row(&mut self, callee: ItemKey) -> Result<usize, LazyRefusal> {
+        if let Some(&i) = self.rows.by_key.get(&callee) {
+            return Ok(i as usize);
+        }
+        self.locate(callee)?;
+        if !self.store.fns.contains_key(&callee) && !self.store.ctors.contains_key(&callee) {
+            let (_, want) = self.target_of(callee)?;
+            self.make_want(want, callee, "callee_row")?;
+        }
+        let of_trait = matches!(self.front.keys.origin(callee), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !self.store.impls.contains_key(container));
+        self.row(callee, of_trait)
+    }
+
     /// Fn `key`'s row, made once: its head facts as `program/tabled.rs` `row` reads them, with
-    /// no body (a body is `check_one`'s). Returns its index.
+    /// no body (a body is `check_one`'s). Returns its index. A key the map does not know yet
+    /// is filed first (lazy/locate.rs), as `target_of` files it: its row path is read from
+    /// the key map.
     fn row(&mut self, key: ItemKey, of_trait: bool) -> Result<usize, LazyRefusal> {
         if let Some(&i) = self.rows.by_key.get(&key) {
             return Ok(i as usize);
         }
+        self.locate(key)?;
         let row_path = crate::front2::row_path::RowPath::of(self.front.names, &self.front.keys, &self.store, key)
             .map_err(|no| LazyRefusal::Row { function: no.item.boxed(), refusal: Box::new(Front2Refusal::NoRowPath(no)) })?;
         // `path` is for messages; the item's identifier, data, is `row_path.ident()` (rule 30).
@@ -221,13 +321,14 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         }
         if !self.store.fns.contains_key(&key) {
             let (_, want) = self.target_of(key)?;
-            self.make_want(want, key)?;
+            self.make_want(want, key, "row")?;
         }
         let Some(head) = self.store.fns.get(&key) else {
             return Err(refuse(Front2Refusal::NoHead { function: Box::from(path.as_str()) }));
         };
         let (lib, text, in_container, has_body) = (head.lib, head.text, head.container.is_some(), head.has_body);
-        let symbols = symbols_of(self.front.names, lib, text, &path).map_err(&refuse)?;
+        let values_at = crate::front2::links::values_key(self.front.names, &self.store, lib);
+        let symbols = symbols_of(self.front.names, lib, values_at, text, &path).map_err(&refuse)?;
         let (at, foreign) = self.placed_of(key, lib, &path)?;
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));
@@ -249,7 +350,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             && !self.store.fns.contains_key(&default)
         {
             let (_, want) = self.target_of(default)?;
-            self.make_want(want, default)?;
+            self.make_want(want, default, "row (an allocator declaration's bound fn)")?;
         }
         let (kind, symbol) = if let Some(bound) = bound {
             bound
@@ -491,7 +592,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
 
     /// The ADT `k` (library item `lib`) made and filed under its key, or refused by name.
     fn adt_row(&mut self, lib: LibKey, k: ItemKey) -> Result<(), LazyRefusal> {
-        self.make_want(Want::Adt(lib), k).map_err(|e| match e {
+        self.make_want(Want::Adt(lib), k, "adt_row").map_err(|e| match e {
             LazyRefusal::Head { item, why } => LazyRefusal::Adt { adt: item, why },
             other => other,
         })?;
@@ -531,15 +632,25 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             if self.store.fns.contains_key(&k) {
                 continue;
             }
-            // A trait's fn is a library-keyed member (by_origin.rs `kind_of_lib`): its head is
-            // made with its trait's members (`Store::need` of the owner).
-            let want = match self.front.names.member_owner(lib) {
-                Some((owner, _)) => self.store.need(owner),
-                None => self.store.need(lib),
-            };
-            // No head filed under `k` after this is refused where it is needed, by name (the
-            // build's `NoAbi`: "the build's `Adts` gave no ABI for it").
-            self.make_want(want, k)?;
+            // The lang item's whole record by the one rule (by_origin.rs `item_want` of
+            // `kind_of_lib`): a library-keyed member's is its OWNER's, a trait's members or an
+            // impl's head (the ladder's `into_future` is the blanket impl's fn,
+            // `<impl<F: Future> IntoFuture for F>::into_future`); a free fn's its own. Never
+            // `Store::need` of the owner: that asks an impl for a type's head and was refused
+            // "is an impl" (the async rung, d106 `a_run_from_typed_records_..`).
+            let names = self.front.names;
+            let want = crate::front2::by_origin::kind_of_lib(names, lib)
+                .and_then(|kind| crate::front2::by_origin::item_want(names, kind))
+                .map_err(|e| LazyRefusal::Head { item: self.refused_shown(k), why: format!("async_rows: the lang item `{name}`: {e}").into_boxed_str() })?;
+            self.make_want(want, k, "async_rows (a lang fn's container)")?;
+            // An impl's fn: its own signature, now that its impl's head filed it (heads/
+            // member_fn.rs `member_fn_want`, the check's rule). No head filed under `k` after
+            // this is refused where it is needed, by name (the build's `NoAbi`).
+            if !self.store.fns.contains_key(&k)
+                && let Some(own) = crate::front2::heads::member_fn_want(names, &self.front.keys, k)
+            {
+                self.make_want(own, k, "async_rows (a lang fn of an impl)")?;
+            }
         }
         // Each one's row, as a callee's: the build resolves the call it makes by the fn's row
         // (`fn_index`), a trait's fn tabled as declared, as `check_one_key` tables a callee.
@@ -608,7 +719,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             crate::front2::statics::static_values(&mut r, core::iter::once(checked))
         };
         if let Some((k, why)) = refused.into_iter().next() {
-            let static_ = self.refused_shown(k);
+            let static_ = self.static_shown(k);
             return Err(LazyRefusal::Row { function: Box::from(function), refusal: Box::new(Front2Refusal::Static { static_, why }) });
         }
         let crate::front2::statics::Statics { values, kinds } = made;
@@ -625,23 +736,28 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
-    /// Static `item` as a refusal names it (its path, or its key).
+    /// Static `item` as a refusal names it (front2 static_shown.rs, the one home, as the eager
+    /// program.rs `made_statics` names it): a module-level static's path; one declared in a
+    /// body (a static a macro writes in a block: tracing's `callsite2!`) by its written head and
+    /// the item whose body declares it, never "an item the names source holds no path for".
     pub fn static_shown(&self, item: ItemKey) -> Box<str> {
-        self.refused_shown(item)
+        crate::front2::static_shown::static_shown_in(self.front.names, &self.front.keys, &self.store, item).into_boxed_str()
     }
 
-    /// Static `item`'s value and kind, for its run record (code_records.rs `statics`): the one
-    /// this program made when a body named it, or evaluated now, alone (statics.rs
-    /// `one_static`; the statics its value points at are the walk's own rows, each asked by
-    /// its record, never here). A refusal names the static.
-    pub fn static_value(&mut self, item: ItemKey) -> Result<(&blaze_build::data::DataRecord<Global>, blaze_build::StaticItem), LazyRefusal> {
-        if self.statics.kind(item).is_none() {
+    /// Make static `item`'s value and kind available for its run record (code_records.rs
+    /// `statics`): the one this program made when a body named it, or evaluated now, alone
+    /// (statics.rs `one_static`; the statics its value points at are the walk's own rows, each
+    /// asked by its record, never here). A refusal names the static.
+    pub fn make_static_value(&mut self, item: ItemKey) -> Result<blaze_build::StaticItem, LazyRefusal> {
+        if let Some(kind) = self.statics.kind(item) {
+            Ok(kind)
+        } else {
             let made = {
                 let mut r = self.records(true);
                 crate::front2::statics::one_static(&mut r, item)
             };
             let (record, kind) = made.map_err(|why| {
-                let static_ = self.refused_shown(item);
+                let static_ = self.static_shown(item);
                 LazyRefusal::Row { function: static_.clone(), refusal: Box::new(Front2Refusal::Static { static_, why }) }
             })?;
             if let Err(at) = self.statics.values.binary_search_by_key(&item, |(x, _)| *x) {
@@ -650,10 +766,16 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             if let Err(at) = self.statics.kinds.binary_search_by_key(&item, |(x, _)| *x) {
                 self.statics.kinds.insert(at, (item, kind));
             }
+            Ok(kind)
         }
-        let kind = self.statics.kind(item).ok_or(LazyRefusal::NoStatic { item })?;
+    }
+
+    /// Static `item`'s value after [`Self::make_static_value`] has made it available.
+    /// This read-only half keeps the value borrow separate from the mutable evaluation above, so
+    /// a caller can resolve the function instances named by the value while it builds the entry.
+    pub fn static_value(&self, item: ItemKey) -> Result<&crate::seam::SeamData, LazyRefusal> {
         let at = self.statics.values.binary_search_by_key(&item, |(x, _)| *x).map_err(|_| LazyRefusal::NoStatic { item })?;
-        Ok((&self.statics.values[at].1, kind))
+        Ok(&self.statics.values[at].1)
     }
 
     /// The object table of each `dyn` principal `checked`'s types or the heads' table name

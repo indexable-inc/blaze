@@ -93,6 +93,9 @@ pub enum EntryForm {
     /// bstd's hosted entry `extern "C" fn(table: *const HostTable) -> i32`: the child builds
     /// the host table (lane H's launcher piece).
     Hosted,
+    /// A compile-time program's entry (D175): C `main`'s form, called with the compile-time
+    /// host's arguments, its C names bound through blaze-comptime-sys's table.
+    Comptime,
 }
 
 impl EntryForm {
@@ -102,6 +105,7 @@ impl EntryForm {
             EntryForm::Unit => "unit",
             EntryForm::CMain => "c-main",
             EntryForm::Hosted => "hosted",
+            EntryForm::Comptime => "comptime",
         }
     }
 }
@@ -486,12 +490,12 @@ fn make_shim_entry<'a>(shim: &Shim<'_>, isa: Isa, alloc: Alloc<'a>) -> Result<AV
     let lang_start = b.reference(RefKind::Func, LANG_START_PLACE);
     let main = b.reference(RefKind::Func, MAIN_PLACE);
     blaze_build::start::c_main_shim(&mut b, lang_start, main).map_err(CodeRecordError::Shim)?;
-    let func = b.finish_checked().map_err(|error| CodeRecordError::Shim(blaze_build::BuildError::Lir(error)))?;
+    let func = b.finish_verified().map_err(|error| CodeRecordError::Shim(blaze_build::BuildError::Lir(error)))?;
     // By place: `lang_start::<T>` at 0, `main` at 1.
     let funcs = [Callee::Symbol(shim.lang_start.symbol), Callee::Symbol(shim.main.symbol)];
     let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
     declared.push(Declared { tabled: shim.lang_start.tabled, name: shim.lang_start.name });
     declared.push(Declared { tabled: shim.main.tabled, name: shim.main.name });
-    make_entry(&func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
+    make_entry(func.verified(), &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, isa, alloc)
 }

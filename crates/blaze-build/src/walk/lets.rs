@@ -267,7 +267,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             i -= 1;
             match self.scope_pats[i] {
                 h @ (Held::Rest { .. } | Held::Moved { .. }) => self.drop_held(h, false)?,
-                Held::Pat(_) => {}
+                // An owned environment field is the body's outermost scope's, made before any
+                // statement: never this statement's entry.
+                Held::Pat(_) | Held::EnvPlace(_) => {}
                 Held::Temp { .. } => {
                     return Err(unsupported(init, "an extended temporary in a `let`-`else` initializer"));
                 }

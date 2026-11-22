@@ -157,7 +157,7 @@ class SyncTest(unittest.TestCase):
         after = {"lib.rs": "fn a() {}\n\nfn b() { blaze() }\n"}
         for name in solver_sync.CRATES:
             crate(root, name, after, {"0001-blaze": patch_between(base, after)})
-        write(root, {"harness/toolchain": "nightly-2026-10-28\n"})
+        write(root, {"pins/toolchain": "nightly-2026-10-28\n"})
         moved = {"lib.rs": "fn new() {}\n\n" + base["lib.rs"]}
         files = {name: moved for name in solver_sync.CRATES}
         if broken:
@@ -208,7 +208,7 @@ class SyncTest(unittest.TestCase):
     def test_the_nightly_must_be_the_pinned_one(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            write(root, {"harness/toolchain": "nightly-2026-10-27\n"})
+            write(root, {"pins/toolchain": "nightly-2026-10-27\n"})
             with self.assertRaisesRegex(solver_sync.Failed, "pins nightly-2026-10-27, not nightly-2026-10-28"):
                 solver_sync.sync(solver_sync.Input(nightly="nightly-2026-10-28", root=str(root)))
 

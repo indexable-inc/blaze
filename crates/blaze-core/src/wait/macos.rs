@@ -1,6 +1,8 @@
 //! macOS's waits: `kevent` for the kqueue driver, `mach_wait_until` for a sleep, and the
 //! wait on an address (`os_sync_wait_on_address_with_deadline`) for a [`super::Parker`].
 
+use blaze_sys::{Errno, Timespec, posix::thread};
+use core::ffi::c_int;
 use std::{
     convert::Infallible,
     ffi::c_void,
@@ -12,7 +14,7 @@ use std::{
 
 use crate::atomic::AtomicU32;
 
-use super::{Clock, Deadline, Once, WaitError, Waited, parking::Futex, unix::timespec, until};
+use super::{Clock, Deadline, Once, WaitError, Waited, parking::Futex, until};
 
 /// `struct mach_timebase_info`: mach time units are `numer / denom` nanoseconds.
 #[repr(C)]
@@ -29,12 +31,12 @@ struct Timebase {
 // drops it fails CI naming it.
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
-    fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
-    fn mach_wait_until(deadline: u64) -> libc::c_int;
+    fn mach_timebase_info(info: *mut Timebase) -> c_int;
+    fn mach_wait_until(deadline: u64) -> c_int;
 }
 
 /// `KERN_ABORTED`: the wait was interrupted.
-const KERN_ABORTED: libc::c_int = 14;
+const KERN_ABORTED: c_int = 14;
 
 // The wait on an address and its wake (rule macos-private-apis; docs/macos.md, "Parking"):
 // libplatform's `os_sync_wait_on_address_with_deadline`, `os_sync_wait_on_address` and
@@ -105,19 +107,21 @@ fn timebase() -> io::Result<(u32, u32)> {
 /// ways: they give the start as wall-clock microseconds, which a wall-clock step moves and
 /// which would have to be set against a second clock read at another instant.
 pub(crate) fn process_age() -> io::Result<Duration> {
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let mut info = std::mem::MaybeUninit::<thread::rusage_info_v4>::zeroed();
     // SAFETY: the flavour says the buffer is a `rusage_info_v4`, which `info` is, for the
     // kernel to fill; this process's own id needs no right.
     let got = unsafe {
-        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast())
+        thread::proc_pid_rusage(thread::getpid(), thread::RUSAGE_INFO_V4, info.as_mut_ptr().cast())
     };
     if got != 0 {
         let error = io::Error::last_os_error();
         // alloc: an error.
         return Err(io::Error::new(error.kind(), format!("proc_pid_rusage(RUSAGE_INFO_V4): {error}")));
     }
+    // sys/resource.h: ri_proc_start_abstime is word 8 following the UUID in rusage_info_v4.
+    const START_ABSTIME: usize = 8;
     // SAFETY: filled by the call that returned 0.
-    let began = unsafe { info.assume_init() }.ri_proc_start_abstime;
+    let began = unsafe { info.assume_init() }.words[START_ABSTIME];
     let (numer, denom) = timebase()?;
     // SAFETY: a read of Mach's clock.
     let now = unsafe { mach_absolute_time() };
@@ -219,12 +223,12 @@ fn address_once(word: &AtomicU32, expected: u32, left: Option<Duration>) -> io::
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::EINTR) => Ok(Once::Interrupted),
-        Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+        Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+        Some(code) if code == i32::from(Errno::TimedOut.raw()) => Ok(Once::TimedOut),
         // The header's two transient returns under low memory (the kernel could not allocate,
         // or could not page the word in to read it; the word is a live reference, so `EFAULT`
         // is never a bad address): waited for again.
-        Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
+        Some(code) if code == i32::from(Errno::NoMem.raw()) || code == i32::from(Errno::Fault.raw()) => Ok(Once::Spurious),
         // alloc: an error.
         _ => Err(io::Error::new(
             error.kind(),
@@ -274,10 +278,10 @@ pub(crate) fn wait_shared(
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EINTR) => Ok(Once::Interrupted),
-            Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+            Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+            Some(code) if code == i32::from(Errno::TimedOut.raw()) => Ok(Once::TimedOut),
             // The header's transient returns under low memory: waited for again.
-            Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
+            Some(code) if code == i32::from(Errno::NoMem.raw()) || code == i32::from(Errno::Fault.raw()) => Ok(Once::Spurious),
             // alloc: an error.
             _ => Err(io::Error::new(
                 error.kind(),
@@ -318,10 +322,10 @@ pub(crate) unsafe fn kevent(
 ) -> Result<Waited<usize>, WaitError> {
     let too_many =
         || WaitError::io(what, io::Error::new(io::ErrorKind::InvalidInput, "too many kevents"));
-    let mut nchanges = libc::c_int::try_from(nchanges).map_err(|_| too_many())?;
-    let room = libc::c_int::try_from(room).map_err(|_| too_many())?;
+    let mut nchanges = c_int::try_from(nchanges).map_err(|_| too_many())?;
+    let room = c_int::try_from(room).map_err(|_| too_many())?;
     until(what, clock, deadline, |left| {
-        let timeout = left.map(timespec);
+        let timeout = left.map(Timespec::from_duration);
         let timeout = timeout.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: the caller's changes and room, and a timeout that outlives the call.
         let got = unsafe { kevent_once(kq, changes, nchanges, events, room, timeout) };
@@ -334,7 +338,7 @@ pub(crate) unsafe fn kevent(
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EINTR) => Ok(Once::Interrupted),
+            Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
             _ => Err(error),
         }
     })
@@ -352,13 +356,14 @@ pub(crate) unsafe fn kevent(
 unsafe fn kevent_once(
     kq: RawFd,
     changes: *const libc::kevent,
-    nchanges: libc::c_int,
+    nchanges: c_int,
     events: *mut libc::kevent,
-    room: libc::c_int,
-    timeout: *const libc::timespec,
-) -> libc::c_int {
-    // SAFETY: the caller's pointers, valid for the counts given.
-    unsafe { libc::kevent(kq, changes, nchanges, events, room, timeout) }
+    room: c_int,
+    timeout: *const Timespec,
+) -> c_int {
+    // SAFETY: the caller's pointers are valid for the counts given. Timespec has the
+    // macOS timespec layout (two signed 64-bit fields in C order), including its alignment.
+    unsafe { libc::kevent(kq, changes, nchanges, events, room, timeout.cast()) }
 }
 
 /// Sleeps until `deadline` on `clock`. Each call is a `mach_wait_until` to what is left on
@@ -387,6 +392,7 @@ pub fn sleep_until(
 
 #[cfg(test)]
 mod tests {
+    use blaze_sys::{Errno, posix::thread::{RTLD_DEFAULT, symbol}};
     use std::{
         sync::{Arc, atomic::Ordering},
         time::Duration,
@@ -404,10 +410,10 @@ mod tests {
     #[test]
     fn the_mach_calls_of_a_sleep_resolve() {
         for name in [c"mach_wait_until", c"mach_absolute_time", c"mach_timebase_info"] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            // SAFETY: RTLD_DEFAULT is the loader's handle for every loaded image.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
             assert!(
-                !found.is_null(),
+                found.is_some(),
                 "{name:?} is gone from this macOS: wait::sleep_until needs it"
             );
         }
@@ -432,10 +438,10 @@ mod tests {
             c"os_sync_wait_on_address",
             c"os_sync_wake_by_address_any",
         ] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            // SAFETY: RTLD_DEFAULT is the loader's handle for every loaded image.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
             assert!(
-                !found.is_null(),
+                found.is_some(),
                 "{name:?} is gone from this macOS (it is there from 14.4): wait::Parker \
                  needs it, and there is no other park"
             );
@@ -447,10 +453,10 @@ mod tests {
     #[test]
     fn the_shared_address_waits_resolve() {
         for name in [c"os_sync_wait_on_address_with_deadline", c"os_sync_wake_by_address_all"] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            // SAFETY: RTLD_DEFAULT is the loader's handle for every loaded image.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
             assert!(
-                !found.is_null(),
+                found.is_some(),
                 "{name:?} is gone from this macOS (it is there from 14.4): wait::wait_shared \
                  needs it, and there is no other cross-process wait"
             );
@@ -467,7 +473,7 @@ mod tests {
         let error = std::io::Error::last_os_error();
         assert_eq!(
             error.raw_os_error(),
-            Some(libc::ENOENT),
+            Some(i32::from(Errno::NoEnt.raw())),
             "a wake of a word nobody waits on fails with something other than ENOENT: {error}"
         );
         false

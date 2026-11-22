@@ -17,18 +17,32 @@
 //!
 //! Neither blocks: a waiting receiver is a channel's (`blaze_core::chan` in blaze-core,
 //! which wraps these). A crate of its own, below blaze-core, so that every crate that hands a
-//! value between threads (the allocator's, the launcher's runtime) has the same two. The
-//! memory of both is `Global`'s, named at each allocation.
+//! value between threads (the allocator's, the launcher's runtime) has the same two.
+//!
+//! Memory: each queue is generic over its allocator `A` with no default (D170 C1), named at
+//! construction (`ArrayQueue::new_in(cap, alloc)`, `SegQueue::new_in(alloc)`); a queue shared
+//! between threads takes an allocator that is `Send + Sync` (a `SharedAlloc`). The forms that
+//! took the global heap (`ArrayQueue::new`, `SegQueue::new`, `SegQueue::default`) stay for the
+//! callers of this wave only, on the `Global` instantiation, and are deprecated: their
+//! replacement is the `new_in` form. Their callers (2026-11-20): blaze-core chan.rs, cgroup.rs
+//! and host.rs; blaze-graph par.rs, arena.rs and pump/table.rs; blaze-memo image.rs;
+//! blaze-profile facts.rs; blaze-launch-rt table.rs; ix-prof alloc.rs and explore/server.rs.
 //!
 //! Under `--cfg blaze_check` the atomics are the model checker's and every slot's value is a
 //! tracked place, so a race on it, or a read of it after its block is freed, is a finding;
-//! `tests.rs` checks each queue and plants a bug in each the model must catch.
+//! `tests.rs` checks each queue and plants a bug in each the model must catch, through the
+//! [`QueuePlant`] seam (`blaze_own::planted`, D165): shipped code passes `NoPlant`.
 
 #![no_std]
 #![feature(allocator_api)]
 // `#![blaze::trust]` below names blaze's tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+// No IO, no clock, no environment: atomics and the allocator it is handed (the spins are
+// blaze-spin's one bounded spin).
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
 #![blaze::trust(
     unsafe,
     reason = "lock-free queues: a slot's value is written by the one push its stamp or state gives the slot to and read by the one pop it then gives it to, and a block is freed by the one reader the slots' bits name last"
@@ -38,6 +52,7 @@
     reason = "a slot's value is reached through its stamp or state: each `unsafe` says what orders it"
 )]
 
+// The deprecated `Global` forms alone (the module doc); nothing else names `alloc`.
 extern crate alloc;
 #[cfg(any(test, blaze_check))]
 extern crate std;
@@ -69,17 +84,20 @@ impl<T> core::ops::Deref for Padded<T> {
     }
 }
 
-/// A safeguard a model test removes, to see the model catch the removal. Production code
-/// passes [`Plant::None`], a constant the branch folds away.
+/// The safeguards a model test removes, to see the model catch the removal: the plants of the
+/// [`Planted`](blaze_own::planted::Planted) seam the queues' inner forms take. Shipped code
+/// passes `NoPlant`, whose `has` is `false`, so every plant branch folds away.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Plant {
+pub(crate) enum QueuePlant {
+    /// The queues as they are.
+    #[cfg_attr(not(test), expect(dead_code, reason = "named by the model tests alone"))]
     None,
     /// [`ArrayQueue`]'s push publishes its slot with a relaxed store: a pop reads the value
     /// with nothing ordering the write before it (a race).
-    #[cfg(test)]
     RelaxedPublish,
     /// [`SegQueue`]'s pop of a block's last slot frees the block without asking its other
     /// readers: one still reading its value reads freed memory.
-    #[cfg(test)]
     FreeUnasked,
 }
+
+impl blaze_own::planted::Plants for QueuePlant {}

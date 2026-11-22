@@ -115,7 +115,7 @@ mod tests {
     use blaze_fetch::plan::Unit;
     use blaze_git_fetch::Oid;
     use blaze_manifest::lock::LockId;
-    use blaze_own::{Alloc, String};
+    use blaze_own::String;
     use blaze_text::Writes as _;
 
     use super::{Made, index, made, name, unit_of};
@@ -161,7 +161,7 @@ mod tests {
             other => panic!("failed, not {other:?}"),
         };
         assert!(failed(Why::Mismatch { want: [1; 32], got: [3; 32] }));
-        assert!(!failed(Why::Net { failure: NetFailure::Reset, tries: 4 }));
-        assert!(!failed(Why::Status { status: 503, tries: 4 }));
+        assert!(!failed(Why::Net { failure: NetFailure::Reset }));
+        assert!(!failed(Why::Status { status: 503 }));
     }
 }

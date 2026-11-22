@@ -49,6 +49,7 @@ use super::{Held, NO_EXPR, Owner, Repr, Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
 mod boxes;
+pub(super) mod env_places;
 mod field_scrutinee;
 mod struct_update;
 
@@ -202,21 +203,24 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if !self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))? {
             return Ok(None);
         }
-        // A place behind a pointer, matched in place: no one here owns it, nothing is held,
-        // and a by-value binding of a part that needs drop is refused (`move_out`).
-        if self.scrutinee_in_place(scrutinee)? {
-            return Ok(None);
-        }
         if self.adjust_rows(scrutinee).is_empty()
             && let Some(x) = self.local_of(scrutinee)?
         {
             self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g, field: None });
             return Ok(None);
         }
-        // A field of an owned local (`match self.failed`, `self: Held`): matched in place, its
-        // parts moved by the local's field flags (field_scrutinee.rs).
+        // A part of an owned local by fields and `Box` contents (`match self.failed`, `self:
+        // Held`; `if let Type::Path(mut ty) = *group.elem`): matched in place, its parts moved
+        // by the local's field flags (field_scrutinee.rs). Asked before `scrutinee_in_place`,
+        // which takes every dereference as behind a pointer: a box's contents are the box
+        // owner's ([expr.move.movable-place]).
         if let Some(x) = self.owned_field_scrutinee(scrutinee)? {
             self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g, field: Some(scrutinee) });
+            return Ok(None);
+        }
+        // A place behind a pointer, matched in place: no one here owns it, nothing is held,
+        // and a by-value binding of a part that needs drop is refused (`move_out`).
+        if self.scrutinee_in_place(scrutinee)? {
             return Ok(None);
         }
         let (V::Place(p, off), Repr::Agg(_)) = (s, srepr) else {
@@ -801,9 +805,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// match does not allocate a temporary location; however, a by-value binding may copy or
     /// move from the memory location"; so nothing moves but what a by-value binding binds,
     /// and such a binding of a part that needs drop is refused by name (`move_out` finds no
-    /// owner: E0507 behind a reference; out of a `Box`, not built). A local and a temporary are
-    /// not this (their own owners: field flags, `own_scrutinee`); neither is a scrutinee with
-    /// an adjustment (a coercion makes a new value).
+    /// owner: E0507 behind a reference). A local and a temporary are not this (their own
+    /// owners: field flags, `own_scrutinee`); neither is a scrutinee with an adjustment (a
+    /// coercion makes a new value). A `Box`'s contents reached from an owned local answer
+    /// `true` here too, but are owned by that local (field_scrutinee.rs `field_chain_local`,
+    /// which `own_scrutinee` and walk/matches.rs `tested_place` ask first).
     pub(super) fn scrutinee_in_place(&mut self, scrutinee: ExprId) -> Result<bool, BuildError> {
         if !self.adjust_rows(scrutinee).is_empty() {
             return Ok(false);

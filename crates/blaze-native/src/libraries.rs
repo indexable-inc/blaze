@@ -1,16 +1,28 @@
-//! The library table (NATIVE.md 3.5, M5): which shared library of the platform a name in
-//! `#[link(name = ..)]` or a build script's `rustc-link-lib` stands for, as the install name the
-//! native image's load command carries. Sans-IO: a fixed table, no search of the host, so the
-//! image's bytes depend on no machine's library contents (rule 25).
+//! The libraries a program's image loads (NATIVE.md 3.5, M5): which shared library of the
+//! platform a name in `#[link(name = ..)]` or a build script's `rustc-link-lib` stands for, as
+//! the install name the native image's load command carries. Sans-IO: nothing here reads a file.
 //!
 //! The Rust Reference (items/external-blocks.html): "dylib — Indicates a dynamic library. This is
 //! the default if kind is not specified."; "framework — Indicates a macOS framework. This is only
-//! valid for macOS targets." A name outside the table is refused by name (`Unknown`), never
-//! guessed as `lib<name>.dylib`; `stdc++` on Linux waits on the owner (`Undecided`).
+//! valid for macOS targets."
+//!
+//! - macOS: the install name is a FACT OF THE SDK, never built from the name. ld64 links `-l<N>`
+//!   against `<SDK>/usr/lib/lib<N>.tbd` and `-framework <N>` against
+//!   `<SDK>/System/Library/Frameworks/<N>.framework/<N>.tbd`, and writes the stub's
+//!   `install-name` into the load command ([`crate::tbd`]). [`source`] names that stub
+//!   ([`StubPath`]); the caller reads it through the file system it was handed and
+//!   [`StubPath::linked`] takes the install name from its bytes. A library whose stub is missing
+//!   (a header-only framework such as `Kernel`) is refused by that read, naming the path asked.
+//! - Linux: glibc's sonames, a fixed table; a name outside it is refused by name (`Unknown`),
+//!   never guessed as `lib<name>.so`; `stdc++` waits on the owner (`Undecided`).
+//!
+//! A [`Linked`] is the proof a library was resolved: the resolver and the writers take it, and
+//! nothing checks a library's name twice (rule 74).
 
-use blaze_own::AString;
+use core::fmt;
 
 use crate::Platform;
+use crate::tbd::{self, TbdError};
 
 /// How a library is named: a plain shared library (`dylib`, the default kind) or a macOS
 /// framework.
@@ -28,46 +40,23 @@ pub struct Library<'a> {
     pub name: &'a str,
 }
 
-/// Why a library name has no install name.
+/// Why a library name has no install name on the platform.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LibraryError<'a> {
-    /// The name is not in the platform's table (NATIVE.md 3.5): nothing guesses a path for it.
+    /// Linux: the name is not in glibc's table (NATIVE.md 3.5): nothing guesses a soname for it.
     Unknown { platform: Platform, kind: LibraryKind, name: &'a str },
+    /// macOS: the name cannot be one file's name in the SDK (empty, or with a `/`, a `\` or a
+    /// NUL in it): the stub's path would name another file.
+    Name { kind: LibraryKind, name: &'a str },
     /// `framework=` on a platform other than macOS (Reference: "only valid for macOS targets").
     FrameworkOffMac { name: &'a str },
     /// A name whose library is an open question of the owner's, quoted in `question`.
     Undecided { name: &'a str, question: &'static str },
 }
 
-/// The install name of a library: a fixed path (macOS) or soname (Linux), or a framework's path
-/// built from its name: `/System/Library/Frameworks/<N>.framework/Versions/A/<N>`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InstallName {
-    Fixed(&'static str),
-    Framework,
-}
-
 /// The question `stdc++` on Linux waits on (NATIVE.md 3.5).
 const STDCXX_QUESTION: &str = "toolchain-c.md ships a static libc++, but rocksdb asks for `stdc++`: link the system \
      libstdc++.so.6, or map `stdc++` to the shipped libc++? (owner's decision, NATIVE.md 3.5)";
-
-/// macOS's table: the name as written, then the install name (NATIVE.md 3.5).
-const MACOS: &[(&str, &str)] = &[
-    ("c", "/usr/lib/libSystem.B.dylib"),
-    ("m", "/usr/lib/libSystem.B.dylib"),
-    ("pthread", "/usr/lib/libSystem.B.dylib"),
-    ("dl", "/usr/lib/libSystem.B.dylib"),
-    ("System", "/usr/lib/libSystem.B.dylib"),
-    ("info", "/usr/lib/libSystem.B.dylib"),
-    ("c++", "/usr/lib/libc++.1.dylib"),
-    ("c++abi", "/usr/lib/libc++abi.dylib"),
-    ("objc", "/usr/lib/libobjc.A.dylib"),
-    ("iconv", "/usr/lib/libiconv.2.dylib"),
-    ("z", "/usr/lib/libz.1.dylib"),
-    ("resolv", "/usr/lib/libresolv.9.dylib"),
-    ("bz2", "/usr/lib/libbz2.1.0.dylib"),
-    ("sqlite3", "/usr/lib/libsqlite3.dylib"),
-];
 
 /// Linux's (glibc's) table: the name as written, then the soname (NATIVE.md 3.5).
 const LINUX: &[(&str, &str)] = &[
@@ -80,49 +69,136 @@ const LINUX: &[(&str, &str)] = &[
     ("gcc_s", "libgcc_s.so.1"),
 ];
 
-const FRAMEWORKS: &str = "/System/Library/Frameworks/";
-const FRAMEWORK_VERSION: &str = ".framework/Versions/A/";
+/// Where the SDK keeps the stubs of `-l<N>`, relative to its root.
+const MACOS_LIBRARIES: &str = "usr/lib";
+/// Where the SDK keeps the stubs of `-framework <N>`, relative to its root.
+const MACOS_FRAMEWORKS: &str = "System/Library/Frameworks";
 
-/// A framework's name is `[A-Za-z0-9_]+` (NATIVE.md 3.5); anything else (a `/`, a `..`, an
-/// empty name) would make the path name another file.
-fn framework_name_ok(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+/// A library resolved to the install name its load command carries (a soname on Linux): made
+/// only by [`source`] (Linux) or [`StubPath::linked`] (macOS, from the SDK's stub).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Linked<'a> {
+    library: Library<'a>,
+    platform: Platform,
+    install: &'a str,
+}
+
+impl<'a> Linked<'a> {
+    /// The library as declared.
+    pub fn library(&self) -> Library<'a> {
+        self.library
+    }
+
+    /// The platform it was resolved for.
+    pub fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    /// The install name (macOS) or soname (Linux): the text a load command holds.
+    pub fn install(&self) -> &'a str {
+        self.install
+    }
+}
+
+/// Where a library's install name comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source<'a> {
+    /// Known without a read (Linux's sonames).
+    Linked(Linked<'a>),
+    /// Stated by the SDK's stub at this path (macOS).
+    Stub(StubPath<'a>),
+}
+
+impl<'a> Source<'a> {
+    /// The library as declared.
+    pub fn library(&self) -> Library<'a> {
+        match self {
+            Source::Linked(linked) => linked.library,
+            Source::Stub(at) => at.library,
+        }
+    }
+}
+
+/// The SDK's text stub of one library: [`StubPath::folder`] under the SDK's root, then
+/// [`StubPath::file`] (its `Display`) under that folder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StubPath<'a> {
+    library: Library<'a>,
+}
+
+impl<'a> StubPath<'a> {
+    /// The library whose stub this is.
+    pub fn library(&self) -> Library<'a> {
+        self.library
+    }
+
+    /// The folder under the SDK's root: `usr/lib` or `System/Library/Frameworks`.
+    pub fn folder(&self) -> &'static str {
+        match self.library.kind {
+            LibraryKind::Dylib => MACOS_LIBRARIES,
+            LibraryKind::Framework => MACOS_FRAMEWORKS,
+        }
+    }
+
+    /// The stub's path under [`StubPath::folder`]: `lib<N>.tbd` or `<N>.framework/<N>.tbd`.
+    pub fn file(&self) -> StubFile<'a> {
+        StubFile(self.library)
+    }
+
+    /// The library linked as the stub `bytes` states (its install name, borrowed from them).
+    pub fn linked(self, bytes: &'a [u8]) -> Result<Linked<'a>, TbdError> {
+        let stub = tbd::read(bytes)?;
+        Ok(Linked { library: self.library, platform: Platform::MacosArm64, install: stub.install_name })
+    }
+}
+
+/// A stub's path under its folder, as text ([`StubPath::file`]).
+#[derive(Clone, Copy)]
+pub struct StubFile<'a>(Library<'a>);
+
+impl fmt::Display for StubFile<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.0.name;
+        match self.0.kind {
+            LibraryKind::Dylib => write!(f, "lib{name}.tbd"),
+            LibraryKind::Framework => write!(f, "{name}.framework/{name}.tbd"),
+        }
+    }
+}
+
+impl fmt::Display for StubPath<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.folder(), self.file())
+    }
+}
+
+/// A name that can be one file's name: not empty, no `/`, `\` or NUL, not `.` or `..`.
+fn file_name_ok(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 fn find(table: &[(&str, &'static str)], name: &str) -> Option<&'static str> {
     table.iter().find(|(written, _)| *written == name).map(|(_, path)| *path)
 }
 
-/// The install name of `library` on `platform`, or why it has none.
-pub fn install_name(platform: Platform, library: Library<'_>) -> Result<InstallName, LibraryError<'_>> {
-    let unknown = LibraryError::Unknown { platform, kind: library.kind, name: library.name };
+/// Where the install name of `library` on `platform` comes from, or why it has none.
+pub fn source(platform: Platform, library: Library<'_>) -> Result<Source<'_>, LibraryError<'_>> {
     match (platform, library.kind) {
-        (Platform::MacosArm64, LibraryKind::Dylib) => find(MACOS, library.name).map(InstallName::Fixed).ok_or(unknown),
-        (Platform::MacosArm64, LibraryKind::Framework) => {
-            if framework_name_ok(library.name) { Ok(InstallName::Framework) } else { Err(unknown) }
+        (Platform::MacosArm64, kind) => {
+            if !file_name_ok(library.name) {
+                return Err(LibraryError::Name { kind, name: library.name });
+            }
+            Ok(Source::Stub(StubPath { library }))
         }
         (Platform::LinuxArm64, LibraryKind::Framework) => Err(LibraryError::FrameworkOffMac { name: library.name }),
         (Platform::LinuxArm64, LibraryKind::Dylib) => {
             if library.name == "stdc++" {
                 return Err(LibraryError::Undecided { name: library.name, question: STDCXX_QUESTION });
             }
-            find(LINUX, library.name).map(InstallName::Fixed).ok_or(unknown)
+            match find(LINUX, library.name) {
+                Some(soname) => Ok(Source::Linked(Linked { library, platform, install: soname })),
+                None => Err(LibraryError::Unknown { platform, kind: library.kind, name: library.name }),
+            }
         }
     }
-}
-
-/// Appends the install name of `library` on `platform` to `out` (the text a load command holds).
-/// The verbatim error type has no allocation variant, so growth goes through `push_str`, which
-/// takes blaze-own's path for a failed allocation.
-pub fn write_install_name<'a>(platform: Platform, library: Library<'a>, out: &mut AString<'_>) -> Result<(), LibraryError<'a>> {
-    match install_name(platform, library)? {
-        InstallName::Fixed(path) => out.push_str(path),
-        InstallName::Framework => {
-            out.push_str(FRAMEWORKS);
-            out.push_str(library.name);
-            out.push_str(FRAMEWORK_VERSION);
-            out.push_str(library.name);
-        }
-    }
-    Ok(())
 }

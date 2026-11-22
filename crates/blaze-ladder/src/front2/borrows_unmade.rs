@@ -67,6 +67,7 @@ pub enum WhyClass {
     PatternType,
     ConstPath,
     NeedConst,
+    Regions,
 }
 
 fn range_of(r: &Range) -> Option<(u32, u32)> {
@@ -100,6 +101,7 @@ impl HeadClass {
                     Why::PatternType(_, r) => (WhyClass::PatternType, range_of(r)),
                     Why::ConstPath(_, r) => (WhyClass::ConstPath, range_of(r)),
                     Why::NeedConst(_, r) => (WhyClass::NeedConst, range_of(r)),
+                    Why::Regions(_) => (WhyClass::Regions, None),
                 };
                 HeadClass::Item { why, at }
             }

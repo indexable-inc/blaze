@@ -78,6 +78,7 @@ fn kind(routed: &Route<'_>) -> &'static str {
         Route::Fact(Fact::PkgConfig { .. }) => "fact pkg-config",
         Route::Fact(Fact::SwVers { .. }) => "fact sw_vers",
         Route::Fact(Fact::CompilerVersion { .. }) => "fact compiler",
+        Route::Fact(Fact::CcProbe { .. }) => "fact probe",
         Route::Deferred => "deferred",
         Route::Executor => "executor",
         Route::Refused => "refused",
@@ -104,6 +105,10 @@ fn route_order_is_fixed() {
         ("pkg-config", &["--libs", "--cflags", "libusb-1.0"], CMode::Built, true, "fact pkg-config"),
         ("clang", &["--version"], CMode::Deferred, false, "fact compiler"),
         ("clang", &["--version"], CMode::Built, true, "fact compiler"),
+        // cc's probes are the pinned table's in every mode (c_tasks_probe), before deferring.
+        ("cc", &["-E", "/out/1detect_compiler_family.c"], CMode::Deferred, false, "fact probe"),
+        ("cc", &["-E", "/out/1detect_compiler_family.c"], CMode::Built, true, "fact probe"),
+        ("c++", &["-?"], CMode::Built, false, "fact probe"),
         ("cc", &["-c", "x.c"], CMode::Deferred, false, "deferred"),
         ("cc", &["-c", "x.c"], CMode::Deferred, true, "deferred"),
         ("cc", &["-c", "x.c"], CMode::Built, true, "executor"),
@@ -317,4 +322,95 @@ fn recorded_answers_a_second_time_without_the_inner_executor() {
     assert_eq!(calls.load(Ordering::Relaxed), 1, "the inner executor answered once for two spawns of one key");
     assert_eq!(bytes[0], bytes[1], "the record answers with the first answer's bytes");
     let _ = std::fs::remove_dir_all(&store);
+}
+
+// ---- A deferred request's inputs are captured at its spawn (outputs.rs, THE C INPUTS) ----
+//
+// The task side (blaze-build-script c_tasks_tests.rs, `a_source_the_script_*`) holds that
+// each compile reads its state; these hold that the script's record holds each state.
+
+const X_A: &[u8] = b"int x(void) { return 0xA; }\n";
+const X_B: &[u8] = b"int x(void) { return 0xB; }\n";
+
+/// The script writes (or, with `None`, deletes) `name` in `OUT_DIR`, as its `fd_write` and
+/// `path_unlink_file` do: through [`crate::script_sandbox::OutDir::edit`].
+fn put(sandbox: &mut ScriptSandbox, name: &str, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            sandbox.out.edit().insert(name.to_owned(), Some(bytes.to_vec()));
+        }
+        None => {
+            sandbox.out.edit().remove(name);
+        }
+    }
+}
+
+fn defer(sandbox: &mut ScriptSandbox, argv: &[&str]) {
+    if let Err(stop) = sandbox.spawn(&shim(argv, false, &[], None, b"", [2, 2])) {
+        panic!("`{}` stopped: {}", argv.join(" "), stop.0);
+    }
+    assert_eq!(&sandbox.reply[..4], &0i32.to_le_bytes(), "a deferred request answers exit 0");
+}
+
+/// The script's record as script.rs makes it at the run's end: its files, then its requests
+/// and their states (`c_inputs`).
+fn record_of<'a>(sandbox: &ScriptSandbox, alloc: Alloc<'a>) -> blaze_own::AVec<'a, u8> {
+    let mut outputs = blaze_build_script::Outputs::new_in("/out", alloc);
+    for (name, bytes) in sandbox.out_files() {
+        outputs.add_file(name, bytes, blaze_build_script::outputs::FileLimits { bytes: 1 << 20, files: 16 }, alloc).expect("a file of OUT_DIR");
+    }
+    crate::script::c_inputs(sandbox, &mut outputs, alloc);
+    let mut bytes = blaze_own::Vec::new_in(alloc);
+    outputs.encode(&mut bytes);
+    bytes
+}
+
+/// (capture a) aws-lc-sys's `compiler_check`: the script writes `gone.c`, defers its compile,
+/// then deletes it. The record holds the state the compile saw, `gone.c`'s bytes in it, and a
+/// driver lays them (`laid_state`). CONTROL: `OUT_DIR` as the script left it has no `gone.c`.
+#[test]
+fn a_deferred_compile_keeps_a_source_the_script_deleted() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut sandbox = ScriptSandbox::new(script(CMode::Deferred, None, SpawnSetting::off()));
+    put(&mut sandbox, "gone.c", Some(X_A));
+    defer(&mut sandbox, &["cc", "-o", "/out/gone.o", "-c", "/out/gone.c"]);
+    put(&mut sandbox, "gone.c", None);
+    let record = record_of(&sandbox, alloc);
+    let outputs = blaze_build_script::outputs::OutputsRef::open(&record).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(outputs.c_request_states().collect::<Vec<_>>(), [0]);
+    let laid = blaze_build_script::c_tasks::laid_state(&outputs, 0, alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(laid.as_slice(), [("gone.c", Some(X_A))], "the compile's state holds the source as written");
+    assert!(outputs.file("gone.c").is_none(), "CONTROL: the record's OUT_DIR holds no gone.c: reading it at run time finds nothing");
+}
+
+/// (capture b) The script writes `x.c` = A, defers, rewrites `x.c` = B, defers again, then
+/// defers an `ar` with no edit between: three requests, two states (the `ar` takes the second
+/// again, by the edit count), A held by digest and B the record's own final file, kept once.
+/// CONTROL: the record's `OUT_DIR` holds B only: a driver reading it at run time compiles B
+/// for both.
+#[test]
+fn a_deferred_compile_keeps_each_version_of_a_rewritten_source() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut sandbox = ScriptSandbox::new(script(CMode::Deferred, None, SpawnSetting::off()));
+    put(&mut sandbox, "x.c", Some(X_A));
+    defer(&mut sandbox, &["cc", "-o", "/out/x1.o", "-c", "/out/x.c"]);
+    put(&mut sandbox, "x.c", Some(X_B));
+    defer(&mut sandbox, &["cc", "-o", "/out/x2.o", "-c", "/out/x.c"]);
+    defer(&mut sandbox, &["ar", "cqD", "/out/libx.a", "/out/x1.o", "/out/x2.o"]);
+    let record = record_of(&sandbox, alloc);
+    let outputs = blaze_build_script::outputs::OutputsRef::open(&record).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(outputs.c_request_states().collect::<Vec<_>>(), [0, 1, 1]);
+    assert_eq!(outputs.c_state_count(), 2);
+    let snaps = |state| outputs.c_state(state).expect("the state").collect::<Vec<_>>();
+    let a = blaze_build_script::outputs::snap_digest(X_A);
+    assert_eq!(snaps(0), [("x.c", blaze_build_script::outputs::Snap::Held(a))]);
+    assert_eq!(snaps(1), [("x.c", blaze_build_script::outputs::Snap::Final)], "B is the final file, not held twice");
+    let lay = |state| blaze_build_script::c_tasks::laid_state(&outputs, state, alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((lay(0).as_slice(), lay(1).as_slice()), ([("x.c", Some(X_A))].as_slice(), [("x.c", Some(X_B))].as_slice()));
+    assert!(outputs.c_held(&blaze_build_script::outputs::snap_digest(X_B)).is_none(), "B's bytes are only the file's");
+    let last = match outputs.file("x.c") {
+        Some(blaze_build_script::outputs::OutFileRef::Inline(bytes)) => bytes,
+        other => panic!("x.c: {other:?}"),
+    };
+    assert_eq!(last, X_B, "CONTROL: OUT_DIR read at run time is B for both compiles");
 }

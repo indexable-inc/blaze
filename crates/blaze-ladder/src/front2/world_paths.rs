@@ -76,28 +76,12 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         };
         let mut at_module = site.module;
         let mut local_type = None;
-        let ns = if written.len() == 1 { LocalNs::Value } else { LocalNs::Type };
-        let mut found = self.store.locals.find(self.owner, Some(scope.0), first, ns);
-        if found.is_none() && ns == LocalNs::Value {
-            // A one-segment path may be a type's name (a struct expression's or a pattern's
-            // path: an enum, a union, an alias). Only a type of a block's module is taken
-            // here: the name solver at that module then answers for the value namespace too,
-            // so a value of the same name outside the block is still found first.
-            // A module or a crate is never a one-segment value (the Reference, "Paths").
-            found = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|r| r.kind.in_block_module() && !matches!(r.kind, LocalKind::Mod | LocalKind::ExternCrate));
-        }
-        // A glob import of a block around the path (`use E::*;`) gives its first segment
-        // before the items of the blocks outside that block and the module do
-        // (super::glob_uses, where the rules are quoted): the path then stands for `<the
-        // glob's path>::<the name>..`, read where the glob's path is.
-        let glob_ns = if ns == LocalNs::Value { Ns::Value } else { Ns::Type };
-        let via_glob = match super::glob_uses::before(&self.store.locals, &self.resolver(), self.module, self.owner, scope.0, first, glob_ns, found.as_ref(), self.store.tys.alloc()) {
-            Ok(hit) => hit,
+        let (found, via_glob) = match super::scope_table::value_prefix(
+            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, mark, self.store.tys.alloc(),
+        ) {
+            Ok(prefix) => prefix,
             Err(gap) => return self.gap(Gap::Local(gap)),
         };
-        if via_glob.is_some() {
-            found = None;
-        }
         if let Some(row) = found {
             let k = checker_of(row.key);
             let def = match row.kind {
@@ -416,18 +400,9 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             if first == "Self" || self.env.params.iter().any(|(n, _)| *n == Name::of(first)) {
                 return Ok(None);
             }
-            let ns = if texts.len() == 1 { LocalNs::Value } else { LocalNs::Type };
-            let mut found = self.locals.find(self.owner, Some(scope.0), first, ns);
-            if found.is_none() && ns == LocalNs::Value {
-                found = self.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|row| row.kind.in_block_module() && !matches!(row.kind, LocalKind::Mod | LocalKind::ExternCrate));
-            }
-            if found.is_some() {
-                return Ok(None);
-            }
-            // A first segment a block's glob import gives is not the module's reading either
-            // (a refusal there is the world's gap, when it reads the same path).
-            let glob_ns = if ns == LocalNs::Value { Ns::Value } else { Ns::Type };
-            if !matches!(super::glob_uses::before(self.locals, &self.builder.resolver, self.env.module, self.owner, scope.0, first, glob_ns, None, tys.alloc()), Ok(None)) {
+            if !matches!(super::scope_table::value_prefix(
+                &self.builder.resolver, self.locals, self.owner, self.env.module, Some(scope.0), first, texts.len() == 1, view.mark_of_path(p)?, tys.alloc(),
+            ), Ok((None, None))) {
                 return Ok(None);
             }
         }
@@ -440,6 +415,27 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
             let own = written.get(at as usize).copied().unwrap_or(&[]);
             let filled = super::adt_paths::adt_segment_defaults(self.builder.heads, target.key, own, tys, shown, r, out)?;
+            return Ok(filled.then_some(at));
+        }
+        // `FilterChanges::<T>::Logs(x)`, `E::V::<T>`: a variant's path, the enum's arguments
+        // written on the enum's segment or on the variant's (the Reference, "Paths", "Paths in
+        // expressions"; rustc takes them from either, never both: E0109), filled as the
+        // enum's own segment is (super::adt_paths). The enum's segment is the one before the
+        // variant's only where the variant was reached through it; a module's segment there
+        // writes no arguments, so it is never the one taken.
+        if let Kind::Variant { adt, .. } = target.kind {
+            let Some(v_at) = target.consumed.checked_sub(1) else { return Ok(None) };
+            let on = |i: u32| written.get(i as usize).copied().unwrap_or(&[]);
+            let on_enum = v_at.checked_sub(1).filter(|&e| !on(e).is_empty());
+            let on_variant = Some(v_at).filter(|&v| !on(v).is_empty());
+            let at = match (on_enum, on_variant) {
+                (Some(e), None) => e,
+                (None, Some(v)) => v,
+                // Neither (inferred), or both (the language's E0109): as written.
+                _ => return Ok(None),
+            };
+            let Some(&shown) = texts.get(at as usize) else { return Ok(None) };
+            let filled = super::adt_paths::adt_segment_defaults(self.builder.heads, adt, on(at), tys, shown, r, out)?;
             return Ok(filled.then_some(at));
         }
         if !matches!(target.kind, Kind::TypeAlias) {

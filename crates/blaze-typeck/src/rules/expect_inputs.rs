@@ -64,8 +64,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Binds each formal input of a callee (`inputs`, `output`: its instantiated signature) to
     /// the type the call's expected type gives it, before any argument is typed. Nothing is
     /// bound when the call has no expected type, when `output` cannot be the expected type
-    /// (the mismatch is reported once, at the call, by whoever gave the expectation), or for
-    /// an input the expected type does not decide.
+    /// (the mismatch is reported once by whoever gave the expectation), or for an input the
+    /// expected type does not decide.
     pub(crate) fn expected_inputs(
         &mut self,
         expect: Expectation,
@@ -73,7 +73,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         output: Ty,
         args: &[ExprId],
     ) -> Result<(), Stop> {
-        let Some(expected) = expect.only_has_type() else { return Ok(()) };
+        let expected = match expect {
+            Expectation::HasType(t) => t,
+            // A coroutine body carries a sized destination output as a non-reporting rvalue
+            // hint. Use that hint to infer generic inputs while leaving the output equality to
+            // the enclosing coercion's projection obligation. Ordinary unsized rvalue hints are
+            // for the argument only and do not determine a callee's output.
+            Expectation::RvalueLikeUnsized(t) => {
+                let t = self.ty.shallow_resolve(t);
+                if matches!(self.view(t), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_)) {
+                    return Ok(());
+                }
+                t
+            }
+            Expectation::None | Expectation::Castable(_) => return Ok(()),
+        };
         let n = self.ty.list_len(inputs);
         if n == 0 || self.is_ty_var(expected) || self.is_err(expected) || self.is_err(output) {
             return Ok(());

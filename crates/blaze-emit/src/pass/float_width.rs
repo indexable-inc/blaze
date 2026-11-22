@@ -39,7 +39,7 @@ use std::alloc::Allocator;
 use blaze_lir::{Op, Scalar, Ty, Value, View};
 
 use super::{EmitError, Pass, unsupported};
-use crate::enc::{self, Cond, SP, Size, X0, X1, X9, X10, X11, X12};
+use crate::enc::{self, Cond, SP, Size, X0, X1, X9, X10, X11};
 
 /// `v0`: where an `f16` conversion computes.
 const V0: u32 = 0;
@@ -156,13 +156,13 @@ impl<A: Allocator> Pass<'_, '_, A> {
     }
 
     /// `ldr q<v>` (`load`) or `str q<v>` of the 16 bytes at `sp + off` (a cell: a multiple of
-    /// 16); past the scaled immediate's reach through `x12`, as `ld_sp` does.
+    /// 16); past the scaled immediate's reach through [`super::FAR`], as `ld_sp` does.
     fn q_cell(&mut self, load: bool, v: u32, off: u32) {
         let (base, imm) = match off / 16 < 4096 {
             true => (SP, off / 16),
             false => {
-                self.sp_addr(X12, off);
-                (X12, 0)
+                self.sp_addr(super::FAR, off);
+                (super::FAR, 0)
             }
         };
         self.put(match load {

@@ -40,7 +40,7 @@
 //! [`value!`] builds a value from JSON-like syntax (`value!(in alloc; {"a": [1, x, null]})`),
 //! taking the allocator first as everything here does.
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 // Each core module is marked `#![blaze::sans_io]`, not the crate: a tool attribute is an
@@ -48,6 +48,9 @@
 // the crate itself then cannot name by `$crate::` path (the macros module stays unmarked; it
 // holds no code).
 #![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
 
 // First, and textually scoped, so the crate's own modules call its macros by name.
@@ -55,31 +58,23 @@
 mod macros;
 mod map;
 mod path;
+mod plant;
 mod traits;
 #[cfg(feature = "std")]
+#[allow(blaze::std_use, reason = "the `std` feature alone: impls for std's `String`, `Vec` and `PathBuf`")]
 mod std_types;
 mod value;
 mod walk;
 
-// The `std` feature's impls name std's types; tests have std already.
-#[cfg(all(feature = "std", not(test)))]
+// The `std` feature's impls name std's types; the tests' models are std's maps and vectors.
+#[cfg(any(feature = "std", test))]
 extern crate std;
 
 #[cfg(test)]
-mod plant;
-#[cfg(test)]
 mod tests;
 
-/// The planted bug the map's control asks for, compiled away outside tests.
-#[cfg(not(test))]
-mod plant {
-    #[inline(always)]
-    pub(crate) fn replace_on_hit() -> bool {
-        true
-    }
-}
-
 pub use map::{Map, Taken};
+pub use plant::DataPlant;
 pub use path::{At, Cursor, Extra, Fields, Shape, ShapeError, Step, write_step};
 pub use traits::{FromValue, ToValue};
 pub use value::{Int, Kind, Value};

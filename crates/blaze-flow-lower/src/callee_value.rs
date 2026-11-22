@@ -28,7 +28,7 @@ use core::alloc::Allocator;
 
 use crate::{At, Facts, Form, Lower, Plant, Refusal, Val};
 
-impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
+impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// When the callee `vs[0]` is a closure value (or a reference to one, as `call_done` leaves
     /// an `Fn`/`FnMut` callee): relates the value's positions with `dest`'s (the module doc)
     /// and answers `true`; any other callee answers `false`, untouched.
@@ -55,6 +55,30 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         if ci.len < skip {
             return self.refuse(Form::Malformed, e);
         }
+        // THE ONE RULE (D190 item 2(b)): the result's type is the closure signature's output,
+        // whose regions are the signature's own: a binder variable (fresh per call) or a free
+        // region of the signature, which IS a slot of the closure's type (grain.rs: a closure's
+        // slots are its captures' then its signature's). What the body moves from a capture
+        // into its return place reaches the result only through those, and the body's flow
+        // proves nothing from a capture into its return place but what it requires of the
+        // owner (`Facts::closure_requirements`, applied at the closure expression among the
+        // value's slots: lib.rs `closure_value`). So the call relates the arguments and the
+        // result with the signature ([`Self::closure_call_sig`]) and nothing else: no
+        // capture slot is tied to the result (rustc's closure call is `Fn::call` with the
+        // closure type's signature, its captures never named). Only where the bodies are
+        // checked (their requirements given); else the old relation below stands.
+        let facts: &F = self.facts;
+        if <R::Grain as crate::grain::Grain>::SLOTS && facts.closure_bodies_checked() {
+            self.closure_call_sig(t, cp, skip, &vs[1..], dest, e)?;
+            return Ok(true);
+        }
+        // Two or more value positions with any result position, or two result positions with
+        // any of the value's, are made equal to each other: stricter than Rust's (the result's
+        // regions are those the closure's signature names, each one of them): noted.
+        let held = ci.len - skip;
+        if held > 0 && di.len > 0 && held + di.len > 2 {
+            self.coarse_step(Form::Unified { why: crate::Unified::ClosureValueCall }, e);
+        }
         for k in ci.start + skip..ci.start + ci.len {
             for d in di.start..di.start + di.len {
                 let (a, b) = (self.origs[k as usize], self.origs[d as usize]);
@@ -62,6 +86,9 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
                 self.b.subset(b, a);
             }
         }
+        // Each argument and the result with the signature positions they bind (D148:
+        // closure.rs `closure_call_sig`).
+        self.closure_call_sig(t, cp, skip, &vs[1..], dest, e)?;
         Ok(true)
     }
 }

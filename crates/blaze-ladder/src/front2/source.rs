@@ -30,8 +30,9 @@ use core::cell::{Cell, Ref, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{CrateItemKey, ItemKey};
-use blaze_own::{AVec, Alloc};
-use blaze_scope::items_record::{ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
+use blaze_own::{ARc, AVec, Alloc};
+use blaze_scope::attr_values::{RowRefusal, RowValue};
+use blaze_scope::items_record::{CurrentFile, ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
 use blaze_scope::names::{self, PathError, Resolved, Unheld, Why, Written};
 use blaze_scope::names_record::{Decoded, LoadNames, NamesRecord, NamesRecordError, RecordNames};
 use blaze_scope::package_path::PackagePath;
@@ -107,6 +108,9 @@ pub trait NamesSource<'n>: Copy {
     /// The solved names, for a caller of a function not yet switched to a source; `None` over
     /// records (the caller then notes [`NamesSource::gap`] naming itself and refuses).
     fn solved(self) -> Option<&'n Names<'n>>;
+
+    /// The count of signature lowerings made through this source, when the source keeps one.
+    fn head_lowerings(self) -> Option<&'n super::heads::HeadLowerings>;
 
     /// Notes that `question` (about `key`) has no answer from this source. Nothing over
     /// [`Solved`], which answers everything.
@@ -184,6 +188,11 @@ pub trait NamesSource<'n>: Copy {
     /// Questions 7, 8, 9: an item's whole text, its module, its name, its impl header.
     fn text_of(self, key: ItemKey) -> Option<ItemText<'n>>;
 
+    fn signature_text_of(self, key: ItemKey) -> Option<ItemText<'n>> { self.text_of(key) }
+    fn seeded_text_of(self, key: ItemKey) -> Option<ItemText<'n>> { self.text_of(key) }
+    fn read_member_signature(self, _member: ItemKey, _written_by: Option<ItemKey>) {}
+    fn read_member_body(self, _member: ItemKey, _written_by: Option<ItemKey>) {}
+
     /// Question 9: an item's name. Reads no text.
     fn name_of(self, key: ItemKey) -> Option<&'n str>;
 
@@ -220,6 +229,15 @@ pub trait NamesSource<'n>: Copy {
     /// expansion's text is filed through. `Err` names why it cannot be.
     fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped>;
 
+    /// Question 10h: the text the expansion `call` of crate `krate` is written in (a file, or
+    /// another expansion): the call part of its origins (`CallView::text`). What an include in
+    /// a macro-made body is relative to (the Reference, `include!`: the file of the outermost
+    /// call site; front2 body_host.rs `body_file`). `None`: the call's origins are not served
+    /// (over records, the reason in the log).
+    fn call_text(self, krate: usize, call: ItemKey) -> Option<blaze_scope::resolve::At> {
+        self.call_origin(krate, call).ok().map(|origin| origin.view.text)
+    }
+
     /// Question 10e: the text the expansion `call` of crate `krate` made with the mark of each
     /// of its tokens (front2 item_site.rs, token-mark-F1): what an item that call writes resolves
     /// its head's paths by. `Ok(None)`: the text keeps no column by design
@@ -236,6 +254,20 @@ pub trait NamesSource<'n>: Copy {
     /// which its readers ask instead (heads.rs `fn_head`, program/head_abi.rs `placed_fn`); over
     /// records such a key is `None` with a gap naming it in the log.
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>>;
+
+    /// Question 10d: the value of `attr` (`link_name` or `export_name`) on item `key` when it is
+    /// written as a macro call (ring's `#[link_name = concat!(prefix!(), stringify!(f))]`), as
+    /// the item's crate's solve expanded it once at the item (blaze-scope attr_values.rs): over
+    /// the solved names the crate's `values` rows, over records the crate's items record's value
+    /// table (blaze-scope items_record/values.rs), whose rows the `Item` cell's digest covers.
+    /// `Some(Some(answer))`: the row (its string, or its refusal); `Some(None)`: no row (a quoted
+    /// value is read from the item's text, front2 links.rs `symbol_of`, and an item declared in
+    /// a body held for its own solve has none: its call value is refused by name there);
+    /// `None`: not answered (over records the error is in the log).
+    ///
+    /// Required of every source, no default: a wrapper that did not forward it would answer "no
+    /// row" for every item, and every call value would be refused.
+    fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>>;
 
     /// Question 11, the kind: what an item's outline entry is, without its detail's data.
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind>;
@@ -308,6 +340,11 @@ pub trait NamesSource<'n>: Copy {
     /// lists it; one that does not has nothing to list.
     fn impls_read(self, _read: super::tables::recorder::TableRead) {}
 
+    /// Which checker question the reads that follow answer, or that its answer is in
+    /// (blaze-typeck `World::asking`): a source that records its reads tells its recorder
+    /// (front2 tables/recorder.rs `ReadSink::asking`); one that does not has nothing to tell.
+    fn asking(self, _ask: Option<blaze_typeck::Asking>) {}
+
     /// The impl `key` of crate `krate`, written in `module`, with its header's text: for the
     /// one impl a row does not file ([`NamesSource::each_impl_row`]'s reader). `None`: the
     /// text did not read (filed in the log).
@@ -344,6 +381,9 @@ pub trait NamesSource<'n>: Copy {
     /// run path's reach, a census), never for one body.
     fn each_item(self, krate: usize, each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool;
 
+    /// A block's direct binding, before globs. The outer option says whether the scope was read.
+    fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>>;
+
     /// Whether `module` (a module, a block's module or an enum) binds `name` in `ns`: its own
     /// binding, else through its glob edges (`Names::lookup`). Asked for a struct, enum, union
     /// or alias declared in a block of a body ([`super::locals`]).
@@ -351,13 +391,25 @@ pub trait NamesSource<'n>: Copy {
 
     /// The item, module or variant whose key begins with `first` (a checker key is a library
     /// key's first 16 bytes, `keys::checker_of`): the inverse the key map asks where it holds
-    /// no row ([`super::keys::Keys::library_in`]). Over the solved names always `None`: there
-    /// the key map is filled when the front end is made (`Front2::new` files every item,
-    /// variant, module and impl), so a key in no row is no library item's. Over records the
+    /// no row ([`super::keys::Keys::library_in`]). Over the solved names it is the names' own
+    /// index of items by their first 16 bytes (`Names::key_beginning`): the key map there is
+    /// filled when the front end is made (`Front2::new` files every item, variant, module and
+    /// impl), so `library_in` never needs it, but the region walk's declared lifetimes (D155,
+    /// types.rs `declared_lifetimes`) ask it with no key map. Over records the
     /// key map starts empty and this is one search of the key's crate (found by the key's
     /// first eight bytes): its item rows, then its module rows, then its enums' variants. Two
     /// keys of one table that begin alike are a typed error filed, and `None`.
     fn key_beginning(self, first: [u8; 16]) -> Option<ItemKey>;
+
+    /// The lifetime parameters the struct, enum, union, trait, trait alias or type alias `key`
+    /// declares (D155): a fact of its own text, answered from its crate's items record (or,
+    /// over the solved names, from the same text by the same count), in any store, whatever
+    /// heads were made. `None` for a key the names world does not hold or a kind with none.
+    fn declared_lifetimes(self, key: ItemKey) -> Option<u32>;
+
+    /// The own (GAT) lifetime parameters of the associated type `name` (the checker's name,
+    /// its text's hash) of the trait `trait_` (D155), as [`NamesSource::declared_lifetimes`].
+    fn assoc_lifetimes(self, trait_: ItemKey, name: blaze_typeck::Name) -> Option<u32>;
 }
 
 /// What a macro path names ([`NamesSource::macro_at`]).
@@ -379,6 +431,10 @@ pub struct MacroAt<'n> {
 // Solved: each method is the expression front2 wrote, moved.
 
 impl<'n> NamesSource<'n> for &'n Names<'n> {
+    fn head_lowerings(self) -> Option<&'n super::heads::HeadLowerings> {
+        None
+    }
+
     fn solved(self) -> Option<&'n Names<'n>> {
         Some(self)
     }
@@ -437,7 +493,7 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     fn may_write_incoherent(self, krate: usize) -> Option<bool> {
         // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
         // read; a mention anywhere in that text keeps the crate on the wide side.
-        self.crates().get(krate).map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core")))
+        self.crates().get(krate).map(|c| blaze_scope::items_record::root_may_write_incoherent(c))
     }
 
     fn walk(self, module: ItemKey, ns: Namespace, written: Written<'_, &str>) -> Result<Resolved, PathError> {
@@ -531,6 +587,13 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         // it cannot read is not answered (`None`), as over records the record is not written.
         let crate_key = self.crates().get(krate)?.key;
         blaze_scope::items_record::foreign_abi(text, outline, outline.item(item), key, crate_key).ok()
+    }
+
+    fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>> {
+        // The rows the crate's solve made (`CrateNames::values`, sorted by item and attribute):
+        // the very rows its items record's value table is written from.
+        let krate: &'n blaze_scope::resolve::CrateNames<'n> = self.crates().get(Names::crate_of(self, key)?).copied()?;
+        Some(blaze_scope::attr_values::row(&krate.values, key, attr).map(|row| row.answer()))
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
@@ -634,14 +697,35 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         true
     }
 
+    fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>> {
+        let scope = &self.krate(Names::crate_of(self, module)?).done.get(&module)?.scope;
+        Some(scope.get(ns, name).copied())
+    }
+
     fn binds(self, module: ItemKey, ns: Namespace, name: &'n str) -> bool {
         self.lookup(module, ns, name).is_some()
     }
 
-    fn key_beginning(self, _first: [u8; 16]) -> Option<ItemKey> {
-        // `Front2::new` filed every item, variant, module and impl of every crate: a checker
-        // key the key map holds no row for is no library item's.
-        None
+    fn key_beginning(self, first: [u8; 16]) -> Option<ItemKey> {
+        // `Front2::new` filed every item, variant, module and impl of every crate in the key
+        // map, so `Keys::library_in` asks this only for a key it holds no row for; a reader
+        // with no key map (the region walk's declared lifetimes, D155: `types::HeadsArity`)
+        // asks it directly, and the solved names' index of items by their first 16 bytes
+        // answers it (two keys alike refused the names when they were made, rule 21).
+        Names::key_beginning(self, first)
+    }
+
+    fn declared_lifetimes(self, key: ItemKey) -> Option<u32> {
+        // A text that does not count (it does not lex, no keyword) answers none: the region
+        // walk then refuses the count by name (`Unknown::AdtLifetimes`), as over records,
+        // where the record was not written for it (`ItemsRecordError::Generics`).
+        let krate = self.krate(Names::crate_of(self, key)?);
+        blaze_scope::items_record::solved_lifetimes(krate, key).ok()?.map(u32::from)
+    }
+
+    fn assoc_lifetimes(self, trait_: ItemKey, name: blaze_typeck::Name) -> Option<u32> {
+        let krate = self.krate(Names::crate_of(self, trait_)?);
+        blaze_scope::items_record::solved_assoc_lifetimes(krate, trait_, |m| blaze_typeck::Name::of(m) == name).ok()?.map(u32::from)
     }
 }
 
@@ -753,8 +837,24 @@ pub trait Load<'n> {
     /// its digest): the loader joins `path` onto the directory its world placed the crate's
     /// package at (D96).
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str>;
-    /// The text the macro call `call` of the crate expanded to.
-    fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str>;
+    /// What the macro call `call` of the crate expanded to: its text AND its origins, from ONE
+    /// read of the expansion's record ([`LoadedExpansion`]). `None`: no text is kept for the
+    /// call. One method, never a text method beside an origins method: two methods were two
+    /// store reads of one record per marks request (D149 piece I4, F4; rule 77), the second past
+    /// the items memo that had the text already.
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'n>>;
+    /// The current FileItems snapshot. Text-backed sources produce it once per file.
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
+        self.file(krate, path).map(|text| CurrentFile::from_text(index, text, edition, alloc)).transpose()
+    }
+}
+
+/// One read of an expansion's record ([`Load::expansion`]): the text and its origins, both
+/// borrowed where they lie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedExpansion<'n> {
+    /// The text the call expanded to (the items record checks its digest, not the loader).
+    pub text: &'n str,
     /// The origins of that text as the TWO parts they are stored in, never a joined copy: the
     /// call part (where the call stands and the macro's path: an expansion record's crate
     /// directory keeps it) and the origin column (the record's, beside the text), what
@@ -762,21 +862,23 @@ pub trait Load<'n> {
     /// part: the text keeps none. No default (rule 3): every loader says what it serves; `None`
     /// is "this loader holds no origins for the call", which a finding in the text files by name
     /// (front2 expansion_origin.rs `Unmapped::NotServed`), never a quiet nothing.
-    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<(&'n [u8], &'n [u8])>;
-    /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`: what
-    /// an items record row whose file changed is checked against, item by item
-    /// (`blaze_scope::items_record::ItemsRecord::item_now`). This one outlines the file's text
-    /// now; a caller that holds the file's `FileItems` record answers from it instead.
-    fn item(&self, krate: usize, path: PackagePath<'_>, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
-        blaze_scope::items_record::grain::outline_today(self.file(krate, path)?, chain, edition, alloc)
-    }
+    pub origins: Option<(&'n [u8], &'n [u8])>,
 }
 
-/// The loader the two readers hold: the caller's, with "no record kept" filed in the log.
-#[derive(Clone, Copy)]
+/// The origin parts the loader's text reads brought with them, by (crate, call), until
+/// [`NamesSource::text_marks`] takes them: what lets one store read serve an expansion's text
+/// and its marks (F4). Bounded by the expansion rows of the records' items records (each call
+/// is read through the items memo once, `ItemsRecord::whole`'s `seen`), and an entry leaves
+/// when its marks are made, so it holds only texts read and not yet marked.
+type OriginParts<'n> = RefCell<HashMap<(usize, ItemKey), Option<(&'n [u8], &'n [u8])>, Alloc<'n>>>;
+
+/// The loader the two readers hold: the caller's, with "no record kept" filed in the log, and
+/// each expansion read's origin parts kept for its marks ([`OriginParts`]).
+#[derive(Clone)]
 pub struct Loader<'n> {
     load: &'n dyn Load<'n>,
     log: &'n Log<'n>,
+    origins: ARc<'n, OriginParts<'n>>,
 }
 
 impl<'n> LoadNames<'n> for Loader<'n> {
@@ -802,12 +904,17 @@ impl<'n> LoadItems<'n> for Loader<'n> {
         self.load.file(krate, path)
     }
 
+    /// The text, read with its origin parts in one loader read; the parts are kept for the
+    /// call's marks ([`OriginParts`]). Asked once per call per records (the items memo, whose
+    /// borrow is not held across this read).
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str> {
-        self.load.expansion(krate, call)
+        let read = self.load.expansion(krate, call)?;
+        self.origins.borrow_mut().insert((krate, call), read.origins);
+        Some(read.text)
     }
 
-    fn item(&self, krate: usize, path: PackagePath<'_>, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
-        self.load.item(krate, path, chain, edition, alloc)
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, surface: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
+        self.load.file_items(krate, index, path, surface, edition, alloc)
     }
 }
 
@@ -900,9 +1007,18 @@ pub struct Records<'n> {
     paths: RecordNames<'n, Loader<'n>>,
     items: RecordItems<'n, Loader<'n>>,
     keys: &'n [CrateItemKey],
-    /// The caller's loader, for an expansion's text and origins ([`NamesSource::text_marks`]).
+    /// The origin parts the items reader's loader brought with each expansion text it read, the
+    /// same table its [`Loader`] fills: [`NamesSource::text_marks`] takes a call's parts here,
+    /// never by a second read of its record (F4).
+    origin_parts: ARc<'n, OriginParts<'n>>,
+    /// The caller's loader, asked here only by the planted bug [`Records::plant_reread_origins`].
     load: &'n dyn Load<'n>,
+    /// A test's planted bug: [`NamesSource::text_marks`] reads the record again for its origin
+    /// parts ([`Records::plant_reread_origins`]).
+    reread_origins: Cell<bool>,
     log: &'n Log<'n>,
+    /// Signature lowerings made through this records reader, including unsuccessful attempts.
+    head_lowerings: super::heads::HeadLowerings,
     /// The command's frame: what is made ONCE per records and kept for them (the lang crates'
     /// list, [`Records::name_lang_crates`]). Nothing is put here per question: a frame is never
     /// reset under the records, so a per-lookup copy would grow it by every body checked over
@@ -921,9 +1037,9 @@ pub struct Records<'n> {
     incoherent: Cell<Option<(&'n [usize], blaze_id::ContentId)>>,
     /// A test's planted bug: the item whose row is withheld ([`Records::plant_no_item`]).
     no_item: Cell<Option<ItemKey>>,
-    /// Each changed file's outline as it is now, by (crate, file), made the first time a
-    /// member of it is read at item grain (source/item_grain.rs): at most [`MOST_OUTLINES`].
-    outlines: RefCell<HashMap<(usize, u32), blaze_file_items::Outline<'n>, Alloc<'n>>>,
+    /// A test's planted bug: the item whose declared lifetimes are not answered
+    /// ([`Records::plant_no_lifetimes`]).
+    no_lifetimes: Cell<Option<ItemKey>>,
     /// What [`NamesSource::text_marks`] answered, by (crate, call): the expansion's origin
     /// column opened and verified ONCE (rule 74), its view handed out after in O(1). Before
     /// (tempo `engine-check`, 2026-11-17): every head and body site of an expansion re-opened
@@ -952,25 +1068,38 @@ impl<'n> Records<'n> {
     /// `keys`: each crate's key by index (index 0 the program's own), as `load` and `log` know
     /// the crates. Nothing is read here.
     pub fn new(keys: &'n [CrateItemKey], load: &'n dyn Load<'n>, log: &'n Log<'n>, frame: &'n blaze_mem::Frame, alloc: Alloc<'n>) -> Records<'n> {
-        let loader = Loader { load, log };
+        let origin_parts: ARc<'n, OriginParts<'n>> = ARc::new_in(RefCell::new(HashMap::new_in(alloc)), alloc);
+        let loader = Loader { load, log, origins: origin_parts.clone() };
         Records {
-            paths: RecordNames::new(keys, loader, alloc),
+            paths: RecordNames::new(keys, loader.clone(), alloc),
             items: RecordItems::new(keys, loader, alloc),
             keys,
+            origin_parts,
             load,
+            reread_origins: Cell::new(false),
             log,
+            head_lowerings: super::heads::HeadLowerings::default(),
             frame,
             beginnings: RefCell::new(HashMap::new_in(alloc)),
             no_impls: Cell::new(None),
             no_bucket_impl: Cell::new(None),
             incoherent: Cell::new(None),
             no_item: Cell::new(None),
-            outlines: RefCell::new(HashMap::new_in(alloc)),
+            no_lifetimes: Cell::new(None),
             marks: RefCell::new(HashMap::new_in(alloc)),
             origins_opened: Cell::new(0),
             scratch: RefCell::new(ThroughScratch::new_in(alloc)),
             alloc,
         }
+    }
+
+    /// PLANTED BUG, for tests/front2_token_mark_bodies.rs only: from now on
+    /// [`NamesSource::text_marks`] asks the loader again for an expansion's origin parts instead
+    /// of taking the ones its text's read brought (the two reads per marked text F4 removed), so
+    /// a loader counting its reads sees two for each marked text.
+    #[doc(hidden)]
+    pub fn plant_reread_origins(&self) {
+        self.reread_origins.set(true);
     }
 
     /// PLANTED BUG, for tests/front2_walk_scratch.rs only: the held glob walk's values are not
@@ -1002,6 +1131,15 @@ impl<'n> Records<'n> {
     #[doc(hidden)]
     pub fn plant_no_item(&self, key: ItemKey) {
         self.no_item.set(Some(key));
+    }
+
+    /// PLANTED BUG, for the region walk's tests only (D155, rule 23): from now on
+    /// [`NamesSource::declared_lifetimes`] and [`NamesSource::assoc_lifetimes`] of `key` answer
+    /// `None`, as a names world that held no count for it would. A region column that counts
+    /// it must then be refused by name (`Unlaid::Counts`), never laid by a guess.
+    #[doc(hidden)]
+    pub fn plant_no_lifetimes(&self, key: ItemKey) {
+        self.no_lifetimes.set(Some(key));
     }
 
     /// What could not be answered so far. Not empty: the result of whatever was checked over
@@ -1036,12 +1174,34 @@ impl<'n> Records<'n> {
     pub fn text_at(&'n self, key: ItemKey) -> Option<blaze_scope::resolve::At> {
         let krate = self.items.crate_of(key)?;
         let record = self.items_of(krate)?;
-        let row = self.read(krate, record.item(key))??;
-        let Some(span) = row.text else {
+        let row = self.read(krate, record.identity(key))??;
+        let Some(at) = row.at else {
             self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
             return None;
         };
-        Some(span.at)
+        Some(at)
+    }
+
+    /// Each member row of `owner` alone (its key, name, kind, outline entry and the call that
+    /// wrote it), in declaration order: NO member text is read, so no expansion record is asked
+    /// (blaze-cli engine_heads.rs `heads_of_crate`, which places members by their entry and never
+    /// reads their bytes). [`NamesSource::each_member`] proves each member's text first
+    /// (item_grain.rs `member_now`); a reader that checks a member reads its text there. A file
+    /// member's row is read against today's file as every items row is (blaze-scope
+    /// items_record.rs `item_span`, `current_file`: a file whose surface moved is refused).
+    /// `false`: no such owner, or its rows do not read; a row that does not read is filed in the
+    /// log, which voids the result, and the rest are still given.
+    pub fn each_member_row(&'n self, owner: ItemKey, each: &mut dyn FnMut(&blaze_scope::items_record::MemberRow<'n>)) -> bool {
+        let Some(krate) = self.items.crate_of(owner) else { return false };
+        if self.items_of(krate).is_none() {
+            return false;
+        }
+        let Some(Some(rows)) = self.read(krate, self.items.members(owner)) else { return false };
+        for row in rows.iter() {
+            let Some(row) = self.read(krate, row) else { continue };
+            each(&row);
+        }
+        true
     }
 
     /// [`NamesSource::walk`] with every cell the walk consults put in `sink` (blaze-scope
@@ -1150,7 +1310,7 @@ impl<'n> Records<'n> {
         whole[..16].copy_from_slice(&first);
         let krate = self.items.crate_of(ItemKey(blaze_id::ContentId(whole)))?;
         let record = self.items_of(krate)?;
-        let item_at = |i: usize| self.read(krate, record.item_at(i)).flatten().map(|row| row.key);
+        let item_at = |i: usize| self.read(krate, record.identity_at(i)).flatten().map(|row| row.key);
         match self.one_beginning(krate, first, record.items(), &item_at) {
             Beginning::One(key) => return Some(key),
             Beginning::Void => return None,
@@ -1232,9 +1392,8 @@ impl<'n> Records<'n> {
     fn block_abi(&'n self, key: ItemKey) -> Option<Option<&'n str>> {
         let krate = self.items.crate_of(key)?;
         // No record: the loader filed `NoRecord` the one time it was asked.
-        self.items_of(krate)?;
-        let now = self.row_now(krate, key)?;
-        Some(now.row.foreign)
+        let record = self.items_of(krate)?;
+        Some(self.read(krate, record.identity(key))??.foreign)
     }
 }
 
@@ -1258,6 +1417,10 @@ enum Beginning {
 }
 
 impl<'n> NamesSource<'n> for &'n Records<'n> {
+    fn head_lowerings(self) -> Option<&'n super::heads::HeadLowerings> {
+        Some(&self.head_lowerings)
+    }
+
     fn solved(self) -> Option<&'n Names<'n>> {
         None
     }
@@ -1419,7 +1582,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     fn has_text(self, key: ItemKey) -> bool {
         let Some(krate) = self.items.crate_of(key) else { return false };
         let Some(record) = self.items_of(krate) else { return false };
-        matches!(self.read(krate, record.item(key)), Some(Some(_)))
+        matches!(self.read(krate, record.identity(key)), Some(Some(_)))
     }
 
     fn text_of(self, key: ItemKey) -> Option<ItemText<'n>> {
@@ -1431,15 +1594,14 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         self.items_of(krate)?;
         // At item grain (item_grain.rs): an edit elsewhere in the file, or inside this item's
         // body, leaves its row standing at today's place; a moved head is refused by name.
-        let now = self.row_now(krate, key)?;
-        let row = now.row;
+        let row = self.row_now(krate, key)?;
         let Some(span) = row.text else {
             self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
             return None;
         };
-        let text = self.span_now(krate, &now, span)?;
+        let text = self.span_now(krate, span)?;
         let impl_header = match row.impl_header {
-            Some(header) => Some(self.span_now(krate, &now, header)?),
+            Some(header) => Some(self.span_now(krate, header)?),
             None => None,
         };
         Some(ItemText { key, module: row.module, item: row.outline, name: row.name, impl_header, text })
@@ -1448,21 +1610,19 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     fn name_of(self, key: ItemKey) -> Option<&'n str> {
         let krate = self.items.crate_of(key)?;
         let record = self.items_of(krate)?;
-        self.read(krate, record.item(key))??.name
+        self.read(krate, record.identity(key))??.name
     }
 
     fn home_of(self, key: ItemKey) -> Option<ItemKey> {
         let krate = self.items.crate_of(key)?;
         let record = self.items_of(krate)?;
-        Some(self.read(krate, record.item(key))??.module)
+        Some(self.read(krate, record.identity(key))??.module)
     }
 
     fn place_of(self, key: ItemKey) -> Option<Place> {
         let krate = self.items.crate_of(key)?;
         self.items_of(krate)?;
-        // Today's outline entry (item_grain.rs): a body edit that adds or removes an item
-        // nested in a body moves the entries after it.
-        let row = self.row_now(krate, key)?.row;
+        let row = self.row_now(krate, key)?;
         Some(Place { krate, at: row.text?.at, item: row.outline })
     }
 
@@ -1470,7 +1630,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let krate = self.items.crate_of(key)?;
         self.items_of(krate)?;
         // Today's place (item_grain.rs): the row's span is in today's text of its file.
-        let row = self.row_now(krate, key)?.row;
+        let row = self.row_now(krate, key)?;
         let Some(span) = row.text else {
             self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
             return None;
@@ -1481,7 +1641,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// Both columns of the items record's file row, without reading its text.
     fn file_paths(self, krate: usize, file: u32) -> Option<FilePaths<'n>> {
         let record = self.items_of(krate)?;
-        match self.read(krate, record.file(file))? {
+        match self.read(krate, record.file_surface(file))? {
             Some(row) => Some(FilePaths { package: row.path, shown: row.shown }),
             None => {
                 self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::Short { what: "a file row", at: file as usize } });
@@ -1497,12 +1657,60 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn call_origin(self, krate: usize, call: ItemKey) -> Result<super::expansion_origin::CallOrigin<'n>, super::expansion_origin::Unmapped> {
-        // Owed by name: the calling text's outline over the crates' records is not served (the
-        // `Texts` table over records is empty, texts.rs `Texts::empty`). The origins themselves
-        // are in the record (`Load::expansion_origins`); reading the calling entry is what is
-        // missing. Never guessed: the finding is filed with this reason.
-        let _ = krate;
-        Err(super::expansion_origin::Unmapped::OverRecords { call })
+        // The origins' two parts as `call_text` reads them: those the text's read brought
+        // (`OriginParts`), peeked, never taken (`text_marks` takes them); else one loader read.
+        // The calling entry is then found in the items record and today's text of its file
+        // (program/lazy/seam_rules.rs `recorded_call_origin`). Before (tempo tests t0850,
+        // 2026-11-21): refused here by name, so no item a derive or an attribute macro wrote
+        // had a `#[track_caller]` place over records (132 tests not run).
+        use super::expansion_origin::Unmapped;
+        let kept = self.origin_parts.borrow().get(&(krate, call)).copied();
+        let parts = match kept {
+            Some(parts) => parts,
+            None => self.load.expansion(krate, call).ok_or(Unmapped::NotServed { call })?.origins,
+        };
+        let parts = parts.ok_or(Unmapped::NotServed { call })?;
+        // An empty call part is a text that keeps no origins by design (blaze-scope
+        // expansion_records.rs `write`), answered typed and filed in no log: the log voids the
+        // whole instance (tempo a1425), and only a place through this call is lost.
+        if parts.0.is_empty() {
+            return Err(Unmapped::NoCallPart { call });
+        }
+        self.recorded_call_origin(parts, krate, call, self.alloc)
+    }
+
+    fn call_text(self, krate: usize, call: ItemKey) -> Option<blaze_scope::resolve::At> {
+        use blaze_scope::expansion_origins::CallView;
+        // The call part alone (`CallView::open`: its fixed words, no column), which the
+        // expansion's record keeps: the parts the text's read brought (`Loader`'s
+        // `LoadItems::expansion`), peeked, never taken (`text_marks` takes them); a call whose
+        // parts were taken or whose text was not read here is one loader read.
+        let kept = self.origin_parts.borrow().get(&(krate, call)).copied();
+        let parts = match kept {
+            Some(parts) => parts,
+            None => self.load.expansion(krate, call)?.origins,
+        };
+        let Some((call_part, _)) = parts else {
+            self.gap("`call_text`: the loader holds no origins for the expansion", Some(call));
+            return None;
+        };
+        // A text that keeps no origins by its writer's design (blaze-scope expansion_records.rs
+        // `write`; `Unmapped::NoCallPart`, as `call_origin` answers it): no calling file is
+        // known, which is an answer, not a records fault. `body_file` answers no file, and an
+        // include or `file!()` in that body is refused by name there (body_host.rs
+        // `HostAsk::Include`, `HostAsk::Place`). Before (tempo a1425, 2026-11-21): filed in the
+        // log here, so every body such a text wrote voided its instance (body.rs asks
+        // `body_file` of each body with sources) and most packages' suites stopped.
+        if call_part.is_empty() {
+            return None;
+        }
+        match CallView::open(call_part) {
+            Ok(view) => Some(view.text),
+            Err(_) => {
+                self.gap("`call_text`: the expansion's call part does not open (blaze-scope `CallView::open`)", Some(call));
+                None
+            }
+        }
     }
 
     fn text_marks(self, krate: usize, call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::item_site::MarksLost> {
@@ -1517,13 +1725,31 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             return Err(MarksLost::TooManyTexts { call, most: MOST_MARKED_TEXTS });
         }
         let answer = (|| -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, MarksLost> {
-            let text = self.load.expansion(krate, call).ok_or(MarksLost::NoExpansion { call })?;
-            // `Load::expansion_origins`: `None` is a loader that holds no origins for the call
+            // The text through the items memo ([`Records::whole_text`], blaze-scope
+            // items_record.rs `ItemsRecord::whole` and its `seen` memo): the text a body or row
+            // of this call already read in these records, checked against the record's digest
+            // once, never a second store read past the memo (D149 piece I4, rule 77). A text the
+            // record does not keep or that moved is filed in the log there, which voids the
+            // result, and the marks are lost by name.
+            let text = self.whole_text(krate, blaze_scope::resolve::At::Expansion(call)).ok_or(MarksLost::NoExpansion { call })?;
+            // The origin parts the SAME read brought (`Loader`'s `LoadItems::expansion` kept
+            // them, F4): one store read of the record serves the text and its marks. The text
+            // read above went through the loader (only it fills the items memo of these
+            // records), so a missing entry is a broken invariant, filed by name (rule 3), never
+            // a second read.
+            let kept = self.origin_parts.borrow_mut().remove(&(krate, call));
+            // The planted bug (tests/front2_token_mark_bodies.rs): the second read F4 removed.
+            let kept = if self.reread_origins.get() { self.load.expansion(krate, call).map(|read| read.origins) } else { kept };
+            let Some(parts) = kept else {
+                self.gap("`text_marks`: the origin parts of an expansion text read through the records' loader were not kept beside it (source.rs `OriginParts`)", Some(call));
+                return Err(MarksLost::NoExpansion { call });
+            };
+            // `LoadedExpansion::origins`: `None` is a loader that holds no origins for the call
             // and an empty call part a text that keeps none; both are a text with no column, as
-            // `item_site::marks_of`'s `Ok(None)` (OPEN: the records loaders of tests/ serve none,
-            // so a def-site head over records resolves at its module until they do). The two
-            // parts are opened where they lie (`OriginsView::open_parts`): no joined copy.
-            match self.load.expansion_origins(krate, call) {
+            // `item_site::marks_of`'s `Ok(None)` (OPEN: some records loaders of tests/ serve
+            // none, so a def-site head over records resolves at its module until they do). The
+            // two parts are opened where they lie (`OriginsView::open_parts`): no joined copy.
+            match parts {
                 None | Some(([], _)) => Ok(None),
                 Some((call_part, column)) => {
                     self.origins_opened.set(self.origins_opened.get() + 1);
@@ -1558,16 +1784,29 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         }
     }
 
+    /// The crate's items record's value table (blaze-scope items_record/values.rs): one binary
+    /// search, no text read, nothing expanded again (rule 77). A refusal comes back as the words
+    /// the solve wrote with the record.
+    fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>> {
+        let Some(krate) = self.items.crate_of(key) else {
+            self.gap("`attr_value` of a key of no crate the records hold", Some(key));
+            return None;
+        };
+        // No record: the loader filed `NoRecord` the one time it was asked.
+        let record = self.items_of(krate)?;
+        Some(self.read(krate, record.attr_value(key, attr))?.map(|answer| answer.map_err(RowRefusal::Recorded)))
+    }
+
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
         let krate = self.items.crate_of(key)?;
         let record = self.items_of(krate)?;
-        Some(self.read(krate, record.item(key))??.kind)
+        Some(self.read(krate, record.identity(key))??.kind)
     }
 
     fn detail_of(self, key: ItemKey) -> Option<ItemDetail> {
         let krate = self.items.crate_of(key)?;
         let record = self.items_of(krate)?;
-        let row = self.read(krate, record.item(key))??;
+        let row = self.read(krate, record.identity(key))??;
         let detail = detail_from(row.kind, row.body_holds_items);
         if detail.is_none() {
             self.gap("an outline entry's detail beyond its kind and its body-holds-items flag (question 11: the file's own FileItems record)", Some(key));
@@ -1578,7 +1817,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     fn is_ctor(self, key: ItemKey) -> bool {
         let Some(krate) = self.items.crate_of(key) else { return false };
         let Some(record) = self.items_of(krate) else { return false };
-        matches!(self.read(krate, record.item(key)), Some(Some(row)) if row.ctor)
+        matches!(self.read(krate, record.identity(key)), Some(Some(row)) if row.ctor)
     }
 
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool {
@@ -1627,8 +1866,8 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             let Some(Some(row)) = self.read(krate, record.impl_at(i)) else { continue };
             // At item grain (item_grain.rs): a body edit in the impl's file leaves its header.
             let Some(now) = self.row_now(krate, row.key) else { continue };
-            let header = match now.row.impl_header {
-                Some(span) => match self.span_now(krate, &now, span) {
+            let header = match now.impl_header {
+                Some(span) => match self.span_now(krate, span) {
                     Some(text) => text,
                     None => continue,
                 },
@@ -1694,11 +1933,11 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         self.items_of(krate)?;
         // At item grain (item_grain.rs), as `text_of`.
         let now = self.row_now(krate, key)?;
-        let Some(span) = now.row.impl_header else {
+        let Some(span) = now.impl_header else {
             self.gap("an impl's header text (its item row has no header range)", Some(key));
             return None;
         };
-        let header = self.span_now(krate, &now, span)?;
+        let header = self.span_now(krate, span)?;
         Some(ImplAt { krate, key, module, header })
     }
 
@@ -1712,26 +1951,21 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn macro_body_of(self, module: ItemKey, written: Written<'_, &str>) -> Result<Option<MacroBody<'n>>, PathError> {
-        let found = self.walk(module, Namespace::Macros, written)?;
-        let len = written.segments.len();
-        let def = found.whole(len).ok_or(PathError { module, at: found.consumed, why: Why::NotAModule })?;
-        let krate = self.items.crate_of(def.key).ok_or(PathError { module, at: len.saturating_sub(1), why: Why::NotRead { module: def.key, layer: Unheld::Step } })?;
-        if self.items_of(krate).is_none() {
-            return Err(PathError { module, at: len.saturating_sub(1), why: Why::NotRead { module: def.key, layer: Unheld::Step } });
-        }
-        Ok(self.read(krate, self.items.macro_src(def.key)).flatten().map(|s| s.body))
+        Ok(self.macro_at(module, written)?.src.map(|s| s.body))
     }
 
     fn macro_at(self, module: ItemKey, written: Written<'_, &str>) -> Result<MacroAt<'n>, PathError> {
         let found = self.walk(module, Namespace::Macros, written)?;
         let len = written.segments.len();
         let def = found.whole(len).ok_or(PathError { module, at: found.consumed, why: Why::NotAModule })?;
-        let krate = self.items.crate_of(def.key).ok_or(PathError { module, at: len.saturating_sub(1), why: Why::NotRead { module: def.key, layer: Unheld::Step } })?;
+        let unread = || PathError { module, at: len.saturating_sub(1), why: Why::NotRead { module: def.key, layer: Unheld::Step } };
+        let krate = self.items.crate_of(def.key).ok_or_else(unread)?;
         // No record: the loader filed `NoRecord`; the path is then one into a crate not read.
-        let record = self.items_of(krate).ok_or(PathError { module, at: len.saturating_sub(1), why: Why::NotRead { module: def.key, layer: Unheld::Step } })?;
-        // A macro row whose body text does not read is an error filed (the log voids the
-        // body's result); it is then answered as a definition with no source.
-        let src = self.read(krate, self.items.macro_src(def.key)).flatten();
+        let record = self.items_of(krate).ok_or_else(unread)?;
+        let src = self.items.macro_src(def.key).map_err(|error| {
+            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error });
+            unread()
+        })?;
         Ok(MacroAt { krate, def, src, crate_key: record.key(), proc_key: record.proc_key(), edition: record.edition() })
     }
 
@@ -1762,11 +1996,15 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let Some(record) = self.items_of(krate) else { return false };
         // The item rows are sorted by key.
         for i in 0..record.items() {
-            if let Some(Some(row)) = self.read(krate, record.item_at(i)) {
+            if let Some(Some(row)) = self.read(krate, record.identity_at(i)) {
                 each(row.key, row.module);
             }
         }
         true
+    }
+
+    fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>> {
+        Some(self.names_of(self.crate_of(module)?)?.scope(module)?.get(ns, name))
     }
 
     fn binds(self, module: ItemKey, ns: Namespace, name: &'n str) -> bool {
@@ -1799,5 +2037,25 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let found = self.find_beginning(first);
         self.beginnings.borrow_mut().insert(first, found);
         found
+    }
+
+    fn declared_lifetimes(self, key: ItemKey) -> Option<u32> {
+        if self.no_lifetimes.get() == Some(key) {
+            return None;
+        }
+        let krate = self.items.crate_of(key)?;
+        // No record: the loader filed `NoRecord` the one time it was asked; a refused read
+        // is filed by `read`.
+        let record = self.items_of(krate)?;
+        self.read(krate, record.declared_lifetimes(key))?.map(u32::from)
+    }
+
+    fn assoc_lifetimes(self, trait_: ItemKey, name: blaze_typeck::Name) -> Option<u32> {
+        if self.no_lifetimes.get() == Some(trait_) {
+            return None;
+        }
+        let krate = self.items.crate_of(trait_)?;
+        let record = self.items_of(krate)?;
+        self.read(krate, record.assoc_lifetimes(trait_, |m| blaze_typeck::Name::of(m) == name))?.map(u32::from)
     }
 }

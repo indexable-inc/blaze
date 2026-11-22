@@ -211,10 +211,25 @@ fn the_block_is_equal_across_runs_and_its_labels_sorted() {
     );
 }
 
-/// (e) `Enforce` is not built: a search asked for it panics naming it, never observing quietly.
-/// Prints the panic: "blaze-sim: `ObserveMode::Enforce` is not built yet (..)".
+/// (e) `Enforce` is built (D165): the search observes under it as under `Observe`, and the
+/// "never varied" lines it fails on are exactly the ones the block lists. (The driver failing a
+/// run on them, and `search` refusing it, are in tests/limits.rs.)
 #[test]
-#[should_panic(expected = "`ObserveMode::Enforce` is not built yet")]
-fn enforce_panics_naming_itself() {
-    let _ = Search::new(Config::cases(1).observe(ObserveMode::Enforce));
+fn enforce_fails_on_exactly_the_never_varied_lines() {
+    let search = Search::new(Config::cases(1).observe(ObserveMode::Enforce));
+    assert_eq!(search.tally().cases(), 0);
+    let (lines, _) = lines_of(Config::cases(1000), |tape| {
+        let n = tape.below(10, "n");
+        tape.assume(n == 3);
+        let _ = tape.below(10, "free");
+    });
+    let (verdict, searched) = search_observing(Config::cases(1000), |tape| {
+        let n = tape.below(10, "n");
+        tape.assume(n == 3);
+        let _ = tape.below(10, "free");
+    });
+    assert!(matches!(verdict, Verdict::Passed(_)), "{verdict:?}");
+    let mut enforced = observed_lines();
+    assert_eq!(searched.tally().never_varied_into(&mut enforced), 1);
+    assert_eq!(enforced.as_str(), lines.as_str());
 }

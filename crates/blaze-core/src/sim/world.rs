@@ -616,6 +616,10 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
     if let Some(plant) = plant {
         sim.plant(plant);
     }
+    // The world is one directory of files: the folder its names are in is there, durably,
+    // before any effect, so no effect makes it (a folder an effect makes is a change of a name
+    // the world does not hold).
+    sim.mkdir(&FileName::new("w").expect("a name"));
     let memory = memory();
     let mut world = Disk::new();
     let mut asks = World::new();

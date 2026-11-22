@@ -232,9 +232,11 @@ fn run<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, toks: Toks<'_, '_, 'a>,
             path_mark: m.mark_at(request.path_range.start),
             input: m.call_input(&request),
             range: request.range,
+            written: m.written_call(request.range),
             fragment: request.fragment,
             edition: m.edition,
             locals: &locals,
+            expansions: m.expansions(),
         };
         let expansion = expand.expand_body(call, &mut *cfg, &mut out);
         // The locals read the machine's text, which the expansion is appended to next.

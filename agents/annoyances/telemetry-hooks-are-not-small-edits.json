@@ -1,0 +1,12 @@
+{
+ "id": "telemetry-hooks-are-not-small-edits",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), D178 telemetry writer",
+ "where": "crates/blaze-std/src/{cx.rs,workers.rs,rt.rs,entry.rs} against telemetry.rs's hook list",
+ "what": "The telemetry module's hook list (and the brief built on it) called each hook 'a small edit', but three hooks need a design the runtime does not have yet: Cx::span returns a child Cx and has no close, so Cell::open has nowhere to pair a Cell::close; charge_wait gets (on, id, ns), not the task id and start/end a WaitRec holds; and blaze-cli parses its --stats flag inside main, after bstd's pool and workers' cells are made, so a level 'in the runtime's options' cannot be set from that flag without a run-time raise.",
+ "class": "a hook list written from the telemetry side without reading the seams it names",
+ "prevention": "read each named seam before calling a hook small; the hook list in telemetry.rs should name the seam's current signature",
+ "annoyance": "the brief's 'each a small edit' read as done-in-minutes; it is a spec first",
+ "workaround": "declared the module, fixed Waited's merge order, added the frame-pointer lines; the hooks are specified in the final report, not edited",
+ "state": "open"
+}

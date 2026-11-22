@@ -897,7 +897,7 @@ fn main() {
             for (cause, (n, first)) in &by_cause {
                 println!("    {cause}: {n}; {}", first.chars().take(300).collect::<String>());
             }
-            let mut show = |what: &str, map: &Mutex<BTreeMap<String, u64>>| {
+            let show = |what: &str, map: &Mutex<BTreeMap<String, u64>>| {
                 let map = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut rows: Vec<_> = map.iter().collect();
                 rows.sort_by(|a, b| b.1.cmp(a.1));

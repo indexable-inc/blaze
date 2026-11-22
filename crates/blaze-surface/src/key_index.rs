@@ -3,7 +3,7 @@
 
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Slice, Writer};
+use blaze_format::{FormatError, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc};
 
@@ -74,7 +74,7 @@ impl<'a> KeyIndex<'a> {
             return Err(BuildError::Twice { table: "KeyIndex rows", key: pair[1].key });
         }
         crate::column::count(self.rows.len(), "KeyIndex rows")?;
-        let mut out = Writer::new_in(<KeyIndexRoot as blaze_format::Record>::SCHEMA, self.alloc);
+        let mut out = Writer::new(WriterOpts { schema: <KeyIndexRoot as blaze_format::Record>::SCHEMA, alloc: self.alloc, capacity: None });
         let rows = Column::push(&mut out, &self.rows);
         Ok(finish_with(out, |at| KeyIndexRoot {
             module: self.module.0,

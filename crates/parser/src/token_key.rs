@@ -242,6 +242,34 @@ impl TokenPlace {
             }
             count += 1;
         });
+        self.resolved(start, end, count, text)
+    }
+
+    /// [`TokenPlace::to_bytes`] from a table of the item's file made once ([`file_tokens`],
+    /// [`FileTokens::item`]): the same range of `text` (the item's text today, from its start),
+    /// with no lex. A file's places are then one lex of the file, however many it holds.
+    pub fn to_bytes_in(self, tokens: ItemTokens<'_>, text: &str) -> Result<Range<usize>, PlaceError> {
+        fits(text).map_err(|TokenKeyError::TooLong { bytes }| PlaceError::TooLong { bytes })?;
+        let TokenPlace { first, last, inside } = self;
+        if last < first {
+            return Err(PlaceError::Backwards { first, last });
+        }
+        if inside.is_some() && first != last {
+            return Err(PlaceError::InsideSpansTokens { first, last });
+        }
+        // Every key of an `ItemTokens` starts at or after its item (`FileTokens::item`).
+        let from_item = |(start, len): (u32, u32)| (wide(start - tokens.item), wide(len));
+        let start = tokens.keys.get(wide(first)).map(|&key| from_item(key).0);
+        let end = tokens.keys.get(wide(last)).map(|&key| from_item(key));
+        let count = u32::try_from(tokens.keys.len()).unwrap_or(u32::MAX);
+        self.resolved(start, end, count, text)
+    }
+
+    /// The range of a place whose first token starts at `start` and whose last token starts at
+    /// `end.0` with a lexeme of `end.1` bytes, in an item of `count` tokens: [`TokenPlace::to_bytes`]'s
+    /// and [`TokenPlace::to_bytes_in`]'s one rule.
+    fn resolved(self, start: Option<usize>, end: Option<(usize, usize)>, count: u32, text: &str) -> Result<Range<usize>, PlaceError> {
+        let TokenPlace { last, inside, .. } = self;
         let (Some(start), Some((last_start, last_len))) = (start, end) else {
             return Err(PlaceError::PastEnd { last, tokens: count });
         };
@@ -316,6 +344,69 @@ impl TokenPlace {
         }
         debug_assert!(last_lo < end, "the last token holds the range's end");
         Ok(TokenPlace { first, last, inside: None })
+    }
+}
+
+/// Each raw token of a file's `text` in `edition` that is not whitespace, in order, with its start
+/// and its lexeme's length in bytes from the file's start: a key token ([`token_digest`]'s) to
+/// `key`, a plain comment to `comment`. One lex of the file: the columns a caller keeps of it
+/// ([`FileTokens`]) place every [`TokenPlace`] of the file's items ([`TokenPlace::to_bytes_in`]),
+/// so a file is lexed once however many places it holds. The parser keeps nothing of it: the
+/// caller holds the columns, in its own allocator.
+pub fn file_tokens(text: &str, edition: Edition, mut key: impl FnMut(u32, u32), mut comment: impl FnMut(u32, u32)) -> Result<(), TokenKeyError> {
+    fits(text)?;
+    let lexed = LexedStr::new(edition, text);
+    let mut at = 0usize;
+    for (kind, len) in lexed.kinds_and_lens() {
+        let start = at;
+        at += len;
+        if kind == SyntaxKind::WHITESPACE {
+            continue;
+        }
+        if counts(kind, &text[start..at]) {
+            key(narrow(start), narrow(len));
+        } else {
+            comment(narrow(start), narrow(len));
+        }
+    }
+    Ok(())
+}
+
+/// The columns of one lex of a file ([`file_tokens`]): each key token's and each plain comment's
+/// (start, length), in order, from the file's start.
+#[derive(Clone, Copy, Debug)]
+pub struct FileTokens<'t> {
+    pub keys: &'t [(u32, u32)],
+    pub comments: &'t [(u32, u32)],
+}
+
+/// The key tokens of one item of a file ([`FileTokens::item`]): the file's from the item's start
+/// to its end, each starting at or after `item`, the item's start in the file.
+#[derive(Clone, Copy, Debug)]
+pub struct ItemTokens<'t> {
+    keys: &'t [(u32, u32)],
+    item: u32,
+}
+
+impl<'t> FileTokens<'t> {
+    /// The key tokens a lex of the file's text from `item` on gives (what
+    /// [`TokenPlace::to_bytes`] counts over the item's text), when `item` is where a raw token of
+    /// the file starts or lies in whitespace: there a lex from `item` sees the file's tokens from
+    /// there on, one by one (a token's lexing reads no byte before its start). None when `item`
+    /// is inside a key token or a plain comment, where a lex from `item` would make other tokens.
+    pub fn item(&self, item: u32) -> Option<ItemTokens<'t>> {
+        let inside = |column: &[(u32, u32)]| {
+            let before = column.partition_point(|&(start, _)| start < item);
+            before > 0 && {
+                let (start, len) = column[before - 1];
+                item < start.saturating_add(len)
+            }
+        };
+        if inside(self.keys) || inside(self.comments) {
+            return None;
+        }
+        let first = self.keys.partition_point(|&(start, _)| start < item);
+        Some(ItemTokens { keys: &self.keys[first..], item })
     }
 }
 

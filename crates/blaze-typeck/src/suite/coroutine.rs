@@ -33,8 +33,8 @@ use super::{Want, check_body, expect};
 use crate::body::{Capture, IntSuffix};
 use crate::diag::DiagCode;
 use crate::fixture::{Bb, Fx, rung_7c};
-use crate::ids::{ExprId, ItemKey, LangItem, Name, PatId, UintTy};
-use crate::infer::{InferPlant, assoc_def};
+use crate::ids::{ExprId, ItemKey, LangItem, PatId, UintTy};
+use crate::infer::InferPlant;
 use crate::machine::Plant;
 use crate::portable::PNode;
 use crate::world::Def;
@@ -62,6 +62,7 @@ fn world() -> (Fx, Items) {
     // closure's do (rules/async_fn.rs, rules/closure.rs `moved_out`).
     let copy = fx.tr("Copy", 1, Vec::new(), &[]);
     fx.lang(LangItem::Copy, copy);
+    fx.imp("Copy for u8", 0, u8_, Some((copy, &[])), &[], Vec::new());
     let future = fx.tr("Future", 1, Vec::new(), &["Output"]);
     fx.lang(LangItem::Future, future);
     let into_future = fx.tr("IntoFuture", 1, Vec::new(), &["Output", "IntoFuture"]);
@@ -97,6 +98,12 @@ fn world() -> (Fx, Items) {
     fx.func("use_rc", 0, &[rc_t], unit, Vec::new());
     let is_send = fx.bound(send, &[p0]);
     fx.func("spawn", 1, &[p0], unit, std::vec![is_send]);
+    // `trait Job {}  impl<T: Send> Job for T {}  fn job<F: Job>(f: F);`: a goal that is no
+    // auto trait and holds exactly when its type is `Send` (axum's `Handler` for an async fn).
+    let job = fx.tr("Job", 1, Vec::new(), &[]);
+    fx.imp("impl<T: Send> Job for T", 1, p0, Some((job, &[])), &[], std::vec![is_send]);
+    let is_job = fx.bound(job, &[p0]);
+    fx.func("job", 1, &[p0], unit, std::vec![is_job]);
     let error_t = fx.adt(error, &[]);
     let res_unit_error = fx.adt(s.result, &[unit, error_t]);
     let output_is = fx.proj(future, &[p0], "Output", res_unit_error);
@@ -146,7 +153,7 @@ fn output_type_flows_through_await() {
                 (ExprId(0), "u8"),
                 (ExprId(1), "u32"),
                 (ExprId(2), "u32"),
-                (ExprId(3), "future#3<u32; (u8, u32)>"),
+                (ExprId(3), "future#3<u32; ()>"),
                 (ExprId(4), "u32"),
                 (ExprId(5), "u32"),
                 (ExprId(6), "u32"),
@@ -235,8 +242,8 @@ fn async_fn_awaits_another() {
                 (ExprId(2), "u8"),
                 (ExprId(3), "u8"),
                 (ExprId(4), "u8"),
-                // The interior: `v`'s `u8` and its capture by reference `&u8` (sorted by id).
-                (ExprId(5), "future#5<u8; (u8, &u8)>"),
+                // Polling copies the u8 out of the shared reference held by the future.
+                (ExprId(5), "future#5<u8; (&u8,)>"),
                 (ExprId(6), "u8"),
                 (ExprId(7), "u8"),
             ],
@@ -363,12 +370,18 @@ fn no_rc(b: &mut Bb) -> ExprId {
 
 /// As [`spawn_case`], with the check's own refusal kept: a typed gap is the `Err`.
 fn spawn_outcome(owner: fn(&Items) -> ItemKey, inner: fn(&mut Bb) -> ExprId, capture: Capture) -> Result<Vec<DiagCode>, crate::error::CheckError> {
+    call_outcome("spawn", owner, inner, capture)
+}
+
+/// `callee(async { .. })` in `owner`, the async block's body built by `inner`, with the
+/// check's own refusal kept.
+fn call_outcome(callee: &str, owner: fn(&Items) -> ItemKey, inner: fn(&mut Bb) -> ExprId, capture: Capture) -> Result<Vec<DiagCode>, crate::error::CheckError> {
     let (fx, it) = world();
     let mut b = Bb::new();
     if owner(&it) != it.c_sync {
         b.param("t");
     }
-    let e0 = b.path(&["spawn"]);
+    let e0 = b.path(&[callee]);
     let body = inner(&mut b);
     let fut = b.async_block(body, capture);
     let call = b.call(e0, &[fut]);
@@ -385,7 +398,7 @@ fn spawn_outcome(owner: fn(&Items) -> ItemKey, inner: fn(&mut Bb) -> ExprId, cap
 
 /// Whether `got` is the gap of an auto trait that failed only on the superset interior.
 fn is_interior_gap(got: &Result<Vec<DiagCode>, crate::error::CheckError>) -> bool {
-    matches!(got, Err(crate::error::CheckError::Unported(what)) if *what == crate::rules::async_fn::INTERIOR_GAP)
+    matches!(got, Err(crate::error::CheckError::FutureWitness { reason, at }) if *reason == crate::INTERIOR_GAP && at.start < at.end)
 }
 
 /// "Auto traits": an async block's future is `Send` when every value its state holds is, and
@@ -412,6 +425,34 @@ fn rc_held_across_await_is_a_gap() {
 fn rc_dropped_before_await_is_a_gap_not_e0277() {
     let got = spawn_outcome(|it| it.c_sync, rc_before_await, Capture::Ref);
     assert!(is_interior_gap(&got), "{got:?}");
+}
+
+/// tempo crates/zones/rpc/src/server.rs:63, reduced: `post(handle_rpc)` asks axum's
+/// `Handler`, no auto trait, whose impl for an async fn holds exactly when the fn's future is
+/// `Send`. Here `job(async { use_rc(make_rc()); ready().await; })` asks `Job`, whose one impl
+/// `impl<T: Send> Job for T` fails only by `Send` of the future, which failed on the superset
+/// interior alone: the same gap as `spawn`'s, never E0277 (the checker gave E0277: the
+/// classification looked at the goal `Job` only, never at the clause under it).
+///
+/// Expected line: `test suite::coroutine::send_under_a_blanket_impl_is_a_gap_not_e0277 ... ok`.
+#[test]
+fn send_under_a_blanket_impl_is_a_gap_not_e0277() {
+    let got = call_outcome("job", |it| it.c_sync, rc_before_await, Capture::Ref);
+    assert!(is_interior_gap(&got), "{got:?}");
+}
+
+/// The negative twin: `fn c_gen_unbound<T>(t: T) { job(async move { t }); }`: the clause
+/// under `Job` is `Send` of a future whose initial capture `T` already fails it (no
+/// `T: Send`), so the goal's failure is decided: E0277, as `spawn`'s is.
+#[test]
+fn send_under_a_blanket_impl_failing_by_capture_is_refused() {
+    assert_eq!(call_outcome("job", |it| it.c_gen_unbound, move_t, Capture::Move), Ok(std::vec![DiagCode::Unsatisfied]));
+}
+
+/// The control: with `T: Send` the clause holds and `job` accepts the future.
+#[test]
+fn send_under_a_blanket_impl_holds_by_the_bound() {
+    assert_eq!(call_outcome("job", |it| it.c_gen, move_t, Capture::Move), Ok(std::vec![]));
 }
 
 /// The control for both: with no `Rc`, the interior is `Ready`, `()` and `u8`, all `Send` by
@@ -501,11 +542,12 @@ fn outer_block_holds_by_value_what_an_inner_move_takes() {
 /// `async fn c_async() -> u8 { let x: u16 = ready().await; 0u8 }`, `ready()`'s future having
 /// `Output = u8`. The Reference, "Await expressions": "the value contained in the
 /// `Poll::Ready` variant is used as the result of the await expression itself", so the
-/// `.await` is a `u8` and a `u16` binding of it is refused. The one finding is the unmet goal
-/// `<Ready as IntoFuture>::Output == u16` (`Unsatisfied`, E0271's shape: the annotation
-/// reaches the `.await` as its expected type, and the output is a projection); a body whose
-/// `.await` output is taken as written (no goal on `Output`) has no finding and fails this.
-/// Owed, not checked here: the same refusal worded as E0308 naming `u8` and `u16`.
+/// `.await` is a `u8` and a `u16` binding of it is refused. The one finding is E0271 on the
+/// goal `<Ready as IntoFuture>::Output == u16`, naming `u16` expected and `u8` found (the
+/// annotation reaches the `.await` as its expected type, and the output is a projection the
+/// blanket impl decides: machine.rs `projection_found`); a body whose `.await` output is taken
+/// as written (no goal on `Output`) has no finding and fails this. rustc words it E0308 (its
+/// desugaring normalizes the output first); the types named are the same.
 ///
 /// Expected line: `test suite::coroutine::await_output_mismatch_is_refused ... ok`.
 #[test]
@@ -524,8 +566,14 @@ fn await_output_mismatch_is_refused() {
     let root = b.block(&[s0], Some(e3));
     let c = check_body(&fx, &b, it.c_async, root, Plant::None, InferPlant::None);
     let codes: Vec<DiagCode> = c.diags.iter().map(|d| d.code).collect();
-    assert_eq!(codes, std::vec![DiagCode::Unsatisfied], "{:?}", c.diags);
+    assert_eq!(codes, std::vec![DiagCode::ProjectionMismatch], "{:?}", c.diags);
+    let d = &c.diags[0];
+    assert_eq!(d.code.code(), "E0271");
+    assert_eq!(crate::fixture::show(&fx, c.types.view(), d.expected.expect("the annotation")), "u16");
+    assert_eq!(crate::fixture::show(&fx, c.types.view(), d.found.expect("the future's output")), "u8");
 }
 
 /// Auto-trait goals decided on the exact interior (src/stalled.rs).
 mod stalled;
+/// The solver's why-chain on an unmet future's `Send` finding (`Diag::why`).
+mod why;

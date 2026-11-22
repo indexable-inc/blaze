@@ -1,0 +1,35 @@
+[package]
+name = "blaze-cc"
+description = "blaze's C toolchain driver (D174, docs/v2/plan/design/c.md \"The toolchain side\"): the hermetic arguments for the pinned clang, a sans-IO job machine that serves the blaze-cfront helper every file it opens from the roots a run may see (blaze-roots) and returns the checked read list with every miss, the `cfront-decls 2` declaration codec read into blaze-c's model, the helper as blaze-c's `CFrontEnd`, and a thin driver over bstd's served child"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Every buffer, path and record in the allocator passed in.
+blaze-own.workspace = true
+# The driver alone (driver.rs, front.rs): the served child, its channel and deadlines.
+blaze-std.workspace = true
+# The roots a run may see, the mounts that spell them, the read list and its proof.
+blaze-roots.workspace = true
+# The declaration model the dump is read into, and the `CFrontEnd` seam front.rs implements.
+blaze-c.workspace = true
+# A file's digest as the read list holds it (BLAKE3, blaze-roots' `Digest`).
+blaze-blake3.workspace = true
+
+[dev-dependencies]
+# Property tests and planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

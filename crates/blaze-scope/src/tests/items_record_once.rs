@@ -5,7 +5,7 @@
 use blaze_mem::{Frame, Tag};
 use blaze_own::{AVec, Alloc, Erased};
 
-use super::items_record::solve_one;
+use super::items_record::{one_file, solve_one};
 use crate::items_record::{ItemsRecord, ItemsRecordError, encode};
 use crate::resolve::aligned;
 
@@ -49,7 +49,7 @@ fn a_row_read_checks_no_string_again() {
     let frame = frame();
     let erased = Erased::new(&frame);
     let g = erased.handle();
-    let record = ItemsRecord::open(record_bytes(g), g).unwrap_or_else(|e| panic!("open: {e:?}"));
+    let record = one_file(record_bytes(g), TEXT, g);
     let (mut rows, mut named, mut foreign) = (0u64, 0u64, 0u64);
     for _ in 0..100 {
         for i in 0..record.items() {

@@ -12,7 +12,10 @@
 //!
 //! **What the table costs.** `nodes x symbols x size_of::<Node>()` bytes, the nodes counted
 //! exactly by [`nodes_for`] (one per distinct prefix, the root's included). The rules' table is
-//! 207 nodes over 107 symbols at one byte, 22,149 bytes; before the `ambient-hasher` rows it was
+//! 207 nodes over 126 symbols at one byte, 26,082 bytes (the 5 lock types `lock-without-reason`
+//! dispatches on added symbols, not nodes); at 121 symbols it was 25,047 bytes (the 14 words
+//! `process-static` and `sans-io-core` dispatch on added symbols too); at 107, 22,149 bytes, and
+//! before the `ambient-hasher` rows it was
 //! 147 nodes over 95 symbols, 13,965 bytes. (Counted by hand from `sequences::SEQS`; the build
 //! checks the count, and `rule_trie_equals_a_scan_per_sequence` the table.) `nodes_for` was once
 //! the bound `1 + total symbols` (284 now), used only to size a first build; that bound, not the
@@ -20,7 +23,7 @@
 //!
 //! A node number is a byte while the table has at most 254 nodes, and the hot path is fastest so:
 //! a token costs one load of the root's row ([`Trie::starts`]) and one per live state, the same
-//! loads at any width, but a byte halves every row (107 bytes, two cache lines, against 214 and
+//! loads at any width, but a byte halves every row (121 bytes, two cache lines, against 242 and
 //! four) and the whole table, so more of what tokens reach stays in L1. Past 254 nodes the build
 //! fails at compile time (`Trie::build`'s assert) and [`Node`] becomes `u16`: every place that
 //! stores, compares or indexes a node goes through `Node` and [`DEAD`], so that is the one line

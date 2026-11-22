@@ -17,7 +17,6 @@ blaze-file-items	1	0	0	0	0
 blaze-ladder	126	0	0	0	0
 blaze-launch-rt	1	0	0	0	0
 blaze-launcher	0	1	0	0	0
-blaze-llvm	1	0	0	0	0
 blaze-lower	7	0	0	0	0
 # RT1 (2026-11-17): src/root_tests.rs `a_leaked_root_gives_static_handles`, the one test of the leak form itself.
 blaze-mem	0	0	0	0	1

@@ -99,7 +99,7 @@ impl Host {
     pub(crate) const THIS: Host = if cfg!(target_os = "linux") { Host::Linux } else { Host::Macos };
 
     /// A test sandbox exists here (macOS `sandbox_init`; Linux's is not built: test.md piece 9).
-    const fn has_sandbox(self) -> bool {
+    pub(crate) const fn has_sandbox(self) -> bool {
         match self {
             Host::Macos => true,
             Host::Linux => false,

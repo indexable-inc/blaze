@@ -4,6 +4,7 @@
 //! every module, so that no module imports from one built on it.
 
 mod board;
+mod limits;
 mod observe;
 mod search;
 mod tape;

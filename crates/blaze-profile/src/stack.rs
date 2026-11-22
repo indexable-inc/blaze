@@ -115,24 +115,18 @@ static PIPE: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
 pub(crate) fn ready() -> bool {
     static MADE: std::sync::Once = std::sync::Once::new();
     MADE.call_once(|| {
-        let mut fds = [0; 2];
-        // SAFETY: `fds` is live for the call to fill with two descriptors.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return;
-        }
-        for fd in fds {
-            // SAFETY: integer calls on a descriptor just made, owned by this module.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            // SAFETY: as above.
-            let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != -1
-                // SAFETY: as above.
-                && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != -1;
-            if !set {
+        let Ok((read, write)) = blaze_sys::posix::io::pipe() else { return };
+        let read = read.into_raw();
+        let write = write.into_raw();
+        for fd in [read, write] {
+            if blaze_sys::posix::io::set_nonblocking(blaze_sys::Fd::new(fd), true).is_err()
+                || blaze_sys::posix::io::set_close_on_exec(blaze_sys::Fd::new(fd), true).is_err()
+            {
                 return;
             }
         }
-        PIPE[0].store(fds[0], Ordering::Release);
-        PIPE[1].store(fds[1], Ordering::Release);
+        PIPE[0].store(read, Ordering::Release);
+        PIPE[1].store(write, Ordering::Release);
     });
     PIPE[1].load(Ordering::Acquire) >= 0
 }
@@ -154,7 +148,7 @@ pub(crate) fn probe(at: u64) -> bool {
     }
     // SAFETY: `write` copies from `at` in the kernel, which checks the range and fails with
     // `EFAULT` where it is not readable: this process's memory is never touched by user code.
-    let wrote = unsafe { libc::write(write, at as usize as *const libc::c_void, 16) };
+    let wrote = unsafe { libc::write(write, at as usize as *const core::ffi::c_void, 16) };
     let mut drained = [0u8; 16];
     if wrote > 0 {
         // SAFETY: `drained` is live for the call and 16 bytes long.

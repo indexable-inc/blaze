@@ -526,7 +526,7 @@ impl<A: Allocator + Clone> Chunk<A> {
     }
 
     /// Text `i` of the page.
-    fn text_at(text: &[u8], ends: &[u32], i: usize) -> Range<usize> {
+    fn text_at(_text: &[u8], ends: &[u32], i: usize) -> Range<usize> {
         let start = if i == 0 { 0 } else { ends[i - 1].widen_to::<usize>() };
         start..ends[i].widen_to::<usize>()
     }

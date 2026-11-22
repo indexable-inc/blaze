@@ -8,7 +8,7 @@
 //! THE ONE HOME. Where a body's check finishes clean (front2 body_reads.rs: `check_body_asked`,
 //! the build's path, where its read list's digest is filed; and `check_body_filed`, the records
 //! path of `blaze check`, project.rs), each closure of its record is filed here
-//! ([`ClosureRows::file`]): its kind and its signature copied into the head store's type table,
+//! ([`ClosureRows::file`]): its kind, signature and proven capture tuple in the head store's type table,
 //! in the owner's parameters (`Param(i)` stays `Param(i)`, as `ClosureFacts` is read: the
 //! closure type's `args[i]`). The world's `closure` answers from this table
 //! ([`ClosureRows::get`]); the answer is a question of the checker (`Question::Closure`), so it
@@ -32,12 +32,12 @@ use blaze_own::Vec;
 use blaze_typeck as tc;
 use blaze_typeck::{ClosureKind, ItemKey, PNode, PTy, PortableTys};
 
-/// One closure of a checked body: its kind and its signature (a `FnPtr`) in the store's
-/// table, or why the signature could not be copied.
+/// One closure of a checked body: kind, signature and optional exact capture tuple
+/// in the store's table, or why its facts could not be copied.
 #[derive(Clone, Copy, Debug)]
 struct Row {
     ordinal: u32,
-    got: Result<(ClosureKind, PTy), RowRefusal>,
+    got: Result<(ClosureKind, PTy, Option<PTy>), RowRefusal>,
 }
 
 /// Why a closure's row holds no signature.
@@ -100,8 +100,18 @@ impl<A: Allocator + Clone> ClosureRows<A> {
         let first = self.rows.len() as u32;
         let kinds = checked.closures.column::<1>();
         for ordinal in 0..count {
+            // The capture tuple is the record's own (`Checked::closures` column 3: the captured
+            // places' stored types, blaze-typeck capture_places.rs), the one the owner's solver
+            // read; the layout's environment is the whole-binding rows, which a place capture
+            // is not (rule 30: one answer in the owner and out of it).
             let got = match blaze_build::layout::closure_facts(body, checked, ordinal, generics, into, scratch) {
-                Ok((_, sig, _)) => Ok((kinds[ordinal as usize], sig)),
+                Ok((_, sig, _)) => match checked.closures.column::<3>()[ordinal as usize] {
+                    None => Ok((kinds[ordinal as usize], sig, None)),
+                    Some(upvars) => match places_env(body, checked, ordinal, upvars, into, scratch) {
+                        Ok(env) => Ok((kinds[ordinal as usize], sig, Some(env))),
+                        Err(e) => Err(RowRefusal::Copy(build_error_text(&e))),
+                    },
+                },
                 Err(e) => Err(RowRefusal::Copy(build_error_text(&e))),
             };
             self.rows.push(Row { ordinal, got });
@@ -111,6 +121,10 @@ impl<A: Allocator + Clone> ClosureRows<A> {
 
     /// The kind and signature (in the store's table) of closure `ordinal` of `owner`.
     pub fn get(&self, owner: ItemKey, ordinal: u32) -> Result<(ClosureKind, PTy), Missing> {
+        self.with_captures(owner, ordinal).map(|(kind, sig, _)| (kind, sig))
+    }
+
+    pub(super) fn with_captures(&self, owner: ItemKey, ordinal: u32) -> Result<(ClosureKind, PTy, Option<PTy>), Missing> {
         let Ok(at) = self.owners.binary_search_by_key(&owner, |o| o.0) else {
             return Err(Missing::NotChecked);
         };
@@ -140,6 +154,47 @@ fn param_count(v: tc::PTys<'_>) -> u32 {
         }
     }
     n
+}
+
+/// Closure `ordinal`'s capture tuple `upvars` (its record's column 3) copied as written into
+/// `into`, in the owner's parameters: the identity substitution blaze-build `layout::
+/// closure_facts` copies the signature through (`Param(i)` stays `Param(i)`), made the same way
+/// from the closure's own type.
+fn places_env(
+    body: &tc::BodyView<'_>,
+    checked: &tc::Checked<'_>,
+    ordinal: u32,
+    upvars: PTy,
+    into: &mut PortableTys<'_>,
+    scratch: blaze_own::Alloc<'_>,
+) -> Result<PTy, blaze_build::BuildError> {
+    let malformed = blaze_build::BuildError::Malformed {
+        what: "a closure's checked type does not identify its owner, ordinal and generic arguments",
+    };
+    let from = checked.types.view();
+    let Some(&e) = checked.closures.column::<0>().get(ordinal as usize) else {
+        return Err(malformed);
+    };
+    let Some(&ty) = checked.expr_ty.get(e.ix()) else {
+        return Err(malformed);
+    };
+    let Ok(PNode::Closure { args, .. }) = from.node(ty) else {
+        return Err(malformed);
+    };
+    let Ok(identity) = from.list(args) else {
+        return Err(malformed);
+    };
+    let mut params: Vec<PTy, blaze_own::Alloc<'_>> = Vec::with_capacity_in(identity.len(), scratch);
+    for &arg in identity {
+        let Ok(node) = from.node(arg) else {
+            return Err(malformed);
+        };
+        let Ok(p) = into.intern(node) else {
+            return Err(blaze_build::BuildError::Malformed { what: "a closure's facts table is full" });
+        };
+        params.push(p);
+    }
+    blaze_build::copy_written(from, upvars, &params, body, into, scratch)
 }
 
 /// The refusal's static text: `copy_written` refuses with `Malformed` or `UnsupportedSig`, each

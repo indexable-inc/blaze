@@ -62,6 +62,15 @@ fn lower_and_check_with(
     text: &str,
     types: &mut dyn Types,
 ) -> (blaze_typeck::Checked<'static>, std::vec::Vec<blaze_typeck::Range>, ExprId) {
+    try_lower_and_check_with(fx, owner, text, types).unwrap_or_else(|e| panic!("check refused {e:?} in\n{text}"))
+}
+
+fn try_lower_and_check_with(
+    fx: &blaze_typeck::fixture::Fx,
+    owner: ItemKey,
+    text: &str,
+    types: &mut dyn Types,
+) -> Result<(blaze_typeck::Checked<'static>, std::vec::Vec<blaze_typeck::Range>, ExprId), blaze_typeck::CheckError> {
     let alloc = Alloc::global();
     let lowered = match lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc) {
         Ok(l) => l,
@@ -78,9 +87,9 @@ fn lower_and_check_with(
     let c = match check(&bv, fx, &mut cx, &Needs::new_in(alloc), alloc) {
         Ok(Outcome::Done(c)) => c,
         Ok(Outcome::Need(n)) => panic!("{text}: the world missed {:?}", n.questions),
-        Err(e) => panic!("check refused {e:?} in\n{text}"),
+        Err(e) => return Err(e),
     };
-    (c, body.expr_ranges.iter().copied().collect(), bv.root)
+    Ok((c, body.expr_ranges.iter().copied().collect(), bv.root))
 }
 
 /// Every expression as `text => type`, one a line, in the record's order: a desugaring's node
@@ -168,6 +177,265 @@ fn byte_literals_are_u8() {
 8: { match b { b'a' => b'A', _ => [b'x', b'y'][0], } } => u8
 ";
     assert_eq!(lines, want);
+}
+
+fn pinned_future_world() -> blaze_typeck::fixture::Fx {
+    use blaze_typeck::{FnPtrHeader, LangItem, List, Name, PNode};
+    use std::vec;
+
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, vec![], &[]);
+    fx.lang(LangItem::Copy, copy);
+    let unsize = fx.tr("Unsize", 2, vec![], &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let coerce = fx.tr("CoerceUnsized", 2, vec![], &[]);
+    fx.lang(LangItem::CoerceUnsized, coerce);
+    let send = fx.tr("Send", 1, vec![], &[]);
+    fx.auto(send);
+    fx.lang(LangItem::Send, send);
+    let future = fx.tr("Future", 1, vec![], &["Output"]);
+    fx.lang(LangItem::Future, future);
+
+    let (t, u, byte) = (fx.param(0), fx.param(1), fx.u8());
+    let word = fx.strukt("Word", 0, &[("byte", byte)]);
+    let word = fx.adt(word, &[]);
+    let args = fx.list(&[t, byte]);
+    let callback = fx.ty(PNode::FnPtr(args, FnPtrHeader::RUST));
+    fx.func("make", 1, &[callback], t, vec![]);
+
+    let boxed = fx.strukt("Box", 1, &[]);
+    let pin = fx.strukt("Pin", 1, &[("pointer", t)]);
+    let (box_t, box_u) = (fx.adt(boxed, &[t]), fx.adt(boxed, &[u]));
+    let pointee_unsizes = fx.bound(unsize, &[t, u]);
+    let box_impl = fx.imp("box_unsize", 2, box_t, Some((coerce, &[box_u])), &[], vec![pointee_unsizes]);
+    fx.unsized_param(box_impl, 0);
+    fx.unsized_param(box_impl, 1);
+    let (pin_t, pin_u) = (fx.adt(pin, &[t]), fx.adt(pin, &[u]));
+    let pointer_coerces = fx.bound(coerce, &[t, u]);
+    fx.imp("pin_unsize", 2, pin_t, Some((coerce, &[pin_u])), &[], vec![pointer_coerces]);
+    let concrete = fx.adt(pin, &[box_t]);
+    let inherent = fx.imp("Box<T>", 1, box_t, None, &[], vec![]);
+    fx.impl_fn(inherent, "pin", false, &[t], concrete);
+
+    let principal = fx.ty(PNode::ExTrait(future, List::EMPTY));
+    let auto = fx.ty(PNode::ExAuto(send));
+    let mut alias = |name, term, send| {
+        let output = fx.ty(PNode::ExProj { trait_: future, name: Name::of("Output"), args: List::EMPTY, term });
+        let rows = [principal, output, auto];
+        let obj = fx.t.dynamic(&rows[..if send { 3 } else { 2 }]).expect("future object");
+        let erased = fx.adt(boxed, &[obj]);
+        let target = fx.adt(pin, &[erased]);
+        fx.type_alias_item(name, 0, target);
+        target
+    };
+    let target = alias("Pinned", word, true);
+    let local = alias("Local", word, false);
+    let other = alias("Other", byte, true);
+    fx.func("example", 0, &[], target, vec![]);
+    fx.func("drop_send", 0, &[target], local, vec![]);
+    fx.func("add_send", 0, &[local], target, vec![]);
+    fx.func("change_output", 0, &[target], other, vec![]);
+    fx.finish();
+    fx
+}
+
+/// `Token` models a thread-bound value. It can be constructed while polling a Send
+/// future, but the unpolled future cannot own one, and a pending future cannot save one.
+fn future_witness_world() -> blaze_typeck::fixture::Fx {
+    use blaze_typeck::{Def, ImplPolarity, LangItem, Mutbl};
+    let mut fx = pinned_future_world();
+    let send = fx.key_of("Send");
+    let future = fx.key_of("Future");
+    let token = fx.strukt("Token", 0, &[]);
+    let token = fx.adt(token, &[]);
+    let negative = fx.imp("impl !Send for Token", 0, token, Some((send, &[])), &[], std::vec![]);
+    fx.set_polarity(negative, ImplPolarity::Negative);
+    let unit = fx.unit();
+    fx.func("token", 0, &[], token, std::vec![]);
+    fx.func("consume", 0, &[token], unit, std::vec![]);
+    let f = fx.param(0);
+    let is_send = fx.bound(send, &[f]);
+    fx.func("spawn", 1, &[f], unit, std::vec![is_send]);
+    fx.func("check_spawn", 0, &[], unit, std::vec![]);
+    let sync = fx.tr("Sync", 1, std::vec![], &[]);
+    fx.lang(LangItem::Sync, sync);
+    fx.auto(sync);
+    let is_sync = fx.bound(sync, &[f]);
+    let reference = fx.r(Mutbl::Not, f);
+    fx.imp("Send for &T where T: Sync", 1, reference, Some((send, &[])), &[], std::vec![is_sync]);
+    let borrowed = fx.r(Mutbl::Not, token);
+    fx.func("observe", 0, &[borrowed], unit, std::vec![]);
+    let word = fx.adt(fx.key_of("Word"), &[]);
+    fx.func("word", 0, &[], word, std::vec![]);
+
+    let pending = fx.strukt("Tick", 0, &[]);
+    let tick = fx.adt(pending, &[]);
+    fx.func("tick", 0, &[], tick, std::vec![]);
+    fx.imp("Future for Tick", 0, tick, Some((future, &[])), &[("Output", unit)], std::vec![]);
+    fx.imp("Future for Token", 0, token, Some((future, &[])), &[("Output", unit)], std::vec![]);
+    let into = fx.tr("IntoFuture", 1, std::vec![], &["Output", "IntoFuture"]);
+    fx.lang(LangItem::IntoFuture, into);
+    let held = fx.alias(into, "IntoFuture", &[f]);
+    let method = fx.trait_fn(into, "into_future", true, &[f], held);
+    fx.lang_def(LangItem::IntoFutureIntoFuture, Def::Fn(method));
+    let output = fx.alias(future, "Output", &[f]);
+    let is_future = fx.bound(future, &[f]);
+    fx.imp("IntoFuture for F", 1, f, Some((into, &[])), &[("IntoFuture", f), ("Output", output)], std::vec![is_future]);
+    fx.finish();
+    fx
+}
+
+#[test]
+fn a_future_without_await_stores_its_captures_only() {
+    use blaze_typeck::{DiagCode, PNode};
+    let fx = future_witness_world();
+    let owner = fx.key_of("example");
+    let text = "fn example() -> Pinned { Box::pin(async { consume(token()); word() }) }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+    let types = checked.types.view();
+    let witnesses: std::vec::Vec<_> = checked.expr_ty.iter().filter_map(|&t| match types.node(t).unwrap() {
+        PNode::Future(_, _, witness) => Some(types.node(witness).unwrap()),
+        _ => None,
+    }).collect();
+    assert!(!witnesses.is_empty());
+    assert!(witnesses.iter().all(|w| *w == PNode::Tuple(blaze_typeck::List::EMPTY)), "{witnesses:?}");
+
+    let text = "fn example() -> Pinned { let x = token(); Box::pin(async move { consume(x); word() }) }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    let codes: std::vec::Vec<_> = checked.diags.iter().map(|d| d.code).collect();
+    assert_eq!(codes, [DiagCode::Unsatisfied], "{:?}", checked.diags);
+
+    // Producing a !Send value on the polling thread does not store it in the future.
+    let owner = fx.key_of("check_spawn");
+    let text = "fn check_spawn() { spawn(async { token() }); }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+
+    // Returning a captured non-Copy binding moves it into the unpolled future,
+    // even without an explicit `move`.
+    let text = "fn check_spawn() { let held = token(); spawn(async { held }); }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    let codes: std::vec::Vec<_> = checked.diags.iter().map(|d| d.code).collect();
+    assert_eq!(codes, [DiagCode::Unsatisfied], "{:?}", checked.diags);
+
+    // This future only borrows Token. Sending &Token requires Token: Sync.
+    let text = "fn check_spawn() { let held = token(); spawn(async { observe(&held); }); }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+
+    // The async call has already taken its argument before the first poll,
+    // including when the body never reads the argument.
+    let text = "fn check_spawn() { let f = async |_unused| word(); spawn(f(token())); }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    let codes: std::vec::Vec<_> = checked.diags.iter().map(|d| d.code).collect();
+    assert_eq!(codes, [DiagCode::Unsatisfied], "{:?}", checked.diags);
+}
+
+/// The initial state can cross threads before it is polled. Consuming a capture
+/// before the first await cannot make an initially !Send future Send.
+#[test]
+fn a_suspending_future_owns_its_move_capture_before_the_first_poll() {
+    let fx = future_witness_world();
+    let owner = fx.key_of("check_spawn");
+    let text = "fn check_spawn() { let held = token(); spawn(async move { consume(held); tick().await; }); }";
+    let (checked, _, _) = lower_and_check(&fx, owner, text);
+    let codes: std::vec::Vec<_> = checked.diags.iter().map(|d| d.code).collect();
+    assert_eq!(codes, [blaze_typeck::DiagCode::Unsatisfied], "{:?}", checked.diags);
+}
+
+#[test]
+fn boxed_coercion_replays_the_target_against_the_suspension_witness() {
+    use blaze_typeck::{DiagCode, List, PNode, check_deferring, decide_stalled};
+    let alloc = Alloc::global();
+    let fx = future_witness_world();
+    let owner = fx.key_of("example");
+    for (body, pending, saved_local) in [
+        ("let x = token(); consume(x); tick().await; word()", "Tick", false),
+        ("let x = token(); tick().await; consume(x); word()", "Tick", true),
+        ("token().await; word()", "Token", false),
+    ] {
+        let text = std::format!("fn example() -> Pinned {{ Box::pin(async {{ {body} }}) }}");
+        let lowered = lower_body(&text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc).expect("no cfg");
+        let mut tys = PortableTys::new_in(alloc);
+        let body = to_typeck(&lowered.view(), owner, &mut tys, &mut NoTypes, alloc).expect("lowered body");
+        let view = body.view(tys.view());
+        let mut cx = InferCtx::new_in(alloc);
+        let Outcome::Done(checked) = check_deferring(&view, &fx, &mut cx, &Needs::new_in(alloc), alloc).expect("defer the coercion") else {
+            panic!("fixture missed a question");
+        };
+        assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+        assert_eq!(checked.stalled.len(), 1);
+        let block = view.exprs.iter().position(|e| matches!(e, blaze_typeck::Expr::AsyncBlock { .. })).expect("async block");
+        let block = blaze_typeck::ExprId(block as u32);
+        // The flow writer supplies the pending operand and any local saved on suspension.
+        let mut out = checked.types.fork_in(alloc).unwrap();
+        let awaited = out.intern(PNode::Adt(fx.key_of(pending), List::EMPTY)).unwrap();
+        let token = out.intern(PNode::Adt(fx.key_of("Token"), List::EMPTY)).unwrap();
+        let parts = [awaited, token];
+        let list = out.intern_list(&parts[..if saved_local { 2 } else { 1 }]).unwrap();
+        let witness = out.intern(PNode::Tuple(list)).unwrap();
+        let findings = decide_stalled(&view, &checked, out.view(), &[(block, witness)], &fx, alloc).expect("replay the coercion");
+        let holds_token = saved_local || pending == "Token";
+        assert_eq!(findings.len(), usize::from(holds_token), "{findings:?}");
+        if holds_token {
+            assert_eq!(findings[0].code, DiagCode::Unsatisfied);
+            let site = findings[0].at;
+            assert!(text[site.start as usize..site.end as usize].contains("Box::pin"), "{site:?}");
+        } else {
+            let record = checked.types.view();
+            let PNode::Future(_, _, provisional) = record.node(checked.expr_ty[block.0 as usize]).unwrap() else {
+                panic!("expected the block's future");
+            };
+            // Plant the old witness, which includes Token even after its move.
+            let wrong = decide_stalled(&view, &checked, out.view(), &[(block, provisional)], &fx, alloc).unwrap();
+            assert_eq!(wrong.as_slice(), &[checked.stalled[0].diag]);
+            assert_eq!(wrong[0].code, DiagCode::Unsatisfied);
+        }
+    }
+}
+
+/// The equality on an erased future's Output types the block before its tail
+/// is checked. Here the callback's field access needs that information at
+/// the call, and the completed concrete future still needs to unsize.
+#[test]
+fn boxed_async_output_types_a_callback_in_the_body() {
+    use blaze_typeck::AdjustKind;
+    let fx = pinned_future_world();
+    let owner = fx.key_of("example");
+    let text = "fn example() -> Pinned { Box::pin(async { make(|value| value.byte) }) }";
+    let (checked, ranges, _) = lower_and_check(&fx, owner, text);
+    assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+    let sites: std::vec::Vec<_> = checked.adjusts.column::<0>().iter().zip(checked.adjusts.column::<1>())
+        .filter_map(|(e, k)| {
+            let r = ranges[e.0 as usize];
+            (*k == AdjustKind::Unsize).then_some(&text[r.start as usize..r.end as usize])
+        })
+        .collect();
+    assert_eq!(sites, ["Box::pin(async { make(|value| value.byte) })"]);
+    // Changing only the field exercises the same inferred callback parameter.
+    let wrong = "fn example() -> Pinned { Box::pin(async { make(|value| value.other) }) }";
+    let (checked, _, _) = lower_and_check(&fx, owner, wrong);
+    assert_eq!(findings(wrong, &checked), [(blaze_typeck::DiagCode::NoField, "value.other")]);
+}
+
+#[test]
+fn a_boxed_future_upcast_preserves_output_and_can_drop_send() {
+    use blaze_typeck::{AdjustKind, DiagCode};
+    let fx = pinned_future_world();
+    let text = "fn drop_send(x: Pinned) -> Local { x }";
+    let (c, _, _) = lower_and_check(&fx, fx.key_of("drop_send"), text);
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    assert_eq!(c.adjusts.column::<1>(), &[AdjustKind::Unsize]);
+    for (name, text) in [
+        ("add_send", "fn add_send(x: Local) -> Pinned { x }"),
+        ("change_output", "fn change_output(x: Pinned) -> Other { x }"),
+    ] {
+        let (c, _, _) = lower_and_check(&fx, fx.key_of(name), text);
+        assert_eq!(findings(text, &c), [(DiagCode::Mismatch, "x")]);
+    }
 }
 
 const LETS: &str = "fn pick(reach: Reach, o: Option<u32>) -> u32 {
@@ -319,6 +587,49 @@ fn show_for_ref_str_needs_the_impls_question_sized() {
     assert_eq!(codes, [blaze_typeck::DiagCode::Unsatisfied], "{:?}", c.diags);
 }
 
+/// The Reference, "Trait object types": "the trait object implements the base trait, its auto
+/// traits, and any supertraits of the base trait." Probe the erased pointee itself, as the
+/// `Send` impl of a pointer to a future must. Changing only the object's bounds changes the
+/// answer. The solver's `control_dyn_undecided_as_no` covers an unavailable principal verdict.
+#[test]
+fn an_erased_future_satisfies_its_listed_or_inherited_auto_trait() {
+    use blaze_typeck::{DiagCode, LangItem, List, Mutbl, Name, PNode};
+    use std::{vec, vec::Vec};
+
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let unit = fx.unit();
+    let t = fx.param(0);
+    let send = fx.tr("Send", 1, vec![], &[]);
+    fx.lang(LangItem::Send, send);
+    fx.auto(send);
+    let send_t = fx.bound(send, &[t]);
+    let future = fx.tr("Future", 1, vec![], &["Output"]);
+    fx.lang(LangItem::Future, future);
+    let future_t = fx.bound(future, &[t]);
+    let task = fx.tr("Task", 1, vec![future_t, send_t], &[]);
+    let r_t = fx.r(Mutbl::Not, t);
+    // No Sized lang item in this world: require<T: ?Sized + Send>(_: &T).
+    fx.func("require", 1, &[r_t], unit, vec![send_t]);
+
+    let base = fx.ty(PNode::ExTrait(future, List::EMPTY));
+    let sub = fx.ty(PNode::ExTrait(task, List::EMPTY));
+    let output = fx.ty(PNode::ExProj { trait_: future, name: Name::of("Output"), args: List::EMPTY, term: unit });
+    let auto = fx.ty(PNode::ExAuto(send));
+    for (name, text, predicates, wanted) in [
+        ("listed", "fn listed(x: &(dyn Future<Output = ()> + Send)) { require(x); }", &[base, output, auto][..], &[][..]),
+        ("inherited", "fn inherited(x: &dyn Task<Output = ()>) { require(x); }", &[sub, output][..], &[][..]),
+        ("absent", "fn absent(x: &dyn Future<Output = ()>) { require(x); }", &[base, output][..], &[DiagCode::Unsatisfied][..]),
+    ] {
+        let object = fx.t.dynamic(predicates).expect("one principal and one Output binding");
+        let reference = fx.r(Mutbl::Not, object);
+        let owner = fx.func(name, 0, &[reference], unit, vec![]);
+        fx.finish();
+        let (checked, _, _) = lower_and_check(&fx, owner, text);
+        let codes: Vec<_> = checked.diags.iter().map(|diag| diag.code).collect();
+        assert_eq!(codes, wanted, "{text}: {:?}", checked.diags);
+    }
+}
+
 const SUM: &str = "fn sum(xs: &[u32]) -> u32 {
     let mut t = 0;
     for i in 0..xs.len() {
@@ -408,6 +719,95 @@ const CLOSURE_SUM: &str = "fn sum() -> u32 {
     add(1u32, 2u32) + f(2)
 }";
 
+/// `type Callback<I, O> = &'static dyn Fn(I) -> O; struct Wrap(Callback<u8, u32>);`
+/// The Reference, "Type aliases": "A type alias defines a new name for an existing type."
+/// The call's input is the object's tuple argument, its result the object's FnOnce::Output.
+#[test]
+fn applied_alias_in_a_nongeneric_callable_field() {
+    use blaze_typeck::{CheckError, LangItem, Malformed, Mutbl, Name, PNode};
+    use std::vec;
+
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let sized = fx.tr("Sized", 1, vec![], &[]);
+    fx.lang(LangItem::Sized, sized);
+    let once = fx.tr("FnOnce", 2, vec![], &["Output"]);
+    fx.lang(LangItem::FnOnce, once);
+    let parent = fx.bound(once, &[p0, p1]);
+    let mutable = fx.tr("FnMut", 2, vec![parent], &[]);
+    fx.lang(LangItem::FnMut, mutable);
+    let parent = fx.bound(mutable, &[p0, p1]);
+    let callable = fx.tr("Fn", 2, vec![parent], &[]);
+    fx.lang(LangItem::Fn, callable);
+
+    let object = |fx: &mut blaze_typeck::fixture::Fx, input, output| {
+        let tuple = fx.tuple(&[input]);
+        let args = fx.list(&[tuple]);
+        let principal = fx.ty(PNode::ExTrait(callable, args));
+        let binding = fx.ty(PNode::ExProj { trait_: once, name: Name::of("Output"), args, term: output });
+        let dyn_ty = fx.t.dynamic(&[principal, binding]).expect("valid object bounds");
+        fx.r(Mutbl::Not, dyn_ty)
+    };
+    let alias = object(&mut fx, p0, p1);
+    let (u8_, u32_) = (fx.u8(), fx.u32());
+    let field = fx.t.subst(alias, &[u8_, u32_]).expect("two alias arguments");
+    assert_eq!(field, object(&mut fx, u8_, u32_));
+    let wrap = fx.tuple_strukt("Wrap", 0, &[field]);
+    let receiver = fx.adt(wrap, &[]);
+    let run = fx.func("run", 0, &[receiver], u32_, vec![]);
+    // Plant the original producer defect: both arguments still belong to the alias
+    // when its unapplied RHS is filed as the field of a wrapper with zero parameters.
+    let broken = fx.tuple_strukt("Broken", 0, &[alias]);
+    let receiver = fx.adt(broken, &[]);
+    let control = fx.func("broken", 0, &[receiver], u32_, vec![]);
+    fx.finish();
+    let text = "fn run(w: Wrap) -> u32 { (w.0)(1) }";
+    let (checked, ranges, root) = lower_and_check(&fx, run, text);
+    assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+    let types = checked.types.view();
+    assert_eq!(show(&fx, types, checked.expr_ty[root.0 as usize]), "u32");
+    let literal = ranges.iter().position(|r| &text[r.start as usize..r.end as usize] == "1").expect("argument");
+    assert_eq!(show(&fx, types, checked.expr_ty[literal]), "u8");
+    let result = try_lower_and_check_with(&fx, control, "fn broken(w: Broken) -> u32 { (w.0)(1) }", &mut NoTypes);
+    assert!(matches!(result, Err(CheckError::Malformed(Malformed::Param {
+        index: 0 | 1, args: 0, site: blaze_typeck::ParamSite::Field { owner, adt, field, .. },
+    })) if owner == control && adt == broken && field == Name::of_index(0)));
+}
+
+/// The Reference, "Async blocks": the final expression of the block determines the
+/// result of the future. The call supplies the type of the captured closure parameter.
+#[test]
+fn writeback_exports_a_closure_returning_an_async_block() {
+    use blaze_typeck::{LangItem, PNode, UintTy};
+
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let copy = fx.tr("Copy", 1, std::vec![], &[]);
+    fx.lang(LangItem::Copy, copy);
+    let u8_ = fx.u8();
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], std::vec![]);
+    let unit = fx.unit();
+    let owner = fx.func("run", 0, &[], unit, std::vec![]);
+    fx.finish();
+    let text = "fn run() { let start = |context| async move { context }; let future = start(7u8); }";
+    let (checked, ranges, _) = lower_and_check(&fx, owner, text);
+    assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+    let types = checked.types.view();
+    for expression in ["async move { context }", "start(7u8)"] {
+        // An async block and its inner block share one range (the first node at it is the
+        // inner block, of type `u8`: the first compile, 2026-11-18): the future is the node at
+        // that range whose type is a future, and there must be exactly one.
+        let at_range: std::vec::Vec<_> = ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| &text[r.start as usize..r.end as usize] == expression)
+            .map(|(at, _)| types.node(checked.expr_ty[at]).expect("exported expression"))
+            .collect();
+        let futures: std::vec::Vec<_> = at_range.iter().filter_map(|ty| match ty { PNode::Future(_, output, _) => Some(*output), _ => None }).collect();
+        assert_eq!(futures.len(), 1, "{expression}: one future among the nodes at its range: {at_range:?}");
+        assert_eq!(types.node(futures[0]), Ok(PNode::Uint(UintTy::U8)));
+    }
+}
+
 /// The census' first wrong answer: `a + b` with `a` still a variable (an unannotated closure
 /// parameter) registers `?A: Add<?B>` ambiguous and projects `Output`, as rustc's
 /// `lookup_method_in_trait` (`predicate_may_hold` only); the calls settle them. Before the fix
@@ -427,6 +827,84 @@ fn binop_on_a_closure_parameter_waits_for_the_call() {
     assert!(c.diags.is_empty(), "diagnostics {:?}\n{lines}", c.diags);
     for want in ["a + b => u32", "x + 1u32 => u32", "f(2) => u32", "add(1u32, 2u32) + f(2) => u32"] {
         assert!(lines.contains(want), "no `{want}` in\n{lines}");
+    }
+}
+
+/// In `fn once(f: impl AsyncFnOnce(Arg) -> u8)`, field lookup needs the input
+/// hint before the body is checked. The u8 describes the call future's output.
+#[test]
+fn async_callable_bound_types_the_parameter_and_the_future_output() {
+    use blaze_typeck::{DiagCode, LangItem};
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let once = fx.tr("AsyncFnOnce", 2, std::vec![], &["CallOnceFuture", "Output"]);
+    fx.lang(LangItem::AsyncFnOnce, once);
+    let copy = fx.tr("Copy", 1, std::vec![], &[]);
+    fx.lang(LangItem::Copy, copy);
+    let future = fx.tr("Future", 1, std::vec![], &["Output"]);
+    fx.lang(LangItem::Future, future);
+    let u8_ = fx.u8();
+    let arg = fx.strukt("Arg", 0, &[("value", u8_)]);
+    let arg = fx.adt(arg, &[]);
+    let tuple = fx.tuple(&[arg]);
+    let f = fx.param(0);
+    let bound = fx.bound(once, &[f, tuple]);
+    let output = fx.proj(once, &[f, tuple], "Output", u8_);
+    let unit = fx.unit();
+    fx.func("once", 1, &[f], unit, std::vec![bound, output]);
+    let owner = fx.func("example", 0, &[], unit, std::vec![]);
+    fx.finish();
+
+    let good = "fn example() { once(async |arg| arg.value); }";
+    let (c, ranges, _) = lower_and_check(&fx, owner, good);
+    let lines = typed_lines(&fx, good, &c, &ranges);
+    assert!(c.diags.is_empty(), "{:?}\n{lines}", c.diags);
+    assert!(lines.contains("arg.value => u8"), "{lines}");
+
+    let wrong = "fn example() { once(async |_arg| false); }";
+    let (c, _, _) = lower_and_check(&fx, owner, wrong);
+    assert_eq!(findings(wrong, &c), [(DiagCode::Mismatch, "false")]);
+}
+
+/// `IntoFuture::into_future(self)` and an inherent method taking `self`
+/// both consume a non-Copy capture. A method taking `&self` only reads it.
+#[test]
+fn an_async_closure_consuming_its_await_operand_or_receiver_is_once() {
+    use blaze_typeck::{CaptureKind, ClosureKind, Def, LangItem, Mutbl};
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let unit = fx.unit();
+    let copy = fx.tr("Copy", 1, std::vec![], &[]);
+    fx.lang(LangItem::Copy, copy);
+    let future = fx.tr("Future", 1, std::vec![], &["Output"]);
+    fx.lang(LangItem::Future, future);
+    let into = fx.tr("IntoFuture", 1, std::vec![], &["IntoFuture", "Output"]);
+    fx.lang(LangItem::IntoFuture, into);
+    let p = fx.param(0);
+    let held = fx.alias(into, "IntoFuture", &[p]);
+    let f = fx.trait_fn(into, "into_future", true, &[p], held);
+    fx.lang_def(LangItem::IntoFutureIntoFuture, Def::Fn(f));
+    let output = fx.alias(future, "Output", &[p]);
+    let bound = fx.bound(future, &[p]);
+    fx.imp("impl<F: Future> IntoFuture for F", 1, p, Some((into, &[])),
+        &[("IntoFuture", p), ("Output", output)], std::vec![bound]);
+    let job = fx.strukt("Job", 0, &[]);
+    let job = fx.adt(job, &[]);
+    fx.imp("impl Future for Job", 0, job, Some((future, &[])), &[("Output", unit)], std::vec![]);
+    let imp = fx.imp("impl Job", 0, job, None, &[], std::vec![]);
+    fx.impl_fn(imp, "finish", true, &[job], unit);
+    let borrowed = fx.r(Mutbl::Not, job);
+    fx.impl_fn(imp, "observe", true, &[borrowed], unit);
+    let owner = fx.func("example", 0, &[job], unit, std::vec![]);
+    fx.finish();
+
+    for (text, capture, kind) in [
+        ("fn example(job: Job) { let _f = async || job.await; }", CaptureKind::ByValue, ClosureKind::FnOnce),
+        ("fn example(job: Job) { let _f = async || job.finish(); }", CaptureKind::ByValue, ClosureKind::FnOnce),
+        ("fn example(job: Job) { let _f = async || job.observe(); }", CaptureKind::ByRef, ClosureKind::Fn),
+    ] {
+        let (c, ranges, _) = lower_and_check(&fx, owner, text);
+        assert!(c.diags.is_empty(), "{:?}\n{}", c.diags, typed_lines(&fx, text, &c, &ranges));
+        assert_eq!(c.captures.column::<2>(), &[capture], "{text}");
+        assert_eq!(c.closures.column::<1>(), &[kind], "{text}");
     }
 }
 

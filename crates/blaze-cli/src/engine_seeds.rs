@@ -9,13 +9,14 @@
 //! kept as "what was read" in a request-wide map that only inserts:
 //! - a MEMBER's head: the cell of its outline entry's head task (engine_heads.rs `head_cell`, by
 //!   the item's name), found in that task's record (a payload run is "want bytes, the cell, a
-//!   u32 LE length, then the frozen bytes"). A stretch places a want ONE way ([`StretchHeads`]):
+//!   u32 LE length, then the frozen bytes"; the runs are followed by the task's run facts,
+//!   [`runs_from`]). A stretch places a want ONE way ([`StretchHeads`]):
 //!   engine_heads.rs `Owners::place` over its own names, the function a body's read of the head
 //!   is placed by (engine_bodies.rs `widen`) and a head task lists its cells by
-//!   (`heads_of_crate`), so the cell a body asks is the cell the task defines for THE BODY'S
-//!   OWN UNIT: a head task freezes once a unit that holds its item, one cell a unit (the cell
-//!   holds the unit's crate prefix, engine_heads.rs `head_cell`; lane RU1), so a reader is
-//!   handed bytes frozen under its own unit's keys, never another's (lane EY's annoyance row
+//!   (`heads_of_crate`), so the cell a body asks is the cell of the defining unit in its
+//!   resolved scope. A head task freezes once per unit that holds its item, one cell per unit
+//!   (the cell holds the defining unit's crate prefix, engine_heads.rs `head_cell`; lane RU1),
+//!   so a reader gets bytes frozen under that unit's keys (lane EY's annoyance row
 //!   head-cell-by-checker-key-is-per-unit). A cell whose task froze under other units only is
 //!   refused by path, naming those units (`Lack::OtherUnits`, `SeedError::NotInItsUnit`);
 //! - a DEPENDENCY's head (a crate with no head tasks: core, std, a registry crate): the record
@@ -24,7 +25,7 @@
 //!   nothing of a dependency moves unless its names record does.
 //!
 //! A MEMBER'S HEAD IS NEVER FROZEN BY A BODY: the table holds its head task's run for the
-//! body's unit, or the body is refused, typed, before any freeze (`StretchHeads::known` answers
+//! requested defining unit, or the body is refused, typed, before any freeze (`StretchHeads::known` answers
 //! `Known::Refused`): a head its task ran for and could not freeze is that failure, the task's
 //! own reason quoted (`NotTheirs::Failed`, seeded as the freeze's error: the body is NOT
 //! CHECKED, as `check` leaves it, never a second failure); the engine's own lack fails the
@@ -64,6 +65,7 @@ use blaze_ladder::front2::item_shown::ItemShown;
 use blaze_ladder::front2::source::{NamesSource, Records};
 use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
 use blaze_ladder::front2::tables::seeds::{BodyLocals, MOST_CELLS, RequestHeads, SeedError};
+pub(crate) use blaze_ladder::front2::tables::seeds::RequestSeed as BodySeed;
 use blaze_own::{Alloc, SharedAlloc};
 use blaze_world::crate_list::{CrateGraph, CrateList};
 use bstd::cx::Cx;
@@ -72,7 +74,6 @@ use bstd::mem::Frame;
 use crate::CliError;
 use crate::engine_head_notes::Failed;
 use crate::engine_heads::{HeadAt, Owners, Subjects};
-use crate::run_names::Crate;
 use crate::engine_names::NamesStage;
 use crate::store::{CommandStore, Sharing, Store as _};
 
@@ -157,8 +158,9 @@ pub(crate) struct CrateAt {
     pub(crate) closed: bool,
 }
 
-/// Every crate of `list` by its key's prefix, sorted, with its names record's key.
-pub(crate) fn crates_of(list: &CrateList<'static>, names: &NamesStage<'_>) -> std::vec::Vec<CrateAt, Global> {
+/// Every crate of `list` by its key's prefix, sorted, with its names record's key, by the names
+/// inputs seam (engine_names.rs `NamesInputs`): on the ready driver a crate's standing row's.
+pub(crate) fn crates_of(list: &CrateList<'static>, names: crate::engine_names::NamesInputs<'_, '_>) -> std::vec::Vec<CrateAt, Global> {
     let mut crates = std::vec::Vec::with_capacity_in(CrateGraph::len(list), Global);
     each_crate(list, names, &mut |one| crates.push(one));
     close(list, &mut crates);
@@ -170,17 +172,36 @@ pub(crate) fn crates_of(list: &CrateList<'static>, names: &NamesStage<'_>) -> st
 /// heads, engine_heads_once.rs `HeadsOnce::find_dependencies`).
 pub(crate) fn crates_in(list: &CrateList<'static>, names: &NamesStage<'_>, alloc: SharedAlloc<'static>) -> blaze_own::Vec<CrateAt, SharedAlloc<'static>> {
     let mut crates: blaze_own::Vec<CrateAt, SharedAlloc<'static>> = blaze_own::Vec::new_in(alloc);
-    each_crate(list, names, &mut |one| crates.push(one));
+    // The Heads phases' (the phase path's): the stage's entries alone.
+    each_crate(list, crate::engine_names::NamesInputs::ran(names), &mut |one| crates.push(one));
+    close(list, &mut crates);
+    crates.sort_unstable_by_key(|one| one.prefix);
+    crates
+}
+
+/// Every crate of `list` by its key's prefix, sorted, its names record's key NOT asked
+/// (`names_at` is `None` for every crate): the ready driver's table ([`RequestTable::paged`])
+/// asks a crate's standing names row on the first head of it a body asks
+/// ([`CrateNames::Standing`]), never one row page per crate of the list (piece C).
+pub(crate) fn crates_unasked(list: &CrateList<'static>) -> std::vec::Vec<CrateAt, Global> {
+    let mut crates = std::vec::Vec::with_capacity_in(CrateGraph::len(list), Global);
+    each_crate_by(list, &|_: Name| None::<Key>, &mut |one| crates.push(one));
     close(list, &mut crates);
     crates.sort_unstable_by_key(|one| one.prefix);
     crates
 }
 
 /// Each crate of `list`, in its order (each closed but a member, until [`close`]).
-fn each_crate(list: &CrateList<'static>, names: &NamesStage<'_>, push: &mut dyn FnMut(CrateAt)) {
+fn each_crate(list: &CrateList<'static>, names: crate::engine_names::NamesInputs<'_, '_>, push: &mut dyn FnMut(CrateAt)) {
+    each_crate_by(list, &|name: Name| names.input_of(name).map(|input| input.at), push);
+}
+
+/// Each crate of `list`, in its order, its names record's key from `names_at` (by its
+/// `CrateScope` name).
+fn each_crate_by(list: &CrateList<'static>, names_at: &dyn Fn(Name) -> Option<Key>, push: &mut dyn FnMut(CrateAt)) {
     for at in 0..CrateGraph::len(list) {
         let key = list.key(at);
-        let names_at = names.input_of(blaze_drive::key::crate_scope_name(&key)).map(|input| input.at);
+        let names_at = names_at(blaze_drive::key::crate_scope_name(&key));
         let member = list.member(at);
         push(CrateAt { prefix: key.prefix(), key, names_at, member, closed: !member });
     }
@@ -415,7 +436,7 @@ enum Lack {
     NoTask,
     /// Its head task's record holds no run of that cell.
     NoCell,
-    /// Its head task froze its heads under these units only, none the reader's (lane RU1,
+    /// Its head task froze its heads under these units only, none the requested defining unit (lane RU1,
     /// engine_heads.rs `head_cell`): a typed refusal, never another unit's bytes.
     OtherUnits(Units),
 }
@@ -426,7 +447,7 @@ impl Lack {
             Lack::Failed => "its entry's head task failed",
             Lack::NoTask => "its entry has no head task record",
             Lack::NoCell => "its head task's record holds no such cell",
-            Lack::OtherUnits(_) => "its head task froze it under other units than the reader's",
+            Lack::OtherUnits(_) => "its head task froze it under units other than the requested defining unit",
         }
     }
 }
@@ -452,26 +473,183 @@ enum DependencyRead {
     Bad(&'static str),
 }
 
+/// What the table knows of one head task: its [`HeadEntries`]' answer for a name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeadEntry {
+    /// It froze its heads into the record under this key.
+    Record(Key),
+    /// It failed (this request, or when it last ran and stands).
+    Failed,
+    /// No head task with a record: none planned today, no row, or a head no unit holds
+    /// (engine_heads.rs `no_units_out`).
+    None,
+}
+
+/// How the table finds a head task's row (rule 78: one seam, two strategies, one answer). The
+/// phase path builds every planned head task's entry before its Bodies phase; the ready path
+/// finds the one a body asks, on the stored answer's own page of that row, on its first ask. Each
+/// gives the same answer for every name: tests/engine_ready_edit_tests.rs checks the ready edit
+/// (paged) against the phase path (built) byte for byte, over an edit whose body reads member
+/// heads, and its control plants a paged miss (`CommitPlant::PagedHeadsMiss`).
+pub(crate) enum HeadEntries<'p> {
+    /// From the whole plan (the phase path): each head task with a record, sorted by name, and
+    /// each that failed, sorted.
+    Built { entries: std::vec::Vec<(Name, Key), Global>, failed: std::vec::Vec<Name, Global> },
+    /// On first ask, from the stored answer's pages (the ready path).
+    Paged(PagedHeads<'p>),
+}
+
+impl HeadEntries<'_> {
+    /// `name`'s entry.
+    fn entry(&self, name: Name) -> HeadEntry {
+        match self {
+            HeadEntries::Built { entries, failed } => match entries.binary_search_by_key(&name, |(one, _)| *one) {
+                Ok(at) => HeadEntry::Record(entries[at].1),
+                Err(_) if failed.binary_search(&name).is_ok() => HeadEntry::Failed,
+                Err(_) => HeadEntry::None,
+            },
+            HeadEntries::Paged(paged) => paged.entry(name),
+        }
+    }
+
+    /// The head tasks with a record the table holds: every planned one built, or those found
+    /// so far paged (the profile's `table of N head tasks`).
+    fn count(&self) -> u32 {
+        match self {
+            HeadEntries::Built { entries, .. } => u32::try_from(entries.len()).unwrap_or(u32::MAX),
+            HeadEntries::Paged(paged) => paged.records.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The first row a paged lookup could not take (rule 3: the request's error after its drive,
+    /// as the built table's [`RequestTable::build`] stops at once); `None` when built.
+    fn fault(&self) -> Option<&'static str> {
+        match self {
+            HeadEntries::Built { .. } => None,
+            HeadEntries::Paged(paged) => paged.fault.get().copied(),
+        }
+    }
+}
+
+/// The ready path's planted bug for [`PagedHeads`] (rule 23): `Misses` answers every name
+/// [`HeadEntry::None`], so a body reading a member head is refused and the answer moves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PagedPlant {
+    None,
+    Misses,
+}
+
+/// The ready path's head entries: a head task's row read where the stored answer keeps it, on
+/// the first ask (blaze-engine `StoredPages::header`, from the row's own page: the ready path's
+/// header index is absent, engine_check.rs `checking`). No head task enters on the ready path
+/// (engine_ready_edit.rs `admit`), so the stored row is today's: a row is planned today when its
+/// file is not edited (the file's plan digest stands) or an edited file's plan lists it.
+pub(crate) struct PagedHeads<'p> {
+    pages: &'p dyn blaze_engine::StoredPages,
+    /// Today's plan of each edited file (the engine's `Edit`), a deleted one's empty.
+    files: &'p [(Name, &'p [Planned])],
+    found: blaze_core::SharedMap<Name, HeadEntry, SharedAlloc<'static>>,
+    records: AtomicU32,
+    fault: std::sync::OnceLock<&'static str>,
+    plant: PagedPlant,
+}
+
+impl<'p> PagedHeads<'p> {
+    pub(crate) fn new(pages: &'p dyn blaze_engine::StoredPages, files: &'p [(Name, &'p [Planned])], plant: PagedPlant, heap: &'static blaze_own::Heap) -> PagedHeads<'p> {
+        PagedHeads { pages, files, found: blaze_core::SharedMap::new_in("engine.head task rows found on the stored answer's pages", heap.shared()), records: AtomicU32::new(0), fault: std::sync::OnceLock::new(), plant }
+    }
+
+    /// `name`'s entry, read once a request.
+    fn entry(&self, name: Name) -> HeadEntry {
+        if let Some(found) = self.found.pin().get(&name).copied() {
+            return found;
+        }
+        let read = self.read(name);
+        match self.found.pin().try_insert(name, read) {
+            Ok(_) => {
+                if matches!(read, HeadEntry::Record(_)) {
+                    self.records.fetch_add(1, Ordering::Relaxed);
+                }
+                read
+            }
+            Err(occupied) => *occupied.current,
+        }
+    }
+
+    /// [`HeadEntries::Built`]'s answer for `name`, from its stored row: a planned `Signature`
+    /// task's row, failed, or holding a record (one no unit holds holds none).
+    fn read(&self, name: Name) -> HeadEntry {
+        if name.kind != Kind::Signature || self.plant == PagedPlant::Misses {
+            return HeadEntry::None;
+        }
+        let header = match self.pages.header(name) {
+            Ok(Some(header)) => header,
+            Ok(None) => return HeadEntry::None,
+            // The page's error is kept by the stored answer (its `refusal`), the request's error
+            // after the drive.
+            Err(_) => return self.faulted("a head task's row page could not be read from the stored answer (engine_seeds.rs `PagedHeads::read`)"),
+        };
+        let facts = header.facts;
+        if facts.inline {
+            return HeadEntry::None;
+        }
+        if let Some((_, plan)) = self.files.iter().find(|(file, _)| *file == facts.file)
+            && !plan.iter().any(|one| one.name == name)
+        {
+            return HeadEntry::None;
+        }
+        if facts.failed {
+            return HeadEntry::Failed;
+        }
+        if facts.out == crate::engine_heads::no_units_out(name) {
+            return HeadEntry::None;
+        }
+        match header.record {
+            Some(key) => HeadEntry::Record(key),
+            None => self.faulted("a head task's row has no record key (pages.rs `records`; engine_seeds.rs `PagedHeads::read`)"),
+        }
+    }
+
+    fn faulted(&self, what: &'static str) -> HeadEntry {
+        let _first_kept = self.fault.set(what);
+        HeadEntry::None
+    }
+}
+
+/// Where the request table reads a crate's names record key (rule 78: one seam, the same key
+/// either way, tested equal by the ready edit's world test, whose oracle compares both drivers'
+/// roots). `Listed`: the crate list's [`CrateAt::names_at`], asked of every crate when the
+/// table is made (the phase path's: its names stage holds every crate's entry in memory).
+/// `ByNeed`: the crate's input by the names seam (engine_names.rs `NamesKeys`: entered this
+/// command, else its standing row on the stored answer), asked only for a crate a body asks a
+/// dependency head of or whose head was frozen now; never one row page per crate of the list
+/// (piece C). A crate asked twice reads its row's page once (blaze-engine headers.rs).
+#[derive(Clone, Copy)]
+pub(crate) enum CrateNames<'p> {
+    Listed,
+    ByNeed(crate::engine_names::NamesKeys<'p>),
+}
+
 /// The request's frozen heads (module docs). Read only while the Bodies phase runs, but for
 /// its maps, which only insert. `Sync`: the snapshot is, and so is every map.
-pub(crate) struct RequestTable {
+pub(crate) struct RequestTable<'p> {
     /// The committed store as the Bodies phase began: every head record is read through it.
     snapshot: Snapshot<Global>,
-    /// Each head task with a record: its name and its record's key, sorted by name.
-    entries: std::vec::Vec<(Name, Key), Global>,
-    /// Each head task that failed this request, sorted.
-    failed: std::vec::Vec<Name, Global>,
-    /// The request's crates (as [`crates_of`] lists them).
+    /// Each head task's entry: built, or found on its first ask (rule 78).
+    heads: HeadEntries<'p>,
+    /// The request's crates (as [`crates_of`] lists them; [`crates_unasked`] on the ready driver).
     crates: std::vec::Vec<CrateAt, Global>,
+    /// Where a crate's names record key is read: [`CrateNames`] (rule 78's seam).
+    names: CrateNames<'p>,
     tool: Tool,
     /// The keys the root listed when the request began, sorted.
     listed: std::vec::Vec<Key, Global>,
     /// What was read of the head tasks' records, by member cell.
-    members: blaze_core::SharedMap<CellId, MemberRead, Global>,
+    members: blaze_core::SharedMapBy<CellId, MemberRead, blaze_hash::DigestState, Global>,
     /// The member cells taken from them.
-    taken: blaze_core::SharedSet<CellId, Global>,
+    taken: blaze_core::SharedSetBy<CellId, blaze_hash::DigestState, Global>,
     /// What was read of the dependency heads' records, by key.
-    dependencies: blaze_core::SharedMap<Key, DependencyRead, Global>,
+    dependencies: blaze_core::SharedMapBy<Key, DependencyRead, blaze_hash::DigestState, Global>,
     fresh: blaze_core::SharedMap<ContentId, Fresh, Global>,
     /// Every cell asked that no head task's record answered.
     read: blaze_core::SharedSet<ContentId, Global>,
@@ -481,7 +659,7 @@ pub(crate) struct RequestTable {
     first_past_cap: AtomicU32,
     /// Each member cell refused to a body, with its words, made once a request
     /// (`StretchHeads::not_theirs`): a cell a thousand bodies ask is formatted once.
-    refused: blaze_core::SharedMap<CellId, NotTheirs, SharedAlloc<'static>>,
+    refused: blaze_core::SharedMapBy<CellId, NotTheirs, blaze_hash::DigestState, SharedAlloc<'static>>,
     twice: AtomicU32,
     heap: &'static blaze_own::Heap,
     /// Where a body's need of an item declared in that body is made (front2 tables/seeds.rs
@@ -490,7 +668,39 @@ pub(crate) struct RequestTable {
     pub(crate) body_locals: BodyLocals,
 }
 
-impl RequestTable {
+impl<'p> RequestTable<'p> {
+    /// The ready path's table: its head entries found on their first ask on the stored
+    /// answer's pages ([`PagedHeads`]), never a scan of the plan; the rest as [`RequestTable::build`].
+    /// `crates`: [`crates_unasked`]'s; each crate's names record key read by need from `names`
+    /// ([`CrateNames::ByNeed`]).
+    #[expect(clippy::too_many_arguments, reason = "the stage's edge: each argument one handle of it")]
+    pub(crate) fn paged<'m, D: Driver, S: Sharing>(
+        cx: &Cx,
+        store: &mut CommandStore<'m, '_, D, S>,
+        heads: PagedHeads<'p>,
+        (crates, names): (std::vec::Vec<CrateAt, Global>, crate::engine_names::NamesKeys<'p>),
+        root: &str,
+        tool: Tool,
+        heap: &'static blaze_own::Heap,
+    ) -> Result<RequestTable<'p>, CliError> {
+        let _cx = cx.span("engine: the request's frozen heads, paged");
+        Self::of(store, HeadEntries::Paged(heads), (crates, CrateNames::ByNeed(names)), root, tool, heap)
+    }
+
+    /// Crate `at`'s names record key this request (`None`: its names failed, or it has no
+    /// names row): by [`CrateNames`].
+    fn names_of(&self, at: &CrateAt) -> Option<Key> {
+        match self.names {
+            CrateNames::Listed => at.names_at,
+            CrateNames::ByNeed(names) => names.input_of(blaze_drive::key::crate_scope_name(&at.key)).map(|input| input.at),
+        }
+    }
+
+    /// The first head task row the paged table could not take, for the request's error.
+    pub(crate) fn fault(&self) -> Option<&'static str> {
+        self.heads.fault()
+    }
+
     /// The request's table (module docs), on the coordinator, after the Heads stage's records
     /// are committed: the snapshot, each head task's record key (none of its bytes read), and
     /// the keys the root lists (none of their records read).
@@ -505,7 +715,7 @@ impl RequestTable {
         root: &str,
         tool: Tool,
         heap: &'static blaze_own::Heap,
-    ) -> Result<RequestTable, CliError> {
+    ) -> Result<RequestTable<'p>, CliError> {
         let _cx = cx.span("engine: the request's frozen heads");
         let mut entries: std::vec::Vec<(Name, Key), Global> = std::vec::Vec::new_in(Global);
         let mut failed: std::vec::Vec<Name, Global> = std::vec::Vec::new_in(Global);
@@ -530,6 +740,19 @@ impl RequestTable {
         }
         entries.sort_unstable_by_key(|(name, _)| *name);
         failed.sort_unstable();
+        Self::of(store, HeadEntries::Built { entries, failed }, (crates, CrateNames::Listed), root, tool, heap)
+    }
+
+    /// The table over `heads`: the snapshot and the keys the root lists (none of their records
+    /// read).
+    fn of<'m, D: Driver, S: Sharing>(
+        store: &mut CommandStore<'m, '_, D, S>,
+        heads: HeadEntries<'p>,
+        (crates, names): (std::vec::Vec<CrateAt, Global>, CrateNames<'p>),
+        root: &str,
+        tool: Tool,
+        heap: &'static blaze_own::Heap,
+    ) -> Result<RequestTable<'p>, CliError> {
         let mut listed: std::vec::Vec<Key, Global> = std::vec::Vec::new_in(Global);
         if let Some(keys) = store.named(root)? {
             if keys.len() % 32 != 0 {
@@ -545,19 +768,19 @@ impl RequestTable {
         listed.dedup();
         Ok(RequestTable {
             snapshot: store.snapshot_in(Global)?,
-            entries,
-            failed,
+            heads,
             crates,
+            names,
             tool,
             listed,
-            members: blaze_core::SharedMap::new_in("engine.member heads read from their head tasks' records", Global),
-            taken: blaze_core::SharedSet::new_in("engine.member heads taken", Global),
-            dependencies: blaze_core::SharedMap::new_in("engine.dependency head records read", Global),
+            members: blaze_core::SharedMapBy::new_in("engine.member heads read from their head tasks' records", Global),
+            taken: blaze_core::SharedSetBy::new_in("engine.member heads taken", Global),
+            dependencies: blaze_core::SharedMapBy::new_in("engine.dependency head records read", Global),
             fresh: blaze_core::SharedMap::new_in("engine.frozen heads, made this request", Global),
             read: blaze_core::SharedSet::new_in("engine.heads not in the head tasks' records, read", Global),
             first_failed: blaze_core::SharedMap::new_in("engine.heads whose first freeze failed, with their reasons", heap.shared()),
             first_past_cap: AtomicU32::new(0),
-            refused: blaze_core::SharedMap::new_in("engine.member heads refused to a body, as said", heap.shared()),
+            refused: blaze_core::SharedMapBy::new_in("engine.member heads refused to a body, as said", heap.shared()),
             twice: AtomicU32::new(0),
             heap,
             body_locals: BodyLocals::Lowered,
@@ -592,10 +815,11 @@ impl RequestTable {
     /// Member cell `id` looked up in its entry's head task's record (module docs), for a reader
     /// of unit `unit`.
     fn read_member(&self, id: CellId, unit: [u8; 8]) -> MemberRead {
-        let Ok(at) = self.entries.binary_search_by_key(&id.of, |(name, _)| *name) else {
-            return MemberRead::Lacked(if self.failed.binary_search(&id.of).is_ok() { Lack::Failed } else { Lack::NoTask });
+        let key = match self.heads.entry(id.of) {
+            HeadEntry::Record(key) => key,
+            HeadEntry::Failed => return MemberRead::Lacked(Lack::Failed),
+            HeadEntry::None => return MemberRead::Lacked(Lack::NoTask),
         };
-        let key = self.entries[at].1;
         let bytes = match self.snapshot.get(&blaze_cas::Key(key.0)) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return MemberRead::Bad("a head task's record the answer names is not in the store's snapshot (engine_seeds.rs `RequestTable::read_member`)"),
@@ -623,13 +847,15 @@ impl RequestTable {
     }
 
     /// Dependency head `cell` of crate `krate` (as a stretch's names give it): its record
-    /// frozen by an earlier request, looked up under its key on the first ask. `None`: no
-    /// record (or its crate is a member's, or has no names record today).
+    /// frozen by an earlier request, looked up under its key on the first ask. The body seed
+    /// makes the signature's const-parameter facts available beside its on-demand body/value
+    /// evaluation.
+    /// `None`: no record (or its crate is a member's, or has no names record today).
     fn dependency(&self, cell: Want, krate: blaze_id::CrateItemKey) -> Option<&[u8]> {
         // Only a CLOSED dependency's head is valid by its key (lane H9, [`CrateAt::closed`]): a
         // crate that depends on a member has a head that moves with the member's text.
         let at = crate_keyed(&self.crates, krate).filter(|one| one.closed)?;
-        let names_at = at.names_at?;
+        let names_at = self.names_of(&at)?;
         let key = dependency_key(names_at, cell, self.tool);
         let read = {
             let dependencies = self.dependencies.pin();
@@ -766,7 +992,7 @@ impl RequestTable {
                 not_put.member = not_put.member.saturating_add(1);
                 continue;
             }
-            let Some(names_at) = krate.names_at else {
+            let Some(names_at) = self.names_of(&krate) else {
                 not_put.no_names = not_put.no_names.saturating_add(1);
                 continue;
             };
@@ -800,7 +1026,7 @@ impl RequestTable {
             store.pin(root, &keys)?;
         }
         Ok(SeedCounts {
-            table: u32::try_from(self.entries.len()).unwrap_or(u32::MAX),
+            table: self.heads.count(),
             taken: u32::try_from(self.taken.pin().len()).unwrap_or(u32::MAX),
             read: u32::try_from(self.read.pin().len()).unwrap_or(u32::MAX),
             found,
@@ -848,18 +1074,33 @@ fn run_of(payload: &[u8], cell: Cell) -> Result<Option<(usize, usize)>, &'static
     Ok(found)
 }
 
-/// Each run of one head task's payload: its want's bytes, its cell's, where its frozen bytes
-/// start and their length; a payload that is not whole runs is refused.
+/// One head task's payload split in two: its RUNS (from byte 0, so a run's offsets are the
+/// payload's) and its RUN FACTS (engine_body_facts.rs's form: the constructors its entry's
+/// ADTs give, engine_heads.rs `ctor_facts`), which come after the runs and are followed by
+/// their length (u32 LE), the payload's last 4 bytes. A payload whose last 4 bytes give no
+/// length within it is refused by name.
+pub(crate) fn runs_from(payload: &[u8]) -> Result<(&[u8], &[u8]), &'static str> {
+    const NO_FACTS: &str = "a head task's payload does not end in its run facts and their length (engine_heads.rs `ctor_facts`, engine_seeds.rs `runs_from`)";
+    let Some((rest, len)) = payload.split_last_chunk::<4>() else { return Err(NO_FACTS) };
+    let len = usize::try_from(u32::from_le_bytes(*len)).map_err(|_| NO_FACTS)?;
+    let Some(facts_at) = rest.len().checked_sub(len) else { return Err(NO_FACTS) };
+    Ok(rest.split_at(facts_at))
+}
+
+/// Each run of one head task's payload ([`runs_from`]'s runs): its want's bytes, its cell's,
+/// where its frozen bytes start in `payload` and their length; a payload that is not whole runs
+/// then its facts is refused.
 pub(crate) fn each_run(payload: &[u8], each: &mut dyn FnMut(&[u8], &[u8], usize, usize)) -> Result<(), &'static str> {
     const MALFORMED: &str = "a head task's payload is not runs of a cell's want, its cell, a length and its frozen bytes (engine_heads.rs `heads_of`)";
+    let (runs, _) = runs_from(payload)?;
     let mut at = 0usize;
-    while at < payload.len() {
+    while at < runs.len() {
         let cell_at = at + WANT_BYTES;
         let len_at = cell_at + CELL_BYTES;
-        let (Some(want), Some(this), Some(len)) = (payload.get(at..cell_at), payload.get(cell_at..len_at), payload.get(len_at..len_at + 4)) else { return Err(MALFORMED) };
+        let (Some(want), Some(this), Some(len)) = (runs.get(at..cell_at), runs.get(cell_at..len_at), runs.get(len_at..len_at + 4)) else { return Err(MALFORMED) };
         let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
         let from = len_at + 4;
-        if payload.get(from..from + len).is_none() {
+        if runs.get(from..from + len).is_none() {
             return Err(MALFORMED);
         }
         each(want, this, from, len);
@@ -944,7 +1185,7 @@ impl core::fmt::Display for UnitWords {
 enum Placed {
     /// A member crate's head, written in a file or by a macro under an entry: its entry's head
     /// task's cell.
-    Member(CellId),
+    Member { id: CellId, slot: Name },
     /// A member crate's head that no head task holds, and why (engine_heads.rs
     /// `HeadAt::Unlisted`): its reader is refused by these words.
     Unlisted(&'static str),
@@ -962,7 +1203,7 @@ enum Placed {
 /// the item's name, never by a key of the reader's unit; a dependency's is its record under
 /// [`dependency_key`]. One worker's (its `Owners` fills on first ask), over the shared table.
 pub(crate) struct StretchHeads<'t, 's: 'n, 'n> {
-    table: &'t RequestTable,
+    table: &'t RequestTable<'t>,
     /// The heads the Heads stage could not freeze, each with its own reason
     /// (engine_head_notes.rs `Failed`): what a refusal of such a head quotes.
     failed: &'t Failed,
@@ -976,7 +1217,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// lists them for `widen`; `over`: the crates `names` was opened over, in its order (their
     /// expansion directories place a written head); `failed`: the heads the Heads stage could
     /// not freeze.
-    pub(crate) fn new(table: &'t RequestTable, failed: &'t Failed, names: &'n Records<'n>, subjects: &'s Subjects, over: &'s [Crate<'s>], listings: &'s crate::engine_heads::Listings, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
+    pub(crate) fn new(table: &'t RequestTable<'t>, failed: &'t Failed, names: &'n Records<'n>, subjects: &'s Subjects, over: crate::run_names::ScopeCrates<'s, 's>, listings: &'s crate::engine_heads::Listings, g: Alloc<'static>) -> StretchHeads<'t, 's, 'n> {
         StretchHeads { table, failed, names, owners: RefCell::new(Owners::new(subjects, over, listings, g)), g }
     }
 
@@ -989,7 +1230,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// Where `want`'s head is, by this stretch's names: the one placing (module docs).
     fn place(&self, want: Want) -> Placed {
         match self.owners.borrow_mut().place(self.names, &head_cell_id(want), self.g) {
-            Some(HeadAt::Cell { cell, .. }) => Placed::Member(cell),
+            Some(HeadAt::Cell { cell, file }) => Placed::Member { id: cell, slot: file },
             Some(HeadAt::Unlisted { why, .. }) => Placed::Unlisted(why),
             Some(HeadAt::OfTheBody(_)) => Placed::OfTheBody,
             Some(HeadAt::Dependency(_)) | None => Placed::Dependency,
@@ -1005,11 +1246,11 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// the body's typed refusal (rule 19), its words made ONCE a cell a request: the first kept
     /// in the table's `refused` map is every asker's (another worker's for the same cell is the
     /// same: the read and the stage's failures are the request's, not the asker's).
-    fn not_theirs(&self, cell: Want, id: CellId) -> NotTheirs {
+    fn not_theirs(&self, cell: Want, id: CellId, slot: Name) -> NotTheirs {
         if let Some(why) = self.table.refused.pin().get(&id).copied() {
             return why;
         }
-        let why = self.not_theirs_now(cell, id);
+        let why = self.not_theirs_now(cell, id, slot);
         match self.table.refused.pin().try_insert(id, why) {
             Ok(_) => why,
             Err(occupied) => *occupied.current,
@@ -1020,7 +1261,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
     /// not freeze is that failure, its task's own reason quoted (the project's head, the body
     /// not checked: engine_bodies.rs `unmade_head`); else another unit's runs only, or which
     /// lack (the engine's own inconsistency, the body's failure).
-    fn not_theirs_now(&self, cell: Want, id: CellId) -> NotTheirs {
+    fn not_theirs_now(&self, cell: Want, id: CellId, slot: Name) -> NotTheirs {
         // First: a failed head defines its cell but writes no run (engine_heads.rs `heads_of`),
         // so the read alone would call it "no such cell", or another unit's when every head of
         // this unit failed.
@@ -1030,6 +1271,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         let read = self.table.members.pin().get(&id).copied();
         match read {
             Some(MemberRead::Lacked(Lack::OtherUnits(units))) => NotTheirs::OtherUnits { said: self.other_units(cell, units) },
+            Some(MemberRead::Lacked(Lack::NoTask)) => NotTheirs::NoCell { said: self.no_task(cell, id.of, slot) },
             Some(MemberRead::Lacked(lack)) => NotTheirs::NoCell { said: self.no_cell(cell, lack.words()) },
             Some(MemberRead::Bad(why)) => NotTheirs::NoCell { said: self.no_cell(cell, why) },
             Some(MemberRead::Found { .. }) => NotTheirs::NoCell { said: self.no_cell(cell, "its head task's record was found and its bytes could not be read back from the store's snapshot") },
@@ -1049,21 +1291,35 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head its head task could not freeze (its words are not text)")
     }
 
-    /// The refusal's words for a member head no head task defines a cell of for this
-    /// stretch's unit this request: its path, its want's kind, the unit and `why` (rule 19).
-    fn no_cell(&self, cell: Want, why: &'static str) -> &'static str {
-        let shown = ItemShown::of_lib(self.names, cell.key());
-        let words = bstd::mem::format_in!(
-            self.table.heap.alloc(),
-            "the head of `{shown}` ({}) is a member crate's, and its head task defines no cell of it for this body's unit {} this request: {why} (a body never freezes a member's head; engine_seeds.rs `StretchHeads::known`)",
-            kind_words(cell),
-            UnitWords(unit_of(cell))
-        );
-        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head its head task defines no cell of (its words are not text)")
+    /// Resolve the listing's logical file slot in the defining unit. For a macro-written
+    /// head this is the file of the covering call, where the signature was planned.
+    fn no_task(&self, cell: Want, entry: Name, slot: Name) -> &'static str {
+        let path = self.owners.borrow().file_path(self.names, cell, slot, self.g);
+        let why = Lack::NoTask.words();
+        match path.as_deref().and_then(|path| path.strip_prefix("/0/")) {
+            Some(path) => {
+                // An explicitly named mod.rs is its own slot. Only a directory module found
+                // through the other slot has a different FileItems name.
+                let (stem, ext) = match path.strip_suffix("/mod.rs") {
+                    Some(stem) if Name::file(path.as_bytes()) != slot => (stem, ".rs"),
+                    _ => (path, ""),
+                };
+                self.no_cell(cell, format_args!("{why} for covering {entry} in `{path}` (slot `{stem}{ext}`, {slot})"))
+            }
+            None => self.no_cell(cell, format_args!("{why} for covering {entry} in slot {slot}, whose path is missing from the defining unit's records")),
+        }
     }
 
-    /// The refusal's words for a member head its task froze under `units` only, none this
-    /// stretch's (rule 19): its path, its want's kind, the units that froze it and the reader's.
+    /// The head's path, its kind and the defining unit requested by `cell`.
+    fn no_cell(&self, cell: Want, why: impl core::fmt::Display) -> &'static str {
+        let shown = ItemShown::of_lib(self.names, cell.key());
+        crate::engine_head_notes::leak(
+            self.table.heap.alloc(),
+            format_args!("the head of `{shown}` ({}) is a member crate's, and its head task defines no cell of it for the requested defining unit {} this request: {why} (a body never freezes a member's head; engine_seeds.rs `StretchHeads::known`)", kind_words(cell), UnitWords(unit_of(cell))),
+        )
+    }
+
+    /// The head's path and kind, the units that froze it and the defining unit `cell` requested.
     fn other_units(&self, cell: Want, units: Units) -> &'static str {
         use core::fmt::Write as _;
         let shown = ItemShown::of_lib(self.names, cell.key());
@@ -1075,7 +1331,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         if more > 0 {
             let _ = write!(words, " and {more} more");
         }
-        let _ = write!(words, " and not under this body's unit {}: a head is frozen once a unit that holds its item (engine_heads.rs `head_cell`, `run_items`)", UnitWords(unit_of(cell)));
+        let _ = write!(words, " and not under this body's unit for the referenced crate (requested defining unit {}): a head is frozen once a unit that holds its item (engine_heads.rs `head_cell`, `run_items`)", UnitWords(unit_of(cell)));
         core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head frozen under other units only (its words are not text)")
     }
 }
@@ -1096,16 +1352,16 @@ fn kind_words(cell: Want) -> &'static str {
 }
 
 impl KnownHeads for StretchHeads<'_, '_, '_> {
-    /// A MEMBER crate's head is its head task's run for the reader's unit, or the body is
+    /// A MEMBER crate's head is its head task's run for the requested defining unit, or the body is
     /// refused, typed (`Known::Refused`): a body never freezes a member's head (rule 3; the
     /// lazy freeze the table replaced). Only a DEPENDENCY's head is frozen by the asker when
     /// neither the store nor another worker holds it (one unit, frozen once a machine).
     fn known(&self, cell: Want) -> Known<'_> {
         let table = self.table;
         match self.place(cell) {
-            Placed::Member(id) => match table.member(id, unit_of(cell)) {
+            Placed::Member { id, slot } => match table.member(id, unit_of(cell)) {
                 Some(bytes) => Known::Bytes(bytes),
-                None => Known::Refused(self.not_theirs(cell, id)),
+                None => Known::Refused(self.not_theirs(cell, id, slot)),
             },
             // A head no head task holds (its walk up the calls that wrote it failed, or no entry
             // covers it): refused by its reason, never frozen by the body (rule 3; before lane
@@ -1119,7 +1375,8 @@ impl KnownHeads for StretchHeads<'_, '_, '_> {
             Placed::Dependency => {
                 let held = self.krate(cell).and_then(|krate| table.dependency(cell, krate));
                 // Not a head task's: a head read outside the table (rule 53: found or frozen,
-                // once).
+                // once). The body seed supplies the dependency fn's signature facts from its
+                // stretch memo when a const evaluator reaches the body.
                 table.mark_read(cell_key(cell));
                 match held.or_else(|| table.fresh_of(cell)) {
                     Some(bytes) => Known::Bytes(bytes),
@@ -1135,7 +1392,7 @@ impl RequestHeads for StretchHeads<'_, '_, '_> {
         match self.place(cell) {
             // `known` refuses every member head the table lacks before a freeze, so a member's
             // head here is the engine's own fault: said and refused, never kept (rule 3).
-            Placed::Member(_) | Placed::Unlisted(_) | Placed::OfTheBody => {
+            Placed::Member { .. } | Placed::Unlisted(_) | Placed::OfTheBody => {
                 Err(SeedError::NoMemberCell { cell, said: self.no_cell(cell, "a body's freeze reached it though a member's head is only its head task's (engine_seeds.rs `StretchHeads::known`)") })
             }
             Placed::Dependency => self.table.publish(cell, krate, bytes),
@@ -1172,7 +1429,7 @@ pub(crate) enum FirstFailed {
     None,
 }
 
-impl RequestTable {
+impl RequestTable<'_> {
     /// `bytes`, frozen now for `cell` by one worker (front2 tables/seeds.rs `RequestHeads`).
     fn publish(&self, cell: Want, krate: Option<blaze_id::CrateItemKey>, bytes: &[u8]) -> Result<(), SeedError> {
         let id = cell_key(cell);

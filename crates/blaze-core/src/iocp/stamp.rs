@@ -9,16 +9,17 @@
 
 use std::{
     io,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::io::OwnedHandle,
     path::{Path, PathBuf},
 };
 
-use windows_sys::Win32::{
-    Foundation::{
+use blaze_sys::windows::{
+    Handle,
+    foundation::{
         ERROR_BAD_PATHNAME, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
         ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
     },
-    Storage::FileSystem::{
+    fs::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
@@ -107,7 +108,7 @@ fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
             std::ptr::null(),
             OPEN_EXISTING,
             flags,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     })
 }
@@ -131,7 +132,7 @@ fn drive(name: &str) -> Option<(&str, &str)> {
 
 /// The stamp of what `handle` is open on.
 fn stamp_of(handle: &OwnedHandle) -> io::Result<Stamp> {
-    let raw = handle.as_raw_handle();
+    let raw = sys::handle_of(handle);
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: an open handle and room for one `BY_HANDLE_FILE_INFORMATION`.
     sys::check(unsafe { GetFileInformationByHandle(raw, &mut info) })?;
@@ -307,13 +308,13 @@ fn list(dir: &Path, name: &crate::DirName, buffer: &mut [u64]) -> io::Result<cra
         // class's entries are.
         let ok = unsafe {
             GetFileInformationByHandleEx(
-                handle.as_raw_handle(),
+                sys::handle_of(&handle),
                 class,
                 buffer.as_mut_ptr().cast(),
                 LISTING as u32,
             )
         };
-        if ok == 0 {
+        if !ok.is_true() {
             return match sys::last() {
                 ERROR_NO_MORE_FILES => Ok(found.finish()?),
                 _ => Err(named(io::Error::last_os_error())),

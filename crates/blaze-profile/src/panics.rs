@@ -381,8 +381,13 @@ pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
     #[cfg(unix)]
     {
         // SAFETY: `out` is live and its length is passed; see above.
+        // SAFETY: the calling thread is live and `out` is writable for its passed length.
         let named = unsafe {
-            libc::pthread_getname_np(libc::pthread_self(), out.as_mut_ptr().cast(), out.len())
+            blaze_sys::posix::thread::pthread_getname_np(
+                blaze_sys::posix::thread::pthread_self(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+            )
         } == 0;
         if !named {
             return 0;

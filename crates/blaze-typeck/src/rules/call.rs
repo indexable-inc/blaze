@@ -20,7 +20,7 @@ use blaze_own::{Alloc, Vec};
 use crate::columns::AdjustKind;
 use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
-use crate::ids::{ExprId, ItemKey, LangItem, List, Mutbl, Name};
+use crate::ids::{ExprId, ItemKey, LangItem, List, Name};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -31,13 +31,54 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// reported there.
     pub(crate) fn fn_def_sig(&mut self, k: ItemKey, args: TyList, cause: Cause) -> Result<Option<(TyList, Ty)>, Stop> {
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(None) };
+        let first_row = self.projected.len();
         let mut inputs: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
         for &t in sig.inputs {
             inputs.push(self.lower(sig.types, t, Lower::Args(args), cause)?);
         }
-        let output = self.lower(sig.types, sig.output, Lower::Args(args), cause)?;
+        // A trait fn's `impl Trait` at a concrete `Self` is the impl's type (rules/rpitit_use.rs).
+        self.rpitit = self.rpitit_rows(k, sig.types, sig.output, args)?;
+        let output = self.lower(sig.types, sig.output, Lower::Args(args), cause);
+        self.rpitit.clear();
+        let output = output?;
+        if self.ty.list_len(args) != 0
+            && let Cause::Expr(call) = cause
+            && matches!(self.body.expr(call)?, crate::body::Expr::Call { .. } | crate::body::Expr::MethodCall { .. })
+        {
+            self.record_lifetime_impls(call, k, args, first_row)?;
+        }
         let inputs = self.mk_list(&inputs)?;
         Ok(Some((inputs, output)))
+    }
+
+    /// Every trait bound of the callee, instantiated at this call (`[Self, trait args..]`), for
+    /// the same selection that resolves projections (src/selected.rs, "Bound rows"): any
+    /// subject, any trait, any arity. A bound proves a lifetime relation whether or not its
+    /// trait names a lifetime (`T: Marker` at `T = &'x u8` with `impl Marker for &'static u8`
+    /// makes `'x: 'static`), and `T: Deserialize<'de>` consumes `'de` though the callee
+    /// returns plain `T`. Which bounds are kept is decided at writeback, where the instance is
+    /// resolved (writeback/selected_rows.rs); where the caller's own where-clause may answer a
+    /// ground row instead of an impl is decided there too. A clause whose written arguments
+    /// hold a projection is not noted ([`crate::selected::holds_alias`]).
+    fn record_lifetime_impls(&mut self, call: ExprId, item: ItemKey, args: TyList, first: usize) -> Result<(), Stop> {
+        let preds = self.reads.predicates(item)?;
+        for &clause in preds.clauses {
+            let crate::world::PClause::Trait { trait_, args: formal } = clause else { continue };
+            if crate::selected::holds_alias(preds.types, formal, self.alloc)? {
+                continue;
+            }
+            let actual = self.lower_list(preds.types, formal, args, Cause::Expr(call))?;
+            // One row per trait reference at a call: a projection row of the same trait at the
+            // same arguments (`T: Tr` beside `T::Out`) is this bound's row too, since a
+            // projection is proven through its trait reference's source (rustc's next solver:
+            // `NormalizesTo` merges by the trait goal's `TraitGoalProvenVia`), and the borrow
+            // check reads a bound from any row of its trait and self type (blaze-flow-lower
+            // trait_ties.rs `tie_by_impl`). Selecting it twice is work done twice (rule 77).
+            if !self.projected[first..].iter().any(|&(e, tr, _, a)| e == call && tr == trait_ && a == actual) {
+                self.projected.push((call, trait_, None, actual));
+            }
+        }
+        Ok(())
     }
 
     /// A fn pointer's (or a closure signature's) inputs and output.
@@ -47,44 +88,32 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok((self.mk_list(&all)?, output))
     }
 
-    /// `try_overloaded_call_traits`: `Fn`, then `FnMut`, then `FnOnce` (rustc's order), each
-    /// with a fresh `Args`; the first whose `callee: Tr<Args>` may hold is the call. Its method
-    /// (`call`, `call_mut`, `call_once`, all `extern "rust-call"` in core's
-    /// library/core/src/ops/function.rs) takes `Args` as one tuple at the type level, so the
-    /// written arguments are checked against the tuple's fields (`TupleArgumentsFlag::
-    /// TupleArguments`), and the output is `<T as FnOnce<Args>>::Output`. `Fn` borrows the
-    /// callee, `FnMut` borrows it mutably, `FnOnce` takes it by value. `None` when no trait may
-    /// hold (the next autoderef step is tried).
+    /// Probe each callable trait with a fresh argument tuple. The selected method determines
+    /// the receiver adjustment and the result projection. For an async call the expression
+    /// produces the call future. Awaiting that future yields the declared output.
     fn overloaded_call(&mut self, e: ExprId, callee: ExprId, t: Ty, n: usize) -> Result<Option<(TyList, Ty)>, Stop> {
-        let tries = [
-            (LangItem::Fn, "call", Some(Mutbl::Not)),
-            (LangItem::FnMut, "call_mut", Some(Mutbl::Mut)),
-            (LangItem::FnOnce, "call_once", None),
-        ];
-        // A world without the three traits cannot decide the call: the one finding naming the
-        // first it lacks, and the call is checked no further.
-        let mut traits = [None; 3];
-        for (slot, (item, ..)) in traits.iter_mut().zip(tries) {
-            let Some(tr) = self.lang(item)? else {
-                self.missing_lang(item, At::Expr(e));
-                return Ok(Some((self.err_list(n)?, self.common.err)));
+        let mut missing = None;
+        for method in super::closure::CALL_METHODS {
+            let Some(tr) = self.lang(method.trait_)? else {
+                if missing.is_none() && matches!(method.trait_, LangItem::Fn | LangItem::FnMut | LangItem::FnOnce) {
+                    missing = Some(method.trait_);
+                }
+                continue;
             };
-            *slot = Some(tr);
-        }
-        let Some(once) = traits[2] else { return Ok(None) };
-        for ((_, method, borrow), tr) in tries.into_iter().zip(traits) {
-            let Some(tr) = tr else { continue };
             let tuple = self.fresh()?;
             let args = self.mk_list(&[t, tuple])?;
             if !self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                 continue;
             }
             self.register_trait(tr, args, Cause::Expr(e))?;
-            let output = self.project(once, args, Name::of("Output"), Cause::Expr(e))?;
-            if let Some(m) = self.reads.assoc_item(tr, Name::of(method))? {
+            let Some(owner) = self.need_lang(method.owner, At::Expr(e))? else {
+                return Ok(Some((self.err_list(n)?, self.common.err)));
+            };
+            let output = self.project(owner, args, Name::of(method.result), Cause::Expr(e))?;
+            if let Some(m) = self.reads.assoc_item(tr, Name::of(method.method))? {
                 self.callees.push((e, m.item, args));
             }
-            if let Some(mutbl) = borrow {
+            if let Some(mutbl) = method.borrow {
                 let borrowed = self.mk(TyView::Ref(mutbl, t))?;
                 self.adjust.push((callee, AdjustKind::Borrow { mutbl, two_phase: false, raw: false }, borrowed));
             }
@@ -105,6 +134,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Ok(Some((self.err_list(n)?, self.common.err)))
                 }
             };
+        }
+        if let Some(item) = missing {
+            self.missing_lang(item, At::Expr(e));
+            return Ok(Some((self.err_list(n)?, self.common.err)));
         }
         Ok(None)
     }

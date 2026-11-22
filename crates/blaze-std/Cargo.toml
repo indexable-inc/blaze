@@ -17,7 +17,13 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-mem.workspace = true
+# D169's meter: every effect counted by kind where it is stamped, its time where `Io::call`
+# waits for it (io/fast.rs, io.rs).
+blaze-meter.workspace = true
 blaze-rng.workspace = true
+# D177's hermetic run (procs/hermetic): its roots, mounts and checked read list. blaze-roots sits
+# on blaze-own and blaze-blake3 alone, neither of which depends on bstd.
+blaze-roots.workspace = true
 # The facade (lib.rs, "Batteries"): each re-exported under bstd's names, none depending on bstd.
 blaze-alloc-count.workspace = true
 blaze-bytes.workspace = true

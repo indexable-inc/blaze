@@ -35,16 +35,16 @@ fn three_checks(seed: u64, good: &str, bad: &str) -> ((u32, u32, u32), std::stri
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", "mod a;\n");
     write(&io, "src/a.rs", good);
-    let first = check(&io, work::Sizes::USUAL);
-    assert!(first.failed.is_empty(), "{:?}\n{}", first.failed, first.profile);
+    let first = check(&io);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     assert!(first.words.iter().all(|w| !w.contains("not checked") && !w.contains("lists no body")), "the clean workspace notes a body unchecked: {:?}", first.words);
     write(&io, "src/a.rs", bad);
-    let edited = check(&io, work::Sizes::USUAL);
-    assert!(edited.failed.is_empty(), "{:?}\n{}", edited.failed, edited.profile);
+    let edited = check(&io);
+    assert_eq!(edited.failures, 0, "{}", edited.profile);
     let after = std::format!("{:?} {:?}", edited.ids, edited.words);
     write(&io, "src/a.rs", good);
-    let undone = check(&io, work::Sizes::USUAL);
-    assert!(undone.failed.is_empty(), "{:?}\n{}", undone.failed, undone.profile);
+    let undone = check(&io);
+    assert_eq!(undone.failures, 0, "{}", undone.profile);
     ((first.errors, edited.errors, undone.errors), after)
 }
 
@@ -93,15 +93,15 @@ fn an_edit_of_the_macro_in_another_file_reruns_its_calls_check() {
     write(&io, "Cargo.toml", MANIFEST);
     write(&io, "src/lib.rs", good);
     write(&io, "src/a.rs", "write_f!();\n");
-    let first = check(&io, work::Sizes::USUAL);
-    assert!(first.failed.is_empty(), "{:?}\n{}", first.failed, first.profile);
+    let first = check(&io);
+    assert_eq!(first.failures, 0, "{}", first.profile);
     write(&io, "src/lib.rs", bad);
-    let edited = check(&io, work::Sizes::USUAL);
-    assert!(edited.failed.is_empty(), "{:?}\n{}", edited.failed, edited.profile);
+    let edited = check(&io);
+    assert_eq!(edited.failures, 0, "{}", edited.profile);
     let after = std::format!("{:?} {:?}\n{}", edited.ids, edited.words, edited.profile);
     write(&io, "src/lib.rs", good);
-    let undone = check(&io, work::Sizes::USUAL);
-    assert!(undone.failed.is_empty(), "{:?}\n{}", undone.failed, undone.profile);
+    let undone = check(&io);
+    assert_eq!(undone.failures, 0, "{}", undone.profile);
     let errors = (first.errors, edited.errors, undone.errors);
     assert_eq!(errors, (0, 1, 0), "the macro's edit in lib.rs must reach the check of its call in a.rs:\n{after}");
     assert!(after.contains("{the expansion of `write_f!`}::f"), "the finding is the call's, naming the expansion's item:\n{after}");

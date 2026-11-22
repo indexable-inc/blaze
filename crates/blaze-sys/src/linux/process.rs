@@ -12,11 +12,28 @@ use crate::{Errno, Fd};
 
 /// `pidfd_open`: a descriptor of the process `pid` that polls readable once it has exited.
 /// Used by the direct driver's wait for a child's exit.
+/// replaces libc::syscall(libc::SYS_pidfd_open) (flags 0; as blaze_sys::linux::pidfd_open(pid); returns Result<OwnedFd, Errno>, the site's -1 check becomes the Err)
+/// replaces libc::SYS_pidfd_open
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn pidfd_open(pid: i32) -> Result<OwnedFd, Errno> {
     // SAFETY: the call takes a pid and flags and no memory.
     owned(unsafe { raw::syscall2(nr::PIDFD_OPEN, pid as usize, 0) })
+}
+
+/// `pidfd_send_signal(pidfd, signal, NULL, 0)` (5.1): `signal` (0 asks only whether the
+/// process is there) to the process `pidfd` is of. Exact even after the process is reaped: a
+/// pidfd never names another process that took its pid. [`Errno::Srch`] where it has ended;
+/// [`Errno::NoSys`] on a kernel before 5.1 (the slot `linux::slot::Signal` chooses the form
+/// once from `KernelFacts` where a caller must run there too).
+/// replaces libc::syscall(libc::SYS_pidfd_send_signal) (with a null siginfo and flags 0; as blaze_sys::linux::pidfd_send_signal(pidfd: Fd, signal: u32); returns Result<(), Errno>, the site's nonzero check becomes the Err)
+/// replaces libc::SYS_pidfd_send_signal (the call; the number as data stays nr::PIDFD_SEND_SIGNAL)
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn pidfd_send_signal(pidfd: Fd, signal: u32) -> Result<(), Errno> {
+    // SAFETY: a null `siginfo` and no flags: the kernel reads no memory.
+    raw::check(unsafe { raw::syscall4(nr::PIDFD_SEND_SIGNAL, arg(pidfd), signal as usize, 0, 0) })
+        .map(|_| ())
 }
 
 /// Which children a [`waitid`] looks at.
@@ -150,6 +167,8 @@ pub fn wait4_now(pid: i32) -> Result<Option<(i32, Rusage)>, Errno> {
 flag_set! {
     /// `clone3`'s flags. A child that shares the caller's memory (`CLONE_VM`, a thread) is
     /// not among them: [`clone3_process`] refuses it.
+    /// replaces libc::CLONE_CLEAR_SIGHAND (blaze_sys::linux::CloneFlags::CLEAR_SIGHAND, in CloneArgs for clone3_process)
+    /// replaces libc::CLONE_INTO_CGROUP (blaze_sys::linux::CloneFlags::INTO_CGROUP, with CloneArgs::cgroup)
     CloneFlags: u64 {
         /// `CLONE_PIDFD`: a pidfd of the child is written to [`CloneArgs::pidfd`].
         PIDFD = 0x1000;
@@ -266,7 +285,107 @@ pub fn kill(pid: i32, signal: u32) -> Result<(), Errno> {
     raw::check(unsafe { raw::syscall2(nr::KILL, pid as isize as usize, signal as usize) }).map(|_| ())
 }
 
+/// `kill(-group)`: `signal` sent to every process of the process group `group`: a child
+/// started as the leader of its own group (`setpgid(0, 0)` in the child) and all it left
+/// running. [`Errno::Inval`] for a group of 1 or less, refused before the call: `kill(0)` is
+/// the caller's own group and `kill(-1)` every process it may signal, neither of which a group
+/// id names. Used by the sandbox's end of a native build script, and the test runner's end of a
+/// test binary.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn kill_group(group: i32, signal: u32) -> Result<(), Errno> {
+    if group <= 1 {
+        return Err(Errno::Inval);
+    }
+    kill(group.wrapping_neg(), signal)
+}
+
+/// `sched_yield`: the CPU given to another runnable thread, if one is waiting; back at once
+/// otherwise. A spin's back-off before it parks (blaze-core's locks, blaze-spin). Linux's
+/// call returns 0; a filter that refuses it is the error.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn sched_yield() -> Result<(), Errno> {
+    // SAFETY: the call takes nothing.
+    raw::check(unsafe { raw::syscall0(nr::SCHED_YIELD) }).map(|_| ())
+}
+
+/// One argument or environment string of an [`execveat`], lent: a pointer to a NUL-terminated
+/// string, or the [`Arg::END`] that closes a list. One word, the layout of a `char *`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct Arg<'a>(*const u8, core::marker::PhantomData<&'a CStr>);
+
+impl<'a> Arg<'a> {
+    /// The null that ends a list.
+    pub const END: Arg<'static> = Arg(core::ptr::null(), core::marker::PhantomData);
+
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn new(text: &'a CStr) -> Arg<'a> {
+        Arg(text.as_ptr().cast(), core::marker::PhantomData)
+    }
+
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    const fn is_end(self) -> bool {
+        self.0.is_null()
+    }
+}
+
+/// A list of [`Arg`]s whose last, and only last, is [`Arg::END`]: what `execve`'s `argv` and
+/// `envp` are. Checked as it is made, so a call never reads past a list.
+#[derive(Clone, Copy, Debug)]
+pub struct Args<'a>(&'a [Arg<'a>]);
+
+impl<'a> Args<'a> {
+    /// `list`, or [`Errno::Inval`] where it is empty, does not end in [`Arg::END`] or holds
+    /// one before its end.
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub fn new(list: &'a [Arg<'a>]) -> Result<Args<'a>, Errno> {
+        let Some((last, before)) = list.split_last() else {
+            return Err(Errno::Inval);
+        };
+        if !last.is_end() || before.iter().any(|arg| arg.is_end()) {
+            return Err(Errno::Inval);
+        }
+        Ok(Args(list))
+    }
+}
+
+/// `execveat`: this process replaced by the program `path` (in `dir`; with
+/// [`AtFlags::EMPTY_PATH`](super::AtFlags::EMPTY_PATH) and [`crate::Path::EMPTY`], the open
+/// file `dir` itself, so a sandbox runs the very file it checked), given `argv` and `envp` and
+/// nothing of the caller's environment. It returns only when refused, with why. Takes
+/// [`AtFlags::NO_FOLLOW`](super::AtFlags::NO_FOLLOW) and `EMPTY_PATH`. Called in a child
+/// between `clone3` and the program, where only system calls run.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn execveat(dir: Fd, path: crate::Path<'_>, argv: Args<'_>, envp: Args<'_>, flags: super::AtFlags) -> Errno {
+    // SAFETY: `path` is a live NUL-terminated string; `argv` and `envp` are live arrays of
+    // pointers to live NUL-terminated strings, each ending in a null (`Args`' invariant); the
+    // kernel reads them, and on success this process's memory is gone with them.
+    let result = unsafe {
+        raw::syscall5(
+            nr::EXECVEAT,
+            arg(dir),
+            path.as_ptr() as usize,
+            argv.0.as_ptr() as usize,
+            envp.0.as_ptr() as usize,
+            flags.bits() as usize,
+        )
+    };
+    match raw::check(result) {
+        Err(errno) => errno,
+        // `execveat` does not return on success: a value here is no errno the kernel could give.
+        Ok(_) => Errno::Inval,
+    }
+}
+
 /// One typed `prctl`.
+/// replaces libc::PR_SET_PDEATHSIG (with prctl: blaze_sys::linux::prctl(Prctl::ParentDeathSignal(signal)))
+/// replaces libc::PR_SET_NO_NEW_PRIVS (with prctl: blaze_sys::linux::prctl(Prctl::NoNewPrivs))
 #[derive(Clone, Copy, Debug)]
 pub enum Prctl<'a> {
     /// `PR_SET_PDEATHSIG`: the signal this process gets when its parent's thread ends.
@@ -278,6 +397,14 @@ pub enum Prctl<'a> {
     /// `PR_SET_NO_NEW_PRIVS`: no exec of this process gains privileges; what an unprivileged
     /// seccomp filter needs first.
     NoNewPrivs,
+    /// `PR_SET_THP_DISABLE`: no transparent huge pages for this process (and what it forks).
+    /// replaces libc::PR_SET_THP_DISABLE
+    ThpDisable(bool),
+    /// `PR_SET_THP_DISABLE` with `PR_THP_DISABLE_EXCEPT_ADVISED` (6.18): transparent huge
+    /// pages only where `madvise(MADV_HUGEPAGE)` asked for them. Older kernels refuse it
+    /// ([`Errno::Inval`]).
+    /// replaces libc::prctl(libc::PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, 0, 0) (as blaze_sys::linux::prctl(Prctl::ThpDisableExceptAdvised); blaze-mem os.rs's private PR_THP_DISABLE_EXCEPT_ADVISED)
+    ThpDisableExceptAdvised,
 }
 
 /// `prctl`, one typed request. Used by a spawned child (its parent-death signal), a thread's
@@ -285,18 +412,35 @@ pub enum Prctl<'a> {
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn prctl(request: Prctl<'_>) -> Result<(), Errno> {
-    let (option, argument) = match request {
-        Prctl::ParentDeathSignal(signal) => (1, signal as usize),
-        Prctl::Dumpable(dumpable) => (4, dumpable as usize),
-        Prctl::Name(name) => (15, name.as_ptr() as usize),
-        Prctl::NoNewPrivs => (38, 1),
+    /// `PR_THP_DISABLE_EXCEPT_ADVISED` (linux/prctl.h): `PR_SET_THP_DISABLE`'s third argument.
+    const THP_DISABLE_EXCEPT_ADVISED: usize = 1 << 1;
+    let (option, argument, third) = match request {
+        Prctl::ParentDeathSignal(signal) => (1, signal as usize, 0),
+        Prctl::Dumpable(dumpable) => (4, dumpable as usize, 0),
+        Prctl::Name(name) => (15, name.as_ptr() as usize, 0),
+        Prctl::NoNewPrivs => (38, 1, 0),
+        Prctl::ThpDisable(off) => (41, off as usize, 0),
+        Prctl::ThpDisableExceptAdvised => (41, 1, THP_DISABLE_EXCEPT_ADVISED),
     };
     // SAFETY: of these requests only `PR_SET_NAME` reads memory: a live NUL-terminated
     // string, not kept. The unused arguments are 0, as `PR_SET_NO_NEW_PRIVS` requires.
-    raw::check(unsafe { raw::syscall5(nr::PRCTL, option, argument, 0, 0, 0) }).map(|_| ())
+    raw::check(unsafe { raw::syscall5(nr::PRCTL, option, argument, third, 0, 0) }).map(|_| ())
+}
+
+/// `prctl(PR_GET_NAME)`: the calling thread's name, NUL-terminated in the kernel's 16 bytes.
+/// replaces libc::PR_GET_NAME (blaze_sys::linux::thread_name())
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn thread_name() -> Result<[u8; 16], Errno> {
+    let mut name = [0u8; 16];
+    // SAFETY: `PR_GET_NAME` writes at most 16 bytes (TASK_COMM_LEN) into `name`, a live local,
+    // and keeps no pointer.
+    raw::check(unsafe { raw::syscall5(nr::PRCTL, 16, name.as_mut_ptr() as usize, 0, 0, 0) })?;
+    Ok(name)
 }
 
 /// `struct sock_filter`: one classic BPF instruction.
+/// replaces libc::sock_filter (blaze_sys::linux::SockFilter { code, jt, jf, k }; the opcodes are blaze_sys::posix::net::BPF_*)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct SockFilter {
@@ -329,6 +473,12 @@ flag_set! {
 /// filters, for good. [`Errno::Inval`] for an empty filter or one over 4096 instructions
 /// (`BPF_MAXINSNS`) before any call; [`Errno::Acces`] without [`Prctl::NoNewPrivs`] or
 /// `CAP_SYS_ADMIN`. The sandbox's filter (`blaze-cargo/src/sandbox/linux.rs`).
+/// replaces libc::syscall(libc::SYS_seccomp) (SECCOMP_SET_MODE_FILTER; as blaze_sys::linux::seccomp_filter(&[SockFilter], SeccompFlags); the sock_fprog is built for you; returns Result<(), Errno>; set no_new_privs first by blaze_sys::linux::prctl)
+/// replaces libc::SYS_seccomp
+/// replaces libc::sock_fprog (none to build: blaze_sys::linux::seccomp_filter takes &[SockFilter] and makes it)
+/// replaces libc::SECCOMP_SET_MODE_FILTER (blaze_sys::linux::seccomp_filter is that operation)
+/// replaces libc::PR_SET_SECCOMP (with prctl and SECCOMP_MODE_FILTER: blaze_sys::linux::seccomp_filter(&filter, SeccompFlags::NONE), the same filter installed by the seccomp call)
+/// replaces libc::SECCOMP_MODE_FILTER (with prctl(PR_SET_SECCOMP): blaze_sys::linux::seccomp_filter)
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn seccomp_filter(filter: &[SockFilter], flags: SeccompFlags) -> Result<(), Errno> {
@@ -393,32 +543,18 @@ pub enum Disposition {
     Ignore,
 }
 
-/// The kernel's `struct sigaction` (not libc's): the handler, the flags, the restorer (a
-/// field on x86-64 and on aarch64, which defines `SA_RESTORER` for AArch32 compatibility) and
-/// the mask.
-#[repr(C)]
-struct KernelSigaction {
-    handler: usize,
-    flags: u64,
-    restorer: usize,
-    mask: SigSet,
-}
-
-/// `rt_sigaction`: `signal`'s action set to `disposition`. A handler function is not offered
-/// in slice 1: on x86-64 it needs a restorer trampoline (`rt_sigreturn`), which is
-/// `bstd::rt`'s (sys.md, "Runtime"). Used by a spawned child (its dispositions reset before
-/// the exec) and the process's `SIGPIPE`.
+/// `rt_sigaction`: `signal`'s action set to `disposition`, with no handler (so no restorer).
+/// A handler is [`super::signal::set_action`]'s, with blaze-sys's own restorer. Used by a
+/// spawned child (its dispositions reset before the exec) and the process's `SIGPIPE`.
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn rt_sigaction(signal: u32, disposition: Disposition) -> Result<(), Errno> {
-    let action = KernelSigaction {
-        handler: match disposition {
+    let action = super::signal::SigAction {
+        sa_sigaction: match disposition {
             Disposition::Default => 0,
             Disposition::Ignore => 1,
         },
-        flags: 0,
-        restorer: 0,
-        mask: SigSet::EMPTY,
+        ..super::signal::SigAction::DEFAULT
     };
     // SAFETY: `action` is a live kernel `sigaction` the kernel reads; no old action is asked
     // for (null); the set's size is the kernel's own. With no handler, no restorer is needed.
@@ -426,4 +562,25 @@ pub fn rt_sigaction(signal: u32, disposition: Disposition) -> Result<(), Errno> 
         raw::syscall4(nr::RT_SIGACTION, signal as usize, core::ptr::from_ref(&action) as usize, 0, size_of::<SigSet>())
     })
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod pidfd_signal_tests {
+    use super::*;
+
+    /// Signal 0 through a pidfd of this process asks only whether it is there: it is; a
+    /// descriptor that is no pidfd is refused.
+    #[test]
+    fn a_pidfd_is_signalled() {
+        let me = match pidfd_open(getpid()) {
+            Ok(me) => me,
+            Err(Errno::NoSys) => {
+                eprintln!("skipped: this kernel has no pidfd_open (5.3)");
+                return;
+            }
+            Err(other) => panic!("pidfd_open: {other}"),
+        };
+        assert_eq!(pidfd_send_signal(me.fd(), 0), Ok(()));
+        assert_eq!(pidfd_send_signal(Fd::new(-1), 0), Err(Errno::BadF));
+    }
 }

@@ -34,11 +34,16 @@ pub fn f() {
     include_str!(\"../tests/assets/g.json\");
     include_bytes!(\"blob.bin\");
 }
+pub fn g() -> u32 {
+    let n = include!(\"expr.in\");
+    n
+}
 ";
 
 static FILES: &[(&str, &[u8])] = &[
     ("/w/src/lib.rs", LIB.as_bytes()),
     ("/w/src/items.rs", b"pub struct A;\n"),
+    ("/w/src/expr.in", b"{ struct B; impl B { fn n(&self) -> u32 { 7 } } B.n() }\n"),
     ("/w/tests/assets/g.json", b"{\"chainId\": 1337}\n"),
     ("/w/src/blob.bin", b"\xff\xfe\x00\x01"),
 ];
@@ -66,11 +71,19 @@ impl SourceTexts<'static> for Asked {
     }
 }
 
-/// The kind decides the read: `include!("items.rs")` is a module read of `/w/src/items.rs`
-/// (and `A` from it resolves), `include_str!` of the JSON and `include_bytes!` of the blob
-/// (not UTF-8) are data reads named with `/w/src/lib.rs`, and neither data file is ever read
-/// as a module. Without the `match how` in `Host::include` both data files are module reads
-/// (`modules` holds `/w/tests/assets/g.json`) and `data` is empty.
+/// The kind and the place decide the read: `include!("items.rs")` in a module is a module read
+/// of `/w/src/items.rs` (and `A` from it resolves); `include!("expr.in")` in `g`'s body is a
+/// data read named with `/w/src/lib.rs` (one expression whose block declares `B` and its impl:
+/// its whole text is what the names read); and neither data file of `f` is ever read as a
+/// module. Without the `match how` in `Host::include` every include is a module read and
+/// `data` is empty.
+///
+/// Changed 2026-11-20 (knowingly): `f`'s `include_str!` and `include_bytes!` are no longer read
+/// by the names at all. They are calls in a body whose output is a literal, so they declare
+/// nothing there (resolve.rs `LITERAL_BUILTINS`) and the names library does not expand them.
+/// No reader needed that read: the body's own lowering reads the file (blaze-ladder
+/// body_host.rs, the body's WHOLE read, which blaze-cli engine_bodies.rs `missing_data` checks),
+/// and the plan lists it from the text (blaze-cli data_include.rs), not from the names' reads.
 ///
 /// Prints `module reads: [..]; data reads: [..]`.
 #[test]
@@ -85,13 +98,7 @@ fn an_include_reads_a_module_and_include_str_and_include_bytes_read_data() {
     data.dedup();
     std::println!("module reads: {modules:?}; data reads: {data:?}");
     assert!(modules.iter().any(|path| path == "/w/src/items.rs"), "include! of items is a module read: {modules:?}");
-    assert!(!modules.iter().any(|path| path.ends_with(".json") || path.ends_with(".bin")), "a data file read as a module: {modules:?}");
-    assert_eq!(
-        data,
-        [
-            (String::from("/w/src/lib.rs"), String::from("/w/src/blob.bin")),
-            (String::from("/w/src/lib.rs"), String::from("/w/tests/assets/g.json")),
-        ]
-    );
+    assert!(!modules.iter().any(|path| path.ends_with(".json") || path.ends_with(".bin") || path.ends_with(".in")), "a data file read as a module: {modules:?}");
+    assert_eq!(data, [(String::from("/w/src/lib.rs"), String::from("/w/src/expr.in"))]);
     drop(names);
 }

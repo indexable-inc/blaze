@@ -6,7 +6,6 @@
 
 use super::*;
 
-use core::fmt::Write as _;
 
 use crate::engine_status::{Act, Asking, Board, Claim, Heading, Label, Plant, STOP_BOUND, Watch, write_status};
 use blaze_engine::Stage;

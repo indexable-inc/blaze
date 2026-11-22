@@ -32,6 +32,13 @@ pub(crate) const WORDS: &[&str] = &[
     "args", "current_dir", "thread_rng", "RandomState", "default", "exit", "id", "dbg", "recv", "join", "wait", "lock",
     "loop", "collections", "hash_map", "hash", "hashbrown", "DefaultHasher", "new_in", "with_capacity_in",
     "from_iter_in", "IndexMap", "IndexSet", "ByHash", "ByHashSet",
+    // `process-static` (engine.rs `STATIC_WORDS`) and `sans-io-core` (`SANS_IO_WORDS`), which
+    // the pass dispatches on; their other words are above.
+    "static", "thread_local", "fs", "net", "io", "os", "thread", "File", "TcpStream", "TcpListener", "UdpSocket", "libc",
+    "rustix", "block_on",
+    // `lock-without-reason` (engine.rs `LOCK_TYPES`): its constructors' words are compared as
+    // text after the type and `::`, and `new` and `new_in` are above.
+    "Lock", "ReadLock", "RwLock", "RankedLock", "SharedMap",
 ];
 
 blaze_phf::name_phf_table!(pub(crate) static WORD = WORDS;);
@@ -77,6 +84,8 @@ const fn renames_in() -> bool {
 
 const _: () = assert!(all_in(&crate::engine::COLLECTIONS) && all_in(&crate::engine::FORMAT_MACROS));
 const _: () = assert!(all_in(&crate::engine::DEFINING) && all_in(&crate::engine::DISPATCHED) && renames_in());
+const _: () = assert!(all_in(&crate::engine::STATIC_WORDS) && all_in(&crate::engine::SANS_IO_WORDS));
+const _: () = assert!(all_in(&crate::engine::LOCK_TYPES));
 
 const W: u8 = WORDS.len() as u8;
 /// `::`.

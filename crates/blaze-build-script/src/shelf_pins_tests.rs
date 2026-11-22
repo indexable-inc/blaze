@@ -7,7 +7,7 @@
 
 use crate::host_tools::{HostToolError, Place, host_tools};
 use crate::shelf_pins::{PinnedMember, PlaceError, ShelfPinError, ShelfPlacer, place_member, shelf_program, shelf_programs};
-use crate::toolchain::PIN;
+use blaze_pins::CLANG_JSON as PIN;
 
 const MAC: &str = "aarch64-apple-darwin";
 const NM_MEMBER: &str = "LLVM-23.1.4-macOS-ARM64/bin/llvm-nm";

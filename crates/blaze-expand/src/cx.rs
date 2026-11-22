@@ -1,15 +1,22 @@
 //! Everything outside the call's tokens and the definition: asked for through [`ExpandCx`],
 //! each answer recorded in the expansion as a [`crate::Read`] so the record is valid exactly
-//! while those answers stand.
+//! while those answers stand. A builtin asks through a [`Recorder`], never the context itself:
+//! each of its methods pushes the read before it hands the answer back, so no builtin can hold
+//! an answer its read list lacks.
 
 use core::fmt;
 
+use blaze_id::ContentId;
 use blaze_own::{AVec, Alloc};
 
 use crate::{
+    builtin::stringified,
+    cfg::{CfgPredicateError, cfg_predicate},
     def::{MacroDefinition, ProcKind},
-    expansion::{ProcLevel, Reads, TokenOrigin},
-    tokens::{Text, TokenStream},
+    error::ExpandError,
+    expansion::{ProcLevel, ReadAnswer, ReadKind, Reads, TokenOrigin},
+    literal::{Buf, escape_str},
+    tokens::{Ctx, Edition, LitKind, Spacing, Text, TokenStream},
 };
 #[cfg(doc)]
 use crate::expansion::Diagnostic;
@@ -38,6 +45,119 @@ pub trait ExpandCx {
         call: ProcCall<'_>,
         alloc: Alloc<'a>,
     ) -> Result<Produced<'a>, HostError>;
+}
+
+/// The one way a builtin reaches the outside: the context and the read list the answers go
+/// to, held together. Each method asks the context, pushes its read (the subject written out
+/// here, never by the caller) and only then returns the answer; the context is a private field,
+/// so a builtin given a `&mut Recorder` cannot ask it anything unrecorded.
+pub(crate) struct Recorder<'x, 'a, C: ExpandCx> {
+    cx: &'x C,
+    reads: &'x mut Reads<'a>,
+    /// The call's edition: an atom's read is lexed again in it ([`Reads::hold`]).
+    edition: Edition,
+    /// Where an atom's tokens and a subject's text are built.
+    scratch: Alloc<'a>,
+}
+
+/// A [`Recorder`]'s parts, each one required.
+pub(crate) struct RecorderOpts<'x, 'a, C: ExpandCx> {
+    pub(crate) cx: &'x C,
+    pub(crate) reads: &'x mut Reads<'a>,
+    pub(crate) edition: Edition,
+    pub(crate) scratch: Alloc<'a>,
+}
+
+impl<'x, 'a, C: ExpandCx> Recorder<'x, 'a, C> {
+    pub(crate) fn new(opts: RecorderOpts<'x, 'a, C>) -> Recorder<'x, 'a, C> {
+        let RecorderOpts { cx, reads, edition, scratch } = opts;
+        Recorder { cx, reads, edition, scratch }
+    }
+
+    /// The env var `name`, recorded under its name with its value's digest (or as absent).
+    pub(crate) fn env(&mut self, name: &str) -> Result<Option<&'x str>, ExpandError> {
+        let value = self.cx.env(name)?;
+        self.reads.push(ReadKind::Env, name, ReadAnswer::of_env(value))?;
+        Ok(value)
+    }
+
+    /// The file `written` names, read `how`, recorded under the root-relative path a host with
+    /// a [`ReadRoot`] answers (D60), else the path as written, with the bytes' digest (or as
+    /// absent). A rooted answer whose path is not root-relative is refused, never recorded: it
+    /// would put the machine's folder or a spelling into the record. [`Included::Outside`] is
+    /// decided by the written path and the calling file's place alone, so it is no read.
+    pub(crate) fn include(&mut self, written: &str, how: IncludeAs) -> Result<Included<'x>, ExpandError> {
+        let included = self.cx.include(written, how)?;
+        // `include!` reads the file as text, the same fact `include_str!` reads.
+        let kind = match how {
+            IncludeAs::Tokens | IncludeAs::Str => ReadKind::IncludeStr,
+            IncludeAs::Bytes => ReadKind::IncludeBytes,
+        };
+        let (subject, found) = match included {
+            Included::Bytes(bytes) => (written, Some(bytes)),
+            Included::Missing => (written, None),
+            Included::At { path, bytes } => (rooted(path)?, Some(bytes)),
+            Included::MissingAt { path } => (rooted(path)?, None),
+            Included::Outside => return Ok(included),
+        };
+        let answer = match found {
+            Some(bytes) => ReadAnswer::Digest(ContentId::of("blaze v2 expand included file 1", bytes)),
+            None => ReadAnswer::Absent,
+        };
+        self.reads.push(kind, subject, answer)?;
+        Ok(included)
+    }
+
+    /// The call's position `what` (asked only inside eager input), recorded with no subject.
+    pub(crate) fn place(&mut self, what: PlaceOf) -> Result<Place<'x>, ExpandError> {
+        let place = self.cx.place(what)?;
+        let kind = match what {
+            PlaceOf::Line => ReadKind::Line,
+            PlaceOf::Column => ReadKind::Column,
+            PlaceOf::File => ReadKind::File,
+            PlaceOf::ModulePath => ReadKind::ModulePath,
+        };
+        self.reads.push(kind, "", ReadAnswer::of_place(place))?;
+        Ok(place)
+    }
+
+    /// The outcome of the cfg `predicate`, evaluated here ([`cfg_predicate`]: every atom, in
+    /// source order, no short cut) with each atom asked of the context as a predicate of its
+    /// own (`unix`, `feature = "x"`) and recorded, one read per atom in evaluation order, its
+    /// subject the atom's text and its answer the atom's outcome. The predicate's text is no
+    /// subject: `all(unix, feature = "x")` and `all(unix, any(feature = "x"))` read the same
+    /// two facts, and a changed set reruns exactly the calls whose atoms moved. A predicate
+    /// that is none is [`CfgPredicateError::Malformed`] or `NotTakesOne`, its token an index of
+    /// `predicate`; a failed ask is [`CfgPredicateError::Atom`].
+    pub(crate) fn cfg(&mut self, predicate: &TokenStream<'_>) -> Result<bool, CfgPredicateError<ExpandError>> {
+        let Recorder { cx, reads, edition, scratch } = self;
+        let (cx, root, scratch) = (*cx, Ctx::root(*edition), *scratch);
+        cfg_predicate(predicate, scratch, &mut |name, value| -> Result<bool, ExpandError> {
+            let mut atom = TokenStream::new_in(scratch);
+            atom.ident(name, root)?;
+            if let Some(value) = value {
+                atom.punct('=', Spacing::Alone, root)?;
+                let mut text = Buf::new_in(scratch);
+                escape_str(value, &mut text);
+                atom.literal(LitKind::Str, text.as_str(), 0, root)?;
+            }
+            let outcome = cx.cfg(&atom)?;
+            let mut subject = Buf::new_in(scratch);
+            stringified(&atom, scratch, &mut subject)?;
+            reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
+            Ok(outcome)
+        })
+    }
+}
+
+/// `path` when it is root-relative ([`is_root_relative`]); a host's rooted answer that is not
+/// one is unreadable.
+fn rooted(path: &str) -> Result<&str, ExpandError> {
+    if is_root_relative(path) {
+        Ok(path)
+    } else {
+        Err(HostError { ask: HostAsk::Include, why: HostWhy::Unreadable }.into())
+    }
 }
 
 /// How an included file is read, which the host is told so it can tell a module file from

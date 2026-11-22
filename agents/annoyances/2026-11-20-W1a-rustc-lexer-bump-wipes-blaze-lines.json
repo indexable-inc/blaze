@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "W1a",
+  "area": "crates/rustc_lexer (vendored), harness/toolchain_bump.py `vendor`",
+  "annoyance": "crates/rustc_lexer/Cargo.toml says the crate is rust-lang/rust's lexer as the pinned nightly has it, but its src holds blaze's own lines (the blaze_unicode tables, and since wave-1124-sansio the no_std root, core paths and the allocation-free frontmatter fence search with its test). toolchain_bump.py's `vendor` keeps blaze's lines for rustc_abi (ABI_ROOT's marker and count) but calls `replace_tree` on rustc_lexer/src with no such guard, so the next toolchain bump silently drops every blaze line there and the crate goes back to std and a `format!`.",
+  "workaround": "After a bump, diff crates/rustc_lexer/src against the previous tree and restore each line marked `blaze:`; the fix is a guard in `vendor` like ABI_ROOT's (refuse when the vendored root lacks blaze's marker lines) or a patch file the script applies after copying."
+}

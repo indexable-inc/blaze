@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::project::ProjectWorld;
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_own::Alloc;
 use blaze_scope::graph::Sysroot;
 use blaze_scope::resolve::{CrateInput, Names, SourceTexts, aligned, resolve_crates};
@@ -113,12 +113,8 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<&'static str> {
-        None
-    }
-
     /// No texts, so no origins.
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<(&'static [u8], &'static [u8])> {
+    fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<LoadedExpansion<'static>> {
         None
     }
 }

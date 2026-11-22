@@ -14,33 +14,45 @@
 //! from there: a module is never compiled lazily under a lock while other work waits for it
 //! ([`Runtime::load_all`] compiles a build's list ahead on N workers).
 //!
-//! - Where: beside the wasm in the module store, `<store>/proc-macro/modules/<module key>/`
-//!   ([`ModuleRecord::dir`]): `compiled-<code key>` holds the bytes of Wasmtime's
-//!   `Engine::precompile_module`, `compiled-<code key>.seal` the BLAKE3 of those bytes and
-//!   the key's parts.
+//! - Where: the store's one folder of compiled code, `<store>/proc-macro/compiled/`
+//!   ([`ModuleRecord::compiled`], module.rs [`crate::module::COMPILED_DIR`]), NOT the module's
+//!   own folder: `<code key>` holds the bytes of Wasmtime's `Engine::precompile_module`,
+//!   `<code key>.seal` their size and the key's parts. The record is keyed by what the code is
+//!   made from (rule 52), not by which module record named it, so a module of any identity
+//!   form whose wasm is the same bytes takes the same record, and a home whose module store is
+//!   copied from another (the scoreboard's fresh homes) takes every record compiled into it.
+//!   (Before, 2026-11-20: records were `compiled-<code key>` in each module's folder; the
+//!   form-3 modules of 2026-11-18 had none, every scoreboard home was a fresh copy, and each
+//!   first check compiled all 81 modules with Cranelift: the Names stage's CPU went from 50 s
+//!   to 153 s.)
 //! - The key ([`Runtime::code_key`]) is the SHA-256 of everything that decides whether the
 //!   bytes are valid here: the module's wasm SHA-256; [`Settings`], every setting the crate
 //!   passes to Wasmtime, read from the one place the engine is built ([`Settings::config`]);
 //!   and Wasmtime's `precompile_compatibility_hash`, which hashes the target triple, the
 //!   compiler's flags, the host CPU features Wasmtime compiled for (`isa_flags`), its tunables
 //!   and wasm features, and Wasmtime's version; and the host's architecture and system.
-//! - Writing: the bytes go to a temporary name (process id and a count) and are renamed to
-//!   `compiled-<code key>`; only then is the seal written the same way. A seal therefore never
-//!   names bytes that are not complete. Two processes compiling one module write equal bytes
-//!   under one name (Wasmtime's output is a function of the wasm and the key), so the later
-//!   rename replaces a file with an equal one.
+//! - Writing: the bytes go to a temporary name (process id and a count), are synced, and are
+//!   renamed to `<code key>`; only then is the seal written the same way. A seal therefore
+//!   never names bytes that are not complete: the seal is the record's proof, made once by the
+//!   writer that made the bytes (rule 74). Two processes compiling one module write equal
+//!   bytes under one name (Wasmtime's output is a function of the wasm and the key), so the
+//!   later rename replaces a file with an equal one, and a process that mapped the earlier one
+//!   keeps its own inode.
+//! - Reading: in place. The record is opened once, checked through that open file, and mapped
+//!   by Wasmtime (`Module::deserialize_open_file`); its bytes are neither copied nor hashed on
+//!   a read.
 //! - TRUST. Wasmtime's deserialize entry trusts its bytes: they are machine code that runs in
-//!   this process. So a compiled record is only ever one this machine wrote into the user's
-//!   own module store, and it is loaded only after: the module's folder, the record and the
-//!   seal are not writable by group or others (the module store's rule: the bootstrap builder
-//!   makes it as the user, mode 755 folders and 644 files; a folder others can write is
+//!   this process. So a compiled record is only ever one this user's blaze wrote into the
+//!   user's own store, and it is loaded only after: the compiled folder, the record and the
+//!   seal are not writable by group or others (a folder others can write is
 //!   [`RuntimeError::OpenStore`] and nothing compiled is read from or written to it); the
-//!   record and seal have the folder's owner; the seal's key parts equal this runtime's; and
-//!   the BLAKE3 of the bytes read equals the seal's. The bytes are read once into memory,
-//!   checked, and the checked bytes themselves are deserialized, so nothing can change them
-//!   between the check and the load. This happens once per process per module (a [`Runtime`]
-//!   keeps each loaded module). A record that fails any of these is not loaded: it is removed
-//!   by name, kept as a [`CompiledFinding`], and the module is compiled again.
+//!   record (checked on the open file that is mapped) and the seal have the folder's owner;
+//!   the seal's key parts equal this runtime's; and the record's size is the seal's. The
+//!   content is not hashed again: only its owner can write it, and the owner can run any code
+//!   already. This happens once per process per module (a [`Runtime`] keeps each loaded
+//!   module). A record that fails any of these is not loaded: it is removed by name (an
+//!   unsealed one is left for the writer that may be between its two renames), kept as a
+//!   [`CompiledFinding`], and the module is compiled again.
 //! - One runtime, two workers asking for one module at once: one compiles or loads, the other
 //!   waits on the module's slot with a deadline ([`LOAD_DEADLINE`]) and a span naming the
 //!   module; past it the wait is [`RuntimeError::Wait`], naming the module.
@@ -55,7 +67,9 @@
 
 use std::{
     collections::BTreeMap,
+    fs::{self, File},
     hash::{Hash as _, Hasher as _},
+    io::{ErrorKind, Write as _},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -222,10 +236,10 @@ pub enum Refused {
     /// A seal with no record.
     NoRecord,
     /// The record or its seal can be written by group or others, or has another owner than
-    /// the module's folder.
+    /// the compiled folder.
     Open { mode: u32, uid: u32, owner: u32 },
-    /// The bytes are not the ones the seal names.
-    Digest { held: String, found: String },
+    /// The record is not the size its seal names (`held` is the seal's size line).
+    Size { held: String, found: u64 },
     /// The seal's key parts are not this runtime's.
     Key { held: String },
 }
@@ -244,14 +258,14 @@ impl std::fmt::Display for CompiledFinding {
         let record = self.record.display();
         let module = &self.module;
         match &self.why {
-            Refused::Unsealed => write!(f, "the compiled record {record} of {module} has no seal; removed and compiled again"),
+            Refused::Unsealed => write!(f, "the compiled record {record} of {module} has no seal (its writer may still be between its two renames); compiled again over it"),
             Refused::NoRecord => write!(f, "the seal of {record} of {module} names no record; removed and compiled again"),
             Refused::Open { mode, uid, owner } => write!(
                 f,
                 "the compiled record {record} of {module} has mode {mode:o} and owner {uid} (its folder's is {owner}): others could have written it; removed and compiled again"
             ),
-            Refused::Digest { held, found } => {
-                write!(f, "the compiled record {record} of {module} is not the bytes its seal names (BLAKE3 {held}, found {found}); removed and compiled again")
+            Refused::Size { held, found } => {
+                write!(f, "the compiled record {record} of {module} is {found} bytes, its seal says {held:?}; removed and compiled again")
             }
             Refused::Key { held } => write!(f, "the seal of {record} of {module} holds another key ({held:?}); removed and compiled again"),
         }
@@ -279,6 +293,10 @@ pub struct Runtime {
     slots: Mutex<BTreeMap<String, Arc<Slot>>>,
     /// How many modules this runtime compiled (none loaded from a record).
     compiles: AtomicU64,
+    /// Their compiles' time, in nanoseconds, summed over the workers that ran them.
+    compile_ns: AtomicU64,
+    /// How many modules this runtime took from their compiled records.
+    taken: AtomicU64,
     /// Temporary names: one count for the runtime, with the process id.
     temps: AtomicU64,
     findings: Mutex<Vec<CompiledFinding>>,
@@ -307,6 +325,27 @@ impl std::hash::Hasher for Bytes {
 
     fn write(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
+    }
+}
+
+/// What a runtime's module loads came to ([`Runtime::module_loads`]). Its `Display` is the
+/// profile's line: `macro modules: N loaded, M compiled now (S ms), K taken compiled`, where S
+/// is the compiles' time summed over the workers that ran them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModuleLoads {
+    /// Modules loaded: `compiled + taken`.
+    pub loaded: u64,
+    /// Modules compiled by this process (no valid compiled record was there).
+    pub compiled: u64,
+    /// The compiles' time, summed over workers.
+    pub compile_time: Duration,
+    /// Modules taken from their compiled records, mapped in place.
+    pub taken: u64,
+}
+
+impl core::fmt::Display for ModuleLoads {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "macro modules: {} loaded, {} compiled now ({} ms), {} taken compiled", self.loaded, self.compiled, self.compile_time.as_millis(), self.taken)
     }
 }
 
@@ -350,6 +389,8 @@ impl Runtime {
             code_id,
             slots: Mutex::new(BTreeMap::new()),
             compiles: AtomicU64::new(0),
+            compile_ns: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
             temps: AtomicU64::new(0),
             findings: Mutex::new(Vec::new()),
             parts: Parts::counted(),
@@ -390,6 +431,13 @@ impl Runtime {
     /// How many modules this runtime compiled.
     pub fn compiles(&self) -> u64 {
         self.compiles.load(Ordering::Relaxed)
+    }
+
+    /// What this runtime's module loads came to so far: the profile's `macro modules` line.
+    pub fn module_loads(&self) -> ModuleLoads {
+        let compiled = self.compiles.load(Ordering::Relaxed);
+        let taken = self.taken.load(Ordering::Relaxed);
+        ModuleLoads { loaded: compiled + taken, compiled, compile_time: Duration::from_nanos(self.compile_ns.load(Ordering::Relaxed)), taken }
     }
 
     /// The compiled records refused so far, taken.
@@ -475,109 +523,133 @@ impl Runtime {
         let started = Instant::now();
         let crate_name = format!("{} {}", module.name, module.version);
         let compile = |why: String| RuntimeError::Compile { module: crate_name.clone(), why };
-        let dir = &module.dir;
+        let dir = &module.compiled;
+        // The store's compiled folder is made on its first compile (mode from the user's umask;
+        // `private_dir` refuses one that group or others can write).
+        fs::create_dir_all(dir).map_err(|error| RuntimeError::Io { path: dir.clone(), error })?;
         let owner = private_dir(dir)?;
         let key = self.code_key(module);
-        let path = dir.join(format!("compiled-{key}"));
-        let seal_path = dir.join(format!("compiled-{key}.seal"));
-        let (compiled, compiled_now, code_bytes) = match self.read_sealed(module, &key, &path, &seal_path, owner)? {
-            Some(code) => {
-                // SAFETY: `deserialize` runs these bytes as machine code. They are the bytes
-                // `read_sealed` read from this user's own module store (folder, record and seal
-                // not writable by group or others, owned by the folder's owner) and checked
-                // against the BLAKE3 its seal holds, under a key holding every setting of this
-                // engine; the checked bytes themselves are what is deserialized.
-                let loaded = unsafe { Module::deserialize(&self.engine, &code) };
-                (loaded.map_err(|e| compile(format!("its compiled record {} does not load: {e:#}", path.display())))?, false, code.len())
+        let path = dir.join(&key);
+        let seal_path = dir.join(format!("{key}.seal"));
+        let (compiled, compiled_now, code_bytes) = match self.open_sealed(module, &key, &path, &seal_path, owner)? {
+            Some((file, len)) => {
+                // SAFETY: `deserialize_open_file` maps this file and runs its bytes as machine
+                // code. It is the record `open_sealed` opened in this user's own store (folder,
+                // seal and this open file not writable by group or others, owned by the
+                // folder's owner), whose seal, written by the process that made the bytes only
+                // after they were synced and renamed whole, names this size under a key holding
+                // every setting of this engine. Records are written once, by rename, never in
+                // place: a later writer replaces the name, not this inode, so the mapping stays
+                // the bytes checked for the life of the module.
+                let loaded = unsafe { Module::deserialize_open_file(&self.engine, file) };
+                let loaded = loaded.map_err(|e| compile(format!("its compiled record {} does not load: {e:#}", path.display())))?;
+                self.taken.fetch_add(1, Ordering::Relaxed);
+                (loaded, false, len)
             }
             None => {
-                self.compiles.fetch_add(1, Ordering::Relaxed);
+                let compiling = Instant::now();
                 // The wasm read and checked only here, for this compile, and dropped with it
                 // (module.rs `ModuleRecord::wasm`).
                 let wasm = module.wasm().map_err(RuntimeError::Wasm)?;
                 let code = self.engine.precompile_module(&wasm).map_err(|e| compile(format!("{e:#}")))?;
                 drop(wasm);
-                self.write_renamed(dir, &path, &code)?;
-                self.write_renamed(dir, &seal_path, seal(&key, module, &self.code_id, &code).as_bytes())?;
+                let len = u64::try_from(code.len()).unwrap_or(u64::MAX);
+                self.write_synced(dir, &path, &code)?;
+                self.write_synced(dir, &seal_path, seal(&key, module, &self.code_id, len).as_bytes())?;
                 // SAFETY: the bytes this engine just made from the module, in this process's
                 // memory.
                 let loaded = unsafe { Module::deserialize(&self.engine, &code) };
-                (loaded.map_err(|e| compile(format!("{e:#}")))?, true, code.len())
+                let loaded = loaded.map_err(|e| compile(format!("{e:#}")))?;
+                self.compiles.fetch_add(1, Ordering::Relaxed);
+                self.compile_ns.fetch_add(u64::try_from(compiling.elapsed().as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+                (loaded, true, len)
             }
         };
         let pre = self.linker.instantiate_pre(&compiled).map_err(|e| compile(format!("{e:#}")))?;
-        let code_bytes = u64::try_from(code_bytes).unwrap_or(u64::MAX);
         Ok(Arc::new(Loaded { pre, crate_name, decls: module.decls.clone(), compiled: compiled_now, code_bytes, load_time: started.elapsed() }))
     }
 
-    /// The bytes of `module`'s compiled record at `path` when its seal at `seal_path` names
-    /// them under `key`; otherwise none, the record and seal removed and a finding kept.
-    fn read_sealed(&self, module: &ModuleRecord, key: &str, path: &Path, seal_path: &Path, owner: u32) -> Result<Option<Vec<u8>>, RuntimeError> {
+    /// `module`'s compiled record at `path`, opened, with its size, when its seal at
+    /// `seal_path` names it under `key`; otherwise none, a finding kept and the record and
+    /// seal removed (an unsealed record is left: its writer may be between its two renames,
+    /// and the compile that follows renames over it).
+    fn open_sealed(&self, module: &ModuleRecord, key: &str, path: &Path, seal_path: &Path, owner: u32) -> Result<Option<(File, u64)>, RuntimeError> {
         let io = |path: &Path| {
             let path = path.to_owned();
             move |error| RuntimeError::Io { path, error }
         };
-        let read = |at: &Path| match std::fs::read(at) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(RuntimeError::Io { path: at.to_owned(), error }),
+        let held = match fs::read(seal_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(io(seal_path)(error)),
         };
-        let held = read(seal_path)?;
-        let code = read(path)?;
-        let refused = match (held, code) {
+        let file = match File::open(path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(io(path)(error)),
+        };
+        let refused = match (held, file) {
             (None, None) => return Ok(None),
             (None, Some(_)) => Refused::Unsealed,
             (Some(_), None) => Refused::NoRecord,
-            (Some(held), Some(code)) => {
-                let open = [path, seal_path].into_iter().find_map(|at| match std::fs::metadata(at) {
-                    Ok(meta) if meta.mode() & 0o022 == 0 && meta.uid() == owner => None,
-                    Ok(meta) => Some(Ok(Refused::Open { mode: meta.mode() & 0o7777, uid: meta.uid(), owner })),
-                    Err(error) => Some(Err(RuntimeError::Io { path: at.to_owned(), error })),
-                });
+            (Some(held), Some(file)) => {
+                // The record's mode, owner and size from the open file that is mapped, not its
+                // name: nothing can be swapped in between the check and the map.
+                let record = file.metadata().map_err(io(path))?;
+                let sealed = fs::metadata(seal_path).map_err(io(seal_path))?;
+                let open = [&record, &sealed]
+                    .into_iter()
+                    .find(|meta| meta.mode() & 0o022 != 0 || meta.uid() != owner)
+                    .map(|meta| Refused::Open { mode: meta.mode() & 0o7777, uid: meta.uid(), owner });
                 let held = String::from_utf8_lossy(&held).into_owned();
-                let expected = seal(key, module, &self.code_id, &code);
-                match open.transpose()? {
+                let expected = seal(key, module, &self.code_id, record.len());
+                match open {
                     Some(open) => open,
-                    None if held == expected => return Ok(Some(code)),
+                    None if held == expected => return Ok(Some((file, record.len()))),
                     None => match (held.split_once('\n'), expected.split_once('\n')) {
-                        (Some((held_digest, held_key)), Some((found_digest, found_key))) if held_key == found_key => {
-                            Refused::Digest { held: held_digest.to_owned(), found: found_digest.to_owned() }
-                        }
+                        (Some((held_size, held_key)), Some((_, found_key))) if held_key == found_key => Refused::Size { held: held_size.to_owned(), found: record.len() },
                         _ => Refused::Key { held },
                     },
                 }
             }
         };
-        for at in [path, seal_path] {
-            match std::fs::remove_file(at) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(io(at)(error)),
-                _ => {}
+        if refused != Refused::Unsealed {
+            for at in [path, seal_path] {
+                match fs::remove_file(at) {
+                    Err(error) if error.kind() != ErrorKind::NotFound => return Err(io(at)(error)),
+                    _ => {}
+                }
             }
         }
         lock(&self.findings).push(CompiledFinding { module: format!("{} {}", module.name, module.version), record: path.to_owned(), why: refused });
         Ok(None)
     }
 
-    /// `bytes` written to a temporary name in `dir`, then renamed to `path`.
-    fn write_renamed(&self, dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
+    /// `bytes` written to a temporary name in `dir`, synced, then renamed to `path`: a name
+    /// never holds bytes that are not whole on disk.
+    fn write_synced(&self, dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), RuntimeError> {
         let n = self.temps.fetch_add(1, Ordering::Relaxed);
         let name = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
         let staging = dir.join(format!(".{name}.{}.{n}.tmp", std::process::id()));
-        std::fs::write(&staging, bytes).map_err(|error| RuntimeError::Io { path: staging.clone(), error })?;
-        std::fs::rename(&staging, path).map_err(|error| RuntimeError::Io { path: path.to_owned(), error })
+        let at = |error| RuntimeError::Io { path: staging.clone(), error };
+        let mut file = File::create(&staging).map_err(at)?;
+        file.write_all(bytes).map_err(at)?;
+        file.sync_all().map_err(at)?;
+        drop(file);
+        fs::rename(&staging, path).map_err(|error| RuntimeError::Io { path: path.to_owned(), error })
     }
 }
 
-/// The seal of a compiled record: the BLAKE3 of its bytes on the first line, then the key's
-/// parts.
-fn seal(key: &str, module: &ModuleRecord, code_id: &str, code: &[u8]) -> String {
-    let digest: String = blaze_ids::b3::hash(code).iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("blake3 {digest}\ncode-key {key}\nwasm-sha256 {}\ncode-id {code_id}\n", module.wasm_sha256)
+/// The seal of a compiled record: its size on the first line, then the key's parts. Written
+/// by the process that made the bytes, after they are synced and renamed whole: the proof a
+/// read takes instead of hashing them again (rule 74).
+fn seal(key: &str, module: &ModuleRecord, code_id: &str, len: u64) -> String {
+    format!("size {len}\ncode-key {key}\nwasm-sha256 {}\ncode-id {code_id}\n", module.wasm_sha256)
 }
 
-/// The owner of `dir`, a module's folder, when group and others cannot write it.
+/// The owner of `dir`, the store's compiled folder, when group and others cannot write it.
 fn private_dir(dir: &Path) -> Result<u32, RuntimeError> {
-    let meta = std::fs::metadata(dir).map_err(|error| RuntimeError::Io { path: dir.to_owned(), error })?;
+    let meta = fs::metadata(dir).map_err(|error| RuntimeError::Io { path: dir.to_owned(), error })?;
     if meta.mode() & 0o022 != 0 {
         return Err(RuntimeError::OpenStore { dir: dir.to_owned(), mode: meta.mode() & 0o7777 });
     }

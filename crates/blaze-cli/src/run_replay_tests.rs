@@ -15,6 +15,7 @@ use bstd::test::BUDGET;
 
 use super::tests::{ECHO, HUB, LEAF, S, SHOUT, T, ToyFolder, ToyFront, builder, need, static_of, statics_before_publish, symbol_of};
 use super::*;
+use crate::start_list::Line;
 
 /// The statics of the fake run.
 const S1: Symbol = Symbol([0x51; 32]);
@@ -126,7 +127,7 @@ fn inbox() -> std::vec::Vec<u8> {
 
 const NEEDS: usize = 5;
 
-const TODAY: start_list::Certificate = start_list::Certificate([0x7a; 32]);
+const TODAY: start_list::Certificate = start_list::Certificate::for_tests([0x7a; 32]);
 
 const HEAD: StartHead = StartHead { line: EntryLine { form: EntryForm::Unit, symbol: CodeSymbol([1; 32]) }, personality: None };
 
@@ -140,12 +141,13 @@ fn first_run(alloc: Alloc<'_>) -> (std::vec::Vec<u8>, std::vec::Vec<Line>) {
     let mut needs = Needs::new(alloc);
     let mut out = std::vec::Vec::new();
     needs.serve(&mut resolver, &inbox(), &mut out).expect("the first run served");
-    (out, needs.first().to_vec())
+    (out, needs.first().lines().collect())
 }
 
+/// `lines` as a list under [`TODAY`] (the planted writer, start_list.rs `encode_lines`).
 fn encoded(lines: &[Line], alloc: Alloc<'_>) -> std::vec::Vec<u8> {
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    start_list::encode(TODAY, HEAD, lines, &mut bytes).expect("the list fits");
+    start_list::encode_lines(&TODAY, HEAD, lines, &mut bytes).expect("the list fits");
     bytes.as_slice().to_vec()
 }
 
@@ -186,8 +188,8 @@ fn a_replay_answers_every_first_call_from_the_list_and_resolves_nothing() {
     let alloc = erased.handle();
     let (first, lines) = first_run(alloc);
     let bytes = encoded(&lines, alloc);
-    let start_list::Held::Today(today) = start_list::read(&bytes, alloc).expect("the list reads").under(TODAY) else { panic!("today's list read as another's") };
-    let placed: std::vec::Vec<Line> = today.lines().collect();
+    let start_list::Held::Today(today) = start_list::read(&bytes, alloc).expect("the list reads").under(&TODAY) else { panic!("today's list read as another's") };
+    let placed: std::vec::Vec<TodayGroup<'_>> = today.groups().collect();
     let mut needs = Needs::new(alloc);
     let mut out = std::vec::Vec::new();
     needs.place_ahead(&placed, &mut out).expect("placed");
@@ -205,10 +207,10 @@ fn a_replay_answers_every_first_call_from_the_list_and_resolves_nothing() {
     let at = |it: &Said| replay.iter().position(|said| said == it).expect("a message of the replay");
     let publish = |n: u8| Said::Publish { symbol: Symbol([n; 32]), record: RecordId([n * 10; 32]) };
     assert!(at(&d1) < at(&publish(2)) && at(&d2) < at(&publish(3)) && at(&d1) < at(&publish(3)), "a Data came after the Publish that needs it: {replay:?}");
-    assert_eq!(needs.first(), &lines[..], "the replay's list is not the one it was given: it would be written again");
+    assert_eq!(needs.first().lines().collect::<std::vec::Vec<_>>(), lines, "the replay's list is not the one it was given: it would be written again");
     let tally = needs.start_tally(Built::No, ListHeld::Today);
     assert_eq!((tally.placed, tally.answered, tally.data, tally.resolved), (4, 4, 2, 0));
-    assert_eq!(std::format!("{tally}"), "start list: placed 4 of 4 first answers (2 data); resolved after the list 0; front end built: no");
+    assert_eq!(std::format!("{tally}"), "start list: placed 4 of 4 first answers (2 data, 0 positioned); resolved after the list 0; front end built: no");
     std::println!("run replay: {NEEDS} needs answered from the list, 0 resolved; Data before each namer's Publish");
 }
 
@@ -225,8 +227,8 @@ fn without_the_static_groups_the_replay_resolves_again() {
     let cut = [row(1), row(4)];
     assert!(lines.contains(&row(2)) && lines.contains(&row(3)), "the first run's list lost the static groups: {lines:?}");
     let bytes = encoded(&cut, alloc);
-    let start_list::Held::Today(today) = start_list::read(&bytes, alloc).expect("the cut list reads").under(TODAY) else { panic!("today's list read as another's") };
-    let placed: std::vec::Vec<Line> = today.lines().collect();
+    let start_list::Held::Today(today) = start_list::read(&bytes, alloc).expect("the cut list reads").under(&TODAY) else { panic!("today's list read as another's") };
+    let placed: std::vec::Vec<TodayGroup<'_>> = today.groups().collect();
     let mut needs = Needs::new(alloc);
     let mut asked = Statics::new();
     let mut out = std::vec::Vec::new();
@@ -267,10 +269,10 @@ fn the_lazy_parent_replays_statics_with_no_front_end() {
     let (head, lines, built) = {
         let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: HUB }, &mut folder, &mut store, builder(), alloc);
         let mut needs = Needs::new(alloc);
-        let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
+        let mut kept: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
         let head = ahead_of(None, &mut lazy, &mut needs, &mut kept, &mut first).expect("the roots");
         needs.serve(&mut lazy, &inbox, &mut first).expect("run 1 served");
-        (head, needs.first().to_vec(), lazy.built())
+        (head, needs.first().lines().collect::<std::vec::Vec<Line>>(), lazy.built())
     };
     assert_eq!(built, Built::Head, "run 1 built the front end for something other than its head");
     let codes: std::vec::Vec<Symbol> = lines.iter().filter_map(Line::code).map(|row| row.symbol).collect();
@@ -278,20 +280,21 @@ fn the_lazy_parent_replays_statics_with_no_front_end() {
     let data: std::vec::Vec<Symbol> = lines.iter().filter_map(|line| if let Line::Datum(datum) = line { Some(datum.symbol) } else { None }).collect();
     assert_eq!(data, [static_of(S), static_of(T)], "run 1's list does not hold S and T once each");
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    start_list::encode(TODAY, head, &lines, &mut bytes).expect("the list fits");
+    start_list::encode_lines(&TODAY, head, &lines, &mut bytes).expect("the list fits");
 
     // Run 2: the same certificate; nothing of the front end may be built.
     starts.set(0);
     calls.set(0);
     let mut second = std::vec::Vec::new();
     let tally = {
-        let start_list::Held::Today(today) = start_list::read(bytes.as_slice(), alloc).expect("the list reads").under(TODAY) else { panic!("today's list read as another's") };
+        let start_list::Held::Today(today) = start_list::read(bytes.as_slice(), alloc).expect("the list reads").under(&TODAY) else { panic!("today's list read as another's") };
         let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: HUB }, &mut folder, &mut store, builder(), alloc);
         let mut needs = Needs::new(alloc);
-        let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
+        let mut kept: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
         let entry = ahead_of(Some(today), &mut lazy, &mut needs, &mut kept, &mut second).expect("placed");
         assert_eq!(entry, head, "the list's head is not run 1's");
-        assert_eq!(kept.as_slice(), &lines[..], "a group of the list was left out with every file there");
+        let kept_lines: std::vec::Vec<Line> = kept.iter().flat_map(|group| group.view().lines()).collect();
+        assert_eq!(kept_lines, lines, "a group of the list was left out with every file there");
         needs.serve(&mut lazy, &inbox, &mut second).expect("run 2 served from the list");
         assert!(lazy.is_cold(), "run 2 built the front end");
         needs.start_tally(lazy.built(), ListHeld::Today)
@@ -299,7 +302,7 @@ fn the_lazy_parent_replays_statics_with_no_front_end() {
     assert_eq!((starts.get(), calls.get()), (0, 0), "run 2 asked for the roots or made a record");
     assert_eq!(statics_before_publish(&second, &folder), Ok(8), "run 2: a Publish before its statics");
     assert_eq!(said(&second, true), said(&first, true), "run 2's messages are not run 1's");
-    assert_eq!(std::format!("{tally}"), "start list: placed 4 of 4 first answers (2 data); resolved after the list 0; front end built: no");
+    assert_eq!(std::format!("{tally}"), "start list: placed 4 of 4 first answers (2 data, 0 positioned); resolved after the list 0; front end built: no");
 
     // Run 3, the control: echo's and shout's groups cut from the list.
     let mut cut: std::vec::Vec<Line> = std::vec::Vec::new();
@@ -314,13 +317,13 @@ fn the_lazy_parent_replays_statics_with_no_front_end() {
         }
     }
     let mut cut_bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    start_list::encode(TODAY, head, &cut, &mut cut_bytes).expect("the cut list fits");
+    start_list::encode_lines(&TODAY, head, &cut, &mut cut_bytes).expect("the cut list fits");
     let mut third = std::vec::Vec::new();
     let tally = {
-        let start_list::Held::Today(today) = start_list::read(cut_bytes.as_slice(), alloc).expect("the cut list reads").under(TODAY) else { panic!("today's list read as another's") };
+        let start_list::Held::Today(today) = start_list::read(cut_bytes.as_slice(), alloc).expect("the cut list reads").under(&TODAY) else { panic!("today's list read as another's") };
         let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: HUB }, &mut folder, &mut store, builder(), alloc);
         let mut needs = Needs::new(alloc);
-        let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
+        let mut kept: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
         ahead_of(Some(today), &mut lazy, &mut needs, &mut kept, &mut third).expect("placed");
         needs.serve(&mut lazy, &inbox, &mut third).expect("run 3 served");
         assert!(!lazy.is_cold(), "run 3 resolved echo without building the front end");
@@ -333,6 +336,6 @@ fn the_lazy_parent_replays_statics_with_no_front_end() {
     for byte in &symbol_of(ECHO).0[..6] {
         short.push_str(&std::format!("{byte:02x}"));
     }
-    assert_eq!(std::format!("{tally}"), std::format!("start list: placed 2 of 4 first answers (0 data); resolved after the list 2; front end built: yes (first need: {short})"));
+    assert_eq!(std::format!("{tally}"), std::format!("start list: placed 2 of 4 first answers (0 data, 0 positioned); resolved after the list 2; front end built: yes (first need: {short})"));
     std::println!("run replay (lazy): run 2 built no front end, 4 of 4 placed; without the static groups the front end is built at echo");
 }

@@ -111,14 +111,13 @@ fn unit(package: u32, name: &str, kind: UnitKind<'static>, for_host: bool, deps:
         deps: d,
         build_script: None,
         links: None,
-        incomplete: false,
     }
 }
 
 fn graph(units: Vec<Unit<'static>>) -> UnitGraph<'static> {
     let mut all = AVec::new_in(a());
     all.extend(units);
-    UnitGraph { units: all, unavailable: AVec::new_in(a()), resolver: Resolver::V3, meta: AVec::new_in(a()) }
+    UnitGraph { units: all, resolver: Resolver::V3, meta: AVec::new_in(a()) }
 }
 
 #[test]

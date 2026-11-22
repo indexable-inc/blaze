@@ -140,6 +140,12 @@ impl<'m> DictBuilder<'m> {
         self.subjects.push(name.subject.0);
     }
 
+    pub(crate) fn name(&self, task: TaskId) -> Name {
+        let local = (task.0 - self.first_task) as usize;
+        let kind = Kind::from_u8(self.kinds[local]).expect("push_task stores a Kind");
+        Name { kind, subject: ContentId(self.subjects[local]) }
+    }
+
     pub(crate) fn push_cell(&mut self, definer: TaskId, cell: Cell) {
         self.definers.push(definer.0);
         self.cells.push(cell.0);
@@ -319,6 +325,18 @@ impl<'a> DictView<'a> {
     }
 
     pub(crate) fn verify(&self, segment: u32) -> Result<(), AnswerError> {
+        for local in 0..self.tasks as usize {
+            let (kind, subject) = self.task_key(local);
+            if !filter_has(self.bytes, self.at[3], self.task_words, task_hash(kind, subject)) {
+                return Err(AnswerError::FilterMissing { segment, section: "task", at: local });
+            }
+        }
+        for local in 0..self.cells as usize {
+            let (definer, selector) = self.cell_key(local);
+            if !filter_has(self.bytes, self.at[7], self.cell_words, cell_hash(definer, selector)) {
+                return Err(AnswerError::FilterMissing { segment, section: "cell", at: local });
+            }
+        }
         for mid in 1..self.tasks as usize {
             let (a, b) = (count(self.bytes, self.at[2] + 4 * (mid - 1)), count(self.bytes, self.at[2] + 4 * mid));
             if self.task_key(a) >= self.task_key(b) {
@@ -333,6 +351,20 @@ impl<'a> DictView<'a> {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_dictionary_filter_cannot_hide_a_stored_task() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut dict = DictBuilder::new_in(0, 0, alloc);
+    let name = Name { kind: Kind::FileItems, subject: ContentId([9; 32]) };
+    dict.push_task(name);
+    let mut bytes = dict.encode(Serial(1), alloc);
+    let at = dict_layout(1, filter_words(1), 0, filter_words(0));
+    bytes[at[3]..at[4]].fill(0);
+    let view = DictView::open(&bytes, 0).expect("the directory bounds are intact");
+    assert_eq!(view.verify(0), Err(AnswerError::FilterMissing { segment: 0, section: "task", at: 0 }));
 }
 
 // ---------------------------------------------------------------------------------------------

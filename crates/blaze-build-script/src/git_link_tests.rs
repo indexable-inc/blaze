@@ -160,7 +160,7 @@ impl GitFiles for NoLinks<'_, '_> {
 }
 
 fn porcelain(files: &mut impl GitFiles, alloc: Alloc<'_>) -> Result<std::string::String, Refused> {
-    status(".git", ".git", "", false, TREE, files, alloc).map(|out| out.as_str().to_owned())
+    status(".git", ".git", "", false, false, TREE, files, alloc).map(|out| out.as_str().to_owned())
 }
 
 /// In a copy every stat differs; links whose target text equals their blob are clean, the one

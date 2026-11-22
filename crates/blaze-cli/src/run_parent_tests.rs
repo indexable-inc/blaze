@@ -21,7 +21,39 @@ use bstd::mem::TASK_FRAME;
 use bstd::test::BUDGET;
 
 use super::*;
-use crate::run_ids::Missing;
+use crate::run_ids::{Checked, Missing};
+use crate::start_list::Line;
+
+/// The certificate the tests' lists are written and replayed under (a planted one: no answer is
+/// behind it).
+const LISTED: start_list::Certificate = start_list::Certificate::for_tests([0x5e; 32]);
+
+/// The head the tests' lists are written with.
+fn list_head() -> StartHead {
+    StartHead { line: EntryLine { form: LineForm::Unit, symbol: CodeSymbol([0x5f; 32]) }, personality: None }
+}
+
+/// `lines` as a list under [`LISTED`] onto `bytes` (the planted writer, start_list.rs
+/// `encode_lines`, so a test can name rows one by one).
+fn listed(lines: &[Line], bytes: &mut AVec<'_, u8>) {
+    start_list::encode_lines(&LISTED, list_head(), lines, bytes).expect("a small list");
+}
+
+/// The list in `bytes` read back under its own certificate: today's rows.
+fn today_rows<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> TodayRows<'b> {
+    let start_list::Held::Today(rows) = start_list::read(bytes, alloc).expect("the list reads").under(&LISTED) else { panic!("the list under its own certificate is not today's") };
+    rows
+}
+
+/// The groups of the list in `bytes`, under its own certificate.
+fn today_groups<'b>(bytes: &'b [u8], alloc: Alloc<'_>) -> std::vec::Vec<TodayGroup<'b>> {
+    today_rows(bytes, alloc).groups().collect()
+}
+
+/// This run's first answers as rows (the list it writes at exit).
+fn first_lines(needs: &Needs<'_>) -> std::vec::Vec<Line> {
+    needs.first().lines().collect()
+}
 
 pub(super) fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
     let mut said = std::vec::Vec::new();
@@ -86,9 +118,8 @@ fn a_symbol_is_declared_once_and_an_unknown_one_refused() {
     let taken = needs.serve(&mut Fixed, &inbox, &mut out).expect("served");
     assert_eq!(taken, inbox.len() - 3, "a frame not all here is left for the next read");
     assert_eq!(frames(&out), ["Declare [(1, 0)]", "Publish 0 10", "Publish 0 10", "Failed Unresolved"]);
-    assert_eq!(status_of(Ended::Exited(3)), Some(3));
-    assert_eq!(status_of(Ended::Signaled(9)), Some(137));
-    assert_eq!(status_of(Ended::Deadline), None);
+    assert_eq!(status_of(Exit::Exited(3)), 3);
+    assert_eq!(status_of(Exit::Signaled(9)), 137);
     std::println!("run_parent: declared once, slot 0 published twice, unknown symbol Unresolved");
 }
 
@@ -143,7 +174,7 @@ fn a_symbol_is_resolved_once_and_declared_before_published() {
         "a record's slots are told before it, once"
     );
     assert_eq!(counting.asks.iter().map(|(s, n)| (*s, *n)).collect::<std::vec::Vec<_>>(), [(1, 1), (2, 1), (9, 1)], "a symbol was resolved more than once, or 3 (never needed) was resolved");
-    let first: std::vec::Vec<(u8, u8, u8)> = needs.first().iter().filter_map(Line::code).map(|row| (row.symbol.0[0], row.key.0.0[0], row.record.0[0])).collect();
+    let first: std::vec::Vec<(u8, u8, u8)> = first_lines(&needs).iter().filter_map(Line::code).map(|row| (row.symbol.0[0], row.key.0.0[0], row.record.0[0])).collect();
     assert_eq!(first, [(1, 1, 10), (2, 2, 20)], "the first-answer order");
 
     let rows = [
@@ -153,11 +184,13 @@ fn a_symbol_is_resolved_once_and_declared_before_published() {
     let mut ahead = Needs::new(alloc);
     let mut none = Counting { asks: std::collections::BTreeMap::new(), one: [Symbol([2; 32]), Symbol([3; 32])], two: [Symbol([1; 32])] };
     let mut out = std::vec::Vec::new();
-    ahead.place_ahead(&rows, &mut out).expect("placed");
+    let mut list = Vec::new_in(alloc);
+    listed(&rows, &mut list);
+    ahead.place_ahead(&today_groups(&list, alloc), &mut out).expect("placed");
     ahead.serve(&mut none, &need(Needed::Symbol(Symbol([6; 32]))), &mut out).expect("served");
     assert_eq!(frames(&out), ["Declare [(5, 0), (6, 1)]", "Publish 0 50", "Publish 1 60", "Publish 1 60"]);
     assert!(none.asks.is_empty(), "a placed row was resolved again: {:?}", none.asks);
-    assert_eq!(ahead.first(), &rows[..], "placed rows are this run's first answers, in the list's order");
+    assert_eq!(first_lines(&ahead), rows, "placed rows are this run's first answers, in the list's order");
     std::println!("run_parent resolve: 1, 2 and 9 asked once each; Declare before Publish; ahead rows ask nothing");
 }
 
@@ -363,16 +396,15 @@ impl BodyIds for ToyIds {
     }
 }
 
+/// Every fn a workspace body with a row: clean, or with no record, through the one gate
+/// (run_ids.rs `Checked::runs`).
 impl Gate for ToyIds {
-    fn grain(&self, _item: ItemKey) -> Option<Grain> {
-        Some(Grain::Workspace)
-    }
-
-    fn checked(&self, _item: ItemKey) -> Option<Checked> {
-        Some(match self.clean {
+    fn runnable(&self, item: ItemKey) -> Result<Runnable, NotRunnable> {
+        match self.clean {
             true => Checked::Clean,
             false => Checked::Absent(Missing::NoRecord),
-        })
+        }
+        .runs(item)
     }
 }
 
@@ -380,13 +412,30 @@ impl Gate for ToyIds {
 /// (4) and the name.
 pub(super) struct ToyMaker<'t> {
     calls: &'t Cell<usize>,
+    /// Whether the bodies have typed records (engine_body_record.rs): a clean front's do; a
+    /// make of a body without one is the typed gap, as the run's reader answers it.
+    typed: bool,
+}
+
+/// The run's reader's answer for a body with no typed record (engine_body_record.rs
+/// `StoreTyped`), as the maker hands it up.
+fn no_typed_record(key: ItemKey) -> RunError {
+    use blaze_ladder::front2::program::Front2Refusal;
+    use blaze_ladder::front2::program::lazy::LazyRefusal;
+    use blaze_ladder::front2::program::lazy::typed::TypedGap;
+    RunError::Front2(Front2Refusal::Lazy(LazyRefusal::Typed { function: Box::from("a toy body"), gap: TypedGap::NoRecord { key } }))
 }
 
 impl Make for ToyMaker<'_> {
     type Error = RunError;
+    /// As the run's maker: handed the gate's proof (run_parent.rs `Front::Maker`).
+    type Grant = Runnable;
 
-    fn make(&mut self, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make(&mut self, _grant: &Runnable, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.calls.set(self.calls.get() + 1);
+        if !self.typed {
+            return Err(no_typed_record(tabled));
+        }
         let (_, callees) = CALLS.iter().find(|(f, _)| *f == tabled.0).ok_or(RunError::OneBody { key: tabled, why: "no such fn in the model" })?;
         for &callee in callees.iter() {
             let name = name_of(callee);
@@ -401,7 +450,7 @@ impl Make for ToyMaker<'_> {
     }
 
     /// A static's entry: its static rows and its mark (counted with the instances' makes).
-    fn make_static(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make_static(&mut self, _grant: &Runnable, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.calls.set(self.calls.get() + 1);
         static_rows(item.0, entry);
         entry.extend_from_slice(&item.0.to_le_bytes());
@@ -409,7 +458,7 @@ impl Make for ToyMaker<'_> {
     }
 
     /// A thread-local's template entry: its mark alone (counted with the others).
-    fn make_thread_local(&mut self, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    fn make_thread_local(&mut self, _grant: &Runnable, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         self.calls.set(self.calls.get() + 1);
         entry.extend_from_slice(&item.0.to_le_bytes());
         Ok(())
@@ -484,7 +533,8 @@ impl<'t> Front for ToyFront<'t> {
     }
 
     fn maker(&mut self, _start: &ToyStart) -> Result<ToyMaker<'t>, ParentError> {
-        Ok(ToyMaker { calls: self.calls })
+        // A body that is not clean has no typed record (the Bodies stage puts one per clean body).
+        Ok(ToyMaker { calls: self.calls, typed: self.clean })
     }
 
     fn form(&self) -> &dyn Form {
@@ -607,7 +657,7 @@ fn an_absent_workspace_body_is_refused_and_an_unknown_symbol_is_unknown() {
     let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: false, root: MAIN }, &mut folder, &mut store, builder(), alloc);
     match lazy.resolve(&symbol_of(MAIN)) {
         Err(ParentError::NotChecked { function, symbol, why }) => {
-            assert_eq!((function, symbol, why), (ItemKey(MAIN), symbol_of(MAIN).0, Some(Checked::Absent(Missing::NoRecord))));
+            assert_eq!((function, symbol, why), (ItemKey(MAIN), symbol_of(MAIN).0, NotRunnable::Checked(Checked::Absent(Missing::NoRecord))));
         }
         other => panic!("an unchecked body was answered: {other:?}"),
     }
@@ -618,6 +668,42 @@ fn an_absent_workspace_body_is_refused_and_an_unknown_symbol_is_unknown() {
     assert!(matches!(clean.resolve(&Symbol([9; 32])), Ok(Resolved::Unknown)), "an unknown symbol was answered with a record");
     assert_eq!(calls.get(), 4, "the walk from the roots did not step every row before answering Unknown");
     std::println!("lazy parent: an unchecked body refused by name, an unknown symbol Unknown");
+}
+
+/// Asserts THE ORDER (D163 part 2): a body with no typed record (one that is not clean: the
+/// Bodies stage puts a record per clean body only, engine_bodies.rs) is refused by the run GATE
+/// (`NotChecked`, run_ids.rs `RunIds::runnable`) before the maker, which reads the typed
+/// records, is ever asked: the user meets the check's verdict, never the reader's
+/// `TypedGap::NoRecord`. Control: the same maker asked past the gate answers the typed gap, so a
+/// parent that made before it gated fails on the error's kind, not only on the count.
+/// Prints "lazy parent: a body with no typed record is refused by the gate before the reader".
+#[test]
+fn a_body_with_no_typed_record_is_refused_by_the_gate_first() {
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut store = MemoryStore::new_in(alloc);
+    let mut folder = ToyFolder::default();
+    let (calls, starts) = (Cell::new(0), Cell::new(0));
+    let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: false, root: MAIN }, &mut folder, &mut store, builder(), alloc);
+    match lazy.resolve(&symbol_of(MAIN)) {
+        Err(ParentError::NotChecked { function, why, .. }) => assert_eq!((function, why), (ItemKey(MAIN), NotRunnable::Checked(Checked::Absent(Missing::NoRecord)))),
+        other => panic!("a body with no typed record was not refused by the gate: {other:?}"),
+    }
+    assert_eq!(calls.get(), 0, "the maker (the typed records' reader) was asked before the gate");
+    drop(lazy);
+
+    // Control: past the gate, the maker of a body with no typed record answers the gap.
+    let grant = Checked::Clean.runs(ItemKey(MAIN)).expect("a clean body is runnable");
+    let mut entry = AVec::new_in(alloc);
+    let mut maker = ToyMaker { calls: &calls, typed: false };
+    match maker.make(&grant, ItemKey(MAIN), &name_of(MAIN), &mut entry) {
+        Err(RunError::Front2(blaze_ladder::front2::program::Front2Refusal::Lazy(blaze_ladder::front2::program::lazy::LazyRefusal::Typed { gap: blaze_ladder::front2::program::lazy::typed::TypedGap::NoRecord { key }, .. }))) => assert_eq!(key, ItemKey(MAIN)),
+        other => panic!("control: the maker past the gate did not answer the typed gap: {other:?}"),
+    }
+    std::println!("lazy parent: a body with no typed record is refused by the gate before the reader");
 }
 
 /// Asserts (UNWIND.md 3.3, piece P3): with no start list the head comes from the roots, and the
@@ -637,7 +723,7 @@ fn the_personality_is_named_before_the_first_publish() {
     let (calls, starts) = (Cell::new(0), Cell::new(0));
     let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
     let mut needs = Needs::new(alloc);
-    let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
+    let mut kept: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
     let mut out = std::vec::Vec::new();
     let head = ahead_of(None, &mut lazy, &mut needs, &mut kept, &mut out).expect("the roots");
     assert_eq!(head.personality, Some(CodeSymbol(symbol_of(PERSONALITY).0)), "the roots' head names no routine");
@@ -678,24 +764,24 @@ fn a_list_under_todays_certificate_starts_cold() {
     let mut out = std::vec::Vec::new();
     needs.serve(&mut first, &need(Needed::Symbol(symbol_of(MAIN))), &mut out).expect("served");
     drop(first);
-    let mut rows: std::vec::Vec<Line> = needs.first().to_vec();
+    let mut rows: std::vec::Vec<Line> = first_lines(&needs);
     // A row whose file is gone: b, with a record never filed.
     let gone = Row { symbol: symbol_of(B), key: CodeKey(blaze_ids::ContentId([0xb; 32])), record: RecordId([0xee; 32]) };
     rows.push(Line::Code(gone));
-    let today = start_list::Certificate([1; 32]);
     let mut bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    start_list::encode(today, line, &rows, &mut bytes).expect("two rows");
-    let start_list::Held::Today(placed) = start_list::read(bytes.as_slice(), alloc).expect("a list").under(today) else { panic!("today's list read as another's") };
+    start_list::encode_lines(&LISTED, line, &rows, &mut bytes).expect("two rows");
+    let start_list::Held::Today(placed) = start_list::read(bytes.as_slice(), alloc).expect("a list").under(&LISTED) else { panic!("today's list read as another's") };
 
     starts.set(0);
     calls.set(0);
     let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: MAIN }, &mut folder, &mut store, builder(), alloc);
     let mut needs = Needs::new(alloc);
-    let mut kept: AVec<'_, Line> = Vec::new_in(alloc);
+    let mut kept: AVec<'_, TodayGroup<'_>> = Vec::new_in(alloc);
     let mut out = std::vec::Vec::new();
     let entry = ahead_of(Some(placed), &mut lazy, &mut needs, &mut kept, &mut out).expect("placed");
     assert_eq!(entry, line, "the list's head is not the one written");
-    assert_eq!(kept.as_slice(), &rows[..1], "a row whose record's file is gone was placed");
+    let kept_lines: std::vec::Vec<Line> = kept.iter().flat_map(|group| group.view().lines()).collect();
+    assert_eq!(kept_lines, &rows[..1], "a row whose record's file is gone was placed");
     // The routine named from the list's head, first: its slot declared, then `Personality`,
     // before the placed row's `Publish`.
     let said = frames(&out);
@@ -803,10 +889,10 @@ fn a_records_statics_are_told_once_before_its_publish() {
     assert_eq!(kinds, ["Declare", "Data", "Publish"], "{said:?}");
     let datum = |s: u128| data.iter().find(|d| d.symbol == static_of(s)).map(|d| (d.symbol.0[0], d.record.0[0])).expect("told");
     assert_eq!(said[1], std::format!("Data {:?}", [datum(S), datum(T)]), "the found data are the made data");
-    let codes: std::vec::Vec<Symbol> = needs.first().iter().filter_map(Line::code).map(|row| row.symbol).collect();
-    let kept: std::vec::Vec<Symbol> = needs.first().iter().filter_map(|line| match line {
+    let codes: std::vec::Vec<Symbol> = first_lines(&needs).iter().filter_map(Line::code).map(|row| row.symbol).collect();
+    let kept: std::vec::Vec<Symbol> = first_lines(&needs).iter().filter_map(|line| match line {
         Line::Datum(datum) => Some(datum.symbol),
-        Line::Code(_) | Line::Named(_) => None,
+        Line::Code(_) | Line::Named(_) | Line::Values(_) => None,
     }).collect();
     assert_eq!((codes, kept), (std::vec![symbol_of(SHOUT)], std::vec![static_of(S), static_of(T)]), "the record that brought data is not a start-list group with its data before it");
     assert_eq!(again.tally(), Tally { reached: 3, found: 3, made: 0, unkeyed: 0 });
@@ -867,7 +953,7 @@ fn a_record_naming_a_static_told_before_is_a_group_after_its_datum() {
         Line::Code(Row { symbol, key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]) })
     };
     assert_eq!(
-        needs.first(),
+        first_lines(&needs),
         &[Line::Datum(namers.told[0]), Line::Named(namers.s[0]), row(one), Line::Named(namers.s[0]), row(two), row(three)][..],
         "the first answers are not each a group in order, the datum once before its first namer"
     );
@@ -986,7 +1072,7 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
             inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(item))));
         }
         needs.serve(&mut lazy, &inbox, &mut out).expect("served");
-        needs.first().to_vec()
+        first_lines(&needs)
     };
     let said = frames(&out);
     assert!(said.iter().any(|frame| frame.starts_with("Personality")) && said.iter().any(|frame| frame.starts_with("Failed")), "{said:?}");
@@ -995,11 +1081,14 @@ fn every_publish_stands_on_its_statics_on_the_wire() {
     assert_eq!(rows, [symbol_of(HUB), symbol_of(ECHO), symbol_of(SHOUT), symbol_of(LEAF)], "the start list lost a first answer, a namer of a static or not");
 
     let mut again = std::vec::Vec::new();
+    let mut list = Vec::new_in(alloc);
+    listed(&first, &mut list);
     {
+        let groups = today_groups(&list, alloc);
         let mut needs = Needs::new(alloc);
         let mut lazy = Lazy::new(&cx, ToyFront { calls: &calls, starts: &starts, clean: true, root: HUB }, &mut folder, &mut store, builder(), alloc);
-        needs.place_ahead(&first, &mut again).expect("placed");
-        lazy.placed(&first);
+        needs.place_ahead(&groups, &mut again).expect("placed");
+        lazy.placed(&groups);
         let mut inbox = need(Needed::Symbol(symbol_of(HUB)));
         inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(ECHO))));
         inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(SHOUT))));
@@ -1058,10 +1147,11 @@ fn a_record_naming_a_vtable_stands_on_its_datum() {
         let mut inbox = need(Needed::Symbol(symbol_of(DYN)));
         inbox.extend_from_slice(&need(Needed::Symbol(symbol_of(DYN))));
         needs.serve(&mut lazy, &inbox, &mut out).expect("a record naming a vtable served");
-        needs.first().iter().map(|line| match line {
+        first_lines(&needs).iter().map(|line| match line {
             Line::Datum(datum) => ('d', datum.symbol),
             Line::Named(symbol) => ('n', *symbol),
             Line::Code(row) => ('c', row.symbol),
+            Line::Values(_) => ('v', Symbol([0; 32])),
         }).collect::<std::vec::Vec<_>>()
     };
     let said = frames(&out);
@@ -1336,4 +1426,36 @@ fn a_recorded_run_emits_each_first_call_and_how_it_was_answered() {
     assert_eq!(*second.seen.borrow(), ["Resolving { path: None }".to_string(), "Answered(Found)".to_string()]);
     assert_eq!(named.get(), 2, "a sink that wants no paths had one named");
     std::println!("run events: first run {:?}; second run {:?}", first.seen.borrow(), second.seen.borrow());
+}
+
+/// Asserts: (1) the program's native library is the run's first frame, its two words numbered
+/// slots 0 and 1 in word order, and the personality's `Declare` after it tells its own pair
+/// alone (slot 2), so no word is declared twice; (2) the control: told after a slot was
+/// numbered, it is refused by name ([`ParentError::NativeLate`]) and nothing is written.
+/// Prints "native: the library told first, its words slots 0 and 1; told late refused".
+#[test]
+fn the_native_library_is_the_first_frame() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let words = [Symbol([7; 32]), Symbol([8; 32])];
+    let mut needs = Needs::new(alloc);
+    let mut out = std::vec::Vec::new();
+    needs.tell_native(RecordId([5; 32]), &words, &mut out).expect("told first");
+    needs.name_personality(Some(CodeSymbol([9; 32])), &mut out).expect("the personality named");
+    let said = frames(&out);
+    assert_eq!(said, ["Native 5 2", "Declare [(9, 2)]", "Personality 2"], "the library was not the first frame: {said:?}");
+    let (_, first) = Down::decode(split(&out).expect("a frame").expect("one frame").0).expect("a run wire message");
+    let Down::Native { words: told, .. } = first else { panic!("the first frame is no Native") };
+    let pairs: std::vec::Vec<_> = told.iter().map(|it| (it.symbol, it.slot.0)).collect();
+    assert_eq!(pairs, [(words[0], 0), (words[1], 1)], "the words were not numbered in word order");
+
+    let mut late = Needs::new(alloc);
+    let mut before = std::vec::Vec::new();
+    late.name_personality(Some(CodeSymbol([9; 32])), &mut before).expect("the personality named");
+    let mut after = std::vec::Vec::new();
+    let refused = late.tell_native(RecordId([5; 32]), &words, &mut after);
+    assert!(matches!(refused, Err(ParentError::NativeLate { slots: 1 })), "a late library was not refused: {refused:?}");
+    assert!(after.is_empty(), "a refused library wrote a frame");
+    std::println!("native: the library told first, its words slots 0 and 1; told late refused");
 }

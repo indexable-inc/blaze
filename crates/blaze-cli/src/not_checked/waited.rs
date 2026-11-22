@@ -144,25 +144,6 @@ pub(crate) fn groups<'f>(waits: &mut Vec<Wait<'f>, &'f Frame>, frame: &'f Frame)
     Ok(out)
 }
 
-/// Groups of causes printed as one (blaze-drive `Print::also`: one failure two names held) as
-/// one group under the first's cause: crates and files each once, items and tasks summed.
-pub(crate) fn merged<'g, 'f: 'g>(groups: impl Iterator<Item = &'g Group<'f>>, frame: &'f Frame) -> Result<Group<'f>, CliError> {
-    let mut all: Option<Group<'f>> = None;
-    for group in groups {
-        let into = all.get_or_insert_with(|| Group { cause: group.cause, crates: Vec::new_in(frame), files: Vec::new_in(frame), items: 0, tasks: 0 });
-        into.crates.extend(group.crates.iter().copied());
-        into.files.extend(group.files.iter().copied());
-        into.items = into.items.checked_add(group.items).ok_or(CliError::Text { what: "more than 2^32 items waited on one failure" })?;
-        into.tasks = into.tasks.checked_add(group.tasks).ok_or(CliError::Text { what: "more than 2^32 tasks waited on one failure" })?;
-    }
-    let mut all = all.ok_or(CliError::Text { what: "no group to merge (blaze-cli not_checked/waited.rs `merged`)" })?;
-    all.crates.sort_unstable();
-    all.crates.dedup();
-    all.files.sort_unstable();
-    all.files.dedup();
-    Ok(all)
-}
-
 /// The line under a cause: "3 crates, 2 files, 9 items not checked because of it (12 tasks in
 /// all): `a`, `b`, `c`", the first [`CRATES_SHOWN`] crates named and "and N more" past them.
 /// Counts of none are left out.

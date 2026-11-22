@@ -14,7 +14,6 @@
 #![feature(allocator_api)]
 
 use std::{
-    alloc::Global,
     hint::black_box,
     sync::{Arc, Barrier, atomic::AtomicU64},
     time::Instant,
@@ -370,9 +369,17 @@ fn main() {
     for case in [Case::OursOff, Case::TheirsNone, Case::TheirsNothing] {
         println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));
     }
-    let rings: &'static Rings = Box::leak(Box::new(Rings::new_in(64, 1 << 12, Global).expect("the rings")));
-    blaze_trace::install_rings(blaze_trace::RingConfig { rings, wants: |_| true, clock: record::Clock::Counter })
-        .expect("rings installed once");
+    // The example is its own entry: its heap is the test capability (blaze-own's `testing`).
+    let heap = blaze_own::testing::heap().shared();
+    let rings: &'static Rings =
+        blaze_own::Box::leak(blaze_own::Box::new_in(Rings::new_in(64, 1 << 12, heap).expect("the rings"), heap));
+    blaze_trace::install_rings(blaze_trace::RingConfig {
+        rings,
+        wants: |_| true,
+        clock: record::Clock::Counter,
+        limits: blaze_trace::TraceLimits::SHIPPED,
+    })
+    .expect("rings installed once");
     ladder_on(&mut ladder);
     for case in [Case::OursRing, Case::TheirsRing] {
         println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));

@@ -18,8 +18,7 @@ doctest = false
 # blaze-swiss, workspace crates with no dependency from outside it (docs/v2/plan/design/bottom.md,
 # "Also decided on 2026-11-15").
 [features]
-# serde's forms of `Map` and `Set`, written by hand in `hash_map` and `hash_set`.
-serde = ["dep:serde"]
+# (`serde`, serde's forms of `Map` and `Set`, was removed on 2026-11-20: `hash_set` says why.)
 # `SharedMap`, `SharedSet` and `SharedByHash`: sharded tables read with no lock (`shared`),
 # whose unlinked entries `blaze-reclaim` frees once no reader can hold them.
 shared = ["dep:blaze-reclaim"]
@@ -28,7 +27,6 @@ shared = ["dep:blaze-reclaim"]
 blaze-own.workspace = true
 blaze-reclaim = { workspace = true, optional = true }
 blaze-swiss.workspace = true
-serde = { workspace = true, optional = true }
 
 # The shared tables' atomics, lock and tracked entries, explored by the model checker.
 [target.'cfg(blaze_check)'.dependencies]
@@ -36,6 +34,8 @@ blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# The tests and the cost example make their tables with the tests' root allocator (`blaze_own::testing::heap`).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-sim.workspace = true
 # What `fold` is a port of: `fold_is_foldhash` holds it to this, and `hash_cost` measures its
 # random-seeded form.

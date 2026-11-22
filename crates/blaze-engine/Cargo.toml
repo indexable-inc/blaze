@@ -17,12 +17,15 @@ doctest = false
 # Vec, BTreeMap, BTreeSet with the allocator always named: the crate's only collections.
 blaze-own.workspace = true
 # `ContentId`: every out and cell digest.
-blaze-id = { path = "../blaze-id" }
+blaze-id.workspace = true
 # Names, kinds, keys, tools and cells (key.rs, cells.rs): kept, not rewritten (engine.md "What
 # stays"). Depended on until the old machine is deleted, then moved here with their files.
 blaze-drive.workspace = true
 # The answer's stored form: the seam's digest, serial, flags and tree types (last.rs).
-blaze-answer = { path = "../blaze-answer" }
+blaze-answer.workspace = true
+# `DigestKey` for `CellId`: a cell's table hash is its digest's word, its other fields folded
+# in (blaze-hash digest.rs). No cycle: blaze-hash depends on blaze-own and blaze-swiss only.
+blaze-hash.workspace = true
 
 [dev-dependencies]
 # `check` and `control`: the history simulations and their planted-bug controls.

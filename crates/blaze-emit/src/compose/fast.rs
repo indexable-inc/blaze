@@ -3,7 +3,7 @@
 //! order, loops and homes; the emission pass (emit.rs) copies templates. Nothing here encodes an
 //! instruction.
 
-use blaze_lir::View;
+use blaze_lir::Verified;
 use blaze_own::Alloc;
 use blaze_tier::{Arch, Emitted, Machine, Names, RegDesc, Table, Tier, TierError, TierName};
 
@@ -18,7 +18,9 @@ pub struct Fast<'t> {
 impl Tier for Fast<'_> {
     const NAME: TierName = TierName::Fast;
 
-    fn emit<'a>(&self, func: View<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
+    fn emit<'a>(&self, func: Verified<'_>, names: &dyn Names, machine: Machine, alloc: Alloc<'a>) -> Result<Emitted<'a>, TierError> {
+        // The proof is the seam's to take (D163); the passes below read the view.
+        let func = func.view();
         // One machine throughout: the table's, the description's and the caller's. arm64 only:
         // the composer's frame, poll and glue patterns are arm64's (emit.rs, `glue`).
         if self.table.head().machine != machine || self.regs.arch != machine.arch || machine.arch != Arch::Arm64 {

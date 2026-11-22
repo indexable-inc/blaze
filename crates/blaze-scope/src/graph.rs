@@ -381,7 +381,7 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         };
         let mut prelude: AVec<'a, GraphDep<N>> = AVec::new_in(self.alloc.clone());
         prelude.extend(c.deps.iter().copied());
-        let mut add = |list: &mut AVec<'a, GraphDep<N>>, name: N, krate: Option<CrateId>| {
+        let add = |list: &mut AVec<'a, GraphDep<N>>, name: N, krate: Option<CrateId>| {
             if let Some(krate) = krate {
                 if !list.iter().any(|d| d.name == name) {
                     list.push(GraphDep { name, krate });

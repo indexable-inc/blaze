@@ -19,6 +19,9 @@ use blaze_own::{Alloc, Box};
 pub struct Prepares<'d> {
     alloc: Alloc<'d>,
     by_item: Mutex<HashMap<ItemKey, Kept<'d>, Alloc<'d>>>,
+    /// Per definition, by the same key: whether its text may write an item
+    /// ([`Prepares::may_declare`]). A property of the definition alone (rule 65).
+    declares: Mutex<HashMap<ItemKey, bool, Alloc<'d>>>,
 }
 
 /// One definition as an expansion takes it: compiled once, or as written (its rules do not
@@ -53,7 +56,25 @@ impl<'d> Prepares<'d> {
     /// An empty set, itself kept in `alloc` beside what it holds (it lives as long as they do,
     /// and every user borrows it for that long).
     pub fn new_in(alloc: Alloc<'d>) -> &'d Prepares<'d> {
-        Box::leak(Box::new_in(Prepares { alloc, by_item: Mutex::new(HashMap::new_in(alloc)) }, alloc))
+        Box::leak(Box::new_in(Prepares { alloc, by_item: Mutex::new(HashMap::new_in(alloc)), declares: Mutex::new(HashMap::new_in(alloc)) }, alloc))
+    }
+
+    /// Whether the definition kept under `item`, whose text `text` is (a `macro_rules!`'s
+    /// rules, or a `macro`'s parameters and body), may write an item
+    /// ([`blaze_file_items::nested::may_declare`]): read once per definition per build, by its
+    /// defining item's key, which covers the text (the key is the item's). The lock is held for
+    /// the lookup and the insert, not across the read; two threads reading one definition at
+    /// once find equal answers.
+    pub fn may_declare(&self, item: ItemKey, text: &[&str]) -> bool {
+        if let Some(known) = self.declares_held().get(&item).copied() {
+            return known;
+        }
+        let answer = text.iter().any(|t| blaze_file_items::nested::may_declare(t));
+        *self.declares_held().entry(item).or_insert(answer)
+    }
+
+    fn declares_held(&self) -> std::sync::MutexGuard<'_, HashMap<ItemKey, bool, Alloc<'d>>> {
+        self.declares.lock().unwrap_or_else(|poisoned| panic!("the macro definitions' may-declare lock was poisoned by a panic while held: {poisoned}"))
     }
 
     /// The allocator the definitions are kept in.

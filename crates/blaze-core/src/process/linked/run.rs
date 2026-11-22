@@ -5,8 +5,8 @@
 //!
 //! - **Streams.** Each of standard output and error is [`Output::Inherit`] (a copy of this
 //!   process's own descriptor 1 or 2: `blaze run`'s program writes to the command's terminal or
-//!   pipe), [`Output::Pipe`] (a pipe whose read end the caller takes,
-//!   [`LinkedChild::take_stdout`]: `blaze test` reads it by deadline) or [`Output::Null`]
+//!   pipe), [`Output::Pipe`] (a pipe whose read end is given once with the child,
+//!   [`Started::stdout`]: `blaze test` reads it by deadline) or [`Output::Null`]
 //!   (`/dev/null`). Standard input is [`Input::Inherit`] or [`Input::Null`]. Nothing is
 //!   chosen for the caller: a [`RunLink`] names all three.
 //! - **`argv[0]`.** `arg0`, where given, is the child's `argv[0]` (the program it runs is still
@@ -16,7 +16,7 @@
 
 use std::{ffi::OsStr, os::fd::{AsRawFd as _, OwnedFd, RawFd}, sync::atomic::Ordering};
 
-use super::{BorrowedFd, LinkError, LinkOp, LinkedChild, MOST_INHERITED, copy_past, os_of};
+use super::{BorrowedFd, Exit, LinkError, LinkOp, LinkedChild, MOST_INHERITED, Started, copy_past, os_of};
 use crate::{Command, Sandbox, wait::Monotonic};
 
 /// Where a linked child's standard input comes from.
@@ -33,8 +33,8 @@ pub enum Input {
 pub enum Output {
     /// A copy of this process's own descriptor (1 for output, 2 for error).
     Inherit,
-    /// A pipe; its read end is the caller's ([`LinkedChild::take_stdout`],
-    /// [`LinkedChild::take_stderr`]). Unread, it fills and the child blocks on its next write.
+    /// A pipe; its read end is the caller's, given once ([`Started::stdout`],
+    /// [`Started::stderr`]). Unread, it fills and the child blocks on its next write.
     Pipe,
     /// `/dev/null`: what it writes is dropped.
     Null,
@@ -89,21 +89,45 @@ impl ParentDeath {
     pub const STRONGEST: ParentDeath = ParentDeath::Channel;
 }
 
+/// A child's confinement, entered in the child before its program runs (D177): DATA the parent
+/// made, never a closure. On Linux blaze-sys's [`blaze_sys::linux::confine::ChildConfine`]
+/// (a Landlock ruleset, a seccomp filter, resource limits), built by blaze-sys, carried here
+/// and run by the child of `spawn.rs` through `blaze_sys::linux::confine::enter`. The type is
+/// blaze-sys's because blaze-sys builds the filter and is the one crate below both blaze-core
+/// (which runs it) and bstd (which asks for it); blaze-core already depends on blaze-sys on
+/// Linux and macOS and gains no dependency.
+#[cfg(target_os = "linux")]
+pub use blaze_sys::linux::confine::ChildConfine;
+
+/// Elsewhere none can be made: the type has no value, so a `Some` does not compile. macOS's
+/// confinement is Seatbelt, which `posix_spawn` cannot apply: no public spawn attribute takes a
+/// sandbox profile (the private `posix_spawnattr_setmacpolicyinfo_np` takes a policy's opaque
+/// data, whose form for the Sandbox policy is undocumented), so bstd's backend runs the
+/// program under `/usr/bin/sandbox-exec` instead.
+#[cfg(not(target_os = "linux"))]
+pub struct ChildConfine<'a> {
+    never: core::convert::Infallible,
+    _of: core::marker::PhantomData<&'a ()>,
+}
+
 /// How a linked child is started: descriptors it is given (`(descriptor, target)`, targets 3
 /// and up, each once), whether it leads a process group of its own, its streams, its
-/// `argv[0]` and what ends it at its parent's death.
+/// `argv[0]`, what ends it at its parent's death, and the confinement it enters before its
+/// program runs (`None`: none; bstd's hermetic run is the one caller that gives one).
 pub struct RunLink<'a> {
     pub inherit: &'a [(BorrowedFd<'a>, u32)],
     pub own_group: bool,
     pub streams: Streams,
     pub arg0: Option<&'a OsStr>,
     pub parent_death: ParentDeath,
+    pub confine: Option<&'a ChildConfine<'a>>,
 }
 
-/// `command` started linked as `link` says, listed until reaped. Refused by name: `Sandbox::On`,
-/// a memory limit, input bytes, a target below 3 or named twice, more than
-/// [`MOST_INHERITED`] descriptors, and [`ParentDeath::Kernel`] where the system has none.
-pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<LinkedChild, LinkError> {
+/// `command` started linked as `link` says, listed until reaped, with the read ends of its
+/// piped streams. Refused by name: `Sandbox::On`, a memory limit, input bytes, a target below
+/// 3 or named twice, more than [`MOST_INHERITED`] descriptors, and [`ParentDeath::Kernel`]
+/// where the system has none.
+pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<Started, LinkError> {
     let refuse = |op: LinkOp, os: i32| LinkError {
         // clone: an error path, the program's path.
         program: command.program.clone(),
@@ -125,6 +149,11 @@ pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<LinkedChild, L
     }
     if link.inherit.len() > MOST_INHERITED {
         return Err(refuse(LinkOp::TooManyDescriptors, 0));
+    }
+    // No confinement can be made here (the type has no value).
+    #[cfg(not(target_os = "linux"))]
+    if let Some(confine) = link.confine {
+        match confine.never {}
     }
     // Every target past 2 and named once; the copies go past the highest, so no `dup2` in the
     // child lands on a source a later one still reads (`spawn_with`).
@@ -158,9 +187,13 @@ pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<LinkedChild, L
         extra: &extra[..link.inherit.len()],
         group: link.own_group,
         parent_death: link.parent_death == ParentDeath::Kernel,
+        confine: link.confine,
     };
-    let spawned = super::super::spawn::streams::spawn_streams(&program, &start)
-        .map_err(|error| refuse(LinkOp::Spawn, os_of(&error)))?;
+    let spawned = super::super::spawn::streams::spawn_streams(&program, &start).map_err(|error| match error {
+        super::super::spawn::StartError::Io(error) => refuse(LinkOp::Spawn, os_of(&error)),
+        #[cfg(target_os = "linux")]
+        super::super::spawn::StartError::Confine { step, errno } => refuse(LinkOp::Confine(step), i32::from(errno.raw())),
+    })?;
     drop(copies);
     let run = super::super::RUNS.fetch_add(1, Ordering::Relaxed);
     let listed = super::super::Listed::new(spawned.pid, run, &command.program);
@@ -178,42 +211,28 @@ pub fn start_run(command: &Command, link: &RunLink<'_>) -> Result<LinkedChild, L
             return Err(refuse(LinkOp::Watch, os_of(&error)));
         }
     };
-    Ok(LinkedChild {
+    let child = LinkedChild {
         pid: spawned.pid,
         // clone: once per linked start, the program's path its errors name.
         program: command.program.clone(),
         own_group: link.own_group,
         clock: Monotonic::new(),
-        ended: std::cell::Cell::new(None),
-        stdout: spawned.stdout,
-        stderr: spawned.stderr,
+        reaped: false,
         #[cfg(target_os = "linux")]
         _pidfd: spawned.pidfd,
         #[cfg(target_os = "macos")]
         watch,
         listed,
-    })
+    };
+    Ok(Started { child, stdout: spawned.stdout, stderr: spawned.stderr })
 }
 
 impl LinkedChild {
-    /// The read end of its standard output, once, where it was [`Output::Pipe`].
-    pub fn take_stdout(&mut self) -> Option<OwnedFd> {
-        self.stdout.take()
-    }
-
-    /// The read end of its standard error, once, where it was [`Output::Pipe`].
-    pub fn take_stderr(&mut self) -> Option<OwnedFd> {
-        self.stderr.take()
-    }
-
-    /// `SIGKILL` to it alone (not its group), then its reap: how it ended. A child that ended
-    /// already is left as it ended. For a child started without a group of its own, which
-    /// [`LinkedChild::kill_group`] refuses.
-    pub fn kill_now(&self) -> Result<super::Ended, LinkError> {
-        if let Some(ended) = self.ended.get() {
-            return Ok(ended);
-        }
-        // SAFETY: no pointers; the pid is unreaped (`ended` is none), so it is this process's
+    /// `SIGKILL` to it alone (not its group), then its reap: how it ended (a child that exited
+    /// before the kill is a zombie the kill finds, and its reap reads its own end). For a child
+    /// started without a group of its own, which [`LinkedChild::kill_group`] refuses.
+    pub fn kill_now(self) -> Result<Exit, LinkError> {
+        // SAFETY: no pointers; the pid is unreaped (this value lives), so it is this process's
         // child and no one else's.
         let sent = unsafe { libc::kill(self.pid, libc::SIGKILL) };
         if sent != 0 {
@@ -227,14 +246,11 @@ impl LinkedChild {
 
     /// SIGTERM to it (to its group where it leads one): asked to end. It may handle or ignore
     /// the signal, so nothing is waited for here: its end is waited for as any other's, by the
-    /// caller's deadline (the run parent's grace, D103). A child that has ended is left as it
-    /// ended, and nothing is sent (its pid is reaped and may be another's).
+    /// caller's deadline (the run parent's grace, D103). A reaped child has no value to call
+    /// this on, so nothing is ever sent to a pid that may be another's.
     pub fn terminate(&self) -> Result<(), LinkError> {
-        if self.ended.get().is_some() {
-            return Ok(());
-        }
         let target = if self.own_group { -self.pid } else { self.pid };
-        // SAFETY: no pointers; the pid is unreaped (`ended` is none), so it, and the group it
+        // SAFETY: no pointers; the pid is unreaped (this value lives), so it, and the group it
         // leads where `own_group`, is this process's child and no one else's.
         let sent = unsafe { libc::kill(target, libc::SIGTERM) };
         if sent != 0 {
@@ -259,11 +275,19 @@ mod tests {
     use super::*;
     use crate::{
         linked::{
-            Ended,
+            Waited,
             channel::{self, Message},
         },
         wait::{Clock as _, Deadline},
     };
+
+    /// The end `child` came to by `bound`; a child still running then fails the test.
+    fn ended(child: LinkedChild, bound: Deadline) -> Exit {
+        match child.wait_until(bound).expect("a wait") {
+            Waited::Ended(exit) => exit,
+            Waited::Running(_) => panic!("still running at the test's bound"),
+        }
+    }
 
     fn sh(script: &str) -> Command {
         Command {
@@ -278,7 +302,7 @@ mod tests {
     }
 
     fn link<'a>(inherit: &'a [(BorrowedFd<'a>, u32)], streams: Streams) -> RunLink<'a> {
-        RunLink { inherit, own_group: false, streams, arg0: None, parent_death: ParentDeath::DropOnly }
+        RunLink { inherit, own_group: false, streams, arg0: None, parent_death: ParentDeath::DropOnly, confine: None }
     }
 
     /// Prints "linked run: exit 7, signal 9, deadline then killed, a message on 3, stdout piped".
@@ -289,37 +313,37 @@ mod tests {
         let null = Streams { stdin: Input::Null, stdout: Output::Null, stderr: Output::Null };
         let bound = Deadline::at(Duration::from_secs(20));
 
-        let mut child = start_run(&sh("exit 7"), &link(&[], null)).expect("sh starts");
-        assert!(child.take_stdout().is_none(), "Output::Null gives the caller no pipe");
-        assert_eq!(child.wait_until(bound).expect("a wait"), Ended::Exited(7));
+        let started = start_run(&sh("exit 7"), &link(&[], null)).expect("sh starts");
+        assert!(started.stdout.is_none(), "Output::Null gives the caller no pipe");
+        assert_eq!(ended(started.child, bound), Exit::Exited(7));
 
-        let child = start_run(&sh("kill -s KILL $$"), &link(&[], null)).expect("sh starts");
-        assert_eq!(child.wait_until(bound).expect("a wait"), Ended::Signaled(libc::SIGKILL));
+        let started = start_run(&sh("kill -s KILL $$"), &link(&[], null)).expect("sh starts");
+        assert_eq!(ended(started.child, bound), Exit::Signaled(libc::SIGKILL));
 
-        let child = start_run(&sh("exec sleep 30"), &link(&[], null)).expect("sh starts");
+        let child = start_run(&sh("exec sleep 30"), &link(&[], null)).expect("sh starts").child;
         let soon = Deadline::after(child.clock().now(), Duration::from_millis(100));
-        assert_eq!(child.wait_until(soon).expect("a wait"), Ended::Deadline, "it still runs");
-        assert_eq!(child.kill_now().expect("a kill"), Ended::Signaled(libc::SIGKILL));
+        let Waited::Running(child) = child.wait_until(soon).expect("a wait") else { panic!("it still runs") };
+        assert_eq!(child.kill_now().expect("a kill"), Exit::Signaled(libc::SIGKILL));
 
         // A two-byte message "hi" behind its four-byte big-endian length, on descriptor 3.
         let (mut parent, end) = channel::pair().expect("a socket pair");
         let given = [(end.as_fd(), channel::CHILD_FD)];
-        let child = start_run(&sh("printf '\\000\\000\\000\\002hi' >&3"), &link(&given, null)).expect("sh starts");
+        let child = start_run(&sh("printf '\\000\\000\\000\\002hi' >&3"), &link(&given, null)).expect("sh starts").child;
         drop(end);
         let clock = Monotonic::new();
         let mut inbox = Vec::new();
         let got = parent.recv_message(&mut inbox, 64, Deadline::after(clock.now(), Duration::from_secs(20)), &clock);
         assert_eq!(got.expect("a message"), Message::Whole { len: 6 });
         assert_eq!(&inbox[..], b"\0\0\0\x02hi");
-        assert_eq!(child.wait_until(bound).expect("a wait"), Ended::Exited(0));
+        assert_eq!(ended(child, bound), Exit::Exited(0));
         inbox.clear();
         let after = parent.recv_message(&mut inbox, 64, Deadline::after(clock.now(), Duration::from_secs(20)), &clock);
         assert_eq!(after.expect("the end"), Message::Closed, "the child's end closed at its exit");
 
         let piped = Streams { stdin: Input::Null, stdout: Output::Pipe, stderr: Output::Null };
-        let mut child = start_run(&sh("printf out"), &link(&[], piped)).expect("sh starts");
-        let out = channel::DeadlineFd::new(child.take_stdout().expect("a pipe"), "its stdout").expect("nonblocking");
-        assert_eq!(child.wait_until(bound).expect("a wait"), Ended::Exited(0));
+        let started = start_run(&sh("printf out"), &link(&[], piped)).expect("sh starts");
+        let out = channel::DeadlineFd::new(started.stdout.expect("a pipe"), "its stdout").expect("nonblocking");
+        assert_eq!(ended(started.child, bound), Exit::Exited(0));
         let mut buf = [0u8; 16];
         let read = out.read_some(&mut buf, Deadline::after(clock.now(), Duration::from_secs(20)), &clock).expect("a read");
         assert_eq!(read, channel::Read::Bytes(3));
@@ -327,3 +351,8 @@ mod tests {
         println!("linked run: exit 7, signal 9, deadline then killed, a message on 3, stdout piped");
     }
 }
+
+// The child's confine step (D177), on the host's kernel: Landlock and seccomp entered between
+// `clone` and `execve`.
+#[cfg(all(test, target_os = "linux"))]
+mod confine_tests;

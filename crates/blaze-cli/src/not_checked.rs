@@ -20,8 +20,8 @@ use crate::CliError;
 
 /// The most crates (or items) named under one cause; the count past them stays exact. Few: a
 /// line names what to look at first, and tempo's one cause named hundreds on one line at 20
-/// (2026-11-17); `--each` lists every one.
-pub(crate) const CRATES_SHOWN: usize = 5;
+/// (2026-11-17); `--each` lists every one. One home, the findings' query module's (D164).
+pub(crate) const CRATES_SHOWN: usize = blaze_report::query::SHOWN;
 
 /// The items not checked because a task failed, as the lines under the failures counted them
 /// (waited.rs `line`), and how many of those lines counted an item.

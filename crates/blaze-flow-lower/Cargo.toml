@@ -18,6 +18,8 @@ doctest = false
 blaze-flow.workspace = true
 blaze-typeck.workspace = true
 blaze-own.workspace = true
+# The one call rule (D156): the contract the lowering's calls are switched onto (one_call.rs).
+blaze-borrow.workspace = true
 
 [dev-dependencies]
 # `fixture`: hand-written bodies checked by the real type checker, lowered and checked here.

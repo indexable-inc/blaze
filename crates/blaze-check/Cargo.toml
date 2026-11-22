@@ -20,10 +20,11 @@ blaze-rng.workspace = true
 blaze-alloc-count.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+blaze-sys.workspace = true
 
 [lints]
 workspace = true

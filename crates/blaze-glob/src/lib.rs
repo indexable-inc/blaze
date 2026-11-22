@@ -6,14 +6,20 @@
 //!
 //! A match is a table over (token, character) positions, so a pattern of `t` tokens over a text
 //! of `n` characters takes `O(t * n)` however many `*` it has; glob's own matcher backtracks.
+//!
+//! A [`Pattern`] is a core: it borrows its text and keeps its tokens, and the table a match
+//! fills, in the allocator it was made in ([`Pattern::new_in`]). [`glob`] and [`Tree`] are not
+//! yet: they speak `std::path` and `std::io::Error` and return a vector on the global heap
+//! (wave-1124-sansio, W1 group a's report says what replaces them).
 
 #![feature(allocator_api)]
 
 #[cfg(test)]
 mod tests;
 
+use core::alloc::Allocator;
+use core::fmt;
 use std::alloc::Global;
-use std::fmt;
 use std::path::{Component, Path, PathBuf, is_separator};
 
 /// Why a pattern does not parse, as glob says it: `Pattern syntax error near position {pos}:
@@ -52,18 +58,37 @@ impl fmt::Display for PatternError {
     }
 }
 
-impl std::error::Error for PatternError {}
+impl core::error::Error for PatternError {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Token {
+#[derive(Clone, Debug)]
+enum Token<A: Allocator> {
     Char(char),
     AnyChar,
     AnySequence,
     /// `**`, with the separator after it when one followed.
     AnyRecursiveSequence,
-    AnyWithin(Vec<Class, Global>),
-    AnyExcept(Vec<Class, Global>),
+    AnyWithin(Vec<Class, A>),
+    AnyExcept(Vec<Class, A>),
 }
+
+/// By value, wherever either is allocated (a derive would ask `A: PartialEq`, which no
+/// allocator is).
+impl<A: Allocator> PartialEq for Token<A> {
+    fn eq(&self, other: &Token<A>) -> bool {
+        match (self, other) {
+            (Token::Char(one), Token::Char(other)) => one == other,
+            (Token::AnyChar, Token::AnyChar)
+            | (Token::AnySequence, Token::AnySequence)
+            | (Token::AnyRecursiveSequence, Token::AnyRecursiveSequence) => true,
+            (Token::AnyWithin(one), Token::AnyWithin(other)) | (Token::AnyExcept(one), Token::AnyExcept(other)) => {
+                one == other
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<A: Allocator> Eq for Token<A> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
@@ -80,8 +105,8 @@ impl Class {
     }
 
     /// `[ab-z]`'s inside: a `-` between two characters makes a range, anywhere else it is one.
-    fn parse(inside: &[char]) -> Vec<Class, Global> {
-        let mut out = Vec::new_in(Global);
+    fn parse<A: Allocator>(inside: &[char], alloc: A) -> Vec<Class, A> {
+        let mut out = Vec::new_in(alloc);
         let mut at = 0;
         while at < inside.len() {
             if at + 3 <= inside.len() && inside[at + 1] == '-' {
@@ -96,24 +121,45 @@ impl Class {
     }
 }
 
-/// A parsed pattern.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pattern {
-    tokens: Vec<Token, Global>,
-    original: String,
+/// A parsed pattern: the text it was parsed from, borrowed, and its tokens in `A`.
+#[derive(Clone, Debug)]
+pub struct Pattern<'a, A: Allocator> {
+    tokens: Vec<Token<A>, A>,
+    original: &'a str,
     /// A `*`, `?` or `[` (glob's `has_metachars`): matching it needs a directory listed.
     meta: bool,
 }
 
-impl Pattern {
-    /// `pattern` parsed, or glob's error for it.
-    pub fn new(pattern: &str) -> Result<Pattern, PatternError> {
-        let chars: Vec<char, Global> = {
-            let mut it = Vec::new_in(Global);
+/// Equal when parsed from equal text, wherever either is allocated.
+impl<A: Allocator, B: Allocator> PartialEq<Pattern<'_, B>> for Pattern<'_, A> {
+    fn eq(&self, other: &Pattern<'_, B>) -> bool {
+        self.original == other.original
+    }
+}
+
+impl<A: Allocator> Eq for Pattern<'_, A> {}
+
+impl<'a> Pattern<'a, Global> {
+    /// `pattern` parsed on the global heap, or glob's error for it.
+    ///
+    /// Deprecated: names no allocator; use [`Pattern::new_in`]. Goes with its last callers,
+    /// blaze-manifest's layout/mod.rs:729 and :759 and blaze-new's lib.rs:1157 (and this
+    /// crate's [`glob`], until it is ported).
+    pub fn new(pattern: &'a str) -> Result<Pattern<'a, Global>, PatternError> {
+        Pattern::new_in(pattern, Global)
+    }
+}
+
+impl<'a, A: Allocator + Clone> Pattern<'a, A> {
+    /// `pattern` parsed, its tokens in `alloc` (with the characters it is read through, freed
+    /// on return), or glob's error for it.
+    pub fn new_in(pattern: &'a str, alloc: A) -> Result<Pattern<'a, A>, PatternError> {
+        let chars: Vec<char, A> = {
+            let mut it = Vec::new_in(alloc.clone());
             it.extend(pattern.chars());
             it
         };
-        let mut tokens = Vec::new_in(Global);
+        let mut tokens = Vec::new_in(alloc.clone());
         let mut meta = false;
         let mut at = 0;
         while at < chars.len() {
@@ -163,7 +209,7 @@ impl Pattern {
                     let Some(close) = close.map(|it| from + 1 + it) else {
                         return Err(PatternError { pos: at, refusal: Refusal::InvalidRange });
                     };
-                    let classes = Class::parse(&chars[from..close]);
+                    let classes = Class::parse(&chars[from..close], alloc.clone());
                     tokens.push(if negated { Token::AnyExcept(classes) } else { Token::AnyWithin(classes) });
                     at = close + 1;
                 }
@@ -173,14 +219,12 @@ impl Pattern {
                 }
             }
         }
-        let mut original = String::new();
-        original.push_str(pattern);
-        Ok(Pattern { tokens, original, meta })
+        Ok(Pattern { tokens, original: pattern, meta })
     }
 
     /// The text it was parsed from.
-    pub fn as_str(&self) -> &str {
-        &self.original
+    pub fn as_str(&self) -> &'a str {
+        self.original
     }
 
     /// Whether it has a `*`, `?` or `[`.
@@ -188,17 +232,19 @@ impl Pattern {
         self.meta
     }
 
-    /// Whether `text` matches it whole.
+    /// Whether `text` matches it whole. Its characters and the match's two rows of `n + 1`
+    /// flags are in the pattern's allocator, freed on return.
     pub fn matches(&self, text: &str) -> bool {
-        let chars: Vec<char, Global> = {
-            let mut it = Vec::new_in(Global);
+        let alloc = self.tokens.allocator();
+        let chars: Vec<char, A> = {
+            let mut it = Vec::new_in(alloc.clone());
             it.extend(text.chars());
             it
         };
         let n = chars.len();
         // `rest[p]`: the tokens from the one at hand on match `chars[p..]`; filled from the last
         // token back, starting from the empty pattern, which matches only the empty rest.
-        let mut rest = Vec::new_in(Global);
+        let mut rest = Vec::new_in(alloc.clone());
         rest.resize(n + 1, false);
         rest[n] = true;
         let mut next = rest.clone();
@@ -255,9 +301,9 @@ impl Pattern {
     }
 }
 
-impl fmt::Display for Pattern {
+impl<A: Allocator> fmt::Display for Pattern<'_, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.original)
+        f.write_str(self.original)
     }
 }
 
@@ -270,31 +316,6 @@ pub trait Tree {
     /// The names in a directory, sorted, each with whether it is a directory (not following a
     /// link); names that are not UTF-8 are left out.
     fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool), Global>>;
-}
-
-/// The machine's file system.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Disk;
-
-impl Tree for Disk {
-    fn exists(&self, path: &Path) -> bool {
-        std::fs::symlink_metadata(path).is_ok()
-    }
-
-    fn is_dir(&self, path: &Path) -> bool {
-        std::fs::metadata(path).is_ok_and(|it| it.is_dir())
-    }
-
-    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool), Global>> {
-        let mut names = Vec::new_in(Global);
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            names.push((name, entry.file_type().is_ok_and(|t| t.is_dir())));
-        }
-        names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        Ok(names)
-    }
 }
 
 /// A directory of a pattern that could not be listed, as glob says it.
@@ -397,7 +418,7 @@ pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, Glob
     Ok(out)
 }
 
-fn fill<T: Tree>(tree: &T, todo: &mut Vec<Result<Todo, GlobError>, Global>, parts: &[Pattern], at: usize, path: &Path, dir: bool) {
+fn fill<T: Tree>(tree: &T, todo: &mut Vec<Result<Todo, GlobError>, Global>, parts: &[Pattern<'_, Global>], at: usize, path: &Path, dir: bool) {
     let add = |todo: &mut Vec<Result<Todo, GlobError>, Global>, next: PathBuf| {
         let next_dir = tree.is_dir(&next);
         if at + 1 == parts.len() {

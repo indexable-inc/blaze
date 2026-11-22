@@ -8,7 +8,7 @@ use std::{path::Path, time::Instant};
 
 use blaze_proc_macro::{
     host::Runtime,
-    module::{ModuleRecord, sha256_hex},
+    module::{COMPILED_DIR, ModuleRecord, sha256_hex},
 };
 
 fn main() {
@@ -29,7 +29,7 @@ fn main() {
             let key = dir.file_name().expect("a key").to_string_lossy().into_owned();
             let decls = String::from_utf8_lossy(&read("decls")).trim().to_owned();
             // The record holds no wasm: a compile reads it from `dir` (module.rs `ModuleRecord::wasm`).
-            ModuleRecord { name: key[..12].to_owned(), version: String::new(), key, wasm_sha256, macros: Vec::new(), decls, dir: dir.clone() }
+            ModuleRecord { name: key[..12].to_owned(), version: String::new(), key, wasm_sha256, macros: Vec::new(), decls, dir: dir.clone(), compiled: Path::new(store).join(COMPILED_DIR) }
         })
         .collect();
     let all: Vec<&ModuleRecord> = modules.iter().collect();

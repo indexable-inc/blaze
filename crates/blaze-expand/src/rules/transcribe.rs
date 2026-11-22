@@ -17,7 +17,7 @@ use crate::{
     error::ExpandError,
     expand::Out,
     expansion::TokenOrigin,
-    tokens::{Ctx, Delim, LitKind, Raw, Spacing, StreamMark, TokenKind},
+    tokens::{Ctx, Delim, LitKind, Raw, Spacing, StreamMark, TokenKind, WholeText},
 };
 
 /// One repetition's place: rustc's `NestingState`.
@@ -106,13 +106,13 @@ fn push(
     scratch: &mut Scratch<'_>,
     out: &mut Out<'_, '_>,
     kind: TokenKind,
-    text: &[u8],
+    text: WholeText<'_>,
     origin: TokenOrigin,
 ) -> Result<(), ExpandError> {
     join_prev(out, origin);
     let key = copy::source_key(out, origin);
     let ctx = memo_ctx(scratch, out, origin, key)?;
-    out.push_bytes_ctx(kind, text, origin, ctx)
+    out.push_whole_ctx(kind, text, origin, ctx)
 }
 
 /// The context of this expansion for a token of `origin`, whose source key is `key`
@@ -148,7 +148,7 @@ fn push_def(
     tok: DefTok,
 ) -> Result<(), ExpandError> {
     let def = engine.def;
-    push(scratch, out, written(def.kind(tok)), def.bytes(tok), tok.origin())
+    push(scratch, out, written(def.kind(tok)), def.whole(tok), tok.origin())
 }
 
 /// Copies `toks` of the view; with `alone`, a last punctuation is made `Alone`. With `range`
@@ -169,7 +169,7 @@ fn push_view(
         });
     }
     for at in toks.at..toks.end {
-        push(scratch, out, written(view.kind(at)), view.bytes(at), view.origin(at))?;
+        push(scratch, out, written(view.kind(at)), view.whole(at), view.origin(at))?;
     }
     if alone && !toks.is_empty() {
         set_last_alone(out);
@@ -272,7 +272,7 @@ pub(crate) fn transcribe<'f, B: Copying>(
                 },
                 Op::Crate(tok) => {
                     let kind = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
-                    if let Err(error) = push(scratch, out, kind, b"$crate", tok.origin()) {
+                    if let Err(error) = push(scratch, out, kind, WholeText::of("$crate"), tok.origin()) {
                         return Ok(Err(error));
                     }
                     None
@@ -286,7 +286,7 @@ pub(crate) fn transcribe<'f, B: Copying>(
                     None
                 }
                 Op::Group { delim, open, close, end } => {
-                    if let Err(error) = push(scratch, out, TokenKind::Open(delim), b"", open.origin()) {
+                    if let Err(error) = push(scratch, out, TokenKind::Open(delim), WholeText::of(""), open.origin()) {
                         return Ok(Err(error));
                     }
                     scratch.stack[top].at = end;
@@ -403,7 +403,7 @@ pub(crate) fn transcribe<'f, B: Copying>(
         match done.seq {
             Seq::Top => return Ok(Ok(done.err)),
             Seq::Group { delim, close } => {
-                if let Err(error) = push(scratch, out, TokenKind::Close(delim), b"",close.origin()) {
+                if let Err(error) = push(scratch, out, TokenKind::Close(delim), WholeText::of(""), close.origin()) {
                     return Ok(Err(error));
                 }
                 let parent = scratch.stack.last_mut().expect("a group is inside a sequence");
@@ -548,7 +548,8 @@ fn integer(scratch: &mut Scratch<'_>, out: &mut Out<'_, '_>, value: u32) -> Resu
         }
     }
     let kind = TokenKind::Literal { kind: LitKind::Integer, suffix_len: 0, spacing: Spacing::Alone };
-    push(scratch, out, kind, &digits[at..], SITE)
+    let digits = core::str::from_utf8(&digits[at..]).expect("ASCII digits are a whole `str`");
+    push(scratch, out, kind, WholeText::of(digits), SITE)
 }
 
 /// `${count(..)}` of a binding at `depth`.
@@ -629,34 +630,34 @@ fn var<B: Copying>(
         Err(Miss::Error(CallError::Binding(_, Msg::Unresolved(_)))) => {
             // A name no binder declares is written as it is, `$` and the name.
             let dollar = TokenKind::Punct { char: '$', spacing: Spacing::Alone };
-            push(scratch, out, dollar, b"",id)?;
+            push(scratch, out, dollar, WholeText::of(""), id)?;
             let ident = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
-            push(scratch, out, ident, engine.def.bytes(name), id)?;
+            push(scratch, out, ident, engine.def.whole(name), id)?;
             return Ok(None);
         }
         Err(Miss::Error(error)) => return Ok(Some(error)),
     };
     let invisible = |scratch: &mut Scratch<'_>, out: &mut Out<'_, '_>, open: bool| {
         let kind = if open { TokenKind::Open(Delim::Invisible) } else { TokenKind::Close(Delim::Invisible) };
-        push(scratch, out, kind, b"",id)
+        push(scratch, out, kind, WholeText::of(""), id)
     };
     let paren = |scratch: &mut Scratch<'_>, out: &mut Out<'_, '_>, open: bool| {
         let kind = if open { TokenKind::Open(Delim::Paren) } else { TokenKind::Close(Delim::Paren) };
-        push(scratch, out, kind, b"",id)
+        push(scratch, out, kind, WholeText::of(""), id)
     };
     match value {
         Value::Missing(kind) => {
             let ident = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
             match kind {
-                Frag::Stmt => push(scratch, out, TokenKind::Punct { char: ';', spacing: Spacing::Alone }, b"",id)?,
+                Frag::Stmt => push(scratch, out, TokenKind::Punct { char: ';', spacing: Spacing::Alone }, WholeText::of(""), id)?,
                 Frag::Block => {
-                    push(scratch, out, TokenKind::Open(Delim::Brace), b"",id)?;
-                    push(scratch, out, TokenKind::Close(Delim::Brace), b"",id)?;
+                    push(scratch, out, TokenKind::Open(Delim::Brace), WholeText::of(""), id)?;
+                    push(scratch, out, TokenKind::Close(Delim::Brace), WholeText::of(""), id)?;
                 }
                 Frag::Meta | Frag::Item | Frag::Tt | Frag::Vis => {}
                 Frag::Lifetime => {
-                    push(scratch, out, TokenKind::Punct { char: '\'', spacing: Spacing::Joint }, b"",id)?;
-                    push(scratch, out, ident, b"missing", id)?;
+                    push(scratch, out, TokenKind::Punct { char: '\'', spacing: Spacing::Joint }, WholeText::of(""), id)?;
+                    push(scratch, out, ident, WholeText::of("missing"), id)?;
                     set_last_alone(out);
                 }
                 Frag::Path
@@ -666,7 +667,7 @@ fn var<B: Copying>(
                 | Frag::Expr
                 | Frag::Expr2021
                 | Frag::Ident
-                | Frag::Literal => push(scratch, out, ident, b"missing", id)?,
+                | Frag::Literal => push(scratch, out, ident, WholeText::of("missing"), id)?,
             }
         }
         Value::Fragment(Fragment::Tokens { toks, origin: Origin::Grouped }) => {
@@ -708,8 +709,8 @@ fn var<B: Copying>(
             for tree in trees(view, toks) {
                 let end = view.after_tree(tree);
                 if prev_ident && end == tree + 1 && view.char(tree) == Some('<') {
-                    push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Joint }, b"",SITE)?;
-                    push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Alone }, b"",SITE)?;
+                    push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Joint }, WholeText::of(""), SITE)?;
+                    push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Alone }, WholeText::of(""), SITE)?;
                 }
                 prev_ident = end == tree + 1 && matches!(view.kind(tree), TokenKind::Ident { .. });
                 push_view(scratch, out, view, Toks { at: tree, end }, false, B::RANGES)?;
@@ -747,7 +748,7 @@ fn concat<'f, B: Values>(
     let mut err = None;
     let mut text = core::mem::replace(&mut scratch.text, Vec::new_in(engine.frame));
     text.clear();
-    let mut push_text = |text: &mut Vec<u8, &Frame>, s: &str| text.extend_from_slice(s.as_bytes());
+    let push_text = |text: &mut Vec<u8, &Frame>, s: &str| text.extend_from_slice(s.as_bytes());
     for &elem in &engine.program.concat[start as usize..(start + len) as usize] {
         match elem {
             ConcatElem::Ident(tok) => push_text(&mut text, def.text(tok)),
@@ -807,7 +808,7 @@ fn concat<'f, B: Values>(
         false => Raw::No,
     };
     let kind = TokenKind::Ident { raw, spacing: Spacing::Alone };
-    let result = push(scratch, out, kind, s.as_bytes(), func.origin());
+    let result = push(scratch, out, kind, WholeText::of(s), func.origin());
     scratch.text = text;
     result?;
     Ok(err)

@@ -42,6 +42,9 @@ pub mod chan;
 // The records in flight: a per-key claim, its waiters, the cycle walk (parallel.md, end state).
 pub mod claim_table;
 pub mod claim_watch;
+/// The conformance suites (D167 part c): each model held against what it models.
+#[cfg(test)]
+mod conform;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 #[allow(
@@ -52,6 +55,7 @@ pub mod cores;
 pub mod create_process;
 pub mod decimal;
 mod descriptors;
+mod effect_meter;
 pub mod dgram;
 pub mod exit;
 #[allow(unsafe_code, reason = "setsockopt and getsockopt of values on the stack; bind, listen and connect of a sockaddr")]
@@ -143,8 +147,10 @@ pub use crate::journal::{
 pub use crate::descriptors::Opens;
 pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
-pub use crate::lock::{SharedByHash, SharedMap, SharedSet};
+pub use crate::lock::{SharedByHash, SharedMap, SharedMapBy, SharedSet, SharedSetBy};
 pub use crate::boot::{Boot, NoBoot};
+// The plant seam (D165), for crates that name blaze-core and not blaze-own: one home, in blaze-own.
+pub use blaze_own::planted;
 pub use crate::os::{Os, native_in, system_wall_ns_in};
 /// `blaze_core::testing::os()`: a test's root of real-OS authority (the `testing` feature).
 #[cfg(any(test, feature = "testing"))]
@@ -428,6 +434,21 @@ pub const ABANDONED_SPAN: &str =
 pub const RECV_MOST: usize = 64 << 10;
 
 /// IO a state machine asks for.
+///
+/// **Folders, the one rule.** A name (a file's, a folder's) is durable once its folder's names
+/// are synced ([`Effect::SyncDir`], or the sync a durable [`Effect::Write`] or
+/// [`Effect::Rename`] ends with); a file's sync covers its bytes, never its name. A folder an
+/// effect makes because a file it makes is under it (any effect that makes a file: a write,
+/// an append, a truncate, a map, a rename's target, a link, a clone, a lock) is made durable
+/// by that effect before it completes: each folder made from the top, and its parent synced
+/// after it (`fs.rs`'s `make_parent`, the ring's chain, the simulation's `make_parents`). A
+/// sans-IO core cannot know which folders its effects made, and nothing holds state between
+/// them, so the making is the one place that can; it costs one directory sync per folder
+/// made, none where the folders are there. So a durable call is durable from the root down
+/// by its own last steps (the file synced, its name synced into its folder), whichever effect
+/// made the folder and however long before. Only [`Effect::MakeDir`], a folder asked for by
+/// name, is not: it is durable once its parent is synced, as the caller chooses (bstd's
+/// `make_dir_synced`).
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: tests' logs of what was asked (blaze-vfs's); a driver takes each by value
 pub enum Effect {
     /// The whole file. A file that is not there reads as empty: a journal not yet written is
@@ -572,7 +593,10 @@ pub enum Effect {
         tag: Tag,
     },
     /// The file's whole contents replaced by `bytes`, durably and all at once: a reader or a
-    /// crash sees the old contents or the new, never a part. Its directories are made.
+    /// crash sees the old contents or the new, never a part. Its directories are made, each
+    /// one's name synced into its parent (the folders rule, on [`Effect`]), so the new file
+    /// survives a crash under its name however many it made (the conformance suite,
+    /// `conform/fs.rs`). A name above it that is a file, or `file` a directory, fails.
     Write {
         file: FileName,
         bytes: Vec<u8>,
@@ -583,7 +607,8 @@ pub enum Effect {
     /// never a part. Nothing of it is durable: a crash leaves the old contents (or no file), the
     /// new, or a file holding any part of the new. For derived data whose reader checks it
     /// before it uses it after a crash (the store's whole files of outputs, checked against
-    /// their names). Its directories are made. Completes with [`Done::Written`].
+    /// their names). Its directories are made, durably as every effect makes them (the folders
+    /// rule, on [`Effect`]). Completes with [`Done::Written`].
     WriteUnsynced {
         file: FileName,
         bytes: Vec<u8>,
@@ -611,7 +636,9 @@ pub enum Effect {
         tag: Tag,
     },
     /// `from` renamed over `to`, atomically: a reader sees the old `to` or the new, and the
-    /// new name survives a crash once it completes. Completes with [`Done::Renamed`].
+    /// new name survives a crash once it completes. `to`'s directories are made where `from`
+    /// is there, each synced into its parent (the folders rule, on [`Effect`]); a `from` not there
+    /// fails and makes nothing. Completes with [`Done::Renamed`].
     Rename {
         from: FileName,
         to: FileName,
@@ -620,7 +647,9 @@ pub enum Effect {
     /// As [`Effect::Rename`], waiting for no sync of either directory: a reader sees the old
     /// `to` or the new, and a crash may leave the names as they were before it. For a file
     /// whose bytes are not durable either (an output placed from the store, which a build
-    /// places again). Completes with [`Done::Renamed`].
+    /// places again). `to`'s directories are made where `from` is there, durably as every
+    /// effect makes them (the folders rule, on [`Effect`]); the new name itself is not synced.
+    /// Completes with [`Done::Renamed`].
     RenameUnsynced {
         from: FileName,
         to: FileName,
@@ -787,9 +816,12 @@ pub enum Effect {
     /// [`Done::Unwatched`] or a [`Done::Failed`] does. [`Cursor::None`] starts now, its first
     /// batch naming where the journal is. Changes it cannot name are a
     /// [`Lost`] subtree, never left out: the cursor saved from a batch is never past a change
-    /// not in it or an earlier one.
+    /// not in it or an earlier one. `dir` may be the driver's root itself (a checkout run from
+    /// its own folder): the directory's own changes and losses are [`Journaled::itself`] and
+    /// [`Journaled::whole`], for a named one and the root alike. A driver that cannot journal
+    /// the root fails it by name ([`Done::Failed`]), never with a narrower watch.
     Journal {
-        dir: FileName,
+        dir: DirName,
         since: Cursor,
         tag: Tag,
     },

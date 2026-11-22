@@ -72,5 +72,6 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
 
 #[test]
 fn recordings_round_trip_and_refuse_garbage() {
-    check(Config::cases(2000), round_trip);
+    let lap = super::Lap::new("pack: recordings round-trip");
+    check(Config::cases(2000), |tape| lap.case(round_trip(tape)));
 }

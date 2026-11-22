@@ -2,13 +2,19 @@
 //! written, 2026-11-18), each with its positive, its negative (rustc rejects it) and its control
 //! (rule 23: the provider turned off, the effect gone):
 //!
-//! - IMPL SOURCE (`Facts::impl_source`, sig_impl.rs `impl_texts`): `via(Src(x))` with
-//!   `fn via<'de, D: De<'de>>(d: D) -> D::Out` and `impl<'s> De<'s> for Src<'s> { type Out =
-//!   &'s u8; .. }` is answered by the impl the type check selected (serde's and thiserror's
-//!   shape). `concrete` CLEAN; `concrete_bad` (returns it as `&'static u8`) FOUND. CONTROL
-//!   `NoImplSources`: `concrete` REFUSED (`ImplUnread`, as before).
-//! - ONE READ AN IMPL A BODY (B12's question, decided): `twice` calls `via(Src(x))` twice and
-//!   `Src(x).take()` (a member of the same impl): `impl_text_reads == 1`.
+//! - IMPL REGIONS (D148: an impl's facts are its head record's regions, `RegionFacts::
+//!   impl_header` and `impl_assoc`; the text reader of impl sources is deleted): `via(Src(x))`
+//!   with `fn via<'de, D: De<'de>>(d: D) -> D::Out` and `impl<'s> De<'s> for Src<'s> { type
+//!   Out = &'s u8; .. }` is answered by the impl the type check selected, through its header's
+//!   column (`Src<'s>`: `[Param(0)]`) and its `type Out`'s (`&'s u8`: `[Param(0)]`) (serde's
+//!   and thiserror's shape). `concrete` CLEAN; `concrete_bad` (returns it as `&'static u8`)
+//!   FOUND. CONTROL `NoAliases` (the plant that withholds every head's regions, the impl's
+//!   among them): `concrete` REFUSED (`RegionsUnread`), never accepted.
+//! - ONE READ AN IMPL A BODY (B12's question): `twice` calls `via(Src(x))` twice and
+//!   `Src(x).take()` (a member of the same impl): CLEAN. The old count (`impl_text_reads ==
+//!   1`) has no equal: an impl's regions are its head record's columns read in place, never a
+//!   text re-read per use, so there is no per-body read to count; what is left to assert is the
+//!   verdict.
 //! - VARIANCE (variance.rs; ADTs by `Facts::adt_variances`, from lifetimes.rs `variances`):
 //!   `co` (`W<'b>` as `W<'a>`, `W` covariant) CLEAN; `co_bad` (the reverse) FOUND; `inv`
 //!   (`C<'b>` as `C<'a>`, `C` holds a `Cell<&'w u8>`: invariant) FOUND; `pair` (`(&'b u8,
@@ -103,7 +109,7 @@ fn ok_de<'de: 'x, 'x, D: Tk<'de>>(d: D) -> (&'x u8, D::Error) {
 
 fn shown(item: &str, v: &BorrowVerdict<'_>) -> String {
     let found: Vec<String> = v.findings.iter().map(|d| format!("{} at {:?}", d.code, item.get(d.start as usize..d.end as usize).unwrap_or("<out of range>"))).collect();
-    format!("{found:?} refused {:?} impl texts read {}", v.refused, v.impl_text_reads)
+    format!("{found:?} refused {:?}", v.refused)
 }
 
 /// The test's heap: one root, made here and kept for the process.
@@ -143,44 +149,43 @@ fn b13_impl_sources_variance_and_one_read() {
         };
         names.item_text(k).expect("the body's item text").text
     };
-    // One body checked with one plant: (clean and checked, has a finding, refused, impl texts
-    // read, the printed line).
-    let mut check = |n: &str, plant: FactsPlant| -> (bool, bool, bool, u32, String) {
+    // One body checked with one plant: (clean and checked, has a finding, refused, the printed
+    // line).
+    let mut check = |n: &str, plant: FactsPlant| -> (bool, bool, bool, String) {
         let b = find(n);
         let (types, v) = world.check_borrows_planted(b, plant, root.alloc());
         let line = shown(text_of(b), &v);
         println!("borrows {n} [{plant:?}]: {line}");
         assert!(types.is_clean(), "{n}'s types: {types:?}");
-        (v.findings.is_empty() && v.refused.is_none(), !v.findings.is_empty(), v.refused.is_some(), v.impl_text_reads, line)
+        (v.findings.is_empty() && v.refused.is_none(), !v.findings.is_empty(), v.refused.is_some(), line)
     };
 
-    // IMPL SOURCE.
-    let (clean, _, _, _, line) = check("concrete", FactsPlant::None);
+    // IMPL REGIONS.
+    let (clean, _, _, line) = check("concrete", FactsPlant::None);
     assert!(clean, "concrete: {line}");
-    let (_, found, refused, _, line) = check("concrete_bad", FactsPlant::None);
+    let (_, found, refused, line) = check("concrete_bad", FactsPlant::None);
     assert!(found && !refused, "concrete_bad: no finding: {line}");
-    let (clean, _, refused, _, line) = check("concrete", FactsPlant::NoImplSources);
-    assert!(!clean && refused, "CONTROL concrete without impl sources is not refused: {line}");
+    let (clean, _, refused, line) = check("concrete", FactsPlant::NoAliases);
+    assert!(!clean && refused, "CONTROL concrete without head regions is not refused: {line}");
+    assert!(line.contains("RegionsUnread"), "CONTROL concrete without head regions is refused for another reason: {line}");
 
-    // ONE READ AN IMPL A BODY (the floor: 1; the ratio printed is reads / impls = reads / 1).
-    let (clean, _, _, reads, line) = check("twice", FactsPlant::None);
+    // ONE IMPL, THREE USES IN ONE BODY: clean (no read count to assert: the module doc).
+    let (clean, _, _, line) = check("twice", FactsPlant::None);
     assert!(clean, "twice: {line}");
-    println!("impl texts read in `twice`: {reads} for 1 impl (floor 1, ratio {reads})");
-    assert_eq!(reads, 1, "twice: {line}");
 
     // VARIANCE.
-    let (clean, _, _, _, line) = check("co", FactsPlant::None);
+    let (clean, _, _, line) = check("co", FactsPlant::None);
     assert!(clean, "co: {line}");
-    let (_, found, refused, _, line) = check("co_bad", FactsPlant::None);
+    let (_, found, refused, line) = check("co_bad", FactsPlant::None);
     assert!(found && !refused, "co_bad: no finding: {line}");
-    let (_, found, refused, _, line) = check("inv", FactsPlant::None);
+    let (_, found, refused, line) = check("inv", FactsPlant::None);
     assert!(found && !refused, "inv (Cell, invariant): no finding: {line}");
-    let (clean, _, _, _, line) = check("pair", FactsPlant::None);
+    let (clean, _, _, line) = check("pair", FactsPlant::None);
     assert!(clean, "pair: {line}");
-    let (_, found, refused, _, line) = check("mut_short", FactsPlant::None);
+    let (_, found, refused, line) = check("mut_short", FactsPlant::None);
     assert!(found && !refused, "mut_short (the classic unsoundness): no finding: {line}");
-    let (clean, _, _, _, line) = check("ok_de", FactsPlant::None);
+    let (clean, _, _, line) = check("ok_de", FactsPlant::None);
     assert!(clean, "ok_de (B7's finding): {line}");
-    let (clean, _, _, _, line) = check("co", FactsPlant::NoVariances);
+    let (clean, _, _, line) = check("co", FactsPlant::NoVariances);
     assert!(!clean, "CONTROL co without ADT variances is still clean: {line}");
 }

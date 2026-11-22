@@ -14,15 +14,16 @@
 //!   the `spawn(..)` call, filed as the check files its own; the body is not refused.
 //! - `dropped_before`: `r` is moved into `drop` before the `.await`, so the future stores no
 //!   `Rc` and is `Send`: a clean type verdict.
-//! - The control (rule 23), in the same test: `ProjectWorld::check` (types only) takes the plain
-//!   check (`Stalls::Gap`), whose only answer for the goal is the typed gap: `dropped_before`
-//!   is REFUSED there with `CheckError::Unported(INTERIOR_GAP)`. So its clean verdict above
-//!   comes from the decision on the exact interior, not from the check. (The same failure is
-//!   what `check_borrows` gives with check.rs's `check_deferring` arm taken out: the test then
-//!   fails at "dropped_before: types".)
+//! - `ProjectWorld::check` (types only) takes the same production path (`Stalls::Decide`, the
+//!   witness lowered, the row decided: borrows.rs `witness_and_decide`): `dropped_before` is
+//!   clean there too and `held_across` the same E0277. Before, it took `Stalls::Gap` and
+//!   refused `dropped_before` with the typed interior gap: a harness on another path than
+//!   the command's. The control for the decision itself (rule 23) stays: with check.rs's
+//!   `check_deferring` arm taken out the test fails at "dropped_before: types".
 //!
 //! Prints "stalled held_across: E0277 at \"spawn(..)\"" (the covered text, whole),
-//! "stalled dropped_before: clean", "stalled control dropped_before (plain check): the interior gap".
+//! "stalled dropped_before: clean", "stalled stored Packet: clean; stored Rc<Packet>: E0277 at packet",
+//! "stalled dropped_before (plain check): clean; held_across (plain check): E0277".
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`.
 
 #![feature(allocator_api)]
@@ -42,8 +43,30 @@ fn main() {}
 
 fn spawn<F: Future + Send>(f: F) {}
 
-fn held_across() {
+struct Packet(u8);
+
+fn replay_packet() {
     spawn(async {
+        drop(Rc::new(0u8));
+        let packet = Packet(1);
+        async {}.await;
+        drop(packet);
+    });
+}
+
+fn replay_rc_packet() {
+    spawn(async {
+        drop(Rc::new(0u8));
+        let packet = Rc::new(Packet(1));
+        async {}.await;
+        drop(packet);
+    });
+}
+
+fn held_across() {
+    spawn(async move {
+        let gone = Rc::new(2u8);
+        drop(gone);
         let r = Rc::new(1u8);
         async {}.await;
         drop(r);
@@ -51,7 +74,7 @@ fn held_across() {
 }
 
 fn dropped_before() {
-    spawn(async {
+    spawn(async move {
         let r = Rc::new(1u8);
         drop(r);
         async {}.await;
@@ -104,6 +127,10 @@ fn an_rc_across_an_await_is_not_send() {
     let covered = item.get(d.start as usize..d.end as usize).unwrap_or("<out of range>");
     assert!(d.start >= call && d.end <= call_end && d.end > d.start, "the E0277 at {}..{} ({covered:?}) is not inside the `spawn(..)` call {call}..{call_end} of {item:?}", d.start, d.end);
     assert!(d.text.contains("Send"), "the E0277 names the unmet `Send` goal: {:?}", d.text);
+    // The why-chain's held-slot step (src/front2/stalled_goals.rs `held_slots`): "`r`
+    // (`Rc<u8, ..>`) is held across `async {}.await`".
+    assert!(d.text.contains("`r` (`Rc<u8") && d.text.contains("is held across `async {}.await`"), "the saved binding and suspension: {:?}", d.text);
+    assert!(!d.text.contains("`gone` ("), "a moved binding of the same type is absent from the saved state: {:?}", d.text);
     println!("stalled held_across: E0277 at {covered:?}");
 
     // Dropped before the `.await`: the exact interior holds no `Rc`: clean.
@@ -113,12 +140,77 @@ fn an_rc_across_an_await_is_not_send() {
     assert!(types.reads.is_some(), "dropped_before: a clean verdict has its read list's digest: {types:?}");
     println!("stalled dropped_before: clean");
 
-    // The control: the plain check (types only) cannot decide the goal: the typed gap.
+    // The exact state asks Send of a user ADT. Plant a non-Send stored
+    // value at exactly the same suspension, keeping the poll-time Rc in both.
+    let (packet, _) = world.check_borrows(find("replay_packet"), heap.alloc());
+    assert!(packet.is_clean() && packet.reads.is_some(), "stored Packet(u8): {packet:?}");
+    let (rc_packet, _) = world.check_borrows(find("replay_rc_packet"), heap.alloc());
+    assert!(rc_packet.refused.is_none() && rc_packet.gaps.is_empty(), "{rc_packet:?}");
+    assert_eq!(rc_packet.diagnostics.len(), 1, "{rc_packet:?}");
+    let finding = &rc_packet.diagnostics[0];
+    assert_eq!(finding.code, "E0277");
+    assert!(finding.text.contains("`packet` (`") && finding.text.contains("is held across `async {}.await`"), "{finding:?}");
+    println!("stalled stored Packet: clean; stored Rc<Packet>: E0277 at packet");
+
+    // The plain check (types only) takes the production path too (project.rs `check`:
+    // `Stalls::Decide`, the witness lowered, the row decided): the same verdict as the borrow
+    // check's, never the old path's interior gap (`INTERIOR_GAP`).
     let plain = world.check(dropped, heap.alloc());
     let gap = matches!(
         &plain.refused,
-        Some(Refused::Check(CheckFail::Check { error: blaze_typeck::CheckError::Unported(what), .. })) if *what == blaze_typeck::INTERIOR_GAP
+        Some(Refused::Check(CheckFail::Check { error: blaze_typeck::CheckError::FutureWitness { reason, .. }, .. }))
+            if *reason == blaze_typeck::INTERIOR_GAP
     );
-    assert!(gap, "dropped_before under the plain check is the interior gap: {plain:?}");
-    println!("stalled control dropped_before (plain check): the interior gap");
+    assert!(!gap, "dropped_before under the plain check must be decided, not the old path's interior gap: {plain:?}");
+    assert!(plain.is_clean(), "dropped_before under the plain check: clean, as under check_borrows: {plain:?}");
+    let held = world.check(find("held_across"), heap.alloc());
+    assert!(held.diagnostics.iter().any(|d| d.code == "E0277"), "CONTROL: held_across under the plain check is the same E0277: {held:?}");
+    println!("stalled dropped_before (plain check): clean; held_across (plain check): E0277");
+}
+
+/// Both outer futures await another fn's opaque future. Its initial state is what
+/// differs: a u8 is Send, and an Rc<u8> is not, even if the first poll drops it.
+#[test]
+fn send_of_an_async_fn_follows_the_awaited_opaque() {
+    const SOURCE: &str = r#"
+use std::rc::Rc;
+fn need_send<T: Send>(_: T) {}
+async fn leaf<T>(value: T) { drop(value); }
+async fn outer_send() { leaf(1u8).await; }
+async fn outer_rc() { leaf(Rc::new(1u8)).await; }
+fn pass() { need_send(outer_send()); }
+fn control() { need_send(outer_rc()); }
+fn main() {}
+"#;
+    let alloc = blaze_own::testing::heap().alloc();
+    let home = std::env::var("HOME").expect("HOME");
+    let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("open the installed toolchain");
+    let files = [("/nested/src/main.rs".to_owned(), SOURCE.to_owned())];
+    let user = UserCrate {
+        name: "nested", dir: "/nested/", root: "/nested/src/main.rs", files: &files,
+        edition: edition::PackageEdition::of_manifest(EDITION).expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+    };
+    let inputs = Inputs::new(&user, &tc).expect("toolchain and test crate");
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, alloc).expect("resolve names");
+    let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("test frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front end");
+    let bodies = world.bodies(alloc);
+    for name in ["pass", "control"] {
+        let (body, _) = bodies.iter().find(|(b, _)| {
+            matches!(b, BodyRef::Free(k) if names.item_text(*k).and_then(|t| t.name) == Some(name))
+        }).expect("fixture function");
+        let (types, _) = world.check_borrows(*body, alloc);
+        assert!(types.refused.is_none() && types.gaps.is_empty() && types.undecided.is_empty(), "{name}: {types:?}");
+        if name == "pass" {
+            assert!(types.is_clean() && types.findings.is_empty() && types.reads.is_some(), "{name}: {types:?}");
+            println!("opaque stored future: pass: clean");
+        } else {
+            let [d] = types.diagnostics.as_slice() else { panic!("one error for the Rc stored in the awaited future: {types:?}") };
+            assert_eq!(d.code, "E0277", "{types:?}");
+            assert!(d.text.contains("Send") && d.start < d.end, "{types:?}");
+            println!("opaque stored future: control: E0277 Send");
+        }
+    }
 }

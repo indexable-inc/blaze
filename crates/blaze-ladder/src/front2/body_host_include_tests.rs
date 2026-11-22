@@ -14,12 +14,14 @@ use blaze_surface::Edition;
 use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
 use super::body_host::{BodyHost, Sourced};
-use super::source::{Load, Log, NamesSource, Records};
+use super::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use super::tables::recorder::{Recorder, RecorderOpts};
 use super::tables::view::{Tables, TablesOpts};
 
 const LIB: &str = r#"#![no_core]
 pub fn f() { let _ = (include_str!("../assets/text"), include_bytes!("blob")); }
+macro_rules! make { () => { fn generated() { let _ = include_str!("../assets/text"); } }; }
+make!();
 "#;
 const TEXT: &[u8] = "café\n".as_bytes();
 const BLOB: &[u8] = &[0xff, 0, 0xfe];
@@ -61,6 +63,9 @@ impl<'a> SourceTexts<'a> for Files<'a> {
 struct Kept<'a> {
     names: &'a [u8],
     items: &'a [u8],
+    /// The `make!()` call's expansion as its record keeps it: the call, its text, its origins
+    /// in their joined form (empty: the solve kept none).
+    made: (ItemKey, &'a str, &'a [u8]),
 }
 
 impl<'a> Load<'a> for Kept<'a> {
@@ -76,15 +81,29 @@ impl<'a> Load<'a> for Kept<'a> {
         (krate == 0 && path.as_str() == "src/lib.rs").then_some(LIB)
     }
 
-    fn expansion(&self, _: usize, _: ItemKey) -> Option<&'a str> {
-        None
-    }
-
-    fn expansion_origins(&self, _: usize, _: ItemKey) -> Option<(&'a [u8], &'a [u8])> {
-        None
+    fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'a>> {
+        let (made, text, bytes) = self.made;
+        if krate != 0 || call != made {
+            return None;
+        }
+        let origins = if bytes.is_empty() {
+            (&[][..], &[][..])
+        } else {
+            blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("the fixture's origins of {call:?}: {e:?}"))
+        };
+        Some(LoadedExpansion { text, origins: Some(origins) })
     }
 }
 
+/// Before (tempo c0255wave87, 8 `#[tokio::test]` bodies of crates/node/tests/it): over records
+/// a macro-made body's include was `Refused` (body_host.rs `body_file` walked `place_of` of the
+/// expansion's call, which is no item row). Now `BodyHost::of` reads the call part of the
+/// expansion's origins (`NamesSource::call_text`) and the include is relative to the calling
+/// file (the Reference, `include!`). Twin: `../../elsewhere` from the same body is `Outside`.
+/// Run t67 (2026-11-21) still failed `Refused` here: the body host is given the `Tables` view,
+/// which kept `NamesSource::call_text`'s default (`call_origin`, refused over records by
+/// design); tables/view.rs now serves it from the records' call part. Twin: `missing` from
+/// the macro-made body is `Missing`, asked relative to the calling file.
 #[test]
 fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
     let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("the records frame");
@@ -104,17 +123,37 @@ fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
         implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
         features: &[], deps: &[], cfg: &[], script: None,
     };
-    let (kept, item, module) = {
+    let (kept, item, module, generated) = {
         let solved = resolve_crates(&[input], Sysroot::default(), &Original, &Serial, alloc).expect("resolve the fixture");
         let (item, module, _) = solved.items(0)
             .find(|(key, _, _)| solved.item_text(*key).and_then(|row| row.name) == Some("f"))
             .expect("the function f");
+        let generated = solved.items(0)
+            .find(|(key, _, _)| solved.item_text(*key).and_then(|row| row.name) == Some("generated"))
+            .map(|(key, _, _)| key)
+            .expect("the macro-made function");
+        let sourced = Sourced(&files);
+        {
+            let solved_host = BodyHost::of(&solved, Some(&sourced), 0, generated, module, alloc);
+            assert_eq!(solved_host.include("../assets/text", IncludeAs::Str), Ok(Included::Bytes(TEXT)));
+        }
+        files.reads.set(0);
         let krate = solved.krate(0);
+        // The `make!()` call `generated` is written by, and its expansion as the solve made it.
+        let Some(blaze_scope::resolve::At::Expansion(call)) = NamesSource::place_of(&solved, generated).map(|place| place.at) else {
+            panic!("the macro-made function is placed in an expansion")
+        };
+        let made = krate.expansions.get(&call).and_then(|e| e.made).expect("the `make!()` call's text");
+        let origins: &[u8] = match made.origins {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("the origins of the `make!()` call: {e:?}"),
+        };
         let kept = Kept {
             names: aligned(&names_record::encode(krate, alloc).expect("names record"), alloc),
             items: aligned(&items_record::encode(krate, alloc).expect("items record"), alloc),
+            made: (call, made.text, origins),
         };
-        (kept, item, module)
+        (kept, item, module, generated)
     };
     let sources = Sourced(&files);
     let keys = [input.key];
@@ -131,9 +170,29 @@ fn a_record_backed_body_reads_data_relative_to_its_calling_file() {
     assert_eq!(host.include("../../elsewhere", IncludeAs::Bytes), Ok(Included::Outside));
     assert_eq!(files.reads.get(), 3, "the missing file was consulted and the outside file was not");
 
+    // The macro-made body over records: its include is relative to the file the `make!()` call
+    // is written in, read from the call part of the expansion's origins (`call_text`).
+    let generated_records = BodyHost::of(tables, Some(&sources), 0, generated, module, alloc);
+    assert_eq!(generated_records.include("../assets/text", IncludeAs::Str), Ok(Included::Bytes(TEXT)), "a macro-made body over records");
+    assert_eq!(generated_records.include("../../elsewhere", IncludeAs::Bytes), Ok(Included::Outside), "TWIN: a path out of the package from the macro-made body");
+    assert_eq!(files.reads.get(), 4, "the macro-made body's include read once, the outside one never");
+    // TWIN: a path with no file, from the macro-made body: asked of the reader as
+    // `/7/pkg/src/missing` from `/7/pkg/src/lib.rs` (`Files::read_data` asserts the calling file
+    // and panics on any other path), answered `Missing`, never `Refused`: the file asked is the
+    // written path joined to the calling file's folder.
+    assert_eq!(generated_records.include("missing", IncludeAs::Str), Ok(Included::Missing), "TWIN: a missing file from the macro-made body");
+    assert_eq!(files.reads.get(), 5, "the missing file was asked once, relative to the calling file");
+    files.reads.set(4);
+
+    let source = records.file_paths(0, 0).expect("the invocation's physical file");
+    // The body stage's physical invocation file, given: the same answer.
+    let generated_host = BodyHost::of_with_file(tables, Some(&sources), 0, generated, module, source, alloc);
+    assert_eq!(generated_host.include("../assets/text", IncludeAs::Str), Ok(Included::Bytes(TEXT)));
+    assert_eq!(files.reads.get(), 5, "the macro-made body's include is resolved against its invocation file");
+
     let planted = BodyHost::planted_solved_file(tables, &sources, 0, item, module, alloc);
     assert_eq!(planted.include("../assets/text", IncludeAs::Str), Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused }));
-    assert_eq!(files.reads.get(), 3, "the solved-only lookup refused before reading the file");
+    assert_eq!(files.reads.get(), 5, "the solved-only lookup refused before reading the file");
 
     let builtin = DefAt {
         site: DefSite { krate: input.key, module: Some(module) },

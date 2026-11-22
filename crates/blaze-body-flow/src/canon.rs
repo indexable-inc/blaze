@@ -366,6 +366,10 @@ impl<A: Allocator> Printer<'_, A> {
                 out.write_str("activate ")?;
                 self.loan(l, out)
             }
+            StmtKind::Mention(p) => {
+                out.write_str("mention ")?;
+                self.place(p, out)
+            }
             StmtKind::Goto(b) => {
                 out.write_str("goto ")?;
                 self.block(b, out)
