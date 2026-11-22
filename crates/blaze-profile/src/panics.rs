@@ -378,9 +378,8 @@ fn thread_name(out: &mut [u8; NAME_BYTES]) -> usize {
 /// many bytes, 0 for none. Async-signal-safe: for the calling thread `pthread_getname_np` copies
 /// the name it keeps (Linux: `prctl`, a system call), with no lock and no allocation.
 pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     {
-        // SAFETY: `out` is live and its length is passed; see above.
         // SAFETY: the calling thread is live and `out` is writable for its passed length.
         let named = unsafe {
             blaze_sys::posix::thread::pthread_getname_np(
@@ -394,7 +393,22 @@ pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
         }
         out.iter().position(|&it| it == 0).unwrap_or(out.len())
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(name) = blaze_sys::linux::thread_name() else {
+            return 0;
+        };
+        let mut len = 0;
+        for (dst, &src) in out.iter_mut().zip(name.iter()) {
+            if src == 0 {
+                break;
+            }
+            *dst = src;
+            len += 1;
+        }
+        len
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         _ = out;
         0
