@@ -185,7 +185,7 @@ pub fn area_of(finding: &Print<'_>) -> Area {
 /// its bytes from that start (the finding's own `start..end`, or its token place's bytes today:
 /// [`Place::Tokens`]), `grammar` the file's outline when it is Rust, `read` the text's digest.
 #[expect(clippy::too_many_arguments, reason = "one finding's facts, each a different one")]
-fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, range: (u32, u32), message: &'f [u8], finding: &Print<'_>) -> Result<Listed<'f>, CliError> {
+fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, range: (u32, u32), message: &'f [u8], finding: &Print<'_>, frame: &'f Frame, scratch: &Frame) -> Result<Listed<'f>, CliError> {
     let area = area_of(finding);
     let code = code_of(area, finding.rule);
     let start = place.saturating_add(range.0).min(text.len() as u32);
@@ -197,6 +197,7 @@ fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar:
             let name = core::str::from_utf8(message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
             Some(Change { start, end, insert: "", reason: HelpKind::ToolchainLine, args: [name, ""], given: 1 })
         }
+        (Area::Cli, rule) => crate::lints::rule_of(rule).and_then(|lint| crate::lints::fix_at(lint, text, start, end, frame, scratch)),
         _ => None,
     };
     Ok(Listed { path: Some(path), about: finding.name, read, area, rule: finding.rule, words: message, item, start, end, id, fix })
@@ -688,7 +689,7 @@ pub(crate) fn place_listed<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'
                     }
                 };
                 into[i] = match place {
-                    Some((place, range)) => placed_in(path, text, read, grammar.as_ref(), place, range, wanted[i].words, &prints[i])?,
+                    Some((place, range)) => placed_in(path, text, read, grammar.as_ref(), place, range, wanted[i].words, &prints[i], frame, one)?,
                     None => unplaced(wanted[i].words, &prints[i], no_text, one),
                 };
                 held.saw(file, one, (file_at, line_at), text.len());

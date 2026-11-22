@@ -460,14 +460,11 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
             "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
             _ if arg.starts_with("--view=") => flags.view = Some(View::parse(&arg["--view=".len()..]).ok_or(CliError::Usage("--view is person, agent or json"))?),
             // Every word after `--fix` up to the next flag is a selector: an id or a prefix of
-            // one, a code, a path, or `all` (fix.rs).
+            // one, a code, a path, or `all` (fix.rs). Bare `--fix` with no selector fixes `all`.
             "--fix" => {
                 let start = at;
                 while args.get(at).is_some_and(|word| !word.starts_with("--")) {
                     at += 1;
-                }
-                if at == start {
-                    return Err(CliError::Usage("--fix takes one or more selectors: an id or a prefix of one, a code, a path, or `all`"));
                 }
                 flags.fix = Some((start, at));
             }

@@ -635,6 +635,8 @@ pub enum HelpKind {
     Tied,
     /// A manifest line naming the toolchain's crate again, deleted: `{0}` the name it gave.
     ToolchainLine,
+    /// A mechanical fix from a lint rule: `{0}` names the rule.
+    LintFix,
 }
 
 /// One help's words.
@@ -670,6 +672,12 @@ pub const HELPS: &[HelpWording] = &[
         kind: HelpKind::ToolchainLine,
         name: "help-toolchain-line",
         template: "under edition blaze-2026.11 the package is given {code:0} with no line",
+        args: 1,
+    },
+    HelpWording {
+        kind: HelpKind::LintFix,
+        name: "help-lint-fix",
+        template: "mechanical fix for lint {code:0}",
         args: 1,
     },
 ];

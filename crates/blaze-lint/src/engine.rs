@@ -43,7 +43,7 @@ const SEQUENCE_RULES: [Rule; 11] = [
 
 /// A token's kind, as the rules tell kinds apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum K {
+pub(crate) enum K {
     Ident,
     /// `r#name` or `k#name`: never a keyword.
     Raw,
@@ -60,10 +60,10 @@ enum K {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Tok {
-    start: u32,
-    end: u32,
-    k: K,
+pub(crate) struct Tok {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) k: K,
     /// An identifier's number in the rules' word table (`sequences::WORDS`), found once while
     /// lexing; `NO_WORD` for every other token and for a word no rule reads.
     word: u8,
@@ -97,7 +97,7 @@ struct Sig {
 
 /// A fix a candidate carries, written out with it.
 #[derive(Clone, Copy)]
-enum Plan {
+pub(crate) enum Plan {
     None,
     /// The method name at `name` becomes row `row`'s new name, and when the row has a suffix,
     /// it goes at `after` (the call's `)` end).
@@ -114,15 +114,17 @@ enum Plan {
     WrapFrom { before_expr: u32, after_expr: u32, as_end: u32, prefix: &'static str, add_close: bool },
     /// Insert `!` at `bang_at` and replace `range` with `text` (e.g. `x.len() > 0` -> `!x.is_empty()`).
     NegateReplace { bang_at: u32, range: Span, text: &'static str },
+    /// `range` replaced by the UTF-8 slice `text` in `Pass::fix_buf` (empty for deletion).
+    ReplaceBuf { range: Span, text: Run },
 }
 
 /// A finding before test code is known.
 #[derive(Clone, Copy)]
-struct Cand {
-    template: Template,
-    range: Span,
-    arg: Option<Arg>,
-    plan: Plan,
+pub(crate) struct Cand {
+    pub(crate) template: Template,
+    pub(crate) range: Span,
+    pub(crate) arg: Option<Arg>,
+    pub(crate) plan: Plan,
 }
 
 /// How many lines above a clone or an `unsafe` its comment is looked for (clones.rs's `LOOK_UP`).
@@ -221,6 +223,7 @@ pub struct Scratch<'a> {
     pub(crate) alloc: Alloc<'a>,
     toks: AVec<'a, Tok>,
     cands: AVec<'a, Cand>,
+    fix_buf: AVec<'a, u8>,
     regions: AVec<'a, TestRegion>,
     reasons: AVec<'a, Span>,
     frames: AVec<'a, Frame>,
@@ -236,6 +239,7 @@ impl<'a> Scratch<'a> {
             alloc,
             toks: AVec::new_in(alloc),
             cands: AVec::new_in(alloc),
+            fix_buf: AVec::new_in(alloc),
             regions: AVec::new_in(alloc),
             reasons: AVec::new_in(alloc),
             frames: AVec::new_in(alloc),
@@ -249,6 +253,7 @@ impl<'a> Scratch<'a> {
     pub fn clear(&mut self) {
         self.toks.clear();
         self.cands.clear();
+        self.fix_buf.clear();
         self.regions.clear();
         self.reasons.clear();
         self.frames.clear();
@@ -299,6 +304,7 @@ pub(crate) fn run_with<'a>(
         scope: unit.scope,
         toks: &mut scratch.toks,
         cands: &mut scratch.cands,
+        fix_buf: &mut scratch.fix_buf,
         regions: &mut scratch.regions,
         reasons: &mut scratch.reasons,
         frames: &mut scratch.frames,
@@ -317,6 +323,15 @@ pub(crate) fn run_with<'a>(
     if SEQUENCE_RULES.iter().any(|rule| rules.runs(*rule)) {
         pass.sequences();
     }
+    if rules.runs(Rule::IoRef) {
+        pass.io_ref_pass();
+    }
+    if rules.runs(Rule::UnusedImport) {
+        pass.unused_import_pass(false);
+    }
+    if rules.runs(Rule::UnusedMut) {
+        pass.unused_mut_pass();
+    }
     let test_at_end = pass.test_at(unit.text.len().saturating_sub(1) as u32);
     let from = count(out.list.len())?;
     pass.emit(out)?;
@@ -326,19 +341,63 @@ pub(crate) fn run_with<'a>(
     Ok(PassDone { findings: Run { from, to }, test_at_end, cost: pass.cost, tokens })
 }
 
+/// Whole-file top-level `use` pass for [`Rule::UnusedImport`], separate from [`run_with`] so
+/// per-item passes remain strictly independent of sibling items.
+pub(crate) fn run_file_imports<'a>(
+    text: &str,
+    scope: Scope,
+    scratch: &mut Scratch<'a>,
+    out: &mut Findings<'a>,
+) -> Result<PassDone, LintError> {
+    if u32::try_from(text.len()).is_err() {
+        return Err(LintError::TooLong { len: text.len() });
+    }
+    let only = RuleSet::only(&[Rule::UnusedImport]);
+    scratch.clear();
+    let mut pass = Pass {
+        rules: &only,
+        text,
+        bytes: text.as_bytes(),
+        scope,
+        toks: &mut scratch.toks,
+        cands: &mut scratch.cands,
+        fix_buf: &mut scratch.fix_buf,
+        regions: &mut scratch.regions,
+        reasons: &mut scratch.reasons,
+        frames: &mut scratch.frames,
+        bodies: &mut scratch.bodies,
+        fns: &mut scratch.fns,
+        children: &mut scratch.children,
+        header: None,
+        sig: None,
+        in_use: false,
+        defining: false,
+        last_fn: None,
+        cost: Cost::NONE,
+    };
+    pass.lex(&[])?;
+    pass.unused_import_pass(true);
+    let from = count(out.list.len())?;
+    pass.emit(out)?;
+    let to = count(out.list.len())?;
+    let tokens = count(pass.toks.len())?;
+    Ok(PassDone { findings: Run { from, to }, test_at_end: TestBits::NONE, cost: pass.cost, tokens })
+}
+
 /// The bytes of `unit` outside its holes (holes not yet checked: a bad one only mis-sizes).
 fn own_bytes(unit: &Unit<'_>) -> usize {
     let holes: usize = unit.holes.iter().map(|h| h.end.saturating_sub(h.start) as usize).sum();
     unit.text.len().saturating_sub(holes)
 }
 
-struct Pass<'u, 's, 'a> {
+pub(crate) struct Pass<'u, 's, 'a> {
     rules: &'u RuleSet,
-    text: &'u str,
-    bytes: &'u [u8],
+    pub(crate) text: &'u str,
+    pub(crate) bytes: &'u [u8],
     scope: Scope,
-    toks: &'s mut AVec<'a, Tok>,
-    cands: &'s mut AVec<'a, Cand>,
+    pub(crate) toks: &'s mut AVec<'a, Tok>,
+    pub(crate) cands: &'s mut AVec<'a, Cand>,
+    pub(crate) fix_buf: &'s mut AVec<'a, u8>,
     /// Test code: each region's range, flavor, and prefix-max end.
     regions: &'s mut AVec<'a, TestRegion>,
     /// What each `#[blaze::lock_exception(..)]` covers (D179): the statement, field, `static`,
@@ -359,7 +418,7 @@ struct Pass<'u, 's, 'a> {
     /// The last `fn` read: where a local's declaration is looked for from.
     last_fn: Option<usize>,
     /// The sites each rule tried ([`Cost`]): one count at each dispatch into a rule.
-    cost: Cost,
+    pub(crate) cost: Cost,
 }
 
 impl<'u, 's, 'a> Pass<'u, 's, 'a> {
@@ -4283,6 +4342,16 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     let edits_from = count(out.edits.len())?;
                     out.push_edit(Span::new(bang_at, bang_at), "!")?;
                     out.push_edit(range, text)?;
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
+                Plan::ReplaceBuf { range, text } => {
+                    let edits_from = count(out.edits.len())?;
+                    let slice = self
+                        .fix_buf
+                        .get(text.range())
+                        .and_then(|b| core::str::from_utf8(b).ok())
+                        .unwrap_or("");
+                    out.push_edit(range, slice)?;
                     out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
                 }
             }
