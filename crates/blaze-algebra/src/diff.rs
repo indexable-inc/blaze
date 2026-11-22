@@ -151,7 +151,7 @@ impl Dual {
 
 /// Evaluate `root` with forward-mode dual numbers seeded at `wrt` (`d(wrt)/d(wrt) = 1.0`,
 /// all other variables `0.0`), independent of symbolic differentiation rules.
-pub fn eval_dual<A: Allocator + Clone>(
+pub fn eval_dual<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     root: ExprId,
     env: &[f64],
@@ -168,7 +168,7 @@ pub fn eval_dual<A: Allocator + Clone>(
     eval_dual_memo(g, root, env, wrt, &mut cache)
 }
 
-fn eval_dual_memo<A: Allocator + Clone>(
+fn eval_dual_memo<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     env: &[f64],
@@ -229,7 +229,7 @@ fn eval_dual_memo<A: Allocator + Clone>(
 }
 
 /// Compute the symbolic partial derivative `∂(root) / ∂(wrt)` over the shared DAG (memoized O(|V|)).
-pub fn diff<A: Allocator + Clone>(
+pub fn diff<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,
@@ -238,7 +238,7 @@ pub fn diff<A: Allocator + Clone>(
 }
 
 /// Symbolic partial derivative with explicit `AlgebraPlant` for planted-bug oracle controls.
-pub fn diff_with_plant<A: Allocator + Clone>(
+pub fn diff_with_plant<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,
@@ -255,7 +255,7 @@ pub fn diff_with_plant<A: Allocator + Clone>(
     diff_memo(g, root, wrt, plant, &mut cache)
 }
 
-fn diff_memo<A: Allocator + Clone>(
+fn diff_memo<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     id: ExprId,
     wrt: VarId,
@@ -379,7 +379,7 @@ fn diff_memo<A: Allocator + Clone>(
 }
 
 /// Compute the `order`-th symbolic derivative `∂^n(root) / ∂(wrt)^n`.
-pub fn nth_diff<A: Allocator + Clone>(
+pub fn nth_diff<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,
@@ -394,7 +394,7 @@ pub fn nth_diff<A: Allocator + Clone>(
 
 /// Compute the symbolic gradient `[∂f/∂v0, ∂f/∂v1, ...]` with respect to `vars` via forward
 /// memoized DAG differentiation (O(N · |V|)). For many inputs, prefer [`grad_reverse`].
-pub fn grad<A: Allocator + Clone>(
+pub fn grad<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -409,7 +409,7 @@ pub fn grad<A: Allocator + Clone>(
 /// Compute the full symbolic gradient `[∂f/∂v0, ∂f/∂v1, ...]` in a SINGLE reverse-mode
 /// symbolic adjoint sweep over the DAG — **O(|V|) total time & graph growth independent of
 /// `vars.len()`**! All partial derivatives share intermediate nodes inside `g`.
-pub fn grad_reverse<A: Allocator + Clone>(
+pub fn grad_reverse<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -418,7 +418,7 @@ pub fn grad_reverse<A: Allocator + Clone>(
 }
 
 /// Reverse-mode symbolic gradient with explicit [`AlgebraPlant`] for oracle controls.
-pub fn grad_reverse_with_plant<A: Allocator + Clone>(
+pub fn grad_reverse_with_plant<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -574,7 +574,7 @@ pub fn grad_reverse_with_plant<A: Allocator + Clone>(
     Ok(out)
 }
 
-fn collect_reachable_postorder<A: Allocator + Clone>(
+fn collect_reachable_postorder<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     visited: &mut OwnVec<bool, A>,
@@ -607,7 +607,7 @@ fn collect_reachable_postorder<A: Allocator + Clone>(
 
 /// Compute the symbolic Jacobian matrix `J[r * vars.len() + c] = ∂(outputs[r]) / ∂(vars[c])`
 /// in row-major order, automatically selecting reverse-mode per output row when `vars.len() > 1`.
-pub fn jacobian<A: Allocator + Clone>(
+pub fn jacobian<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     outputs: &[ExprId],
     vars: &[VarId],
@@ -624,7 +624,7 @@ pub fn jacobian<A: Allocator + Clone>(
 
 /// Compute the symbolic Hessian matrix `H[i * n + j] = ∂²f / (∂v_i ∂v_j)` in row-major order,
 /// using reverse-mode symbolic adjoints for both the first and second passes.
-pub fn hessian<A: Allocator + Clone>(
+pub fn hessian<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     vars: &[VarId],
@@ -634,7 +634,7 @@ pub fn hessian<A: Allocator + Clone>(
 }
 
 /// Compute the symbolic Taylor polynomial of `root` around `wrt = center` up to degree `order`.
-pub fn taylor<A: Allocator + Clone>(
+pub fn taylor<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     wrt: VarId,

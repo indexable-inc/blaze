@@ -10,7 +10,7 @@
 
 use core::alloc::Allocator;
 
-use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, diff, simplify};
+use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, diff, simplify, simplify_poly_expr};
 
 /// Symbolic solution of `lhs = rhs` with respect to a target variable `x`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,7 +28,7 @@ pub enum Solution {
 }
 
 /// Solve `lhs = rhs` symbolically for `target` inside `g`.
-pub fn solve_for<A: Allocator + Clone>(
+pub fn solve_for<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     lhs: ExprId,
     rhs: ExprId,
@@ -58,8 +58,10 @@ pub fn solve_for<A: Allocator + Clone>(
         }
     }
 
-    // 2. Derivative-extracted exact linear / quadratic polynomial solver on `f(x) = lhs - rhs = 0`.
+    // 2. Exact polynomial normalization + derivative-extracted linear / quadratic solver on
+    // `f(x) = lhs - rhs = 0`.
     let f = g.sub(lhs, rhs);
+    let f = simplify_poly_expr(g, f)?;
     let f = simplify(g, f)?;
     let df1 = diff(g, f, target)?;
     let df1 = simplify(g, df1)?;
@@ -127,7 +129,7 @@ pub fn solve_for<A: Allocator + Clone>(
 
 /// Structurally isolate `target` from `expr = rhs` when `target` appears in only one branch
 /// of each invertible operation.
-fn try_isolate<A: Allocator + Clone>(
+fn try_isolate<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     expr: ExprId,
     rhs: ExprId,

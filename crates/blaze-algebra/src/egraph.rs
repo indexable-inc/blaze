@@ -85,7 +85,7 @@ pub struct SimplifyStats {
 }
 
 /// Minimal zero-dep e-graph over an explicit allocator `A` with O(1) SwissTable hashconsing.
-pub struct EGraph<A: Allocator + Clone> {
+pub struct EGraph<A: Allocator + Copy> {
     parent: OwnVec<u32, A>,
     classes: OwnVec<OwnVec<ENode, A>, A>,
     /// Canonical e-node -> canonical e-class hashcons table (O(1) lookup & O(E) congruence closure).
@@ -96,17 +96,17 @@ pub struct EGraph<A: Allocator + Clone> {
     alloc: A,
 }
 
-impl<A: Allocator + Clone> EGraph<A> {
+impl<A: Allocator + Copy> EGraph<A> {
     pub fn new_in(alloc: A) -> Self {
         Self {
-            parent: OwnVec::new_in(alloc.clone()),
-            classes: OwnVec::new_in(alloc.clone()),
+            parent: OwnVec::new_in(alloc),
+            classes: OwnVec::new_in(alloc),
             hashcons: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc: alloc,
                 capacity: None,
             }),
-            const_val: OwnVec::new_in(alloc.clone()),
+            const_val: OwnVec::new_in(alloc),
             total_enodes: 0,
             alloc,
         }
@@ -163,7 +163,7 @@ impl<A: Allocator + Clone> EGraph<A> {
         }
         let cid = EClassId(self.parent.len() as u32);
         self.parent.push(cid.0);
-        let mut list = OwnVec::new_in(self.alloc.clone());
+        let mut list = OwnVec::new_in(self.alloc);
         list.push(canon);
         self.classes.push(list);
         self.hashcons.insert(canon, cid);
@@ -208,14 +208,14 @@ impl<A: Allocator + Clone> EGraph<A> {
             guard += 1;
             let nclasses = self.classes.len();
             self.hashcons.clear();
-            let mut merges: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc.clone());
+            let mut merges: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc);
 
             for cid in 0..nclasses {
                 if self.parent[cid] != cid as u32 {
                     continue;
                 }
                 let root = EClassId(cid as u32);
-                let mut dedup = OwnVec::new_in(self.alloc.clone());
+                let mut dedup = OwnVec::new_in(self.alloc);
                 let len = self.classes[cid].len();
                 for i in 0..len {
                     let c = self.canonicalize(self.classes[cid][i]);
@@ -254,7 +254,7 @@ impl<A: Allocator + Clone> EGraph<A> {
 
     /// Run one equality-saturation rewrite pass over all live e-classes.
     fn saturate_once(&mut self, max_enodes: usize) -> bool {
-        let mut pending_unions: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc.clone());
+        let mut pending_unions: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc);
         let nclasses = self.classes.len();
 
         for cid in 0..nclasses {
@@ -592,8 +592,8 @@ impl<A: Allocator + Clone> EGraph<A> {
     /// Compute minimum tree-cost e-node for every live e-class via Bellman-Ford relaxation.
     fn compute_best(&self) -> (OwnVec<u32, A>, OwnVec<Option<ENode>, A>) {
         let n = self.classes.len();
-        let mut costs: OwnVec<u32, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
-        let mut best: OwnVec<Option<ENode>, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut costs: OwnVec<u32, A> = OwnVec::with_capacity_in(n, self.alloc);
+        let mut best: OwnVec<Option<ENode>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             costs.push(u32::MAX / 4);
             best.push(None);
@@ -639,7 +639,7 @@ impl<A: Allocator + Clone> EGraph<A> {
 
     fn extract_into(&self, root: EClassId, best: &[Option<ENode>], g: &mut ExprGraph<A>) -> ExprId {
         let n = self.classes.len();
-        let mut memo: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut memo: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             memo.push(None);
         }
@@ -734,7 +734,7 @@ impl<A: Allocator + Clone> EGraph<A> {
 }
 
 /// Compute the tree-weighted operation cost of `root` in `g`.
-pub fn expr_cost<A: Allocator + Clone>(g: &ExprGraph<A>, root: ExprId) -> Result<u32, AlgebraError> {
+pub fn expr_cost<A: Allocator + Copy>(g: &ExprGraph<A>, root: ExprId) -> Result<u32, AlgebraError> {
     let n = g.len();
     if (root.0 as usize) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
@@ -746,7 +746,7 @@ pub fn expr_cost<A: Allocator + Clone>(g: &ExprGraph<A>, root: ExprId) -> Result
     expr_cost_memo(g, root, &mut memo)
 }
 
-fn expr_cost_memo<A: Allocator + Clone>(
+fn expr_cost_memo<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     memo: &mut OwnVec<Option<u32>, A>,
@@ -780,7 +780,7 @@ fn expr_cost_memo<A: Allocator + Clone>(
     Ok(c)
 }
 
-fn insert_expr<A: Allocator + Clone>(
+fn insert_expr<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     eg: &mut EGraph<A>,
@@ -860,7 +860,7 @@ fn insert_expr<A: Allocator + Clone>(
 }
 
 /// Simplify `root` using bounded e-graph equality saturation with default options.
-pub fn simplify<A: Allocator + Clone>(
+pub fn simplify<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
 ) -> Result<ExprId, AlgebraError> {
@@ -869,7 +869,7 @@ pub fn simplify<A: Allocator + Clone>(
 }
 
 /// Simplify `root` with explicit [`SimplifyOpts`], returning the simplified [`ExprId`] and stats.
-pub fn simplify_with<A: Allocator + Clone>(
+pub fn simplify_with<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     opts: SimplifyOpts,

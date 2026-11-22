@@ -10,7 +10,7 @@ use blaze_own::{String as OwnString, Vec as OwnVec};
 use crate::{AlgebraError, ExprGraph, ExprId, Op};
 
 /// Format `root` as a clean human-readable infix formula with minimal parentheses.
-pub fn format_expr<A: Allocator + Clone>(
+pub fn format_expr<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     root: ExprId,
 ) -> Result<OwnString<A>, AlgebraError> {
@@ -38,7 +38,7 @@ fn op_prec(op: Op) -> u8 {
     }
 }
 
-fn fmt_rec<A: Allocator + Clone>(
+fn fmt_rec<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     parent_prec: u8,
@@ -106,7 +106,7 @@ fn fmt_rec<A: Allocator + Clone>(
     Ok(())
 }
 
-fn fmt_call<A: Allocator + Clone>(
+fn fmt_call<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     name: &str,
     arg: ExprId,
@@ -121,7 +121,7 @@ fn fmt_call<A: Allocator + Clone>(
 
 /// Emit a zero-allocation, CSE-shared SSA Rust function computing `root` using deterministic
 /// `blaze_math` calls. Every shared DAG node is computed once into a `let tN: f64 = ...;` local.
-pub fn emit_rust_fn<A: Allocator + Clone>(
+pub fn emit_rust_fn<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     fn_name: &str,
     root: ExprId,
@@ -132,7 +132,7 @@ pub fn emit_rust_fn<A: Allocator + Clone>(
 /// Emit a zero-allocation, multi-output CSE-shared SSA Rust function returning `[f64; K]`
 /// (for example `[f, df/dx, df/dy]` or a full Jacobian), sharing every common subexpression
 /// across all outputs in one topological SSA schedule!
-pub fn emit_rust_multi_fn<A: Allocator + Clone>(
+pub fn emit_rust_multi_fn<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     fn_name: &str,
     roots: &[ExprId],
@@ -140,7 +140,7 @@ pub fn emit_rust_multi_fn<A: Allocator + Clone>(
     emit_ssa_body(g, fn_name, roots, true)
 }
 
-fn emit_ssa_body<A: Allocator + Clone>(
+fn emit_ssa_body<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     fn_name: &str,
     roots: &[ExprId],
@@ -251,7 +251,7 @@ fn emit_ssa_body<A: Allocator + Clone>(
     Ok(out)
 }
 
-fn collect_postorder<A: Allocator + Clone>(
+fn collect_postorder<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
     visited: &mut OwnVec<bool, A>,

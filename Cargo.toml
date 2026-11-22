@@ -287,6 +287,7 @@ blaze-screen = { path = "crates/blaze-screen" }
 blaze-script = { path = "crates/blaze-script" }
 # v2 (docs/v2/plan.md)
 blaze-algebra = { path = "crates/blaze-algebra" }
+blaze-algebra-body = { path = "crates/blaze-algebra-body" }
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-answer = { path = "crates/blaze-answer" }
 blaze-ask = { path = "crates/blaze-ask" }

@@ -39,22 +39,40 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
    - Solves `lhs = rhs` symbolically for a target variable via structural unwrapping of invertible
      operations (`+`, `-`, `*`, `/`, `-u`, `exp`, `ln`, `sqrt`, `pow`) and exact derivative-based
      polynomial extraction (linear `-b / a` and quadratic `(-b ± sqrt(b^2 - 4ac)) / 2a`).
-5. **Compile-Time `const fn` Expression Graph (`ConstGraph<const N: usize>`) & CSE SSA Emitter**:
+5. **Exact Rational & Canonical Sparse Multivariate Polynomial Engine (`poly.rs`)**:
+   - Exact reduced `Rat` (`i128/u128`, overflow-checked) and canonical sparse multivariate
+     `Poly<A: Allocator + Copy>` implementing `blaze_own::CloneIn` (zero implicit `Clone` impls,
+     zero `.clone()` calls, zero redundant allocator field on `Monomial`).
+   - Exact polynomial differentiation (`Poly::diff`), univariate polynomial long division
+     (`div_rem_univariate`), monic Euclidean polynomial GCD (`gcd_univariate`), and bi-directional
+     `expr_to_poly` / `poly_to_expr` / `simplify_poly_expr` (cancelling both multivariate
+     identities like `(x + y)^3 - (x^3 + 3x^2y + 3xy^2 + y^3) == 0` and rational functions like
+     `(x^3 - 6x^2 + 11x - 6) / (x - 2) == x^2 - 4x + 3`, wired directly into `solve_for`).
+6. **Compile-Time `const fn` Expression Graph (`ConstGraph<const N: usize>`) & CSE SSA Emitter**:
    - Fixed-capacity stack/const expression DAG supporting `const fn` construction, symbolic
      differentiation, algebraic simplification, and `eval_const` inside `const` items today.
    - `emit_rust_fn` and multi-output `emit_rust_multi_fn` emit zero-allocation, CSE-shared SSA
      Rust functions (`pub fn f_and_grad(...) -> [f64; K]`) over `blaze_math`.
-6. **Future Compiler Seam (`blaze::comptime::expr_of` / `splice!`)**:
-   - When `blaze-comptime` exposes `expr_of(pure_fn) -> ExprGraph` and `splice!(graph, args...)`,
-     this same library transforms ordinary `#[blaze::pure]` Rust functions at compile time and
-     lowers the simplified derivative/solver DAG straight into MIR/LIR/SIMD/GPU with zero runtime
-     overhead.
+7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-algebra-body`)**:
+   - `lift_body`: lifts a verified straight-line pure numeric `blaze_body::Verified<'_>` into
+     `ExprGraph<A>`, refusing cycles/branches/impure calls with typed `BodyAlgebraError` naming
+     the exact `Block` and `Stmt`.
+   - `splice_body`: CSE topological walk emitting a fresh `blaze_body::Body<A>` (including math
+     `Call` continuation blocks) checked via `blaze_body::verify`.
+   - `diff_body`, `grad_bodies` (single-sweep reverse-mode), and `simplify_body` (exact `Poly` +
+     e-graph) run end-to-end `Verified<Body>` → verified `Body` compiler transforms today.
 
 ## Proof
-- `blaze-sim` property test `blaze_sim_property_random_exprs_match_dual_oracle_and_egraph_preserves_value`
-  across 64 random DAGs verifying forward `diff`, reverse `grad_reverse`, and e-graph `simplify`
-  against `eval_dual`, with planted-bug controls (`WrongSinDeriv`, `WrongQuotientSign`,
-  `WrongReverseAdjointAccum`) proved caught by the oracle.
+- `blaze-algebra` (`9 passed, 0 failed`, 0 `.clone()` calls): `blaze-sim` property tests over
+  random DAGs (`diff`, `grad_reverse`, e-graph `simplify` vs `eval_dual`) and random exact
+  polynomials (`(p*r)/r == (p,0)`, Euclidean GCD divisibility, `Poly::diff == Dual tangent`),
+  with 5 planted-bug controls (`WrongSinDeriv`, `WrongQuotientSign`, `WrongReverseAdjointAccum`,
+  `WrongGcdRemainder`, `WrongPolyDiffCoeff`) proved caught by the oracle.
+- `blaze-algebra-body` (`5 passed, 0 failed`, 0 `.clone()` calls): end-to-end MIR → `diff_body` /
+  `grad_bodies` / `simplify_body` → `blaze_body::verify` → `eval_pure_body` verified against
+  `eval_dual` across rational bodies, multi-block transcendental `Call` bodies, exact polynomial
+  collapsing to 2 MIR rows, cyclic refusal, and 32 `blaze-sim` random MIR bodies with planted-bug
+  control `SpliceOriginalInsteadOfDeriv`.
 - E-graph equivalence & cost-reduction property tests (`eval(orig) ≈ eval(simplified)` and
   `cost(simplified) <= cost(original)`).
 - Symbolic solver substitution tests (`eval(lhs, x = root) ≈ eval(rhs, x = root)`).
