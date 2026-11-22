@@ -29,6 +29,7 @@ pub mod comptime;
 pub mod diff;
 pub mod egraph;
 pub mod emit;
+pub mod poly;
 pub mod solve;
 
 #[cfg(test)]
@@ -49,6 +50,9 @@ pub use diff::{
 };
 pub use egraph::{EGraph, SimplifyOpts, SimplifyStats, expr_cost, simplify, simplify_with};
 pub use emit::{emit_rust_fn, emit_rust_multi_fn, format_expr};
+pub use poly::{
+    Monomial, Poly, PolyError, PolyPlant, Rat, expr_to_poly, poly_to_expr, simplify_poly_expr,
+};
 pub use solve::{Solution, solve_for};
 
 /// Typed variable index inside an [`ExprGraph`].
@@ -169,31 +173,31 @@ pub fn det_tanh(x: f64) -> f64 {
 }
 
 /// Hash-consed symbolic expression DAG backed by an explicit caller-provided allocator `A`.
-pub struct ExprGraph<A: Allocator + Clone> {
+pub struct ExprGraph<A: Allocator + Copy> {
     nodes: OwnVec<Op, A>,
     intern_map: Map<Op, ExprId, FixedState, A>,
     var_names: OwnVec<OwnString<A>, A>,
     alloc: A,
 }
 
-impl<A: Allocator + Clone> ExprGraph<A> {
+impl<A: Allocator + Copy> ExprGraph<A> {
     /// Construct an empty expression graph using allocator `alloc`.
     pub fn new_in(alloc: A) -> Self {
         Self {
-            nodes: OwnVec::new_in(alloc.clone()),
+            nodes: OwnVec::new_in(alloc),
             intern_map: Map::new(MapOpts {
                 hasher: FixedState,
-                alloc: alloc.clone(),
+                alloc: alloc,
                 capacity: None,
             }),
-            var_names: OwnVec::new_in(alloc.clone()),
+            var_names: OwnVec::new_in(alloc),
             alloc,
         }
     }
 
     #[inline]
     pub fn alloc(&self) -> A {
-        self.alloc.clone()
+        self.alloc
     }
 
     #[inline]
@@ -234,7 +238,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
             }
         }
         let vid = VarId(self.var_names.len() as u32);
-        self.var_names.push(OwnString::from_str_in(name, self.alloc.clone()));
+        self.var_names.push(OwnString::from_str_in(name, self.alloc));
         let eid = self.intern(Op::Var(vid));
         (vid, eid)
     }
@@ -491,7 +495,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         if (root.0 as usize) >= n {
             return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
         }
-        let mut cache: OwnVec<Option<f64>, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut cache: OwnVec<Option<f64>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             cache.push(None);
         }
@@ -541,7 +545,7 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         if (root.0 as usize) >= n {
             return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
         }
-        let mut cache: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut cache: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             cache.push(None);
         }
@@ -637,11 +641,11 @@ impl<A: Allocator + Clone> ExprGraph<A> {
         if (root.0 as usize) >= n {
             return false;
         }
-        let mut seen: OwnVec<bool, A> = OwnVec::with_capacity_in(n, self.alloc.clone());
+        let mut seen: OwnVec<bool, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             seen.push(false);
         }
-        let mut stack: OwnVec<ExprId, A> = OwnVec::new_in(self.alloc.clone());
+        let mut stack: OwnVec<ExprId, A> = OwnVec::new_in(self.alloc);
         stack.push(root);
         while let Some(cur) = stack.pop() {
             let idx = cur.0 as usize;
@@ -682,11 +686,11 @@ impl<A: Allocator + Clone> ExprGraph<A> {
 /// let (_, y) = s.var("y");
 /// let energy = (x * y).sin() / (s.lit(1.0) + x * x);
 /// ```
-pub struct SymScope<A: Allocator + Clone> {
+pub struct SymScope<A: Allocator + Copy> {
     graph: RefCell<ExprGraph<A>>,
 }
 
-impl<A: Allocator + Clone> SymScope<A> {
+impl<A: Allocator + Copy> SymScope<A> {
     pub fn new_in(alloc: A) -> Self {
         Self { graph: RefCell::new(ExprGraph::new_in(alloc)) }
     }
@@ -707,20 +711,20 @@ impl<A: Allocator + Clone> SymScope<A> {
 }
 
 /// Copyable symbolic expression handle tied to a [`SymScope`].
-pub struct Sym<'g, A: Allocator + Clone> {
+pub struct Sym<'g, A: Allocator + Copy> {
     scope: &'g SymScope<A>,
     id: ExprId,
 }
 
-impl<'g, A: Allocator + Clone> Clone for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Clone for Sym<'g, A> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'g, A: Allocator + Clone> Copy for Sym<'g, A> {}
+impl<'g, A: Allocator + Copy> Copy for Sym<'g, A> {}
 
-impl<'g, A: Allocator + Clone> Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Sym<'g, A> {
     #[inline]
     pub const fn id(self) -> ExprId {
         self.id
@@ -779,7 +783,7 @@ impl<'g, A: Allocator + Clone> Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Neg for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Neg for Sym<'g, A> {
     type Output = Self;
     fn neg(self) -> Self {
         let id = self.scope.graph.borrow_mut().neg(self.id);
@@ -787,7 +791,7 @@ impl<'g, A: Allocator + Clone> Neg for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Add for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Add for Sym<'g, A> {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().add(self.id, rhs.id);
@@ -795,7 +799,7 @@ impl<'g, A: Allocator + Clone> Add for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Sub for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Sub for Sym<'g, A> {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().sub(self.id, rhs.id);
@@ -803,7 +807,7 @@ impl<'g, A: Allocator + Clone> Sub for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Mul for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Mul for Sym<'g, A> {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().mul(self.id, rhs.id);
@@ -811,7 +815,7 @@ impl<'g, A: Allocator + Clone> Mul for Sym<'g, A> {
     }
 }
 
-impl<'g, A: Allocator + Clone> Div for Sym<'g, A> {
+impl<'g, A: Allocator + Copy> Div for Sym<'g, A> {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
         let id = self.scope.graph.borrow_mut().div(self.id, rhs.id);

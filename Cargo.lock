@@ -236,6 +236,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-algebra-body"
+version = "0.0.0"
+dependencies = [
+ "blaze-algebra",
+ "blaze-body",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-alloc-count"
 version = "0.0.0"
 
