@@ -20,6 +20,8 @@ use crate::{
 pub const PGO_MAGIC: [u8; 4] = *b"BPG1";
 /// Binary schema version of `BPG1`.
 pub const PGO_VERSION: u32 = 1;
+/// Hash domain for sealing and verifying `BPG1` PGO binary records.
+const PGO_RECORD_DOMAIN: &str = "blaze v2 lir pgo record 1";
 
 /// Coarse PGO tier bucket joined into content-addressed JIT/export code keys so hot functions
 /// compiled in run N are reused straight from disk in run N+1 without warm-up.
@@ -290,7 +292,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
             out.extend_from_slice(&b.body.0);
             out.extend_from_slice(&b.weight.to_le_bytes());
         }
-        let mut hasher = blaze_ids::Hasher::new("blaze v2 lir pgo record 1");
+        let mut hasher = blaze_ids::Hasher::new(PGO_RECORD_DOMAIN);
         hasher.update(&out);
         let digest = hasher.finish().0;
         out.extend_from_slice(&digest);
@@ -328,7 +330,7 @@ impl<A: Allocator + Clone> PgoSiteTable<A> {
             return Err(PgoRecordError::LengthMismatch);
         }
         let payload = &bytes[..bytes.len() - TRAILER];
-        let mut hasher = blaze_ids::Hasher::new("blaze v2 lir pgo record 1");
+        let mut hasher = blaze_ids::Hasher::new(PGO_RECORD_DOMAIN);
         hasher.update(payload);
         if hasher.finish().0 != bytes[bytes.len() - TRAILER..] {
             return Err(PgoRecordError::BadDigest);

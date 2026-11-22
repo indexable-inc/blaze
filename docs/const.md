@@ -7,7 +7,7 @@ summary: Const evaluation: blaze's own interpreter for constants and const fns, 
 A `const fn` is blaze's pure function: deterministic, touching no mutable state, so its result
 can be computed at compile time, cached by its code and arguments, and trusted to be the same
 on every machine. blaze evaluates constants with its own interpreter
-(`crates/hir-ty-mir/src/mir/eval.rs`) and never asks rustc. Everything the pinned nightly
+(`crates/blaze-consteval` and `crates/blaze-body-eval`) and never asks rustc. Everything the pinned nightly
 (`pins/toolchain`) accepts in const is accepted, and gives the value rustc gives; what goes
 further is an extension a workspace opts into.
 
@@ -29,20 +29,18 @@ As in the pinned nightly, under `#![feature(const_trait_impl, const_closures, de
   `[const] FnMut` and `[const] FnOnce`; a `const fn` item passed the same way.
 
 Whether a call in a const body is const is decided as rustc decides it, by proving the callee's
-`[const]` bounds const (`crates/hir-ty/src/effects.rs`): `T: [const] Tr` holds in a const fn
+`[const]` bounds const (`crates/blaze-typeck`): `T: [const] Tr` holds in a const fn
 that has the bound, a `const impl` holds for its type when its own `[const]` bounds do, and a
 closure or fn item is `[const] Fn` when it is const. `non_const_calls` lists the calls that are
 not, for the const checker (#860) to refuse; ordinary type checking does not prove effects, so
-it costs nothing outside const bodies. Tests: `crates/hir-ty-mir/src/tests/const_effects.rs`.
-
-Tests: `crates/hir-ty-mir/src/tests/consteval/const_traits.rs` (values from rustc on the same
-programs).
+it costs nothing outside const bodies. Tests: `crates/blaze-consteval/src/tests.rs` and
+`crates/blaze-body-eval/src/tests.rs`.
 
 ## Reflection: `core::mem::type_info`
 
 The nightly's reflection API (`#![feature(type_info)]`: `Type::of::<T>()`, `TypeId::info`,
 `TypeId::trait_info_of`, `Struct`/`Enum`/`Tuple` fields, generics, fn pointer facts) is
-answered in const by `crates/hir-ty-mir/src/mir/eval/shim/reflection.rs`, as rustc's const eval
+answered in const by `crates/blaze-consteval` and `crates/blaze-body-eval`, as rustc's const eval
 answers it:
 
 - A field's id is the `TypeId` of its field representing type
@@ -57,7 +55,7 @@ Not yet: a `DynMetadata<*const ()>` in a constant (what `TypeId::vtable` returns
 build with an error naming the type, because blaze's vtable ids do not record the trait;
 `field_of!(..)` (`builtin # field_of`) is not parsed as a type; `field_offset` called at run
 time is an unsupported intrinsic in codegen; `Type::of` of a tuple is refused (rustc ICEs).
-Tests: `crates/hir-ty-mir/src/tests/consteval/intrinsics.rs` (`type_info_*`). Plan:
+Tests: `crates/blaze-consteval/src/tests/` (`type_info_*`). Plan:
 [docs/v2/plan/design/comptime.md](v2/plan/design/comptime.md).
 
 ## Extensions (beyond the pinned nightly)
@@ -72,7 +70,7 @@ experimental = ["const-hash", "const-fn-pointers"]
 
 Today v2 knows only the experiments `sandboxed-tests` (the opt-in on macOS; on Linux, where
 tests are sandboxed by default, noted as doing nothing) and `const-macros`
-(`crates/blaze-units/src/load/sandbox.rs`, `KNOWN`) and stops at any other name, so this table
+(`crates/blaze-manifest`) and stops at any other name, so this table
 is refused.
 
 - `const-hash`: `core::hash::Hash`, `Hasher` and `BuildHasher` are const traits, so
@@ -219,9 +217,8 @@ const G: u3 = 9;                // error: literal `9` out of range for `u3`
   in const eval, which can't format it. `a + b` itself is a builtin operation and says the
   type in both.
 
-The evaluator's arithmetic is `crates/hir-ty-mir/src/mir/eval/narrow.rs`, codegen's
-`crates/hir-ty-codegen/arbitrary_int.rs`. Tests: `arbitrary_ints_*` in
-`crates/hir-ty-mir/src/tests/` (`consteval.rs`, `layout.rs`, `simple.rs`), and the smoke case
+The evaluator's arithmetic is `crates/blaze-consteval/src/arith.rs`, and codegen is in
+`crates/blaze-emit` / `crates/blaze-build`. Tests: `crates/blaze-consteval/src/tests/`, and the smoke case
 `harness/smoke/arbitrary_ints`, which runs the same calls compiled and in const eval, in dev
 and release.
 
@@ -233,7 +230,7 @@ on an enum. Each is an error naming the type.
 Plan: [v2/plan/lanes/frontend/arbitrary-ints.md](v2/plan/design/arbitrary-ints.md).
 
 blaze checks const bodies against rustc's `check_consts` rules (#914, #1440,
-`crates/hir-ty-mir/src/mir/const_check.rs`): E0015 for a non-const call, a call of a `fn`
+`crates/blaze-consteval`): E0015 for a non-const call, a call of a `fn`
 pointer, an intrinsic not declared `const`, and const stability (`const_check/calls.rs`: the
 nightly's atomics are `const` only under `#![feature(const_atomic)]`). Its errors are part of a
 unit's check, so they fail the build as rustc's do.

@@ -10,7 +10,9 @@
 #![no_std]
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
-#![blaze::sans_io]
+// The core module is marked `#![blaze::sans_io]`, not the crate root: a tool attribute on the
+// crate root makes `#[macro_export]` macros macro-expanded, which rustc forbids naming by
+// `$crate::` path (agents/annoyances/crate-root-tool-attribute-hides-macros.json).
 #![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
 
@@ -18,20 +20,23 @@
 #[cfg(test)]
 extern crate std;
 
-/// The Weyl increment, `2^64 / φ` rounded to odd.
-pub const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+mod rng {
+    #![blaze::sans_io]
 
-/// SplitMix64's finalizer: a bijection on `u64` that spreads every input bit over the output.
-#[inline]
-pub const fn mix(z: u64) -> u64 {
-    let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
+    /// The Weyl increment, `2^64 / φ` rounded to odd.
+    pub const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// One SplitMix64 stream: its state is the seed plus `GAMMA` once per draw.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitMix64(u64);
+    /// SplitMix64's finalizer: a bijection on `u64` that spreads every input bit over the output.
+    #[inline]
+    pub const fn mix(z: u64) -> u64 {
+        let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// One SplitMix64 stream: its state is the seed plus `GAMMA` once per draw.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SplitMix64(u64);
 
 impl SplitMix64 {
     pub const fn new(seed: u64) -> SplitMix64 {
@@ -137,6 +142,9 @@ impl SplitMix64 {
         open.iter().enumerate().filter(|(_, it)| **it).nth(at).map(|(arm, _)| arm)
     }
 }
+}
+
+pub use rng::{GAMMA, SplitMix64, mix};
 
 /// One of the arms, evaluated, drawn from `rng` (a [`SplitMix64`]): each arm whose condition
 /// holds is as likely as the others. `if cond => arm` gives an arm a condition; an arm without

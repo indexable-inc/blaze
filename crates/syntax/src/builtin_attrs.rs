@@ -739,7 +739,7 @@ blaze_phf::phf_table! {
 mod tests {
     use super::{INERT_ATTRIBUTES, find, is_built_in};
 
-    /// The invariant: the lookup finds each name of the table at its row, and nothing else.
+    /// Invariant: the lookup finds each name of the table at its row, and nothing else.
     #[test]
     fn every_name_is_found_at_its_row() {
         for (at, attr) in INERT_ATTRIBUTES.iter().enumerate() {

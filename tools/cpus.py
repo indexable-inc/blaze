@@ -41,7 +41,7 @@ from typed_input import parse
 SCRIPT = "cpus.py"
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "harness"))
-import toolchain_pins  # noqa: E402 (the pins' one reader, found from the tree)
+import toolchain_pins  # the pins' one reader, found from the tree
 
 PIN = Path(toolchain_pins.LLVM)
 ANSWERS = Path(toolchain_pins.ANSWERS)

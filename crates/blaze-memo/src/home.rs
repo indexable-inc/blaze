@@ -282,7 +282,7 @@ mod tests {
     use super::named_home;
     use crate::{ArenaId, Gid};
 
-    /// The invariant: a box is homed by what it holds (the control: a box of plain data names
+    /// Invariant: a box is homed by what it holds (the control: a box of plain data names
     /// no arena, so it is homed in the session arena the snapshot holds, `home_of`).
     #[test]
     fn a_box_is_homed_by_what_it_holds() {

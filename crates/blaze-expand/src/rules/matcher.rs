@@ -123,12 +123,23 @@ impl<'f> Bindings<'f> {
 
     /// How many values a node binds.
     fn bound(&self, binding: Binding) -> usize {
-        match binding {
-            Binding::Nested { start, len } => {
-                (0..len).map(|idx| self.bound(self.child(start, idx))).sum()
+        let Binding::Nested { start, len } = binding else { return 1 };
+        let mut stack: Vec<(u32, u32, u32), &'f Frame> = Vec::new_in(*self.nodes.allocator());
+        stack.push((start, 0, len));
+        let mut total = 0usize;
+        while let Some((s, idx, n)) = stack.last_mut() {
+            if *idx >= *n {
+                stack.pop();
+                continue;
             }
-            _ => 1,
+            let cur = *idx;
+            *idx = cur + 1;
+            match self.child(*s, cur) {
+                Binding::Nested { start, len } => stack.push((start, 0, len)),
+                _ => total += 1,
+            }
         }
+        total
     }
 }
 

@@ -291,8 +291,10 @@ impl<T> Mailbox<T> {
     fn new(room: usize) -> Mailbox<T> {
         // alloc: once per driver, the room of what is told between two polls.
         let items = VecDeque::with_capacity(room);
+        let state = Lock::new("core.threads.inbox", Inbox { items, waiting: 0, closed: false });
+        state.prewarm_contention();
         Mailbox {
-            state: Lock::new("core.threads.inbox", Inbox { items, waiting: 0, closed: false }),
+            state,
             ready: Signal::new("core.threads.inbox_ready"),
         }
     }

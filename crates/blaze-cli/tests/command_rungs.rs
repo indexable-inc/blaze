@@ -423,6 +423,7 @@ fn programs(cli: &Path) -> Vec<(String, PathBuf)> {
 /// on WRONG, HUNG, CRASHED, or a must-pass program not PASS. Expected line, last:
 /// `command rungs: N rungs: a PASS, b REFUSED, c WRONG, d HUNG, e CRASHED`.
 #[test]
+#[ignore = "requires BLAZE_RUNGS_BIN pointing to a prebuilt release blaze binary"]
 fn every_rung_through_the_command() {
     let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
     // The release blaze to run, never the debug `CARGO_BIN_EXE_blaze` in its place.

@@ -128,6 +128,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     oracle(waiting.is_empty(), || format!("{} calls were never answered", waiting.len()))
 }
 
+/// The invariant: toggling hooks compiles and looks up nothing and leaves every slot's active hooks equal to the exact set currently turned on.
 #[test]
 fn a_toggle_changes_only_the_hooks_and_compiles_nothing() {
     check(Config::cases(500), |tape| run(tape, Plant::None));

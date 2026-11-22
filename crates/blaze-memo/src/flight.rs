@@ -294,7 +294,7 @@ mod tests {
         out.write_str("the_query(the key)").expect("a name is written");
     }
 
-    /// The invariant: on [`Alone`] a key's holder asking it again is `Mine`, and another task
+    /// Invariant: on [`Alone`] a key's holder asking it again is `Mine`, and another task
     /// (here another thread, one job of the scheduler for its life) asking it while it is held
     /// is refused with a panic that names the key, the flight and what to take instead; never
     /// `Mine`. The control: once the holder let the key go, the other task's ask runs it.

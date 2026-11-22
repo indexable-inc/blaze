@@ -88,7 +88,7 @@ mod tests {
 
     use super::{String, into_std_boxed_str, into_std_bytes};
 
-    /// The invariant: `format_into!` appends to the caller's buffer and allocates nothing
+    /// Invariant: `format_into!` appends to the caller's buffer and allocates nothing
     /// while what it writes fits the capacity the buffer has.
     #[test]
     fn format_into_appends_to_the_callers_buffer_without_growing_it() {

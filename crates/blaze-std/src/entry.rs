@@ -368,11 +368,13 @@ macro_rules! main {
         $vis fn main() -> $crate::entry::Exit {
             fn main($cx: $cxty $(, $name: $ty)*) $(-> $returns)? $body
             /// The program's manifest: what it takes, as data in the binary.
-            static MANIFEST: $crate::grant::Manifest = $crate::grant::Manifest::new(&[
+            const PARAMS: &[$crate::grant::Param] = &[
                 $( $crate::grant::Param::of::<$ty>(stringify!($name)) ),*
-            ])
-            // The attribute's defaults (grant/defaults.rs), checked here as the crate compiles.
-            .with_defaults(&$crate::__grant_spellings!($($default)*));
+            ];
+            const DEFAULTS: &[$crate::grant::Spelling] = &$crate::__grant_spellings!($($default)*);
+            static MANIFEST: $crate::grant::Manifest = $crate::grant::Manifest::new(PARAMS)
+                // The attribute's defaults (grant/defaults.rs), checked here as the crate compiles.
+                .with_defaults(DEFAULTS);
             /// The start of the program hosted by `blaze run` (run.md, "The hosted world"):
             /// each parameter asked of the host, then `main`, over the host's table.
             #[unsafe(no_mangle)]

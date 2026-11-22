@@ -221,7 +221,7 @@ region, each span with its role and its link, the progress report. `encode` is t
 a frame becomes bytes, for one terminal's capabilities. Nothing of the terminal reaches the
 daemon beyond what a diagnostic is drawn with, which no key holds.
 
-The driver is `crates/blaze-cargo/src/cli/show.rs`: it reads the clock and the size, writes
+The driver is in `crates/blaze-screen` and `crates/blaze-cli/src/print.rs`: it reads the clock and the size, writes
 the bytes, and on a terminal runs on a thread of its own so timers turn while the daemon says
 nothing. `Printer::clear` is the one call for "the build is over": it returns once nothing
 live is on the terminal. While a region is up the terminal does not echo typed keys (they

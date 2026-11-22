@@ -263,6 +263,7 @@ fn simulate(ops: &[Op], plant: ShadowPlant) -> Result<(), String> {
     Ok(())
 }
 
+/// The refinement: `ShadowStack` refines the sequential reference model across nested calls, tail calls at equal stack pointer, unwinds, and unique span ids.
 #[test]
 fn shadow_stack_refines_model_under_calls_tail_calls_and_unwinds() {
     blaze_sim::check(blaze_sim::Config::cases(300), |tape| {

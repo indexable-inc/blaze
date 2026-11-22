@@ -153,11 +153,11 @@ private theorem insertKey_comm (a b : TypeKey) :
             simp [insertKey, hb1, hb2, h1]
       · by_cases hb1 : b < x
         · have h1 : ¬(a < b) := by omega
-          have h2 : ¬(a = b) := by omega
+          have h2 : ¬(a = b) := fun h => ha1 (h ▸ hb1)
           simp [insertKey, ha1, ha2, hb1, h1, h2]
         · by_cases hb2 : b = x
           · subst hb2
-            have h1 : ¬(b < b) := by omega
+            have h1 : ¬(b < b) := Nat.lt_irrefl b
             simp [insertKey, ha1, ha2, h1]
           · simp [insertKey, ha1, ha2, hb1, hb2, ih]
 
@@ -168,11 +168,11 @@ private theorem insertKey_idem (a : TypeKey) :
   | x :: rest => by
     have ih := insertKey_idem a rest
     by_cases ha1 : a < x
-    · have h1 : ¬(a < a) := by omega
+    · have h1 : ¬(a < a) := Nat.lt_irrefl a
       simp [insertKey, ha1, h1]
     · by_cases ha2 : a = x
       · subst ha2
-        have h1 : ¬(a < a) := by omega
+        have h1 : ¬(a < a) := Nat.lt_irrefl a
         simp [insertKey, h1]
       · simp [insertKey, ha1, ha2, ih]
 
@@ -183,9 +183,9 @@ private theorem indexOfKey_injective (a b : TypeKey) (hne : a ≠ b) :
   | x :: rest, i, j, ha, hb => by
     simp only [indexOfKey] at ha hb
     by_cases hax : a = x
-    · have hbx : ¬(b = x) := by omega
-      rw [if_pos hax] at ha
-      rw [if_neg hbx] at hb
+    · have hbx : ¬(b = x) := fun h => hne (hax.trans h.symm)
+      simp only [hax, ↓reduceIte] at ha
+      simp only [hbx, ↓reduceIte] at hb
       cases ha
       cases hbr : indexOfKey b rest with
       | none =>
@@ -193,11 +193,13 @@ private theorem indexOfKey_injective (a b : TypeKey) (hne : a ≠ b) :
         cases hb
       | some j' =>
         rw [hbr] at hb
+        dsimp only [Option.map] at hb
         cases hb
-        omega
-    · rw [if_neg hax] at ha
+        intro h
+        cases h
+    · simp only [hax, ↓reduceIte] at ha
       by_cases hbx : b = x
-      · rw [if_pos hbx] at hb
+      · simp only [hbx, ↓reduceIte] at hb
         cases hb
         cases har : indexOfKey a rest with
         | none =>
@@ -205,15 +207,18 @@ private theorem indexOfKey_injective (a b : TypeKey) (hne : a ≠ b) :
           cases ha
         | some i' =>
           rw [har] at ha
+          dsimp only [Option.map] at ha
           cases ha
-          omega
-      · rw [if_neg hbx] at hb
+          intro h
+          cases h
+      · simp only [hbx, ↓reduceIte] at hb
         cases har : indexOfKey a rest with
         | none =>
           rw [har] at ha
           cases ha
         | some i' =>
           rw [har] at ha
+          dsimp only [Option.map] at ha
           cases ha
           cases hbr : indexOfKey b rest with
           | none =>
@@ -221,9 +226,11 @@ private theorem indexOfKey_injective (a b : TypeKey) (hne : a ≠ b) :
             cases hb
           | some j' =>
             rw [hbr] at hb
+            dsimp only [Option.map] at hb
             cases hb
             have hne' := indexOfKey_injective a b hne rest i' j' har hbr
-            omega
+            intro h
+            exact hne' (Nat.succ.inj h)
 
 private theorem mem_iff_indexOfKey_isSome (k : TypeKey) :
     ∀ (xs : List TypeKey), k ∈ xs ↔ ∃ i, indexOfKey k xs = some i

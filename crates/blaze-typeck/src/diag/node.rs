@@ -15,6 +15,8 @@
 
 use core::fmt::{self, Write};
 
+use blaze_own::FixedVec;
+
 use super::At;
 use crate::body::{BinOp, BodyView, Expr, Lit, Pat, UnOp};
 use crate::ids::{ExprId, List, Mutbl, Name, PatId, PathIdx};
@@ -130,10 +132,21 @@ pub fn range_shared(view: &BodyView<'_>, node: Node) -> usize {
 /// spell), at most [`SKETCH_DEPTH`] levels and [`SKETCH_NODES`] nodes.
 pub fn sketch<'s>(view: &BodyView<'_>, node: Node, spell: &dyn Fn(Name) -> Option<&'s str>, out: &mut dyn Write) -> fmt::Result {
     let mut s = Sketch { view, spell, out, left: SKETCH_NODES };
-    match node {
-        Node::Expr(e) => s.expr(e, SKETCH_DEPTH),
-        Node::Pat(p) => s.pat(p, SKETCH_DEPTH),
-    }
+    let first = match node {
+        Node::Expr(e) => SketchTask::Expr(e, SKETCH_DEPTH),
+        Node::Pat(p) => SketchTask::Pat(p, SKETCH_DEPTH),
+    };
+    s.run(first)
+}
+
+enum SketchTask {
+    Str(&'static str),
+    Name(Name),
+    TupleIndex(u32),
+    Expr(ExprId, u32),
+    Pat(PatId, u32),
+    ExprList { list: List, next: usize, depth: u32 },
+    PatList { list: List, next: usize, sep: &'static str, depth: u32 },
 }
 
 struct Sketch<'v, 'b, 's, 'o> {
@@ -234,242 +247,262 @@ impl Sketch<'_, '_, '_, '_> {
         Ok(())
     }
 
-    fn exprs(&mut self, l: List, depth: u32) -> fmt::Result {
-        let view = self.view;
-        let items = view.expr_lists.get(l.range()).unwrap_or(&[]);
-        for (i, &e) in items.iter().enumerate() {
-            if i > 0 {
-                self.out.write_str(", ")?;
-            }
-            self.expr(e, depth)?;
-        }
-        Ok(())
-    }
-
-    fn pats(&mut self, l: List, depth: u32, sep: &str) -> fmt::Result {
-        let view = self.view;
-        let items = view.pat_lists.get(l.range()).unwrap_or(&[]);
-        for (i, &p) in items.iter().enumerate() {
-            if i > 0 {
-                self.out.write_str(sep)?;
-            }
-            self.pat(p, depth)?;
-        }
-        Ok(())
-    }
-
-    fn expr(&mut self, e: ExprId, depth: u32) -> fmt::Result {
-        let Some(&x) = self.view.exprs.get(e.ix()) else { return self.out.write_str("?") };
-        if !self.take(depth)? {
-            return Ok(());
-        }
-        let d = depth - 1;
-        match x {
-            Expr::Missing => self.out.write_str("{missing}"),
-            Expr::Lit(l) => self.out.write_str(lit_words(l)),
-            Expr::Local(p) => match self.view.pats.get(p.ix()) {
-                Some(Pat::Bind { name, .. }) => self.name(*name),
-                _ => self.out.write_str("{local}"),
-            },
-            Expr::Path(p) => self.path(p),
-            Expr::Paren(inner) => {
-                self.out.write_str("(")?;
-                self.expr(inner, d)?;
-                self.out.write_str(")")
-            }
-            Expr::Binary { op, lhs, rhs } => {
-                self.expr(lhs, d)?;
-                write!(self.out, " {} ", bin_op(op))?;
-                self.expr(rhs, d)
-            }
-            Expr::AssignOp { op, lhs, rhs } => {
-                self.expr(lhs, d)?;
-                write!(self.out, " {}= ", bin_op(op))?;
-                self.expr(rhs, d)
-            }
-            Expr::Assign { lhs, rhs } => {
-                self.expr(lhs, d)?;
-                self.out.write_str(" = ")?;
-                self.expr(rhs, d)
-            }
-            Expr::Unary { op, operand } => {
-                self.out.write_str(un_op(op))?;
-                self.expr(operand, d)
-            }
-            Expr::Ref { mutbl, operand } => {
-                self.out.write_str(ref_words(mutbl))?;
-                self.expr(operand, d)
-            }
-            Expr::RawRef { mutbl, operand } => {
-                self.out.write_str(match mutbl {
-                    Mutbl::Not => "&raw const ",
-                    Mutbl::Mut => "&raw mut ",
-                })?;
-                self.expr(operand, d)
-            }
-            Expr::Cast { operand, ty } => {
-                self.expr(operand, d)?;
-                match self.view.types.node(ty) {
-                    Ok(PNode::Infer) => self.out.write_str(" as _"),
-                    _ => self.out.write_str(" as {type}"),
-                }
-            }
-            Expr::Call { callee, args } => {
-                self.expr(callee, d)?;
-                self.out.write_str("(")?;
-                self.exprs(args, d)?;
-                self.out.write_str(")")
-            }
-            Expr::MethodCall { receiver, name, args, .. } => {
-                self.expr(receiver, d)?;
-                self.out.write_str(".")?;
-                self.name(name)?;
-                self.out.write_str("(")?;
-                self.exprs(args, d)?;
-                self.out.write_str(")")
-            }
-            Expr::Field { base, name } => {
-                self.expr(base, d)?;
-                self.out.write_str(".")?;
-                self.name(name)
-            }
-            Expr::TupleField { base, index } => {
-                self.expr(base, d)?;
-                write!(self.out, ".{index}")
-            }
-            Expr::Index { base, index } => {
-                self.expr(base, d)?;
-                self.out.write_str("[")?;
-                self.expr(index, d)?;
-                self.out.write_str("]")
-            }
-            Expr::Tuple { elems } => {
-                self.out.write_str("(")?;
-                self.exprs(elems, d)?;
-                self.out.write_str(")")
-            }
-            Expr::Array { elems } => {
-                self.out.write_str("[")?;
-                self.exprs(elems, d)?;
-                self.out.write_str("]")
-            }
-            Expr::Repeat { elem, .. } => {
-                self.out.write_str("[")?;
-                self.expr(elem, d)?;
-                self.out.write_str("; ..]")
-            }
-            Expr::Struct { path, .. } => {
-                self.path(path)?;
-                self.out.write_str(" { .. }")
-            }
-            Expr::Closure { params, body, .. } => {
-                self.out.write_str("|")?;
-                self.pats(params, d, ", ")?;
-                self.out.write_str("| ")?;
-                self.expr(body, d)
-            }
-            Expr::Match { scrutinee, .. } => {
-                self.out.write_str("match ")?;
-                self.expr(scrutinee, d)?;
-                self.out.write_str(" { .. }")
-            }
-            Expr::If { cond, .. } => {
-                self.out.write_str("if ")?;
-                self.expr(cond, d)?;
-                self.out.write_str(" { .. }")
-            }
-            Expr::Let { pat, init } => {
-                self.out.write_str("let ")?;
-                self.pat(pat, d)?;
-                self.out.write_str(" = ")?;
-                self.expr(init, d)
-            }
-            Expr::Await(inner) => {
-                self.expr(inner, d)?;
-                self.out.write_str(".await")
-            }
-            Expr::Return { value: Some(v) } => {
-                self.out.write_str("return ")?;
-                self.expr(v, d)
-            }
-            Expr::Break { value: Some(v), .. } => {
-                self.out.write_str("break ")?;
-                self.expr(v, d)
-            }
-            Expr::Return { value: None } => self.out.write_str("return"),
-            Expr::Break { value: None, .. } => self.out.write_str("break"),
-            Expr::Continue { .. } => self.out.write_str("continue"),
-            Expr::Underscore => self.out.write_str("_"),
-            Expr::Block { .. } => self.out.write_str("{ .. }"),
-            Expr::ConstBlock { .. } => self.out.write_str("const { .. }"),
-            Expr::Loop { .. } => self.out.write_str("loop { .. }"),
-            Expr::AsyncBlock { .. } => self.out.write_str("async { .. }"),
-            Expr::FormatArgs { .. } => self.out.write_str("format_args!(..)"),
-            Expr::OffsetOf { .. } => self.out.write_str("offset_of!(..)"),
-            Expr::Asm { .. } => self.out.write_str("asm!(..)"),
-        }
-    }
-
-    fn pat(&mut self, p: PatId, depth: u32) -> fmt::Result {
-        let Some(&x) = self.view.pats.get(p.ix()) else { return self.out.write_str("?") };
-        if !self.take(depth)? {
-            return Ok(());
-        }
-        let d = depth - 1;
-        match x {
-            Pat::Missing => self.out.write_str("{missing}"),
-            Pat::Wild => self.out.write_str("_"),
-            Pat::Bind { name, sub, .. } => {
-                self.name(name)?;
-                match sub {
-                    Some(s) => {
-                        self.out.write_str(" @ ")?;
-                        self.pat(s, d)
+    fn run(&mut self, first: SketchTask) -> fmt::Result {
+        let mut stack: FixedVec<SketchTask, 64> = FixedVec::new();
+        let _ = stack.push(first);
+        while let Some(task) = stack.pop() {
+            match task {
+                SketchTask::Str(s) => self.out.write_str(s)?,
+                SketchTask::Name(n) => self.name(n)?,
+                SketchTask::TupleIndex(index) => write!(self.out, ".{index}")?,
+                SketchTask::ExprList { list, next, depth } => {
+                    let items = self.view.expr_lists.get(list.range()).unwrap_or(&[]);
+                    if let Some(&e) = items.get(next) {
+                        if next + 1 < items.len() {
+                            let _ = stack.push(SketchTask::ExprList { list, next: next + 1, depth });
+                        }
+                        let _ = stack.push(SketchTask::Expr(e, depth));
+                        if next > 0 {
+                            let _ = stack.push(SketchTask::Str(", "));
+                        }
                     }
-                    None => Ok(()),
                 }
-            }
-            Pat::Tuple { elems, .. } => {
-                self.out.write_str("(")?;
-                self.pats(elems, d, ", ")?;
-                self.out.write_str(")")
-            }
-            Pat::Ref { mutbl, inner } => {
-                self.out.write_str(ref_words(mutbl))?;
-                self.pat(inner, d)
-            }
-            Pat::Lit(l) => self.out.write_str(lit_words(l)),
-            Pat::NegLit(l) => {
-                self.out.write_str("-")?;
-                self.out.write_str(lit_words(l))
-            }
-            Pat::Path(path) => self.path(path),
-            Pat::TupleStruct { path, elems, .. } => {
-                self.path(path)?;
-                self.out.write_str("(")?;
-                self.pats(elems, d, ", ")?;
-                self.out.write_str(")")
-            }
-            Pat::Struct { path, .. } => {
-                self.path(path)?;
-                self.out.write_str(" { .. }")
-            }
-            Pat::Or { alts } => self.pats(alts, d, " | "),
-            Pat::Slice { elems, .. } => {
-                self.out.write_str("[")?;
-                self.pats(elems, d, ", ")?;
-                self.out.write_str("]")
-            }
-            Pat::Range { lo, hi, inclusive } => {
-                if let Some(lo) = lo {
-                    self.pat(lo, d)?;
+                SketchTask::PatList { list, next, sep, depth } => {
+                    let items = self.view.pat_lists.get(list.range()).unwrap_or(&[]);
+                    if let Some(&p) = items.get(next) {
+                        if next + 1 < items.len() {
+                            let _ = stack.push(SketchTask::PatList { list, next: next + 1, sep, depth });
+                        }
+                        let _ = stack.push(SketchTask::Pat(p, depth));
+                        if next > 0 {
+                            let _ = stack.push(SketchTask::Str(sep));
+                        }
+                    }
                 }
-                self.out.write_str(if inclusive { "..=" } else { ".." })?;
-                match hi {
-                    Some(hi) => self.pat(hi, d),
-                    None => Ok(()),
+                SketchTask::Expr(e, depth) => {
+                    let Some(&x) = self.view.exprs.get(e.ix()) else {
+                        self.out.write_str("?")?;
+                        continue;
+                    };
+                    if !self.take(depth)? {
+                        continue;
+                    }
+                    let d = depth - 1;
+                    match x {
+                        Expr::Missing => self.out.write_str("{missing}")?,
+                        Expr::Lit(l) => self.out.write_str(lit_words(l))?,
+                        Expr::Local(p) => match self.view.pats.get(p.ix()) {
+                            Some(Pat::Bind { name, .. }) => self.name(*name)?,
+                            _ => self.out.write_str("{local}")?,
+                        },
+                        Expr::Path(p) => self.path(p)?,
+                        Expr::Paren(inner) => {
+                            let _ = stack.push(SketchTask::Str(")"));
+                            let _ = stack.push(SketchTask::Expr(inner, d));
+                            self.out.write_str("(")?;
+                        }
+                        Expr::Binary { op, lhs, rhs } => {
+                            let _ = stack.push(SketchTask::Expr(rhs, d));
+                            let _ = stack.push(SketchTask::Str(" "));
+                            let _ = stack.push(SketchTask::Str(bin_op(op)));
+                            let _ = stack.push(SketchTask::Str(" "));
+                            let _ = stack.push(SketchTask::Expr(lhs, d));
+                        }
+                        Expr::AssignOp { op, lhs, rhs } => {
+                            let _ = stack.push(SketchTask::Expr(rhs, d));
+                            let _ = stack.push(SketchTask::Str("= "));
+                            let _ = stack.push(SketchTask::Str(bin_op(op)));
+                            let _ = stack.push(SketchTask::Str(" "));
+                            let _ = stack.push(SketchTask::Expr(lhs, d));
+                        }
+                        Expr::Assign { lhs, rhs } => {
+                            let _ = stack.push(SketchTask::Expr(rhs, d));
+                            let _ = stack.push(SketchTask::Str(" = "));
+                            let _ = stack.push(SketchTask::Expr(lhs, d));
+                        }
+                        Expr::Unary { op, operand } => {
+                            self.out.write_str(un_op(op))?;
+                            let _ = stack.push(SketchTask::Expr(operand, d));
+                        }
+                        Expr::Ref { mutbl, operand } => {
+                            self.out.write_str(ref_words(mutbl))?;
+                            let _ = stack.push(SketchTask::Expr(operand, d));
+                        }
+                        Expr::RawRef { mutbl, operand } => {
+                            self.out.write_str(match mutbl {
+                                Mutbl::Not => "&raw const ",
+                                Mutbl::Mut => "&raw mut ",
+                            })?;
+                            let _ = stack.push(SketchTask::Expr(operand, d));
+                        }
+                        Expr::Cast { operand, ty } => {
+                            let suffix = match self.view.types.node(ty) {
+                                Ok(PNode::Infer) => " as _",
+                                _ => " as {type}",
+                            };
+                            let _ = stack.push(SketchTask::Str(suffix));
+                            let _ = stack.push(SketchTask::Expr(operand, d));
+                        }
+                        Expr::Call { callee, args } => {
+                            let _ = stack.push(SketchTask::Str(")"));
+                            let _ = stack.push(SketchTask::ExprList { list: args, next: 0, depth: d });
+                            let _ = stack.push(SketchTask::Str("("));
+                            let _ = stack.push(SketchTask::Expr(callee, d));
+                        }
+                        Expr::MethodCall { receiver, name, args, .. } => {
+                            let _ = stack.push(SketchTask::Str(")"));
+                            let _ = stack.push(SketchTask::ExprList { list: args, next: 0, depth: d });
+                            let _ = stack.push(SketchTask::Str("("));
+                            let _ = stack.push(SketchTask::Name(name));
+                            let _ = stack.push(SketchTask::Str("."));
+                            let _ = stack.push(SketchTask::Expr(receiver, d));
+                        }
+                        Expr::Field { base, name } => {
+                            let _ = stack.push(SketchTask::Name(name));
+                            let _ = stack.push(SketchTask::Str("."));
+                            let _ = stack.push(SketchTask::Expr(base, d));
+                        }
+                        Expr::TupleField { base, index } => {
+                            let _ = stack.push(SketchTask::TupleIndex(index));
+                            let _ = stack.push(SketchTask::Expr(base, d));
+                        }
+                        Expr::Index { base, index } => {
+                            let _ = stack.push(SketchTask::Str("]"));
+                            let _ = stack.push(SketchTask::Expr(index, d));
+                            let _ = stack.push(SketchTask::Str("["));
+                            let _ = stack.push(SketchTask::Expr(base, d));
+                        }
+                        Expr::Tuple { elems } => {
+                            self.out.write_str("(")?;
+                            let _ = stack.push(SketchTask::Str(")"));
+                            let _ = stack.push(SketchTask::ExprList { list: elems, next: 0, depth: d });
+                        }
+                        Expr::Array { elems } => {
+                            self.out.write_str("[")?;
+                            let _ = stack.push(SketchTask::Str("]"));
+                            let _ = stack.push(SketchTask::ExprList { list: elems, next: 0, depth: d });
+                        }
+                        Expr::Repeat { elem, .. } => {
+                            self.out.write_str("[")?;
+                            let _ = stack.push(SketchTask::Str("; ..]"));
+                            let _ = stack.push(SketchTask::Expr(elem, d));
+                        }
+                        Expr::Struct { path, .. } => {
+                            self.path(path)?;
+                            self.out.write_str(" { .. }")?;
+                        }
+                        Expr::Closure { params, body, .. } => {
+                            self.out.write_str("|")?;
+                            let _ = stack.push(SketchTask::Expr(body, d));
+                            let _ = stack.push(SketchTask::Str("| "));
+                            let _ = stack.push(SketchTask::PatList { list: params, next: 0, sep: ", ", depth: d });
+                        }
+                        Expr::Match { scrutinee, .. } => {
+                            self.out.write_str("match ")?;
+                            let _ = stack.push(SketchTask::Str(" { .. }"));
+                            let _ = stack.push(SketchTask::Expr(scrutinee, d));
+                        }
+                        Expr::If { cond, .. } => {
+                            self.out.write_str("if ")?;
+                            let _ = stack.push(SketchTask::Str(" { .. }"));
+                            let _ = stack.push(SketchTask::Expr(cond, d));
+                        }
+                        Expr::Let { pat, init } => {
+                            self.out.write_str("let ")?;
+                            let _ = stack.push(SketchTask::Expr(init, d));
+                            let _ = stack.push(SketchTask::Str(" = "));
+                            let _ = stack.push(SketchTask::Pat(pat, d));
+                        }
+                        Expr::Await(inner) => {
+                            let _ = stack.push(SketchTask::Str(".await"));
+                            let _ = stack.push(SketchTask::Expr(inner, d));
+                        }
+                        Expr::Return { value: Some(v) } => {
+                            self.out.write_str("return ")?;
+                            let _ = stack.push(SketchTask::Expr(v, d));
+                        }
+                        Expr::Break { value: Some(v), .. } => {
+                            self.out.write_str("break ")?;
+                            let _ = stack.push(SketchTask::Expr(v, d));
+                        }
+                        Expr::Return { value: None } => self.out.write_str("return")?,
+                        Expr::Break { value: None, .. } => self.out.write_str("break")?,
+                        Expr::Continue { .. } => self.out.write_str("continue")?,
+                        Expr::Underscore => self.out.write_str("_")?,
+                        Expr::Block { .. } => self.out.write_str("{ .. }")?,
+                        Expr::ConstBlock { .. } => self.out.write_str("const { .. }")?,
+                        Expr::Loop { .. } => self.out.write_str("loop { .. }")?,
+                        Expr::AsyncBlock { .. } => self.out.write_str("async { .. }")?,
+                        Expr::FormatArgs { .. } => self.out.write_str("format_args!(..)")?,
+                        Expr::OffsetOf { .. } => self.out.write_str("offset_of!(..)")?,
+                        Expr::Asm { .. } => self.out.write_str("asm!(..)")?,
+                    }
+                }
+                SketchTask::Pat(p, depth) => {
+                    let Some(&x) = self.view.pats.get(p.ix()) else {
+                        self.out.write_str("?")?;
+                        continue;
+                    };
+                    if !self.take(depth)? {
+                        continue;
+                    }
+                    let d = depth - 1;
+                    match x {
+                        Pat::Missing => self.out.write_str("{missing}")?,
+                        Pat::Wild => self.out.write_str("_")?,
+                        Pat::Bind { name, sub, .. } => {
+                            self.name(name)?;
+                            if let Some(s) = sub {
+                                let _ = stack.push(SketchTask::Pat(s, d));
+                                self.out.write_str(" @ ")?;
+                            }
+                        }
+                        Pat::Tuple { elems, .. } => {
+                            self.out.write_str("(")?;
+                            let _ = stack.push(SketchTask::Str(")"));
+                            let _ = stack.push(SketchTask::PatList { list: elems, next: 0, sep: ", ", depth: d });
+                        }
+                        Pat::Ref { mutbl, inner } => {
+                            self.out.write_str(ref_words(mutbl))?;
+                            let _ = stack.push(SketchTask::Pat(inner, d));
+                        }
+                        Pat::Lit(l) => self.out.write_str(lit_words(l))?,
+                        Pat::NegLit(l) => {
+                            self.out.write_str("-")?;
+                            self.out.write_str(lit_words(l))?;
+                        }
+                        Pat::Path(path) => self.path(path)?,
+                        Pat::TupleStruct { path, elems, .. } => {
+                            self.path(path)?;
+                            self.out.write_str("(")?;
+                            let _ = stack.push(SketchTask::Str(")"));
+                            let _ = stack.push(SketchTask::PatList { list: elems, next: 0, sep: ", ", depth: d });
+                        }
+                        Pat::Struct { path, .. } => {
+                            self.path(path)?;
+                            self.out.write_str(" { .. }")?;
+                        }
+                        Pat::Or { alts } => {
+                            let _ = stack.push(SketchTask::PatList { list: alts, next: 0, sep: " | ", depth: d });
+                        }
+                        Pat::Slice { elems, .. } => {
+                            self.out.write_str("[")?;
+                            let _ = stack.push(SketchTask::Str("]"));
+                            let _ = stack.push(SketchTask::PatList { list: elems, next: 0, sep: ", ", depth: d });
+                        }
+                        Pat::Range { lo, hi, inclusive } => {
+                            if let Some(hi) = hi {
+                                let _ = stack.push(SketchTask::Pat(hi, d));
+                            }
+                            let _ = stack.push(SketchTask::Str(if inclusive { "..=" } else { ".." }));
+                            if let Some(lo) = lo {
+                                let _ = stack.push(SketchTask::Pat(lo, d));
+                            }
+                        }
+                    }
                 }
             }
         }
+        Ok(())
     }
 }

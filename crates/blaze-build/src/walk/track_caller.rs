@@ -206,10 +206,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         rpass: Pass,
     ) -> Result<(), BuildError> {
         let loc = self.caller_arg(at, instance)?;
+        let callee_nounwind = self.adts.nounwind(instance.item) == Some(true);
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
         let Some(loc) = loc else {
-            return self.emit_call_from(Callee::Direct(reference), reprs, passes, declared, rrepr, rpass);
+            return self.emit_call_from(Callee::Direct(reference), reprs, passes, declared, callee_nounwind, rrepr, rpass);
         };
         if declared.is_some() {
             // E0737: "`#[track_caller]` requires Rust ABI"; a C-variadic fn is never of it.
@@ -222,7 +223,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         p.extend_from_slice(passes);
         p.push(PASS);
         self.push_val(V::Scalar(loc), None);
-        self.emit_call_from(Callee::Direct(reference), &r, &p, None, rrepr, rpass)
+        self.emit_call_from(Callee::Direct(reference), &r, &p, None, callee_nounwind, rrepr, rpass)
     }
 
     /// The signature (no results) and argument values of a call the walk makes of lang fn

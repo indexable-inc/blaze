@@ -320,6 +320,7 @@ fn world_from(records: &BTreeMap<ContentId, std::vec::Vec<u8>>, signer: &Signer,
     World { objects: objects.iter().map(|o| (o.object.name().as_str().to_owned(), o.bytes.as_slice().to_vec())).collect(), truth: records.clone(), gone: 0 }
 }
 
+/// The invariant: the remote read path verifies head signatures, wire sizes, byte ranges, and payload digests, returning only true bytes or typed misses and never hanging.
 #[test]
 fn the_read_path_answers_true_bytes_or_a_typed_miss_never_wrong_never_a_hang() {
     blaze_sim::check(Config::cases(300), |tape| case(tape, Plant::None));

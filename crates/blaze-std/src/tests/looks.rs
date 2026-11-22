@@ -201,6 +201,7 @@ fn run_one<S: Strategy>(plan: &Plan) -> Result<(), std::string::String> {
     against_stat(&cx, &dir, &asked, &got, "one")
 }
 
+/// The refinement: batched `Dir::looks` under every strategy returns the exact same metadata as per-path `Dir::stat` for every queried path without skipping folder boundaries.
 /// (i) and (ii): for random simulated trees (beneath the root or a folder, with a folder that
 /// vanished) and random sorted paths in many folders, missing ones and folders among them,
 /// every strategy's rows equal a stat of each path, and so each other.

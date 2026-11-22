@@ -1,5 +1,5 @@
 //! The identity of a set of keyed entries, kept as entries are set and removed
-//! (docs/v2/plan/design/patch-in-place.md): what a link is given, or what a build made, as one
+//! (docs/v2/plan/design/data.md): what a link is given, or what a build made, as one
 //! id, without hashing every entry each time.
 //!
 //! The rule: an identity of many hashes is made here, by a hash of the whole set, and nowhere

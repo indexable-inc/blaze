@@ -284,6 +284,7 @@ fn fn_bodies(text: &str) -> Vec<usize> {
     bodies
 }
 
+/// The refinement: every lexer, skipper, UTF-8 validator, and byte classifier SIMD/scalar path agrees with `rustc_lexer::tokenize`, `core::str::from_utf8`, and the scalar predicates across all boundaries.
 #[test]
 fn every_file_of_the_trees_lexes_validates_and_skips_as_the_references_do() {
     let files = tree_sources();

@@ -206,6 +206,7 @@ fn flow(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: the viewer bounds slow-page queues, checks origin and pairing keys before routing or toggling, and expires idle viewers without holding resources forever.
 #[test]
 fn a_slow_page_never_grows_the_viewer() {
     let lap = Lap::new("viewer: a slow page");

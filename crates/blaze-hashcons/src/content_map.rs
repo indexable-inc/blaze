@@ -192,7 +192,7 @@ mod tests {
         Blob((0..n).map(|it| (it * 7 + n) as u8).collect()) // alloc: a test's value
     }
 
-    /// The invariant: after any inserts and removes the map holds each distinct value once,
+    /// Invariant: after any inserts and removes the map holds each distinct value once,
     /// under the id of its content, as a `Vec` of `(id, value)` with no id twice does.
     #[test]
     fn a_content_map_is_the_distinct_values_by_their_ids() {

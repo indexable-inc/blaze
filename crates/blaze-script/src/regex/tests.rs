@@ -90,6 +90,7 @@ fn the_table_of_patterns_matches_as_written() {
         (r#"!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#, r#"see [a [b]](x.md "t") end"#, Some(&[Some(r#"[a [b]](x.md "t")"#), Some("x.md")])),
         (r"(?m)^[ \t]*(?:pub(?:\([a-z: ]+\))?[ \t]+)?const[ \t]+([A-Z0-9_]*(?:SCHEMA|LAYOUT|FORMAT|MAGIC|VERSION)[A-Z0-9_]*)[ \t]*:", "x\npub(crate) const STORE_LAYOUT_V2: u32 = 1;", Some(&[Some("pub(crate) const STORE_LAYOUT_V2:"), Some("STORE_LAYOUT_V2")])),
         (r"(?s)\bstd::\{([^;]*)\}", "use std::{fs,\n io};", Some(&[Some("std::{fs,\n io}"), Some("fs,\n io")])),
+        // asks blaze: regex test pattern literal matching the rustcsites scanner regex
         (r"(?i)Command::new\([^)]*(rustc|rustdoc|cargo|rustup)|MetadataCommand::new\(\)", "command::NEW(\"RUSTC\")", Some(&[Some("command::NEW(\"RUSTC"), Some("RUSTC")])),
         (r"(?m)^\s*(?:(?:private|protected|noncomputable|unsafe)\s+)*axiom\s", "theorem x\n  private axiom foo", Some(&[Some("  private axiom ")])),
         (r"(?m)\s*:=|\s+where\s*$", "theorem t : P := by", Some(&[Some(" :=")])),
@@ -442,7 +443,7 @@ impl Backtrack<'_> {
     }
 }
 
-/// The refinement: on small patterns and texts, the Pike VM's first match and its groups, and
+/// Refinement: on small patterns and texts, the Pike VM's first match and its groups, and
 /// its iteration, are the backtracking reference's.
 #[test]
 fn the_pike_vm_matches_what_backtracking_matches() {

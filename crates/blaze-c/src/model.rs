@@ -1,4 +1,4 @@
-//! The declaration model: what a C header gives a Rust program, as columns (docs/v2/plan/data.md:
+//! The declaration model: what a C header gives a Rust program, as columns (docs/v2/plan/design/data.md:
 //! a tag and a few words a row, lists as ranges into one flat column, names by number).
 //!
 //! A front end fills a [`DeclsBuilder`] in any order it likes; [`crate::canon::encode`] writes

@@ -4185,7 +4185,22 @@ impl<'f> BodiesStage<'f> {
                 // `Checker::holds`): what tells an entry a `cfg` left out from one the records
                 // lost ([`absent_entry`]).
                 let cfg = NamesSource::cfg_atoms(records, 0).map(|atoms| blaze_scope::task::Cfg::from_atoms(atoms, g));
-                (records, mine, row, cfg)
+                // Free fn/const/static items in block modules (e.g. `bstd_hosted_start` inside
+                // `bstd::main!`'s launcher `main`): `covered::in_blocks` skips them so each body
+                // is checked once via `each_from`, while `program.rs` calls exported block items
+                // by their block-module library key. Pre-index `(expansion_key, item_key)` once
+                // per member so each body adds its library-key aliases to `covers` in O(log N).
+                let mut block_locals: Vec<(ItemKey, ItemKey), blaze_own::Alloc<'static>> = Vec::new_in(g);
+                for idx in 0..items.items() {
+                    if let Ok(Some(id)) = items.identity_at(idx)
+                        && matches!(id.kind, blaze_surface::ItemKind::Function | blaze_surface::ItemKind::Const | blaze_surface::ItemKind::Static)
+                        && let Some(blaze_scope::resolve::At::Expansion(exp)) = id.at
+                    {
+                        block_locals.push((exp, id.key));
+                    }
+                }
+                block_locals.sort_unstable();
+                (records, mine, row, cfg, block_locals)
             });
             tally.parts.listing_list_ns = tally.parts.listing_list_ns.saturating_add(lap(handles.clock, &mut list_mark));
             // The member's crate root, by its path: its top-level `fn main` is D104's
@@ -4196,7 +4211,7 @@ impl<'f> BodiesStage<'f> {
             for &(file, outline_at) in owed_files.iter() {
                 let file_name = handles.outlined[outline_at as usize].name;
                 let root_file = handles.outlined[outline_at as usize].path.as_slice() == root_path.as_bytes();
-                let Some((records, mine, row, cfg)) = index.as_ref() else {
+                let Some((records, mine, row, cfg, block_locals)) = index.as_ref() else {
                     // Its file is the member's; its scope could not be read: every body says why.
                     let (why, reads) = refused.unwrap_or((RULE, empty));
                     member_files.push(FileClaim { file: file_name, unit, is: FileIs::Refused(why), reads });
@@ -4395,6 +4410,57 @@ impl<'f> BodiesStage<'f> {
                         let mut called: Vec<blaze_typeck::ItemKey, _> = Vec::new_in(g);
                         if let Ok((_, keys)) = found {
                             asked_keys(records, keys, &mut called);
+                            if !block_locals.is_empty() {
+                                let krate = items.key();
+                                let mut queue: Vec<ItemKey, _> = Vec::with_capacity_in(keys.len(), g);
+                                queue.extend_from_slice(keys);
+                                let mut head = 0usize;
+                                let limit = block_locals.len().saturating_add(keys.len());
+                                while head < queue.len() && head < limit {
+                                    let owner = queue[head];
+                                    head += 1;
+                                    let block = crate::body_types::covered::block_key(krate, owner);
+                                    let from = block_locals.partition_point(|(exp, _)| *exp < block);
+                                    for &(_, alias) in block_locals[from..].iter().take_while(|(exp, _)| *exp == block) {
+                                        let asked_alias = blaze_ladder::front2::keys::asked_key(records, alias);
+                                        if called.scan_for(&asked_alias).is_none() {
+                                            called.push(asked_alias);
+                                        }
+                                        // Also include nested locals derived from this block-module
+                                        // alias (e.g. `hosted` inside `bstd_hosted_start`, when
+                                        // `program.rs` enters `bstd_hosted_start` by its
+                                        // block-module library key instead of its `INNER` key).
+                                        if let Some(alias_text) = NamesSource::text_of(records, alias)
+                                            && let Some(atoms) = NamesSource::cfg_atoms(records, 0)
+                                            && let Ok(walk) = blaze_ladder::front2::nested_exports::walk_every(
+                                                blaze_ladder::front2::nested_exports::Top {
+                                                    text: alias_text.text,
+                                                    name: NamesSource::name_of(records, alias).unwrap_or("_"),
+                                                    library: Some((krate, alias)),
+                                                },
+                                                None,
+                                                blaze_ladder::front2::nested_exports::Reading {
+                                                    edition: items.edition(),
+                                                    atoms,
+                                                    alloc: g,
+                                                },
+                                            )
+                                        {
+                                            for local in walk.locals.iter() {
+                                                if let Ok(local_key) = local.key {
+                                                    let asked_local = blaze_ladder::front2::keys::checker_of(local_key);
+                                                    if called.scan_for(&asked_local).is_none() {
+                                                        called.push(asked_local);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if queue.scan_for(&alias).is_none() {
+                                            queue.push(alias);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         let called: &'f [blaze_typeck::ItemKey] = called.leak();
                         if grown.is_ok() {

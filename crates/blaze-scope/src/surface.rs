@@ -270,13 +270,15 @@ fn source_bytes(src: Option<MacroSrc<'_>>) -> [u8; 32] {
     h.finish().0
 }
 
+const SURFACE_READ_DOMAIN: &str = "blaze-scope surface read 1";
+
 impl<'o, N> Logged<'_, 'o, N> {
     fn note(&self, h: &Hasher, answer: [u8; 32]) {
         self.reads.borrow_mut().push(SurfaceRead { question: h.finish().0, answer });
     }
 
     fn path_question(tag: &[u8], module: ItemKey, kind: PathKind, segments: &[&str]) -> Hasher {
-        let mut h = Hasher::new("blaze-scope surface read 1");
+        let mut h = Hasher::new(SURFACE_READ_DOMAIN);
         h.update(tag).update(&module.0.0).update(&kind_bytes(kind));
         for s in segments {
             h.update(s.as_bytes()).update(b"\0");
@@ -288,7 +290,7 @@ impl<'o, N> Logged<'_, 'o, N> {
 impl<'a, N: BodyNames<'a>> EffectNames<'a> for Logged<'_, '_, N> {
     fn root_of(&self, def: ItemKey) -> Option<ItemKey> {
         let answer = self.names.root_of(def);
-        let mut h = Hasher::new("blaze-scope surface read 1");
+        let mut h = Hasher::new(SURFACE_READ_DOMAIN);
         h.update(b"root").update(&def.0.0);
         self.note(&h, key_bytes(answer));
         answer
@@ -296,7 +298,7 @@ impl<'a, N: BodyNames<'a>> EffectNames<'a> for Logged<'_, '_, N> {
 
     fn lookup(&self, module: ItemKey, ns: Namespace, name: &'a str) -> Option<ItemKey> {
         let answer = self.names.lookup(module, ns, name);
-        let mut h = Hasher::new("blaze-scope surface read 1");
+        let mut h = Hasher::new(SURFACE_READ_DOMAIN);
         h.update(b"lookup").update(&module.0.0).update(&[ns_byte(ns)]).update(name.as_bytes());
         self.note(&h, key_bytes(answer));
         answer
@@ -304,7 +306,7 @@ impl<'a, N: BodyNames<'a>> EffectNames<'a> for Logged<'_, '_, N> {
 
     fn source(&self, def: ItemKey) -> Option<MacroSrc<'a>> {
         let answer = self.names.source(def);
-        let mut h = Hasher::new("blaze-scope surface read 1");
+        let mut h = Hasher::new(SURFACE_READ_DOMAIN);
         h.update(b"source").update(&def.0.0);
         self.note(&h, source_bytes(answer));
         answer
@@ -376,47 +378,81 @@ impl<'a, 'p, 'r, 'o, N: BodyNames<'a>> Pass<'p, 'r, 'o, N> {
         if nested.surface_by_text {
             return Some(SurfaceWhy::Text);
         }
-        let frames = [Frame { text, nested: &nested, offset: 0, outer: (0, 0) }];
-        self.frame(&frames)
+        self.frame(text, nested)
     }
 
-    /// Why the innermost of `frames` (its calls, then its local items' texts) makes the body a
+    /// Why the innermost of the frames (its calls, then its local items' texts) makes the body a
     /// surface body.
-    fn frame(&mut self, frames: &[Frame<'a, '_, '_>]) -> Option<SurfaceWhy> {
-        let here = frames.len() - 1;
-        let f = frames[here];
-        for call in f.nested.calls.iter() {
-            if let Some(why) = self.call(frames, here, call) {
-                return Some(why);
+    fn frame(&mut self, text: &'a str, nested: Nested<'o>) -> Option<SurfaceWhy> {
+        struct OwnedFrame<'a, 'o> {
+            text: &'a str,
+            nested: Nested<'o>,
+            offset: u32,
+            outer: (u32, u32),
+            next_item: usize,
+            calls_done: bool,
+        }
+        let mut owned: AVec<'o, OwnedFrame<'a, 'o>> = AVec::new_in(self.alloc);
+        owned.push(OwnedFrame { text, nested, offset: 0, outer: (0, 0), next_item: 0, calls_done: false });
+        loop {
+            let Some(here) = owned.len().checked_sub(1) else {
+                return None;
+            };
+            if let Some(top) = owned.last_mut()
+                && !top.calls_done
+            {
+                top.calls_done = true;
+                let mut views: blaze_own::FixedVec<Frame<'a, '_, 'o>, MAX_FRAMES> = blaze_own::FixedVec::new();
+                for f in owned.iter() {
+                    let _ = views.push(Frame { text: f.text, nested: &f.nested, offset: f.offset, outer: f.outer });
+                }
+                let f = views[here];
+                for call in f.nested.calls.iter() {
+                    if let Some(why) = self.call(views.as_slice(), here, call) {
+                        return Some(why);
+                    }
+                }
+            }
+            let mut next_frame: Option<OwnedFrame<'a, 'o>> = None;
+            let owned_len = owned.len();
+            if let Some(top) = owned.last_mut() {
+                while let Some(item) = top.nested.items.get(top.next_item).copied() {
+                    top.next_item += 1;
+                    // Kinds whose own text is read when lowered and may hold calls: everything but an
+                    // impl and an extern block (already surface by text), a `use`, an `extern crate`,
+                    // and a macro definition (its calls are its own callers').
+                    if matches!(item.kind, NestedKind::Impl | NestedKind::ExternBlock | NestedKind::Use | NestedKind::ExternCrate | NestedKind::MacroRules | NestedKind::Macro) {
+                        continue;
+                    }
+                    let Some(own) = item_text(top.text, item.range) else { return Some(SurfaceWhy::NotRead { call: item.range }) };
+                    if !own.contains('!') {
+                        continue;
+                    }
+                    let at = Range::new(top.offset + item.range.start, top.offset + item.range.end);
+                    if owned_len >= MAX_FRAMES {
+                        return Some(SurfaceWhy::Deep { call: at });
+                    }
+                    let inner = scan(own, self.alloc);
+                    if inner.surface_by_text {
+                        return Some(SurfaceWhy::Text);
+                    }
+                    next_frame = Some(OwnedFrame {
+                        text: own,
+                        nested: inner,
+                        offset: top.offset + item.range.start,
+                        outer: (item.block, item.range.start),
+                        next_item: 0,
+                        calls_done: false,
+                    });
+                    break;
+                }
+            }
+            if let Some(frame) = next_frame {
+                owned.push(frame);
+            } else {
+                owned.pop();
             }
         }
-        for item in f.nested.items.iter() {
-            // Kinds whose own text is read when lowered and may hold calls: everything but an
-            // impl and an extern block (already surface by text), a `use`, an `extern crate`,
-            // and a macro definition (its calls are its own callers').
-            if matches!(item.kind, NestedKind::Impl | NestedKind::ExternBlock | NestedKind::Use | NestedKind::ExternCrate | NestedKind::MacroRules | NestedKind::Macro) {
-                continue;
-            }
-            let Some(own) = item_text(f.text, item.range) else { return Some(SurfaceWhy::NotRead { call: item.range }) };
-            if !own.contains('!') {
-                continue;
-            }
-            let at = Range::new(f.offset + item.range.start, f.offset + item.range.end);
-            if frames.len() >= MAX_FRAMES {
-                return Some(SurfaceWhy::Deep { call: at });
-            }
-            let inner = scan(own, self.alloc);
-            if inner.surface_by_text {
-                return Some(SurfaceWhy::Text);
-            }
-            let mut deeper: AVec<'_, Frame<'a, '_, '_>> = AVec::new_in(self.alloc);
-            deeper.extend(frames.iter().copied());
-            deeper.push(Frame { text: own, nested: &inner, offset: f.offset + item.range.start, outer: (item.block, item.range.start) });
-            if let Some(why) = self.frame(&deeper) {
-                return Some(why);
-            }
-        }
-        None
     }
 
     /// Why the call `call` of frame `here` makes the body a surface body.

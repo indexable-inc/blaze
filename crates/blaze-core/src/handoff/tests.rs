@@ -85,8 +85,9 @@ mod theorems {
         }
     }
 
-    /// The theorem's function holds on drawn schedules, picks and flags, reached with both
-    /// orders of the two swaps.
+    /// The invariant (proved: crates/blaze-core/lean/BlazeCore/Handoff.lean): no hand-back is
+    /// missed, in the weak memory; [`no_hand_back_is_missed`] holds on drawn schedules, picks
+    /// and flags, reached with both orders of the two swaps.
     #[test]
     fn no_hand_back_is_missed_where_it_is_run() {
         let config = Config {

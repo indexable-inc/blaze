@@ -1476,3 +1476,17 @@ path, from a read of the code on `origin/main` and `origin/newproj-1111`:
 (`blaze_cas::Config::layers`); the daemon configures none. An imported pack is best kept as a
 layer: read in place, verified on every read, removed as one directory.
 
+## Environment variables
+
+In CI and headless environments, `crates/blaze-remote` reads bucket, credential, and signing settings from the environment (refusing any setting given both in a config file and in the environment):
+
+- `BLAZE_CACHE_ENDPOINT`: S3/R2 bucket endpoint URL (`bucket.endpoint`).
+- `BLAZE_CACHE_BUCKET`: bucket name (`bucket.name`).
+- `BLAZE_CACHE_PUBLIC_URL`: public read URL for anonymous pulls (`bucket.public_url`).
+- `BLAZE_CACHE_PUBLIC_ANCHORS`: comma-separated hex public anchor keys for verifying signed heads (`namespaces` / `anchors`).
+- `BLAZE_CACHE_ACCESS_KEY_ID` / `BLAZE_CACHE_SECRET_ACCESS_KEY`: S3/R2 write credentials (`remote-credentials.json`).
+- `BLAZE_CACHE_SIGNING_SEED`: hex Ed25519 signing seed for publishing cache heads.
+- `BLAZE_CACHE_KEY_LIST`: path to the signed key list paired with `BLAZE_CACHE_SIGNING_SEED`.
+- `BLAZE_CACHE_ANCHOR_SEED`: hex Ed25519 anchor seed used by `blaze cache keys` commands to sign key lists and print public anchor keys.
+
+

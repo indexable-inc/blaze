@@ -451,6 +451,7 @@ fn writes(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: a crash at any point of a page-backed answer write leaves the last committed answer whole, pins every live page, and never trusts a segment proof from an earlier boot.
 #[test]
 fn a_crash_at_any_point_of_a_write_leaves_the_last_committed_answer_whole() {
     check(SimConfig::cases(200), |tape| writes(tape, Plant::None));

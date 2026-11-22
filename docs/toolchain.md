@@ -56,7 +56,7 @@ the standard library is part of a compiler.
   then the profile directory), so a systemd unit, a CI runner or cron with no `HOME` finds
   the same copy a shell does. With neither, blaze stops, saying what it tried and naming
   `BLAZE_TOOLCHAINS`. It is found
-  with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
+  with nothing run (`crates/blaze-cli/src/toolchain.rs`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md),
   which also plans the end of this download). The installer downloads it by running
@@ -65,7 +65,7 @@ the standard library is part of a compiler.
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
-  and the daemon's front end reads the library blaze fetched (`crates/blaze-cargo/src/toolchain/library.rs`,
+  and the engine's front end reads the library blaze fetched (`crates/blaze-toolchain`,
   the build's `library` mount) rather than looking for a `rust-src`. Where
   `rust-src` is still installed it is for something that is not blaze: CI's `cargo` job
   (`.github/actions/toolchain`, [harness.md](harness.md#ci)), rust-analyzer
@@ -74,8 +74,7 @@ the standard library is part of a compiler.
 - **Who uses it:** the daemon, which runs none of its programs. Its linker takes the C runtime
   WASI links and the sanitizer runtimes from the toolchain's sysroot
   (`blaze_link::target::locate`), and blaze answers `rustc --print sysroot` with it. A build
-  script's `RUSTC` and `RUSTDOC` are blaze itself, linked as `rustc` and `rustdoc` in the
-  daemon's `tools` directory (`crates/blaze-cargo/src/as_rustc.rs`). The user's `cargo`,
+  script's `RUSTC` and `RUSTDOC` are answered by blaze itself (`crates/blaze-build-script`). The user's `cargo`,
   `rustc` and pins are untouched, and blaze reads none of them.
 - **What rustc says:** blaze answers every question asked of rustc (`--version`, `-vV`,
   `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release
@@ -135,7 +134,7 @@ from crates.io so that a cold build needs no network beyond blaze's store, and s
 paths, which panics and `file!()` show, are the ones `rust-src` gives: blaze names a file of
 it `/rustc/<commit>/library/...` as rustc does, wherever it is on disk.
 
-Where blaze reads it (`crates/blaze-cargo/src/toolchain/library.rs`): it is known by its
+Where blaze reads it (`crates/blaze-toolchain`): it is known by its
 digest, `library/DIGEST` (the sha256 of a line per file, `harness/library.py digest` writes
 it), which is compiled into blaze and is what the store keys the standard library by
 (`library=<digest>` in place of the nightly's commit and `rustc_driver` name). Every process

@@ -371,6 +371,7 @@ fn any_key(tape: &Tape) -> Result<(), Broke> {
     }
 }
 
+/// The refinement: every sort kernel, stable sort-by-key, and SIMD find/mismatch routine equals the standard library's ordering and scalar twins across all input shapes, lengths, and alignments.
 #[test]
 fn every_kernel_equals_the_standard_form() {
     blaze_sim::check(Config::cases(CASES), any_key);

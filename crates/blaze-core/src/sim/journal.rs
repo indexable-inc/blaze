@@ -726,7 +726,7 @@ mod tests {
         Ok(())
     }
 
-    /// Expected: passes. A journal of the root names every change since its place, at the
+    /// The invariant: a journal of the root names every change since its place, at the
     /// root's own level as beneath it.
     #[test]
     fn a_journal_of_the_root_names_every_change_since_its_place() {

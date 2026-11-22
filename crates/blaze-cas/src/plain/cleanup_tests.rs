@@ -516,6 +516,7 @@ fn history(seed: u64, plant: Plant, commands: u32, per_wave: u32, root: &Frame) 
     Outcome { problems, waits_on_cleanup: w.waits_on_cleanup, slices: w.slices, swept_under: w.swept_under, carried: w.carried, errors: w.errors, dead_lease_left, dead_kept, short_root_left, disk }
 }
 
+/// The invariant: concurrent commands folding cleanup slices without a lock keep every record reached by an unexpired root, never wait on cleanup, expire dead holders' leases, and keep segment bytes bounded.
 /// Prints `cleanup: 1000 commands, 3 at a time: S slices folded into commits, 0 waits on
 /// cleanup, C records carried forward under a slice, 0 refused; segments B bytes for L live (ratio X, N segments); every
 /// rooted record read back; the dead holder's lease and records gone; the short root gone`.

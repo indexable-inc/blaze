@@ -363,6 +363,7 @@ fn histories(tape: &Tape, plant: HeadersPlant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The refinement: across both phase and ready commits and crashes, the producer header index answers identically to reading the pages directly and never serves stale shards.
 /// Expected: "test headers_sim::the_header_index_answers_as_the_pages_across_both_writers ... ok".
 #[test]
 fn the_header_index_answers_as_the_pages_across_both_writers() {

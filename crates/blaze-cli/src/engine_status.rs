@@ -560,13 +560,46 @@ pub(crate) fn put(cx: &Cx, root: &Dir<ReadWrite>, err: &Out, text: &[u8]) -> Res
     Ok(())
 }
 
-/// `work` with the watcher beside it when a signal can ask or a line is due; the watcher ends
-/// and is joined on every path, an unwind too. A stop the workers do not reach in
-/// [`STOP_BOUND`] is written from here and ends the process (`Exit::StopStalled`). A plant
-/// starts no watcher: its requests are the driver's at its scheduling points, so a planted run
-/// stays one deterministic thread on one worker.
-pub(crate) fn watched<R>(io: &Io, root: &Dir<ReadWrite>, err: &Out, clock: &Clock, board: &Board<'_>, every: Option<Duration>, work: impl FnOnce() -> R) -> Result<R, StatusError> {
-    if board.asked.is_none() && every.is_none() {
+/// Human-readable live progress verb for each engine stage.
+fn stage_verb(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Units => "reading manifests",
+        Stage::Scripts => "running build scripts",
+        Stage::Outlines => "parsing files",
+        Stage::Names => "resolving names",
+        Stage::Heads => "checking heads",
+        Stage::Bodies => "checking bodies",
+        Stage::Lints => "linting",
+    }
+}
+
+/// Publish the board's live stage, task counts, and longest active task label to `live`.
+fn report_live(board: &Board<'_>, live: &(dyn blaze_screen::Watch + Sync)) {
+    let Some(stage) = board.stage() else { return };
+    let Some(counts) = board.counts.get(stage.index()) else { return };
+    let done = u32::try_from(counts.done.load(Ordering::Acquire)).unwrap_or(u32::MAX);
+    let total = u32::try_from(counts.known.load(Ordering::Acquire)).unwrap_or(u32::MAX);
+    let (longest, _) = board.longest();
+    let detail = longest.first().and_then(Option::as_ref).map(|slot| slot.label.as_str()).filter(|s| !s.is_empty());
+    live.see(blaze_screen::Step::Progress { stage: stage_verb(stage), done, total, detail });
+}
+
+/// `work` with the watcher beside it when a signal can ask, a line is due, or a live progress sink
+/// is attached; the watcher ends and is joined on every path, an unwind too. A stop the workers
+/// do not reach in [`STOP_BOUND`] is written from here and ends the process (`Exit::StopStalled`).
+/// A plant starts no watcher: its requests are the driver's at its scheduling points, so a planted
+/// run stays one deterministic thread on one worker.
+pub(crate) fn watched<R>(
+    io: &Io,
+    root: &Dir<ReadWrite>,
+    err: &Out,
+    clock: &Clock,
+    board: &Board<'_>,
+    every: Option<Duration>,
+    live: Option<&(dyn blaze_screen::Watch + Sync)>,
+    work: impl FnOnce() -> R,
+) -> Result<R, StatusError> {
+    if board.asked.is_none() && every.is_none() && live.is_none() {
         return Ok(work());
     }
     struct Over<'b, 'r>(&'b Board<'r>, &'b Signal);
@@ -595,6 +628,9 @@ pub(crate) fn watched<R>(io: &Io, root: &Dir<ReadWrite>, err: &Out, clock: &Cloc
                 let mut guard = parked.lock();
                 while !board.over.load(Ordering::Acquire) {
                     let now = board.now(clock);
+                    if let Some(sink) = live {
+                        report_live(board, sink);
+                    }
                     let act = watch.look(now, board.stopping(), board.take_status(), board.claimed.load(Ordering::Acquire) != 0);
                     act_on(&cx, io, root, err, board, act, now);
                     // A bounded wait (rule 15, 18): the next look in a tick, or at the work's end.

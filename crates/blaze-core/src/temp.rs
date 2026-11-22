@@ -151,7 +151,7 @@ fn named(path: &Path, what: &str, e: io::Error) -> io::Error {
 mod tests {
     use super::*;
 
-    /// The invariant: a `TempDir` is a new empty directory of its own, and is gone, with what
+    /// Invariant: a `TempDir` is a new empty directory of its own, and is gone, with what
     /// it held, once dropped.
     #[test]
     fn a_dir_is_fresh_and_gone_once_dropped() {

@@ -205,6 +205,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     oracle(world.starts == 1, || format!("the start was answered {} times", world.starts))
 }
 
+/// The invariant: at most one compile per function is in flight, a compile resumes only after all lacking records are ready, and a single compile failure fails only its own callers.
 #[test]
 fn one_compile_one_answer_and_failures_fail_only_their_callers() {
     check(Config::cases(500), |tape| run(tape, Plant::None));

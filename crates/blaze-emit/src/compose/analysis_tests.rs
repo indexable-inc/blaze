@@ -493,6 +493,7 @@ fn header_map(view: View<'_>, got: &Analysis<'_>, header: usize, out: &[bool]) -
     Ok(())
 }
 
+/// The invariant: no two values live at one point share a register across loops, back edges, and irreducibility.
 /// No two values live at one point share a register; the loop maps, back edges, irreducibility
 /// and classes hold (the module's list), on 512 drawn functions.
 /// Expected: passes.

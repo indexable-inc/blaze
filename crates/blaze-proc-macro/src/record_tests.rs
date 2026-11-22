@@ -60,6 +60,7 @@ fn crashes(count: u32, plant: RecordPlant) -> Result<bstd::test::Passed, bstd::t
     })
 }
 
+/// The invariant: after any crash or I/O failure during proc-macro expansion persistence, every record read back is whole and sealed or absent.
 #[test]
 fn a_crash_or_failure_anywhere_keeps_each_record_whole_or_absent() {
     match crashes(1000, RecordPlant::None) {

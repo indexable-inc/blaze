@@ -53,6 +53,7 @@ fn case(tape: &Tape) -> Result<(), Broke> {
     no_leaks(&alloc)
 }
 
+/// The refinement: `StaticSearch` returns the exact index `partition_point` returns on every sorted key slice and probe.
 #[test]
 fn static_search_matches_partition_point() {
     blaze_sim::check(Config::cases(200), case);

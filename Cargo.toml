@@ -347,6 +347,7 @@ blaze-world = { path = "crates/blaze-world" } # One world for run and check: the
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-lint = { path = "crates/blaze-lint" }
 blaze-live = { path = "crates/blaze-live" }
+blaze-macro-run = { path = "crates/blaze-macro-run" }
 blaze-real ={ path = "crates/blaze-real" } # blaze's stages on a real checkout (tempo): the harness behind docs/v2/plan/design/tempo.md.
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-record = { path = "crates/blaze-record" }
@@ -368,6 +369,8 @@ blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: check
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
 # What a run may see and what it saw: roots, RelPath, the read list and its one check (no_std, sans-IO).
 blaze-roots = { path = "crates/blaze-roots" }
+blaze-rung-tiers = { path = "crates/blaze-rung-tiers" }
+blaze-rungs = { path = "crates/blaze-rungs" }
 # blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
 blaze-sim = { path = "crates/blaze-sim" }
 # The spawn seam as records: a build step's spawned command and its answer, keyed from text (port27/hvbox-1116/READINESS.md 1a).

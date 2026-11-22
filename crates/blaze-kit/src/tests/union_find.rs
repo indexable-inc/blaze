@@ -135,6 +135,7 @@ impl Narrow32 for usize {
     }
 }
 
+/// The refinement: `UnionFind` with ranks, path halving, and rollback snapshots matches a plain parent array cloned at every snapshot.
 #[test]
 fn union_find_matches_a_parent_array() {
     blaze_sim::check(Config::cases(400), case);

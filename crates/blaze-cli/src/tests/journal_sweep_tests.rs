@@ -295,6 +295,7 @@ fn case(tape: &Tape, plant: JournalPlant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: the journal sweep inspects every row affected by a change, folder event, lost subtree, or untrusted journal continuation, and inspects no checkout row when nothing moved.
 #[test]
 fn the_rows_looked_at_cover_every_change_and_no_more_when_nothing_moved() {
     check(Config::cases(2000), |tape| case(tape, JournalPlant::None));

@@ -609,6 +609,7 @@ fn payload_history(tape: &blaze_sim::Tape, omit_carried: bool) -> Result<(), bla
     Ok(())
 }
 
+/// The invariant: every acknowledged row payload and carried payload is pinned and reachable after a cut at any point of a rows-answer write.
 #[test]
 fn every_acknowledged_row_payload_is_reachable_after_a_cut() {
     blaze_sim::check(blaze_sim::Config::cases(32), |tape| payload_history(tape, false));

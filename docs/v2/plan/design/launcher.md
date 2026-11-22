@@ -785,3 +785,17 @@ still on the path `edit` takes without it.
 | blaze-lazy's stubs, hook and wire; `blaze-link/src/lazy.rs` | nothing on either path runs them, so they can go now; left because `blaze-link`'s `stage.rs` and `native.rs` name `blaze_lazy::{Session, stub, hook}` in files another lane is editing, and `blaze_lazy::allow` is still what `run.rs` asks |
 | `blaze_stencil::tier`, `Mode::Tiered`, `Build::tier_up` | promotion (step 8). `Choice::then` is now what a launched function's optimized spec is kept in |
 | blaze-live, fences | step 5 for test binaries |
+
+### Environment variables
+
+The launcher and `blaze run` parent exchange run-mode parameters and telemetry controls via environment variables (stripped before user code starts):
+
+- `BLAZE_LAUNCH_STORE`: directory holding the run's code records (paired with `BLAZE_LAUNCH_FD=3`).
+- `BLAZE_LAUNCH_NATIVE`: 64-hex-digit native library record ID when the program links C code.
+- `BLAZE_LAUNCH_TELEMETRY`: path to the per-run shared-memory telemetry ring file (`crates/blaze-launch/src/telemetry.rs`).
+- `BLAZE_LAUNCH_EXPLORE`: when set to `1` on interactive runs, instructs the launcher to ensure the local viewer daemon is running and open Explore.
+- `BLAZE_ALLOC_SAMPLE_BYTES`: byte-stride override for allocation telemetry sampling in `blaze-launcher`.
+- `BLAZE_EXPLORE_LOCAL`: when set, opens the local loopback `/explore` URL instead of `https://ix.dev/blaze/explore`.
+- `BLAZE_NO_TELEMETRY`: opt-out of per-run live shared-memory telemetry.
+- `BLAZE_NO_OPEN`: opt-out of auto-opening the Explore browser tab on interactive runs.
+

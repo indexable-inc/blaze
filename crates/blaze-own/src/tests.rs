@@ -502,6 +502,7 @@ fn vec_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> 
     tokens::check(0)
 }
 
+/// The refinement: blaze-own collections match std collections under random operation sequences, free every allocation with its matching layout, and run every drop on truncate, retain, clone, growth, and merge.
 #[test]
 fn vec_matches_std() {
     blaze_sim::check(cases(300), vec_case);

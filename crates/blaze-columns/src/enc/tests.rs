@@ -139,6 +139,7 @@ fn ints_round_trip(tape: &Tape) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: every encoded integer, string, and id column decodes back to its exact values, vector unpack equals scalar at every alignment, and corrupt bytes are refused or read in bounds.
 #[test]
 fn integer_columns_decode_to_their_values() {
     blaze_sim::check(Config::cases(300), ints_round_trip);

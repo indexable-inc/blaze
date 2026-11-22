@@ -111,6 +111,7 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: every squeezed record round-trips only with its exact dictionary, refuses trailing or corrupt bytes, and rejects decoded sizes over the limit before growing the output.
 #[test]
 fn every_record_comes_back_with_its_dictionary_or_none() {
     blaze_sim::check(Config::cases(300), round_trip);

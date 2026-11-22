@@ -56,6 +56,7 @@ fn delta_case(tape: &Tape) -> Result<(), Broke> {
     no_leaks(&alloc)
 }
 
+/// The refinement: delta columns, LEB128 codecs, and `Dict` match their specifications and reference lists without dropping bytes or reusing codes.
 #[test]
 fn delta_column_round_trips() {
     blaze_sim::check(Config::cases(400), delta_case);

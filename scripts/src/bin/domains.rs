@@ -68,12 +68,7 @@ const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
 
 /// Literals of the domain form that are not hash domains, each with the one non-test file that
 /// writes it and why it may equal a domain written elsewhere.
-const ALLOWED: [(&str, &str, &str); 1] = [(
-    "blaze v2 field order 1",
-    "crates/blaze-items/src/field_order.rs",
-    "the first line of a field order plan's text file (`HEADER`), never hashed as a domain; \
-     the plan's ID has its own (`PLAN_DOMAIN`)",
-)];
+const ALLOWED: [(&str, &str, &str); 0] = [];
 
 struct Args {
     root: String,
@@ -138,7 +133,10 @@ impl Patterns {
 
 fn test_path(parts: &[String]) -> bool {
     let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
+    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str()) || part.ends_with("_tests") || part.ends_with("_test"))
+        || TEST_FILES.contains(&name)
+        || name.ends_with("_tests.rs")
+        || name.ends_with("_test.rs")
 }
 
 /// `(root / "crates").rglob("*.rs")`, sorted as Python sorts paths (part by part), each as its

@@ -278,6 +278,7 @@ fn interrupted(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: taking a published set verifies every record digest, never names the root before the set is whole, and leaves either no root or the whole set after any interruption.
 #[test]
 fn a_take_stopped_anywhere_leaves_no_root_or_the_whole_set_and_the_next_command_finishes_it() {
     blaze_sim::check(Config::cases(48), |tape| interrupted(tape, false));

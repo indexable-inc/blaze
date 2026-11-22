@@ -214,66 +214,224 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
 
 /// Imports portable type `t` of `types` into `cx`, `Param(i)` becoming `subst[i]`.
 pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, S::Error> {
-    if depth > MAX_DEPTH {
-        return Err(CheckError::Limit(Limit::InstanceImportDepth { node: t, depth, limit: MAX_DEPTH }).into());
+    enum Kind {
+        Tuple,
+        Ref(crate::ids::Mutbl),
+        Ptr(crate::ids::Mutbl),
+        Array,
+        Slice,
+        Pat,
+        Adt(ItemKey),
+        FnDef(ItemKey),
+        FnPtr(crate::ids::FnPtrHeader),
+        Alias { trait_: ItemKey, name: crate::ids::Name },
+        Opaque(ItemKey),
+        ConstValue { bits: u128 },
+        Dynamic,
+        ExTrait(ItemKey),
+        ExProj { trait_: ItemKey, name: crate::ids::Name },
+        Closure { owner: ItemKey, ordinal: u32 },
+        Coroutine { owner: ItemKey, ordinal: u32 },
     }
-    let d = depth + 1;
-    let v = match types.node(t)? {
-        PNode::Bool => TyView::Bool,
-        PNode::Char => TyView::Char,
-        PNode::Int(i) => TyView::Int(i),
-        PNode::Uint(u) => TyView::Uint(u),
-        PNode::Float(f) => TyView::Float(f),
-        PNode::Str => TyView::Str,
-        PNode::Never => TyView::Never,
-        PNode::Tuple(l) => TyView::Tuple(import_list(cx, src, types,l, subst, d)?),
-        PNode::Ref(m, p) => TyView::Ref(m, import(cx, src, types,p, subst, d)?),
-        PNode::Ptr(m, p) => TyView::Ptr(m, import(cx, src, types,p, subst, d)?),
-        PNode::Array(e, n) => TyView::Array(import(cx, src, types,e, subst, d)?, import(cx, src, types,n, subst, d)?),
-        PNode::Slice(e) => TyView::Slice(import(cx, src, types,e, subst, d)?),
-        PNode::Pat(b, l) => TyView::Pat(import(cx, src, types,b, subst, d)?, import_list(cx, src, types,l, subst, d)?),
-        PNode::Adt(k, l) => TyView::Adt(k, import_list(cx, src, types,l, subst, d)?),
-        PNode::FnDef(k, l) => TyView::FnDef(k, import_list(cx, src, types,l, subst, d)?),
-        PNode::FnPtr(l, h) => TyView::FnPtr(import_list(cx, src, types,l, subst, d)?, h),
-        PNode::Param(i) => match subst.get(i as usize) {
-            Some(&s) => return Ok(s),
-            None => TyView::Param(i),
-        },
-        PNode::Alias { trait_, name, args } => {
-            TyView::Alias { trait_, name, args: import_list(cx, src, types,args, subst, d)? }
-        }
-        PNode::Opaque(k, l) => TyView::Opaque(k, import_list(cx, src, types,l, subst, d)?),
-        PNode::Error => TyView::Error,
-        PNode::ConstParam(i) => match subst.get(i as usize) {
-            Some(&s) => return Ok(s),
-            None => TyView::ConstParam(i),
-        },
-        PNode::ConstValue { ty, bits } => TyView::ConstValue { ty: import(cx, src, types,ty, subst, d)?, bits },
-        // A trait object's rows keep their order: substitution changes no sort key.
-        PNode::Dynamic(l) => TyView::Dynamic(import_list(cx, src, types,l, subst, d)?),
-        PNode::ExTrait(k, l) => TyView::ExTrait(k, import_list(cx, src, types,l, subst, d)?),
-        PNode::ExProj { trait_, name, args, term } => {
-            let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len as usize + 1, cx.alloc());
-            for &a in types.list(args)? {
-                v.push(import(cx, src, types,a, subst, d)?);
+    struct Frame {
+        kind: Kind,
+        depth: u32,
+        val_base: usize,
+        list: Option<(List, usize)>,
+        extra: Option<PTy>,
+    }
+    fn finish<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, kind: Kind, slice: &[Ty], depth: u32) -> Result<Ty, S::Error> {
+        let v = match kind {
+            Kind::Tuple => TyView::Tuple(cx.mk_list(slice)?),
+            Kind::Ref(m) => {
+                let Some(&p) = slice.first() else { return Ok(cx.mk(TyView::Error)?) };
+                TyView::Ref(m, p)
             }
-            v.push(import(cx, src, types,term, subst, d)?);
-            TyView::ExProj { trait_, name, args_term: cx.mk_list(&v)? }
+            Kind::Ptr(m) => {
+                let Some(&p) = slice.first() else { return Ok(cx.mk(TyView::Error)?) };
+                TyView::Ptr(m, p)
+            }
+            Kind::Array => {
+                let [e, n] = *slice else { return Ok(cx.mk(TyView::Error)?) };
+                TyView::Array(e, n)
+            }
+            Kind::Slice => {
+                let Some(&e) = slice.first() else { return Ok(cx.mk(TyView::Error)?) };
+                TyView::Slice(e)
+            }
+            Kind::Pat => {
+                let Some((&b, rest)) = slice.split_first() else { return Ok(cx.mk(TyView::Error)?) };
+                TyView::Pat(b, cx.mk_list(rest)?)
+            }
+            Kind::Adt(k) => TyView::Adt(k, cx.mk_list(slice)?),
+            Kind::FnDef(k) => TyView::FnDef(k, cx.mk_list(slice)?),
+            Kind::FnPtr(h) => TyView::FnPtr(cx.mk_list(slice)?, h),
+            Kind::Alias { trait_, name } => TyView::Alias { trait_, name, args: cx.mk_list(slice)? },
+            Kind::Opaque(k) => TyView::Opaque(k, cx.mk_list(slice)?),
+            Kind::ConstValue { bits } => {
+                let Some(&ty) = slice.first() else { return Ok(cx.mk(TyView::Error)?) };
+                TyView::ConstValue { ty, bits }
+            }
+            // A trait object's rows keep their order: substitution changes no sort key.
+            Kind::Dynamic => TyView::Dynamic(cx.mk_list(slice)?),
+            Kind::ExTrait(k) => TyView::ExTrait(k, cx.mk_list(slice)?),
+            Kind::ExProj { trait_, name } => TyView::ExProj { trait_, name, args_term: cx.mk_list(slice)? },
+            Kind::Closure { owner, ordinal } => {
+                let args = cx.mk_list(slice)?;
+                return src.closure_of(cx, owner, ordinal, args, depth);
+            }
+            Kind::Coroutine { owner, ordinal } => {
+                let args = cx.mk_list(slice)?;
+                return src.coroutine_of(cx, owner, ordinal, args, depth);
+            }
+        };
+        cx.mk(v).map_err(Into::into)
+    }
+
+    let mut frames: Vec<Frame, Alloc<'_>> = Vec::new_in(cx.alloc());
+    let mut values: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc());
+    let mut cur_t = t;
+    let mut cur_d = depth;
+    loop {
+        if cur_d > MAX_DEPTH {
+            return Err(CheckError::Limit(Limit::InstanceImportDepth { node: cur_t, depth: cur_d, limit: MAX_DEPTH }).into());
         }
-        PNode::ExAuto(k) => TyView::ExAuto(k),
-        PNode::Foreign(k) => TyView::Foreign(k),
-        PNode::Closure { owner, ordinal, args } => {
-            let args = import_list(cx, src, types, args, subst, d)?;
-            return src.closure_of(cx, owner, ordinal, args, d);
+        let d = cur_d + 1;
+        let val = match types.node(cur_t)? {
+            PNode::Bool => cx.mk(TyView::Bool)?,
+            PNode::Char => cx.mk(TyView::Char)?,
+            PNode::Int(i) => cx.mk(TyView::Int(i))?,
+            PNode::Uint(u) => cx.mk(TyView::Uint(u))?,
+            PNode::Float(f) => cx.mk(TyView::Float(f))?,
+            PNode::Str => cx.mk(TyView::Str)?,
+            PNode::Never => cx.mk(TyView::Never)?,
+            PNode::Error => cx.mk(TyView::Error)?,
+            PNode::ExAuto(k) => cx.mk(TyView::ExAuto(k))?,
+            PNode::Foreign(k) => cx.mk(TyView::Foreign(k))?,
+            PNode::Param(i) => match subst.get(i as usize) {
+                Some(&s) => s,
+                None => cx.mk(TyView::Param(i))?,
+            },
+            PNode::ConstParam(i) => match subst.get(i as usize) {
+                Some(&s) => s,
+                None => cx.mk(TyView::ConstParam(i))?,
+            },
+            PNode::Future(e, output, interior) => src.future_of(cx, types, e, output, interior, subst, d)?,
+            PNode::Infer => return Err(CheckError::Malformed(Malformed::InstanceImportInfer { node: cur_t }).into()),
+            PNode::Ref(m, p) => {
+                frames.push(Frame { kind: Kind::Ref(m), depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = p;
+                cur_d = d;
+                continue;
+            }
+            PNode::Ptr(m, p) => {
+                frames.push(Frame { kind: Kind::Ptr(m), depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = p;
+                cur_d = d;
+                continue;
+            }
+            PNode::Array(e, n) => {
+                frames.push(Frame { kind: Kind::Array, depth: d, val_base: values.len(), list: None, extra: Some(n) });
+                cur_t = e;
+                cur_d = d;
+                continue;
+            }
+            PNode::Slice(e) => {
+                frames.push(Frame { kind: Kind::Slice, depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = e;
+                cur_d = d;
+                continue;
+            }
+            PNode::Pat(b, l) => {
+                frames.push(Frame { kind: Kind::Pat, depth: d, val_base: values.len(), list: Some((l, 0)), extra: None });
+                cur_t = b;
+                cur_d = d;
+                continue;
+            }
+            PNode::ConstValue { ty, bits } => {
+                frames.push(Frame { kind: Kind::ConstValue { bits }, depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = ty;
+                cur_d = d;
+                continue;
+            }
+            PNode::ExProj { trait_, name, args, term } => {
+                let items = types.list(args)?;
+                if let Some(&first) = items.first() {
+                    values.reserve(args.len as usize + 1);
+                    frames.push(Frame {
+                        kind: Kind::ExProj { trait_, name },
+                        depth: d,
+                        val_base: values.len(),
+                        list: Some((args, 1)),
+                        extra: Some(term),
+                    });
+                    cur_t = first;
+                } else {
+                    frames.push(Frame {
+                        kind: Kind::ExProj { trait_, name },
+                        depth: d,
+                        val_base: values.len(),
+                        list: None,
+                        extra: None,
+                    });
+                    cur_t = term;
+                }
+                cur_d = d;
+                continue;
+            }
+            node => {
+                let (kind, l) = match node {
+                    PNode::Tuple(l) => (Kind::Tuple, l),
+                    PNode::Adt(k, l) => (Kind::Adt(k), l),
+                    PNode::FnDef(k, l) => (Kind::FnDef(k), l),
+                    PNode::FnPtr(l, h) => (Kind::FnPtr(h), l),
+                    PNode::Alias { trait_, name, args } => (Kind::Alias { trait_, name }, args),
+                    PNode::Opaque(k, l) => (Kind::Opaque(k), l),
+                    PNode::Dynamic(l) => (Kind::Dynamic, l),
+                    PNode::ExTrait(k, l) => (Kind::ExTrait(k), l),
+                    PNode::Closure { owner, ordinal, args } => (Kind::Closure { owner, ordinal }, args),
+                    PNode::Coroutine { owner, ordinal, args } => (Kind::Coroutine { owner, ordinal }, args),
+                    _ => return Ok(cx.mk(TyView::Error)?),
+                };
+                let items = types.list(l)?;
+                if let Some(&first) = items.first() {
+                    frames.push(Frame { kind, depth: d, val_base: values.len(), list: Some((l, 1)), extra: None });
+                    cur_t = first;
+                    cur_d = d;
+                    continue;
+                }
+                finish(cx, src, kind, &[], d)?
+            }
+        };
+        let mut val = val;
+        loop {
+            let Some(top) = frames.last_mut() else {
+                return Ok(val);
+            };
+            values.push(val);
+            if let Some((l, idx)) = top.list {
+                let items = types.list(l)?;
+                if let Some(&next_t) = items.get(idx) {
+                    top.list = Some((l, idx + 1));
+                    cur_t = next_t;
+                    cur_d = top.depth;
+                    break;
+                }
+                top.list = None;
+            }
+            if let Some(extra_t) = top.extra.take() {
+                cur_t = extra_t;
+                cur_d = top.depth;
+                break;
+            }
+            let Some(frame) = frames.pop() else {
+                return Ok(val);
+            };
+            let slice = values.get(frame.val_base..).unwrap_or(&[]);
+            val = finish(cx, src, frame.kind, slice, frame.depth)?;
+            values.truncate(frame.val_base);
         }
-        PNode::Future(e, output, interior) => return src.future_of(cx, types, e, output, interior, subst, d),
-        PNode::Infer => return Err(CheckError::Malformed(Malformed::InstanceImportInfer { node: t }).into()),
-        PNode::Coroutine { owner, ordinal, args } => {
-            let args = import_list(cx, src, types, args, subst, d)?;
-            return src.coroutine_of(cx, owner, ordinal, args, d);
-        }
-    };
-    cx.mk(v).map_err(Into::into)
+    }
 }
 
 pub(crate) fn import_list<S: ClosureSource>(
@@ -314,119 +472,217 @@ pub(crate) fn export(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableTys<
 
 /// [`export`] keeping the types `keep` names.
 pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableTys<'_>, keep: Keep, depth: u32) -> Result<Option<PTy>, CheckError> {
-    if depth > MAX_DEPTH {
-        return Err(CheckError::Limit(Limit::InstanceExportDepth { node: t, depth, limit: MAX_DEPTH }));
+    enum Kind {
+        Future(crate::ids::ExprId),
+        Tuple,
+        Ref(crate::ids::Mutbl),
+        Ptr(crate::ids::Mutbl),
+        Array,
+        Slice,
+        Pat,
+        Adt(ItemKey),
+        FnDef(ItemKey),
+        FnPtr(crate::ids::FnPtrHeader),
+        Alias { trait_: ItemKey, name: crate::ids::Name },
+        Opaque(ItemKey),
+        ConstValue { bits: u128 },
+        Dynamic,
+        ExTrait(ItemKey),
+        ExProj { trait_: ItemKey, name: crate::ids::Name },
+        Closure { owner: ItemKey, ordinal: u32 },
+        Coroutine { owner: ItemKey, ordinal: u32 },
     }
-    let t = cx.resolve(t)?;
-    // A closure or async block the solver made revealing an opaque is filed first.
-    cx.adopt(t)?;
-    let d = depth + 1;
-    // The same mode all the way down.
-    let export = |cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableTys<'_>, d: u32| export_as(cx, t, ground, keep, d);
-    let export_list = |cx: &mut Exporter<'_, '_>, l: crate::ty::TyList, ground: &mut PortableTys<'_>, d: u32| export_list_as(cx, l, ground, keep, d);
-    let n = match cx.view(t) {
-        TyView::Param(i) if keep == Keep::Owner => PNode::Param(i),
-        TyView::ConstParam(i) if keep == Keep::Owner => PNode::ConstParam(i),
-        TyView::Future(e, o, i) if keep == Keep::Owner => match (export(cx, o, ground, d)?, export(cx, i, ground, d)?) {
-            (Some(o), Some(i)) => PNode::Future(e, o, i),
-            _ => return Ok(None),
-        },
-        TyView::Bool => PNode::Bool,
-        TyView::Char => PNode::Char,
-        TyView::Int(i) => PNode::Int(i),
-        TyView::Uint(u) => PNode::Uint(u),
-        TyView::Float(f) => PNode::Float(f),
-        TyView::Str => PNode::Str,
-        TyView::Never => PNode::Never,
-        TyView::Tuple(l) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::Tuple(l),
-            None => return Ok(None),
-        },
-        TyView::Ref(m, p) => match export(cx, p, ground, d)? {
-            Some(p) => PNode::Ref(m, p),
-            None => return Ok(None),
-        },
-        TyView::Ptr(m, p) => match export(cx, p, ground, d)? {
-            Some(p) => PNode::Ptr(m, p),
-            None => return Ok(None),
-        },
-        TyView::Array(e, n) => match (export(cx, e, ground, d)?, export(cx, n, ground, d)?) {
-            (Some(e), Some(n)) => PNode::Array(e, n),
-            _ => return Ok(None),
-        },
-        TyView::Slice(e) => match export(cx, e, ground, d)? {
-            Some(e) => PNode::Slice(e),
-            None => return Ok(None),
-        },
-        TyView::Pat(b, l) => match (export(cx, b, ground, d)?, export_list(cx, l, ground, d)?) {
-            (Some(b), Some(l)) => PNode::Pat(b, l),
-            _ => return Ok(None),
-        },
-        TyView::Adt(k, l) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::Adt(k, l),
-            None => return Ok(None),
-        },
-        TyView::FnDef(k, l) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::FnDef(k, l),
-            None => return Ok(None),
-        },
-        TyView::FnPtr(l, h) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::FnPtr(l, h),
-            None => return Ok(None),
-        },
-        TyView::Alias { trait_, name, args } => match export_list(cx, args, ground, d)? {
-            Some(args) => PNode::Alias { trait_, name, args },
-            None => return Ok(None),
-        },
-        TyView::Opaque(k, l) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::Opaque(k, l),
-            None => return Ok(None),
-        },
-        TyView::Error => PNode::Error,
-        TyView::ConstValue { ty, bits } => match export(cx, ty, ground, d)? {
-            Some(ty) => PNode::ConstValue { ty, bits },
-            None => return Ok(None),
-        },
-        // The view's rows are already in `PortableTys::dynamic`'s order.
-        TyView::Dynamic(l) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::Dynamic(l),
-            None => return Ok(None),
-        },
-        TyView::ExTrait(k, l) => match export_list(cx, l, ground, d)? {
-            Some(l) => PNode::ExTrait(k, l),
-            None => return Ok(None),
-        },
-        TyView::ExProj { trait_, name, args_term } => {
-            let n = cx.list_len(args_term);
-            let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(n as usize, cx.alloc());
-            for i in 0..n {
-                let t = cx.list_get(args_term, i);
-                match export(cx, t, ground, d)? {
-                    Some(p) => v.push(p),
+    struct Frame {
+        kind: Kind,
+        depth: u32,
+        val_base: usize,
+        list: Option<(crate::ty::TyList, u32, u32)>,
+        extra: Option<Ty>,
+    }
+    fn finish(ground: &mut PortableTys<'_>, kind: Kind, slice: &[PTy]) -> Result<Option<PTy>, CheckError> {
+        let n = match kind {
+            Kind::Future(e) => {
+                let [o, i] = *slice else { return Ok(None) };
+                PNode::Future(e, o, i)
+            }
+            Kind::Tuple => PNode::Tuple(ground.intern_list(slice)?),
+            Kind::Ref(m) => {
+                let Some(&p) = slice.first() else { return Ok(None) };
+                PNode::Ref(m, p)
+            }
+            Kind::Ptr(m) => {
+                let Some(&p) = slice.first() else { return Ok(None) };
+                PNode::Ptr(m, p)
+            }
+            Kind::Array => {
+                let [e, n] = *slice else { return Ok(None) };
+                PNode::Array(e, n)
+            }
+            Kind::Slice => {
+                let Some(&e) = slice.first() else { return Ok(None) };
+                PNode::Slice(e)
+            }
+            Kind::Pat => {
+                let Some((&b, rest)) = slice.split_first() else { return Ok(None) };
+                PNode::Pat(b, ground.intern_list(rest)?)
+            }
+            Kind::Adt(k) => PNode::Adt(k, ground.intern_list(slice)?),
+            Kind::FnDef(k) => PNode::FnDef(k, ground.intern_list(slice)?),
+            Kind::FnPtr(h) => PNode::FnPtr(ground.intern_list(slice)?, h),
+            Kind::Alias { trait_, name } => PNode::Alias { trait_, name, args: ground.intern_list(slice)? },
+            Kind::Opaque(k) => PNode::Opaque(k, ground.intern_list(slice)?),
+            Kind::ConstValue { bits } => {
+                let Some(&ty) = slice.first() else { return Ok(None) };
+                PNode::ConstValue { ty, bits }
+            }
+            // The view's rows are already in `PortableTys::dynamic`'s order.
+            Kind::Dynamic => PNode::Dynamic(ground.intern_list(slice)?),
+            Kind::ExTrait(k) => PNode::ExTrait(k, ground.intern_list(slice)?),
+            Kind::ExProj { trait_, name } => {
+                let Some((&term, args)) = slice.split_last() else { return Ok(None) };
+                PNode::ExProj { trait_, name, args: ground.intern_list(args)?, term }
+            }
+            Kind::Closure { owner, ordinal } => PNode::Closure { owner, ordinal, args: ground.intern_list(slice)? },
+            Kind::Coroutine { owner, ordinal } => PNode::Coroutine { owner, ordinal, args: ground.intern_list(slice)? },
+        };
+        Ok(Some(ground.intern(n)?))
+    }
+
+    let mut frames: Vec<Frame, Alloc<'_>> = Vec::new_in(cx.alloc());
+    let mut values: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.alloc());
+    let mut cur_t = t;
+    let mut cur_d = depth;
+    loop {
+        if cur_d > MAX_DEPTH {
+            return Err(CheckError::Limit(Limit::InstanceExportDepth { node: cur_t, depth: cur_d, limit: MAX_DEPTH }));
+        }
+        let resolved = cx.resolve(cur_t)?;
+        // A closure or async block the solver made revealing an opaque is filed first.
+        cx.adopt(resolved)?;
+        let d = cur_d + 1;
+        let val = match cx.view(resolved) {
+            TyView::Param(i) if keep == Keep::Owner => ground.intern(PNode::Param(i))?,
+            TyView::ConstParam(i) if keep == Keep::Owner => ground.intern(PNode::ConstParam(i))?,
+            TyView::Future(e, o, i) if keep == Keep::Owner => {
+                frames.push(Frame { kind: Kind::Future(e), depth: d, val_base: values.len(), list: None, extra: Some(i) });
+                cur_t = o;
+                cur_d = d;
+                continue;
+            }
+            TyView::Bool => ground.intern(PNode::Bool)?,
+            TyView::Char => ground.intern(PNode::Char)?,
+            TyView::Int(i) => ground.intern(PNode::Int(i))?,
+            TyView::Uint(u) => ground.intern(PNode::Uint(u))?,
+            TyView::Float(f) => ground.intern(PNode::Float(f))?,
+            TyView::Str => ground.intern(PNode::Str)?,
+            TyView::Never => ground.intern(PNode::Never)?,
+            TyView::Error => ground.intern(PNode::Error)?,
+            TyView::ExAuto(k) => ground.intern(PNode::ExAuto(k))?,
+            TyView::Foreign(k) => ground.intern(PNode::Foreign(k))?,
+            TyView::Ref(m, p) => {
+                frames.push(Frame { kind: Kind::Ref(m), depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = p;
+                cur_d = d;
+                continue;
+            }
+            TyView::Ptr(m, p) => {
+                frames.push(Frame { kind: Kind::Ptr(m), depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = p;
+                cur_d = d;
+                continue;
+            }
+            TyView::Array(e, n) => {
+                frames.push(Frame { kind: Kind::Array, depth: d, val_base: values.len(), list: None, extra: Some(n) });
+                cur_t = e;
+                cur_d = d;
+                continue;
+            }
+            TyView::Slice(e) => {
+                frames.push(Frame { kind: Kind::Slice, depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = e;
+                cur_d = d;
+                continue;
+            }
+            TyView::Pat(b, l) => {
+                let n = cx.list_len(l);
+                frames.push(Frame { kind: Kind::Pat, depth: d, val_base: values.len(), list: Some((l, 0, n)), extra: None });
+                cur_t = b;
+                cur_d = d;
+                continue;
+            }
+            TyView::ConstValue { ty, bits } => {
+                frames.push(Frame { kind: Kind::ConstValue { bits }, depth: d, val_base: values.len(), list: None, extra: None });
+                cur_t = ty;
+                cur_d = d;
+                continue;
+            }
+            TyView::Closure(..)
+            | TyView::Future(..)
+            | TyView::Param(_)
+            | TyView::Infer(_)
+            | TyView::ConstParam(_)
+            | TyView::ConstInfer(_) => return Ok(None),
+            view => {
+                let (kind, l) = match view {
+                    TyView::Tuple(l) => (Kind::Tuple, l),
+                    TyView::Adt(k, l) => (Kind::Adt(k), l),
+                    TyView::FnDef(k, l) => (Kind::FnDef(k), l),
+                    TyView::FnPtr(l, h) => (Kind::FnPtr(h), l),
+                    TyView::Alias { trait_, name, args } => (Kind::Alias { trait_, name }, args),
+                    TyView::Opaque(k, l) => (Kind::Opaque(k), l),
+                    TyView::Dynamic(l) => (Kind::Dynamic, l),
+                    TyView::ExTrait(k, l) => (Kind::ExTrait(k), l),
+                    TyView::ExProj { trait_, name, args_term } => (Kind::ExProj { trait_, name }, args_term),
+                    TyView::ClosureOf { owner, ordinal, args, .. } => (Kind::Closure { owner, ordinal }, args),
+                    TyView::CoroutineOf { owner, ordinal, args, .. } => (Kind::Coroutine { owner, ordinal }, args),
+                    _ => return Ok(None),
+                };
+                let n = cx.list_len(l);
+                if n > 0 {
+                    values.reserve(n as usize);
+                    let first = cx.list_get(l, 0);
+                    frames.push(Frame { kind, depth: d, val_base: values.len(), list: Some((l, 1, n)), extra: None });
+                    cur_t = first;
+                    cur_d = d;
+                    continue;
+                }
+                match finish(ground, kind, &[])? {
+                    Some(p) => p,
                     None => return Ok(None),
                 }
             }
-            let Some((&term, args)) = v.split_last() else { return Ok(None) };
-            PNode::ExProj { trait_, name, args: ground.intern_list(args)?, term }
+        };
+        let mut val = val;
+        loop {
+            let Some(top) = frames.last_mut() else {
+                return Ok(Some(val));
+            };
+            values.push(val);
+            if let Some((l, idx, n)) = top.list {
+                if idx < n {
+                    top.list = Some((l, idx + 1, n));
+                    cur_t = cx.list_get(l, idx);
+                    cur_d = top.depth;
+                    break;
+                }
+                top.list = None;
+            }
+            if let Some(extra_t) = top.extra.take() {
+                cur_t = extra_t;
+                cur_d = top.depth;
+                break;
+            }
+            let Some(frame) = frames.pop() else {
+                return Ok(Some(val));
+            };
+            let slice = values.get(frame.val_base..).unwrap_or(&[]);
+            val = match finish(ground, frame.kind, slice)? {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            values.truncate(frame.val_base);
         }
-        TyView::ExAuto(k) => PNode::ExAuto(k),
-        TyView::Foreign(k) => PNode::Foreign(k),
-        TyView::ClosureOf { owner, ordinal, args, .. } => match export_list(cx, args, ground, d)? {
-            Some(args) => PNode::Closure { owner, ordinal, args },
-            None => return Ok(None),
-        },
-        TyView::CoroutineOf { owner, ordinal, args, .. } => match export_list(cx, args, ground, d)? {
-            Some(args) => PNode::Coroutine { owner, ordinal, args },
-            None => return Ok(None),
-        },
-        TyView::Closure(..)
-        | TyView::Future(..)
-        | TyView::Param(_)
-        | TyView::Infer(_)
-        | TyView::ConstParam(_)
-        | TyView::ConstInfer(_) => return Ok(None),
-    };
-    Ok(Some(ground.intern(n)?))
+    }
 }
 
 fn export_list(

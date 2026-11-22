@@ -150,6 +150,7 @@ fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
     let mut sandbox = Sandbox::new(Arc::new(package));
     let dir = sandbox.var("CARGO_MANIFEST_DIR").unwrap_or_else(|e| panic!("{e:?}")).unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR unset"));
     assert_eq!(dir, "/package");
+    // asks blaze: asserts that the sandboxed proc-macro env leaves CARGO unset
     assert_eq!(sandbox.var("CARGO"), Ok(None), "CARGO is unset by rule: proc-macro-crate skips `cargo locate-project`");
     const READ_ONLY: Open = Open { dirflags: 1, oflags: 0, rights_base: 1 << 1, rights_inheriting: 0, fdflags: 0 };
     let path = std::format!("{dir}/Cargo.toml");
@@ -177,6 +178,7 @@ fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
     set.extend(unit_env(&env));
     let old_env = PackageEnv::new(set, old_unknown, std::vec::Vec::new()).unwrap_or_else(|e| panic!("{e}"));
     let mut old = Sandbox::new(Arc::new(Package::new(files(), old_env).unwrap_or_else(|e| panic!("{e}"))));
+    // asks blaze: asserts that the planted old env refused CARGO
     assert!(old.var("CARGO").is_err(), "the planted old env answered CARGO");
     println!("git package's macro: CARGO unset, read {} manifest bytes at {path}; the old env refused CARGO", read.len());
 }

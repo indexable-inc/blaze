@@ -121,6 +121,7 @@ fn text(result: &Result<Expanded<'static>, ExpandError>) -> String {
 
 const E21: Edition = Edition::E2021;
 
+/// The refinement: `macro_rules!` expansions, hygiene marks, and diagnostics agree token-for-token with the recorded reference expansions.
 #[test]
 fn rules_and_their_errors_agree() {
     // Local ambiguity: a repetition of `ident` before an `ident`.

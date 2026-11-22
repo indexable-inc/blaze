@@ -471,6 +471,7 @@ fn case_in(tape: &Tape, alloc: Alloc<'_>) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: published remote reads return only verified true bytes of public settled records or typed refusals within configured index limits.
 #[test]
 fn published_records_are_true_bytes_or_typed_refusals_in_three_waves() {
     on_a_big_stack(|| blaze_sim::check(Config::cases(400), |tape| case(tape, Plant::None)));

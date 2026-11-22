@@ -91,12 +91,52 @@ fn write_dir<'n>(d: u32, parent: &impl Fn(u32) -> u32, name: &impl Fn(u32) -> &'
     if d == 0 {
         return;
     }
-    let up = parent(d);
-    write_dir(up, parent, name, put);
-    if up != 0 {
-        put("/");
+    const CHUNK: usize = 128;
+    let mut buf = [0u32; CHUNK];
+    let mut cur = d;
+    let mut len = 0usize;
+    for slot in &mut buf {
+        if cur == 0 {
+            break;
+        }
+        *slot = cur;
+        len += 1;
+        cur = parent(cur);
     }
-    put(name(d));
+    if cur == 0 {
+        for (i, &id) in buf.iter().take(len).rev().enumerate() {
+            if i > 0 {
+                put("/");
+            }
+            put(name(id));
+        }
+        return;
+    }
+    let mut depth = len;
+    while cur != 0 {
+        depth += 1;
+        cur = parent(cur);
+    }
+    let mut emitted = 0usize;
+    while emitted < depth {
+        let take = (depth - emitted).min(CHUNK);
+        let skip = depth - emitted - take;
+        let mut cur = d;
+        for _ in 0..skip {
+            cur = parent(cur);
+        }
+        for slot in buf.iter_mut().take(take) {
+            *slot = cur;
+            cur = parent(cur);
+        }
+        for (i, &id) in buf.iter().take(take).rev().enumerate() {
+            if emitted > 0 || i > 0 {
+                put("/");
+            }
+            put(name(id));
+        }
+        emitted += take;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

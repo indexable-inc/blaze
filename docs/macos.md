@@ -63,8 +63,8 @@ is; "measure" rows name the measurement that decides them, below the tables.
 | Today | Better call | Buys | Risk | Decision |
 |---|---|---|---|---|
 | The pool gives pages back with `MADV_FREE_REUSABLE` and takes them with `MADV_FREE_REUSE` (`crates/blaze-mem/src/os.rs`) | the same | Out of `phys_footprint` at once, the one measure (rule `one-memory-measure`); the region test holds the kernel to it | Apple-only advice | In use |
-| Footprint is `proc_pid_rusage`'s `ri_phys_footprint` (`crates/blaze-core/src/raw.rs:437`, `crates/blaze-cargo/src/raw/memory.rs`) | `task_info(TASK_VM_INFO)`, `os_proc_available_memory` | The same ledger; `proc_pid_rusage` also reads a child's and the lifetime peak, which the others do not | none | In use |
-| The daemon's ceiling is `memorystatus_control(SET_MEMLIMIT_PROPERTIES)` (`crates/blaze-cargo/src/raw/memory.rs`) | `task_set_phys_footprint_limit` | The same limit by another door, and kernel-private | Root or an entitlement either way | In use |
+| Footprint is `proc_pid_rusage`'s `ri_phys_footprint` (`crates/blaze-core/src/raw.rs:437`) | `task_info(TASK_VM_INFO)`, `os_proc_available_memory` | The same ledger; `proc_pid_rusage` also reads a child's and the lifetime peak, which the others do not | none | In use |
+| The daemon's ceiling is `memorystatus_control(SET_MEMLIMIT_PROPERTIES)` (`crates/blaze-core/src/raw.rs`) | `task_set_phys_footprint_limit` | The same limit by another door, and kernel-private | Root or an entitlement either way | In use |
 | A child's limit is a thread reading its footprint every 2 ms (`crates/blaze-core/src/footprint.rs`) | `posix_spawnattr_setjetsam_ext` (private, `spawn_private.h`) with a fatal memory limit at spawn | The kernel enforces it at the page fault: no polling thread, no overshoot | Private; may need an entitlement on macOS | Measure (M7) |
 | The pressure signal is `EVFILT_MEMORYSTATUS` (above) | the same | | | In use |
 | Caches are evicted by the pool on the pressure signal | `mach_vm_purgable_control` | The kernel drops volatile memory itself | Purgeable memory still counts in footprint while non-volatile, and a dropped range must be detected at every read: the pool's evictor already decides by footprint | Not used |
@@ -82,7 +82,7 @@ is; "measure" rows name the measurement that decides them, below the tables.
 
 | Today | Better call | Buys | Risk | Decision |
 |---|---|---|---|---|
-| `sandbox_init_with_parameters` with a profile whose paths are parameters (`crates/blaze-cargo/src/sandbox/macos/raw.rs`) | the same | A profile applied in the child before exec, with no `sandbox-exec` process | Private; now has a resolve test | In use |
+| `sandbox_init_with_parameters` with a profile whose paths are parameters (`crates/blaze-wasi`) | the same | A profile applied in the child before exec, with no `sandbox-exec` process | Private; now has a resolve test | In use |
 | Paths are granted by parameters of the profile | `sandbox_extension_issue_file` and `sandbox_extension_consume` | A grant after the profile is applied | The profile must allow the extension class, and the token is consumed by code inside the child: blaze runs none there | Not used |
 | Nothing asks what the sandbox would allow | `sandbox_check` | A test could ask, without trying the access | Private | Not used; the sandbox's tests try the access, which is the evidence |
 

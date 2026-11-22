@@ -186,24 +186,36 @@ impl<'a, N: Name> Resolver<'a, N> {
         sink: &mut Sink<'a, N>,
         errors: &mut Errors<'a, N>,
     ) -> Result<(), ResolveError> {
-        let f = &self.frags[frag as usize];
-        for &(ns, name, e) in f.items.iter() {
-            errors.bind(ns, name, e.def);
-        }
-        for path in f.bad_vis.iter() {
-            errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(self.alloc.clone()) });
-        }
-        for &name in f.bad_extern.iter() {
-            errors.list.push(ScopeError::ExternCrate { name });
-        }
-        for slot in f.slots.iter() {
-            match *slot {
+        let mut stack: AVec<'a, (u32, usize, bool)> = AVec::new_in(self.alloc);
+        stack.push((frag, 0, false));
+        while let Some((cur, idx, entered)) = stack.last_mut() {
+            let cur_frag = *cur;
+            let f = &self.frags[cur_frag as usize];
+            if !*entered {
+                *entered = true;
+                for &(ns, name, e) in f.items.iter() {
+                    errors.bind(ns, name, e.def);
+                }
+                for path in f.bad_vis.iter() {
+                    errors.list.push(ScopeError::RestrictedNotAncestor { path: path.copy_in(self.alloc.clone()) });
+                }
+                for &name in f.bad_extern.iter() {
+                    errors.list.push(ScopeError::ExternCrate { name });
+                }
+            }
+            let slot_idx = *idx;
+            let Some(&slot) = f.slots.get(slot_idx) else {
+                stack.pop();
+                continue;
+            };
+            *idx = slot_idx + 1;
+            match slot {
                 Slot::Use(i) => self.finish_import(i as usize, env, sink, errors),
                 Slot::Glob(g) => self.finish_glob(g as usize, facts, env, sink, errors)?,
                 Slot::Call(c) => {
                     self.finish_call(c as usize, env, sink, errors);
                     if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
-                        self.finish_frag(inner, facts, env, sink, errors)?;
+                        stack.push((inner, 0, false));
                     }
                 }
                 Slot::Rules { .. } | Slot::Mod { .. } => {}
@@ -489,10 +501,22 @@ impl<'a, N: Name> Resolver<'a, N> {
         traits: &mut AVec<'a, AnonImport>,
         exports: &mut AVec<'a, TextualDef<N>>,
     ) {
-        let f = &self.frags[frag as usize];
-        exports.extend_from_slice(&f.exports);
-        for slot in f.slots.iter() {
-            match *slot {
+        let mut stack: AVec<'a, (u32, usize, bool)> = AVec::new_in(self.alloc);
+        stack.push((frag, 0, false));
+        while let Some((cur, idx, entered)) = stack.last_mut() {
+            let cur_frag = *cur;
+            let f = &self.frags[cur_frag as usize];
+            if !*entered {
+                *entered = true;
+                exports.extend_from_slice(&f.exports);
+            }
+            let slot_idx = *idx;
+            let Some(&slot) = f.slots.get(slot_idx) else {
+                stack.pop();
+                continue;
+            };
+            *idx = slot_idx + 1;
+            match slot {
                 Slot::Use(i) => {
                     let imp = &self.imports[i as usize];
                     if imp.bound.is_some() || imp.failed.is_some() {
@@ -506,7 +530,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 }
                 Slot::Call(c) => {
                     if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
-                        self.anon_and_exports(inner, traits, exports);
+                        stack.push((inner, 0, false));
                     }
                 }
                 Slot::Rules { .. } | Slot::Mod { .. } | Slot::Glob(_) => {}
@@ -525,13 +549,22 @@ impl<'a, N: Name> Resolver<'a, N> {
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) {
-        let f = &self.frags[frag as usize];
-        for slot in f.slots.iter() {
-            match *slot {
+        let mut stack: AVec<'a, (u32, usize)> = AVec::new_in(self.alloc);
+        stack.push((frag, 0));
+        while let Some((cur, idx)) = stack.last_mut() {
+            let cur_frag = *cur;
+            let f = &self.frags[cur_frag as usize];
+            let slot_idx = *idx;
+            let Some(&slot) = f.slots.get(slot_idx) else {
+                stack.pop();
+                continue;
+            };
+            *idx = slot_idx + 1;
+            match slot {
                 Slot::Rules { name, def, shapes, .. } => out.push(TextualDef { name, def, expansion: f.expansion, shapes }),
                 Slot::Call(c) => {
                     if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
-                        self.flatten(inner, out, marks.as_deref_mut(), env, sink);
+                        stack.push((inner, 0));
                     }
                 }
                 Slot::Mod { child, macro_use } => {

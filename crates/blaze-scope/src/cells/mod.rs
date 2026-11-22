@@ -3043,32 +3043,36 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// `amb_kind`: set to `GlobVsOuter` when the answer is ambiguous because a glob's candidate
     /// meets a different outer one (`...ambiguity.glob-vs-outer`); left as it is otherwise.
     #[expect(clippy::too_many_arguments, reason = "the lookup's inputs, and the ambiguity kind it answers beside its value")]
-    fn first_segment(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, guess: Option<&Guess<'a>>, hold: Hold, amb_kind: &mut AmbiguityKind) -> Step<Value> {
+    fn first_segment(&mut self, mut m: ModId, ns: Namespace, name: N, me: ItemId, guess: Option<&Guess<'a>>, hold: Hold, amb_kind: &mut AmbiguityKind) -> Step<Value> {
         let weak = hold == Hold::NamedImport;
-        let view = if weak { self.weak_view(m, ns, name, me) } else { self.own_view(m, ns, name, me, Skip::Growth, guess) };
-        let (inner, from) = match view {
-            Step::Done(x) => x,
-            Step::Wait(n) => return Step::Wait(n),
+        let (inner, from) = loop {
+            let view = if weak { self.weak_view(m, ns, name, me) } else { self.own_view(m, ns, name, me, Skip::Growth, guess) };
+            let (inner, from) = match view {
+                Step::Done(x) => x,
+                Step::Wait(n) => return Step::Wait(n),
+            };
+            // A block's module whose only glob is its lexical one ([`Cells::lexical_glob`]) and that
+            // binds `name` itself nowhere: its candidate is the scope around the block's, not a
+            // glob's. The Reference, `names.scopes.block` / "Statements", "Item declarations": a
+            // block's names are its own item declarations, and a name it lacks is looked up in the
+            // scope around it, lexically; that walk is no glob import, so the glob-vs-outer rule
+            // (`names.resolution.expansion.imports.ambiguity.glob-vs-outer`) is the enclosing
+            // module's to apply, against its own kind of binding. (`use dep::emits_impl as format;
+            // fn g() { format!(); }`: the module's named import shadows the `#[macro_use]`
+            // prelude's `format`; taken as a glob's candidate it was GlobVsOuter, the call failed
+            // and its impl was never written.) A block with a glob of its own keeps the glob
+            // reading: its candidates and the outer ones are then really a glob's and the outer's.
+            if from == From::Glob
+                && self.anonymous(m)
+                && self.plant != CellPlant::LexicalGlobIsAGlob
+                && self.modules[m as usize].glob_items.iter().all(|&g| self.lexical_glob(g))
+                && let Some(p) = self.modules[m as usize].parent
+            {
+                m = p;
+                continue;
+            }
+            break (inner, from);
         };
-        // A block's module whose only glob is its lexical one ([`Cells::lexical_glob`]) and that
-        // binds `name` itself nowhere: its candidate is the scope around the block's, not a
-        // glob's. The Reference, `names.scopes.block` / "Statements", "Item declarations": a
-        // block's names are its own item declarations, and a name it lacks is looked up in the
-        // scope around it, lexically; that walk is no glob import, so the glob-vs-outer rule
-        // (`names.resolution.expansion.imports.ambiguity.glob-vs-outer`) is the enclosing
-        // module's to apply, against its own kind of binding. (`use dep::emits_impl as format;
-        // fn g() { format!(); }`: the module's named import shadows the `#[macro_use]`
-        // prelude's `format`; taken as a glob's candidate it was GlobVsOuter, the call failed
-        // and its impl was never written.) A block with a glob of its own keeps the glob
-        // reading: its candidates and the outer ones are then really a glob's and the outer's.
-        if from == From::Glob
-            && self.anonymous(m)
-            && self.plant != CellPlant::LexicalGlobIsAGlob
-            && self.modules[m as usize].glob_items.iter().all(|&g| self.lexical_glob(g))
-            && let Some(p) = self.modules[m as usize].parent
-        {
-            return self.first_segment(p, ns, name, me, guess, hold, amb_kind);
-        }
         if inner == Value::Outside {
             return Step::Done(Value::Outside);
         }

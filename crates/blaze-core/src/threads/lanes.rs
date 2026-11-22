@@ -588,6 +588,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: fast-lane effects never wait behind device-lane barriers, and each lane's backlog stays within its configured caps.
     /// Expected: passes. N barriers of 100 ms fill the device lane; a rename asked after them
     /// is taken at once and ends in its own time.
     #[test]

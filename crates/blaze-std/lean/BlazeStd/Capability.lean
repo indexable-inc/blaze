@@ -130,7 +130,8 @@ theorem chan_pop_preserves_bound {α : Type} (c c' : BoundedChan α) (v : α)
     unfold BoundedChan.withinBound at hbound ⊢
     rw [hbuf] at hbound
     simp only [List.length_cons] at hbound
-    omega
+    dsimp only
+    exact Nat.le_of_succ_le hbound
 
 /-- Strict FIFO delivery: pushing `a` then `b` into an empty channel of capacity ≥ 2 pops `a`
     first, then `b`, returning the channel to empty. -/

@@ -335,7 +335,18 @@ fn serve(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_
         let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, .. } = edge;
         let Some(target) = why else {
             let checked = match flags.fix {
-                None => Some(check(cx, io, root, opts(), &mut shown, phases, out, err)?),
+                None => {
+                    let line = crate::run_line::LineOpts::from_io(io, err, flags.color);
+                    let clock = io.need_clock()?;
+                    let ran = crate::run_line::watched(cx, io, err, &clock, line, |watch, bg| {
+                        watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
+                        let live = line.live.then_some(bg);
+                        let res = check_live(cx, io, root, opts(), &mut shown, phases, out, err, live);
+                        watch.see(blaze_screen::Step::Says);
+                        res
+                    }).map_err(CliError::RunLine)??;
+                    Some(ran)
+                }
                 // `blaze check --fix <selector>..` (fix.rs): a quiet check, its findings' fixes
                 // written as one transaction, then a second check printing what is left; the
                 // listed findings are in the request's frame, which outlives both.
@@ -399,9 +410,9 @@ fn edge<R>(
     cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap, flags: &crate::Flags<'_>, why: Option<&str>, frame: &Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
-    // `why`'s first word is its target, never a checkout: it stands where blaze was started.
-    let checkout = crate::checkout::checkout(if why.is_some() { None } else { flags.dir }, frame)?;
     let fs = io.need_fs()?;
+    let env = io.env();
+    let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&VarName::new(name).ok()?).ok().flatten() };
     // The named origin, opened as `check-old` opens it (main.rs): a miss is read from it.
     // Declared before `shown`: the request's options and what it prints share one lifetime
     // (`checking` takes `&mut Shown<'f>`), so the origin must outlive the printer's state.
@@ -412,9 +423,18 @@ fn edge<R>(
     // layout whole (every member's manifest); the SDK is xcrun's, a process started, wherever
     // SDKROOT is unset.
     phases.mark_cx(cx, "open checkout: the origin named", frame);
-    // A member's folder walks up to its workspace's root (run_package.rs `locate`, R3): the
-    // root is the engine's checkout; the member is what `run` and `test` select by default.
-    let located = crate::run_package::locate(cx, &fs, &checkout, frame)?;
+    // Single-file `.rs` script (`blaze run script.rs`, `blaze check script.rs`, `blaze test script.rs`),
+    // or a directory/workspace checkout walking up to its workspace root (run_package.rs `locate`, R3).
+    let located = match flags.dir {
+        Some(raw) if why.is_none() && crate::single_file::is_script_arg(raw) => {
+            crate::single_file::prepare(cx, &fs, var("HOME"), raw, frame)?
+        }
+        _ => {
+            // `why`'s first word is its target, never a checkout: it stands where blaze was started.
+            let checkout = crate::checkout::checkout(if why.is_some() { None } else { flags.dir }, frame)?;
+            crate::run_package::locate(cx, &fs, &checkout, frame)?
+        }
+    };
     phases.mark_cx(cx, "open checkout: the workspace's root (run_package.rs `locate`: one manifest at a `[workspace]` root, else the layout whole)", frame);
     let (checkout_at, member): (&str, &str) = (located.at, located.member);
     let root = located.root;
@@ -424,8 +444,6 @@ fn edge<R>(
     let producers = crate::producers::table(host.build_id()?.as_bytes());
     let tools = crate::engine_store::tools(&crate::home::tools(&producers, crate::lints::Lints::NONE.rules));
     phases.mark_cx(cx, "open checkout: the host's facts and the tools' producers", frame);
-    let env = io.env();
-    let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&VarName::new(name).ok()?).ok().flatten() };
     // The fetch environment's facts, read at the edge as `check` reads them (main.rs).
     let cargo_home = match (var("CARGO_HOME"), var("HOME")) {
         (Some(cargo), _) => Some(bstd::mem::format_in!(frame, "{cargo}")),
@@ -457,7 +475,7 @@ fn edge<R>(
     // cargo's `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for this machine's target (rustflags.rs).
     let target_rustflags_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, heap.alloc());
     let place = Place {
-        checkout: checkout_at,
+        checkout: served.root_text().unwrap_or(checkout_at),
         served,
         cert_file: var("SSL_CERT_FILE"),
         cert_dir: var("SSL_CERT_DIR"),
@@ -609,7 +627,7 @@ impl<'r, 'm> Standing<'r, 'm> {
 /// borrows the lent store opened here and the answer borrows both (a returned value would
 /// refer to itself). COST: the check's, then one pointer get, one root get and the snapshot.
 pub(crate) fn check_for_start<R>(
-    cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap, flags: &crate::Flags<'_>,
+    cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap, flags: &crate::Flags<'_>, quiet_when_clean: bool, live: Option<&(dyn blaze_screen::Watch + Sync)>,
     start: impl for<'r, 'm> FnOnce(Standing<'r, 'm>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
     let request = request_frame()?;
@@ -618,9 +636,10 @@ pub(crate) fn check_for_start<R>(
         let Edge { root, opts, mut shown, err, frame, place, tools, workers, producers, member, signals, .. } = edge;
         #[cfg(not(unix))]
         let Edge { root, opts, mut shown, err, frame, place, tools, workers, producers, member, .. } = edge;
+        shown.quiet_when_clean = quiet_when_clean;
         let opts = opts();
         let toolchain = opts.toolchain;
-        let checked = check(cx, io, root, opts, &mut shown, phases, out, err)?;
+        let checked = check_live(cx, io, root, opts, &mut shown, phases, out, err, live)?;
         // The check has answered: its signals go back before the start, which takes the
         // parent's own (D103: run_loop.rs `Held::hold`; a suite's pool, test_drive.rs
         // `Signals`, once for the suite). Held into the start, the first run is refused.
@@ -931,6 +950,13 @@ pub(crate) struct Checked {
 /// `err`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
 pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out) -> Result<Checked, CliError> {
+    check_live(cx, io, root, opts, shown, phases, out, err, None)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
+fn check_live<'f>(
+    cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out, live: Option<&(dyn blaze_screen::Watch + Sync)>,
+) -> Result<Checked, CliError> {
     #[cfg(test)]
     stack_probe::at("check");
     // Where the check stands, said when asked or stopped (engine_status.rs), the watcher
@@ -944,8 +970,8 @@ pub(crate) fn check<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'
     let heap = opts.heap;
     let mut active = None;
     let result = work::unwinding(|| {
-        crate::engine_status::watched(io, root, err, &clock, board, asking.every, || {
-            checking(cx, io, root, opts, shown, phases, out, err, board, &mut active)
+        crate::engine_status::watched(io, root, err, &clock, board, asking.every, live, || {
+            checking(cx, io, root, opts, shown, phases, out, err, board, &mut active, live)
         }).map_err(EngineCheckError::Watcher)?
     });
     let error = match result {
@@ -1005,7 +1031,10 @@ fn made_boxed<T>(heap: &'static blaze_own::Heap, make: impl FnOnce() -> T) -> bl
 
 /// [`check`] under its board.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out, board: &crate::engine_status::Board<'_>, active: &mut Option<Phase>) -> Result<BoxedChecked, CliError> {
+fn checking<'f>(
+    cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, shown: &mut print::Shown<'f>, phases: &mut Phases, out: &Out, err: &Out, board: &crate::engine_status::Board<'_>, active: &mut Option<Phase>,
+    live: Option<&(dyn blaze_screen::Watch + Sync)>,
+) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
     let Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant } = opts;
@@ -1161,6 +1190,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
             // (rule 54: no stage's temporaries in this frame).
             if let Some(sweep) = script_sweep.as_mut() { sweep.keep(cx, &mut store, answer_root.as_str(), &followed.now, frame)?; sweep_counts.status = Some(sweep.counts()); }
             let journal = (&chosen, &now_places, &mut journal_counts);
+            if let Some(live) = live {
+                live.see(blaze_screen::Step::Says);
+            }
             let stood = certified(cx, root, &view_slot, pointer, lines, answer_root.as_str(), journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
             drop(store);
             let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
@@ -1748,6 +1780,9 @@ fn checking<'f>(cx: &'f Cx, io: &Io, root: &Dir<ReadWrite>, opts: Opts<'f>, show
         // The closing line's count: every file the request has an outline of (on the ready setup,
         // those read back and those it did not need: `slots`), as the phase path's walk outlines each.
         let files_checked = slots.unwrap_or_else(|| u32::try_from(outlined.len()).unwrap_or(u32::MAX));
+        if let Some(live) = live {
+            live.see(blaze_screen::Step::Says);
+        }
         let printed = print_answer(cx, root, &view_slot, &mut store, &made, &mut rows, (names.as_ref(), &bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, (&*phases, began), shown, frame, out)?;
         let AnswerPrinted { tally, lines_key, lines_bytes, status, oracle, bodies_whole } = printed;
         let unprinted = made.unprinted;
@@ -2276,8 +2311,22 @@ fn print_answer<'m, 'f, 'a>(
     let bodies_whole = names.is_some() && bodies.whole() && *standing_bodies_whole;
     let (ran_stages, not_stages) = crate::check_coverage(names.is_some(), bodies_whole, bodies_whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
-    print::stage_notes(cx, &not_stages, shown, frame, out)?;
-    print::closing(cx, shown, files_checked, phases.since(began), Some(finished.report.entered), None, coverage, frame, out)?;
+    let silent_clean = shown.quiet_when_clean
+        && shown.counts.errors == 0
+        && shown.counts.warnings == 0
+        && unchecked == 0
+        && shown.behind.items == 0
+        && unprinted == 0
+        && unreadable.is_none();
+    if !silent_clean {
+        print::stage_notes(cx, &not_stages, shown, frame, out)?;
+        // Never print "0 errors" or "no errors in" beside items blaze could not check
+        // (`check_unchecked_items.rs`).
+        let unchecked_only = (unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
+        if !unchecked_only {
+            print::closing(cx, shown, files_checked, phases.since(began), Some(finished.report.entered), None, coverage, frame, out)?;
+        }
+    }
     // The bodies not checked, under one line beside the closing line, as `check` prints it.
     if let Some(words) = crate::not_checked::items::summary(unchecked, shown.behind, frame) {
         print::note(cx, words.as_str(), shown, frame, out)?;
@@ -2364,8 +2413,18 @@ fn certified<'f, D: blaze_core::Driver, S: crate::store::Sharing>(
     let whole = facts.printed.bodies_whole;
     let (ran_stages, not_stages) = crate::check_coverage(facts.printed.names, whole, whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
-    print::stage_notes(cx, &not_stages, shown, frame, out)?;
-    print::closing(cx, shown, facts.files, phases.since(began), Some(0), None, coverage, frame, out)?;
+    let silent_clean = shown.quiet_when_clean
+        && shown.counts.errors == 0
+        && shown.counts.warnings == 0
+        && tally.unchecked == 0
+        && shown.behind.items == 0;
+    if !silent_clean {
+        print::stage_notes(cx, &not_stages, shown, frame, out)?;
+        let unchecked_only = (tally.unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
+        if !unchecked_only {
+            print::closing(cx, shown, facts.files, phases.since(began), Some(0), None, coverage, frame, out)?;
+        }
+    }
     if let Some(words) = crate::not_checked::items::summary(tally.unchecked, shown.behind, frame) {
         print::note(cx, words.as_str(), shown, frame, out)?;
     }

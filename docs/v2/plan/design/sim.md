@@ -66,7 +66,8 @@ the whole run. Reach points are the complement of planted bugs: a control proves
 a bug, a reach point proves the run got to where the bug lives.
 
 **The driver** (`check.rs`) is the one place that reads the environment (`BLAZE_SIM_SEED`,
-`BLAZE_SIM_SEEDS`, `BLAZE_SIM_TAPE`), catches a panic and prints. No attribute macro: a test is
+`BLAZE_SIM_SEEDS`, `BLAZE_SIM_TAPE`, and `BLAZE_SIM_BOARD` for the runner's board descriptor in
+`board.rs`), catches a panic and prints. No attribute macro: a test is
 `#[test] fn f() { blaze_sim::check(Config::cases(200), |tape| ..) }`, and a generator is a
 function of the tape (`fn op(tape: &Tape) -> Op`), not a combinator object. A failure prints the
 seed, the least tape with each choice that is not calm by label, the notes, and one line that

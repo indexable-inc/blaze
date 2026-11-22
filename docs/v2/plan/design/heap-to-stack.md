@@ -6,7 +6,7 @@ date: 2026-11-02
 # HeapToStack: allocations that never leave their function
 
 Lane escape. The pass is
-[`crates/hir-ty-mir/src/mir/optimize/escape.rs`](../../../../crates/hir-ty-mir/src/mir/optimize/escape.rs);
+`crates/hir-ty-mir/src/mir/optimize/escape.rs`;
 its module doc is the reference for each shape it takes and why. This page is what the pass
 relies on, what it does not do yet, and how to measure it.
 

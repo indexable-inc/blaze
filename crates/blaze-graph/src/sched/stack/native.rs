@@ -425,7 +425,7 @@ mod tests {
         std::hint::black_box(&frame)[100].wrapping_add(below)
     }
 
-    /// The invariant: a fiber's stack is in its tag's count from its start, by its standing
+    /// Invariant: a fiber's stack is in its tag's count from its start, by its standing
     /// bytes, and as deep as it is seen to reach at each suspend; its count leaves with it.
     /// 2 MiB of frames suspended from leave the stack's region holding at least 2 MiB; a fresh
     /// stack holds exactly [`STANDING`]. The control, by removing the cause: a fiber that

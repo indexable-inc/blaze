@@ -1001,7 +1001,6 @@ impl CodeStore for MemoryStore<'_> {
                 let mut value = Vec::new_in(self.alloc);
                 value.extend_from_slice(bytes);
                 self.rows.insert_shift(at, (key, value));
-                self.puts += 1;
                 Ok(())
             }
         }
@@ -1013,9 +1012,14 @@ impl CodeStore for MemoryStore<'_> {
 
     fn point(&mut self, _class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
         match self.pointers.binary_search_by(|row| row.0.cmp(&key)) {
-            Ok(at) => self.pointers[at].1 = content,
+            Ok(at) if self.pointers[at].1 == content => {}
+            Ok(at) => {
+                self.pointers[at].1 = content;
+                self.puts += 1;
+            }
             Err(at) => {
                 self.pointers.insert_shift(at, (key, content));
+                self.puts += 1;
             }
         }
         Ok(())

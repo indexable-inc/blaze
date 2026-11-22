@@ -626,7 +626,7 @@ fn a_stream_is_acknowledged_once_the_peer_has_its_fin_and_never_before() {
 /// Control: with the acknowledgement told as the FIN is handed to QUIC (the meaning of
 /// `StreamSent`), the test above fails.
 #[test]
-fn the_acknowledgement_test_catches_an_ack_told_at_sent() {
+fn the_oracle_catches_an_ack_told_at_sent() {
     let failed = an_answer_acknowledged(super::endpoint::Plant::AckedAtSent).unwrap_err();
     assert!(failed.contains("before any byte of it left"), "{failed}");
 }

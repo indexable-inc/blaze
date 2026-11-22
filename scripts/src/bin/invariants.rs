@@ -250,8 +250,36 @@ fn scan(p: &Patterns, path: &str, text: &str) -> Result<(Vec<Entry>, Vec<String>
             words.push(more.get(1).map_or("", |m| m.as_str()));
             i += 1;
         }
-        while i < lines.len() && (lstrip(lines[i]).starts_with("#[") || lstrip(lines[i]).starts_with("//")) {
-            i += 1;
+        let mut attr_depth: usize = 0;
+        while i < lines.len() {
+            let trimmed = lstrip(lines[i]);
+            if attr_depth > 0 {
+                for ch in trimmed.chars() {
+                    if ch == '[' {
+                        attr_depth += 1;
+                    } else if ch == ']' {
+                        attr_depth = attr_depth.saturating_sub(1);
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                for ch in trimmed.chars() {
+                    if ch == '[' {
+                        attr_depth += 1;
+                    } else if ch == ']' {
+                        attr_depth = attr_depth.saturating_sub(1);
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                i += 1;
+                continue;
+            }
+            break;
         }
         let item = if i < lines.len() { p.item.captures(lines[i]) } else { None };
         let Some(item) = item else {

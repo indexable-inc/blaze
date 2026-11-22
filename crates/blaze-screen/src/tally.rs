@@ -109,7 +109,7 @@ pub fn tests_line(tally: &Tally, ok: bool, why: Option<&str>, elapsed_ms: u64) -
 mod tests {
     use super::*;
 
-    /// The invariant: every line a run's end is said by carries how many tests were selected
+    /// Invariant: every line a run's end is said by carries how many tests were selected
     /// and how many ran, so a run of nothing cannot read as a pass of something.
     #[test]
     fn the_line_always_says_how_many_were_selected_and_ran() {

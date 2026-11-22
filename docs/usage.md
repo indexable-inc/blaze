@@ -26,7 +26,7 @@ blaze's home (docs/v2/plan/design/bottom.md, "The commands"). No `cargo build` a
 
 A build blaze can't do fails with the reason and is not handed to cargo. Each is a bug
 ([#84](https://github.com/indexable-inc/blaze/issues/84), [the plan](no-rustc.md)). rustc's `-Z`
-flags in `RUSTFLAGS` or `rustflags` are read by one table (`crates/blaze-cargo/src/unstable.rs`):
+flags in `RUSTFLAGS` or `rustflags` are read by `crates/blaze-unit-graph`:
 each is ignored (it changes only how rustc works), modelled, or refused, naming the flag; one the
 table lacks is refused ([support.md](support.md#-z-flags-for-rustc)).
 

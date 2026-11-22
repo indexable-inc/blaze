@@ -564,36 +564,107 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
 /// [`scan`] of a text `depth` item bodies deep: then each `fn`, `const` and `static` found is
 /// scanned in turn for [`NestedItem::body_writes`] (its own text is a body-like text too).
 fn scan_at<'a>(text: &str, depth: u16, alloc: Alloc<'a>) -> Nested<'a> {
-    let mut out = scan_one(text, alloc);
-    if out.end == NestedEnd::Unbalanced {
-        out.surface_by_text = true;
-        return out;
+    struct Frame<'t, 'a> {
+        text: &'t str,
+        out: Nested<'a>,
+        next: usize,
+        depth: u16,
+        writes_kind: bool,
+        surface_kind: bool,
+        own_surface: bool,
+        braced: bool,
     }
-    for item in out.items.iter_mut() {
-        let Some(own) = text.get(item.range.start as usize..item.range.end as usize) else {
-            // Never: the scan's ranges are of `text`. Taken to be seen outside, never inside.
-            item.surface = true;
-            continue;
-        };
-        let writes_kind = matches!(item.kind, NestedKind::Fn | NestedKind::Const | NestedKind::Static);
-        // The kinds whose own text may hold an item seen outside (a block `mod`'s, a trait's
-        // default bodies, an array length's block); an `impl` and an extern block already are.
-        let surface_kind = !matches!(
-            item.kind,
-            NestedKind::Impl | NestedKind::ExternBlock | NestedKind::MacroRules | NestedKind::Macro | NestedKind::Use | NestedKind::ExternCrate
-        );
-        let own_surface = matches!(item.kind, NestedKind::Impl | NestedKind::ExternBlock) || attrs_emit(own);
-        // A body with no brace group has no block (`const K: u8 = 1;`).
-        let braced = own.contains('{');
-        let deep = depth >= MAX_BODY_DEPTH;
-        let inner = if braced && !deep && (writes_kind || (surface_kind && !own_surface)) { Some(scan_at(own, depth + 1, alloc)) } else { None };
-        if writes_kind && braced {
-            item.body_writes = deep || inner.as_ref().is_some_and(Nested::writes);
+    let mut root = scan_one(text, alloc);
+    if root.end == NestedEnd::Unbalanced {
+        root.surface_by_text = true;
+        return root;
+    }
+    let mut stack: AVec<'a, Frame<'_, 'a>> = AVec::new_in(alloc);
+    stack.push(Frame {
+        text,
+        out: root,
+        next: 0,
+        depth,
+        writes_kind: false,
+        surface_kind: false,
+        own_surface: false,
+        braced: false,
+    });
+    loop {
+        let mut descend: Option<(&str, Nested<'a>, u16)> = None;
+        if let Some(top) = stack.last_mut() {
+            while let Some(item) = top.out.items.get_mut(top.next) {
+                let Some(own) = top.text.get(item.range.start as usize..item.range.end as usize) else {
+                    // Never: the scan's ranges are of `text`. Taken to be seen outside, never inside.
+                    item.surface = true;
+                    top.next += 1;
+                    continue;
+                };
+                let writes_kind = matches!(item.kind, NestedKind::Fn | NestedKind::Const | NestedKind::Static);
+                // The kinds whose own text may hold an item seen outside (a block `mod`'s, a trait's
+                // default bodies, an array length's block); an `impl` and an extern block already are.
+                let surface_kind = !matches!(
+                    item.kind,
+                    NestedKind::Impl | NestedKind::ExternBlock | NestedKind::MacroRules | NestedKind::Macro | NestedKind::Use | NestedKind::ExternCrate
+                );
+                let own_surface = matches!(item.kind, NestedKind::Impl | NestedKind::ExternBlock) || attrs_emit(own);
+                // A body with no brace group has no block (`const K: u8 = 1;`).
+                let braced = own.contains('{');
+                let deep = top.depth >= MAX_BODY_DEPTH;
+                if braced && !deep && (writes_kind || (surface_kind && !own_surface)) {
+                    let mut inner = scan_one(own, alloc);
+                    if inner.end == NestedEnd::Unbalanced {
+                        inner.surface_by_text = true;
+                        if writes_kind {
+                            item.body_writes = inner.writes();
+                        }
+                        item.surface = own_surface || (surface_kind && inner.surface_by_text);
+                        top.next += 1;
+                        continue;
+                    }
+                    top.writes_kind = writes_kind;
+                    top.surface_kind = surface_kind;
+                    top.own_surface = own_surface;
+                    top.braced = braced;
+                    descend = Some((own, inner, top.depth + 1));
+                    break;
+                }
+                if writes_kind && braced {
+                    item.body_writes = deep;
+                }
+                item.surface = own_surface || (surface_kind && braced && deep);
+                top.next += 1;
+            }
         }
-        item.surface = own_surface || (surface_kind && braced && (deep || inner.as_ref().is_some_and(|n| n.surface_by_text)));
+        if let Some((own, inner, next_depth)) = descend {
+            stack.push(Frame {
+                text: own,
+                out: inner,
+                next: 0,
+                depth: next_depth,
+                writes_kind: false,
+                surface_kind: false,
+                own_surface: false,
+                braced: false,
+            });
+            continue;
+        }
+        let Some(mut done) = stack.pop() else {
+            return scan_one(text, alloc);
+        };
+        done.out.surface_by_text = done.out.items.iter().any(|i| i.surface);
+        if let Some(parent) = stack.last_mut() {
+            if let Some(item) = parent.out.items.get_mut(parent.next) {
+                if parent.writes_kind && parent.braced {
+                    item.body_writes = done.out.writes();
+                }
+                item.surface = parent.own_surface || (parent.surface_kind && parent.braced && done.out.surface_by_text);
+            }
+            parent.next += 1;
+        } else {
+            return done.out;
+        }
     }
-    out.surface_by_text = out.items.iter().any(|i| i.surface);
-    out
 }
 
 /// The outer attributes that leave an item in a block seen only by that block (D189, point

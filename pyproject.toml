@@ -32,26 +32,12 @@ include = [
   ".github/scripts/downstream_build.py",
   ".github/scripts/explore_page.py",
   "crates/harness/scripts/cef.py",
-  "harness/ci.py",
   "harness/counters.py",
   "harness/failures.py",
-  "harness/focused.py",
-  "harness/fuzz/edits.py",
-  "harness/hermetic.py",
-  "harness/includes.py",
-  "harness/incremental.py",
-  "harness/keys.py",
-  "harness/live_types.py",
-  "harness/own_inputs.py",
   "harness/profile_fixtures.py",
-  "harness/profile_gate.py",
-  "harness/profile_trend.py",
-  "harness/storelib.py",
-  "harness/storerevisions.py",
   "harness/toolchain_bump.py",
   "harness/v2",
   "tools/astlog/scan.py",
-  "tools/devirt/*.py",
   "tools/cpus.py",
   "tools/typed-input",
   "tools/v2",
@@ -61,10 +47,6 @@ include = [
 # These harnesses arrange their sibling imports after computing HERE. Their runtime
 # migration keeps that existing import order; new workspace packages use normal imports.
 [tool.ruff.lint.per-file-ignores]
-"harness/fuzz/edits.py" = ["E402"]
-"harness/hermetic.py" = ["E402"]
-"harness/includes.py" = ["E402"]
-"harness/keys.py" = ["E402"]
 "harness/v2/*.py" = ["E402"]
 
 [tool.pyright]
@@ -76,26 +58,12 @@ include = [
   ".github/scripts/downstream_build.py",
   ".github/scripts/explore_page.py",
   "crates/harness/scripts/cef.py",
-  "harness/ci.py",
   "harness/counters.py",
   "harness/failures.py",
-  "harness/focused.py",
-  "harness/fuzz/edits.py",
-  "harness/hermetic.py",
-  "harness/includes.py",
-  "harness/incremental.py",
-  "harness/keys.py",
-  "harness/live_types.py",
-  "harness/own_inputs.py",
   "harness/profile_fixtures.py",
-  "harness/profile_gate.py",
-  "harness/profile_trend.py",
-  "harness/storelib.py",
-  "harness/storerevisions.py",
   "harness/toolchain_bump.py",
   "harness/v2",
   "tools/astlog/scan.py",
-  "tools/devirt",
   "tools/cpus.py",
   "tools/typed-input",
   "tools/v2",

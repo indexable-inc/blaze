@@ -93,9 +93,7 @@ For wrong generated code:
    hash, and `blaze trace --out PATH` writes every result of the last build with its edges, as
    CBOR. (v1's `--report`, `--deny` and `--isolate`, which listed, left to rustc and split out
    functions, are gone with its crate-at-a-time entry.)
-2. `BLAZE_DUMP_MIR=<function name>` prints the MIR of functions with exactly that name
-   (`{closure}` for closures). `BLAZE_DUMP_LLVM=1` prints the LLVM module of every function
-   compiled, and `BLAZE_DUMP_CLIF=1` the Cranelift IR of drop glue.
+2. Reproduce against a unit test in `crates/blaze-body`, `crates/blaze-build`, or `crates/blaze-emit` to inspect the lowered body or LIR.
 3. Reduce it to a test ([Adding a test](#adding-a-test)), and fix it there.
 
 For a CI failure, the last line of the harness step lists which scripts failed.
@@ -202,7 +200,7 @@ for an old glibc; the ix image's glibc is 2.39. Windows, which ix does not serve
 [toolchain-c.md](v2/plan/design/toolchain-c.md) are not built. A driver given one
 (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
 but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
-an FHS one (`crates/blaze-link/src/target.rs`, `fhs`), so the binaries would not run elsewhere.
+an FHS one (`crates/blaze-native`), so the binaries would not run elsewhere.
 Once blaze links against an old glibc sysroot, these move to ix.
 
 ### Concurrency, the check and the ruleset

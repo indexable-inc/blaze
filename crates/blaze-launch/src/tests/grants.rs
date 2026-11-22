@@ -13,7 +13,7 @@ fn part(tape: &Tape, label: &'static str) -> String {
     (0..len).map(|_| ALPHABET[tape.int_in(0..=ALPHABET.len() - 1, "byte")] as char).collect()
 }
 
-/// The invariant: any list of distinct pairs of the form, up to [`MOST_GRANTS`] of parts up to
+/// Invariant: any list of distinct pairs of the form, up to [`MOST_GRANTS`] of parts up to
 /// [`MOST_PART`] bytes, is written within [`MOST_BYTES`] and read back as the same pairs in the
 /// same order. Prints nothing; passes as `grants_round_trip ... ok`.
 #[test]

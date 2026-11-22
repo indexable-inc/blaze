@@ -21,7 +21,7 @@ fn hello(cx: &Cx, io: Io) -> Result<(), Error> {
     Ok(())
 }
 
-/// The invariant: a `main` that writes a line and returns `Ok` leaves exactly that line on
+/// Invariant: a `main` that writes a line and returns `Ok` leaves exactly that line on
 /// its world's standard output, says nothing, and ends `Status::OK`.
 #[test]
 fn a_main_writes_its_line_through_out_and_ends_ok() {
@@ -97,7 +97,7 @@ fn written_err(io: &Io) -> String {
     String::from_utf8(io.script(|host| host.err.clone()).expect("a simulated world")).expect("UTF-8")
 }
 
-/// The invariant: what `line` and `write` put on a stream is exactly what `format!` of the
+/// Invariant: what `line` and `write` put on a stream is exactly what `format!` of the
 /// same values gives, for text, for formatted values, and for text longer than what one call
 /// holds (which is handed over in pieces and loses nothing).
 #[test]

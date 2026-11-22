@@ -32,7 +32,7 @@ pub enum Unwritten {
     Run(CellError),
     /// A module with `count` imports or calls the core holds as outside what it follows, or
     /// left undecided: its scope would not be the answer (rule 3: refused, never guessed).
-    Unknown { module: ItemKey, count: u32 },
+    Unknown { module: ItemKey, count: u32, why: &'static str },
     /// Made modules kept appearing past [`MOST_ROUNDS`] rounds.
     Rounds,
     /// D116's equality check (asked by the driver's [`crate::task::Par::decide_check`]) stopped.
@@ -49,8 +49,8 @@ impl core::fmt::Display for Unwritten {
         match self {
             Unwritten::Load(e) => write!(f, "the cell core's load: {e}"),
             Unwritten::Run(e) => write!(f, "the cell core's run: {e}"),
-            Unwritten::Unknown { module, count } => {
-                write!(f, "module {module:?}: {count} imports or macro calls the cell core does not follow or left undecided")
+            Unwritten::Unknown { module, count, why } => {
+                write!(f, "module {module:?}: {count} imports or macro calls the cell core does not follow or left undecided ({why})")
             }
             Unwritten::Rounds => write!(f, "made modules kept appearing past {MOST_ROUNDS} rounds of the cell core"),
             Unwritten::Decide(e) => write!(f, "{e}"),
@@ -189,7 +189,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     for &k in keys.iter() {
         let Some((scope, unknown)) = c.scope(&ix, k, alloc) else { continue };
         if unknown > 0 {
-            return Err(Unwritten::Unknown { module: k, count: unknown });
+            return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
         }
         done.insert(k, Resolved { scope, reads: ReadList { entries: AVec::new_in(alloc) } });
     }

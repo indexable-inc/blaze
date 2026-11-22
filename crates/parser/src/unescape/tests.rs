@@ -191,6 +191,7 @@ fn case(tape: &Tape, reader: Reader) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: every valid Rust escape sequence and line continuation unescapes back to its written value with its exact byte range.
 #[test]
 fn every_written_form_reads_back_with_its_range() {
     blaze_sim::check(Config::cases(2000), |tape| case(tape, Reader::Clean));

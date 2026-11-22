@@ -85,6 +85,7 @@ fn sparse_case(tape: &Tape) -> Result<(), Broke> {
     no_leaks(&alloc)
 }
 
+/// The refinement: `SparseSet` matches an ordered `Vec`, and `IntervalSet` and `ChunkedBitSet` match `BTreeSet` under any sequence of operations.
 #[test]
 fn sparse_set_matches_an_ordered_vec() {
     blaze_sim::check(Config::cases(300), sparse_case);

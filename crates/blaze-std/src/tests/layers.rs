@@ -224,6 +224,7 @@ fn run_dry(steps: &Vec<Step>, plant: Plant) -> Result<(), String> {
     }
 }
 
+/// The invariant: dry runs leave the host world unchanged, `ask` layers obey pretend/yes/no/script decisions without leaking refused effects, and replay performs no host effects.
 #[test]
 fn a_dry_run_changes_nothing_whatever_the_program_does() {
     blaze_sim::check(Config::cases(200), |tape| check(steps(tape), run_dry));

@@ -126,7 +126,7 @@ fn the_wait_is_bounded_by_its_summed_time() {
     assert!(asks >= 30_000, "{asks} asks: the steps are at most the cap");
 }
 
-/// The invariant: a lock another process holds for a while delays the commit, which lands
+/// Invariant: a lock another process holds for a while delays the commit, which lands
 /// within one capped step (plus the simulation's latency) of the release; the wait is counted.
 #[test]
 fn a_commit_lands_within_one_step_of_the_locks_release() {

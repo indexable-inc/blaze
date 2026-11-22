@@ -240,6 +240,7 @@ fn sweep_once(seed: u64, days: u64, plant: SweepPlant) -> Result<u32, std::strin
     Ok(removed)
 }
 
+/// The invariant: sweeping other store forms removes only expired foreign forms, leaves this blaze's folder and cache tag intact, and respects each form's last use.
 #[test]
 fn the_sweep_removes_exactly_the_expired_other_forms() {
     for seed in 30..36 {

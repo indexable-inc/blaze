@@ -762,17 +762,57 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
 
     /// The scratch's pattern operations `[from, to)` as matcher locations.
     fn flatten(&mut self, ops: &[Op], from: usize, to: usize) -> Result<(), Stop> {
-        let mut at = from;
-        while at < to {
+        enum Close {
+            Group(Delim),
+            Repeat { rep: u32, body: u32 },
+        }
+        struct FlatFrame {
+            at: usize,
+            to: usize,
+            close: Option<Close>,
+        }
+        let mut stack: Vec<FlatFrame, &'f Frame> = Vec::new_in(self.frame);
+        stack.push(FlatFrame { at: from, to, close: None });
+        while let Some(top) = stack.last_mut() {
+            if top.at >= top.to {
+                let Some(done) = stack.pop() else { break };
+                match done.close {
+                    Some(Close::Group(delim)) => {
+                        if delim != Delim::Invisible {
+                            self.program.locs.push(Loc::Close(delim));
+                        }
+                    }
+                    Some(Close::Repeat { rep, body }) => {
+                        self.program.locs.push(Loc::RepEnd(rep));
+                        let after = crate::tokens::index(self.program.locs.len());
+                        let rep = &mut self.program.reps[rep as usize];
+                        rep.body = body;
+                        rep.after = after;
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            let at = top.at;
             match ops[at] {
-                Op::Tok(tok) => self.program.locs.push(match self.def.kind(tok) {
-                    TokenKind::Literal { .. } => Loc::Literal(tok),
-                    _ => Loc::Ident(tok),
-                }),
-                Op::Crate(tok) => self.program.locs.push(Loc::Crate(tok)),
-                Op::Puncts { at: tok, len } => self.program.locs.push(Loc::Punct { at: tok, len }),
+                Op::Tok(tok) => {
+                    self.program.locs.push(match self.def.kind(tok) {
+                        TokenKind::Literal { .. } => Loc::Literal(tok),
+                        _ => Loc::Ident(tok),
+                    });
+                    top.at = at + 1;
+                }
+                Op::Crate(tok) => {
+                    self.program.locs.push(Loc::Crate(tok));
+                    top.at = at + 1;
+                }
+                Op::Puncts { at: tok, len } => {
+                    self.program.locs.push(Loc::Punct { at: tok, len });
+                    top.at = at + 1;
+                }
                 Op::Var { binder, kind, name, spec } => {
                     self.program.locs.push(Loc::Var { binder, kind, name, spec });
+                    top.at = at + 1;
                 }
                 Op::Group { delim, end, .. } => {
                     self.program.locs.push(Loc::Subtree(delim));
@@ -780,12 +820,8 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
                     if visible {
                         self.program.locs.push(Loc::Open(delim));
                     }
-                    self.flatten(ops, at + 1, end as usize)?;
-                    if visible {
-                        self.program.locs.push(Loc::Close(delim));
-                    }
-                    at = end as usize;
-                    continue;
+                    top.at = end as usize;
+                    stack.push(FlatFrame { at: at + 1, to: end as usize, close: Some(Close::Group(delim)) });
                 }
                 Op::Repeat { end, sep, kind } => {
                     let rep = crate::tokens::index(self.program.reps.len());
@@ -799,14 +835,8 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
                     self.program.reps.push(Rep { body: 0, after: 0, vars, vars_len, sep, kind });
                     self.program.locs.push(Loc::RepStart(rep));
                     let body = crate::tokens::index(self.program.locs.len());
-                    self.flatten(ops, at + 1, end as usize)?;
-                    self.program.locs.push(Loc::RepEnd(rep));
-                    let after = crate::tokens::index(self.program.locs.len());
-                    let rep = &mut self.program.reps[rep as usize];
-                    rep.body = body;
-                    rep.after = after;
-                    at = end as usize;
-                    continue;
+                    top.at = end as usize;
+                    stack.push(FlatFrame { at: at + 1, to: end as usize, close: Some(Close::Repeat { rep, body }) });
                 }
                 Op::Ignore { .. }
                 | Op::Index { .. }
@@ -814,7 +844,6 @@ impl<'d, 'f> Compiler<'_, 'd, 'f> {
                 | Op::Count { .. }
                 | Op::Concat { .. } => unreachable!("a pattern has no metavariable expressions"),
             }
-            at += 1;
         }
         Ok(())
     }

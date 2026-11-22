@@ -106,7 +106,7 @@ fn run_own_not_run_a_blocked_records_folder_exits_125() {
         // The run parent's own words (run_parent.rs `ParentError`: the records folder refused
         // as it is opened, or the first record's write under it, by where bstd `Fs::home`
         // finds the file in the way).
-        said.lines().any(|line| line.starts_with("error: ") && line.contains("`blaze run` did not start the program (run.md piece 6)")),
+        said.lines().any(|line| line.starts_with("error: ") && line.contains("`blaze run` did not start or serve the program (run.md piece 6, D124)")),
         "an `error: ` line says the run parent did not start the program:\n{said}"
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "", "standard output is the program's alone, and nothing ran");

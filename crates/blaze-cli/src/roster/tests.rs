@@ -115,6 +115,7 @@ fn roster_case(tape: &Tape, plant: RosterPlant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: binary liveness is determined by build id and last-run window, never by path alone.
 /// A rebuild that replaces the running binary's file makes its entry dead at once
 /// (`Replaced`), while an installed second binary (`blaze-old`) that ran within the window
 /// stays live; a missing binary is `Gone` and one past the window `Stale`.

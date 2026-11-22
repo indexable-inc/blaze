@@ -251,6 +251,7 @@ fn two_commands(tape: &Tape, plant: Plant, heap: &'static blaze_own::Heap) -> Re
     }
 }
 
+/// The invariant: a closed dependency head is frozen once per key (including its features), never treated as stored before commit, and found by key across interleavings and crashes.
 /// Expected: passes over every interleaving, crash and change of features the tape draws.
 #[test]
 fn a_closed_dependency_head_is_frozen_once_a_machine_and_found_by_key() {

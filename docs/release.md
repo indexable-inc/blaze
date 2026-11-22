@@ -14,7 +14,7 @@ and installing a release that was already published.
 Everything blaze downloads from blaze's own releases comes from one place, the R2 bucket
 `blaze-releases` at its custom domain `https://blaze-releases.ix.dev`, served from Cloudflare's
 edge: a pinned release's archive and sums, the channels'
-pointers, the standard library's source (`crates/blaze-cargo/src/toolchain/library.rs`), install.sh's
+pointers, the standard library's source (`crates/blaze-toolchain`), install.sh's
 download (CI's stage 0 too, `.github/actions/blaze`) and the pinned LLVM
 (`pins/llvm.json`'s `release`, which blaze's native inputs and `llvm.py fetch`
 read). GitHub's release CDN ran at 0.3 to 0.55 MB/s per download from a

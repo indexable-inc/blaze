@@ -416,11 +416,9 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     if let Some(crash) = &crash {
         err.line(cx, format_args!("{crash}")).map_err(OwnError::Out)?;
     }
-    // The closing line on the error stream, when a first call cost work (a run answered from
-    // the store alone is quiet: its output is the program's); the profile has it on every run.
-    if tally.made + tally.unkeyed > 0 {
-        err.line(cx, format_args!("blaze run: {tally}")).map_err(OwnError::Out)?;
-    }
+    // A clean run stays quiet on stderr so its output is the program's alone (`run_output.rs`);
+    // the profile always records `{tally}`.
+    let _ = tally;
     // This run's first answers, the next start's list, under today's certificate.
     let mut bytes = blaze_own::Vec::new_in(alloc);
     let wrote = needs

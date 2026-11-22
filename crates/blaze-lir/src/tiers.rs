@@ -536,6 +536,7 @@ fn tiers_agree(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The refinement: every LIR tier produces the exact same outcome as the reference LIR evaluator on generated well-formed programs.
 #[test]
 fn every_tier_agrees_with_the_evaluator() {
     blaze_sim::check(Config::cases(512), |tape| tiers_agree(tape, Plant::None));

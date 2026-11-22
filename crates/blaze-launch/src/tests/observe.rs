@@ -396,6 +396,7 @@ fn run(ops: &[Op], plant: Plant) -> Result<(), Found> {
     sim.settle().map_err(at(String::from(" (settling)")))
 }
 
+/// The invariant: under every interleaving of the control thread and program threads, observe stubs keep observed slots on their stubs, publish body words before stubs, and never execute stale or inlined observed callees.
 #[test]
 fn no_schedule_breaks_what_observe_promises() {
     blaze_sim::check(blaze_sim::Config::cases(400), |tape| {

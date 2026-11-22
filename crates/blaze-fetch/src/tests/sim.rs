@@ -736,6 +736,7 @@ fn case_inner(tape: &Tape, crates: &[Crate], limits: Limits) -> Result<(), Broke
     Ok(())
 }
 
+/// The invariant: a fetch stores only checksum- and path-verified records within allocation bounds, never trusts an unverified commit or wire size, and terminates under any origin fault or crash.
 #[test]
 fn a_fetch_stores_only_verified_records_and_ends_whatever_the_origin_does() {
     blaze_sim::check(Config::cases(300), |tape| case(tape, Plant::None));

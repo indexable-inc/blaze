@@ -47,6 +47,10 @@ pub struct Shown<'f> {
     pub view: View,
     /// `--fix`'s first check: its findings are listed, nothing is printed.
     pub quiet: bool,
+    /// `blaze run`'s check: when the check has zero errors, zero warnings, and zero unchecked
+    /// items, omit the stage-coverage note and closing summary so a clean run prints only its
+    /// program's output.
+    pub(crate) quiet_when_clean: bool,
     /// The caller consumes stdout and status alone. Other callers (including fixes)
     /// receive the placed listing even on a certificate hit.
     pub(crate) output_only: bool,
@@ -96,6 +100,7 @@ impl<'f> Shown<'f> {
             counts: Counts::default(),
             view,
             quiet: false,
+            quiet_when_clean: false,
             output_only: false,
             replay_fixes: Vec::new_in(frame),
             listed: Vec::new_in(frame),
@@ -821,10 +826,10 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
     if borrows_unchecked {
         shown.borrows_unchecked += 1;
     }
-    // A borrow note is neither drawn nor counted for a person: untrusted, census 3 found every
-    // finding false; the closing line's "NOT checked: borrows" says the stage did not pass. The
-    // agent's and JSON views list each with its code, range and why.
-    if borrows_note && shown.view == View::Person {
+    // A borrow note is neither drawn nor counted for a person or a clean `blaze run`: untrusted,
+    // census 3 found every finding false; the closing line's "NOT checked: borrows" says the stage
+    // did not pass. The agent's and JSON views of `blaze check` list each with its code, range and why.
+    if borrows_note && (shown.view == View::Person || shown.quiet_when_clean) {
         return Ok(());
     }
     // Every view sees an item or a body not checked as its cause's line (main.rs `draw`), not a

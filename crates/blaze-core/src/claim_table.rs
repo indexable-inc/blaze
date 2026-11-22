@@ -740,6 +740,7 @@ mod tests {
         !matches!(got, Some((Waited::Parked, Waited::Parked)))
     }
 
+    /// The invariant: concurrent claims, waiter handoffs, and cycle detection hold on every drawn schedule without lost reservations, missed wakes, or undetected cycles.
     /// Drawn schedules of all three pairs hold their oracles.
     #[test]
     fn claims_waits_and_cycles_hold_on_drawn_schedules() {

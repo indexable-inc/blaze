@@ -123,6 +123,7 @@ fn promoted(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: a sampled hot slot is promoted into the hot region at most once, with aligned non-overlapping placement inside the region.
 /// Prints `test sim::promote::a_sampled_hot_function_is_promoted_once_into_the_hot_region ... ok`.
 #[test]
 fn a_sampled_hot_function_is_promoted_once_into_the_hot_region() {

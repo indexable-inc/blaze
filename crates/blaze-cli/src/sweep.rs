@@ -1554,6 +1554,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: the sweep checks every file, manifest, absent probe, and directory listing recorded in the leaf table without trusting racy timestamps.
     #[test]
     fn the_sweep_follows_what_was_read_and_nothing_else() {
         check(Config::cases(300), |tape| rounds(tape, Plant::None));

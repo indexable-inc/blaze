@@ -71,6 +71,13 @@ pub(crate) struct LineOpts {
 }
 
 impl LineOpts {
+    /// From `io`'s environment variables, whether `err` is a terminal and how wide, and `--color`.
+    pub(crate) fn from_io(io: &Io, err: &Out, color: Choice) -> LineOpts {
+        let env = io.env();
+        let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&bstd::env::VarName::new(name).ok()?).ok().flatten() };
+        Self::new(&|name| var(name).map(String::from), err, color)
+    }
+
     /// From the command's variables (`var`, read through `io.env()` by the caller), whether
     /// `err` is a terminal and how wide, and `--color`.
     pub(crate) fn new(var: &dyn Fn(&str) -> Option<String>, err: &Out, color: Choice) -> LineOpts {
@@ -216,13 +223,44 @@ impl Drop for Over<'_, '_> {
     }
 }
 
+/// Thread-safe progress sink for background watchers (e.g. `engine_status::watched`): updates
+/// `RunStatus` and wakes the ticker thread to draw the next frame without touching `Cx`.
+pub(crate) struct ProgressSink<'l, 'a> {
+    line: Option<&'l Line<'a>>,
+}
+
+impl ProgressSink<'_, '_> {
+    pub(crate) const NONE: ProgressSink<'static, 'static> = ProgressSink { line: None };
+}
+
+impl Watch for ProgressSink<'_, '_> {
+    fn see(&self, step: Step<'_>) {
+        let Some(line) = self.line else { return };
+        let now = line.now_ms();
+        let mut shared = line.shared.lock();
+        shared.core.see(now, step);
+        line.woken.notify_one();
+    }
+
+    fn paths(&self) -> bool {
+        self.line.is_some()
+    }
+}
+
 /// `work` run with the live line's sink when `opts` says the error stream is a live terminal,
 /// else with [`Unwatched`]: the line is erased and its thread joined before this returns, on
 /// every path. `Err` only when the line itself failed (the work's value is then dropped: the
 /// command ends with that error, rule 3).
-pub(crate) fn watched<R>(cx: &Cx, io: &Io, err: &Out, clock: &Clock, opts: LineOpts, work: impl FnOnce(&dyn Watch) -> R) -> Result<R, RunLineError> {
+pub(crate) fn watched<R>(
+    cx: &Cx,
+    io: &Io,
+    err: &Out,
+    clock: &Clock,
+    opts: LineOpts,
+    work: impl FnOnce(&dyn Watch, &(dyn Watch + Sync)) -> R,
+) -> Result<R, RunLineError> {
     if !opts.live {
-        return Ok(work(&Unwatched));
+        return Ok(work(&Unwatched, &ProgressSink::NONE));
     }
     let core = RunStatus::new(RunStatusOpts { caps: opts.caps });
     let line = Line { shared: Lock::new("run.line", Shared { core, err, terminal: opts.terminal, failed: None }), woken: Signal::new("run.line.due"), clock, began: clock.now() };
@@ -232,7 +270,8 @@ pub(crate) fn watched<R>(cx: &Cx, io: &Io, err: &Out, clock: &Clock, opts: LineO
             .spawn_scoped(scope, || line.tick(io))
             .map_err(|why| RunLineError::Ticker { kind: why.kind() })?;
         let over = Over { line: &line, cx };
-        let got = work(&Watching { line: &line, cx });
+        let bg = ProgressSink { line: Some(&line) };
+        let got = work(&Watching { line: &line, cx }, &bg);
         let done = line.finish(cx);
         drop(over);
         done.map(|()| got)

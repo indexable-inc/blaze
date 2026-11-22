@@ -221,6 +221,7 @@ fn case(tape: &Tape, plant: Plant, tally: &Tally) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: every name an expansion binds in its calling module (items and `use` bindings) is listed in its `writes` summary.
 #[test]
 fn every_name_an_expansion_binds_is_in_its_summary() {
     let tally = Tally::default();

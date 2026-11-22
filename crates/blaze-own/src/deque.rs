@@ -712,7 +712,11 @@ impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
 
 impl<'a, T: Copy + 'a, A: Allocator> Extend<&'a T> for VecDeque<T, A> {
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().copied());
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
+        for &value in iter {
+            self.push_back(value);
+        }
     }
 }
 

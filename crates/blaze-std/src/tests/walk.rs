@@ -164,6 +164,7 @@ fn run(plan: &Plan, plant: WalkPlant) -> Result<(), String> {
     Ok(())
 }
 
+/// The refinement: `Dir::walk` yields every file in the stated order matching the reference walk and never enters or lists declined folders.
 /// (i) and (ii): on random trees, a walk entering every folder hands over exactly the files
 /// published, in the stated order, as a reference walk over `entries` finds them; a walk
 /// declining `target` lists exactly the folders outside one, in pre-order, and asks nothing

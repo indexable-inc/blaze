@@ -44,7 +44,7 @@ fn a_step_restarted_after_a_real_change_is_not_said() {
 
 /// The control of the planted bug: counting every restart as progress never says the loop.
 #[test]
-fn the_planted_bug_breaks_its_case() {
+fn the_oracle_catches_restart_counted_as_progress() {
     let mut flawed = Again::new();
     flawed.flaw = Flaw::RestartIsProgress;
     let said = (0..4 * AGAIN_BOUND).filter_map(|_| flawed.restarted(1, 1, NOTHING)).count();

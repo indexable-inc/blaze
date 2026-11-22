@@ -64,11 +64,11 @@ run, and the committed fixtures are what holds it now. Part of the self-containe
 - A manifest that does not parse or fit the schema is shown as cargo shows it, a snippet with
   the place marked (`blaze_manifest::diagnostic`).
 
-`blaze` reads the workspace with it through blaze-units (`crates/blaze-units/src/load/`), with
+`blaze` reads the workspace with it through `crates/blaze-unit-graph`, with
 `--manifest-path` and `--config` as the command was given them, and runs no cargo. v1, deleted
 on 2026-10-30, read it the same way in place of `cargo metadata --no-deps`.
 
-The daemon's loads read the workspace with `crates/blaze-metadata` (2026-10-25): the root found
+The engine reads the workspace with `crates/blaze-manifest` and `crates/blaze-unit-graph`: the root found
 without `cargo locate-project`, every package the lock file locks fetched by blaze-registry
 where cargo keeps it, and the graph of the build the load is for, not `cargo metadata`'s: the
 features and edges `cargo build` with the load's `-p`, `--workspace`, `--exclude` and

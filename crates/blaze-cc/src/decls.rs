@@ -319,12 +319,17 @@ impl<'r, 'a, P: Planted<DeclsPlant>> DeclsReader<'r, 'a, P> {
             Read::Abi => {
                 let mut t = Tokens::new(text);
                 let row = self.into.abi();
-                let ok = t.word()? == "abi"
-                    && t.num::<u8>("pointer size")? == row.pointer_size
-                    && t.num::<u8>("pointer alignment")? == row.pointer_align
-                    && t.num::<u8>("endianness")? == row.little_endian
-                    && t.num::<u8>("char sign")? == row.char_signed;
+                let tag = t.word()?;
+                let pointer_size = t.num::<u8>("pointer size")?;
+                let pointer_align = t.num::<u8>("pointer alignment")?;
+                let little_endian = t.num::<u8>("endianness")?;
+                let char_signed = t.num::<u8>("char sign")?;
                 t.end()?;
+                let ok = tag == "abi"
+                    && pointer_size == row.pointer_size
+                    && pointer_align == row.pointer_align
+                    && little_endian == row.little_endian
+                    && char_signed == row.char_signed;
                 if !ok {
                     return Err(DeclsWhy::Abi);
                 }

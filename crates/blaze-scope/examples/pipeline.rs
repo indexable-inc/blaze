@@ -402,25 +402,7 @@ fn peak_rss_mb() -> f64 {
 // ---------------------------------------------------------------------------------------------
 // Keys.
 
-fn make_key(krate: CrateItemKey, parts: &[&[u8]]) -> ItemKey {
-    let mut bytes = Vec::new();
-    for part in parts {
-        bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(part);
-    }
-    let mut id = ContentId::of("blaze pipeline example key 1", &bytes).0;
-    id[..8].copy_from_slice(&krate.prefix());
-    id[8] &= !ItemKey::INNER;
-    ItemKey(ContentId(id))
-}
-
-fn key_of(krate: CrateItemKey, parent: ItemKey, tag: &str, name: &str, index: u32) -> ItemKey {
-    make_key(krate, &[&parent.0.0, tag.as_bytes(), name.as_bytes(), &index.to_le_bytes()])
-}
-
-fn root_key(krate: CrateItemKey) -> ItemKey {
-    make_key(krate, &[b"crate root"])
-}
+use blaze_scope::task::{key_of, make_key, root_key};
 
 // ---------------------------------------------------------------------------------------------
 // cfg: one stated configuration.
@@ -590,109 +572,136 @@ impl Cfg {
     }
 
     fn pred(&self, t: &[CTok<'_>], at: &mut usize, prefix: &str) -> Option<bool> {
-        let CTok::Ident(name) = *t.get(*at)? else { return None };
-        *at += 1;
-        match t.get(*at) {
-            Some(CTok::Open) => {
-                *at += 1;
-                let inner = if name == "target" { "target_" } else { prefix };
-                let mut values = Vec::new();
-                loop {
+        let mut stack: Vec<(&str, &str, Vec<bool>)> = Vec::new();
+        let mut cur_prefix = prefix;
+        loop {
+            let CTok::Ident(name) = *t.get(*at)? else { return None };
+            *at += 1;
+            let mut val = match t.get(*at) {
+                Some(CTok::Open) => {
+                    *at += 1;
+                    let inner = if name == "target" { "target_" } else { cur_prefix };
                     if t.get(*at) == Some(&CTok::Close) {
                         *at += 1;
-                        break;
+                        match name {
+                            "all" | "target" => true,
+                            "any" => false,
+                            _ => return None,
+                        }
+                    } else {
+                        stack.push((name, inner, Default::default()));
+                        cur_prefix = inner;
+                        continue;
                     }
-                    values.push(self.pred(t, at, inner)?);
-                    match t.get(*at) {
-                        Some(CTok::Comma) => *at += 1,
-                        Some(CTok::Close) => {
+                }
+                Some(CTok::Eq) => {
+                    *at += 1;
+                    let Some(CTok::Str(value)) = t.get(*at).copied() else { return None };
+                    *at += 1;
+                    self.has_pair(&format!("{cur_prefix}{name}"), value)
+                }
+                _ => self.has_name(&format!("{cur_prefix}{name}")),
+            };
+            loop {
+                let Some((_, inner_prefix, values)) = stack.last_mut() else {
+                    return Some(val);
+                };
+                values.push(val);
+                match t.get(*at) {
+                    Some(CTok::Comma) => {
+                        *at += 1;
+                        if t.get(*at) == Some(&CTok::Close) {
                             *at += 1;
+                        } else {
+                            cur_prefix = *inner_prefix;
                             break;
                         }
-                        _ => return None,
                     }
+                    Some(CTok::Close) => {
+                        *at += 1;
+                    }
+                    _ => return None,
                 }
-                match name {
-                    "all" | "target" => Some(values.iter().all(|it| *it)),
-                    "any" => Some(values.iter().any(|it| *it)),
-                    "not" if values.len() == 1 => Some(!values[0]),
-                    _ => None,
-                }
+                let Some((op, _, values)) = stack.pop() else { return None };
+                val = match op {
+                    "all" | "target" => values.iter().all(|it| *it),
+                    "any" => values.iter().any(|it| *it),
+                    "not" if values.len() == 1 => !values[0],
+                    _ => return None,
+                };
             }
-            Some(CTok::Eq) => {
-                *at += 1;
-                let Some(CTok::Str(value)) = t.get(*at).copied() else { return None };
-                *at += 1;
-                Some(self.has_pair(&format!("{prefix}{name}"), value))
-            }
-            _ => Some(self.has_name(&format!("{prefix}{name}"))),
         }
     }
 
     /// Reads one attribute's content (`cfg(..)`, `path = ".."`, `derive(..)`, ...) into
     /// `attrs`, a true `cfg_attr`'s attributes in its place.
     fn attr(&self, attrs: &mut Attrs, content: &'static str) {
-        let name = head(content);
-        match name {
-            "cfg" => {
-                if !self.eval(args(content)) {
-                    attrs.cfg_ok = false;
+        let mut work = split_top("");
+        work.clear();
+        work.push(content);
+        while let Some(content) = work.pop() {
+            let name = head(content);
+            match name {
+                "cfg" => {
+                    if !self.eval(args(content)) {
+                        attrs.cfg_ok = false;
+                    }
                 }
-            }
-            "cfg_attr" => {
-                attrs.cfg_attrs += 1;
-                let parts = split_top(args(content));
-                if let Some((predicate, rest)) = parts.split_first() {
-                    if self.eval(predicate) {
-                        for part in rest {
-                            let part = part.trim();
-                            if !part.is_empty() {
-                                self.attr(attrs, part);
+                "cfg_attr" => {
+                    attrs.cfg_attrs += 1;
+                    let parts = split_top(args(content));
+                    if let Some((predicate, rest)) = parts.split_first() {
+                        if self.eval(predicate) {
+                            for part in rest.iter().rev() {
+                                let part = part.trim();
+                                if !part.is_empty() {
+                                    work.push(part);
+                                }
                             }
                         }
                     }
                 }
-            }
-            "unsafe" => self.attr(attrs, args(content).trim()),
-            "path" => attrs.path = string_value(content),
-            "derive" | "derive_const" => {
-                for path in split_top(args(content)) {
-                    let path = path.trim();
-                    if !path.is_empty() {
-                        attrs.derives.push(path);
+                "unsafe" => work.push(args(content).trim()),
+                "path" => attrs.path = string_value(content),
+                "derive" | "derive_const" => {
+                    for path in split_top(args(content)) {
+                        let path = path.trim();
+                        if !path.is_empty() {
+                            attrs.derives.push(path);
+                        }
                     }
                 }
-            }
-            "macro_export" => {
-                attrs.macro_export = true;
-                attrs.local_inner |= args(content).contains("local_inner_macros");
-            }
-            "macro_use" => attrs.macro_use = true,
-            "lang" => attrs.lang = string_value(content),
-            "rustc_builtin_macro" => {
-                attrs.builtin = true;
-                let arg = split_top(args(content)).first().map(|it| it.trim()).unwrap_or("");
-                if !arg.is_empty() {
-                    attrs.builtin_name = Some(arg);
+                "macro_export" => {
+                    attrs.macro_export = true;
+                    attrs.local_inner |= args(content).contains("local_inner_macros");
                 }
-            }
-            "prelude_import" => attrs.prelude_import = true,
-            "no_implicit_prelude" => attrs.no_implicit_prelude = true,
-            "no_std" => attrs.no_std = true,
-            "no_core" => attrs.no_core = true,
-            "register_tool" => {
-                for tool in split_top(args(content)) {
-                    let tool = tool.trim();
-                    if !tool.is_empty() {
-                        attrs.tools.push(tool);
+                "macro_use" => attrs.macro_use = true,
+                "lang" => attrs.lang = string_value(content),
+                "rustc_builtin_macro" => {
+                    attrs.builtin = true;
+                    let arg = split_top(args(content)).first().map(|it| it.trim()).unwrap_or("");
+                    if !arg.is_empty() {
+                        attrs.builtin_name = Some(arg);
                     }
                 }
-            }
-            _ => {
-                attrs.arbitrary_ints |=
-                    name.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "arbitrary_ints");
-                if !is_builtin_attr(name) {
-                    attrs.others.push(name);
+                "prelude_import" => attrs.prelude_import = true,
+                "no_implicit_prelude" => attrs.no_implicit_prelude = true,
+                "no_std" => attrs.no_std = true,
+                "no_core" => attrs.no_core = true,
+                "register_tool" => {
+                    for tool in split_top(args(content)) {
+                        let tool = tool.trim();
+                        if !tool.is_empty() {
+                            attrs.tools.push(tool);
+                        }
+                    }
+                }
+                _ => {
+                    attrs.arbitrary_ints |=
+                        name.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "arbitrary_ints");
+                    if !is_builtin_attr(name) {
+                        attrs.others.push(name);
+                    }
                 }
             }
         }
@@ -1022,65 +1031,86 @@ fn use_leaves(text: &'static str) -> Option<Vec<UseLeaf>> {
 
 fn use_tree(t: &[PTok], at: &mut usize, prefix: &[N], abs: bool, out: &mut Vec<UseLeaf>) -> Option<()> {
     let mut segments = prefix.to_vec();
-    let mut abs = abs;
-    if prefix.is_empty() && t.get(*at) == Some(&PTok::Colons) {
-        abs = true;
-        *at += 1;
-    }
-    loop {
-        match t.get(*at).copied() {
-            Some(PTok::Ident(name)) => {
-                segments.push(name);
-                *at += 1;
-                if t.get(*at) == Some(&PTok::Colons) {
+    let mut cur_abs = abs;
+    let mut stack: blaze_own::FixedVec<(usize, bool), 64> = blaze_own::FixedVec::new();
+    'child: loop {
+        if segments.is_empty() && t.get(*at) == Some(&PTok::Colons) {
+            cur_abs = true;
+            *at += 1;
+        }
+        let mut emitted = false;
+        loop {
+            match t.get(*at).copied() {
+                Some(PTok::Ident(name)) => {
+                    segments.push(name);
                     *at += 1;
-                    continue;
+                    if t.get(*at) == Some(&PTok::Colons) {
+                        *at += 1;
+                        continue;
+                    }
+                    break;
                 }
-                break;
-            }
-            Some(PTok::Open) => {
-                *at += 1;
-                loop {
+                Some(PTok::Open) => {
+                    *at += 1;
                     if t.get(*at) == Some(&PTok::Close) {
                         *at += 1;
-                        return Some(());
+                        emitted = true;
+                        break;
                     }
-                    use_tree(t, at, &segments, abs, out)?;
-                    match t.get(*at) {
-                        Some(PTok::Comma) => *at += 1,
-                        Some(PTok::Close) => {
-                            *at += 1;
-                            return Some(());
-                        }
-                        _ => return None,
+                    stack.push((segments.len(), cur_abs)).ok()?;
+                    continue 'child;
+                }
+                Some(PTok::Star) => {
+                    *at += 1;
+                    out.push((cur_abs, segments.to_vec(), UseForm::Glob));
+                    emitted = true;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        if !emitted {
+            let mut rename = Rename::Same;
+            if t.get(*at) == Some(&PTok::Ident("as")) {
+                *at += 1;
+                rename = match t.get(*at).copied() {
+                    Some(PTok::Ident("_")) => Rename::Underscore,
+                    Some(PTok::Ident(name)) => Rename::To(name),
+                    _ => return None,
+                };
+                *at += 1;
+            }
+            let mut types_only = false;
+            if segments.len() > 1 && segments.last() == Some(&"self") {
+                segments.pop();
+                types_only = true;
+            }
+            out.push((cur_abs, segments.to_vec(), UseForm::Named { rename, types_only }));
+        }
+        loop {
+            let Some(&(saved_len, saved_abs)) = stack.last() else {
+                return Some(());
+            };
+            match t.get(*at) {
+                Some(PTok::Comma) => {
+                    *at += 1;
+                    if t.get(*at) == Some(&PTok::Close) {
+                        *at += 1;
+                        stack.pop();
+                    } else {
+                        segments.truncate(saved_len);
+                        cur_abs = saved_abs;
+                        continue 'child;
                     }
                 }
+                Some(PTok::Close) => {
+                    *at += 1;
+                    stack.pop();
+                }
+                _ => return None,
             }
-            Some(PTok::Star) => {
-                *at += 1;
-                out.push((abs, segments, UseForm::Glob));
-                return Some(());
-            }
-            _ => return None,
         }
     }
-    let mut rename = Rename::Same;
-    if t.get(*at) == Some(&PTok::Ident("as")) {
-        *at += 1;
-        rename = match t.get(*at).copied() {
-            Some(PTok::Ident("_")) => Rename::Underscore,
-            Some(PTok::Ident(name)) => Rename::To(name),
-            _ => return None,
-        };
-        *at += 1;
-    }
-    let mut types_only = false;
-    if segments.len() > 1 && segments.last() == Some(&"self") {
-        segments.pop();
-        types_only = true;
-    }
-    out.push((abs, segments, UseForm::Named { rename, types_only }));
-    Some(())
 }
 
 fn show_path(path: &Path<'_, N>) -> String {
@@ -2578,43 +2608,57 @@ fn sccs(nodes: &[usize], edges: &HashMap<usize, Vec<usize>>) -> Vec<Vec<usize>> 
         index: HashMap<usize, usize>,
         low: HashMap<usize, usize>,
         on: HashSet<usize>,
-        stack: Vec<usize>,
+        stack: Vec<usize>, frames: Vec<(usize, usize)>,
         next: usize,
         out: Vec<Vec<usize>>,
     }
-    fn visit(t: &mut T<'_>, v: usize) {
-        t.index.insert(v, t.next);
-        t.low.insert(v, t.next);
+    fn visit(t: &mut T<'_>, start: usize) {
+        t.index.insert(start, t.next);
+        t.low.insert(start, t.next);
         t.next += 1;
-        t.stack.push(v);
-        t.on.insert(v);
-        let targets = t.edges.get(&v).cloned().unwrap_or_default();
-        for w in targets {
-            if !t.index.contains_key(&w) {
-                visit(t, w);
-                let lw = t.low[&w];
-                let lv = t.low.get_mut(&v).expect("visited");
-                *lv = (*lv).min(lw);
-            } else if t.on.contains(&w) {
-                let iw = t.index[&w];
-                let lv = t.low.get_mut(&v).expect("visited");
-                *lv = (*lv).min(iw);
-            }
-        }
-        if t.low[&v] == t.index[&v] {
-            let mut component = Vec::new();
-            loop {
-                let w = t.stack.pop().expect("v is on the stack");
-                t.on.remove(&w);
-                component.push(w);
-                if w == v {
-                    break;
+        t.stack.push(start);
+        t.on.insert(start);
+        t.frames.push((start, 0));
+        while let Some((v, edge_idx)) = t.frames.last_mut() {
+            let v = *v;
+            let idx = *edge_idx;
+            if let Some(&w) = t.edges.get(&v).and_then(|es| es.get(idx)) {
+                *edge_idx = idx + 1;
+                if !t.index.contains_key(&w) {
+                    t.index.insert(w, t.next);
+                    t.low.insert(w, t.next);
+                    t.next += 1;
+                    t.stack.push(w);
+                    t.on.insert(w);
+                    t.frames.push((w, 0));
+                } else if t.on.contains(&w) {
+                    let iw = t.index[&w];
+                    let lv = t.low.get_mut(&v).expect("visited");
+                    *lv = (*lv).min(iw);
+                }
+            } else {
+                t.frames.pop();
+                if t.low[&v] == t.index[&v] {
+                    let mut component = Vec::new();
+                    loop {
+                        let w = t.stack.pop().expect("v is on the stack");
+                        t.on.remove(&w);
+                        component.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    t.out.push(component);
+                }
+                if let Some(&(parent, _)) = t.frames.last() {
+                    let lv = t.low[&v];
+                    let lp = t.low.get_mut(&parent).expect("visited");
+                    *lp = (*lp).min(lv);
                 }
             }
-            t.out.push(component);
         }
     }
-    let mut t = T { edges, index: HashMap::new(), low: HashMap::new(), on: HashSet::new(), stack: Vec::new(), next: 0, out: Vec::new() };
+    let mut t = T { edges, index: HashMap::new(), low: HashMap::new(), on: HashSet::new(), stack: Vec::new(), frames: Vec::new(), next: 0, out: Vec::new() };
     for &v in nodes {
         if !t.index.contains_key(&v) {
             visit(&mut t, v);

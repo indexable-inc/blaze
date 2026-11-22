@@ -429,6 +429,7 @@ fn interrupted(tape: &Tape, order: Order) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: publishing a set interrupted at any point leaves either the old published set whole or the new one, never writing a head before its payloads.
 #[test]
 fn a_publish_stopped_anywhere_leaves_the_old_set_whole_or_the_new() {
     blaze_sim::check(Config::cases(48), |tape| interrupted(tape, Order::HeadLast));

@@ -170,6 +170,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: producer pushes to the telemetry ring never block, readers never observe torn entries, and reported gaps cover overwritten oldest entries with exact counts.
 #[test]
 fn rings_lose_only_the_oldest_and_never_block() {
     let lap = Lap::new("ring: only the oldest lost, never blocked");

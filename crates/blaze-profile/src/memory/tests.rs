@@ -232,7 +232,7 @@ COPY (SELECT * FROM (VALUES \
     AS t(build_id, process, thread, t_ns, bytes, tag, block_bytes, site, read_ns)) TO '{d}/1-00000001.held_samples.parquet' (FORMAT parquet, COMPRESSION uncompressed);
 ";
 
-/// The invariant: each part of `blaze explain memory`, answered without DuckDB, is its view's
+/// Invariant: each part of `blaze explain memory`, answered without DuckDB, is its view's
 /// answer, cell for cell (to the last bit of a double) and column for column, for a build with
 /// its own counters and one with only counters of no build, with a limit and without.
 #[test]

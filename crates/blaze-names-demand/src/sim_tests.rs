@@ -818,6 +818,7 @@ fn ratio(part: usize, whole: usize) -> f64 {
     p / w
 }
 
+/// The refinement: for random generated module worlds and asks, demand-driven name resolution equals whole-world resolution.
 #[test]
 fn demand_answers_equal_the_whole_world() {
     let mut tally = Tally::default();

@@ -536,7 +536,7 @@ fn owns_fixpoint_drops_each_round_once_with_its_arena() {
 /// The control: the oracle refuses a bitwise copy dropped beside its original (the bug
 /// `owns` with `cycle_initial` was refused for), and a value never dropped.
 #[test]
-fn the_drop_oracle_catches_a_copy_and_a_leak() {
+fn the_oracle_catches_a_copy_and_a_leak() {
     /// Counts its drops and owns nothing else, so a bitwise copy of one is sound to drop.
     struct Tallied<'a>(&'a AtomicUsize);
     impl Drop for Tallied<'_> {

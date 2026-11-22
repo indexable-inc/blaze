@@ -490,6 +490,21 @@ impl<'r> ProcMacros<'r> {
             self.report(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
             return Err(refused);
         };
+        // Default built-in comptime patch fast path: expand in-process in microseconds without
+        // touching the disk proc-macro answer store (never polluting the real proc-macro's
+        // `base_key`), falling back losslessly to the cached/native/Wasm proc macro on exotic
+        // attributes or hygiene-sensitive macro_rules! inputs.
+        if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, &export.name) {
+            match crate::comptime_patch::try_expand(&macro_crate.label, kind, &export.name, call, edition, alloc) {
+                crate::comptime_patch::PatchResult::Expanded(produced) => {
+                    self.patch_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(produced);
+                }
+                crate::comptime_patch::PatchResult::Fallback => {
+                    self.patch_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         let parts = self.runtime.parts();
         let mut mark = parts.start();
         let base = base_key(&module.wasm_sha256, export, edition, call);
@@ -504,26 +519,6 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
-        // Default built-in comptime patch fast path: expand in-process in microseconds before
-        // spawning a native `.dylib` server or Wasmtime sandbox, falling back losslessly on
-        // exotic attributes.
-        if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, &export.name) {
-            match crate::comptime_patch::try_expand(&macro_crate.label, kind, &export.name, call, edition, alloc) {
-                crate::comptime_patch::PatchResult::Expanded(produced) => {
-                    self.patch_hits.fetch_add(1, Ordering::Relaxed);
-                    let mut mark = parts.start();
-                    let kept = slot.results.insert(self.store, base, &produced);
-                    mark.lap(Part::Keep);
-                    if let Err(error) = kept {
-                        self.report(Finding::Record { base, error });
-                    }
-                    return Ok(produced);
-                }
-                crate::comptime_patch::PatchResult::Fallback => {
-                    self.patch_fallbacks.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
         // Native zero-Wasm fast path (D175): expand directly via `NativeServerPool` on host `.dylib`/`.so`.
         if let Some(ref dylib) = module.native_dylib {
             let real_dir: Option<String> = match &package.files {
@@ -568,13 +563,14 @@ impl<'r> ProcMacros<'r> {
                 .vars()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
+            let mut orig_manifest_dir = None;
             if let Some(ref dir) = real_dir {
                 let manifest_path = std::path::Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned();
                 let mut had_dir = false;
                 let mut had_path = false;
                 for (k, v) in &mut env_owned {
                     if k == "CARGO_MANIFEST_DIR" {
-                        *v = dir.clone();
+                        orig_manifest_dir = Some(core::mem::replace(v, dir.clone()));
                         had_dir = true;
                     } else if k == "CARGO_MANIFEST_PATH" {
                         *v = manifest_path.clone();
@@ -588,8 +584,9 @@ impl<'r> ProcMacros<'r> {
                     env_owned.push(("CARGO_MANIFEST_PATH".to_owned(), manifest_path));
                 }
             }
+            let path_remap = real_dir.as_deref().zip(orig_manifest_dir.as_deref());
             let env_refs: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            match self.native_pool.expand_macro(dylib, &export.name, call, edition, &env_refs, real_dir.as_deref(), alloc) {
+            match self.native_pool.expand_macro(dylib, &export.name, call, edition, &env_refs, real_dir.as_deref(), path_remap, alloc) {
                 Ok(produced) => {
                     let mut mark = parts.start();
                     let kept = slot.results.insert(self.store, base, &produced);

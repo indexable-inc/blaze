@@ -139,7 +139,7 @@ fn hands(schedule: &[Step], flagged: bool) -> bool {
     }
 }
 
-/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Handoff.lean): no hand-back is
+/// Invariant (proved: `crates/blaze-core/lean/BlazeCore/Handoff.lean`): no hand-back is
 /// missed, in the weak memory. For every schedule of a sender
 /// and the driver, every value each read may see under its ordering, and the flag set or
 /// clear as they begin: where both returned, the driver read the sender's slot after its

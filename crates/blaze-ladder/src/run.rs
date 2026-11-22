@@ -669,7 +669,7 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
     fn code_id(&self, item: ItemKey) -> ContentId {
         match self.program.fn_index(item) {
             Some(i) => self.program.code_of(i),
-            None => blaze_ids::Hasher::new("blaze-ladder item identity 1").part(&item.0.to_le_bytes()).finish(),
+            None => crate::symbols::item_identity(item),
         }
     }
 

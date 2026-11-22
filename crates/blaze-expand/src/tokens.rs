@@ -716,11 +716,25 @@ impl<'a> TokenStream<'a> {
         from: &TokenStream<'_>,
         ctx: Ctx,
     ) -> Result<Ctx, StreamError> {
-        let Some(at) = ctx.node() else { return Ok(ctx) };
-        let node =
-            *from.contexts.get(at as usize).ok_or(StreamError::NoSuchContext { ctx: ctx.0 })?;
-        let parent = self.import_ctx(from, node.parent)?;
-        self.context(CtxNode { parent, mark: node.mark })
+        let Some(mut node_at) = ctx.node() else { return Ok(ctx) };
+        let mut marks: AVec<'a, Mark> = AVec::new_in(*self.contexts.allocator());
+        let mut cur = ctx;
+        let root = loop {
+            if marks.len() > from.contexts.len() {
+                return Err(StreamError::NoSuchContext { ctx: cur.0 });
+            }
+            let node =
+                *from.contexts.get(node_at as usize).ok_or(StreamError::NoSuchContext { ctx: cur.0 })?;
+            marks.push(node.mark);
+            cur = node.parent;
+            let Some(next) = cur.node() else { break cur };
+            node_at = next;
+        };
+        let mut parent = root;
+        while let Some(mark) = marks.pop() {
+            parent = self.context(CtxNode { parent, mark })?;
+        }
+        Ok(parent)
     }
 
     /// Appends the token at `at` of `from`, its context imported.

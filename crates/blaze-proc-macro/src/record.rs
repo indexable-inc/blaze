@@ -536,9 +536,10 @@ fn stream_pieces(stream: &TokenStream<'_>, mut out: impl FnMut(&[u8])) {
 /// The version of what the host gives a macro (the bridge server, the sandbox's answers, the
 /// streams a call passes): in every expansion's base key, so a change to it never reads an
 /// answer an older host made. 2: an attribute without arguments is given an empty stream (1
-/// gave none, and every such macro's client panicked reading it). Here, beside the key, so a
-/// build without the runtime computes the same keys.
-pub const HOST_VERSION: u32 = 2;
+/// gave none, and every such macro's client panicked reading it). 3: native bridge preserves
+/// token spans / `TokenOrigin` hygiene and empty attribute streams. 4: native bridge remaps host
+/// `CARGO_MANIFEST_DIR` back to virtual mount root in emitted string literals (D60/D96).
+pub const HOST_VERSION: u32 = 4;
 
 /// The base of `call`'s record: computed from text, before the run.
 pub fn base_key(module_wasm_sha256: &str, export: &Exported, edition: Edition, call: &ProcCall<'_>) -> ContentId {

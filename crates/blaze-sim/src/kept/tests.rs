@@ -161,6 +161,7 @@ fn reads_back(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     }
 }
 
+/// The invariant: every kept failure line written by `write_line` round-trips through the kept-file parser as a single line without splitting on its reason text.
 /// (b) A property of the engine itself: for drawn test paths, versions, tapes and whys, the line
 /// [`write_line`] writes reads back through the file's reader as exactly that line: text -> line
 /// -> parse -> tape is the identity (the tape's trailing zeros cut, as a tape's text always is).
