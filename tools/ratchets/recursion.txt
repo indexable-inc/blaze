@@ -11,6 +11,7 @@ blaze-body-eval	1
 blaze-body-flow	1
 blaze-body-lower	2
 blaze-borrow	6
+blaze-bstd-convert	5
 blaze-build-script	3
 blaze-c	4
 blaze-cad	1
