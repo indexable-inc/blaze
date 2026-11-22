@@ -50,7 +50,7 @@ fn comparison(op: BinOp) -> bool {
     matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
 }
 
-impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
+impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     // The body's side tables, read with the body's lifetime.
 
     pub(crate) fn exprs_in(&self, l: List, at: ExprId) -> Result<&'v [ExprId], LowerError> {
@@ -565,7 +565,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
     }
 
     fn operands_of(&mut self, ids: &[ExprId]) -> Result<Vec<Operand, A>, LowerError> {
-        let mut ops = Vec::new_in(self.alloc.clone());
+        let mut ops = Vec::new_in(self.alloc);
         for &x in ids {
             ops.push(self.operand(x)?);
         }
@@ -606,7 +606,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         let c = self.item_callee(k, l, e)?;
         let act = self.activate.len();
         let ids = self.exprs_in(args, e)?;
-        let mut ops = Vec::new_in(self.alloc.clone());
+        let mut ops = Vec::new_in(self.alloc);
         ops.push(self.operand(receiver)?);
         for &a in ids {
             ops.push(self.operand(a)?);
@@ -1043,7 +1043,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
             return self.refuse(Construct::Union, e);
         }
         let Some(n) = self.facts.field_count(adt, variant) else { return self.refuse(Construct::UnknownField, e) };
-        let mut slots: Vec<Option<Operand>, A> = Vec::new_in(self.alloc.clone());
+        let mut slots: Vec<Option<Operand>, A> = Vec::new_in(self.alloc);
         for _ in 0..n {
             slots.push(None);
         }
@@ -1083,7 +1083,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
                 }
             }
         }
-        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
         for s in slots.iter() {
             match s {
                 Some(o) => ops.push(*o),

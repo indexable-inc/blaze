@@ -24,7 +24,7 @@ use crate::{At, BodyFacts, Construct, DiscrInt, Lower, LowerError, MOST_POSITION
 /// Most implicit dereferences one pattern takes.
 const MOST_PEELS: u32 = 64;
 
-impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
+impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// A binding's local, its storage begun.
     pub(crate) fn binding_local(&mut self, p: PatId, ty: PTy) -> Result<(Local, Place), LowerError> {
         let mutbl = match self.pat(p)? {
@@ -95,7 +95,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
     /// its field index.
     fn positional(&self, elems: List, rest: Option<u32>, n: u32, p: PatId) -> Result<Vec<(u32, PatId), A>, LowerError> {
         let subs = self.pats_in(elems, p)?;
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         let len = subs.len() as u32;
         if len > n {
             return self.refuse_pat(Construct::Malformed, p);
@@ -114,7 +114,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
     /// The fields a tuple, tuple struct or struct pattern names, each with its index, its
     /// sub-pattern and its type; and the base place their projections start from.
     fn sub_fields(&mut self, p: PatId, place: Place, ty: PTy) -> Result<(Place, bool, Vec<(u32, PatId, PTy), A>), LowerError> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         match self.pat(p)? {
             Pat::Tuple { elems, rest } => {
                 let PNode::Tuple(l) = self.node(ty, At::Pat(p))? else { return self.refuse_pat(Construct::Malformed, p) };
@@ -246,7 +246,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
     /// Whether `p` matches every value of its type (no literal, range, slice, or enum variant
     /// test).
     fn irrefutable(&self, p: PatId) -> Result<bool, LowerError> {
-        let mut work: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut work: Vec<PatId, A> = Vec::new_in(self.alloc);
         work.push(p);
         let mut steps = 0u32;
         while let Some(q) = work.pop() {
@@ -406,7 +406,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
             let fail = self.b.new_block(BlockKind::Normal);
             self.test_pat(arm.pat, sp, sty, fail, e)?;
             let bm = self.open();
-            let mut out: Vec<Binding, A> = Vec::new_in(self.alloc.clone());
+            let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
             self.bind_pat(arm.pat, sp, sty, &mut out)?;
             self.schedule(&out);
             if let Some(g) = arm.guard {

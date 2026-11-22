@@ -75,7 +75,8 @@ impl<const N: usize> ConstGraph<N> {
             | (Op::Mul(a1, a2), Op::Mul(b1, b2))
             | (Op::Div(a1, a2), Op::Div(b1, b2))
             | (Op::Pow(a1, a2), Op::Pow(b1, b2)) => a1.0 == b1.0 && a2.0 == b2.0,
-            (Op::Select(c1, t1, e1), Op::Select(c2, t2, e2)) => {
+            (Op::Select(c1, t1, e1), Op::Select(c2, t2, e2))
+            | (Op::Fma(c1, t1, e1), Op::Fma(c2, t2, e2)) => {
                 c1.0 == c2.0 && t1.0 == t2.0 && e1.0 == e2.0
             }
             _ => false,
@@ -287,6 +288,10 @@ impl<const N: usize> ConstGraph<N> {
         self.intern(Op::Select(ExprId(cond.0), ExprId(then_val.0), ExprId(else_val.0)))
     }
 
+    pub const fn fma(&mut self, a: ConstExpr, b: ConstExpr, c: ConstExpr) -> ConstExpr {
+        self.intern(Op::Fma(ExprId(a.0), ExprId(b.0), ExprId(c.0)))
+    }
+
     pub const fn relu(&mut self, x: ConstExpr) -> ConstExpr {
         let z = self.lit(0.0);
         self.select(x, x, z)
@@ -420,6 +425,15 @@ impl<const N: usize> ConstGraph<N> {
                 let de = self.diff_memo(ConstExpr(e.0), wrt_var, cache);
                 self.select(ConstExpr(c.0), dt, de)
             }
+            Op::Fma(a, b, c) => {
+                let da = self.diff_memo(ConstExpr(a.0), wrt_var, cache);
+                let db = self.diff_memo(ConstExpr(b.0), wrt_var, cache);
+                let dc = self.diff_memo(ConstExpr(c.0), wrt_var, cache);
+                let t1 = self.mul(da, ConstExpr(b.0));
+                let t2 = self.mul(ConstExpr(a.0), db);
+                let sum = self.add(t1, t2);
+                self.add(sum, dc)
+            }
         };
         cache[idx] = out.0;
         out
@@ -446,6 +460,10 @@ impl<const N: usize> ConstGraph<N> {
                 } else {
                     self.eval_const(ConstExpr(e.0), env)
                 }
+            }
+            Op::Fma(a, b, c) => {
+                self.eval_const(ConstExpr(a.0), env) * self.eval_const(ConstExpr(b.0), env)
+                    + self.eval_const(ConstExpr(c.0), env)
             }
             _ => panic!("transcendental eval_const requires runtime `eval` with `blaze-math`"),
         }
@@ -477,6 +495,11 @@ impl<const N: usize> ConstGraph<N> {
                     self.eval(ConstExpr(e.0), env)
                 }
             }
+            Op::Fma(a, b, c) => blaze_math::mul_add(
+                self.eval(ConstExpr(a.0), env),
+                self.eval(ConstExpr(b.0), env),
+                self.eval(ConstExpr(c.0), env),
+            ),
         }
     }
 }

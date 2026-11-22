@@ -37,6 +37,32 @@ pub enum ENode {
     Tanh(EClassId),
     Abs(EClassId),
     Select(EClassId, EClassId, EClassId),
+    Fma(EClassId, EClassId, EClassId),
+}
+
+/// Floating-point rewrite soundness policy (`autodiff.md`, "Floating point").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewriteMode {
+    /// Only identities that preserve IEEE-754 bit-exact semantics (`--x`, `x * 1`, `x / 1`,
+    /// `x^1`, `x^2 = x*x`, commutativity of `+`/`*`, `select(c, x, x) -> x`, constant folding).
+    /// Never applies `x * 0 -> 0`, `x - x -> 0`, `x / x -> 1`, reassociation, or FMA fusion.
+    IeeeExact,
+    /// Real-algebraic rewrites (factoring, associativity, `x * 0 -> 0`, `x / x -> 1`,
+    /// `ln(exp(x)) -> x`, `sin² + cos² -> 1`, and FMA fusion under [`CostModel::CpuFma`] /
+    /// [`CostModel::GpuTranscendental`]).
+    FastMath,
+}
+
+/// Target extraction cost model for e-graph DAG extraction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostModel {
+    /// General CPU cost model (default).
+    Balanced,
+    /// FMA-preferring CPU model (`a * b + c` fused into `fma(a, b, c)` at cost 4 vs 7).
+    CpuFma,
+    /// GPU/SPIR-V model heavily penalizing transcendentals (`sin`/`cos`/`exp`/`ln` = 32) and
+    /// division (16) while favoring FMA (4).
+    GpuTranscendental,
 }
 
 impl ENode {
@@ -49,17 +75,42 @@ impl ENode {
     }
 
     #[inline]
-    fn op_cost(self) -> u32 {
-        match self {
-            Self::Const(_) | Self::Var(_) => 1,
-            Self::Neg(_) | Self::Abs(_) => 2,
-            Self::Add(_, _) | Self::Sub(_, _) => 3,
-            Self::Mul(_, _) => 4,
-            Self::Div(_, _) => 6,
-            Self::Select(_, _, _) => 5,
-            Self::Sqrt(_) => 8,
-            Self::Pow(_, _) => 10,
-            Self::Sin(_) | Self::Cos(_) | Self::Tan(_) | Self::Exp(_) | Self::Ln(_) | Self::Tanh(_) => 12,
+    fn op_cost(self, model: CostModel) -> u32 {
+        match model {
+            CostModel::Balanced => match self {
+                Self::Const(_) | Self::Var(_) => 1,
+                Self::Neg(_) | Self::Abs(_) => 2,
+                Self::Add(_, _) | Self::Sub(_, _) => 3,
+                Self::Mul(_, _) => 4,
+                Self::Fma(_, _, _) => 5,
+                Self::Div(_, _) => 6,
+                Self::Select(_, _, _) => 5,
+                Self::Sqrt(_) => 8,
+                Self::Pow(_, _) => 10,
+                Self::Sin(_) | Self::Cos(_) | Self::Tan(_) | Self::Exp(_) | Self::Ln(_) | Self::Tanh(_) => 12,
+            },
+            CostModel::CpuFma => match self {
+                Self::Const(_) | Self::Var(_) => 1,
+                Self::Neg(_) | Self::Abs(_) => 2,
+                Self::Add(_, _) | Self::Sub(_, _) => 3,
+                Self::Mul(_, _) | Self::Fma(_, _, _) => 4,
+                Self::Select(_, _, _) => 5,
+                Self::Div(_, _) => 8,
+                Self::Sqrt(_) => 10,
+                Self::Pow(_, _) => 14,
+                Self::Sin(_) | Self::Cos(_) | Self::Tan(_) | Self::Exp(_) | Self::Ln(_) | Self::Tanh(_) => 16,
+            },
+            CostModel::GpuTranscendental => match self {
+                Self::Const(_) | Self::Var(_) => 1,
+                Self::Neg(_) | Self::Abs(_) => 2,
+                Self::Add(_, _) | Self::Sub(_, _) => 3,
+                Self::Mul(_, _) | Self::Fma(_, _, _) => 4,
+                Self::Select(_, _, _) => 5,
+                Self::Sqrt(_) => 12,
+                Self::Div(_, _) => 16,
+                Self::Pow(_, _) => 24,
+                Self::Sin(_) | Self::Cos(_) | Self::Tan(_) | Self::Exp(_) | Self::Ln(_) | Self::Tanh(_) => 32,
+            },
         }
     }
 }
@@ -69,11 +120,18 @@ impl ENode {
 pub struct SimplifyOpts {
     pub max_iters: usize,
     pub max_enodes: usize,
+    pub mode: RewriteMode,
+    pub cost_model: CostModel,
 }
 
 impl Default for SimplifyOpts {
     fn default() -> Self {
-        Self { max_iters: 12, max_enodes: 4_096 }
+        Self {
+            max_iters: 12,
+            max_enodes: 4_096,
+            mode: RewriteMode::FastMath,
+            cost_model: CostModel::Balanced,
+        }
     }
 }
 
@@ -151,6 +209,7 @@ impl<A: Allocator + Copy> EGraph<A> {
             ENode::Tanh(a) => ENode::Tanh(self.find(a)),
             ENode::Abs(a) => ENode::Abs(self.find(a)),
             ENode::Select(c, t, e) => ENode::Select(self.find(c), self.find(t), self.find(e)),
+            ENode::Fma(a, b, c) => ENode::Fma(self.find(a), self.find(b), self.find(c)),
         }
     }
 
@@ -256,7 +315,9 @@ impl<A: Allocator + Copy> EGraph<A> {
     }
 
     /// Run one equality-saturation rewrite pass over all live e-classes.
-    fn saturate_once(&mut self, max_enodes: usize) -> bool {
+    fn saturate_once(&mut self, max_enodes: usize, mode: RewriteMode, cost_model: CostModel) -> bool {
+        let fast = mode == RewriteMode::FastMath;
+        let fuse_fma = fast && matches!(cost_model, CostModel::CpuFma | CostModel::GpuTranscendental);
         let mut pending_unions: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc);
         let nclasses = self.classes.len();
 
@@ -280,7 +341,7 @@ impl<A: Allocator + Copy> EGraph<A> {
                             let c = self.add_const(-ca);
                             pending_unions.push((me, c));
                         }
-                        // -(-x) = x
+                        // -(-x) = x (IEEE-754 bit-exact)
                         let ra = self.find(a);
                         let alen = self.classes[ra.0 as usize].len();
                         for j in 0..alen {
@@ -294,75 +355,86 @@ impl<A: Allocator + Copy> EGraph<A> {
                             let c = self.add_const(ca + cb);
                             pending_unions.push((me, c));
                         }
-                        // x + 0 = x, 0 + x = x
-                        if self.is_const(b, 0.0) {
-                            pending_unions.push((me, a));
-                        }
-                        if self.is_const(a, 0.0) {
-                            pending_unions.push((me, b));
-                        }
-                        // x + x = 2 * x
-                        if self.find(a) == self.find(b) {
-                            let two = self.add_const(2.0);
-                            let mul = self.add(ENode::Mul(two, a));
-                            pending_unions.push((me, mul));
-                        }
-                        // Commutativity: a + b = b + a
+                        // Commutativity: a + b = b + a (IEEE-754 exact for non-NaN payloads)
                         if a != b {
                             let comm = self.add(ENode::Add(b, a));
                             pending_unions.push((me, comm));
                         }
-                        // x + (-x) = 0
-                        let rb = self.find(b);
-                        let blen = self.classes[rb.0 as usize].len();
-                        for j in 0..blen {
-                            if let ENode::Neg(x) = self.classes[rb.0 as usize][j] {
-                                if self.find(x) == self.find(a) {
-                                    let z = self.add_const(0.0);
-                                    pending_unions.push((me, z));
+                        if fast {
+                            // x + 0 = x, 0 + x = x (not IEEE-exact for -0.0)
+                            if self.is_const(b, 0.0) {
+                                pending_unions.push((me, a));
+                            }
+                            if self.is_const(a, 0.0) {
+                                pending_unions.push((me, b));
+                            }
+                            // x + x = 2 * x
+                            if self.find(a) == self.find(b) {
+                                let two = self.add_const(2.0);
+                                let mul = self.add(ENode::Mul(two, a));
+                                pending_unions.push((me, mul));
+                            }
+                            // x + (-x) = 0
+                            let rb = self.find(b);
+                            let blen = self.classes[rb.0 as usize].len();
+                            for j in 0..blen {
+                                if let ENode::Neg(x) = self.classes[rb.0 as usize][j] {
+                                    if self.find(x) == self.find(a) {
+                                        let z = self.add_const(0.0);
+                                        pending_unions.push((me, z));
+                                    }
                                 }
                             }
-                        }
-                        // Factoring: (k * x) + (k * y) = k * (x + y)
-                        // AND Pythagorean trig identity: sin(u)^2 + cos(u)^2 = 1
-                        let ra = self.find(a);
-                        let alen = self.classes[ra.0 as usize].len();
-                        for ai in 0..alen {
-                            let an = self.classes[ra.0 as usize][ai];
-                            for bi in 0..blen {
-                                let bn = self.classes[rb.0 as usize][bi];
-                                match (an, bn) {
-                                    (ENode::Mul(k1, x), ENode::Mul(k2, y)) if self.find(k1) == self.find(k2) => {
-                                        let sum = self.add(ENode::Add(x, y));
-                                        let fac = self.add(ENode::Mul(k1, sum));
-                                        pending_unions.push((me, fac));
-                                    }
-                                    (ENode::Pow(p1, e1), ENode::Pow(p2, e2))
-                                        if self.is_const(e1, 2.0) && self.is_const(e2, 2.0) =>
-                                    {
-                                        if self.is_sin_cos_pair(p1, p2) {
+                            // Factoring: (k * x) + (k * y) = k * (x + y)
+                            // FMA fusion: (x * y) + b = fma(x, y, b)
+                            // Pythagorean trig identity: sin(u)^2 + cos(u)^2 = 1
+                            let ra = self.find(a);
+                            let alen = self.classes[ra.0 as usize].len();
+                            for ai in 0..alen {
+                                let an = self.classes[ra.0 as usize][ai];
+                                if fuse_fma
+                                    && let ENode::Mul(x, y) = an
+                                {
+                                    let f = self.add(ENode::Fma(x, y, b));
+                                    pending_unions.push((me, f));
+                                }
+                                for bi in 0..blen {
+                                    let bn = self.classes[rb.0 as usize][bi];
+                                    match (an, bn) {
+                                        (ENode::Mul(k1, x), ENode::Mul(k2, y))
+                                            if self.find(k1) == self.find(k2) =>
+                                        {
+                                            let sum = self.add(ENode::Add(x, y));
+                                            let fac = self.add(ENode::Mul(k1, sum));
+                                            pending_unions.push((me, fac));
+                                        }
+                                        (ENode::Pow(p1, e1), ENode::Pow(p2, e2))
+                                            if self.is_const(e1, 2.0) && self.is_const(e2, 2.0) =>
+                                        {
+                                            if self.is_sin_cos_pair(p1, p2) {
+                                                let one = self.add_const(1.0);
+                                                pending_unions.push((me, one));
+                                            }
+                                        }
+                                        (ENode::Mul(s1, s2), ENode::Mul(c1, c2))
+                                            if self.find(s1) == self.find(s2)
+                                                && self.find(c1) == self.find(c2)
+                                                && self.is_sin_cos_pair(s1, c1) =>
+                                        {
                                             let one = self.add_const(1.0);
                                             pending_unions.push((me, one));
                                         }
+                                        _ => {}
                                     }
-                                    (ENode::Mul(s1, s2), ENode::Mul(c1, c2))
-                                        if self.find(s1) == self.find(s2)
-                                            && self.find(c1) == self.find(c2)
-                                            && self.is_sin_cos_pair(s1, c1) =>
-                                    {
-                                        let one = self.add_const(1.0);
-                                        pending_unions.push((me, one));
-                                    }
-                                    _ => {}
                                 }
                             }
-                        }
-                        // Associativity: (x + y) + z = x + (y + z)
-                        for ai in 0..alen {
-                            if let ENode::Add(x, y) = self.classes[ra.0 as usize][ai] {
-                                let yz = self.add(ENode::Add(y, b));
-                                let assoc = self.add(ENode::Add(x, yz));
-                                pending_unions.push((me, assoc));
+                            // Associativity: (x + y) + z = x + (y + z)
+                            for ai in 0..alen {
+                                if let ENode::Add(x, y) = self.classes[ra.0 as usize][ai] {
+                                    let yz = self.add(ENode::Add(y, b));
+                                    let assoc = self.add(ENode::Add(x, yz));
+                                    pending_unions.push((me, assoc));
+                                }
                             }
                         }
                     }
@@ -371,30 +443,38 @@ impl<A: Allocator + Copy> EGraph<A> {
                             let c = self.add_const(ca - cb);
                             pending_unions.push((me, c));
                         }
-                        if self.find(a) == self.find(b) {
-                            let z = self.add_const(0.0);
-                            pending_unions.push((me, z));
-                        }
-                        if self.is_const(b, 0.0) {
-                            pending_unions.push((me, a));
-                        }
-                        if self.is_const(a, 0.0) {
-                            let nb = self.add(ENode::Neg(b));
-                            pending_unions.push((me, nb));
-                        }
-                        // Factoring: (k * x) - (k * y) = k * (x - y)
-                        let ra = self.find(a);
-                        let rb = self.find(b);
-                        let alen = self.classes[ra.0 as usize].len();
-                        let blen = self.classes[rb.0 as usize].len();
-                        for ai in 0..alen {
-                            if let ENode::Mul(k1, x) = self.classes[ra.0 as usize][ai] {
-                                for bi in 0..blen {
-                                    if let ENode::Mul(k2, y) = self.classes[rb.0 as usize][bi] {
-                                        if self.find(k1) == self.find(k2) {
-                                            let diff_xy = self.add(ENode::Sub(x, y));
-                                            let fac = self.add(ENode::Mul(k1, diff_xy));
-                                            pending_unions.push((me, fac));
+                        if fast {
+                            if self.find(a) == self.find(b) {
+                                let z = self.add_const(0.0);
+                                pending_unions.push((me, z));
+                            }
+                            if self.is_const(b, 0.0) {
+                                pending_unions.push((me, a));
+                            }
+                            if self.is_const(a, 0.0) {
+                                let nb = self.add(ENode::Neg(b));
+                                pending_unions.push((me, nb));
+                            }
+                            // Factoring: (k * x) - (k * y) = k * (x - y)
+                            // FMA fusion: (x * y) - b = fma(x, y, -b)
+                            let ra = self.find(a);
+                            let rb = self.find(b);
+                            let alen = self.classes[ra.0 as usize].len();
+                            let blen = self.classes[rb.0 as usize].len();
+                            for ai in 0..alen {
+                                if let ENode::Mul(k1, x) = self.classes[ra.0 as usize][ai] {
+                                    if fuse_fma {
+                                        let nb = self.add(ENode::Neg(b));
+                                        let f = self.add(ENode::Fma(k1, x, nb));
+                                        pending_unions.push((me, f));
+                                    }
+                                    for bi in 0..blen {
+                                        if let ENode::Mul(k2, y) = self.classes[rb.0 as usize][bi] {
+                                            if self.find(k1) == self.find(k2) {
+                                                let diff_xy = self.add(ENode::Sub(x, y));
+                                                let fac = self.add(ENode::Mul(k1, diff_xy));
+                                                pending_unions.push((me, fac));
+                                            }
                                         }
                                     }
                                 }
@@ -406,10 +486,6 @@ impl<A: Allocator + Copy> EGraph<A> {
                             let c = self.add_const(ca * cb);
                             pending_unions.push((me, c));
                         }
-                        if self.is_const(a, 0.0) || self.is_const(b, 0.0) {
-                            let z = self.add_const(0.0);
-                            pending_unions.push((me, z));
-                        }
                         if self.is_const(a, 1.0) {
                             pending_unions.push((me, b));
                         }
@@ -420,23 +496,29 @@ impl<A: Allocator + Copy> EGraph<A> {
                             let comm = self.add(ENode::Mul(b, a));
                             pending_unions.push((me, comm));
                         }
-                        // sqrt(x) * sqrt(x) = x
-                        let ra = self.find(a);
-                        if ra == self.find(b) {
-                            let alen = self.classes[ra.0 as usize].len();
-                            for ai in 0..alen {
-                                if let ENode::Sqrt(x) = self.classes[ra.0 as usize][ai] {
-                                    pending_unions.push((me, x));
+                        if fast {
+                            if self.is_const(a, 0.0) || self.is_const(b, 0.0) {
+                                let z = self.add_const(0.0);
+                                pending_unions.push((me, z));
+                            }
+                            // sqrt(x) * sqrt(x) = x
+                            let ra = self.find(a);
+                            if ra == self.find(b) {
+                                let alen = self.classes[ra.0 as usize].len();
+                                for ai in 0..alen {
+                                    if let ENode::Sqrt(x) = self.classes[ra.0 as usize][ai] {
+                                        pending_unions.push((me, x));
+                                    }
                                 }
                             }
-                        }
-                        // Associativity: (x * y) * z = x * (y * z)
-                        let alen = self.classes[ra.0 as usize].len();
-                        for ai in 0..alen {
-                            if let ENode::Mul(x, y) = self.classes[ra.0 as usize][ai] {
-                                let yz = self.add(ENode::Mul(y, b));
-                                let assoc = self.add(ENode::Mul(x, yz));
-                                pending_unions.push((me, assoc));
+                            // Associativity: (x * y) * z = x * (y * z)
+                            let alen = self.classes[ra.0 as usize].len();
+                            for ai in 0..alen {
+                                if let ENode::Mul(x, y) = self.classes[ra.0 as usize][ai] {
+                                    let yz = self.add(ENode::Mul(y, b));
+                                    let assoc = self.add(ENode::Mul(x, yz));
+                                    pending_unions.push((me, assoc));
+                                }
                             }
                         }
                     }
@@ -447,42 +529,44 @@ impl<A: Allocator + Copy> EGraph<A> {
                                 pending_unions.push((me, c));
                             }
                         }
-                        if self.is_const(a, 0.0) {
-                            let z = self.add_const(0.0);
-                            pending_unions.push((me, z));
-                        }
                         if self.is_const(b, 1.0) {
                             pending_unions.push((me, a));
                         }
-                        if self.find(a) == self.find(b) {
-                            let one = self.add_const(1.0);
-                            pending_unions.push((me, one));
-                        }
-                        // (x * y) / y = x
-                        let ra = self.find(a);
-                        let rb = self.find(b);
-                        let alen = self.classes[ra.0 as usize].len();
-                        for ai in 0..alen {
-                            if let ENode::Mul(x, y) = self.classes[ra.0 as usize][ai] {
-                                if self.find(y) == rb {
-                                    pending_unions.push((me, x));
-                                } else if self.find(x) == rb {
-                                    pending_unions.push((me, y));
+                        if fast {
+                            if self.is_const(a, 0.0) {
+                                let z = self.add_const(0.0);
+                                pending_unions.push((me, z));
+                            }
+                            if self.find(a) == self.find(b) {
+                                let one = self.add_const(1.0);
+                                pending_unions.push((me, one));
+                            }
+                            // (x * y) / y = x
+                            let ra = self.find(a);
+                            let rb = self.find(b);
+                            let alen = self.classes[ra.0 as usize].len();
+                            for ai in 0..alen {
+                                if let ENode::Mul(x, y) = self.classes[ra.0 as usize][ai] {
+                                    if self.find(y) == rb {
+                                        pending_unions.push((me, x));
+                                    } else if self.find(x) == rb {
+                                        pending_unions.push((me, y));
+                                    }
                                 }
                             }
                         }
                     }
                     ENode::Pow(a, b) => {
-                        if self.is_const(b, 0.0) {
-                            let one = self.add_const(1.0);
-                            pending_unions.push((me, one));
-                        }
                         if self.is_const(b, 1.0) {
                             pending_unions.push((me, a));
                         }
                         if self.is_const(b, 2.0) {
                             let sq = self.add(ENode::Mul(a, a));
                             pending_unions.push((me, sq));
+                        }
+                        if fast && self.is_const(b, 0.0) {
+                            let one = self.add_const(1.0);
+                            pending_unions.push((me, one));
                         }
                         if let (Some(ca), Some(cb)) = (self.const_of(a), self.const_of(b)) {
                             let c = self.add_const(blaze_math::pow(ca, cb));
@@ -496,12 +580,14 @@ impl<A: Allocator + Copy> EGraph<A> {
                                 pending_unions.push((me, c));
                             }
                         }
-                        // ln(exp(x)) = x
-                        let ra = self.find(a);
-                        let alen = self.classes[ra.0 as usize].len();
-                        for ai in 0..alen {
-                            if let ENode::Exp(x) = self.classes[ra.0 as usize][ai] {
-                                pending_unions.push((me, x));
+                        if fast {
+                            // ln(exp(x)) = x
+                            let ra = self.find(a);
+                            let alen = self.classes[ra.0 as usize].len();
+                            for ai in 0..alen {
+                                if let ENode::Exp(x) = self.classes[ra.0 as usize][ai] {
+                                    pending_unions.push((me, x));
+                                }
                             }
                         }
                     }
@@ -510,12 +596,14 @@ impl<A: Allocator + Copy> EGraph<A> {
                             let c = self.add_const(blaze_math::exp(ca));
                             pending_unions.push((me, c));
                         }
-                        // exp(ln(x)) = x
-                        let ra = self.find(a);
-                        let alen = self.classes[ra.0 as usize].len();
-                        for ai in 0..alen {
-                            if let ENode::Ln(x) = self.classes[ra.0 as usize][ai] {
-                                pending_unions.push((me, x));
+                        if fast {
+                            // exp(ln(x)) = x
+                            let ra = self.find(a);
+                            let alen = self.classes[ra.0 as usize].len();
+                            for ai in 0..alen {
+                                if let ENode::Ln(x) = self.classes[ra.0 as usize][ai] {
+                                    pending_unions.push((me, x));
+                                }
                             }
                         }
                     }
@@ -564,6 +652,14 @@ impl<A: Allocator + Copy> EGraph<A> {
                             pending_unions.push((me, if cv > 0.0 { t } else { e }));
                         }
                     }
+                    ENode::Fma(a, b, c) => {
+                        if let (Some(ca), Some(cb), Some(cc)) =
+                            (self.const_of(a), self.const_of(b), self.const_of(c))
+                        {
+                            let v = self.add_const(blaze_math::mul_add(ca, cb, cc));
+                            pending_unions.push((me, v));
+                        }
+                    }
                     ENode::Const(_) | ENode::Var(_) => {}
                 }
             }
@@ -600,7 +696,7 @@ impl<A: Allocator + Copy> EGraph<A> {
     }
 
     /// Compute minimum tree-cost e-node for every live e-class via Bellman-Ford relaxation.
-    fn compute_best(&self) -> (OwnVec<u32, A>, OwnVec<Option<ENode>, A>) {
+    fn compute_best(&self, model: CostModel) -> (OwnVec<u32, A>, OwnVec<Option<ENode>, A>) {
         let n = self.classes.len();
         let mut costs: OwnVec<u32, A> = OwnVec::with_capacity_in(n, self.alloc);
         let mut best: OwnVec<Option<ENode>, A> = OwnVec::with_capacity_in(n, self.alloc);
@@ -618,7 +714,7 @@ impl<A: Allocator + Copy> EGraph<A> {
                     continue;
                 }
                 for &node in self.classes[cid].iter() {
-                    let c = node.op_cost().saturating_add(match node {
+                    let c = node.op_cost(model).saturating_add(match node {
                         ENode::Const(_) | ENode::Var(_) => 0,
                         ENode::Neg(a)
                         | ENode::Sin(a)
@@ -635,7 +731,7 @@ impl<A: Allocator + Copy> EGraph<A> {
                         | ENode::Div(a, b)
                         | ENode::Pow(a, b) => costs[self.find(a).0 as usize]
                             .saturating_add(costs[self.find(b).0 as usize]),
-                        ENode::Select(c, t, e) => costs[self.find(c).0 as usize]
+                        ENode::Select(c, t, e) | ENode::Fma(c, t, e) => costs[self.find(c).0 as usize]
                             .saturating_add(costs[self.find(t).0 as usize])
                             .saturating_add(costs[self.find(e).0 as usize]),
                     });
@@ -746,14 +842,29 @@ impl<A: Allocator + Copy> EGraph<A> {
                 let ee = self.extract_rec(e, best, g, memo, depth + 1);
                 g.select(ec, et, ee)
             }
+            ENode::Fma(a, b, c) => {
+                let ea = self.extract_rec(a, best, g, memo, depth + 1);
+                let eb = self.extract_rec(b, best, g, memo, depth + 1);
+                let ec = self.extract_rec(c, best, g, memo, depth + 1);
+                g.fma(ea, eb, ec)
+            }
         };
         memo[idx] = Some(eid);
         eid
     }
 }
 
-/// Compute the tree-weighted operation cost of `root` in `g`.
+/// Compute the tree-weighted operation cost of `root` in `g` under [`CostModel::Balanced`].
 pub fn expr_cost<A: Allocator + Copy>(g: &ExprGraph<A>, root: ExprId) -> Result<u32, AlgebraError> {
+    expr_cost_with(g, root, CostModel::Balanced)
+}
+
+/// Compute the tree-weighted operation cost of `root` in `g` under a specific [`CostModel`].
+pub fn expr_cost_with<A: Allocator + Copy>(
+    g: &ExprGraph<A>,
+    root: ExprId,
+    model: CostModel,
+) -> Result<u32, AlgebraError> {
     let n = g.len();
     if (root.0 as usize) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
@@ -762,12 +873,13 @@ pub fn expr_cost<A: Allocator + Copy>(g: &ExprGraph<A>, root: ExprId) -> Result<
     for _ in 0..n {
         memo.push(None);
     }
-    expr_cost_memo(g, root, &mut memo)
+    expr_cost_memo(g, root, model, &mut memo)
 }
 
 fn expr_cost_memo<A: Allocator + Copy>(
     g: &ExprGraph<A>,
     id: ExprId,
+    model: CostModel,
     memo: &mut OwnVec<Option<u32>, A>,
 ) -> Result<u32, AlgebraError> {
     let idx = id.0 as usize;
@@ -775,29 +887,45 @@ fn expr_cost_memo<A: Allocator + Copy>(
         return Ok(hit);
     }
     let op = g.node(id)?;
+    let dummy = EClassId(0);
+    let base = match op {
+        Op::Const(_) => ENode::Const(0).op_cost(model),
+        Op::Var(v) => ENode::Var(v).op_cost(model),
+        Op::Neg(_) => ENode::Neg(dummy).op_cost(model),
+        Op::Add(_, _) => ENode::Add(dummy, dummy).op_cost(model),
+        Op::Sub(_, _) => ENode::Sub(dummy, dummy).op_cost(model),
+        Op::Mul(_, _) => ENode::Mul(dummy, dummy).op_cost(model),
+        Op::Div(_, _) => ENode::Div(dummy, dummy).op_cost(model),
+        Op::Pow(_, _) => ENode::Pow(dummy, dummy).op_cost(model),
+        Op::Sin(_) => ENode::Sin(dummy).op_cost(model),
+        Op::Cos(_) => ENode::Cos(dummy).op_cost(model),
+        Op::Tan(_) => ENode::Tan(dummy).op_cost(model),
+        Op::Exp(_) => ENode::Exp(dummy).op_cost(model),
+        Op::Ln(_) => ENode::Ln(dummy).op_cost(model),
+        Op::Sqrt(_) => ENode::Sqrt(dummy).op_cost(model),
+        Op::Tanh(_) => ENode::Tanh(dummy).op_cost(model),
+        Op::Abs(_) => ENode::Abs(dummy).op_cost(model),
+        Op::Select(_, _, _) => ENode::Select(dummy, dummy, dummy).op_cost(model),
+        Op::Fma(_, _, _) => ENode::Fma(dummy, dummy, dummy).op_cost(model),
+    };
     let c = match op {
-        Op::Const(_) | Op::Var(_) => 1,
-        Op::Neg(a) | Op::Abs(a) => 2u32.saturating_add(expr_cost_memo(g, a, memo)?),
-        Op::Add(a, b) | Op::Sub(a, b) => 3u32
-            .saturating_add(expr_cost_memo(g, a, memo)?)
-            .saturating_add(expr_cost_memo(g, b, memo)?),
-        Op::Mul(a, b) => 4u32
-            .saturating_add(expr_cost_memo(g, a, memo)?)
-            .saturating_add(expr_cost_memo(g, b, memo)?),
-        Op::Div(a, b) => 6u32
-            .saturating_add(expr_cost_memo(g, a, memo)?)
-            .saturating_add(expr_cost_memo(g, b, memo)?),
-        Op::Sqrt(a) => 8u32.saturating_add(expr_cost_memo(g, a, memo)?),
-        Op::Pow(a, b) => 10u32
-            .saturating_add(expr_cost_memo(g, a, memo)?)
-            .saturating_add(expr_cost_memo(g, b, memo)?),
-        Op::Sin(a) | Op::Cos(a) | Op::Tan(a) | Op::Exp(a) | Op::Ln(a) | Op::Tanh(a) => {
-            12u32.saturating_add(expr_cost_memo(g, a, memo)?)
-        }
-        Op::Select(c, t, e) => 5u32
-            .saturating_add(expr_cost_memo(g, c, memo)?)
-            .saturating_add(expr_cost_memo(g, t, memo)?)
-            .saturating_add(expr_cost_memo(g, e, memo)?),
+        Op::Const(_) | Op::Var(_) => base,
+        Op::Neg(a)
+        | Op::Sin(a)
+        | Op::Cos(a)
+        | Op::Tan(a)
+        | Op::Exp(a)
+        | Op::Ln(a)
+        | Op::Sqrt(a)
+        | Op::Tanh(a)
+        | Op::Abs(a) => base.saturating_add(expr_cost_memo(g, a, model, memo)?),
+        Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => base
+            .saturating_add(expr_cost_memo(g, a, model, memo)?)
+            .saturating_add(expr_cost_memo(g, b, model, memo)?),
+        Op::Select(c, t, e) | Op::Fma(c, t, e) => base
+            .saturating_add(expr_cost_memo(g, c, model, memo)?)
+            .saturating_add(expr_cost_memo(g, t, model, memo)?)
+            .saturating_add(expr_cost_memo(g, e, model, memo)?),
     };
     memo[idx] = Some(c);
     Ok(c)
@@ -882,6 +1010,12 @@ fn insert_expr<A: Allocator + Copy>(
             let ct = insert_expr(g, t, eg, memo)?;
             let ce = insert_expr(g, e, eg, memo)?;
             eg.add(ENode::Select(cc, ct, ce))
+        }
+        Op::Fma(a, b, c) => {
+            let ca = insert_expr(g, a, eg, memo)?;
+            let cb = insert_expr(g, b, eg, memo)?;
+            let cc = insert_expr(g, c, eg, memo)?;
+            eg.add(ENode::Fma(ca, cb, cc))
         }
     };
     memo[idx] = Some(cid);
@@ -1144,7 +1278,7 @@ pub fn simplify_with_rules<A: Allocator + Copy>(
     opts: SimplifyOpts,
     custom_rules: &[RewriteRule<'_>],
 ) -> Result<(ExprId, SimplifyStats), AlgebraError> {
-    let cost_before = expr_cost(g, root)?;
+    let cost_before = expr_cost_with(g, root, opts.cost_model)?;
     let n = g.len();
     let mut eg = EGraph::new_in(g.alloc());
     let mut memo: OwnVec<Option<EClassId>, A> = OwnVec::with_capacity_in(n, g.alloc());
@@ -1156,16 +1290,16 @@ pub fn simplify_with_rules<A: Allocator + Copy>(
     let mut iterations = 0usize;
     for _ in 0..opts.max_iters {
         iterations += 1;
-        let builtin_changed = eg.saturate_once(opts.max_enodes);
+        let builtin_changed = eg.saturate_once(opts.max_enodes, opts.mode, opts.cost_model);
         let custom_changed = eg.apply_custom_rules(custom_rules, opts.max_enodes);
         if !builtin_changed && !custom_changed {
             break;
         }
     }
 
-    let (_, best) = eg.compute_best();
+    let (_, best) = eg.compute_best(opts.cost_model);
     let extracted = eg.extract_into(root_cid, best.as_slice(), g);
-    let cost_after = expr_cost(g, extracted)?;
+    let cost_after = expr_cost_with(g, extracted, opts.cost_model)?;
     let chosen = if cost_after <= cost_before { extracted } else { root };
     let final_cost = cost_after.min(cost_before);
 
