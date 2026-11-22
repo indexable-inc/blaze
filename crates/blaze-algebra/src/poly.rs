@@ -868,6 +868,14 @@ fn expr_to_poly_memo<A: Allocator + Copy>(
                 None
             }
         }
+        Op::Fma(a, b, c) => match (
+            expr_to_poly_memo(g, a, cache)?,
+            expr_to_poly_memo(g, b, cache)?,
+            expr_to_poly_memo(g, c, cache)?,
+        ) {
+            (Some(pa), Some(pb), Some(pc)) => pa.mul(&pb).ok().and_then(|ab| ab.add(&pc).ok()),
+            _ => None,
+        },
         Op::Sin(_)
         | Op::Cos(_)
         | Op::Tan(_)

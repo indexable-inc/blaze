@@ -74,7 +74,7 @@ pub(crate) struct Binding {
     pub(crate) drops: bool,
 }
 
-impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
+impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// Opens a scope; its mark is the schedule's length.
     pub(crate) fn open(&mut self) -> usize {
         let m = self.sched.len();
@@ -187,7 +187,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
 
     /// The unwind edge that drops every droppable entry below schedule index `top`.
     pub(crate) fn chain(&mut self, top: usize) -> Unwind {
-        let mut todo: Vec<usize, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<usize, A> = Vec::new_in(self.alloc);
         let mut below: Option<Block> = None;
         let mut j = top;
         while j > 0 {

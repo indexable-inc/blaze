@@ -8,11 +8,7 @@ blaze-arrow-ipc	51
 blaze-ask	6
 blaze-audit	30
 blaze-blake3	1
-blaze-body	31
-blaze-body-build	41
-blaze-body-drops	10
 blaze-body-flow	26
-blaze-body-lower	38
 blaze-borrow	12
 blaze-bstd-convert	102
 blaze-build	286

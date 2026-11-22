@@ -34,7 +34,7 @@ pub(crate) fn second(l: &Layout) -> i32 {
 /// The most elements a `[x; N]` row is written as stores of.
 const REPEAT_CAP: u64 = 4096;
 
-impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// `ty` of the body's table at this instance, in the ground table.
     pub(crate) fn ground(&mut self, ty: PTy) -> Result<PTy, BuildError> {
         // A type of the body's own overlay (blaze-body's `intern_ty`) is past `from`: grounding
@@ -144,7 +144,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
     /// Where place `p` is, and its ground type: its local, then each projection in turn.
     pub(crate) fn resolve(&mut self, p: Place) -> Result<(At, PTy), BuildError> {
         let depth = self.v.place(p).depth as usize;
-        let mut chain: Vec<Proj, A> = Vec::with_capacity_in(depth, self.alloc.clone());
+        let mut chain: Vec<Proj, A> = Vec::with_capacity_in(depth, self.alloc);
         let mut q = p;
         while chain.len() < depth {
             let row = self.v.place(q);
@@ -370,7 +370,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                 return Err(self.malformed("an enum variant built into a value local"));
             }
             // The fields, at their offsets, make the local's one or two values.
-            let mut parts: Vec<(i32, Value), A> = Vec::with_capacity_in(2, self.alloc.clone());
+            let mut parts: Vec<(i32, Value), A> = Vec::with_capacity_in(2, self.alloc);
             for &(idx, x, flay) in fields {
                 let foff = self.field_off(lay, idx)?;
                 let x = match x {
@@ -480,7 +480,7 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
                     _ => return Err(self.unsupported("a repeat count that is not a scalar constant")),
                 };
                 let n = u64::try_from(n).ok().filter(|&n| n <= REPEAT_CAP).ok_or(self.unsupported("a repeat of more than 4096 elements"))?;
-                let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(n as usize, self.alloc.clone());
+                let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(n as usize, self.alloc);
                 for i in 0..n as u32 {
                     fields.push((i, x, elem));
                 }
@@ -756,9 +756,9 @@ impl<A: Allocator + Clone> Cx<'_, '_, '_, A> {
             }
             AggregateKind::Coroutine => return Err(self.unsupported("a coroutine built from its upvars")),
         };
-        let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(operands.len() as usize, self.alloc.clone());
+        let mut fields: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(operands.len() as usize, self.alloc);
         let ops: Vec<Operand, A> = {
-            let mut out = Vec::with_capacity_in(operands.len() as usize, self.alloc.clone());
+            let mut out = Vec::with_capacity_in(operands.len() as usize, self.alloc);
             out.extend(self.v.ops(operands));
             out
         };
