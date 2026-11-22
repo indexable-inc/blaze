@@ -1233,6 +1233,7 @@ dependencies = [
  "blaze-id",
  "blaze-ids",
  "blaze-impls",
+ "blaze-inproc",
  "blaze-launch",
  "blaze-launch-rt",
  "blaze-lir",
@@ -2969,11 +2970,6 @@ dependencies = [
 [[package]]
 name = "gpu-macros"
 version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "hashbrown"

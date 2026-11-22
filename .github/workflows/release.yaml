@@ -1,0 +1,226 @@
+name: release
+
+# Builds and publishes `blaze` (`blaze-cli`) for macOS ARM64, Linux x86-64, and Linux ARM64.
+# Uploads all release assets + SHA256SUMS + B3SUMS + library archive to Cloudflare R2
+# (`blaze-releases`, served at https://blaze-releases.ix.dev) and GitHub Releases, and updates
+# the `canary` (and optionally `stable`) channel pointers.
+on:
+  push:
+    tags: ["v0.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.20261122.0)"
+        required: true
+        type: string
+      promote_stable:
+        description: "Also promote this release to the stable channel and Latest"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BLAZE_CORES: all
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+
+jobs:
+  prepare:
+    name: prepare release
+    runs-on: [ix, arm64]
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      promote_stable: ${{ steps.meta.outputs.promote_stable }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_STABLE: ${{ inputs.promote_stable }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+            PROMOTE="true"
+          else
+            TAG="$INPUT_TAG"
+            PROMOTE="${INPUT_STABLE:-true}"
+          fi
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "promote_stable=$PROMOTE" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
+          enable-cache: false
+      - run: |
+          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: library
+          path: ${{ runner.temp }}/library/library-*.tar.xz
+          if-no-files-found: error
+
+  build:
+    name: ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+    env:
+      NAME: blaze-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+      BLAZE_RELEASE: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned nightly toolchain
+        run: |
+          tc="$(cat pins/toolchain)"
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          rustup default "$tc"
+          rustc --version
+      - name: Build release blaze binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: |
+          tc="$(cat pins/toolchain)"
+          cargo +"$tc" build --release --locked -p blaze-cli --bin blaze
+      - name: Archive and checksum
+        run: |
+          mkdir -p "$NAME"
+          cp LICENSE-APACHE LICENSE-MIT README.md "$NAME/"
+          cp target/release/blaze "$NAME/blaze"
+          chmod 755 "$NAME/blaze"
+          "$NAME/blaze" --version
+          "$NAME/blaze" toolchain
+          command -v xz >/dev/null || brew install xz
+          tar cf - "$NAME" | xz -9e -T0 > "$NAME.tar.xz"
+          tar czf "$NAME.tar.gz" "$NAME"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$NAME.tar.xz" > "$NAME.tar.xz.sha256"
+            sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          else
+            shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256"
+            shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          fi
+          ls -lh "$NAME.tar.xz" "$NAME.tar.gz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.NAME }}.tar.xz*
+            ${{ env.NAME }}.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: publish release and channels
+    needs: [prepare, build]
+    runs-on: [ix, arm64]
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROMOTE_STABLE: ${{ needs.prepare.outputs.promote_stable }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
+          enable-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+      - name: Generate SHA256SUMS and B3SUMS
+        run: |
+          uv run --frozen python - <<'EOF'
+          import hashlib, pathlib, blake3
+          out = pathlib.Path("out")
+          archives = sorted(
+              p for p in out.iterdir()
+              if p.is_file() and p.name.startswith("blaze-") and (p.name.endswith(".tar.gz") or p.name.endswith(".tar.xz"))
+          )
+          sha_lines = []
+          b3_lines = []
+          for p in archives:
+              data = p.read_bytes()
+              sha_lines.append(f"{hashlib.sha256(data).hexdigest()}  {p.name}\n")
+              b3_lines.append(f"{blake3.blake3(data).hexdigest()}  {p.name}\n")
+          (out / "SHA256SUMS").write_text("".join(sha_lines))
+          (out / "B3SUMS").write_text("".join(b3_lines))
+          EOF
+          cat out/SHA256SUMS
+          cat out/B3SUMS
+      - name: Plan R2 release upload
+        id: r2
+        run: |
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\"}"; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Upload release assets to R2
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            ${{ steps.r2.outputs.r2 }}
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          ASSETS=(out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz)
+          NOTES="Blaze $TAG — native zero-Wasm proc-macro & hermetic build-script pipeline, Sota AArch64 backend (memory, spilling, scalar FP), ThinArc/ThinVec, Rust Lean 4 kernel checker, and blaze-lint jank rules."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${ASSETS[@]}"
+            if [ "$PROMOTE_STABLE" = "true" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+            fi
+          else
+            FLAGS=(--title "blaze $TAG" --notes "$NOTES")
+            if [ "$PROMOTE_STABLE" = "true" ]; then
+              FLAGS+=(--latest)
+            else
+              FLAGS+=(--prerelease)
+            fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}" "${ASSETS[@]}"
+          fi
+      - name: Update stable and canary channel pointers
+        id: channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p channels
+          printf '%s\n' "$VERSION" > channels/canary
+          if [ "$PROMOTE_STABLE" = "true" ]; then
+            printf '%s\n' "$VERSION" > channels/stable
+          else
+            curl -fsSL https://blaze-releases.ix.dev/channels/stable > channels/stable
+          fi
+          gh release upload channels --repo "$GITHUB_REPOSITORY" --clobber channels/stable channels/canary
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Upload channel pointers to R2
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            ${{ steps.channels.outputs.r2 }}

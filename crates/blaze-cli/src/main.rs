@@ -615,6 +615,17 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
         Some("journal-helper") => journal_helper::run(cx, io, &args, out),
+        Some("--version" | "-V" | "version") => {
+            let ver = option_env!("BLAZE_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
+            let tc = include_str!("../../../pins/toolchain").trim();
+            out.line(cx, format_args!("blaze {ver} ({tc})"))?;
+            Ok(Status::OK)
+        }
+        Some("toolchain") => {
+            let tc = include_str!("../../../pins/toolchain").trim();
+            out.line(cx, format_args!("Rust {tc}"))?;
+            Ok(Status::OK)
+        }
         Some("store") => store::publish_command::run(cx, io, out, err, heap),
         Some(_) | None => Err(CliError::Usage("the command is check, run, test, clean or explain")),
     }
