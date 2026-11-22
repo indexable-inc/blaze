@@ -43,6 +43,9 @@ run, and the committed fixtures are what holds it now. Part of the self-containe
   `[profile.<name>]` read as cargo's `TomlProfile`. The `cfg` of a target and the host triple
   are the caller's: blaze computes the cfgs `rustc --print cfg` would print itself
   (`blaze_units::stdlib::target::target_cfg`), running no rustc.
+- `build.build-dir` expands `{workspace-path-hash}` into Cargo's two-component hash of the
+  canonical workspace manifest path. Where Cargo hashes the path as given when it cannot
+  canonicalize it, blaze refuses, naming the manifest and the io error.
 - `cargo config get` as cargo 1.99 prints it (`blaze_manifest::config::get`, the `config`
   example): `toml` with and without `--show-origin`, `json`, `json-value`, `--merged no`, the
   variables that may affect a table, and the warnings of old and doubled config files. It is how
@@ -96,8 +99,7 @@ naming it, not a cargo run.
 Not yet: the unstable profile keys (`trim-paths`, `rustflags`, `codegen-backend`, which need nightly
 `cargo-features`), `links` overrides in `[target.<triple>]`, a source defined twice under two names
 (blaze-registry's, which has the `SourceId` display it names), and the warnings cargo prints for
-unused manifest keys and lints. `{workspace-path-hash}` in `build.build-dir` is refused until
-cargo's hash is ported. cargo checks a list against the lists that do not merge (`target.*.runner`,
+unused manifest keys and lints. cargo checks a list against the lists that do not merge (`target.*.runner`,
 `registry.credential-provider`, …) by a key path it never pops, so whether such a list merges
 across files depends on the keys merged before it in `FxHashMap` order; blaze does the same.
 

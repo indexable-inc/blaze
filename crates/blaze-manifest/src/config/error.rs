@@ -84,7 +84,9 @@ pub enum ConfigWhat {
     TargetDirEmptyEnv,
     TargetDirEmpty { definition: Definition },
     NotUtf8 { what: &'static str },
-    BuildDirHash { definition: Definition },
+    /// The workspace manifest whose path `{workspace-path-hash}` hashes could not be
+    /// canonicalized; the cause is the io error.
+    BuildDirManifestPath { manifest: PathBuf, definition: Definition },
     BuildDirVariable { variable: String, value: String, help: String },
     BuildDirOpen { value: String },
     BuildDirClose { value: String },
@@ -276,10 +278,11 @@ impl fmt::Display for ConfigWhat {
                 definition.located()
             ),
             W::NotUtf8 { what } => write!(f, "{what} was not valid utf-8"),
-            W::BuildDirHash { definition } => write!(
+            W::BuildDirManifestPath { manifest, definition } => write!(
                 f,
-                "`{{workspace-path-hash}}` in build.build-dir (defined in {}) is not supported \
-                 by blaze yet",
+                "could not canonicalize the workspace manifest `{}` to expand \
+                 `{{workspace-path-hash}}` in build.build-dir (defined in {})",
+                manifest.display(),
                 definition.located()
             ),
             W::BuildDirVariable { variable, value, help } => {

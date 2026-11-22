@@ -2,12 +2,13 @@
 //! `[build]` and `[net]`, each as cargo 1.99 takes them (the rustflags order and `[env]`
 //! values checked against `cargo build -v` and `cargo run`).
 
+use core::error::Error;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use blaze_core::temp::TempDir;
 use blaze_manifest::Config;
-use blaze_manifest::config::{CompileKind, Flags, Replacement};
+use blaze_manifest::config::{CompileKind, ConfigWhat, Flags, Replacement};
 use blaze_manifest::files::Disk;
 use blaze_manifest::schema::{ProfilePackageSpec, TomlDebugInfo, TomlOptLevel};
 use blaze_resolve::Cfg;
@@ -203,6 +204,49 @@ fn build_table_warns_of_keys_it_does_not_know() {
         config.take_warnings(),
         [format!("unused config key `build.target-dri` in `{def}`")]
     );
+}
+
+#[test]
+fn build_dir_shards_the_workspace_manifest_hash() {
+    let tree = Tree::new(
+        "build-dir-hash",
+        &[
+            (
+                ".cargo/config.toml",
+                "[build]\nbuild-dir = '{cargo-cache-home}/build-dir/{workspace-path-hash}'\n",
+            ),
+            ("checkout/Cargo.toml", "[workspace]\n"),
+        ],
+    );
+    let config = tree.config(&[]);
+    let canonical_manifest = tree.root.join("checkout/Cargo.toml").canonicalize().unwrap();
+    let hash = blaze_source::short_hash(&canonical_manifest);
+    let (shard, suffix) = hash.split_at(2);
+    let expected = tree.root.join("home/build-dir").join(shard).join(suffix);
+    let manifest = tree.root.join("checkout/../checkout/Cargo.toml");
+    assert_eq!(config.build_dir(&manifest).unwrap(), Some(expected));
+
+    let missing_manifest = tree.root.join("missing/Cargo.toml");
+    let error = config.build_dir(&missing_manifest).unwrap_err();
+    assert!(
+        matches!(
+            error.what(),
+            ConfigWhat::BuildDirManifestPath { manifest, .. } if *manifest == missing_manifest
+        ),
+        "{error:?}"
+    );
+    assert!(error.source().is_some(), "{error:?}");
+}
+
+#[test]
+fn build_dir_expands_the_workspace_hash_after_the_workspace_root() {
+    let tree =
+        Tree::new("build-dir-root-hash", &[("{workspace-path-hash}/Cargo.toml", "[workspace]\n")]);
+    let manifest = tree.root.join("{workspace-path-hash}/Cargo.toml");
+    let hash = blaze_source::short_hash(&manifest.canonicalize().unwrap());
+    let (shard, suffix) = hash.split_at(2);
+    let config = tree.config(&[("CARGO_BUILD_BUILD_DIR", "{workspace-root}")]);
+    assert_eq!(config.build_dir(&manifest).unwrap(), Some(tree.root.join(shard).join(suffix)));
 }
 
 #[test]
