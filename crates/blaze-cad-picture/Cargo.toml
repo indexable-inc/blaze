@@ -17,7 +17,9 @@ doctest = false
 [dependencies]
 # The tape and its interval, point and gradient evaluators.
 blaze-cad-field.workspace = true
-# `Image`, `png()` and `PngOpts`: the picture written as a file.
+# Triangle meshes for previewing exported assets directly.
+blaze-cad-mesh.workspace = true
+# `Image`, `png()`, `PngOpts`, `Material` and `Transform`: the picture written as a file and scene inputs.
 blaze-cad-out.workspace = true
 # `Vec3`, `Aabb3`, `tan`.
 blaze-math.workspace = true

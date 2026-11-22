@@ -92,8 +92,8 @@ pub use canon::{CanonError, CanonOpts, canonical};
 pub use check::{CheckOpts, Defect, Proof, Verified, check};
 pub use cluster::{Cluster, ClusterCaps, ClusterError, ClusterOpts, Clusters, clusters, clusters_planted};
 pub use contour::{
-    CONTOUR_SCHEMA, MeshError, MeshOpts, MeshStats, Meshed, PieceCache, PieceCacheOpts, QEF_RANK_CUT, RedistanceOpts, RegionKey, mesh,
-    mesh_cached, mesh_planted, solve_redistance, solve_redistance_planted,
+    CONTOUR_SCHEMA, GridSizing, MeshError, MeshOpts, MeshStats, Meshed, PieceCache, PieceCacheOpts, QEF_RANK_CUT, RedistanceOpts,
+    RegionKey, auto_grid, mesh, mesh_cached, mesh_planted, solve_redistance, solve_redistance_planted,
 };
 pub use decompose::{ConvexPiece, DecomposeError, DecomposeOpts, Decomposition, decompose};
 pub use digest::MeshDigest;
@@ -101,7 +101,10 @@ pub use geom::Aabb;
 pub use hull::{Flat, Hull, HullError, HullOpts, convex_hull, convex_hull_planted};
 pub use ids::{MaterialRole, PartId, TriId, VertexId, VertexPair};
 pub use lod::{LodChain, LodError, LodLevel, LodOpts, Projection, lod_chain};
-pub use measure::{Components, MassProps, area, bounds, components, mass_properties};
+pub use measure::{
+    Components, CreaseProfile, CreaseProfileOpts, MassProps, Topology, area, bounds, components, crease_profile, mass_properties,
+    topology,
+};
 pub use mesh::{Column, Columns, Mesh, MeshVecs, MeshView, ShapeError};
 pub use plant::{ClusterPlant, ContourPlant, DecimatePlant, HullPlant, QuantPlant, RedistancePlant};
 pub use quant::{

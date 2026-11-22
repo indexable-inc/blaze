@@ -515,6 +515,7 @@ name = "blaze-cad-picture"
 version = "0.0.0"
 dependencies = [
  "blaze-cad-field",
+ "blaze-cad-mesh",
  "blaze-cad-out",
  "blaze-deflate",
  "blaze-math",
@@ -1352,17 +1353,6 @@ dependencies = [
  "blaze-ids",
  "blaze-own",
  "blaze-sim",
-]
-
-[[package]]
-name = "blaze-live"
-version = "0.0.0"
-dependencies = [
- "blaze-cbor",
- "blaze-own",
- "blaze-sim",
- "blaze-text",
- "blaze-unicode",
 ]
 
 [[package]]

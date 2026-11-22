@@ -36,7 +36,7 @@ fn main() -> Result<(), ModelError> {
         }
         for part in model.parts() {
             let t = Instant::now();
-            let m = mesh_part(model.graph_ref(), part, MeshPartOpts { alloc, scratch: alloc, tolerance }, Some(&mut cache))?;
+            let m = mesh_part(model.graph_ref(), part, MeshPartOpts { alloc, scratch: alloc, tolerance, .. }, Some(&mut cache))?;
             let ns = ms(t) * 1e6;
             let s = m.stats;
             println!(

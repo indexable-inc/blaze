@@ -769,6 +769,17 @@ fn simplify_case(tape: &Tape, plant: impl Planted<DecimatePlant> + Copy) -> Resu
                 return Err(Broken::Oracle(MeshBroken::OverError { got: bound, target: most.as_m() }));
             }
         }
+        Target::Budget { max_triangles, max_error, .. } => {
+            let got = out.mesh.view().triangle_count();
+            if out.stop == Stop::Reached && got > max_triangles {
+                return Err(Broken::Oracle(MeshBroken::OverTarget { got, target: max_triangles }));
+            }
+            if let Some(ce) = max_error
+                && out.error_bound > ce + blaze_units::Length::nm(1)
+            {
+                return Err(Broken::Oracle(MeshBroken::OverError { got: bound, target: ce.as_m() }));
+            }
+        }
     }
     // Every feature corner is still a vertex, where it was.
     let have: std::collections::BTreeSet<Key> = output.positions.iter().map(|&p| key(p)).collect();
@@ -1683,4 +1694,110 @@ fn redistance_grid_matches_exact_field() {
 #[test]
 fn redistance_plants_are_caught() {
     controls(Config::cases(80), |tape, plant: RedistancePlant| redistance_case(tape, plant));
+}
+
+#[test]
+fn auto_grid_scales_for_cabin_and_respects_min_feature() {
+    use blaze_math::{Aabb3, Vec3};
+    use blaze_units::Length;
+    // 6 m x 4 m x 3 m cabin wall at 2 mm tolerance: auto_grid picks ~128 mm feature / ~256 mm
+    // piece instead of the legacy 8.4 mm fixed default (dramatically fewer flat-wall cells).
+    let cabin_box = Aabb3::new(Vec3::new(-3.0, -2.0, 0.0), Vec3::new(3.0, 2.0, 3.0));
+    let g = auto_grid(&cabin_box, Length::mm(2.0), None);
+    assert!(g.feature >= Length::mm(64.0), "expected coarse feature on 6m cabin, got {:?}", g.feature);
+    assert!(g.piece >= g.feature * 2.0, "piece {:?} must be at least 2x feature {:?}", g.piece, g.feature);
+    assert!((g.feature.as_nm() as u64).is_power_of_two(), "feature must be dyadic power of two");
+    assert!((g.piece.as_nm() as u64).is_power_of_two(), "piece must be dyadic power of two");
+
+    // With explicit 25 mm minimum feature (e.g. window mullion / bolt hole), feature is capped <= 25 mm.
+    let g_fine = auto_grid(&cabin_box, Length::mm(2.0), Some(Length::mm(25.0)));
+    assert!(g_fine.feature <= Length::mm(25.0), "feature {:?} must respect min_feature 25mm", g_fine.feature);
+    assert!(g_fine.feature >= Length::mm(8.0));
+}
+
+#[test]
+fn target_budget_enforces_triangle_cap_and_error_ceiling() {
+    use blaze_cad_field::{CompileOpts, Graph, GraphOpts, SphereOpts, compile};
+    use blaze_units::Length;
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let s = g.sphere(SphereOpts { radius: Length::mm(40.0), .. }).expect("sphere");
+    let t = compile(&g, s.id(), CompileOpts { alloc: heap(), .. }).expect("compile");
+    let meshed = mesh(&t, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.5), .. }).expect("mesh");
+    let orig = meshed.mesh.view().triangle_count();
+    assert!(orig > 400, "sphere should mesh to > 400 tris, got {orig}");
+
+    // 1) Budget of 160 tris with no ceiling: reaches <= 160 tris and preserves Verified proof.
+    let d1 = decimate(
+        Source::Verified(meshed.verified()),
+        DecimateOpts {
+            target: Target::Budget { error: Length::mm(0.2), max_triangles: 160, max_error: None },
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+        },
+    )
+    .expect("budget decimate");
+    assert_eq!(d1.stop, Stop::Reached);
+    assert!(d1.mesh.view().triangle_count() <= 160);
+    assert!(d1.verified().is_some());
+
+    // 2) Impossible budget of 20 tris with tight 0.6 mm error ceiling: stops at ErrorCeiling and
+    // keeps error_bound <= 0.6 mm + 1 nm!
+    let ceiling = Length::mm(0.6);
+    let d2 = decimate(
+        Source::Verified(meshed.verified()),
+        DecimateOpts {
+            target: Target::Budget { error: Length::mm(0.1), max_triangles: 20, max_error: Some(ceiling) },
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+        },
+    )
+    .expect("ceiling decimate");
+    assert_eq!(d2.stop, Stop::ErrorCeiling, "expected ErrorCeiling, got {:?}", d2.stop);
+    assert!(d2.mesh.view().triangle_count() > 20);
+    assert!(d2.error_bound <= ceiling + Length::nm(1), "error {:?} exceeded ceiling {:?}", d2.error_bound, ceiling);
+}
+
+#[test]
+fn topology_counts_exact_holes_and_crease_profile_detects_bevels() {
+    use blaze_cad_field::{BoxOpts, CompileOpts, CylinderOpts, Graph, GraphOpts, Placement, compile};
+    use blaze_units::Length;
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+
+    // Solid box -> genus 0, sharp creases, ~0 bevel edges.
+    let plate = g.cuboid(BoxOpts { size: [Length::mm(80.0), Length::mm(50.0), Length::mm(12.0)], .. }).expect("plate");
+    let t_box = compile(&g, plate.id(), CompileOpts { alloc: heap(), .. }).expect("compile box");
+    let m_box = mesh(&t_box, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.0), .. }).expect("mesh box");
+    let topo_box = topology(&m_box.mesh.view(), heap()).expect("topo box");
+    assert_eq!(topo_box.components, 1);
+    assert_eq!(topo_box.open_edges, 0);
+    assert_eq!(topo_box.non_manifold_edges, 0);
+    assert_eq!(topo_box.genus, Some(0), "solid box must have genus 0, got {topo_box:?}");
+
+    // Plate with TWO through-holes -> genus 2!
+    let h1 = g.cylinder(CylinderOpts { radius: Length::mm(8.0), height: Length::mm(30.0), .. }).expect("h1");
+    let h1 = g.place(h1, Placement::shift(Length::mm(-18.0), Length::ZERO, Length::ZERO)).expect("p1");
+    let h2 = g.cylinder(CylinderOpts { radius: Length::mm(8.0), height: Length::mm(30.0), .. }).expect("h2");
+    let h2 = g.place(h2, Placement::shift(Length::mm(18.0), Length::ZERO, Length::ZERO)).expect("p2");
+    let holes = g.union(h1, h2).expect("holes");
+    let holed = g.difference(plate, holes).expect("holed");
+    let t_holed = compile(&g, holed.id(), CompileOpts { alloc: heap(), .. }).expect("compile holed");
+    let m_holed = mesh(&t_holed, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.0), .. }).expect("mesh holed");
+    let topo_holed = topology(&m_holed.mesh.view(), heap()).expect("topo holed");
+    assert_eq!(topo_holed.components, 1);
+    assert_eq!(topo_holed.genus, Some(2), "plate with 2 through-holes must have genus 2, got {topo_holed:?}");
+
+    // Rounded/beveled box vs sharp box: crease_profile sees bevel edges on the rounded box.
+    let rounded = g
+        .cuboid(BoxOpts { size: [Length::mm(60.0); 3], round: Length::mm(8.0), .. })
+        .expect("rounded");
+    let t_rnd = compile(&g, rounded.id(), CompileOpts { alloc: heap(), .. }).expect("compile rounded");
+    let m_rnd = mesh(&t_rnd, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.8), .. }).expect("mesh rounded");
+    let prof_sharp = crease_profile(&m_box.mesh.view(), CreaseProfileOpts { scratch: heap(), .. }).expect("prof sharp");
+    let prof_rnd = crease_profile(&m_rnd.mesh.view(), CreaseProfileOpts { scratch: heap(), .. }).expect("prof rnd");
+    assert!(prof_sharp.sharp_edge_length > Length::mm(100.0), "sharp box must have sharp creases");
+    assert!(prof_rnd.bevel_edge_length > Length::mm(50.0), "rounded box must have bevel edges, got {prof_rnd:?}");
 }

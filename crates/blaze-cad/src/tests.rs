@@ -74,6 +74,8 @@ enum CadBroken {
     OverhangWrong { should_fail: bool, verdict: String },
     /// A draft-angle DFM verdict disagrees with the geometry.
     DraftWrong { should_fail: bool, verdict: String },
+    /// A mesh fidelity check missed a lost hole or lost bevel (or falsely rejected a good mesh).
+    FidelityWrong { what: &'static str, verdict: String },
 }
 
 impl fmt::Display for CadBroken {
@@ -136,6 +138,14 @@ blaze_sim::plants! {
     impl DraftPlant breaks CadBroken {
         None,
         IgnoreUndercutSign => CadBroken::DraftWrong { should_fail: true, .. },
+    }
+}
+
+blaze_sim::plants! {
+    impl FidelityPlant breaks CadBroken {
+        None,
+        SkipVoidSubdivision => CadBroken::FidelityWrong { what: "off-center lost hole", .. },
+        IgnoreNormalDeviation => CadBroken::FidelityWrong { what: "lost bevel", .. },
     }
 }
 
@@ -260,7 +270,7 @@ fn mass_case(tape: &Tape, plant: impl Planted<MassPlant> + Copy) -> Result<(), B
     // A fortieth of the radius (half a millimetre to one): a debug run in a second a case; every
     // bound below is in tolerances.
     let tol = r_mm / 40.0;
-    let meshed = mesh_part(&g, &part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(tol) }, None).map_err(harness)?;
+    let meshed = mesh_part(&g, &part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(tol), .. }, None).map_err(harness)?;
     let m = mass_properties_planted(&meshed.verified(), Density::kg_per_m3(rho), plant);
 
     let r = r_mm / 1000.0;
@@ -581,7 +591,7 @@ fn export_glb_gpu_optimized_lods_colliders_materials_and_hierarchy() {
 
     // Verify Tipsify vertex-cache optimization directly reduces or keeps low ACMR on a meshed sphere.
     let cap_part = *model.part(cap_id).expect("cap part");
-    let meshed = mesh_part(model.graph_ref(), &cap_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.8) }, None)
+    let meshed = mesh_part(model.graph_ref(), &cap_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.8), .. }, None)
         .expect("mesh sphere");
     let raw_acmr = blaze_cad_mesh::acmr(&meshed.mesh.view(), blaze_cad_mesh::AcmrOpts { cache_size: 32, scratch: heap() }).expect("raw acmr");
     let cached = blaze_cad_mesh::optimize_vertex_cache(
@@ -1012,7 +1022,7 @@ fn decimate_mesh_reduces_triangles_within_hausdorff_bound() {
     let meshed = mesh_part(
         model.graph_ref(),
         &part,
-        MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.3) },
+        MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(0.3), .. },
         None,
     )
     .expect("mesh");
@@ -1032,4 +1042,269 @@ fn decimate_mesh_reduces_triangles_within_hausdorff_bound() {
     assert!(dec.verified().is_some(), "decimated mesh keeps Verified proof");
     assert!(dec_tris < orig_tris, "expected fewer triangles: {dec_tris} vs {orig_tris}");
     assert!(dec.error_bound <= max_err, "error_bound {:?} exceeded {:?}", dec.error_bound, max_err);
+}
+
+// ---- SOTA Game-Asset Workflow: Fidelity (Lost Holes & Bevels), Budgets, Report & Mesh Preview ----
+
+fn fidelity_case(tape: &Tape, plant: impl Planted<FidelityPlant> + Copy) -> Result<(), Broken<CadBroken>> {
+    use blaze_cad_mesh::{COS_32_DEGREES, DecimateOpts, MeshLimits, Source, Target, decimate};
+
+    // 1) Off-center through-hole hidden inside a large flat plate's 2-triangle face:
+    // the solid box mesh bridges the hole completely; its centroid sits on solid material, so
+    // only interval-guided triangle subdivision catches the lost hole!
+    let hole_r = tape.int_in(10..=15i64, "hole radius mm") as f64;
+    let hole_x = tape.int_in(42..=58i64, "hole offset x mm") as f64;
+    let hole_y = tape.int_in(38..=54i64, "hole offset y mm") as f64;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let plate = g.cuboid(BoxOpts { size: mm3(200.0, 200.0, 20.0), .. }).map_err(harness)?;
+    let cutter = g.cylinder(CylinderOpts { radius: Length::mm(hole_r), height: Length::mm(40.0), .. }).map_err(harness)?;
+    let cutter = g
+        .place(cutter, Placement::shift(Length::mm(hole_x), Length::mm(hole_y), Length::ZERO))
+        .map_err(harness)?;
+    let holed = g.difference(plate, cutter).map_err(harness)?;
+    let holed_part = Part::new(&mut g, PartOpts { solid: holed, name: "holed_plate" }).map_err(harness)?;
+    let solid_part = Part::new(&mut g, PartOpts { solid: plate, name: "solid_plate" }).map_err(harness)?;
+
+    // Build a minimal 12-triangle sharp box mesh of the un-holed plate (giant wall faces).
+    let raw_solid = mesh_part(&g, &solid_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(2.0), .. }, None)
+        .map_err(harness)?;
+    let box_12 = decimate(
+        Source::Verified(raw_solid.verified()),
+        DecimateOpts {
+            target: Target::Error(Length::mm(1.0)),
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+        },
+    )
+    .map_err(harness)?;
+
+    let res_hole = check_mesh_fidelity_planted(
+        &g,
+        &holed_part,
+        &box_12.mesh.view(),
+        None,
+        FidelityOpts {
+            hole_tolerance: Length::mm(3.0),
+            surface_tolerance: Length::mm(3.0),
+            min_hole_feature: Length::mm(6.0),
+            scratch: heap(),
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if !matches!(res_hole.verdict, Verdict::Found(FidelityFinding::LostHole { .. })) {
+        return Err(Broken::Oracle(CadBroken::FidelityWrong {
+            what: "off-center lost hole",
+            verdict: format!("{:?}", res_hole.verdict),
+        }));
+    }
+
+    // 2) Lost bevel whose positional corner offset `r*(sqrt(2)-1)` (~2.9..3.7 mm) is BELOW a
+    // permissive 8 mm position tolerance, yet whose surface normal deviates by 45 deg!
+    let bevel_r = tape.int_in(7..=9i64, "bevel radius mm") as f64;
+    let rounded = g
+        .cuboid(BoxOpts { size: mm3(100.0, 100.0, 40.0), round: Length::mm(bevel_r), .. })
+        .map_err(harness)?;
+    let sharp = g.cuboid(BoxOpts { size: mm3(100.0, 100.0, 40.0), .. }).map_err(harness)?;
+    let rounded_part = Part::new(&mut g, PartOpts { solid: rounded, name: "beveled" }).map_err(harness)?;
+    let sharp_part = Part::new(&mut g, PartOpts { solid: sharp, name: "sharp" }).map_err(harness)?;
+
+    let raw_sharp = mesh_part(&g, &sharp_part, MeshPartOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.5), .. }, None)
+        .map_err(harness)?;
+    let sharp_12 = decimate(
+        Source::Verified(raw_sharp.verified()),
+        DecimateOpts {
+            target: Target::Error(Length::mm(1.0)),
+            cos_crease: COS_32_DEGREES,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+        },
+    )
+    .map_err(harness)?;
+
+    let res_bevel = check_mesh_fidelity_planted(
+        &g,
+        &rounded_part,
+        &sharp_12.mesh.view(),
+        None,
+        FidelityOpts {
+            hole_tolerance: Length::mm(8.0),
+            surface_tolerance: Length::mm(8.0),
+            bevel_probe_tolerance: Some(Length::mm(0.5)),
+            max_normal_error: Angle::degrees(18.0),
+            min_hole_feature: Length::mm(4.0),
+            scratch: heap(),
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+    if !matches!(res_bevel.verdict, Verdict::Found(FidelityFinding::LostBevel { .. })) {
+        return Err(Broken::Oracle(CadBroken::FidelityWrong {
+            what: "lost bevel",
+            verdict: format!("{:?}", res_bevel.verdict),
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn fidelity_plants_are_caught() {
+    controls(Config::cases(4), |tape, plant: FidelityPlant| fidelity_case(tape, plant));
+}
+
+#[test]
+fn allocate_budgets_honors_explicit_caps_weights_and_total() {
+    let inputs = [
+        BudgetInput { natural_triangles: 10_000, explicit_cap: Some(3_000), weight: 1.0 },
+        BudgetInput { natural_triangles: 20_000, explicit_cap: None, weight: 2.0 },
+        BudgetInput { natural_triangles: 15_000, explicit_cap: None, weight: 1.0 },
+        BudgetInput { natural_triangles: 40, explicit_cap: None, weight: 1.0 },
+    ];
+    let alloc = allocate_budgets(&inputs, 10_000, 24, heap()).expect("allocate");
+    assert_eq!(alloc[0], 3_000, "explicit cap honored");
+    assert!(alloc[1] > alloc[2], "higher weight & natural count gets more budget: {} vs {}", alloc[1], alloc[2]);
+    assert!(alloc[3] >= 24 && alloc[3] <= 40, "small part keeps floor: {}", alloc[3]);
+    let sum: u32 = alloc.iter().copied().sum();
+    assert!(sum <= 10_000, "total {sum} exceeded budget 10000");
+
+    // When natural total already fits, zero compression occurs.
+    let easy = allocate_budgets(&inputs, 100_000, 24, heap()).expect("easy");
+    assert_eq!(easy.as_slice(), &[3_000, 20_000, 15_000, 40]);
+}
+
+#[test]
+fn game_asset_workflow_budgets_fidelity_report_and_mesh_preview() {
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+
+    // Meter-scale mini-cabin assembly:
+    // 1. Walls shell (3.0 x 2.4 x 2.0 m) with 2 window cutouts + 1 door opening (genus = 3!)
+    let g = model.graph();
+    let outer = g.cuboid(BoxOpts { size: mm3(3000.0, 2400.0, 2000.0), round: Length::mm(20.0), .. }).expect("outer");
+    let inner = g.cuboid(BoxOpts { size: mm3(2700.0, 2100.0, 2200.0), .. }).expect("inner");
+    let shell = g.difference(outer, inner).expect("shell");
+    let win_a = g.cuboid(BoxOpts { size: mm3(500.0, 600.0, 600.0), .. }).expect("win a");
+    let win_a = g.place(win_a, Placement::shift(Length::mm(-700.0), Length::mm(-1200.0), Length::mm(100.0))).expect("place win a");
+    let win_b = g.cuboid(BoxOpts { size: mm3(500.0, 600.0, 600.0), .. }).expect("win b");
+    let win_b = g.place(win_b, Placement::shift(Length::mm(700.0), Length::mm(-1200.0), Length::mm(100.0))).expect("place win b");
+    let door = g.cuboid(BoxOpts { size: mm3(650.0, 600.0, 1200.0), .. }).expect("door");
+    let door = g.place(door, Placement::shift(Length::ZERO, Length::mm(1200.0), Length::mm(-200.0))).expect("place door");
+    let cutouts = union_all(g, &[win_a, win_b, door]).expect("cutouts");
+    let walls = g.difference(shell, cutouts).expect("walls");
+    let walls = g.place(walls, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(1000.0))).expect("place walls");
+
+    // 2. Beveled roof slab resting atop the walls.
+    let roof = g.cuboid(BoxOpts { size: mm3(3400.0, 2800.0, 220.0), round: Length::mm(25.0), .. }).expect("roof");
+    let roof = g.place(roof, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(2110.0))).expect("place roof");
+
+    // 3. Stone chimney with a cylindrical through-flue (genus = 1!).
+    let chim_body = g.cuboid(BoxOpts { size: mm3(550.0, 550.0, 1400.0), .. }).expect("chim body");
+    let flue = g.cylinder(CylinderOpts { radius: Length::mm(120.0), height: Length::mm(1800.0), .. }).expect("flue");
+    let chimney = g.difference(chim_body, flue).expect("chimney");
+    let chimney = g.place(chimney, Placement::shift(Length::mm(950.0), Length::mm(550.0), Length::mm(2500.0))).expect("place chimney");
+
+    let (walls_id, _) = model.add(PartOpts { solid: walls, name: "walls" }).expect("add walls");
+    let (roof_id, _) = model.add(PartOpts { solid: roof, name: "roof" }).expect("add roof");
+    let (chimney_id, _) = model.add(PartOpts { solid: chimney, name: "chimney" }).expect("add chimney");
+
+    model.set_material(walls_id, MaterialRole(0)).expect("mat walls");
+    model.set_material(roof_id, MaterialRole(1)).expect("mat roof");
+    model.set_material(chimney_id, MaterialRole(2)).expect("mat chimney");
+
+    model.set_budget(roof_id, PartBudget::max_triangles(1_500)).expect("budget roof");
+
+    const WOOD: Material<'static> = Material {
+        name: "wood.wall",
+        base_colour: [0.46, 0.28, 0.14, 1.0],
+        metallic: 0.0,
+        roughness: 0.78,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    };
+    const SLATE: Material<'static> = Material {
+        name: "slate.roof",
+        base_colour: [0.18, 0.21, 0.26, 1.0],
+        metallic: 0.05,
+        roughness: 0.65,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    };
+    const STONE: Material<'static> = Material {
+        name: "stone.chimney",
+        base_colour: [0.42, 0.41, 0.39, 1.0],
+        metallic: 0.0,
+        roughness: 0.88,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    };
+    let materials = [WOOD, SLATE, STONE];
+
+    let asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::Environment,
+            total_budget: Some(TriangleBudget(6_000)),
+            materials: &materials,
+            lods: Some(ExportLodOpts { ratio: 0.5, fewest_triangles: 64, .. }),
+            colliders: Some(ColliderMode::ConvexHull),
+            ..
+        },
+        None,
+    )
+    .expect("build game asset");
+
+    assert!(asset.report.budget_passed, "budget must pass:\n{}", Shown(&asset.report));
+    assert!(asset.triangles() <= 6_000, "total {} exceeded 6000", asset.triangles());
+    assert!(asset.report.parts[1].written_triangles <= 1_500, "roof exceeded explicit 1500 cap");
+    // Open-ended rectangular tube (top & bottom open) with 3 side cutouts (2 windows + door)
+    // has 5 openings connecting inside to outside, so its exact topological genus is 5 - 1 = 4!
+    assert_eq!(asset.report.parts[0].holes, Some(4), "walls must preserve all openings (genus 4):\n{}", Shown(&asset.report));
+    assert_eq!(asset.report.parts[2].holes, Some(1), "chimney must preserve its flue hole:\n{}", Shown(&asset.report));
+    assert!(asset.report.fidelity_passed, "fidelity checks must pass:\n{}", Shown(&asset.report));
+
+    let report_text = format!("{}", Shown(&asset.report));
+    assert!(report_text.contains("walls") && report_text.contains("roof") && report_text.contains("chimney"));
+    assert!(report_text.contains("TOTAL (3 parts)"));
+    assert!(report_text.contains("fidelity=PASS"));
+
+    // Preview using the ACTUAL exported meshes (materials + wireframe overlay).
+    let view = View {
+        eye: mm3(4800.0, -5600.0, 3600.0),
+        target: mm3(0.0, 0.0, 1400.0),
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 64,
+        height: 48,
+        ..
+    };
+    let preview = asset
+        .preview(
+            &materials,
+            view,
+            MeshPictureOpts {
+                alloc: heap(),
+                scratch: heap(),
+                wireframe: Wireframe::Overlay { width_px: 1.0, colour: [24, 28, 34] },
+                ..
+            },
+        )
+        .expect("preview exported asset");
+    assert!(preview.stats.hits > 400, "exported mesh preview must hit the cabin, got {} hits", preview.stats.hits);
+    let part_col = asset
+        .preview_part_colors(view, MeshPictureOpts { alloc: heap(), scratch: heap(), .. })
+        .expect("preview part colors");
+    assert_ne!(preview.pixels[..], part_col.pixels[..], "material+wireframe preview must differ from part-color preview");
 }

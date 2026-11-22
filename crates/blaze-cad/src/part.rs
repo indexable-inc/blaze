@@ -7,14 +7,75 @@ use blaze_cad_field::{
     Tape, Weakens, compile,
 };
 use blaze_cad_mesh::{
-    DecimateOpts, Decimated, MaterialRole, MeshLimits, MeshOpts, Meshed, PieceCache, RedistanceOpts, Source,
-    Target, Verified, decimate, mesh, mesh_cached, solve_redistance,
+    DecimateOpts, Decimated, GridSizing, MaterialRole, MeshLimits, MeshOpts, Meshed, PieceCache, RedistanceOpts, Source, Target,
+    Verified, auto_grid, decimate, mesh, mesh_cached, solve_redistance,
 };
 use blaze_own::Alloc;
 use blaze_own::planted::{NoPlant, Planted};
 use blaze_units::{Density, Length, Mass, Volume};
 
 use crate::{MassPlant, ModelError, PartId, PartPlant, RoundPlant};
+
+/// Explicit triangle count budget for a part or an entire game-asset bundle (rule 76/85).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TriangleBudget(pub u32);
+
+impl TriangleBudget {
+    /// The budget as a `u32` triangle count.
+    #[inline]
+    pub const fn count(self) -> u32 {
+        self.0
+    }
+}
+
+/// Per-part tessellation and triangle-budget policy used by [`crate::build_game_asset`] and
+/// [`crate::export_glb`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PartBudget {
+    /// Use scale-aware preset defaults and proportional share of any asset-level total budget.
+    Auto,
+    /// Cap this part at most `TriangleBudget` triangles after error-bounded simplification.
+    MaxTriangles(TriangleBudget),
+    /// Fine-grained per-part budget, tessellation tolerance, minimum feature size, error ceiling,
+    /// and relative budget-allocation weight (`> 0.0`, default `1.0`).
+    Detailed {
+        max_triangles: Option<TriangleBudget>,
+        tolerance: Option<Length>,
+        min_feature: Option<Length>,
+        max_error: Option<Length>,
+        weight: f32,
+    },
+}
+
+impl PartBudget {
+    /// Convenience constructor for an explicit per-part triangle cap.
+    #[inline]
+    pub const fn max_triangles(triangles: u32) -> PartBudget {
+        PartBudget::MaxTriangles(TriangleBudget(triangles))
+    }
+
+    /// Explicit triangle cap if set on this part.
+    #[inline]
+    pub const fn explicit_cap(self) -> Option<u32> {
+        match self {
+            PartBudget::Auto => None,
+            PartBudget::MaxTriangles(b) => Some(b.0),
+            PartBudget::Detailed { max_triangles, .. } => match max_triangles {
+                Some(b) => Some(b.0),
+                None => None,
+            },
+        }
+    }
+
+    /// Relative allocation weight used when distributing an asset-level total budget.
+    #[inline]
+    pub fn weight(self) -> f32 {
+        match self {
+            PartBudget::Detailed { weight, .. } if weight.is_finite() && weight > 0.0 => weight,
+            _ => 1.0,
+        }
+    }
+}
 
 /// A named solid and where it sits. PLACEMENT IS NOT GEOMETRY: `solid` is the unplaced shape
 /// (its digest, and so every mesh piece and check record of it, does not move when the part
@@ -30,6 +91,8 @@ pub struct Part<K: Ex = Bound> {
     pub material: MaterialRole,
     /// Optional parent part in a scene/model hierarchy (defaults to `None` for a root node).
     pub parent: Option<PartId>,
+    /// Per-part triangle budget and tessellation override (defaults to [`PartBudget::Auto`]).
+    pub budget: PartBudget,
 }
 
 /// What [`Part::new`] takes.
@@ -62,10 +125,18 @@ impl<K: Ex> Part<K> {
                 name: Name::new(o.name),
                 material: MaterialRole(0),
                 parent: None,
+                budget: PartBudget::Auto,
             });
         }
         let (placement, local) = g.split_placement(o.solid).map_err(ModelError::Cad)?;
-        Ok(Part { solid: local, placement, name: Name::new(o.name), material: MaterialRole(0), parent: None })
+        Ok(Part {
+            solid: local,
+            placement,
+            name: Name::new(o.name),
+            material: MaterialRole(0),
+            parent: None,
+            budget: PartBudget::Auto,
+        })
     }
 
     /// The same part somewhere else: only the placement changes, so its pieces and records stay.
@@ -83,6 +154,11 @@ impl<K: Ex> Part<K> {
         Part { parent, ..self }
     }
 
+    /// The same part assigned a triangle budget or tessellation override.
+    pub fn with_budget(self, budget: PartBudget) -> Part<K> {
+        Part { budget, ..self }
+    }
+
     /// The same part at a weaker level (an assembly takes `Part<Bound>`).
     pub fn weaken<J: Ex>(self) -> Part<J>
     where
@@ -94,6 +170,7 @@ impl<K: Ex> Part<K> {
             name: self.name,
             material: self.material,
             parent: self.parent,
+            budget: self.budget,
         }
     }
 }
@@ -224,6 +301,16 @@ pub struct MeshPartOpts<'a, 's> {
     pub scratch: Alloc<'s>,
     /// The most distance a vertex may be from the surface.
     pub tolerance: Length,
+    /// Optional explicit octree piece size (overrides [`Self::auto_grid`]).
+    pub piece: Option<Length> = None,
+    /// Optional explicit octree feature cell ceiling (overrides [`Self::auto_grid`]).
+    pub feature: Option<Length> = None,
+    /// Smallest feature size (hole/trim/bevel width) that must never fall between octree
+    /// lattice samples when [`Self::auto_grid`] computes the grid.
+    pub min_feature: Option<Length> = None,
+    /// Use scale-aware dyadic grid sizing (`blaze_cad_mesh::auto_grid`) so meter-scale flat
+    /// faces do not explode into hundreds of thousands of tiny cells before decimation.
+    pub auto_grid: bool = true,
 }
 
 /// The part's mesh in its own frame (the placement goes on the glTF node), each piece read from
@@ -235,7 +322,14 @@ pub fn mesh_part<'a, K: Ex, P: Planted<CadPlant>>(
     cache: Option<&mut PieceCache<'_>>,
 ) -> Result<Meshed<'a>, ModelError> {
     let t = part_tape(g, part, Detail::Full, o.scratch)?;
-    let opts = MeshOpts { alloc: o.alloc, scratch: o.scratch, tolerance: o.tolerance, .. };
+    let GridSizing { piece, feature } = if o.auto_grid {
+        let auto = auto_grid(&t.aabb(), o.tolerance, o.min_feature);
+        GridSizing { piece: o.piece.unwrap_or(auto.piece), feature: o.feature.unwrap_or(auto.feature) }
+    } else {
+        let def = MeshOpts { alloc: o.alloc, scratch: o.scratch, tolerance: o.tolerance, .. };
+        GridSizing { piece: o.piece.unwrap_or(def.piece), feature: o.feature.unwrap_or(def.feature) }
+    };
+    let opts = MeshOpts { alloc: o.alloc, scratch: o.scratch, tolerance: o.tolerance, piece, feature, .. };
     match cache {
         Some(c) => mesh_cached(&t, opts, c),
         None => mesh(&t, opts),

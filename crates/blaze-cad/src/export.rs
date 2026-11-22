@@ -19,13 +19,15 @@ use blaze_cad_out::{
     Collider, DEFAULT_FILL, DEFAULT_STROKE, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, Matrix, SectionGrid, StlOpts,
     StlUnit, SvgError, SvgOpts, Transform, Up, glb, stl, svg,
 };
-use blaze_cad_picture::{Picture, PictureOpts, Shading, StudioOpts, View, render};
+use blaze_cad_picture::{
+    MeshPictureOpts, MeshScenePart, Picture, PictureOpts, Shading, StudioOpts, View, render, render_mesh, render_mesh_scene,
+};
 use blaze_math::{Aabb3, Vec3};
 use blaze_own::planted::Planted;
 use blaze_own::{Alloc, Vec};
 use blaze_units::{Density, Length};
 
-use crate::{MeshPartOpts, ModelError, Part, mass_properties, mesh_part};
+use crate::{MeshPartOpts, ModelError, Part, PartBudget, mass_properties, mesh_part};
 
 /// Camera projection parameters used to compute LOD switch distances (re-export of
 /// `blaze_cad_mesh::Projection`, named to avoid colliding with `blaze_cad_picture::Projection`).
@@ -141,18 +143,19 @@ pub fn transform_of(p: &Placement) -> Transform {
 
 /// Prepare a mesh for GPU export: optionally run Tipsify vertex-cache optimization followed by
 /// vertex-fetch reordering, and stamp `role` onto all triangles when non-zero.
-fn prepare_gpu_mesh<'s>(
+pub(crate) fn prepare_gpu_mesh<'s>(
     view: &MeshView<'_>,
     role: MaterialRole,
     optimize_gpu: bool,
     cache_size: u32,
-    scratch: Alloc<'s>,
+    alloc: Alloc<'s>,
+    scratch: Alloc<'_>,
 ) -> Result<Mesh<'s>, ModelError> {
     let mesh = if optimize_gpu {
         let cached = optimize_vertex_cache(view, CacheOpts { cache_size, alloc: scratch, scratch })?;
-        optimize_vertex_fetch(&cached.view(), FetchOpts { alloc: scratch, scratch })?
+        optimize_vertex_fetch(&cached.view(), FetchOpts { alloc, scratch })?
     } else {
-        copy_view(view, scratch)?
+        copy_view(view, alloc)?
     };
     if role == MaterialRole(0) {
         return Ok(mesh);
@@ -187,7 +190,7 @@ fn copy_view<'s>(view: &MeshView<'_>, alloc: Alloc<'s>) -> Result<Mesh<'s>, Mode
 
 /// Convert a quickhull [`Hull`] into an indexed [`Mesh`] with area-weighted unit vertex normals
 /// suitable for glTF collider meshes.
-fn hull_to_mesh<'s>(hull: &Hull<'_>, alloc: Alloc<'s>) -> Result<Mesh<'s>, ModelError> {
+pub(crate) fn hull_to_mesh<'s>(hull: &Hull<'_>, alloc: Alloc<'s>) -> Result<Mesh<'s>, ModelError> {
     let n_pts = hull.points.len();
     let n_tris = hull.triangles.len();
     let mut positions = Vec::new_in(alloc);
@@ -280,7 +283,16 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
     let mut meshes: Vec<Meshed<'_>, Alloc<'_>> = Vec::new_in(s);
     meshes.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "the export's meshes" })?;
     for part in parts {
-        let m = mesh_part(g, part, MeshPartOpts { alloc: s, scratch: s, tolerance: o.tolerance }, cache.as_deref_mut())?;
+        let (part_tol, min_feature) = match part.budget {
+            PartBudget::Detailed { tolerance, min_feature, .. } => (tolerance.unwrap_or(o.tolerance), min_feature),
+            _ => (o.tolerance, None),
+        };
+        let m = mesh_part(
+            g,
+            part,
+            MeshPartOpts { alloc: s, scratch: s, tolerance: part_tol, min_feature, .. },
+            cache.as_deref_mut(),
+        )?;
         meshes.try_push(m).map_err(|_| ModelError::Alloc { what: "the export's meshes" })?;
     }
     let mut simple: Vec<Decimated<'_>, Alloc<'_>> = Vec::new_in(s);
@@ -288,10 +300,21 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
     counts.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "the export's counts" })?;
     if o.decimate {
         simple.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "the export's simplified meshes" })?;
-        for m in meshes.iter() {
+        for (part, m) in parts.iter().zip(meshes.iter()) {
+            let target = match part.budget {
+                PartBudget::Auto => Target::Error(o.tolerance),
+                PartBudget::MaxTriangles(cap) => Target::Budget { error: o.tolerance, max_triangles: cap.0, max_error: None },
+                PartBudget::Detailed { max_triangles, tolerance, max_error, .. } => {
+                    let tol = tolerance.unwrap_or(o.tolerance);
+                    match max_triangles {
+                        Some(cap) => Target::Budget { error: tol, max_triangles: cap.0, max_error },
+                        None => Target::Error(tol),
+                    }
+                }
+            };
             let d = decimate(
                 Source::Verified(m.verified()),
-                DecimateOpts { target: Target::Error(o.tolerance), cos_crease: o.cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+                DecimateOpts { target, cos_crease: o.cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
             )?;
             simple.try_push(d).map_err(|_| ModelError::Alloc { what: "the export's simplified meshes" })?;
         }
@@ -323,7 +346,7 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
         let count = PartCount { meshed: m.stats.triangles, written, simplified_within: within, vertex_bound: m.vertex_bound };
         counts.try_push(count).map_err(|_| ModelError::Alloc { what: "the export's counts" })?;
 
-        let opt_mesh = prepare_gpu_mesh(&base_view, part.material, o.optimize_gpu, o.vertex_cache_size, s)?;
+        let opt_mesh = prepare_gpu_mesh(&base_view, part.material, o.optimize_gpu, o.vertex_cache_size, s, s)?;
         ready_meshes.try_push(opt_mesh).map_err(|_| ModelError::Alloc { what: "the export's optimized meshes" })?;
 
         let lod_start = ready_lods.len();
@@ -341,7 +364,7 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
                 },
             )?;
             for level in chain.levels.iter().skip(1) {
-                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), part.material, o.optimize_gpu, o.vertex_cache_size, s)?;
+                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), part.material, o.optimize_gpu, o.vertex_cache_size, s, s)?;
                 ready_lods
                     .try_push(ReadyLod { mesh: lv_mesh, error: level.error, switch_distance: level.switch_distance })
                     .map_err(|_| ModelError::Alloc { what: "the export's lod meshes" })?;
@@ -456,7 +479,7 @@ pub fn export_stl<'a, K: Ex, P: Planted<CadPlant>>(
     cache: Option<&mut PieceCache<'_>>,
 ) -> Result<ExportedStl<'a>, ModelError> {
     let s = o.scratch;
-    let m = mesh_part(g, part, MeshPartOpts { alloc: s, scratch: s, tolerance: o.tolerance }, cache)?;
+    let m = mesh_part(g, part, MeshPartOpts { alloc: s, scratch: s, tolerance: o.tolerance, .. }, cache)?;
     let title = if o.title.is_empty() { part.name.as_str() } else { o.title };
     let (bytes, count) = if o.decimate {
         let d = decimate(
@@ -657,4 +680,41 @@ pub fn picture_studio<'a, K: Ex, P: Planted<CadPlant>>(
         o.supersample = 2;
     }
     picture(g, solid, view, o)
+}
+
+/// Render a preview picture directly from an exported triangle mesh (`MeshView`) with its
+/// materials, shading normals, studio lighting / ray-traced shadows, and optional wireframe.
+pub fn picture_mesh<'a>(
+    mesh: MeshView<'_>,
+    materials: &[Material<'_>],
+    view: View,
+    o: MeshPictureOpts<'a, '_>,
+) -> Result<Picture<'a>, ModelError> {
+    render_mesh(mesh, materials, view, o).map_err(ModelError::Picture)
+}
+
+/// Render a preview picture directly from a multi-part exported scene (`blaze_cad_out::Scene`),
+/// placing every part with its transform and parent hierarchy and shading with its materials.
+pub fn picture_exported_scene<'a>(
+    scene: &blaze_cad_out::Scene<'_>,
+    view: View,
+    o: MeshPictureOpts<'a, '_>,
+) -> Result<Picture<'a>, ModelError> {
+    let mut parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(o.scratch);
+    parts.try_reserve(scene.parts.len()).map_err(|_| ModelError::Alloc { what: "scene preview parts" })?;
+    let mut remapped: Vec<Option<u32>, Alloc<'_>> = Vec::new_in(o.scratch);
+    remapped.try_reserve(scene.parts.len()).map_err(|_| ModelError::Alloc { what: "scene preview parents" })?;
+    for p in scene.parts {
+        if let Some(mesh) = p.mesh {
+            let parent = p.parent.and_then(|pi| remapped.get(pi as usize).copied().flatten());
+            let idx = parts.len() as u32;
+            parts
+                .try_push(MeshScenePart { mesh, parent, transform: p.transform, tint_override: None })
+                .map_err(|_| ModelError::Alloc { what: "scene preview parts" })?;
+            remapped.try_push(Some(idx)).map_err(|_| ModelError::Alloc { what: "scene preview parents" })?;
+        } else {
+            remapped.try_push(None).map_err(|_| ModelError::Alloc { what: "scene preview parents" })?;
+        }
+    }
+    render_mesh_scene(&parts, scene.materials, view, o).map_err(ModelError::Picture)
 }
